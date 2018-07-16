@@ -147,8 +147,8 @@ values."
                          white-sand
                          material-light
                          material
-                         majapahlt-light
-                         majapahlt-dark
+                         majapahit-light
+                         majapahit-dark
                          subatomic
                          apropospriate-dark)
    ;; If non nil the cursor color matches the state color in GUI Emacs.
