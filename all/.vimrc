@@ -16,7 +16,7 @@ let maplocalleader=','
 " SET RUNTIMEPATH {{{4
 if isdirectory(expand("$HOME/.vim"))
    if isdirectory(expand("$HOME/.vim/colors"))
-          if filereadable(expand("$HOME/colors/flatlandia.vim"))
+          if filereadable(expand("$HOME/colors/Atelier_DuneLight.vim"))
                  let $VIMRUNTIME=expand("$HOME/.vim")
                  set runtimepath=$VIMRUNTIME
           endif
@@ -86,10 +86,10 @@ if &t_Co > 2
           set bg=dark t_Co=256 vb
           let &t_vb="\<Esc>[?5h\<Esc>[?5l"      " flash screen for visual bell
 
-          if filereadable(expand("$VIMRUNTIME/colors/flatlandia.vim"))
-                 colorscheme flatlandia
-          elseif filereadable(expand("$HOME/.vim/colors/flatlandia.vim"))
-                 colorscheme flatlandia
+          if filereadable(expand("$VIMRUNTIME/colors/Atelier_DuneLight.vim"))
+                 colorscheme Atelier_DuneLight
+          elseif filereadable(expand("$HOME/.vim/colors/Atelier_DuneLight.vim"))
+                 colorscheme Atelier_DuneLight
           else
                  colorscheme default
           endif
@@ -949,6 +949,29 @@ cmap w!! w !sudo tee > /dev/null %
 
 " With the default leader key, just press \s to save any changes to the current file.
 noremap <Leader>s :update<CR>
-
+set background=light
 let g:airline_powerline_fonts = 1
-"let g:airline_theme = "flatlandia"
+" "let g:airline_theme = "base16_atelierdune"
+" Airline for AtelierSchemes
+" dark
+" let g:airline_theme='Atelier_ForestDark'
+" or any of the other themes:
+" let g:airline_theme='Atelier_HeathDark'
+" let g:airline_theme='Atelier_CaveDark'
+" let g:airline_theme='Atelier_SulphurpoolDark'
+" let g:airline_theme='Atelier_LakesideDark'
+" let g:airline_theme='Atelier_SavannaDark'
+" let g:airline_theme='Atelier_SeasideDark'
+" let g:airline_theme='Atelier_EstuaryDark'
+" let g:airline_theme='Atelier_DuneDark'
+
+" light
+" let g:airline_theme='Atelier_ForestLight'
+" let g:airline_theme='Atelier_HeathLight'
+" let g:airline_theme='Atelier_CaveLight'
+" let g:airline_theme='Atelier_SulphurpoolLight'
+" let g:airline_theme='Atelier_LakesideLight'
+" let g:airline_theme='Atelier_SavannaLight'
+" let g:airline_theme='Atelier_SeasideLight'
+" let g:airline_theme='Atelier_EstuaryLight'
+let g:airline_theme='Atelier_DuneLight'

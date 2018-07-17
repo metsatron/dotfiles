@@ -281,7 +281,7 @@ set laststatus=2
 set linebreak                                   " wrap at 'breakat' instead of last char
 set magic                                               " Enable the "magic"
 
-set maxmem=25123        " 24 MB -  max mem in Kbyte to use for one buffer.  Max is 2000000
+""set maxmem=25123        " 24 MB -  max mem in Kbyte to use for one buffer.  Max is 2000000
 
 set noautowrite                                 " don't automagically write on :next
 
@@ -637,3 +637,4 @@ let g:airline_powerline_fonts = 1
 let g:airline_theme = "base16_atelierdune"
 let g:base16_airline=1
 set guicursor="\x1b[%p1%d q"
+set termguicolors
