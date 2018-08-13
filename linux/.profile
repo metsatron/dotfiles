@@ -26,3 +26,4 @@ if [ -d "$HOME/.local/bin" ]; then
 fi
 
 export AQUARIA_DATA_PATH=~/.config/Aquaria
+export QT_QPA_PLATFORMTHEME=gtk2

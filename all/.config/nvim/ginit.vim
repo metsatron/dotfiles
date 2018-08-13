@@ -1,0 +1,1 @@
+GuiFont Courier 10 Pitch for Powerline:h10
