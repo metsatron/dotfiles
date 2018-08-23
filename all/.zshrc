@@ -7,21 +7,74 @@
 # Somebody set us up the prompt
 #
 
-## POWERLEVEL9K SETTINGS ##
-POWERLEVEL9K_MODE='nerdfont-complete'
-POWERLEVEL9K_SHORTEN_DIR_LENGTH=2
-POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(os_icon dir vcs)
-POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status nvm node_version)
+# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Power Level 9k custom
+# POWERLEVEL9K_TIME_BACKGROUND='32'
+# POWERLEVEL9K_TIME_FOREGROUND='0'
 
-POWERLEVEL9K_OS_ICON_BACKGROUND="white"
-POWERLEVEL9K_OS_ICON_FOREGROUND="blue"
-POWERLEVEL9K_DIR_HOME_FOREGROUND="white"
-POWERLEVEL9K_DIR_HOME_SUBFOLDER_FOREGROUND="white"
-POWERLEVEL9K_DIR_DEFAULT_FOREGROUND="white"
+POWERLEVEL9K_PROMPT_ON_NEWLINE=true
+POWERLEVEL9K_RPROMPT_ON_NEWLINE=true
+
+POWERLEVEL9K_CONTEXT_DEFAULT_BACKGROUND='black'
+POWERLEVEL9K_CONTEXT_DEFAULT_FOREGROUND='009'
+
+POWERLEVEL9K_DIR_HOME_BACKGROUND='009'
+POWERLEVEL9K_DIR_HOME_FOREGROUND='black'
+
+POWERLEVEL9K_DIR_DEFAULT_BACKGROUND='196'
+POWERLEVEL9K_DIR_DEFAULT_FOREGROUND='232'
+
+#POWERLEVEL9K_VCS_CLEAN_FOREGROUND='099'
+POWERLEVEL9K_MODE='awesome-fontconfig'
+
+#Icon config
+POWERLEVEL9K_HOME_ICON='\UF20E'
+POWERLEVEL9K_SUB_ICON='\UF07C'
+POWERLEVEL9K_FOLDER_ICON='\UF07B'
+#POWERLEVEL9K_STATUS_OK_ICON='\UF2B0'
+POWERLEVEL9K_LEFT_SEGMENT_SEPARATOR='\UE0BC'
+POWERLEVEL9K_RIGHT_SEGMENT_SEPARATOR='\UE0BA'
+
+# Anaconda
+POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(anaconda battery)
+POWERLEVEL9K_ANACONDA_RIGHT_DELIMITER='>'
+POWERLEVEL9K_ANACONDA_LEFT_DELIMITER='<'
+POWERLEVEL9K_ANACONDA_BACKGROUND='24'
+POWERLEVEL9K_ANACONDA_FOREGROUND='111'
+# POWERLEVEL9K_ANACONDA_ICON=''
+
+# Bateria
+POWERLEVEL9K_BATTERY_CHARGING='yellow'
+POWERLEVEL9K_BATTERY_CHARGED='blue'
+POWERLEVEL9K_BATTERY_LOW_THRESHOLD='20'
+POWERLEVEL9K_BATTERY_LOW_COLOR='red'
+POWERLEVEL9K_BATTERY_CHARGED_BACKGROUND='46'
+POWERLEVEL9K_BATTERY_CHARGED_FOREGROUND='235'
+POWERLEVEL9K_BATTERY_CHARGING_BACKGROUND='178'
+POWERLEVEL9K_BATTERY_CHARGING_FOREGROUND='235'
+POWERLEVEL9K_BATTERY_LOW_BACKGROUND='88'
+POWERLEVEL9K_BATTERY_LOW_FOREGROUND='235'
+POWERLEVEL9K_BATTERY_CHARGED_ICON='/UF240'
+POWERLEVEL9K_BATTERY_LOW_ICON='/UF240'
+POWERLEVEL9K_BATTERY_CHARGING_ICON='/UF1E6'
+POWERLEVEL9K_BATTERY_DISCONNECTED_FOREGROUND='195'
+POWERLEVEL9K_BATTERY_DISCONNECTED_BACKGROUND='009'
+POWERLEVEL9K_BATTERY_ICON='\UF1E6'
+
+## POWERLEVEL9K SETTINGS ##
+# POWERLEVEL9K_MODE='nerdfont-complete'
+# POWERLEVEL9K_SHORTEN_DIR_LENGTH=1
+# POWERLEVEL9K_LEFT_PROMPT_ELEMENTS=(os_icon dir vcs)
+# POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS=(status nvm node_version)
+
+# POWERLEVEL9K_OS_ICON_BACKGROUND="white"
+# POWERLEVEL9K_OS_ICON_FOREGROUND="blue"
+# POWERLEVEL9K_DIR_HOME_FOREGROUND="white"
+# POWERLEVEL9K_DIR_HOME_SUBFOLDER_FOREGROUND="white"
+# POWERLEVEL9K_DIR_DEFAULT_FOREGROUND="white"
 ##
 
 # Let's have some colors first
-autoload -U colors && colors
+# autoload -U colors && colors
 
 ##
 # Environment variables
@@ -329,15 +382,15 @@ fi
 # load zplug
 source ~/.zplug/init.zsh
 
-zplug "modules/history",    from:prezto                                                                                                                                
-zplug "modules/utility",    from:prezto                                                                                                                                
-zplug "modules/ssh",        from:prezto                                                                                                                                
-zplug "modules/terminal",   from:prezto                                                                                                                                
-zplug "modules/directory",  from:prezto 
+zplug "modules/history",    from:prezto
+zplug "modules/utility",    from:prezto
+zplug "modules/ssh",        from:prezto
+zplug "modules/terminal",   from:prezto
+zplug "modules/directory",  from:prezto
 zplug "bhilburn/powerlevel9k", use:powerlevel9k.zsh-theme
 
 zplug "zsh-users/zsh-completions", defer:0
-zplug "zsh-users/zsh-autosuggestions", defer:2, on:"zsh-users/zsh-completions" 
+zplug "zsh-users/zsh-autosuggestions", defer:2, on:"zsh-users/zsh-completions"
 zplug load
 
 zle -N zle-line-init
