@@ -151,10 +151,14 @@
 	{
 		FriendsPanel
 		{			
-			bgcolor="WhiteWolf2"
+			bgcolor="none"
 			render_bg
 			{
-				1="image( x0, y0, x1, y1, graphics/clienttexture2)"
+				0="gradient( x0, y0, x1, y0+175, WhiteWolf, WhiteWolf3 )"
+				//1="image( x0, y0, x1, y1, graphics/clienttexture2)"
+				3="fill( x0, y0+175, x0+20, y1-76, WhiteWolf3 )"
+				4="fill( x1-20, y0+175, x1, y1-76, WhiteWolf3 )"
+				5="fill( x0, y1 - 76, x1, y1, WhiteWolf3 )"
 			}
 		}	
 		
