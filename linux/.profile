@@ -18,7 +18,7 @@ fi
 
 # set PATH so it includes user's private bin if it exists
 if [ -d "$HOME/bin" ] ; then
-    PATH="$HOME/bin:$PATH"
+    PATH="$HOME/bin:$PATH:/home/metsatron/Apps/android-studio/bin"
 fi
 
 # set PATH so it includes user's private bin if it exists
