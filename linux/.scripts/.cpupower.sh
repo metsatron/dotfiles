@@ -61,17 +61,17 @@ GOV=`zenity --title="Freq" --text="Set Frequency Scaling Governor" --height=300 
 --list --column="Available Settings:" "Conservative" "Ondemand" "Userspace" "Powersave" "Performance"`
 
 if [ "$GOV" = "Performance" ]; then
-   cpupower frequency-set -g performance
+   cpufreq-set -g performance
 fi
 
 if [ "$GOV" = "Conservative" ]; then
-    cpupower frequency-set -g conservative
+    cpufreq-set -g conservative
 fi
 
 if [ "$GOV" = "Powersave" ]; then
-    cpupower frequency-set -g powersave
+    cpufreq-set -g powersave
 fi
 
 if [ "$GOV" = "Userspace" ]; then
-   cpupower frequency-set -g userspace
+   cpufreq-set -g userspace
 fi
