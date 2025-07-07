@@ -18,7 +18,7 @@ fi
 
 # set PATH so it includes user's private bin if it exists
 if [ -d "$HOME/bin" ] ; then
-    PATH="$HOME/bin:$PATH:/home/metsatron/Apps/android-studio/bin"
+    PATH="$HOME/bin:$PATH"
 fi
 
 # set PATH so it includes user's private bin if it exists
@@ -26,5 +26,16 @@ if [ -d "$HOME/.local/bin" ] ; then
     PATH="$HOME/.local/bin:$PATH"
 fi
 
-export AQUARIA_DATA_PATH=~/.config/Aquaria
-export QT_QPA_PLATFORMTHEME=gtk2
+# set PATH so it includes user's private bin if it exists
+if [ -d "$HOME/.cargo/bin" ] ; then
+    PATH="$HOME/.cargo/bin:$PATH"
+fi
+
+# DXC compiler
+if [ -d "$HOME/.cargo/bin" ] ; then
+    PATH="~/dxc-artifacts/bin:$PATH"
+fi
+
+export aquaria_data_path=~/.config/aquaria
+export qt_qpa_platformtheme=gtk2
+export MOZ_X11_EGL=1
