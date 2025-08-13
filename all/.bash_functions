@@ -9,6 +9,28 @@
 #     mkdir -p "$1" && cd "$1"
 # }
 
+function chatgpt-process-export() {
+  local export_dir=~/HelmCortex/LOGS/ChatGPT/EXPORT
+  local today=$(date +%y%m%d)
+  local zip_src="$export_dir/chatgpt-export-markdown.zip"
+  local zip_dst="$export_dir/chatgpt-export-markdown-$today.zip"
+  local extract_dir="$export_dir/chatgpt-export-markdown-$today"
+
+  # Rename with timestamp
+  if [[ -f "$zip_src" ]]; then
+    mv "$zip_src" "$zip_dst"
+    echo "✅ Renamed to $zip_dst"
+  else
+    echo "❌ Source ZIP not found: $zip_src"
+    return 1
+  fi
+
+  # Extract to dated folder
+  mkdir -p "$extract_dir"
+  unzip "$zip_dst" -d "$extract_dir"
+  echo "✅ Extracted to $extract_dir"
+}
+
 # ============================
 # Custom Game Utility Scripts
 # ============================
