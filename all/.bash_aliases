@@ -31,7 +31,7 @@ alias sl="ls"
 alias alert='notify-send --urgency=low -i "$([ $? = 0 ] && echo terminal || echo error)" "$(history|tail -n1|sed -e '\''s/^\s*[0-9]\+\s*//;s/[;&|]\s*alert$//'\'')"'
 
 # Common Useful Aliases
-alias gs='git status'
+alias gss='git status'
 alias ga='git add'
 alias gc='git commit'
 alias gp='git push'
@@ -40,7 +40,8 @@ alias ...='cd ../..'
 alias update='sudo apt update && sudo apt upgrade'
 alias rm='rm -iv'
 alias diff="diff -u"
-alias mkhttp="python -m http.server"
-alias json="python -m json.tool"
+alias python="python3"
+alias mkhttp="python3 -m http.server"
+alias json="python3 -m json.tool"
 alias perms="stat -c '%A %a %n'"
 alias neofetch="neofetch --ascii ~/.local/share/neofetch/CoplandOS.neofetch --ascii_colors 6 4"
