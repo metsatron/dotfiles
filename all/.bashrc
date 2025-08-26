@@ -53,5 +53,9 @@ if [ "$SHOW_FORTUNE" = "1" ] && command -v fortune &>/dev/null && command -v cow
   fortune | cowsay
 fi
 
-[ "$SHOW_NEOFETCH" = "1" ] && command -v neofetch &>/dev/null && neofetch
+# [ "$SHOW_NEOFETCH" = "1" ] && command -v neofetch &>/dev/null && neofetch
 
+
+export NVM_DIR="$HOME/.config/nvm"
+[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
+[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
