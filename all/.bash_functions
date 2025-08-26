@@ -4,6 +4,26 @@
 # Mètsàtron's Bash Functions
 # --------------------------------------------------
 
+# speak with an agent/model quickly
+pvoice() { pvox say "$@"; }
+
+# render a transcript file to a single wav and play it
+prender() { pvox render "$@"; }
+
+# read clipboard with a chosen agent (for panel launcher / browser)
+pclip() {
+  local agent="${1:-ChatGPT}"
+  local text
+  if command -v xclip >/dev/null; then
+    text="$(xclip -o -selection clipboard)"
+  elif command -v xsel >/dev/null; then
+    text="$(xsel -ob)"
+  else
+    echo "Install xclip or xsel to use pclip." >&2; return 1
+  }
+  pvox say "$agent" "$text"
+}
+
 # Example function
 # mkcd() {
 #     mkdir -p "$1" && cd "$1"

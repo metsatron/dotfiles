@@ -2,9 +2,9 @@
 # Metsatron's .zshrc
 
 # Guard interactive
-if [[ $- == *i* ]]; then
-  neofetch --ascii ~/.local/share/neofetch/CoplandOS.neofetch --ascii_colors 6 4
-fi
+# if [[ $- == *i* ]]; then
+#   neofetch --ascii ~/.local/share/neofetch/CoplandOS.neofetch --ascii_colors 6 4
+# fi
 
 # Powerlevel10k Instant Prompt
 if [[ $- == *i* ]]; then
