@@ -1,1 +1,0 @@
-("~/.dotfiles/" "~/.dotfiles/all/.emacs.d.spacemacs/" "~/HelmCortex/" "~/.dotfiles/all/.emacs.d/")
