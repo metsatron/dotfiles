@@ -1,55 +1,217 @@
 #!/usr/bin/env bash
-# symlinks-broken — enumerate broken symlinks under a root (default: $HOME)
-# Outputs to stdout and appends a timestamped report to ~/broken-symlinks.log
-# Safe for weird filenames; does not dereference symlinks when traversing.
+# symlinks-broken — enumerate (and optionally repair) broken symlinks
+# - Recurses from ROOT (default: $HOME)
+# - Respects excludes from a config file
+# - Logs to ~/.local/share/symlinks by default
+# - Repair pass can propose or apply safe fixes (see --repair-* flags)
+#
+# Covenants honored: no destructive defaults, preview first, quoted vars.
 
 set -Eeuo pipefail
 
-ROOT="${1:-$HOME}"
-LOG="${HOME}/broken-symlinks.log"
+# ---------- Defaults ----------
+ROOT="${HOME}"
+CFG_DEFAULT="${HOME}/.dotfiles/all/.local/share/symlinks/symlinks.cfg"
+LOG_DIR_DEFAULT="${HOME}/.local/share/symlinks"
+LOG_BASE="broken-symlinks.log"
+TIMESTAMP_LOGS_DEFAULT=0    # 0=append to single log; 1=timestamp per run
+
+# ---------- CLI ----------
+CFG="$CFG_DEFAULT"
+EXTRA_EXCLUDES=()
+REPAIR_MODE="off"           # off | preview | apply
+TIMESTAMP_LOGS="$TIMESTAMP_LOGS_DEFAULT"
+LOG_DIR="$LOG_DIR_DEFAULT"
+
+usage() {
+  cat <<EOF
+Usage: $(basename "$0") [--root PATH] [--config PATH] [--exclude-dir PATH ...]
+                      [--timestamp-logs|--no-timestamp-logs]
+                      [--repair-preview | --repair-apply]
+
+Options:
+  --root PATH                 Root to scan (default: \$HOME)
+  --config PATH               Config file (default: $CFG_DEFAULT)
+  --exclude-dir PATH          Extra directory to prune (repeatable)
+  --timestamp-logs            Write timestamped logs (…-YYYYMMDD-HHMMSS.log)
+  --no-timestamp-logs         Append to single $LOG_BASE (default)
+  --repair-preview            Show proposed fixes (no changes)
+  --repair-apply              Apply safe fixes (see notes below)
+
+Repair logic (conservative):
+  • If link target is absolute /home/<otheruser>/… and a path exists under your \$HOME
+    with the same tail, relink relatively to that.
+  • If basename exists in the link's own directory, relink to that basename.
+EOF
+}
+
+for arg in "$@"; do
+  case "$arg" in
+    --help|-h) usage; exit 0;;
+    --timestamp-logs) TIMESTAMP_LOGS=1;;
+    --no-timestamp-logs) TIMESTAMP_LOGS=0;;
+    --repair-preview) REPAIR_MODE="preview";;
+    --repair-apply)   REPAIR_MODE="apply";;
+    --root)           shift; ROOT="${1:-$ROOT}";;
+    --config)         shift; CFG="${1:-$CFG}";;
+    --exclude-dir)    shift; EXTRA_EXCLUDES+=("${1:?}");;
+    --*) echo "Unknown option: $arg" >&2; usage; exit 2;;
+  esac
+done
+
+# ---------- Config parsing ----------
+# Format: key=value, comments with #, blank lines ignored
+EXCLUDE_DIRS=()
+OLD_HOME=""           # optionally set in cfg to rewrite /home/<olduser>/ → $HOME/…
+if [[ -f "$CFG" ]]; then
+  while IFS='=' read -r raw_k raw_v; do
+    # strip comments & trim
+    k="${raw_k%%#*}"; v="${raw_v%%#*}"
+    k="${k#"${k%%[![:space:]]*}"}"; k="${k%"${k##*[![:space:]]}"}"
+    v="${v#"${v%%[![:space:]]*}"}"; v="${v%"${v##*[![:space:]]}"}"
+    [[ -z "$k" ]] && continue
+    case "$k" in
+      exclude_dir) EXCLUDE_DIRS+=("$v");;
+      log_dir)     LOG_DIR="$v";;
+      timestamp_logs) TIMESTAMP_LOGS="${v}";;
+      old_home)    OLD_HOME="$v";;
+      *) : ;;
+    esac
+  done < <(sed -e 's/[[:space:]]\+#.*$//' -e '/^[[:space:]]*$/d' -- "$CFG")
+fi
+EXCLUDE_DIRS+=("${EXTRA_EXCLUDES[@]}")
+
+mkdir -p -- "$LOG_DIR"
+
+ts="$(date +%Y%m%d-%H%M%S)"
+if [[ "$TIMESTAMP_LOGS" == "1" ]]; then
+  LOG="${LOG_DIR}/${LOG_BASE%.log}-${ts}.log"
+else
+  LOG="${LOG_DIR}/${LOG_BASE}"
+fi
+
+# helpful symlink when rotating
+if [[ "$TIMESTAMP_LOGS" == "1" ]]; then
+  ln -sfn -- "$LOG" "${LOG_DIR}/latest.log" || true
+fi
 
 timestamp() { date -Is; }
 
-# emit one record
 emit_record() {
-  local link_path="$1"
-  # raw target as stored in the symlink (may be relative)
-  local raw_target
-  raw_target="$(readlink -- "$link_path" || true)"
+  local link_path="$1" raw_target="$2" abs_target="$3" status="$4"
+  printf 'LINK    : %s\n' "$link_path"
+  printf 'TARGET  : %s\n' "${raw_target:-<no target>}"
+  printf 'ABS PATH: %s\n' "$abs_target"
+  printf 'STATUS  : %s\n' "$status"
+  printf '\n'
+}
 
-  # normalize to an absolute path without requiring the target to exist
-  # - if raw target is absolute, keep it; otherwise resolve against link's dir
+# compute absolute interpretation without requiring existence
+norm_abs_target() {
+  local link_path="$1" raw_target="$2"
   local abs_target
   if [[ "$raw_target" = /* ]]; then
     abs_target="$(realpath -m -- "$raw_target" 2>/dev/null || printf '%s' "$raw_target")"
   else
-    abs_target="$(realpath -m -- "$(dirname -- "$link_path")/$raw_target" 2>/dev/null || printf '%s' "$raw_target")"
+    abs_target="$(realpath -m -- "$(dirname -- "$link_path")/$raw_target" 2>/dev/null \
+                  || printf '%s' "$(dirname -- "$link_path")/$raw_target")"
+  fi
+  printf '%s' "$abs_target"
+}
+
+# propose a safe new *relative* target for a broken link
+propose_fix() {
+  local link_path="$1" raw_target="$2" abs_target="$3"
+  local link_dir; link_dir="$(dirname -- "$link_path")"
+  local base; base="$(basename -- "$raw_target")"
+  local candidate=""
+
+  # Strategy A: basename exists in same directory
+  if [[ -n "$base" && -e "$link_dir/$base" ]]; then
+    candidate="$base"
+  else
+    # Strategy B: /home/<someone>/… → $HOME/… (cfg.old_home preferred, else infer)
+    local tail=""
+    if [[ -n "$OLD_HOME" && "$abs_target" == "$OLD_HOME"* ]]; then
+      tail="${abs_target#"$OLD_HOME"/}"
+    elif [[ "$abs_target" =~ ^/home/[^/]+/(.*)$ ]]; then
+      tail="${BASH_REMATCH[1]}"
+    fi
+    if [[ -n "$tail" && -e "$HOME/$tail" ]]; then
+      # make it relative to link_dir
+      candidate="$(realpath --relative-to="$link_dir" -- "$HOME/$tail" 2>/dev/null || printf '%s' "$HOME/$tail")"
+    fi
   fi
 
-  printf 'LINK    : %s\n' "$link_path"
-  printf 'TARGET  : %s\n' "${raw_target:-<no target>}"
-  printf 'ABS PATH: %s\n' "$abs_target"
-  printf 'STATUS  : BROKEN\n'
-  printf '\n'
+  [[ -n "$candidate" ]] && printf '%s' "$candidate" || true
 }
 
-main() {
-  printf '===== broken-symlinks scan: %s =====\n\n' "$(timestamp)" | tee -a "$LOG" >/dev/null
+apply_fix() {
+  local link_path="$1" new_target="$2"
+  ln -sfn -- "$new_target" "$link_path"
+}
 
-  # Use -type l to visit symlinks themselves; then test -e to detect broken ones.
-  # -print0 protects against spaces/newlines; silence permission errors under $HOME just in case.
-  broken_count=0
-  while IFS= read -r -d '' link; do
-    if [[ ! -e "$link" ]]; then
-      out="$(emit_record "$link")"
-      # show on screen and append to log
-      printf '%s' "$out" | tee -a "$LOG"
-      broken_count=$((broken_count + 1))
+# build the find command with prunes
+build_find_and_run() {
+  local -a cmd=(find -H "$ROOT")
+  if ((${#EXCLUDE_DIRS[@]})); then
+    cmd+=( '(' )
+    for i in "${!EXCLUDE_DIRS[@]}"; do
+      local d="${EXCLUDE_DIRS[$i]}"
+      cmd+=( -path "$d" -o -path "$d/*" )
+      if (( i < ${#EXCLUDE_DIRS[@]} - 1 )); then cmd+=( -o ); fi
+    done
+    cmd+=( ')' -prune -o )
+  fi
+  cmd+=( -type l -print0 )
+  "${cmd[@]}" 2>/dev/null
+}
+
+# ---------- Main ----------
+{
+  echo "===== broken-symlinks scan: $(timestamp) ====="
+  echo "root: $ROOT"
+  echo "config: ${CFG:-<none>}"
+  ((${#EXCLUDE_DIRS[@]})) && printf 'pruned:\n%s\n' "$(printf '  - %s\n' "${EXCLUDE_DIRS[@]}")"
+  echo
+} | tee -a -- "$LOG" >/dev/null
+
+broken=0; fixed=0
+
+while IFS= read -r -d '' link; do
+  # If the symlink's referent exists, skip
+  if [[ -e "$link" ]]; then
+    continue
+  fi
+
+  raw_target="$(readlink -- "$link" || true)"
+  abs_target="$(norm_abs_target "$link" "$raw_target")"
+
+  # Emit record
+  emit_record "$link" "$raw_target" "$abs_target" "BROKEN" | tee -a -- "$LOG"
+  broken=$((broken + 1))
+
+  # Repair logic (optional)
+  if [[ "$REPAIR_MODE" != "off" ]]; then
+    new_target="$(propose_fix "$link" "$raw_target" "$abs_target" || true)"
+    if [[ -n "$new_target" ]]; then
+      if [[ "$REPAIR_MODE" == "preview" ]]; then
+        printf 'REPAIR  : would relink -> %s\n\n' "$new_target" | tee -a -- "$LOG"
+      else
+        apply_fix "$link" "$new_target"
+        printf 'REPAIR  : relinked -> %s\n\n' "$new_target" | tee -a -- "$LOG"
+        fixed=$((fixed + 1))
+      fi
+    else
+      printf 'REPAIR  : no safe candidate found\n\n' | tee -a -- "$LOG"
     fi
-  done < <(find -H "$ROOT" -type l -print0 2>/dev/null)
+  fi
+done < <(build_find_and_run)
 
-  summary=$(printf 'TOTAL BROKEN: %d (root: %s)\n\n' "$broken_count" "$ROOT")
-  printf '%s' "$summary" | tee -a "$LOG"
-}
-
-main "$@"
+{
+  printf 'TOTAL BROKEN: %d\n' "$broken"
+  if [[ "$REPAIR_MODE" == "apply" ]]; then
+    printf 'TOTAL FIXED : %d\n' "$fixed"
+  fi
+  echo
+} | tee -a -- "$LOG"
