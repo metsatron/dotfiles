@@ -14,11 +14,96 @@ local plugins = {
   -- Core libs/UI
   { "nvim-lua/plenary.nvim" },
   { "nvim-tree/nvim-web-devicons", lazy = true },
-  {
-    "nvim-lualine/lualine.nvim",
-    dependencies = { "nvim-tree/nvim-web-devicons" },
-    opts = { options = { theme = "auto", section_separators = "", component_separators = "" } }
-  },
+
+{
+  "nvim-lualine/lualine.nvim",
+  dependencies = { "nvim-tree/nvim-web-devicons" },
+  opts = function()
+    local P = {
+      bg      = "#1e1e1e",
+      bg_dim  = "#363636",
+      fg      = "#ECECEC",
+      gray    = "#A0A0A0",
+      blue    = "#8CCEFF",
+      green   = "#B9F27C",
+      yellow  = "#FFD76E",
+      red     = "#FF6E6E",
+      purple  = "#D4AFFF",
+      cyan    = "#7DE1FF",
+    }
+
+  opts = {
+    options = { theme = "auto", section_separators = "", component_separators = "" },
+    sections = {
+      lualine_a = { "mode" },
+      lualine_b = { "branch" },
+      lualine_c = { "filename" },
+      lualine_x = { lsp_names, "encoding", "fileformat", "filetype" },
+      lualine_y = { "progress" },
+      lualine_z = { "location" },
+    },
+  }
+
+    -- Obsidian-y theme for lualine
+    local obsidian = {
+      normal  = { a = { fg = P.bg,  bg = P.blue,   gui = "bold" }, b = { fg = P.fg, bg = P.bg_dim }, c = { fg = P.fg, bg = P.bg } },
+      insert  = { a = { fg = P.bg,  bg = P.green,  gui = "bold" } },
+      visual  = { a = { fg = P.bg,  bg = P.purple, gui = "bold" } },
+      replace = { a = { fg = P.bg,  bg = P.red,    gui = "bold" } },
+      command = { a = { fg = P.bg,  bg = P.yellow, gui = "bold" } },
+      inactive= { a = { fg = P.gray,bg = P.bg },   b = { fg = P.gray,bg = P.bg }, c = { fg = P.gray,bg = P.bg } },
+    }
+
+    -- lualine component: show attached LSPs for current buffer (0.11/0.12 safe)
+    local function lsp_names()
+      local bufnr = vim.api.nvim_get_current_buf()
+      local get_clients = vim.lsp.get_clients or vim.lsp.get_active_clients
+      local clients = get_clients and (vim.lsp.get_clients and get_clients({ buf = bufnr }) or get_clients()) or {}
+      if not clients or vim.tbl_isempty(clients) then return "" end
+      local names = {}
+      for _, c in ipairs(clients) do
+        if not c.config or not c.config.workspace_folders or vim.lsp.buf_is_attached(bufnr, c.id) then
+          table.insert(names, c.name)
+        end
+      end
+      return (#names > 0) and ("  " .. table.concat(names, ",")) or ""
+    end
+
+    local function cwd() return " " .. vim.fn.fnamemodify(vim.fn.getcwd(), ":t") end
+
+    return {
+      options = {
+        theme = obsidian,
+        globalstatus = true,
+        component_separators = { left = "", right = "" },
+        section_separators = { left = '', right = '' }, -- ← the “powerline” chevrons
+        disabled_filetypes = { statusline = { "neo-tree" } },
+        always_divide_middle = true,
+      },
+      sections = {
+        lualine_a = { { "mode", fmt = function(s) return s:gsub("^%l", string.upper) end } },
+        lualine_b = { { "branch", icon = "" }, { "diff" } },
+        lualine_c = {
+          { cwd, separator = { right = "" }, padding = { left = 1, right = 1 } },
+          { "filetype", icon_only = true, separator = "", padding = { left = 1, right = 0 } },
+          { "filename", path = 1, symbols = { modified = " ●", readonly = " ", unnamed = " [No Name]" } },
+          { "diagnostics" },
+        },
+        lualine_x = { { lsp_names }, "encoding", "fileformat" },
+        lualine_y = { "progress" },
+        lualine_z = { "location" },
+      },
+      inactive_sections = {
+        lualine_a = {}, lualine_b = {},
+        lualine_c = { { "filename", path = 1 } },
+        lualine_x = { "location" },
+        lualine_y = {}, lualine_z = {},
+      },
+      extensions = { "neo-tree", "quickfix", "fugitive" },
+    }
+  end,
+},
+
   { "lewis6991/gitsigns.nvim", opts = {} },
   { "numToStr/Comment.nvim", opts = {} },
 
@@ -258,24 +343,28 @@ local plugins = {
     window = {
       width = 32,
       auto_expand_width = false, -- Shift+E will toggle this dynamically
-      mappings = {
-        -- kill hjkl & default i/o in the tree
-        ["h"] = "none", ["j"] = "none", ["k"] = "none", ["l"] = "none",
-        ["i"] = "none", ["o"] = "none",
+  mappings = {
+    -- kill hjkl so they don't fight NEIO
+    ["h"] = "none", ["j"] = "none", ["k"] = "none", ["l"] = "none",
 
-        -- NEIO literal
-        ["n"] = "close_node",
-        ["e"] = "move_cursor_down",
-        ["i"] = "move_cursor_up",
-        ["o"] = "open",
-        ["<cr>"] = "open",
+    -- NEIO
+    ["n"]    = "close_node",
+    ["o"]    = "open",
+    ["<cr>"] = "open",
+    ["e"]    = function(_) vim.cmd("normal! j") end, -- down
+    ["i"]    = function(_) vim.cmd("normal! k") end, -- up
 
-        -- Shift helpers
-        ["I"] = "show_file_details",      -- info popup (correct action name)
-        ["O"] = "show_help",              -- actions/help
-        ["E"] = "toggle_auto_expand_width", -- widen/narrow to show long names
-        ["Z"] = "close_all_nodes",
-      },
+    -- info (version-proof)
+    ["I"] = function(state)
+      local c = state.commands
+      local fn = c and (c.show_info_popup or c.show_file_info)
+      if fn then fn(state) else vim.notify("Neo-tree: no info action", vim.log.levels.WARN) end
+    end,
+
+    -- width toggle + collapse-all
+    ["E"] = "toggle_auto_expand_width",
+    ["Z"] = "close_all_nodes",
+  },
     },
   },
 },
@@ -293,32 +382,32 @@ local plugins = {
       offsets = {
         { filetype = "neo-tree", text = "Explorer", highlight = "Directory", separator = true },
       },
-	custom_filter = function(buf, buf_nums)
-	  -- hide terminal buffers from the tabline
-	  return vim.bo[buf].buftype ~= "terminal"
-	end,
+  custom_filter = function(buf, buf_nums)
+    -- hide terminal buffers from the tabline
+    return vim.bo[buf].buftype ~= "terminal"
+  end,
     },
-	highlights = {
-	  -- the bar behind the tabs
-	  fill = { bg = "#363636" },
+  highlights = {
+    -- the bar behind the tabs
+    fill = { bg = "#363636" },
 
-	  -- default (unselected) tabs
-	  background = { bg = "#363636", fg = "#A8A8A8" },
-	  separator = { fg = "#363636", bg = "#363636" },
-	  separator_visible = { fg = "#363636", bg = "#363636" },
-	  separator_selected = { fg = "#363636", bg = "#1e1e1e" }, -- clean seam
+    -- default (unselected) tabs
+    background = { bg = "#363636", fg = "#A8A8A8" },
+    separator = { fg = "#363636", bg = "#363636" },
+    separator_visible = { fg = "#363636", bg = "#363636" },
+    separator_selected = { fg = "#363636", bg = "#1e1e1e" }, -- clean seam
 
-	  -- selected tab
-	  buffer_selected = { bg = "#1e1e1e", fg = "#ECECEC", bold = true },
-	  indicator_selected = { fg = "#1e1e1e", bg = "#1e1e1e" },
+    -- selected tab
+    buffer_selected = { bg = "#1e1e1e", fg = "#ECECEC", bold = true },
+    indicator_selected = { fg = "#1e1e1e", bg = "#1e1e1e" },
 
-	  -- when the tree is open, the divider to its right
-	  offset_separator = { fg = "#363636", bg = "#363636" },
+    -- when the tree is open, the divider to its right
+    offset_separator = { fg = "#363636", bg = "#363636" },
 
-	  -- close buttons (optional)
-	  close_button = { bg = "#363636", fg = "#7A7A7A" },
-	  close_button_selected = { bg = "#1e1e1e", fg = "#E0E0E0" },
-	}
+    -- close buttons (optional)
+    close_button = { bg = "#363636", fg = "#7A7A7A" },
+    close_button_selected = { bg = "#1e1e1e", fg = "#E0E0E0" },
+  }
   },
 },
 }
