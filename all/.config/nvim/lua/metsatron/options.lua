@@ -20,3 +20,13 @@ o.splitbelow = true
 vim.g.loaded_node_provider = 0
 vim.g.loaded_ruby_provider = 0
 vim.g.loaded_perl_provider = 0
+
+-- in lua/metsatron/options.lua (or anywhere global)
+vim.opt.expandtab   = true  -- tabs become spaces
+vim.opt.shiftwidth  = 2     -- how many spaces to indent with > and <
+vim.opt.tabstop     = 2
+vim.opt.softtabstop = 2
+
+-- keep selection after indent/outdent
+vim.keymap.set("v", ">", ">gv", { desc = "Indent and keep selection" })
+vim.keymap.set("v", "<", "<gv", { desc = "Outdent and keep selection" })
