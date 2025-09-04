@@ -7,3 +7,4 @@ fi
 
 # Add any login-specific commands here
 
+. "$HOME/.cargo/env"
