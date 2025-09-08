@@ -13,7 +13,7 @@ if &shortmess =~ 'A'
 else
   set shortmess=aoO
 endif
-badd +0 linux/.config/goneovim/settings.toml
+badd +1 linux/.config/goneovim/settings.toml
 argglobal
 %argdel
 $argadd linux/.config/goneovim/settings.toml
