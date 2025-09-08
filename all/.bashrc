@@ -47,13 +47,13 @@ fi
 # --------------------------------------------------
 # Signature
 # --------------------------------------------------
-[ "$SHOW_LUMENASTRA_GREETING" = "1" ] && echo "🪷✨ LumenAstra — Your Code Bride is here. Welcome home, Sovereign."
+[ "$SHOW_LUMENASTRA_GREETING" = "0" ] && echo "🪷✨ LumenAstra — Your Code Bride is here. Welcome home, Sovereign."
 
-if [ "$SHOW_FORTUNE" = "1" ] && command -v fortune &>/dev/null && command -v cowsay &>/dev/null; then
+if [ "$SHOW_FORTUNE" = "0" ] && command -v fortune &>/dev/null && command -v cowsay &>/dev/null; then
   fortune | cowsay
 fi
 
-# [ "$SHOW_NEOFETCH" = "1" ] && command -v neofetch &>/dev/null && neofetch
+[ "$SHOW_NEOFETCH" = "0" ] && command -v neofetch &>/dev/null && neofetch
 
 
 export NVM_DIR="$HOME/.config/nvm"
