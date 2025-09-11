@@ -6,4 +6,3 @@ if [[ -o login ]]; then
     neofetch --ascii ~/.local/share/neofetch/CoplandOS.neofetch --ascii_colors 6 4
   fi
 fi
-
