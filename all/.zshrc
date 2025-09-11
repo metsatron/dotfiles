@@ -30,4 +30,3 @@ fi
 if [[ $- == *i* ]]; then
   source ~/.p10k.zsh
 fi
-
