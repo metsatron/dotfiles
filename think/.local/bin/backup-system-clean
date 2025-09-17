@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+ROOT_DEFAULT="/backup/backup-xubuntu/backup-xubuntu"
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+CLEAN_FILTER_DEFAULT="$USER_HOME/.config/backup/system-clean.rsync"
+CLEAN_FILTER="${CLEAN_FILTER:-$CLEAN_FILTER_DEFAULT}"
+LOG="/tmp/backup_system_clean_$(date +%Y%m%d_%H%M%S).log"
+
+MODE="" AUTO=0 ROOT="$ROOT_DEFAULT" DO_RM=0
+
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes";;
+    -n|--dry|--dry-run) MODE="dry";;
+    --auto) AUTO=1;;
+    --root) ROOT="${2:?}"; shift;;
+    --rm) DO_RM=1;;
+    --filter) CLEAN_FILTER="${2:?}"; shift;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run|-y|--yes] [--auto]
+       [--root PATH] [--filter FILE] [--rm]
+  --root PATH    Snapshot root to clean (default: $ROOT_DEFAULT)
+  --filter FILE  Cleanup filter file (default: $CLEAN_FILTER_DEFAULT)
+  --rm           Permanently delete instead of 'gio trash'
+EOF
+      exit 0;;
+    *) echo "Unknown: $1" >&2; exit 1;;
+  esac; shift
+done
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+
+trash_bucket() {
+  local mount="/backup"
+  # bucket is chosen for the *effective* user running gio (EUID)
+  local uid; uid="$(id -u)"
+  if [[ -d "$mount/.Trash-$uid" ]]; then
+    echo "$mount/.Trash-$uid"
+  elif [[ -d "$mount/.Trash/$uid" ]]; then
+    echo "$mount/.Trash/$uid"
+  else
+    echo "(no trash dir found on $mount)"
+  fi
+}
+
+safety() {
+  [ -d "$ROOT" ] || die "No such root: $ROOT"
+  [[ "$ROOT" == /backup/* ]] || die "Refusing to run outside /backup"
+  mountpoint -q /backup || die "/backup not mounted"
+  [ -f "$CLEAN_FILTER" ] || die "Missing cleanup filter: $CLEAN_FILTER"
+  [ -r "$CLEAN_FILTER" ] || die "Cleanup filter not readable"
+  (( DO_RM )) || need gio
+}
+
+# Build candidate list by expanding each '- pattern' as a glob under $ROOT.
+build_candidates() {
+  local tmp=/tmp/clean_candidates_all_$$.txt
+  : > "$tmp"
+  shopt -s nullglob dotglob globstar
+
+  while IFS= read -r line; do
+    # keep only lines that start with '-' (exclude patterns)
+    # ignore comments and blank lines
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    # strip leading "- " and whitespace
+    local pat="${line#*- }"; pat="${pat#"${pat%%[![:space:]]*}"}"
+    [[ -z "$pat" ]] && continue
+    # anchor to ROOT
+    local glob
+    if [[ "$pat" == /* ]]; then
+      glob="$ROOT$pat"
+    else
+      glob="$ROOT/$pat"
+    fi
+    # expand the glob (handles spaces)
+    while IFS= read -r m; do
+      [[ -z "$m" ]] && continue
+      [[ "$m" == "$ROOT" || "$m" != "$ROOT"* ]] && continue
+      printf '%s\n' "$m" >> "$tmp"
+    done < <(compgen -G "$glob" || true)
+  done < "$CLEAN_FILTER"
+
+  # Deduplicate and prune children if parent is already present
+  sort -u "$tmp" |
+  awk '{
+    paths[NR]=$0; lens[NR]=length($0)
+  } END {
+    n=NR
+    for(i=1;i<=n;i++) idx[i]=i
+    for(i=1;i<=n;i++) for(j=i+1;j<=n;j++) if(lens[idx[i]]>lens[idx[j]]) {t=idx[i]; idx[i]=idx[j]; idx[j]=t}
+    keepc=0
+    for(k=1;k<=n;k++){
+      p=paths[idx[k]]
+      keep=1
+      for(m=1;m<=keepc;m++){
+        if (p==keepv[m] || index(p, keepv[m] "/")==1){ keep=0; break }
+      }
+      if(keep){ keepv[++keepc]=p }
+    }
+    for(m=1;m<=keepc;m++) print keepv[m]
+  }' > /tmp/clean_candidates_$$.txt
+
+  # null-delimited for safe iteration
+  tr '\n' '\0' < /tmp/clean_candidates_$$.txt > /tmp/clean_candidates_$$.nul
+}
+
+summary() {
+  local total=0 count=0 path sz
+  while IFS= read -r -d '' path; do
+    if [ -d "$path" ]; then
+      sz=$(du -sb --apparent-size -- "$path" 2>/dev/null | awk '{print $1}')
+    else
+      sz=$(stat -c %s -- "$path" 2>/dev/null || echo 0)
+    fi
+    total=$(( total + sz ))
+    count=$(( count + 1 ))
+  done < /tmp/clean_candidates_$$.nul
+  echo "$count" "$total"
+}
+
+prompt() {
+  canon() { printf '%s' "$1" | sed 's:/*$::'; }   # strip trailing slashes
+  local dev; dev="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$ROOT" 2>/dev/null || true)"
+  local count bytes; read -r count bytes < <(summary)
+  echo "================ CLEAN PREVIEW ================"
+  echo "ROOT : $ROOT  ($dev)"
+  echo "RULE : $CLEAN_FILTER"
+  echo "Would purge: $count items  reclaim ~$(hr "$bytes")"
+  if (( DO_RM )); then
+    echo "Delete mode : PERMANENT (no Trash)"
+  else
+    echo "Trash bucket: $(trash_bucket)"
+  fi
+  echo "Sample:"
+  tr '\0' '\n' < /tmp/clean_candidates_$$.nul | head -n 30 | sed 's/^/  - /'
+  echo "=============================================="
+
+  # If a mode was provided, don't ask anything.
+  case "${MODE:-}" in
+    dry) echo "[DRY MODE] Skipping confirmation."; return ;;
+    yes) echo "[AUTO YES] Proceeding without prompt."; return ;;
+  esac
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+
+  read -rp "Type EXACT ROOT path to confirm, or 'd' dry, 'n' abort: " ans
+  case "$ans" in
+    n|N) exit 0;;
+    d|D) MODE="dry";;
+    *)
+      [ "$(canon "$ans")" = "$(canon "$ROOT")" ] || die "Confirmation mismatch"
+      MODE="yes"
+      ;;
+  esac
+}
+
+do_clean() {
+  if [ "$MODE" = "dry" ]; then
+    echo "[DRY] Nothing deleted. See list above."
+    return
+  fi
+  local path ok=0 fail=0
+  while IFS= read -r -d '' path; do
+    if (( DO_RM )); then
+      if rm -rf --one-file-system -- "$path"; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    else
+      if gio trash -- "$path"; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    fi
+  done < /tmp/clean_candidates_$$.nul
+  echo "[✓] Clean finished. OK=$ok FAIL=$fail"
+}
+
+main() {
+  safety
+  build_candidates
+  prompt
+  do_clean
+  [ -n "${LOG:-}" ] && tr '\0' '\n' < /tmp/clean_candidates_$$.nul > "$LOG" && echo "Log: $LOG"
+  rm -f /tmp/clean_candidates_$$.nul /tmp/clean_candidates_$$.txt /tmp/clean_candidates_all_$$.txt
+  echo "Log: $LOG"
+}
+main "$@"

@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+NAME="nextcloud"
+
+# SUDO-safe HOME
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+
+# === CONFIG ===
+SRC="${USER_HOME}/Nextcloud"
+DEST_POOL="/usr/share/pool/Nextcloud"              # ZFS (local pool)
+DEST_BACK="/backup/backup-nextcloud/Nextcloud"     # ext4 (backup disk)
+GUARD_POOL="${DEST_POOL}/.backup_guard"
+GUARD_BACK="${DEST_BACK}/.backup_guard"
+LOG="/tmp/backup_${NAME}_$(date +%Y%m%d_%H%M%S).log"
+LOCK="/tmp/backup_${NAME}.lock"
+
+RSYNC_RUN=( -aH --delete --info=stats2,progress2 --no-owner --no-group --exclude='.backup_guard' )
+RSYNC_DRY=( -anv --delete --itemize-changes --no-owner --no-group --exclude='.backup_guard' )
+
+# === ARGS ===
+MODE="" AUTO=0 USE_LOCK=1
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes" ;;
+    -n|--dry|--dry-run) MODE="dry" ;;
+    --auto) AUTO=1 ;;
+    --no-lock) USE_LOCK=0 ;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run] [-y|--yes] [--auto] [--no-lock]
+  -n, --dry-run   Dry-run only (no writes)
+  -y, --yes       Perform real sync
+  --auto          Non-interactive (must be combined with -n or -y)
+  --no-lock       Skip single-instance lock (not recommended)
+EOF
+      exit 0;;
+    *) echo "ERROR: Unknown arg: $1" >&2; exit 1;;
+  esac; shift
+done
+
+# === UTILS ===
+die(){ echo "ERROR: $*" >&2; exit 1; }
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
+realp(){ readlink -f "$1" 2>/dev/null || echo "$1"; }
+
+lock(){
+  (( USE_LOCK )) || return 0
+  exec 9>"$LOCK" || true
+  flock -n 9 || die "Another ${NAME} run appears active (lock: $LOCK). Use --no-lock to override."
+  echo "$$" 1>&9 || true
+}
+
+prep_dest() {
+  local d="$1" g="$2" label="$3"
+  mkdir -p "$d"
+  local D; D="$(realp "$d")"
+  [ -w "$D" ] || die "Destination not writable: $D (chown to you)"
+  # refuse parent roots
+  case "$D" in
+    /backup) die "Refusing to target /backup for $label" ;;
+    /backup/backup-nextcloud) die "Refusing to target base dir for $label; must be the Nextcloud subdir" ;;
+  esac
+  if [ ! -f "$g" ]; then
+    {
+      echo "mirror target for \$HOME/Nextcloud"
+      echo "SRC=$(realp "$SRC")"
+      echo "DEST=$D"
+      echo "FSTYPE=$(findmnt -no FSTYPE --target "$D")"
+      echo "DEV=$(findmnt -no SOURCE --target "$D")"
+      echo "CREATED=$(date -Is)"
+    } > "$g"
+    chmod 644 "$g"
+  fi
+}
+
+stats_pair(){ # prints: total xfer dels free dev_str
+  local s="$1" d="$2"
+  local total xfer dels free dev
+  read -r total xfer < <( rsync -an --delete --stats --exclude='.backup_guard' --no-owner --no-group "$s/" "$d/" 2>/dev/null \
+    | awk -F': *' '/Total file size:/{gsub(/,| bytes/,"",$2);t=$2}/Total transferred file size:/{gsub(/,| bytes/,"",$2);x=$2}END{print t? t:0, x? x:0}' )
+  dels="$( rsync -an --delete --itemize-changes --exclude='.backup_guard' --no-owner --no-group "$s/" "$d/" | awk 'BEGIN{c=0} /^\*deleting /{c++} END{print c}' )"
+  free="$(avail_bytes "$d")"
+  dev="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$d" 2>/dev/null || true)"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$total" "$xfer" "$dels" "$free" "$dev"
+}
+
+sanity_checks() {
+  [ -d "$SRC" ] || die "Missing source: $SRC"
+  # mount safety for /backup
+  case "$(realp "$DEST_BACK")" in /backup/*) mountpoint -q /backup || die "/backup is not mounted";; esac
+  prep_dest "$DEST_POOL" "$GUARD_POOL" "POOL"
+  prep_dest "$DEST_BACK" "$GUARD_BACK" "BACKUP"
+
+  # Source non-empty guard
+  local c; c=$(find "$SRC" -mindepth 1 -maxdepth 1 | head -n1 | wc -l)
+  (( c > 0 )) || die "Source looks empty: $SRC (bailing to avoid destructive mirror)"
+}
+
+prompt_dual() {
+  local S D1 D2 t1 x1 d1 f1 dev1 t2 x2 d2 f2 dev2
+  S="$(realp "$SRC")"; D1="$(realp "$DEST_POOL")"; D2="$(realp "$DEST_BACK")"
+
+  IFS=$'\t' read -r t1 x1 d1 f1 dev1 < <( stats_pair "$SRC" "$DEST_POOL" )
+  IFS=$'\t' read -r t2 x2 d2 f2 dev2 < <( stats_pair "$SRC" "$DEST_BACK"  )
+
+  echo "================ NEXTCLOUD DUAL SYNC ================"
+  echo "SRC : $S"
+  echo "POOL: $D1  ($dev1)"
+  echo "      total=$(hr "$t1")  xfer~=$(hr "$x1")  free=$(hr "$f1")  deletes~$d1"
+  echo "BACK: $D2  ($dev2)"
+  echo "      total=$(hr "$t2")  xfer~=$(hr "$x2")  free=$(hr "$f2")  deletes~$d2"
+  echo "CMDs (in order):"
+  echo "  rsync ${RSYNC_RUN[*]} \"$S/\" \"$D1/\""
+  echo "  rsync ${RSYNC_RUN[*]} \"$S/\" \"$D2/\""
+  (( x1 > f1 )) && echo "[warn] POOL: estimated transfer exceeds free space"
+  (( x2 > f2 )) && echo "[warn] BACK: estimated transfer exceeds free space"
+  echo "====================================================="
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+  read -rp "Type BOTH DEST paths (space-separated) to confirm, or 'd' dry, 'n' abort: " A B
+  case "$A" in
+    n|N) exit 0 ;;
+    d|D) MODE="dry" ;;
+    *)
+      [ "$A" = "$D1" ] && [ "$B" = "$D2" ] || die "Confirmation mismatch. Aborting."
+      MODE="yes"
+      ;;
+  esac
+}
+
+run_one() {
+  local s="$1" d="$2" label="$3"
+  if [ "$MODE" = "dry" ]; then
+    echo "[*] DRY → $label"
+    rsync "${RSYNC_DRY[@]}" "$s/" "$d/" | tee -a "$LOG"
+  else
+    echo "[*] SYNC → $label"
+    ionice -c2 -n7 nice -n 19 rsync "${RSYNC_RUN[@]}" "$s/" "$d/" | tee -a "$LOG"
+  fi
+}
+
+main(){ lock; sanity_checks; prompt_dual; run_one "$SRC" "$DEST_POOL" "POOL"; run_one "$SRC" "$DEST_BACK" "BACKUP"; echo "[✓] Done. Log: $LOG"; }
+main "$@"
