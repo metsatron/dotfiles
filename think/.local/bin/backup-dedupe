@@ -1,26 +1,35 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
-# === CONFIG ===
 NAME="dedupe"
 LOG="/tmp/backup_${NAME}_$(date +%Y%m%d_%H%M%S).log"
-ROOT="" MODE="" AUTO=0 ALLOW_XFS=0 BACKEND=""
 
-usage() {
-  cat <<EOF
+ROOT="" MODE="" AUTO=0 ALLOW_XFS=0 BACKEND="" BACKEND_BIN="" CZK_MODE="v10+"
+HASH=BLAKE3
+THREADS=0
+FORCE_SUDO=auto   # auto|always|never
+
+usage(){ cat <<EOF
 Usage: $(basename "$0") --root PATH [-n|--dry-run|-y|--yes] [--auto] [--allow-crossfs]
 Safely hardlink duplicate files under PATH (single filesystem by default).
 
 Options:
-  --root PATH          Parent directory to deduplicate (e.g. /backup/backup-games/Games)
-  -n, --dry-run        Preview only (no modifications)
-  -y, --yes            Real run
+  --root PATH          Directory to dedupe
+  -n, --dry-run        Preview (no writes)
+  -y, --yes            Real run (perform hardlinks)
   --auto               Non-interactive (must combine with -n or -y)
-  --allow-crossfs      Allow deduping across nested mounts (default: refuse)
+  --allow-crossfs      Allow nested mounts under ROOT
+  --sudo               Force sudo even if ROOT seems writable
+  --no-sudo            Never use sudo
 EOF
 }
 
-# === ARGS ===
+die(){ echo "ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+log(){ printf '%s\n' "$*" | tee -a "$LOG"; }
+abspath_of(){ command -v "$1"; }
+
+# ---------- args ----------
 while (($#)); do
   case "$1" in
     --root) ROOT="${2:?}"; shift;;
@@ -28,80 +37,192 @@ while (($#)); do
     -y|--yes) MODE="yes";;
     --auto) AUTO=1;;
     --allow-crossfs) ALLOW_XFS=1;;
+    --sudo) FORCE_SUDO="always";;
+    --no-sudo) FORCE_SUDO="never";;
     -h|--help) usage; exit 0;;
     *) echo "Unknown: $1" >&2; usage; exit 1;;
   esac; shift
 done
-[ -n "$ROOT" ] || { echo "ERROR: --root required" >&2; usage; exit 1; }
+[ -n "$ROOT" ] || die "--root required"
 
-die(){ echo "ERROR: $*" >&2; exit 1; }
-have(){ command -v "$1" >/dev/null 2>&1; }
-hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
-
-# === BACKEND DETECT ===
-pick_backend() {
-  if have czkawka_cli; then BACKEND="czkawka"; return; fi
-  if have jdupes; then BACKEND="jdupes"; return; fi
-  if have rdfind; then BACKEND="rdfind"; return; fi
+# ---------- backend detect ----------
+pick_backend(){
+  if have czkawka_cli; then
+    BACKEND="czkawka"
+    BACKEND_BIN="$(abspath_of czkawka_cli)"
+    if czkawka_cli dup --help 2>/dev/null | grep -q -- '--delete-method'; then
+      CZK_MODE="v10+"
+    else
+      CZK_MODE="legacy"
+    fi
+    return
+  fi
+  if have jdupes; then BACKEND="jdupes"; BACKEND_BIN="jdupes"; return; fi
+  if have rdfind;  then BACKEND="rdfind"; BACKEND_BIN="rdfind"; return; fi
   die "No czkawka_cli/jdupes/rdfind on PATH"
 }
 
-# === SAFETY ===
-safety() {
+# ---------- safety ----------
+safety(){
   [ -d "$ROOT" ] || die "No such dir: $ROOT"
-  case "$ROOT" in /|/backup|/usr/share/pool) die "Refusing to target a base root: $ROOT" ;; esac
-  # filesystem check
+  case "$ROOT" in /|/backup|/usr/share/pool) die "Refusing to target base root: $ROOT";; esac
   local count
   count=$(findmnt --noheadings --submounts --target "$ROOT" | wc -l | tr -d ' ')
   if [ "$count" -gt 1 ] && [ "$ALLOW_XFS" -eq 0 ]; then
-    die "Nested mounts under $ROOT detected. Re-run with --allow-crossfs if intentional."
+    die "Nested mounts under $ROOT detected. Use --allow-crossfs if intentional."
   fi
-  # writability (we need to replace files with hardlinks)
-  [ -w "$ROOT" ] || echo "[warn] $ROOT not writable by $(id -un). Some items may fail." >&2
 }
 
-# === PREVIEW ===
-preview() {
+# ---------- sudo helpers ----------
+SUDO=""
+start_sudo_keepalive(){
+  [ "${MODE:-}" = "dry" ] && return 0
+  SUDO="sudo"
+  sudo -v || true
+  ( while true; do sleep 120; sudo -n true || exit; done ) 2>/dev/null &
+  SUDO_KEEPALIVE_PID=$!
+  trap 'kill ${SUDO_KEEPALIVE_PID:-0} 2>/dev/null || true' EXIT
+}
+need_sudo(){
+  case "$FORCE_SUDO" in
+    always) return 0;;
+    never)  return 1;;
+    auto)   [ -w "$ROOT" ] && return 1 || return 0;;
+  esac
+}
+
+# ---------- stats ----------
+fmt_bytes(){ numfmt --to=iec --suffix=B <<<"${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+saved_bytes(){
+  set +e +o pipefail
+  sudo find "$ROOT" -xdev -type f -printf '%i %n %s\n' 2>/dev/null \
+  | awk '{L[$1]=$2; S[$1]=$3} END{for(i in L) if(L[i]>1) saved+=(L[i]-1)*S[i]; print saved+0}'
+  local rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+  [ $rc -eq 0 ] || true
+}
+count_hardlink_files(){
+  set +e +o pipefail
+  sudo find "$ROOT" -xdev -type f -links +1 -printf . 2>/dev/null | wc -c
+  local rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+  [ $rc -eq 0 ] || true
+}
+show_top_sets(){
+  local N="${1:-20}"
+  set +e +o pipefail
+  sudo find "$ROOT" -xdev -type f -printf '%i\t%n\t%s\t%p\n' 2>/dev/null \
+  | awk '{ ino=$1;n=$2;s=$3;p=$4; if(!(f[ino])) f[ino]=p; sz[ino]=s; ln[ino]=n }
+         END{ for(i in ln) if(ln[i]>1) printf "%s\tlinks=%d\tsize=%d\tsaved=%d\n",f[i],ln[i],sz[i],(ln[i]-1)*sz[i] }' \
+  | sort -k4,4nr -k2,2nr | head -"$N" \
+  | awk -F'\t' '{ cmd=sprintf("numfmt --to=iec --suffix=B <<< %s",$3); cmd|getline sz; close(cmd);
+                  cmd=sprintf("numfmt --to=iec --suffix=B <<< %s",$4); cmd|getline sv; close(cmd);
+                  printf "• %s  (links=%s, size=%s, saved=%s)\n",$1,gensub(/links=/,"","g",$2),sz,sv }'
+  set -e -o pipefail
+}
+
+# ---------- preview ----------
+preview(){
   echo "============== DEDUPE PREVIEW =============="
-  echo "ROOT : $ROOT  ($(findmnt -no SOURCE,TARGET,FSTYPE --target "$ROOT" 2>/dev/null || true))"
-  echo "TOOL : $BACKEND"
+  echo -n "ROOT : $ROOT  "; findmnt -no SOURCE,TARGET,FSTYPE --target "$ROOT" 2>/dev/null || true
+  echo "TOOL : $BACKEND ($BACKEND_BIN)"
+  local dry real
   case "$BACKEND" in
     czkawka)
-      echo "CMD  : czkawka_cli dup -d \"$ROOT\""
+      dry="$BACKEND_BIN dup -d $ROOT -t $HASH --thread-number $THREADS"
+      if [ "$CZK_MODE" = "v10+" ]; then
+        real="$BACKEND_BIN dup -d $ROOT -t $HASH --thread-number $THREADS --allow-hard-links --delete-method HARD"
+      else
+        real="$BACKEND_BIN dup -d $ROOT -t $HASH --thread-number $THREADS --hardlink"
+      fi
       ;;
     jdupes)
-      echo "CMD  : jdupes -r \"$ROOT\""
+      dry="jdupes -r $ROOT"
+      real="jdupes -rL $ROOT"
       ;;
     rdfind)
-      echo "CMD  : rdfind \"$ROOT\""
+      dry="rdfind -makeresultsfile false -dryrun true $ROOT"
+      real="rdfind -makeresultsfile false -makehardlinks true $ROOT"
       ;;
   esac
+  if need_sudo; then real="sudo $real"; fi
+  echo "DRY  : $dry"
+  echo "REAL : $real"
   echo "============================================"
 }
 
-# === RUN ===
-run_dry() {
+# ---------- runs ----------
+run_dry(){
+  local hl_before sb_before
+  hl_before=$(count_hardlink_files)
+  sb_before=$(saved_bytes)
+  log "[DRY] existing hardlinked files : $hl_before"
+  log "[DRY] existing logical saved    : $(fmt_bytes "$sb_before")"
   case "$BACKEND" in
-    czkawka)  czkawka_cli dup -d "$ROOT" | tee "$LOG" ;;
-    jdupes)   jdupes -r "$ROOT" | tee "$LOG" ;;    # lists duplicate groups
-    rdfind)   rdfind -makeresultsfile false -dryrun true "$ROOT" | tee "$LOG" ;;
+    czkawka) "$BACKEND_BIN" dup -d "$ROOT" -t "$HASH" --thread-number "$THREADS" | tee -a "$LOG" ;;
+    jdupes)  jdupes -r "$ROOT" | tee -a "$LOG" ;;
+    rdfind)  rdfind -makeresultsfile false -dryrun true "$ROOT" | tee -a "$LOG" ;;
   esac
-  echo "[DRY] No changes. Log: $LOG"
+  log "[DRY] No changes."
 }
 
-run_real() {
+run_real(){
+  if need_sudo; then start_sudo_keepalive; SUDO=sudo; fi
+  log "[run] hashing & linking… (log: $LOG)"
+
+  local hl_before sb_before
+  hl_before=$(count_hardlink_files)
+  sb_before=$(saved_bytes)
+
+  local rc=0
   case "$BACKEND" in
-    czkawka)  ionice -c2 -n7 nice -n 19 czkawka_cli dup -d "$ROOT" --hardlink | tee "$LOG" ;;
-    jdupes)   ionice -c2 -n7 nice -n 19 jdupes -rL "$ROOT" | tee "$LOG" ;;
-    rdfind)   ionice -c2 -n7 nice -n 19 rdfind -makeresultsfile false -makehardlinks true "$ROOT" | tee "$LOG" ;;
+    czkawka)
+      if [ "$CZK_MODE" = "v10+" ]; then
+        set +e
+        $SUDO ionice -c2 -n7 nice -n 19 "$BACKEND_BIN" dup -d "$ROOT" -t "$HASH" --thread-number "$THREADS" \
+             --allow-hard-links --delete-method HARD | tee -a "$LOG"
+        rc=${PIPESTATUS[0]}; set -e
+      else
+        set +e
+        $SUDO ionice -c2 -n7 nice -n 19 "$BACKEND_BIN" dup -d "$ROOT" -t "$HASH" --thread-number "$THREADS" \
+             --hardlink | tee -a "$LOG"
+        rc=${PIPESTATUS[0]}; set -e
+      fi
+      ;;
+    jdupes) set +e; $SUDO jdupes -rL "$ROOT" | tee -a "$LOG"; rc=${PIPESTATUS[0]}; set -e ;;
+    rdfind) set +e; $SUDO rdfind -makeresultsfile false -makehardlinks true "$ROOT" | tee -a "$LOG"; rc=${PIPESTATUS[0]}; set -e ;;
   esac
-  echo "[✓] Completed. Log: $LOG"
+  [ $rc -eq 0 ] || log "[warn] backend exited with code $rc"
+
+  # ----- FINAL SUMMARY (always) -----
+  local hl_after sb_after delta_hl delta_sb
+  hl_after=$(count_hardlink_files)
+  sb_after=$(saved_bytes)
+  delta_hl=$(( hl_after - hl_before ))
+  delta_sb=$(( sb_after - sb_before ))
+
+  log "-------------- RESULT SUMMARY --------------"
+  log "Hardlinked files before : $hl_before"
+  log "Hardlinked files after  : $hl_after"
+  log "Delta (files)           : $delta_hl"
+  log "Logical saved before    : $(fmt_bytes "$sb_before")"
+  log "Logical saved after     : $(fmt_bytes "$sb_after")"
+  log "Delta (saved)           : $(fmt_bytes "$delta_sb")"
+
+  if [ "$delta_hl" -eq 0 ] && [ "$delta_sb" -eq 0 ]; then
+    log "No new duplicates were hard-linked (either none found or already deduped)."
+  else
+    log ""
+    log "Top hard-linked sets (by saved size):"
+    show_top_sets 20 | tee -a "$LOG"
+  fi
+
+  log "[✓] Completed. Log: $LOG"
 }
 
-confirm() {
+confirm(){
   if (( AUTO )); then
-    [ -n "$MODE" ] || die "--auto requires -n or -y"
-    return
+    [ -n "$MODE" ] || die "--auto requires -n or -y"; return
   fi
   read -rp "Type EXACT ROOT to confirm, or 'd' dry, 'n' abort: " ans
   case "$ans" in
@@ -111,11 +232,13 @@ confirm() {
   esac
 }
 
-main() {
+main(){
   pick_backend
   safety
   preview
   confirm
-  if [ "$MODE" = "dry" ]; then run_dry; else run_real; fi
+  log "[log] writing to: $LOG"
+  if [ "${MODE:-}" = "dry" ]; then run_dry; else run_real; fi
 }
+
 main "$@"
