@@ -1,0 +1,247 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# ===== Defaults / flags =====
+MODE="" AUTO=0 DO_PIP_USER=0 CARGO_UP_ALL=0
+FLATPAK_FIX=1 FLATPAK_UNPIN=0
+NPM_MODE="user"   # user|root|auto|skip (default: user)
+
+# ===== Arg parsing (single block) =====
+while (($#)); do
+  case "$1" in
+    -n|--dry|--dry-run)           MODE="dry" ;;
+    -y|--yes)                     MODE="yes" ;;
+    --auto)                       AUTO=1 ;;
+    --pip-user)                   DO_PIP_USER=1 ;;
+    --cargo-upgrade-all)          CARGO_UP_ALL=1 ;;
+    --npm-mode)                   NPM_MODE="${2:?auto|user|root|skip}"; shift ;;
+    --flatpak-no-fix)             FLATPAK_FIX=0 ;;
+    --flatpak-unpin)              FLATPAK_UNPIN=1 ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: pkg-update-all [-n|--dry-run] [-y|--yes] [--auto]
+                      [--pip-user] [--cargo-upgrade-all]
+                      [--npm-mode auto|user|root|skip]
+                      [--flatpak-no-fix] [--flatpak-unpin]
+
+Defaults:
+  - Nala/Apt/Snap/Flatpak: pretty TTY via `script` + full log
+  - Flatpak: preflight fixes runtimes (ON); optional unpin (OFF)
+  - NPM: user (fnm-managed Node); switch with --npm-mode
+  - Cargo: list only; --cargo-upgrade-all to rebuild
+  - pip user-site: OFF; enable with --pip-user
+EOF
+      exit 0 ;;
+    *) echo "ERROR: Unknown arg: $1" >&2; exit 1 ;;
+  esac
+  shift
+done
+
+# ===== Helpers =====
+die(){ echo "ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+npm_is_root() {
+  local pfx bin
+  pfx="$(npm config get prefix 2>/dev/null || true)"
+  bin="$(command -v npm 2>/dev/null || true)"
+  [[ "$pfx" == "/usr/local" || "$bin" == "/usr/local/bin/npm" ]]
+}
+
+LOG="/tmp/pkg_update_all_$(date +%Y%m%d_%H%M%S).log"
+touch "$LOG" || true
+
+run_tty() {  # preserve UI (Nala/Flatpak) and log
+  local cmd="$*"
+  echo "+ $cmd"
+  [ "${MODE:-}" = "dry" ] && return 0
+  script -q -a "$LOG" -c "$cmd"
+}
+
+run_pipe() {
+  local cmd="$*"
+  echo "+ $cmd"
+  [ "${MODE:-}" = "dry" ] && return 0
+  eval "$cmd" | tee -a "$LOG"
+}
+
+# Run a whole batch in ONE sudo PTY (reduces re-prompts)
+run_sudo_block() {
+  local block="$*"
+  echo "+ (sudo block) $block"
+  [ "${MODE:-}" = "dry" ] && return 0
+  script -q -a "$LOG" -c "sudo bash -lc '$block'"
+}
+
+# ===== Detection (NO sudo here) =====
+echo "=== Detected managers ==="
+det=()
+if have nala; then det+=("nala"); elif have apt; then det+=("apt"); fi
+have snap    && det+=("snap")
+have flatpak && det+=("flatpak")
+have pipx    && det+=("pipx")
+[ "$DO_PIP_USER" -eq 1 ] && have python3 && det+=("pip(user)")
+( have rustup || have cargo ) && det+=("rustup/cargo")
+have npm     && det+=("npm")
+echo "${det[*]:-(none)}"
+[ "${#det[@]}" -eq 0 ] && { echo "Nothing to do."; exit 0; }
+
+# ===== Confirm =====
+if (( ! AUTO )); then
+  read -rp "Proceed? [y/N] " ans
+  case "${ans,,}" in y|yes) :;; *) echo "Aborted."; exit 0;; esac
+else
+  [ -n "${MODE:-}" ] || die "--auto requires -n or -y"
+fi
+
+# ===== Decide if we actually need sudo this run =====
+SUDO_NEEDED=0
+if have nala || have apt || have snap; then
+  SUDO_NEEDED=1
+elif have flatpak; then
+  # We'll touch --system: remote-add/update/cleanup
+  SUDO_NEEDED=1
+fi
+
+# ===== Sudo keep-alive (AFTER confirm, ONLY if needed) =====
+if (( SUDO_NEEDED )) && command -v sudo >/dev/null 2>&1 && [ "${MODE:-}" != "dry" ]; then
+  # one upfront prompt
+  sudo -v
+  # keep alive during the session
+  ( while true; do sleep 45; sudo -n true || exit; done ) 2>/dev/null &
+  SUDO_KEEPALIVE_PID=$!
+  trap 'kill ${SUDO_KEEPALIVE_PID:-0} 2>/dev/null || true' EXIT
+fi
+
+# ===== Nala/Apt (one sudo block) =====
+if have nala; then
+  run_sudo_block 'nala full-upgrade -y; nala autoremove --purge -y'
+elif have apt; then
+  run_sudo_block 'apt update; apt -y full-upgrade; apt -y autoremove --purge'
+fi
+
+# ===== Snap =====
+if have snap; then
+  run_pipe "snap refresh --list"
+  run_sudo_block "snap refresh"
+fi
+
+# ===== Flatpak (explicit system + user) =====
+if have flatpak; then
+  # Ensure remotes exist in both scopes (system via sudo, user without)
+  run_sudo_block 'flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo'
+  run_tty        'flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo'
+
+  # Optional preflight: ensure required runtimes are present
+  if [ "$FLATPAK_FIX" -eq 1 ] && [ "${MODE:-}" != "dry" ]; then
+    # Collect required runtimes (read-only; no sudo needed to list)
+    sys_reqs="$(flatpak list --system --app --columns=runtime 2>/dev/null | awk 'NF' | sort -u || true)"
+    usr_reqs="$(flatpak list --user   --app --columns=runtime 2>/dev/null | awk 'NF' | sort -u || true)"
+
+    # Convert runtime org.Foo.Platform/x86_64/47 -> install ref org.Foo.Platform//47
+    to_refs() { awk -F/ '{print $1"//"$NF}' | sort -u; }
+    sys_refs="$(printf '%s\n' "$sys_reqs" | to_refs)"
+    usr_refs="$(printf '%s\n' "$usr_reqs" | to_refs)"
+
+    # Install in batches; suppress control codes with TERM=dumb
+    if [ -n "$sys_refs" ]; then
+      run_sudo_block "env TERM=dumb flatpak install -y --system flathub $sys_refs || true"
+    fi
+    if [ -n "$usr_refs" ]; then
+      run_pipe      "env TERM=dumb flatpak install -y --user   flathub $usr_refs || true"
+    fi
+
+    # Pins & optional unpin
+    run_pipe "flatpak pin || true"
+    if [ "$FLATPAK_UNPIN" -eq 1 ]; then
+      run_pipe "flatpak pin --remove runtime/org.gnome.Platform/x86_64/43 || true"
+      run_pipe "flatpak pin --remove runtime/org.gnome.Platform/x86_64/45 || true"
+    fi
+  fi
+
+  # Updates + cleanup (both scopes). System in one sudo block; user pretty.
+  if [ "${MODE:-}" = "dry" ]; then
+    run_pipe 'flatpak remote-ls --updates --system || true'
+    run_pipe 'flatpak remote-ls --updates --user   || true'
+  else
+    run_sudo_block 'flatpak update -y --system; flatpak uninstall -y --unused --system || true'
+    run_tty       'flatpak update -y --user'
+    run_tty       'flatpak uninstall -y --unused --user || true'
+  fi
+fi
+
+# ===== pipx =====
+if have pipx; then
+  if [ "${MODE:-}" = "dry" ]; then
+    run_pipe "pipx list --outdated"
+  else
+    run_tty  "pipx upgrade-all"
+  fi
+fi
+
+# ===== pip (user-site, opt-in) =====
+if [ "$DO_PIP_USER" -eq 1 ] && have python3; then
+  if [ "${MODE:-}" = "dry" ]; then
+    run_pipe "python3 -m pip list --user --outdated"
+  else
+    run_tty  "bash -lc 'python3 -m pip list --user --outdated --format=freeze | cut -d= -f1 | xargs -r -n1 python3 -m pip install --user -U'"
+  fi
+fi
+
+# ===== rustup / cargo =====
+if have rustup; then
+  if [ "${MODE:-}" = "dry" ]; then
+    run_pipe "rustup show"
+  else
+    run_pipe  "rustup self update || true"   # simple pipe output is fine here
+    run_tty   "rustup update"                # pretty progress
+  fi
+fi
+if have cargo; then
+  if [ "$CARGO_UP_ALL" -eq 1 ]; then
+    if [ "${MODE:-}" = "dry" ]; then
+      run_pipe "cargo install --list"
+    else
+      run_tty "bash -lc 'cargo install --list | sed -n \"s/^\([^ ]\\+\\) v.*/\\1/p\" | xargs -r -n1 cargo install --force'"
+    fi
+  else
+    run_pipe "cargo install --list"
+  fi
+fi
+
+# ===== npm (fnm-managed Node recommended) =====
+if have npm; then
+  case "$NPM_MODE" in
+    skip) : ;;
+    root)
+      if [ "${MODE:-}" = "dry" ]; then
+        run_pipe "sudo npm -g outdated --depth=0 || true"
+      else
+        run_tty  "sudo npm -g update || true"
+      fi
+      ;;
+    auto)
+      if npm_is_root; then
+        if [ "${MODE:-}" = "dry" ]; then
+          run_pipe "sudo npm -g outdated --depth=0 || true"
+        else
+          run_tty  "sudo npm -g update || true"
+        fi
+      else
+        if [ "${MODE:-}" = "dry" ]; then
+          run_pipe "npm -g outdated --depth=0 || true"
+        else
+          run_tty  "npm -g update || true"
+        fi
+      fi
+      ;;
+    user|*)
+      if [ "${MODE:-}" = "dry" ]; then
+        run_pipe "npm -g outdated --depth=0 || true"
+      else
+        run_tty  "npm -g update || true"
+      fi
+      ;;
+  esac
+fi
+
+echo "[✓] Finished. Log: $LOG"
