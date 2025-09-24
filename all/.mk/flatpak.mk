@@ -30,3 +30,20 @@ flatpak-sync: flatpak-remotes
 flatpak-apply: flatpak-remotes
 | @chmod +x $(HOME)/.local/bin/flatpak-apply 2>/dev/null || true
 | ENFORCE=${ENFORCE} UNINSTALL=${UNINSTALL} FORCE_SUDO_SYSTEM=${FORCE_SUDO_SYSTEM} $(HOME)/.local/bin/flatpak-apply
+
+# Flatpak bridge
+bridge-flatpak: tangle stow
+| if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge" ]; then \
+|   "$(HOME)/.local/bin/flatpak-desktop-bridge"; \
+| else \
+|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge. Tangle and stow first."; \
+|   exit 1; \
+| fi
+
+bridge-flatpak-reset:
+| if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge-reset" ]; then \
+|   "$(HOME)/.local/bin/flatpak-desktop-bridge-reset"; \
+| else \
+|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge-reset. Tangle and stow first."; \
+|   exit 1; \
+| fi
