@@ -45,3 +45,5 @@ alias mkhttp="python3 -m http.server"
 alias json="python3 -m json.tool"
 alias perms="stat -c '%A %a %n'"
 alias neofetch="neofetch --ascii ~/.local/share/neofetch/CoplandOS.neofetch --ascii_colors 6 4"
+alias vi='nvim'
+alias vim='nvim'
