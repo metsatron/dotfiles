@@ -18,6 +18,6 @@
    "moreutils"
    "gimp"
    "appmenu-gtk-module"
-   "maak"
+   "maak" "guile"
    ))
 ;; User profile manifests:1 ends here
