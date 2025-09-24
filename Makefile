@@ -1,5 +1,4 @@
 # -*- mode: makefile-gmake; indent-tabs-mode: t; tab-width: 8 -*-
-# Recipes use '|' instead of a literal TAB (GNU Make 3.82+).
 .RECIPEPREFIX := |
 
 EMACS ?= emacs
@@ -9,11 +8,11 @@ GUIX ?= guix
 GUIX_HOME := $(HOME)/.config/guix
 EXTRA := $(HOME)/.guix-extra-profiles
 
-# --- Stow packages you normally manage here ---
+# Stow packages you normally manage here
 STOW_PKGS ?= all linux debian think
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
-        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset
+        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow
 
 EMACS_BATCH = $(EMACS) --batch -Q \
   --eval "(setq create-lockfiles nil make-backup-files nil auto-save-default nil backup-inhibited t vc-make-backup-files nil)"
@@ -28,18 +27,18 @@ guix-dirs:
 | @chmod +x $(HOME)/.local/bin/guix-mkdirs 2>/dev/null || true
 | @$(HOME)/.local/bin/guix-mkdirs
 
-# keep profiles dirs around and keep manifests fresh
+# all = toc → tangle → guix-dirs only
 all: toc tangle guix-dirs
 
 guix-pull:
 | $(GUIX) pull
 
-# make sure manifests are freshly tangled BEFORE we build the profile
+# Build core profile from manifest after tangling
 guix-core: tangle guix-dirs
 | mkdir -p $(EXTRA)/core
 | $(GUIX) package -m $(GUIX_HOME)/manifests/core.scm -p $(EXTRA)/core/core
 
-# dev depends on core being up-to-date
+# Dev depends on core
 guix-dev: guix-core
 | mkdir -p $(EXTRA)/dev
 | $(GUIX) package -m $(GUIX_HOME)/manifests/dev.scm -p $(EXTRA)/dev/dev
@@ -47,14 +46,11 @@ guix-dev: guix-core
 guix-gc:
 | $(GUIX) gc
 
-
-# ---------- Stow helpers ----------
-# Plain stow (no auto-backups). Use when you’re sure targets are symlinks or absent.
+# Plain stow
 stow:
 | cd $(HOME)/.dotfiles && stow $(STOW_PKGS)
 
-# Safe stow: pre-backup any real files that would be replaced by stow.
-# Looks for “existing target is neither a link nor a directory” and backs those up.
+# Safe stow with timestamped backups of real files
 safe-stow:
 | cd $(HOME)/.dotfiles && \
 | for pkg in $(STOW_PKGS); do \
@@ -68,21 +64,20 @@ safe-stow:
 |   stow $$pkg; \
 | done
 
+preview-stow:
+| cd $(HOME)/.dotfiles && stow -n $(STOW_PKGS) || true
 
-# ---------- X11 ----------
-# Rebuild and stow X11 config (e.g. think/.xsessionrc). Uses normal stow to keep it managed.
+# X11 apply for think overlay
 x11-apply: tangle
 | cd $(HOME)/.dotfiles && stow think
-| @echo "✅ X11 applied (think/.xsessionrc now managed via stow)."
+| @echo "✅ X11 applied."
 
-
-# ---------- Flatpak Bridge ----------
-# Apply the repo-versioned bridge (fonts + cursors, dynamic). Idempotent.
+# Flatpak bridge
 bridge-flatpak: tangle stow
 | if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge" ]; then \
 |   "$(HOME)/.local/bin/flatpak-desktop-bridge"; \
 | else \
-|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge. Tangle/stow your scripts first."; \
+|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge. Tangle and stow first."; \
 |   exit 1; \
 | fi
 
@@ -90,6 +85,6 @@ bridge-flatpak-reset:
 | if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge-reset" ]; then \
 |   "$(HOME)/.local/bin/flatpak-desktop-bridge-reset"; \
 | else \
-|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge-reset. Tangle/stow your scripts first."; \
+|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge-reset. Tangle and stow first."; \
 |   exit 1; \
 | fi
