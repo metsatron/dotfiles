@@ -23,28 +23,8 @@ toc:
 tangle:
 | $(EMACS_BATCH) --eval '(load-file "$(SCRIPT)")' --eval '(dotfiles-batch-tangle "$(ROOT)")'
 
-guix-dirs:
-| @chmod +x $(HOME)/.local/bin/guix-mkdirs 2>/dev/null || true
-| @$(HOME)/.local/bin/guix-mkdirs
-
 # all = toc → tangle → guix-dirs only
 all: toc tangle guix-dirs
-
-guix-pull:
-| $(GUIX) pull
-
-# Build core profile from manifest after tangling
-guix-core: tangle guix-dirs
-| mkdir -p $(EXTRA)/core
-| $(GUIX) package -m $(GUIX_HOME)/manifests/core.scm -p $(EXTRA)/core/core
-
-# Dev depends on core
-guix-dev: guix-core
-| mkdir -p $(EXTRA)/dev
-| $(GUIX) package -m $(GUIX_HOME)/manifests/dev.scm -p $(EXTRA)/dev/dev
-
-guix-gc:
-| $(GUIX) gc
 
 # Plain stow
 stow:
@@ -71,20 +51,3 @@ preview-stow:
 x11-apply: tangle
 | cd $(HOME)/.dotfiles && stow think
 | @echo "✅ X11 applied."
-
-# Flatpak bridge
-bridge-flatpak: tangle stow
-| if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge" ]; then \
-|   "$(HOME)/.local/bin/flatpak-desktop-bridge"; \
-| else \
-|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge. Tangle and stow first."; \
-|   exit 1; \
-| fi
-
-bridge-flatpak-reset:
-| if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge-reset" ]; then \
-|   "$(HOME)/.local/bin/flatpak-desktop-bridge-reset"; \
-| else \
-|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge-reset. Tangle and stow first."; \
-|   exit 1; \
-| fi

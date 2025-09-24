@@ -54,6 +54,46 @@
            0))
    ))
 
+(define (mk-guix cmd) (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/guix.mk " cmd)))
+
+(define tasks
+  (append tasks
+          (list
+           (task 'guix:dirs "Ensure ancillary Guix directories"
+                 (lambda () (mk-guix "guix-dirs")))
+           (task 'guix:pull "guix pull"
+                 (lambda () (mk-guix "guix-pull")))
+           (task 'guix:core "Build core profile from manifest"
+                 (lambda () (mk-guix "guix-core")))
+           (task 'guix:dev "Build dev profile (depends on core)"
+                 (lambda () (mk-guix "guix-dev")))
+           (task 'guix:gc "guix gc"
+                 (lambda () (mk-guix "guix-gc")))
+           )))
+
+;; --- Flatpak control plane via loom ---
+(define (mk cmd) (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/flatpak.mk " cmd)))
+
+(define tasks
+  (append
+   tasks
+   (list
+    (task 'flatpak:remotes "Ensure remotes (user+system) with clean env"
+          (lambda () (mk "flatpak-remotes")))
+    (task 'flatpak:capture "Capture live apps → linux/.flatpak/manifest/apps.tsv"
+          (lambda () (mk "flatpak-capture")))
+    (task 'flatpak:diff "Plan: desired (TSV) vs installed"
+          (lambda () (mk "flatpak-diff")))
+    (task 'flatpak:sync "Additive apply (no removals)"
+          (lambda () (mk "flatpak-sync")))
+    (task 'flatpak:apply "Enforce exact match (set ENFORCE/UNINSTALL/FO... vars as needed)"
+          (lambda () (mk "flatpak-apply")))
+    (task 'flatpak:perms-capture "Capture per-app permissions/overrides"
+          (lambda () (mk "flatpak-perms-capture")))
+    (task 'flatpak:perms-apply "Apply captured permissions/overrides"
+          (lambda () (mk "flatpak-perms-apply")))
+    )))
+
 (define (run name)
   (let ((t (find (lambda (t) (eq? (task-name t) name)) tasks)))
     (if t ((task-thunk t))
