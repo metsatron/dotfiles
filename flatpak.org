@@ -1,0 +1,230 @@
+#+TITLE: Flatpak, literate and reproducible
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+OPTIONS: toc:2 num:t
+#+PROPERTY: header-args :mkdirp yes :results silent :comments both
+
+* Purpose
+This module makes Flatpak installs reproducible from your dotfiles. It uses two manifest files:
+- =linux/.flatpak/manifest/user.apps=
+- =linux/.flatpak/manifest/system.apps=
+
+Each line is =ORIGIN ID BRANCH SCOPE= with SCOPE in {user,system}. Comments and blanks are allowed.
+
+We provide:
+- a seed entry for **Flatseal** so new hosts get it by default
+- =flatpak-capture= to read the live system and write manifests
+- =flatpak-sync= to apply manifests exactly
+- =flatpak-remotes-setup= to declare nondefault remotes before sync
+- a tiny Make include with helpful targets
+
+* Seed manifests
+These are safe to keep under version control. Capture will merge new entries without removing the seed unless you choose to.
+
+#+BEGIN_SRC text :tangle linux/.flatpak/manifest/user.apps
+# origin   id                              branch   scope
+flathub    com.github.tchx84.Flatseal      stable   user    # Flatseal, baseline tool
+# Add more lines or run `make -f all/.mk/flatpak.mk flatpak-capture` to import current state.
+#+END_SRC
+
+#+BEGIN_SRC text :tangle linux/.flatpak/manifest/system.apps
+# origin   id                              branch   scope
+# Empty by default. Capture will populate if you have system installs.
+#+END_SRC
+
+* Remote setup script
+Declare any extra remotes you use before syncing apps. Idempotent and no-op if already present.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/flatpak-remotes-setup :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+# Ensure Flathub exists at both scopes
+if ! flatpak remote-list --columns=name | grep -qx flathub; then
+  flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+fi
+if ! flatpak --user remote-list --columns=name | grep -qx flathub; then
+  flatpak --user remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+fi
+
+# Your custom remotes go here. Example for "pied-origin":
+if ! flatpak remote-list --columns=name | grep -qx pied-origin; then
+  # Replace the URL with your actual remote if different
+  flatpak remote-add --if-not-exists pied-origin https://dl.flathub.org/repo/flathub.flatpakrepo >/dev/null 2>&1 || true
+  # Tip: set the real URL once known. This keeps the script idempotent even before you adjust it.
+fi
+#+END_SRC
+
+* Capture script
+Reads current apps at both scopes and writes normalized lines of =ORIGIN ID BRANCH SCOPE= into the manifest files. Keeps comments and unique entries. Does not delete the Flatseal seed line.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/flatpak-capture :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+MAN_USER="${HOME}/.dotfiles/linux/.flatpak/manifest/user.apps"
+MAN_SYS="${HOME}/.dotfiles/linux/.flatpak/manifest/system.apps"
+
+tmp_user="$(mktemp)"; trap 'rm -f "$tmp_user"' EXIT
+tmp_sys="$(mktemp)"
+
+normalize() {
+  # Input: list of app IDs, one per line. Emits "ORIGIN ID BRANCH SCOPE".
+  scope="$1"
+  while read -r appid; do
+    [ -n "$appid" ] || continue
+    origin="$(flatpak info --show-origin "$appid" || true)"
+    branch="$(flatpak info --show-branch "$appid" || true)"
+    [ -n "$origin" ] && [ -n "$branch" ] || continue
+    printf "%s\t%s\t%s\t%s\n" "$origin" "$appid" "$branch" "$scope"
+  done | sort -u
+}
+
+# Collect IDs
+flatpak --user list --app --columns=application | tail -n +1 | normalize user >"$tmp_user"
+flatpak --system list --app --columns=application | tail -n +1 | normalize system >"$tmp_sys"
+
+# Merge with existing, preserving comments and seed lines
+merge_manifest() {
+  manifest="$1"; tmp="$2"
+  # Keep comments from existing manifest
+  { grep -E '^\s*#' -n "$manifest" 2>/dev/null || true; } >/dev/null
+  {
+    # Keep existing comments and blank lines
+    [ -f "$manifest" ] && grep -E '^\s*#|^\s*$' "$manifest" || true
+    # Keep existing data lines, then add new ones, then uniq by 4 fields
+    {
+      [ -f "$manifest" ] && grep -Ev '^\s*#|^\s*$' "$manifest" || true
+      cat "$tmp"
+    } | awk 'NF>=4{print $0}' | sort -u
+  } > "${manifest}.new"
+  mv "${manifest}.new" "$manifest"
+}
+
+merge_manifest "$MAN_USER" "$tmp_user"
+merge_manifest "$MAN_SYS"  "$tmp_sys"
+
+echo "Wrote:"
+echo "  $MAN_USER"
+echo "  $MAN_SYS"
+#+END_SRC
+
+* Sync script
+Ensures remotes exist, then installs every line in the manifests. Skips already installed apps. Safe to re-run.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/flatpak-sync :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+BASE="${HOME}/.dotfiles/linux/.flatpak/manifest"
+MAN_USER="${BASE}/user.apps"
+MAN_SYS="${BASE}/system.apps"
+
+# Ensure remotes
+if command -v flatpak-remotes-setup >/dev/null 2>&1; then
+  flatpak-remotes-setup
+fi
+
+apply_manifest() {
+  manifest="$1"
+  [ -f "$manifest" ] || return 0
+  while read -r origin id branch scope rest; do
+    # Skip comments and blanks
+    [[ -z "${origin:-}" || "${origin#\#}" != "$origin" ]] && continue
+    [[ -z "${id:-}" || -z "${branch:-}" || -z "${scope:-}" ]] && continue
+
+    args=(install "-y")
+    if [ "$scope" = "user" ]; then
+      args+=(--user)
+    elif [ "$scope" = "system" ]; then
+      args+=(--system)
+    else
+      echo "Skipping line with unknown scope: $origin $id $branch $scope" >&2
+      continue
+    fi
+    args+=("$origin" "$id" "$branch")
+
+    # Only install if missing at intended scope
+    if [ "$scope" = "user" ]; then
+      if ! flatpak --user list --app --columns=application | grep -qx "$id"; then
+        flatpak "${args[@]}"
+      fi
+    else
+      if ! flatpak --system list --app --columns=application | grep -qx "$id"; then
+        flatpak "${args[@]}"
+      fi
+    fi
+  done <"$manifest"
+}
+
+apply_manifest "$MAN_USER"
+apply_manifest "$MAN_SYS"
+
+echo "✔ Flatpak sync complete."
+#+END_SRC
+
+* Make include
+Use this straight with =make -f all/.mk/flatpak.mk <target>=, or add one include line to your main Makefile if you want the targets available there:
+#+BEGIN_EXAMPLE
+# inside Makefile, near the top:
+-include all/.mk/flatpak.mk
+#+END_EXAMPLE
+
+#+BEGIN_SRC makefile :tangle all/.mk/flatpak.mk :padline no :comments none
+.PHONY: flatpak-remotes flatpak-capture flatpak-sync flatpak-verify
+
+flatpak-remotes:
+| @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-remotes-setup
+
+flatpak-capture:
+| @chmod +x $(HOME)/.local/bin/flatpak-capture 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-capture
+
+flatpak-sync: flatpak-remotes
+| @chmod +x $(HOME)/.local/bin/flatpak-sync 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-sync
+
+flatpak-verify:
+| @echo "User scope:"
+| flatpak --user list --app
+| @echo ""
+| @echo "System scope:"
+| flatpak --system list --app
+#+END_SRC
+
+* How to use
+1. Seed manifests are already present. They include Flatseal in user scope.
+2. Import your current setup into the manifests:
+   #+BEGIN_SRC sh
+   make -f all/.mk/flatpak.mk flatpak-capture
+   git add linux/.flatpak/manifest/*.apps
+   git commit -m "Capture Flatpak manifests"
+   #+END_SRC
+3. On any host, apply:
+   #+BEGIN_SRC sh
+   make -f all/.mk/flatpak.mk flatpak-remotes flatpak-sync
+   #+END_SRC
+
+* Maintenance
+- Add an app: append a line to =user.apps= or =system.apps= like:
+  #+BEGIN_EXAMPLE
+  flathub  com.vscodium.codium  stable  user
+  #+END_EXAMPLE
+  Then run =make -f all/.mk/flatpak.mk flatpak-sync=.
+
+- Remove an app: delete its line from the manifest, then remove it locally if desired:
+  #+BEGIN_SRC sh
+  flatpak uninstall --user com.vscodium.codium
+  #+END_SRC
+  The next sync will not reinstall it.
+
+- Update branches: change the =branch= column, then sync.
+
+- Refresh manifests from a live system after ad-hoc changes:
+  #+BEGIN_SRC sh
+  make -f all/.mk/flatpak.mk flatpak-capture
+  #+END_SRC
+
+* Notes
+- We do not force =XCURSOR_THEME= inside Flatpaks. Your existing bridge keeps cursor selection dynamic.
+- The capture script queries origin and branch per app to avoid guessing truncated IDs from =flatpak list= output.
+- If you use a real custom remote for =pied-origin=, set its URL in =flatpak-remotes-setup= once. The script is idempotent.
+
