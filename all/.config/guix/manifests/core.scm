@@ -16,7 +16,8 @@
    "lsd" "ranger"
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly" "python-send2trash" "python-websockets" "python-unidecode" "python-wheel"
    "moreutils"
-   "gimp" "inkscape"
+   "gimp"
    "appmenu-gtk-module"
+   "maak"
    ))
 ;; User profile manifests:1 ends here
