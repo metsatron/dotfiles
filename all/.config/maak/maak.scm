@@ -61,14 +61,43 @@
           (list
            (task 'guix:dirs "Ensure ancillary Guix directories"
                  (lambda () (mk-guix "guix-dirs")))
+
+           ;; PULL (does NOT bench)
            (task 'guix:pull "guix pull"
                  (lambda () (mk-guix "guix-pull")))
+
+          ;; PULL bench: prints fastest URL **and caches it**
+          (task 'guix:pull-bench
+                "Probe guix channel mirrors and print the fastest URL (writes cache)"
+                (lambda ()
+                  (sh "make -f ~/.dotfiles/all/.mk/guix.mk guix-pull-bench")))
+
+          ;; PULL apply: use cached mirror only (or arg passed through)
+          (task 'guix:pull-apply
+                "Apply fastest guix pull mirror to ~/.config/guix/channels.scm"
+                (lambda ()
+                  (sh "~/.dotfiles/all/.local/bin/guix-apply-pull-url")))
+
+           ;; CORE/DEV/Gc (unchanged)
            (task 'guix:core "Build core profile from manifest"
                  (lambda () (mk-guix "guix-core")))
            (task 'guix:dev "Build dev profile (depends on core)"
                  (lambda () (mk-guix "guix-dev")))
-           (task 'guix:gc "guix gc"
+           (task 'guix:nonguix "Build dev profile (depends on core)"
+                 (lambda () (mk-guix "guix-nonguix")))
+           (task 'guix:gc "Collect unreferenced store items (reclaim disk space; safe)"
                  (lambda () (mk-guix "guix-gc")))
+
+           ;; Substitutes: bench+apply (never run on list/all)
+           (task 'guix:sub-bench
+                 "Benchmark Guix substitute servers and print best order"
+                 (lambda ()
+                   (sh "make -f ~/.dotfiles/all/.mk/guix-substitutes.mk guix-sub-bench")))
+
+           (task 'guix:sub-apply
+                 "Apply the best substitute server order to guix-daemon"
+                 (lambda ()
+                   (sh "make -f ~/.dotfiles/all/.mk/guix-substitutes.mk guix-sub-apply")))
            )))
 
 ;; --- Flatpak control plane via loom ---
