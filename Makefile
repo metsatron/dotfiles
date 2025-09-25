@@ -51,3 +51,7 @@ preview-stow:
 x11-apply: tangle
 | cd $(HOME)/.dotfiles && stow think
 | @echo "✅ X11 applied."
+
+include $(HOME)/.dotfiles/all/.mk/flatpak.mk
+include $(HOME)/.dotfiles/all/.mk/guix.mk
+include $(HOME)/.dotfiles/all/.mk/guix-substitutes.mk
