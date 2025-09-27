@@ -1,0 +1,316 @@
+#+TITLE: AppImage Loom — Update, Integrate, and Maintain
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:text :comments no
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* Purpose
+  Manage AppImages under =~/Applications=: daemon integration, updates (with old file removal), and cleaning of broken desktop entries. Keeps the AIL→appimaged migration helpers around for the future.
+
+* Requirements (packages/tools)
+
+- =desktop-file-utils= (for =desktop-file-validate=)
+- =glib2.0-bin= (for =gio=) — optional; falls back to rm if missing
+- A recent =systemd --user=, and your binaries in =~/.local/bin=
+
+* Directory conventions
+
+- AppImages live in: =~/Applications=
+- User binaries/scripts: =~/.local/bin=
+- User services: =~/.config/systemd/user=
+- User desktop cache: =~/.local/share/applications=
+
+* AIL → appimaged migration helpers (kept for later use)
+  These **do nothing automatically**; you run them when/if you want to migrate.
+
+** Stop & scrub AppImageLauncher artifacts (user + system)
+#+BEGIN_SRC bash :tangle all/.local/bin/appimage-ail-scrub :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+echo "== AIL scrub (user + system) =="
+systemctl --user disable --now appimagelauncherd.service 2>/dev/null || true
+systemctl --global disable appimagelauncherd.service 2>/dev/null || true
+sudo systemctl --global disable appimagelauncherd.service 2>/dev/null || true
+rm -f ~/.config/systemd/user/appimagelauncherd.service 2>/dev/null || true
+sudo rm -f /etc/systemd/user/appimagelauncherd.service /usr/lib/systemd/user/appimagelauncherd.service 2>/dev/null || true
+sudo rm -f /etc/systemd/user/default.target.wants/appimagelauncherd.service /usr/lib/systemd/user/default.target.wants/appimagelauncherd.service 2>/dev/null || true
+
+# MIME + desktop traces
+
+sed -i '/application/x-appimage/d' ~/.config/mimeapps.list 2>/dev/null || true
+sed -i '/application/x-appimage/d' ~/.local/share/applications/mimeapps.list 2>/dev/null || true
+sudo update-desktop-database /usr/share/applications 2>/dev/null || true
+sudo update-mime-database /usr/share/mime 2>/dev/null || true
+
+# Package repo crumbs (leave .deb cache as-is)
+
+sudo rm -f /etc/apt/sources.list.d/appimagelauncher-team-*.list /etc/apt/trusted.gpg.d/appimagelauncher-team-*.gpg* 2>/dev/null || true
+systemctl --user daemon-reload || true
+systemctl --user daemon-reexec || true
+echo "== done =="
+#+END_SRC
+
+** Set up =appimaged= as our integrator (user service)
+- Picks the newest =~/Applications/appimaged-*-x86_64.AppImage= and installs a stable wrapper at =~/.local/bin/appimaged=
+- Creates/refreshes the user service
+
+#+BEGIN_SRC bash :tangle all/.local/bin/appimage-integrator-setup :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+APPS_DIR="${APPS_DIR:-$HOME/Applications}"
+BIN="$HOME/.local/bin/appimaged"
+
+cand="$(ls -t "$APPS_DIR"/appimaged-*-x86_64.AppImage 2>/dev/null | head -n1 || true)"
+if [[ -z "$cand" ]]; then
+echo "!! No appimaged-*-x86_64.AppImage in $APPS_DIR"; exit 1
+fi
+install -Dm755 "$cand" "$BIN"
+
+mkdir -p ~/.config/systemd/user
+cat >~/.config/systemd/user/appimaged.service <<'EOF'
+[Unit]
+Description=appimaged (AppImage integration daemon)
+After=graphical-session.target
+
+[Service]
+ExecStart=%h/.local/bin/appimaged -v -q
+Restart=on-failure
+RestartSec=2
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin
+
+[Install]
+WantedBy=default.target
+EOF
+
+systemctl --user daemon-reload
+systemctl --user enable --now appimaged.service
+sleep 1
+systemctl --user status appimaged --no-pager || true
+#+END_SRC
+
+** Health check: only one integrator and it’s ours
+#+BEGIN_SRC bash :tangle all/.local/bin/appimage-health :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+echo "== Integrator processes =="
+pgrep -af appimaged || echo "(none)"
+pgrep -af appimagelauncher || echo "(no AIL)"
+echo "== appimaged status =="
+systemctl --user status appimaged --no-pager || true
+echo "== recent logs =="
+journalctl --user -u appimaged -n 50 --no-pager || true
+#+END_SRC
+
+* Bulk update of all AppImages (self-update first, remove old)
+
+- Uses =~/Applications/appimageupdatetool-x86_64.AppImage=
+- Skips itself (& AppImageUpdate) since =--self-update= handles them
+- **Never** aborts on failures; logs and continues
+
+#+BEGIN_SRC bash :tangle all/.local/bin/appimage-update-all :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APPS_DIR="${APPS_DIR:-$HOME/Applications}"
+LOG="${LOG:-$HOME/appimage-update.log}"
+SELF_UPDATE="${SELF_UPDATE:-1}"   # 1=self-update the tool before runs
+TOOL="$APPS_DIR/appimageupdatetool-x86_64.AppImage"
+
+ts() { date '+%F %T'; }
+
+echo "== appimage-update-all @ $(ts) ==" | tee -a "$LOG"
+echo "APPS_DIR=$APPS_DIR" | tee -a "$LOG"
+echo "TOOL=$TOOL" | tee -a "$LOG"
+
+# 0) Ensure executability up-front
+if [[ -d "$APPS_DIR" ]]; then
+  find "$APPS_DIR" -maxdepth 1 -type f -name '*.AppImage' -exec chmod +x {} + || true
+fi
+
+# 1) Self-update the tool, if present
+if [[ -x "$TOOL" && "$SELF_UPDATE" = "1" ]]; then
+  echo "-- self-updating appimageupdatetool..." | tee -a "$LOG"
+  if "$TOOL" --self-update >>"$LOG" 2>&1; then
+    echo "ok: self-update" | tee -a "$LOG"
+  else
+    echo "warn: self-update failed (continuing)" | tee -a "$LOG"
+  fi
+fi
+
+# 2) Update all AppImages that advertise update info; remove old on success
+shopt -s nullglob
+for path in "$APPS_DIR"/*.AppImage; do
+  base="$(basename -- "$path")"
+  # Skip the tools themselves (they tend to self-manage)
+  case "$base" in
+    appimageupdatetool-*.AppImage|AppImageUpdate-*.AppImage) echo "skip: $base" | tee -a "$LOG"; continue ;;
+  esac
+
+  echo "==> $base" | tee -a "$LOG"
+  if [[ ! -x "$TOOL" ]]; then
+    echo "fail: no appimageupdatetool at $TOOL" | tee -a "$LOG"
+    continue
+  fi
+
+  # Use -r so the old file gets removed on successful update
+  if "$TOOL" -r "$path" >>"$LOG" 2>&1; then
+    echo "ok: $base" | tee -a "$LOG"
+  else
+    rc=$?
+    echo "fail: $base (exit $rc). continuing." | tee -a "$LOG"
+  fi
+done
+shopt -u nullglob
+
+# 3) Refresh appimaged wrapper atomically to the newest available
+latest="$(ls -1t "$APPS_DIR"/appimaged-*-x86_64.AppImage 2>/dev/null | head -n1 || true)"
+wrap="$HOME/.local/bin/appimaged"
+if [[ -n "$latest" ]]; then
+  mkdir -p "$(dirname "$wrap")"
+  if [[ ! -e "$wrap" ]] || ! cmp -s "$latest" "$wrap"; then
+    tmp="${wrap}.tmp.$$"
+    ln -sf "$latest" "$tmp"
+    mv -Tf "$tmp" "$wrap"
+    chmod +x "$wrap" || true
+    systemctl --user try-restart appimaged.service || true
+    echo "-- appimaged wrapper updated -> $(basename "$latest")" | tee -a "$LOG"
+  else
+    echo "-- appimaged wrapper already up to date" | tee -a "$LOG"
+  fi
+fi
+
+# 4) Scrub broken .desktop entries and normalize perms
+apps_dir="$HOME/.local/share/applications"
+if [[ -d "$apps_dir" ]]; then
+  echo "== scrubbing $apps_dir/*.desktop ==" | tee -a "$LOG"
+  # make .desktop files executable (requested)
+  find "$apps_dir" -maxdepth 1 -type f -name '*.desktop' -exec chmod +x {} + || true
+
+  # Trash any .desktop whose Exec= points to an absolute path that doesn't exist
+  while IFS= read -r -d '' f; do
+    exec_line="$(awk -F= '/^[[:space:]]*Exec=/{print $2; exit}' "$f" | sed 's/[[:space:]]*$//')"
+    # extract first token (respecting quotes)
+    if [[ -n "$exec_line" ]]; then
+      if [[ "$exec_line" =~ ^\"([^\"]+)\" ]]; then
+        exe="${BASH_REMATCH[1]}"
+      else
+        exe="${exec_line%% *}"
+      fi
+      if [[ "$exe" = /* && ! -e "$exe" ]]; then
+        echo "trash: $f  [missing absolute Exec: $exe]" | tee -a "$LOG"
+        gio trash "$f" 2>>"$LOG" || rm -f -- "$f"
+      fi
+    fi
+  done < <(find "$apps_dir" -maxdepth 1 -type f -name '*.desktop' -print0)
+
+  update-desktop-database "$apps_dir" >/dev/null 2>&1 || true
+fi
+
+# 5) Normalize perms again for AppImages (in case updates wrote without +x)
+if [[ -d "$APPS_DIR" ]]; then
+  find "$APPS_DIR" -maxdepth 1 -type f -name '*.AppImage' -exec chmod +x {} + || true
+fi
+
+echo "== done @ $(ts) ==" | tee -a "$LOG"
+#+END_SRC
+
+* Scrub broken .desktop entries and refresh caches
+Targets the exact failure you showed (“Exec program … not been found on the PATH”), and also:
+
+- trashes entries whose =Exec= is an absolute path that no longer exists
+- trashes entries whose =Exec= binary name isn’t on PATH
+- uses =gio trash= if available, otherwise =rm -f=
+- refreshes desktop caches at the end
+
+#+BEGIN_SRC bash :tangle all/.local/bin/appimage-scrub-desktops :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+apps="$HOME/.local/share/applications"
+pattern="${PATTERN:-*.desktop}"
+trash() { command -v gio >/dev/null 2>&1 && gio trash "$1" || rm -f "$1"; }
+
+echo "== scrubbing $apps/$pattern =="
+shopt -s nullglob
+while IFS= read -r -d '' f; do
+out="$(desktop-file-validate "$f" 2>&1 || true)"
+if grep -q "Exec program .* has not been found on the PATH" <<<"$out"; then
+echo "trash: $f  [PATH missing]"
+trash "$f"
+continue
+fi
+exec_line="$(awk -F= 'BEGIN{IGNORECASE=1}/^Exec[ \t]*=/{print $2; exit}' "$f")"
+cmd="$(sed -E 's/^"([^"]+)".*/\1/; s/[ \t].*$//' <<<"$exec_line")"
+if [[ -n "$cmd" ]]; then
+if [[ "$cmd" = /* && ! -e "$cmd" ]]; then
+echo "trash: $f  [missing absolute Exec: $cmd]"
+trash "$f"; continue
+fi
+if [[ "$cmd" != /* ]]; then
+if ! command -v "$cmd" >/dev/null 2>&1; then
+echo "trash: $f  [Exec not on PATH: $cmd]"
+trash "$f"; continue
+fi
+fi
+fi
+done < <(find "$apps" -maxdepth 1 -type f -name "$pattern" -print0)
+
+update-desktop-database "$apps" 2>/dev/null || true
+gtk-update-icon-cache -f "$HOME/.local/share/icons/hicolor" 2>/dev/null || true
+echo "== scrub complete =="
+#+END_SRC
+
+* Makefile glue (appimage.mk)
+#+BEGIN_SRC makefile :tangle all/.mk/appimage.mk
+# ~/.dotfiles/all/.mk/appimage.mk
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+
+APPS_DIR   := $(HOME)/Applications
+BIN_DIR    := $(HOME)/.local/bin
+
+INTEGRATE  := $(BIN_DIR)/appimage-integrator-setup
+AIL_SCRUB  := $(BIN_DIR)/appimage-ail-scrub
+HEALTH     := $(BIN_DIR)/appimage-health
+UPDATE_ALL := $(BIN_DIR)/appimage-update-all
+SCRUB_DESK := $(BIN_DIR)/appimage-scrub-desktops
+
+.PHONY: appimage-integrate appimage-ail-scrub appimage-health \
+        appimage-update appimage-update-all appimage-scrub-desktops
+
+appimage-integrate: $(INTEGRATE)
+| $(INTEGRATE)
+
+appimage-ail-scrub: $(AIL_SCRUB)
+| $(AIL_SCRUB)
+
+appimage-health: $(HEALTH)
+| $(HEALTH)
+
+# New short verb
+appimage-update: $(UPDATE_ALL)
+| env SELF_UPDATE=1 $(UPDATE_ALL)
+
+# Back-compat alias
+appimage-update-all: appimage-update
+
+# (kept for reference; no longer needed separately)
+appimage-scrub-desktops: $(SCRUB_DESK)
+| $(SCRUB_DESK)
+#+END_SRC
+
+* Include in your root Makefile (idempotent)
+Add this include to your main =Makefile= (your file already includes others).
+
+#+BEGIN_SRC makefile :tangle Makefile.d/appimage.include.mk :padline no :comments none
+include $(HOME)/.dotfiles/all/.mk/appimage.mk
+#+END_SRC
+
+* Notes: manual override of update info (future work)
+=appimageupdatetool= supports injecting update info for non-compliant AppImages:
+
+#+BEGIN_SRC text :tangle no
+appimageupdatetool-x86_64.AppImage 
+-u 'gh-releases-zsync|ORG|REPO|TAG|pattern-*-x86_64.AppImage.zsync' 
+-r /path/to/Your.AppImage
+
+# pattern must match the upstream artifact names; we can maintain a per-file overrides map later.
+
+#+END_SRC
