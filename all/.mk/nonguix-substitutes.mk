@@ -1,6 +1,3 @@
-# Nonguix substitutes (own cache; apply reads cache only)
-
-# [[file:../../guix.org::*Nonguix substitutes (own cache; apply reads cache only)][Nonguix substitutes (own cache; apply reads cache only):1]]
 ifndef NONGUIX_SUBS_MK_INCLUDED
 NONGUIX_SUBS_MK_INCLUDED := 1
 
@@ -53,4 +50,3 @@ nonguix-authorize-key:
 | echo "Authorizing nonguix key: $$key"; \
 | sudo guix archive --authorize < "$$key"
 endif
-# Nonguix substitutes (own cache; apply reads cache only):1 ends here

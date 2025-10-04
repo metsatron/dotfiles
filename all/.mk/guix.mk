@@ -1,6 +1,3 @@
-# Guix (bench caches + pull that never re-benchmarks)
-
-# [[file:../../guix.org::*Guix (bench caches + pull that never re-benchmarks)][Guix (bench caches + pull that never re-benchmarks):1]]
 # all/.mk/guix.mk
 ifndef GUIX_MK_INCLUDED
 GUIX_MK_INCLUDED := 1
@@ -84,4 +81,3 @@ guix-nonguix: guix-dirs
 guix-gc:
 | $(GUIX) gc
 endif
-# Guix (bench caches + pull that never re-benchmarks):1 ends here

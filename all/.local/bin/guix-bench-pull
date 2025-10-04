@@ -3,101 +3,74 @@
 
 # [[file:../../../guix.org::*Bench fastest Guix channel mirror][Bench fastest Guix channel mirror:1]]
 #!/usr/bin/env bash
+# all/.local/bin/guix-bench-pull
 set -Eeuo pipefail
 
-# Benchmark Guix channel mirrors for `guix pull`.
-# - Per-URL result lines (to STDERR)
-# - Best URL (to STDOUT only)
-# Env:
-#   GUIX_PULL_CANDIDATES="url1 url2 …" to override list
-#   GUIX_PULL_TIMEOUT=15  (git ls-remote timeout seconds)
-#   GUIX_PULL_VERBOSE=1   (default 1; controls STDERR chatter)
-# Flags:
-#   -v/--verbose     force verbose
-#   --force-curl     skip git timing; use curl HEAD latency
+BENCH_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/guix/.bench"
+CACHE="${BENCH_DIR}/pull-url"
+BL="${BENCH_DIR}/pull-blacklist"
+TSV="${XDG_CONFIG_HOME:-$HOME/.config}/guix/pull-candidates.tsv"
 
-VERBOSE="${GUIX_PULL_VERBOSE:-1}"
-TIMEOUT="${GUIX_PULL_TIMEOUT:-15}"
-FORCE_CURL=0
+mkdir -p "$BENCH_DIR"; touch "$BL"
 
-for a in "$@"; do
-  case "$a" in
-    -v|--verbose) VERBOSE=1 ;;
-    --force-curl) FORCE_CURL=1 ;;
-    *) ;;
-  esac
-done
-
-# Default candidates (include Codeberg)
-CANDIDATES=(
-  "https://git.savannah.gnu.org/git/guix.git"
-  "https://mirror.git.savannah.gnu.org/r/guix.git"
-  "https://git.cbaines.net/guix/guix"
-  "https://codeberg.org/guix/guix.git"
-)
-[ -n "${GUIX_PULL_CANDIDATES:-}" ] && read -r -a CANDIDATES <<<"${GUIX_PULL_CANDIDATES}"
-
-have_git=0
-if [ "$FORCE_CURL" -eq 0 ] && command -v git >/dev/null 2>&1; then
-  have_git=1
-fi
-
-ptime_git() { # -> float seconds or 99
-  local url="$1" t
-  t="$( TIMEFORMAT=%R; { time git ls-remote --heads --tags --refs --timeout="$TIMEOUT" "$url" >/dev/null 2>&1; } 2>&1 )" || t=99
-  printf '%s' "$t"
+urls_from_tsv() {
+  [[ -r "$TSV" ]] || return 1
+  awk -F'\t' '
+    BEGIN{IGNORECASE=1}
+    /^[[:space:]]*#/ {next}
+    NF==0 {next}
+    NR==1 && $1 ~ /^url$/ {next}  # optional header
+    {print $1}
+  ' "$TSV" | awk 'NF'
 }
 
-ptime_curl() { # -> float seconds or 99
-  curl -sS -o /dev/null -m "$TIMEOUT" -w '%{time_total}' -I "$1" || printf '%s' 99
-}
-
-mode_desc() { [ "$have_git" -eq 1 ] && echo "git" || echo "curl"; }
-
-[ "$VERBOSE" -eq 1 ] && {
-  >&2 echo "guix-bench-pull: probing ${#CANDIDATES[@]} candidate(s) using $(mode_desc)… (timeout=${TIMEOUT}s)"
-}
-
-best=""; best_t="999999"
-any_ok=0
-
-# header
-[ "$VERBOSE" -eq 1 ] && >&2 printf '%-52s  %8s  %s\n' "URL" "TIME(s)" "MODE"
-
-for url in "${CANDIDATES[@]}"; do
-  # try git timing first unless forced curl / no git
-  t="99"; mode="$(mode_desc)"
-  if [ "$have_git" -eq 1 ]; then
-    t="$(ptime_git "$url")"
-    if [ "$t" = "99" ]; then
-      # fallback to curl latency for this URL only
-      t="$(ptime_curl "$url")"
-      mode="curl"
-    fi
-  else
-    t="$(ptime_curl "$url")"
-    mode="curl"
+declare -a CANDS=()
+if [[ -n "${GUIX_PULL_CANDIDATES:-}" ]]; then
+  # space-separated URLs override TSV
+  read -r -a CANDS <<< "$GUIX_PULL_CANDIDATES"
+else
+  mapfile -t CANDS < <(urls_from_tsv || true)
+  # final fallback if TSV missing/empty
+  if [[ ${#CANDS[@]} -eq 0 ]]; then
+    CANDS=( "https://codeberg.org/guix/guix.git"
+            "https://git.cbaines.net/guix/guix"
+            "https://git.savannah.gnu.org/git/guix.git"
+            "https://mirror.git.savannah.gnu.org/r/guix.git" )
   fi
-
-  [ "$t" != "99" ] && any_ok=1
-
-  # pretty row
-  [ "$VERBOSE" -eq 1 ] && >&2 printf '%-52s  %8s  %s\n' "$url" "$t" "$mode"
-
-  # numeric compare (float-safe)
-  awk -v a="$t" -v b="$best_t" 'BEGIN{exit (a+0<b+0)?0:1}' \
-  && { best="$url"; best_t="$t"; }
-done
-
-if [ -n "$best" ] && [ "$any_ok" -eq 1 ]; then
-  [ "$VERBOSE" -eq 1 ] && >&2 echo "best=${best} time=${best_t}"
-  echo "$best"
-  exit 0
 fi
 
-# If absolutely everything failed (all 99), still return a sane default.
-fallback="https://git.savannah.gnu.org/git/guix.git"
-[ "$VERBOSE" -eq 1 ] && >&2 echo "guix-bench-pull: all probes failed; falling back to ${fallback}"
-echo "$fallback"
-exit 0
+have_git=0; command -v git >/dev/null 2>&1 && have_git=1
+
+probe_git() { # url -> seconds
+  local u="$1"
+  local t
+  t="$( TIMEFORMAT=%R; { time git ls-remote --heads --tags --refs --timeout=12 "$u" >/dev/null 2>&1; } 2>&1 )" || return 1
+  printf '%s\n' "$t"
+}
+probe_tcp() { # host:443 reachable?
+  timeout 4 bash -lc "exec 3<>/dev/tcp/$1/443" 2>/dev/null
+}
+
+rows=()
+for u in "${CANDS[@]}"; do
+  grep -qxF "$u" "$BL" && continue
+  host="$(sed -n 's#https\?://\([^/]*\).*#\1#p' <<<"$u")"
+  probe_tcp "$host" || continue
+  t=""
+  if [[ $have_git -eq 1 ]]; then
+    t="$(probe_git "$u" || true)"
+  fi
+  [[ -z "$t" ]] && continue
+  rows+=("$t $u")
+done
+
+# choose the fastest
+best="$(printf '%s\n' "${rows[@]}" | sort -n | awk 'NR==1{print $2}')"
+
+if [[ -z "${best:-}" ]]; then
+  echo "no-viable-mirror" >&2
+  exit 2
+fi
+
+printf '%s\n' "$best"
 # Bench fastest Guix channel mirror:1 ends here

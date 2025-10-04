@@ -12,7 +12,13 @@ EXTRA := $(HOME)/.guix-extra-profiles
 STOW_PKGS ?= all linux debian think
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
-        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow
+        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint
+
+lint:
+| all/.local/bin/org-style-lint
+
+# Make tangle depend on lint
+tangle: lint
 
 EMACS_BATCH = $(EMACS) --batch -Q \
   --eval "(setq create-lockfiles nil make-backup-files nil auto-save-default nil backup-inhibited t vc-make-backup-files nil)"
@@ -55,3 +61,5 @@ x11-apply: tangle
 include $(HOME)/.dotfiles/all/.mk/flatpak.mk
 include $(HOME)/.dotfiles/all/.mk/guix.mk
 include $(HOME)/.dotfiles/all/.mk/guix-substitutes.mk
+include $(HOME)/.dotfiles/all/.mk/snap.mk
+include $(HOME)/.dotfiles/all/.mk/appimage.mk
