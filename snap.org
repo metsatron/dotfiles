@@ -1,0 +1,393 @@
+#+TITLE: Snap Pack Loom: Literate & Reproducible
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:text :comments no
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* Purpose
+Snap helpers that behave like apt autoremove, without touching active deps. Idempotent, dry run by default, optional data purge is explicit.
+
+* Manifest
+Single TSV, comment friendly. Columns: NAME, CHANNEL, CLASSIC.
+Tangling target: =all/.snap/manifest/apps.tsv=
+
+#+BEGIN_SRC text :tangle all/.snap/manifest/apps.tsv
+# name            channel         classic
+# Examples:
+losslesscut       latest/stable   no
+freemind          latest/stable   no
+foobar2000        latest/stable   no
+pied              latest/stable   no
+dbeaver-ce        latest/stable   no
+remarkable        latest/stable   no
+# xmind           latest/stable   no
+# canonical-livepatch latest/stable no
+# You control the world by editing this list.
+#+END_SRC
+
+* Installer tools
+
+** snap-capture
+Export current non-base apps into TSV format you can curate.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/snap-capture :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+out="${1:-$HOME/.dotfiles/all/.snap/manifest/apps.tsv}"
+tmp="$(mktemp)"
+# Skip core bases and common platforms
+protect='^(bare|core|core18|core20|core22|core24|snapd|gtk-common-themes|gnome-3-28-1804|gnome-42-2204|canonical-livepatch)$'
+{
+  echo -e "# name\tchannel\tclassic"
+  snap list | awk 'NR>1 {print $1, $4}' | while read -r name tracking; do
+    [[ "$name" =~ $protect ]] && continue
+    classic="no"
+    # Best effort: detect classic from snap info
+    if snap info "$name" 2>/dev/null | awk '/confinement:/{print $2}' | grep -qx classic; then
+      classic="yes"
+    fi
+    printf "%s\t%s\t%s\n" "$name" "$tracking" "$classic"
+  done
+} > "$tmp"
+mkdir -p "$(dirname "$out")"
+mv "$tmp" "$out"
+echo "Captured to $out"
+#+END_SRC
+
+** snap-diff
+Show plan: desired vs installed, and who would be removed.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/snap-diff :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+mf="${1:-$HOME/.dotfiles/all/.snap/manifest/apps.tsv}"
+
+# Accept spaces or tabs; ignore comments/blank lines
+want_names="$(
+  awk 'BEGIN{FS="[ \t]+"; IGNORECASE=1}
+       /^[ \t]*($|#)/ {next}
+       NF>=1 {print $1}' "$mf" 2>/dev/null | sort -u || true
+)"
+
+installed="$(snap list | awk 'NR>1{print $1}' | sort -u)"
+protect='^(bare|core|core18|core20|core22|core24|snapd|gtk-common-themes|gnome-3-28-1804|gnome-42-2204|canonical-livepatch)$'
+
+echo "== To install =="
+comm -13 <(echo "$installed") <(echo "$want_names") || true
+
+echo "== Extra installed (candidates to remove) =="
+comm -23 <(echo "$installed") <(echo "$want_names") | grep -Ev "$protect" || true
+
+echo "== Protected installed (not removed unless forced) =="
+comm -23 <(echo "$installed") <(echo "$want_names") | grep -E "$protect" || true
+#+END_SRC
+
+** snap-apply-manifest
+Install missing, optionally remove extras that are not in the manifest.
+Flags: REMOVE_EXTRA=1 to enforce, FORCE_PROTECTED=1 to allow bases/platforms removal if Snap permits.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/snap-apply-manifest :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+
+# Defaults (can be overridden by env or flags)
+REMOVE_EXTRA="${REMOVE_EXTRA:-0}"
+FORCE_PROTECTED="${FORCE_PROTECTED:-0}"
+MODE="apply"   # apply|dry
+
+# Parse flags first, then optional manifest path
+while (($#)); do
+  case "$1" in
+    --dry|-n) MODE="dry" ;;
+    --yes|-y) MODE="apply" ;;
+    --remove-extra) REMOVE_EXTRA=1 ;;
+    --force-protected) FORCE_PROTECTED=1 ;;
+    --) shift; break ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: snap-apply-manifest [options] [MANIFEST.tsv]
+
+Options:
+  -n, --dry             Dry run (no changes)
+  -y, --yes             Apply changes (default)
+      --remove-extra    Uninstall snaps not listed in manifest
+      --force-protected Also attempt protected removals (bases/platforms)
+      --                End of options
+EOF
+      exit 0 ;;
+    ,*) break ;;
+  esac
+  shift
+done
+
+mf="${1:-$HOME/.dotfiles/all/.snap/manifest/apps.tsv}"
+
+run() {
+  if [[ "$MODE" == "dry" ]]; then
+    echo "(dry) $*"
+  else
+    echo "+ $*"
+    eval "$@"
+  fi
+}
+
+read_manifest() {
+  # Accept TABs or any number of SPACEs; ignore blank lines and comments.
+  # Output is normalized to real TABs for downstream reads.
+  awk 'BEGIN{FS="[ \t]+"; IGNORECASE=1}
+       /^[ \t]*($|#)/ { next }
+       {
+         name=$1; ch=$2; cl=$3;
+         if (ch=="") ch="latest/stable";
+         if (tolower(cl)=="yes" || tolower(cl)=="true") cl="--classic"; else cl="";
+         printf "%s\t%s\t%s\n", name, ch, cl
+       }' "$mf"
+}
+
+echo "== Apply installs =="
+read_manifest | while IFS=$'\t' read -r name channel classic; do
+  # Preflight: warn if snap name does not exist in store
+  if ! snap info "$name" >/dev/null 2>&1; then
+    echo "skip: '$name' not found in Snap store (remove or correct in manifest)"; continue
+  fi
+  if snap list | awk 'NR>1{print $1}' | grep -qx "$name"; then
+    run sudo snap refresh "$name" --channel="$channel"
+  else
+    if [[ -n "$classic" ]]; then
+      run sudo snap install "$name" --channel="$channel" --classic
+    else
+      run sudo snap install "$name" --channel="$channel"
+    fi
+  fi
+done
+
+if [[ "$REMOVE_EXTRA" -eq 1 ]]; then
+  echo "== Enforce removals (extras not in manifest) =="
+  protect='^(bare|core|core18|core20|core22|core24|snapd|gtk-common-themes|gnome-3-28-1804|gnome-42-2204|canonical-livepatch)$'
+  want="$(read_manifest | cut -f1 | sort -u)"
+  installed="$(snap list | awk 'NR>1{print $1}' | sort -u)"
+  extras="$(comm -23 <(echo "$installed") <(echo "$want"))"
+  while read -r name; do
+    [[ -z "$name" ]] && continue
+    if [[ "$name" =~ $protect && "$FORCE_PROTECTED" -ne 1 ]]; then
+      echo "keep: $name is protected"
+      continue
+    fi
+    run sudo snap remove --purge "$name" || true
+  done <<< "$extras"
+else
+  echo "== Removals skipped, set --remove-extra to enforce =="
+fi
+
+echo "Done. Mode=${MODE}"
+#+END_SRC
+
+** snap-autoremove
+#+BEGIN_SRC bash :tangle all/.local/bin/snap-autoremove :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+
+MODE="dry" PURGE_DATA=0
+APPS_TO_REMOVE=()
+
+while (($#)); do
+  case "$1" in
+    -n|--dry|--dry-run) MODE="dry" ;;
+    -y|--yes)           MODE="yes" ;;
+    --purge-data)       PURGE_DATA=1 ;;
+    --remove)           shift; APPS_TO_REMOVE+=("$@"); break ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: snap-autoremove [--dry-run|-n] [--yes|-y] [--purge-data] [--remove <apps...>]
+
+Steps:
+  1) Remove disabled revisions.
+  2) Remove specified app snaps (if any).
+  3) Remove unused content/platform snaps.
+  4) Attempt to remove unused bases (kept if in use).
+  5) Optionally purge orphaned data dirs (~/snap and /var/snap).
+
+Dry run by default. Use --yes to execute.
+EOF
+      exit 0;;
+    *) echo "Unknown arg: $1" >&2; exit 2;;
+  esac
+  shift
+done
+
+run() { if [[ "$MODE" == "yes" ]]; then echo "+ $*"; eval "$@"; else echo "(dry) $*"; fi; }
+
+try_remove_base() {
+  local b="$1"
+  if [[ "$MODE" == "yes" ]]; then
+    # Capture stderr and status to print a friendly keep: line
+    if out_err=$(sudo snap remove "$b" 2>&1); then
+      echo "$b removed"
+    else
+      # Trim newlines
+      local oneline; oneline=$(tr '\n' ' ' <<<"$out_err" | sed 's/  */ /g')
+      echo "keep: $b is in use ($oneline)"
+    fi
+  else
+    echo "(dry) sudo snap remove '$b'"
+  fi
+}
+
+echo "== 1) Prune disabled revisions =="
+found=0
+while read -r name rev status; do
+  [[ "$status" == "disabled" ]] || continue
+  found=1
+  run "sudo snap remove '$name' --revision='$rev'"
+done < <(snap list --all | awk 'NR>1 {print $1, $3, $5}')
+[[ "$found" -eq 0 ]] && echo "(none) No disabled revisions to prune."
+
+if ((${#APPS_TO_REMOVE[@]})); then
+  echo "== 2) Remove requested apps =="
+  for app in "${APPS_TO_REMOVE[@]}"; do
+    if snap list | awk 'NR>1 {print $1}' | grep -qx "$app"; then
+      run "sudo snap remove --purge '$app'"
+    else
+      echo "skip: $app not installed"
+    fi
+  done
+fi
+
+echo "== 3) Remove unused content/platform snaps =="
+CANDIDATES=(gtk-common-themes gtk2-common-themes gnome-3-28-1804 gnome-42-2204)
+for s in "${CANDIDATES[@]}"; do
+  if snap list | awk 'NR>1{print $1}' | grep -qx "$s"; then
+    consumers=$(snap connections "$s" | awk -v prov="^"${s//./\\.}":" '
+      NR>1 && $3 ~ prov && $2 != "-" {print $2}' | sort -u | wc -l)
+    if [[ "$consumers" -eq 0 ]]; then
+      run "sudo snap remove '$s'"
+    else
+      echo "keep: $s has $consumers consumer(s)"
+    fi
+  fi
+done
+
+echo "== 4) Attempt to remove unused bases =="
+for b in bare core core18 core20 core22 core24; do
+  if snap list | awk 'NR>1{print $1}' | grep -qx "$b"; then
+    try_remove_base "$b"
+  fi
+done
+
+if ((PURGE_DATA)); then
+  echo "== 5) Purge orphaned data dirs =="
+  installed="$(snap list | awk 'NR>1{print $1}' | sort -u)"
+  if [[ -d "$HOME/snap" ]]; then
+    while read -r dir; do
+      app="${dir##*/}"
+      if ! grep -qx "$app" <<<"$installed"; then
+        run "rm -rf '$dir'"
+      fi
+    done < <(find "$HOME/snap" -mindepth 1 -maxdepth 1 -type d)
+  fi
+  if [[ -d /var/snap ]]; then
+    while read -r dir; do
+      app="${dir##*/}"
+      if ! grep -qx "$app" <<<"$installed"; then
+        run "sudo rm -rf '$dir'"
+      fi
+    done < <(find /var/snap -mindepth 1 -maxdepth 1 -type d)
+  fi
+fi
+
+echo "Done. Mode: ${MODE:-dry}"
+#+END_SRC
+
+** snap-prune-disabled
+Small focused helper if you want the classic one-liner, wired through Make and Loom.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/snap-prune-disabled :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+
+found=0
+echo "== Pruning disabled snap revisions =="
+while read -r name rev status; do
+  [[ "$status" == "disabled" ]] || continue
+  found=1
+  echo "+ sudo snap remove '$name' --revision='$rev'"
+  sudo snap remove "$name" --revision="$rev"
+done < <(snap list --all | awk 'NR>1 {print $1, $3, $5}')
+
+if [[ "$found" -eq 0 ]]; then
+  echo "(none) No disabled revisions to prune."
+fi
+#+END_SRC
+
+* Makefile targets
+
+#+BEGIN_SRC makefile :tangle all/.mk/snap.mk
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+
+SNAP_MF       := $(HOME)/.dotfiles/all/.snap/manifest/apps.tsv
+SNAP_CAPTURE  := $(HOME)/.dotfiles/all/.local/bin/snap-capture
+SNAP_DIFF     := $(HOME)/.dotfiles/all/.local/bin/snap-diff
+SNAP_APPLY    := $(HOME)/.dotfiles/all/.local/bin/snap-apply-manifest
+SNAP_AUTO     := $(HOME)/.dotfiles/all/.local/bin/snap-autoremove
+SNAP_PRUNE    := $(HOME)/.dotfiles/all/.local/bin/snap-prune-disabled
+
+.PHONY: snap-capture snap-diff snap-apply snap-apply-dry snap-enforce snap-enforce-force \
+        snap-autoremove snap-autoremove-yes snap-autoremove-purge snap-prune-disabled \
+        snap-list-orphans snap-connections
+
+snap-capture:
+| $(SNAP_CAPTURE)
+
+snap-diff:
+| $(SNAP_DIFF)
+
+snap-apply:
+| $(SNAP_APPLY) --yes $(SNAP_MF)
+
+snap-apply-dry:
+| $(SNAP_APPLY) --dry $(SNAP_MF)
+
+snap-enforce:
+| $(SNAP_APPLY) --yes --remove-extra $(SNAP_MF)
+
+snap-enforce-force:
+| $(SNAP_APPLY) --yes --remove-extra --force-protected $(SNAP_MF)
+
+snap-autoremove:
+| $(SNAP_AUTO)
+
+snap-autoremove-yes:
+| $(SNAP_AUTO) --yes
+
+snap-autoremove-purge:
+| $(SNAP_AUTO) --yes --purge-data
+
+snap-prune-disabled:
+| $(SNAP_PRUNE)
+
+snap-list-orphans:
+| comm -13 <(snap list | awk 'NR>1{print $$1}' | sort -u) <(ls -1 $(HOME)/snap 2>/dev/null | sort) \
+|   | sed 's|^|orphan: $(HOME)/snap/|'
+
+snap-connections:
+| for s in gtk-common-themes gtk2-common-themes gnome-3-28-1804 gnome-42-2204; do \
+|   echo "== $$s =="; snap connections $$s || true; echo; \
+| done
+#+END_SRC
+
+* Usage notes
+- Dry run first:
+  #+BEGIN_SRC sh
+  make -f ~/.dotfiles/all/.mk/snap.mk snap-autoremove
+  loom snap:autoremove
+  #+END_SRC
+
+- Execute:
+  #+BEGIN_SRC sh
+  make -f ~/.dotfiles/all/.mk/snap.mk snap-autoremove-yes
+  loom snap:autoremove!
+  #+END_SRC
+
+- Include orphaned data purge:
+  #+BEGIN_SRC sh
+  make -f ~/.dotfiles/all/.mk/snap.mk snap-autoremove-purge
+  loom snap:purge-data!
+  #+END_SRC
