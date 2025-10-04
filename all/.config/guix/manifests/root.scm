@@ -1,7 +1,4 @@
-;; User profile manifests
-;; Tangling target: =all/.config/guix/manifests/core.scm= and friends.
-
-;; [[file:../../../../guix.org::*User profile manifests][User profile manifests:1]]
+;; [[file:../../../../guix.org::*User profile manifests][User profile manifests:3]]
 (specifications->manifest
  '(
    "git" "htop" "ripgrep" "fd" "jq" "direnv" "btop"
@@ -9,9 +6,6 @@
    "python" "node"
    "glibc-locales"   ; for UTF-8 locales
    "nss-certs"       ; TLS certs for HTTPS
-   "emacs"           ; or "emacs-pgtk" if you prefer pgtk
-   "emacs-vterm"     ; native vterm module for Emacs
-   "libvterm"
    "neovim"
    "lsd" "ranger"
    "fzf" "emacs-fzf" "fzf-tab"
@@ -20,16 +14,8 @@
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly"
    "python-send2trash" "python-websockets" "python-unidecode" "python-wheel"
    "moreutils"
-   "pandoc"
    "flatpak"
    "cargo"
-   "python-pip"
-   "gimp"
-   "appmenu-gtk-module"
-   "mgba"
-   "keepassxc"
-   "picard"
-   "corectrl"
 ;; "cdemu-client" "cdemu-daemon"
    ))
-;; User profile manifests:1 ends here
+;; User profile manifests:3 ends here
