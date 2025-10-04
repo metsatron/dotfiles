@@ -1,10 +1,8 @@
-# Flatpak Make targets fragment. Safe to include or run standalone.
-# Requires GNU Make 3.82+.
-
+# Flatpak Make targets fragment. Requires GNU Make 3.82+.
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-sync flatpak-apply
+.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply
 
 flatpak-remotes:
 | @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
@@ -18,32 +16,20 @@ flatpak-diff:
 | @chmod +x $(HOME)/.local/bin/flatpak-diff 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-diff
 
-# Additive only by default
+# Additive only: installs + updates, no removals
 flatpak-sync: flatpak-remotes
 | @chmod +x $(HOME)/.local/bin/flatpak-apply 2>/dev/null || true
-| ENFORCE=0 UNINSTALL=0 $(HOME)/.local/bin/flatpak-apply
+| ENFORCE=-1 UNINSTALL=-1 $(HOME)/.local/bin/flatpak-apply
 
-# Enforce exact match. Set both flags to permit removals.
-# Examples:
-#   ENFORCE=1 UNINSTALL=1 make -f all/.mk/flatpak.mk flatpak-apply
-#   FORCE_SUDO_SYSTEM=1 ENFORCE=1 UNINSTALL=1 make -f all/.mk/flatpak.mk flatpak-apply
+# Default apply: enforce installs+updates; removals must be explicit (UNINSTALL=1)
 flatpak-apply: flatpak-remotes
 | @chmod +x $(HOME)/.local/bin/flatpak-apply 2>/dev/null || true
-| ENFORCE=${ENFORCE} UNINSTALL=${UNINSTALL} FORCE_SUDO_SYSTEM=${FORCE_SUDO_SYSTEM} $(HOME)/.local/bin/flatpak-apply
+| $(HOME)/.local/bin/flatpak-apply
 
-# Flatpak bridge
-bridge-flatpak: tangle stow
-| if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge" ]; then \
-|   "$(HOME)/.local/bin/flatpak-desktop-bridge"; \
-| else \
-|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge. Tangle and stow first."; \
-|   exit 1; \
-| fi
+flatpak-perms-capture:
+| @chmod +x $(HOME)/.local/bin/flatpak-perms-capture 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-perms-capture
 
-bridge-flatpak-reset:
-| if [ -x "$(HOME)/.local/bin/flatpak-desktop-bridge-reset" ]; then \
-|   "$(HOME)/.local/bin/flatpak-desktop-bridge-reset"; \
-| else \
-|   echo "❌ Missing $(HOME)/.local/bin/flatpak-desktop-bridge-reset. Tangle and stow first."; \
-|   exit 1; \
-| fi
+flatpak-perms-apply:
+| @chmod +x $(HOME)/.local/bin/flatpak-perms-apply 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-perms-apply

@@ -1,13 +1,25 @@
 #!/usr/bin/env bash
-# ~/.local/bin/flatpak-apply
+# Apply manifest with safe elevation
+# Default behavior: **enforce exact state** (install + update + uninstall).
+# System-scoped actions try Polkit first; if denied, retry the specific command with sudo.
+
+# [[file:../../../flatpak.org::*Apply manifest with safe elevation][Apply manifest with safe elevation:1]]
+# ~/.local/bin/flatpak-apply  (tangle this from flatpak.org)
 #!/usr/bin/env bash
 set -euo pipefail
-MAN="${HOME}/.dotfiles/linux/.flatpak/manifest/apps.tsv"
-ENFORCE="${ENFORCE:-0}"
-UNINSTALL="${UNINSTALL:-0}"
-FORCE_SUDO_SYSTEM="${FORCE_SUDO_SYSTEM:-0}"
 
-# Carry through terminal + UTF-8; include ~/.local/bin so helpers resolve.
+MAN="${HOME}/.dotfiles/linux/.flatpak/manifest/apps.tsv"
+
+# defaults: installs + updates; removals only if UNINSTALL=1
+ENFORCE="${ENFORCE:-1}"
+UNINSTALL="${UNINSTALL:-1}"
+UPDATE="${UPDATE:-1}"
+FORCE_SUDO_SYSTEM="${FORCE_SUDO_SYSTEM:-0}"
+DEBUG="${DEBUG:-0}"
+
+[ "$DEBUG" = 1 ] && set -x
+
+# clean env
 CLEAN_LANG="${LANG:-C.UTF-8}"
 CLEAN_TERM="${TERM:-xterm-256color}"
 CLEAN_PATH="/usr/sbin:/usr/bin:/bin:${HOME}/.local/bin"
@@ -16,50 +28,102 @@ CLEAN_ENV=(env -i HOME="$HOME" PATH="$CLEAN_PATH"
   TERM="$CLEAN_TERM"
   XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
   DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}")
+BUF=(); command -v stdbuf >/dev/null 2>&1 && BUF=(stdbuf -oL -eL)
 
+tab=$'\t'
+FS='[[:space:]]+'   # <-- accept any whitespace in manifest
 unset_ssl(){ unset SSL_CERT_FILE SSL_CERT_DIR CURL_CA_BUNDLE GIT_SSL_CAINFO; }
 
 ensure_remotes(){
   local helper="$HOME/.local/bin/flatpak-remotes-setup"
-  if [ -x "$helper" ]; then
-    "${CLEAN_ENV[@]}" "$helper" || true
-  fi
+  [ -x "$helper" ] && "${CLEAN_ENV[@]}" "${BUF[@]}" "$helper" || true
 }
 
 run_fp(){ local scope="$1"; shift; unset_ssl
-  if [ "$scope" = system ] && [ "$FORCE_SUDO_SYSTEM" = 1 ]; then sudo "${CLEAN_ENV[@]}" flatpak "$@"; return; fi
-  if "${CLEAN_ENV[@]}" flatpak "$@"; then return; fi
-  [ "$scope" = system ] && { echo "Retrying with sudo: flatpak $*" >&2; sudo "${CLEAN_ENV[@]}" flatpak "$@"; }
+  if [ "$scope" = system ] && [ "$FORCE_SUDO_SYSTEM" = 1 ]; then
+    sudo "${CLEAN_ENV[@]}" "${BUF[@]}" flatpak "$@"; return
+  fi
+  if "${CLEAN_ENV[@]}" "${BUF[@]}" flatpak "$@"; then return; fi
+  if [ "$scope" = system ]; then
+    echo "Retrying with sudo: flatpak $*" >&2
+    sudo "${CLEAN_ENV[@]}" "${BUF[@]}" flatpak "$@"
+  fi
 }
 
-already_installed(){ local id="$1" scope="$2"
-  if [ "$scope" = user ]; then "${CLEAN_ENV[@]}" flatpak --user list --app --columns=application | grep -qx "$id"
-  else "${CLEAN_ENV[@]}" flatpak --system list --app --columns=application | grep -qx "$id"; fi
+# ----- parsing & plan (normalize to TAB-delimited) -----
+desired_pairs(){
+  awk -v FS="$FS" -v OFS="$tab" '$0!~/^#/ && NF>=4{print $2,$4}' "$MAN" | sort -u
+}
+installed_pairs(){
+  { "${CLEAN_ENV[@]}" flatpak --user   list --app --columns=application | awk -v OFS="$tab" 'NF{print $1,"user"}'
+    "${CLEAN_ENV[@]}" flatpak --system list --app --columns=application | awk -v OFS="$tab" 'NF{print $1,"system"}'; } \
+  | sort -u
+}
+
+print_plan(){
+  local d i; d="$(mktemp)"; i="$(mktemp)"; trap 'rm -f "$d" "$i"' RETURN
+  desired_pairs >"$d"; installed_pairs >"$i"
+  echo "== Plan =="
+  echo "[to install]"
+  join -v1 -t "$tab" <(cut -f1 "$d") <(cut -f1 "$i") | sed 's/^/  + /' || true
+  echo "[to uninstall]"
+  join -v1 -t "$tab" <(cut -f1 "$i") <(cut -f1 "$d") | sed 's/^/  - /' || true
+}
+
+already_installed(){ # id scope
+  if [ "$2" = user ]; then "${CLEAN_ENV[@]}" flatpak --user   list --app --columns=application | grep -qx "$1"
+  else                           "${CLEAN_ENV[@]}" flatpak --system list --app --columns=application | grep -qx "$1"
+  fi
 }
 
 apply_installs(){
-  awk '$0!~/^#/ && NF>=4{print $1"\t"$2"\t"$3"\t"$4}' "$MAN" |
+  echo "== Installing =="
+  awk -v FS="$FS" '$0!~/^#/ && NF>=4{printf "  manifest: origin=%s id=%s branch=%s scope=%s\n",$1,$2,$3,$4}' "$MAN" || true
+
+  awk -v FS="$FS" -v OFS="$tab" '$0!~/^#/ && NF>=4{print $1,$2,$3,$4}' "$MAN" |
   while IFS=$'\t' read -r origin id branch scope; do
     [ -n "$origin$id$branch$scope" ] || continue
     already_installed "$id" "$scope" && continue
+    echo "  -> installing $id ($scope) from $origin:$branch"
     args=(install -y); [ "$scope" = user ] && args+=(--user) || args+=(--system)
     run_fp "$scope" "${args[@]}" "$origin" "$id" "$branch"
   done
 }
 
-compute_extras(){ local desired installed; desired="$(mktemp)"; installed="$(mktemp)"; trap 'rm -f "$desired" "$installed"' RETURN
-  awk '$0!~/^#/ && NF>=4{print $2"\t"$4}' "$MAN" | sort -u >"$desired"
-  { "${CLEAN_ENV[@]}" flatpak --user list --app --columns=application | awk 'NF{print $1"\tuser"}'
-    "${CLEAN_ENV[@]}" flatpak --system list --app --columns=application | awk 'NF{print $1"\tsystem"}'; } | sort -u >"$installed"
-  join -v2 -t $'\t' <(cut -f1 "$desired") "$installed"
+update_manifested(){
+  [ "$UPDATE" = 1 ] || return 0
+  echo "== Updating =="
+  mapfile -t IDS_USER < <(awk -v FS="$FS" '$0!~/^#/ && NF>=4 && $4=="user"{print $2}' "$MAN" | sort -u)
+  [ "${#IDS_USER[@]}" -gt 0 ] && "${CLEAN_ENV[@]}" "${BUF[@]}" flatpak --user update -y "${IDS_USER[@]}" || true
+
+  mapfile -t IDS_SYS  < <(awk -v FS="$FS" '$0!~/^#/ && NF>=4 && $4=="system"{print $2}' "$MAN" | sort -u)
+  [ "${#IDS_SYS[@]}"  -gt 0 ] && run_fp system update -y "${IDS_SYS[@]}" || true
+}
+
+compute_extras(){ # installed-not-desired (id<TAB>scope)
+  local d i; d="$(mktemp)"; i="$(mktemp)"; trap 'rm -f "$d" "$i"' RETURN
+  desired_pairs >"$d"; installed_pairs >"$i"
+  join -v2 -t "$tab" <(cut -f1 "$d") "$i" || true
 }
 
 apply_uninstalls(){
   [ "$ENFORCE" = 1 ] && [ "$UNINSTALL" = 1 ] || return 0
-  compute_extras | while read -r id scope; do
-    if [ "$scope" = user ]; then "${CLEAN_ENV[@]}" flatpak --user uninstall -y "$id" || true
-    else run_fp system uninstall -y "$id" || true; fi
+  echo "== Uninstalling extras =="
+  compute_extras | while IFS=$'\t' read -r id scope; do
+    [ -n "${id:-}" ] || continue
+    echo "  -> uninstalling $id ($scope)"
+    if [ "$scope" = user ]; then
+      "${CLEAN_ENV[@]}" "${BUF[@]}" flatpak --user uninstall -y "$id" || true
+    else
+      run_fp system uninstall -y "$id" || true
+    fi
   done
 }
 
-ensure_remotes; apply_installs; apply_uninstalls; echo "Done."
+ensure_remotes
+print_plan
+apply_installs
+update_manifested
+apply_uninstalls
+echo "Done."
+# Apply manifest with safe elevation:1 ends here
