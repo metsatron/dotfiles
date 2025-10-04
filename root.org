@@ -1,0 +1,187 @@
+
+#+TITLE: Root Config Literate, Declerative, Reproducible
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent :comments both
+#+PROPERTY: header-args:text :comments no
+#+PROPERTY: header-args:json :comments no
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* Early OOM - balanced policy and installer
+This script writes the earlyoom systemd drop-in with a conservative, balanced policy
+and restarts the service. It avoids /etc/default/ quoting issues by setting ExecStart directly.
+
+You can switch thresholds by exporting MODE=proactive before running.
+
+#+BEGIN_SRC bash :tangle think/.local/bin/earlyoom-balanced :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+MODE="${MODE:-balanced}"   # balanced or proactive
+PREFER='^(kdeconnectd|fluidsynth|jellyfin|[Oo]bsidian|Telegram|WebExtensions|qmmp)$'
+AVOID='^(floorp|thunar|gvfs.*)$'
+
+if [[ "$MODE" = "balanced" ]]; then
+  M_TERM=5;  M_KILL=3;  S_TERM=15; S_KILL=10
+elif [[ "$MODE" = "proactive" ]]; then
+  M_TERM=7;  M_KILL=5;  S_TERM=20; S_KILL=10
+else
+  echo "Unknown MODE='$MODE' (use balanced or proactive)" >&2
+  exit 1
+fi
+
+DROPIN_DIR="/etc/systemd/system/earlyoom.service.d"
+DROPIN="${DROPIN_DIR}/override.conf"
+
+sudo install -d -m 0755 "$DROPIN_DIR"
+
+# Write drop-in atomically
+TMP="$(mktemp)"
+cat >"$TMP" <<EOF
+[Service]
+EnvironmentFile=
+ExecStart=
+ExecStart=/usr/bin/earlyoom -r 3600 -m ${M_TERM},${M_KILL} -s ${S_TERM},${S_KILL} \
+  --prefer ${PREFER} \
+  --avoid  ${AVOID}
+OOMScoreAdjust=-100
+Nice=-20
+EOF
+sudo install -m 0644 "$TMP" "$DROPIN"
+rm -f "$TMP"
+
+sudo systemctl daemon-reload
+sudo systemctl restart earlyoom
+
+echo "Applied Early OOM policy: mem ${M_TERM}%/${M_KILL}%, swap ${S_TERM}%/${S_KILL}%"
+echo "Prefer: ${PREFER}"
+echo "Avoid:  ${AVOID}"
+
+# Show the running command and thresholds
+if pidof earlyoom >/dev/null; then
+  tr '\0' ' ' </proc/$(pidof earlyoom)/cmdline; echo
+  journalctl -u earlyoom -b --no-pager | tail -n 20
+else
+  echo "earlyoom is not running" >&2
+  exit 2
+fi
+#+END_SRC
+
+* Root sync - copy configs from dotfiles into root
+This script syncs select configs from your dotfiles into root’s home. It auto-detects root’s home.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/root-sync :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+ROOT_HOME="$(getent passwd root | cut -d: -f6)"
+: "${ROOT_HOME:=/root}"
+
+# what to sync
+declare -a ITEMS=(
+  "$HOME/.dotfiles/all/.config/guix/channels.scm"
+  "$HOME/.dotfiles/all/.config/guix/manifests/root.scm"
+  "$HOME/.dotfiles/all/.config/nvim/"
+)
+
+for src in "${ITEMS[@]}"; do
+  if [[ -e "$src" ]]; then
+    dest="${ROOT_HOME}${src#"$HOME"}"
+    sudo install -d -m 0755 "$(dirname "$dest")"
+    # Use rsync for dirs, install for files
+    if [[ -d "$src" ]]; then
+      sudo rsync -a --delete "$src" "$dest"
+    else
+      sudo install -m 0644 "$src" "$dest"
+    fi
+    sudo chown -R root:root "${dest%/}"
+    echo "Synced: $src -> $dest"
+  else
+    echo "Skip missing: $src"
+  fi
+done
+#+END_SRC
+
+* Root Guix apply - channels pull and manifest install (declarative)
+This script uses the synced channels and manifest to pull and apply root’s packages.
+It does not re-benchmark mirrors here, it assumes your bench flow updates channels.scm upstream.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/guix-root-apply :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+ROOT_HOME="$(getent passwd root | cut -d: -f6)"
+: "${ROOT_HOME:=/root}"
+
+DEST_CH="$ROOT_HOME/.config/guix/channels.scm"
+DEST_MAN="$ROOT_HOME/.config/guix/manifests/root.scm"
+
+if [[ ! -r "$DEST_CH" || ! -r "$DEST_MAN" ]]; then
+  echo "Missing root channels or manifest. Run: root-sync" >&2
+  exit 1
+fi
+
+# Pull with explicit channels
+sudo -i env GUIX_LOCPATH="$ROOT_HOME/.guix-profile/lib/locale" guix pull -C "$DEST_CH"
+
+# Apply manifest to root profile
+sudo -i env GUIX_LOCPATH="$ROOT_HOME/.guix-profile/lib/locale" guix package -m "$DEST_MAN"
+
+# Make sudo prefer Guix nvim declaratively
+TMP="$(mktemp)"
+cat > "$TMP" <<'SUDOEOF'
+Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/root/.guix-profile/bin:/root/.config/guix/current/bin"
+Defaults editor=/root/.guix-profile/bin/nvim, env_editor
+SUDOEOF
+sudo install -m 0440 "$TMP" /etc/sudoers.d/10-guix-nvim
+rm -f "$TMP"
+
+# Optional: sync nvim config again, so plugins or state are aligned if desired
+if command -v nvim-sync-root >/dev/null 2>&1; then
+  nvim-sync-root || true
+fi
+
+echo "Applied root Guix manifest and sudo defaults."
+sudo -i nvim --version | sed -n '1,2p' || true
+#+END_SRC
+
+* Makefile include for root Guix targets
+Root-specific mk that mirrors your user guix.mk but operates at /root scope and elevates via sudo.
+
+#+BEGIN_SRC makefile :tangle all/.mk/guix-root.mk :mkdirp yes
+# all/.mk/guix-root.mk
+ifndef GUIX_ROOT_MK_INCLUDED
+GUIX_ROOT_MK_INCLUDED := 1
+
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+.ONESHELL:
+
+GUIX ?= guix
+ROOT_HOME := $(shell getent passwd root | cut -d: -f6)
+ROOT_GUIX_HOME := $(ROOT_HOME)/.config/guix
+ROOT_BENCH_DIR := $(ROOT_GUIX_HOME)/.bench
+ROOT_PULL_CACHE := $(ROOT_BENCH_DIR)/pull-url
+
+# Sync user channels and manifest to root
+.PHONY: guix-root-sync
+guix-root-sync:
+| $(HOME)/.dotfiles/all/.local/bin/root-sync
+
+# Pull using the channels already synced into root
+.PHONY: guix-root-pull
+guix-root-pull: guix-root-sync
+| sudo install -d -m 0755 $(ROOT_BENCH_DIR)
+| sudo -i env GUIX_LOCPATH="$(ROOT_HOME)/.guix-profile/lib/locale" $(GUIX) pull \
+|   -C "$(ROOT_GUIX_HOME)/channels.scm"
+
+# Apply the root manifest
+.PHONY: guix-root-apply
+guix-root-apply: guix-root-pull
+| sudo -i env GUIX_LOCPATH="$(ROOT_HOME)/.guix-profile/lib/locale" $(GUIX) package \
+|   -m "$(ROOT_GUIX_HOME)/manifests/root.scm"
+
+# Garbage collect at root scope
+.PHONY: guix-root-gc
+guix-root-gc:
+| sudo -i $(GUIX) gc
+endif
+#+END_SRC
