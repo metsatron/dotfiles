@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply
+.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
 
 flatpak-remotes:
 | @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
@@ -33,3 +33,11 @@ flatpak-perms-capture:
 flatpak-perms-apply:
 | @chmod +x $(HOME)/.local/bin/flatpak-perms-apply 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-perms-apply
+
+flatpak-bridge:
+| @chmod +x $(HOME)/.local/bin/flatpak-desktop-bridge 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-desktop-bridge
+
+flatpak-bridge-reset:
+| @chmod +x $(HOME)/.local/bin/flatpak-desktop-bridge-reset 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-desktop-bridge-reset
