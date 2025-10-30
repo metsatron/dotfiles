@@ -1,3 +1,4 @@
+;; [[file:../../../loom.org::*Maak control plane (Scheme, XDG-friendly)][Maak control plane (Scheme, XDG-friendly):2]]
 ;;; dotfiles-batch.el --- Batch helpers for literate dotfiles (root-only) -*- lexical-binding: t -*-
 
 (require 'cl-lib)
@@ -20,56 +21,40 @@
       create-lockfiles nil
       vc-follow-symlinks t)
 
+;; Disable tangle comment fences by default for common langs we emit
+(defun lc/set-comments-no (&rest langs)
+  (dolist (L langs)
+    (let* ((var (intern (format "org-babel-default-header-args:%s" L)))
+           (alist (when (boundp var) (symbol-value var))))
+      (set var (cons (cons :comments "no")
+                     (assq-delete-all :comments (or alist '())))))))
+(lc/set-comments-no 'yaml 'json 'css 'lua 'python 'sh 'bash 'emacs-lisp)
+
 ;;; --- LainCore bootstrap for batch tangling ---
 (require 'cl-lib)
 
-;; Defaults (edit here or via the Org “Activation” block later)
-(defvar lc/ui 'adobe-cc-dark-blue)
-(defvar lc/syntax 'adobe-cc-dark-blue)
-(defvar lc/overrides nil)
+;;; --- Laincore bootstrap for dynamic :tangle headers ------------------------
 
-;; UI palettes
-(defvar lc/palettes
-  '((adobe-cc-dark-blue
-     :white "#ffffff" :lighter "#5b5b5b" :base "#454545" :darker "#303030" :black "#000000"
-     :accent "#4b6983")
-    (chatgpt-dark-purple
-     :white "#ffffff" :lighter "#414141" :base "#303030" :darker "#212121" :black "#0d0d0d"
-     :accent "#6b3ab4")
-    (obsidian-gray
-     :white "#ECECEC" :lighter "#363636" :base "#1e1e1e" :darker "#262626" :black "#000000"
-     :accent "#8CCEFF")
-    (grok-dark
-     :white "#e6e6e6" :lighter "#1b1d22" :base "#0f1115" :darker "#0b0d11" :black "#000000"
-     :accent "#7c44ff")
-    (claude-dark
-     :white "#e8eaed" :lighter "#1e1f22" :base "#111214" :darker "#0b0c0d" :black "#000000"
-     :accent "#6b9cff")))
-
-(defun lc/p (theme key) (plist-get (alist-get theme lc/palettes) key))
-
-;; Syntax palettes
-(defvar lc/syntax-palettes
-  '((adobe-cc-dark-blue
-     :bg "#1f1f1f" :fg "#dbdbdb" :ui-accent "#4b6983"
-     :string "#98c379" :keyword "#c678dd" :type "#61afef" :func "#e5c07b"
-     :comment "#7f848e" :const "#d19a66" :error "#e06c75")
-    (chatgpt-dark-purple
-     :bg "#212121" :fg "#e2e6ea" :ui-accent "#6b3ab4"
-     :string "#98c379" :keyword "#bb86fc" :type "#82aaff" :func "#e5c07b"
-     :comment "#9aa3ab" :const "#d19a66" :error "#e06c75")
-    (obsidian-gray
-     :bg "#1e1e1e" :fg "#ECECEC" :ui-accent "#8CCEFF"
-     :string "#C8F6A3" :keyword "#FFA870" :type "#9DE6FF" :func "#9BB8FF"
-     :comment "#9EA4AA" :const "#FFD0AA" :error "#FF6E6E")
-    (grok-dark
-     :bg "#0f1115" :fg "#e6e6e6" :ui-accent "#7c44ff"
-     :string "#b6f09c" :keyword "#b085ff" :type "#89b4ff" :func "#ffd28d"
-     :comment "#a3a3a3" :const "#e8b882" :error "#ff6b6b")
-    (claude-dark
-     :bg "#111214" :fg "#e8eaed" :ui-accent "#6b9cff"
-     :string "#97d59a" :keyword "#b58cff" :type "#6b9cff" :func "#ffd48a"
-     :comment "#a0a4a8" :const "#d19a66" :error "#ff6b6b")))
+(defun lc/batch-boot-if-needed (&optional root)
+  (let* ((root (file-name-as-directory (or root default-directory)))
+         (style (expand-file-name "style.org" root))
+         (auto  (expand-file-name "all/.local/bin/laincore-autoload.el" root)))
+    ;; non-fatal autoload — defines stubs like lc/emit if real boot fails
+    (when (file-readable-p auto) (load auto t t))
+    (when (and (not (fboundp 'lc/emit))
+               (file-readable-p style))
+      (require 'org) (require 'ob-emacs-lisp)
+      (let ((org-confirm-babel-evaluate nil))
+        (with-current-buffer (find-file-noselect style)
+          (save-excursion
+            (condition-case _ (progn
+                                (org-babel-goto-named-src-block "lc-bootstrap")
+                                (org-babel-execute-src-block))
+              (error nil))
+            (condition-case _ (progn
+                                (org-babel-goto-named-src-block "lc-activate")
+                                (org-babel-execute-src-block))
+              (error nil))))))))
 
 (defun lc/s (theme key) (plist-get (alist-get theme lc/syntax-palettes) key))
 
@@ -132,14 +117,30 @@
       (kill-buffer))))
 
 (defun dotfiles-batch-tangle (root)
-  "Tangle ROOT/*.org only, confirmation disabled."
+  "Tangle ROOT/*.org only; if FILE==style.org also run the emitter blocks."
   (interactive "DRoot: ")
+  (setq root (file-name-as-directory (expand-file-name root)))
+  ;; make lc/* available for dynamic :tangle, then tangle
+  (lc/batch-boot-if-needed root)
   (let ((org-confirm-babel-evaluate nil))
     (dolist (f (dotfiles--root-org-files root))
+      (message ">> TANGLE %s" f)
       (with-current-buffer (find-file-noselect f)
         (org-mode)
         (org-babel-tangle)
+        ;; ALSO run “:tangle no” emitters for style.org
+        (when (string= (file-name-nondirectory f) "style.org")
+          (dolist (blk '("lc-bootstrap" "lc-activate"
+                         "emit-gtk3-settings-ini" "emit-gtk3-css"
+                         "emit-xfce4-terminal-theme" "emit-doom-base16-theme"
+                         "emit-wezterm-flatpak" "emit-vscodium-theme"
+                         "emit-emacs-vterm-ansi"))
+            (condition-case _ (progn
+                                (org-babel-goto-named-src-block blk)
+                                (org-babel-execute-src-block))
+              (error nil))))
         (kill-buffer)))))
 
 (provide 'dotfiles-batch)
 ;;; dotfiles-batch.el ends here
+;; Maak control plane (Scheme, XDG-friendly):2 ends here
