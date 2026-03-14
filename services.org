@@ -1,0 +1,956 @@
+#+TITLE: Services Loom: DotCortex
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* Services Loom
+This loom tracks small service wrappers and helper scripts that live in
+the =.local/bin= overlays and are deployed via stow.
+
+** Jellyfin toggle (ThinkPad X230 server)
+This script lives in the =think= overlay, it is specific to the current
+X230 that is running Jellyfin as a systemd service.
+#+BEGIN_SRC bash :tangle think/.local/bin/jellyfin-toggle :shebang "#!/bin/sh"
+# jellyfin-toggle
+# Toggle Jellyfin Media Server on and off via systemd.
+# Requires sudoers entry:
+#   metsatron ALL=(root) NOPASSWD: /usr/bin/systemctl
+
+if systemctl is-active --quiet jellyfin; then
+  exec sudo -n /usr/bin/systemctl stop jellyfin
+else
+  exec sudo -n /usr/bin/systemctl start jellyfin
+fi
+#+END_SRC
+
+After first tangle:
+
+#+BEGIN_SRC bash
+chmod +x ~/.dotfiles/think/.local/bin/jellyfin-toggle
+#+END_SRC
+
+Panel launcher command:
+#+BEGIN_SRC bash
+sh -c 'if systemctl is-active --quiet jellyfin; then sudo -n /usr/bin/systemctl stop jellyfin; else sudo -n /usr/bin/systemctl start jellyfin; fi'
+#+END_SRC
+
+*** Jellyfin sudoers drop in (manual step)
+This is not tangled, since =/etc/sudoers.d= is root territory. The doc
+lives here so the setup is reproducible.
+
+Install or re install with:
+#+BEGIN_SRC bash
+sudo visudo -f /etc/sudoers.d/jellyfin-toggle
+#+END_SRC
+
+Then type this line by hand inside =visudo=:
+#+BEGIN_SRC sudoers
+metsatron ALL=(root) NOPASSWD: /usr/bin/systemctl
+#+END_SRC
+
+Test:
+#+BEGIN_SRC bash
+sudo -n /usr/bin/systemctl status jellyfin
+sudo -n /usr/bin/systemctl stop jellyfin
+sudo -n /usr/bin/systemctl start jellyfin
+#+END_SRC
+
+If there is no password prompt, the panel toggle is good.
+
+** xfdesktop reset helper (daemonized murder, parked)
+This helper kills and restarts =xfdesktop= when it gets bloated.
+It is documented here but not yet installed.
+#+BEGIN_SRC bash :tangle no :shebang "#!/bin/sh"
+# xfdesktop-reset
+# Kill xfdesktop and restart it on the current DISPLAY.
+
+pkill xfdesktop || true
+xfdesktop &
+#+END_SRC
+
+If xfdesktop starts creeping back to ~500 600 MiB after long uptimes,
+this script can be promoted into a real =.local/bin= target and wired
+to a user systemd timer.
+
+* Swapfetch
+#+NAME: swapfetch
+#+BEGIN_SRC bash :tangle think/.local/bin/swapfetch :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+# Nerd Font icons
+ICON_ZRAM="󰓅"   # ZRAM / compression
+ICON_SWAP="󰓾"   # swap/disk
+ICON_MEM=""    # RAM
+
+# Colors (always on; tune shades in style.org if you like)
+C_HDR=$'\e[1;36m'     # cyan bold (headers)
+C_LABEL=$'\e[1;33m'   # yellow bold (labels)
+C_VAL=$'\e[1;37m'     # white bold  (values)
+C_DIM=$'\e[2;37m'     # dim white   (background / secondary)
+C_OK=$'\e[1;32m'      # green
+C_WARM=$'\e[1;33m'    # yellow
+C_HOT=$'\e[1;31m'     # red
+C_RESET=$'\e[0m'
+
+C_BOLD=$'\033[1m'
+
+# Bar background: “12th” color – you already settled on #454545
+C_BAR_BG=$'\e[38;5;11m'
+
+# Logo color: *this* is the one that makes the banner colorful.
+# Use header cyan by default; change to C_LABEL if you want gold.
+: "${C_LOGO:=$C_HDR}"
+
+# --- optional watch mode: swapfetch --watch [seconds] ---
+if [[ "${SWAPFETCH_SKIP_WATCH:-0}" != "1" ]]; then
+  case "${1-}" in
+    -w|--watch)
+      shift
+      interval="${1-5}"
+      # default to 5 if not a simple integer
+      [[ "$interval" =~ ^[0-9]+$ ]] || interval=5
+
+      while :; do
+        clear
+        printf "swapfetch (every %ss) - %s\n\n" "$interval" "$(date '+%H:%M:%S')"
+        SWAPFETCH_SKIP_WATCH=1 "$0"
+        sleep "$interval"
+      done
+      exit 0
+      ;;
+  esac
+fi
+
+print_header() {
+  printf '%b%s%b\n' "$C_HDR" "$1" "$C_RESET"
+}
+
+gauge_color_for() {
+  local pct=$1
+  if   (( pct >= 90 )); then printf '%s' "$C_HOT"
+  elif (( pct >= 70 )); then printf '%s' "$C_WARM"
+  else                       printf '%s' "$C_OK"
+  fi
+}
+
+gauge_bar() {
+  local pct=$1
+  local width=${2:-24}
+  local col="${3:-$C_OK}"      # filled color
+  local bg="${4:-$C_BAR_BG}"   # empty + right cap color
+
+  ((pct < 0))   && pct=0
+  ((pct > 100)) && pct=100
+
+  local filled=$(( (pct * width + 50) / 100 ))
+  ((filled > width)) && filled=$width
+
+  local filled_str="" empty_str=""
+  local i
+  for ((i=1; i<=filled; i++)); do
+    filled_str+="█"
+  done
+  for ((; i<=width; i++)); do
+    empty_str+="█"
+  done
+
+  # left cap + filled in severity color; empty + right cap in bar-bg color
+  printf '%b' "${col}${filled_str}${bg}${empty_str}${C_RESET}"
+}
+
+# ---------- ZRAM (zram0) ----------
+print_header "$ICON_ZRAM  ZRAM (zram0)"
+
+if [ -r /sys/block/zram0/mm_stat ]; then
+  eval "$(
+    awk '{
+      og = $1/1024/1024/1024;   # orig_data
+      cg = $2/1024/1024/1024;   # compr_data
+      mg = $3/1024/1024/1024;   # mem_used_total
+      lg = $4/1024/1024/1024;   # mem_limit
+      xg = $5/1024/1024/1024;   # max_used
+      ratio = ($2 > 0 ? $1 / $2 : 0);
+      printf "Z_ORIG=%.2f\n",  og;
+      printf "Z_COMPR=%.2f\n", cg;
+      printf "Z_MEM=%.2f\n",   mg;
+      printf "Z_LIMIT=%.2f\n", lg;
+      printf "Z_MAX=%.2f\n",   xg;
+      printf "Z_RATIO=%.2f\n", ratio;
+    }' /sys/block/zram0/mm_stat
+  )"
+else
+  Z_ORIG=0 Z_COMPR=0 Z_MEM=0 Z_LIMIT=0 Z_MAX=0 Z_RATIO=0
+fi
+
+# Big ASCII logo (no awk, no escaping hell)
+mapfile -t ZLOGO <<'EOF'
+ ____ _ __ __ _ _ __ _ _     ___ __      __ _   _ __
+|_  /| '__/ _` | '_ ` _ \ _ / __|\ \ /\ / / _` | '_ \
+ / / | | | (_| | | | | | |_|\__ \ \ V  V / (_| | |_) |
+/___||_|  \__,_|_| |_| |_|  |___/  \_/\_/ \__,_| .__/
+                                                  |_|
+EOF
+
+printf "  %sorig_data%s   : %s%.2f GiB%s  %s%s%s\n" \
+  "$C_LABEL" "$C_RESET" "$C_VAL" "$Z_ORIG"  "$C_RESET" "$C_LOGO" "${ZLOGO[0]}" "$C_RESET"
+
+printf "  %scompr_data%s  : %s%.2f GiB%s  %s%s%s\n" \
+  "$C_LABEL" "$C_RESET" "$C_VAL" "$Z_COMPR" "$C_RESET" "$C_LOGO" "${ZLOGO[1]}" "$C_RESET"
+
+printf "  %smem_used%s    : %s%.2f GiB%s  %s%s%s\n" \
+  "$C_LABEL" "$C_RESET" "$C_VAL" "$Z_MEM"   "$C_RESET" "$C_LOGO" "${ZLOGO[2]}" "$C_RESET"
+
+printf "  %smax_used%s    : %s%.2f GiB%s  %s%s%s\n" \
+  "$C_LABEL" "$C_RESET" "$C_VAL" "$Z_MAX"   "$C_RESET" "$C_LOGO" "${ZLOGO[3]}" "$C_RESET"
+
+if [ "${Z_LIMIT%.*}" -gt 0 ] 2>/dev/null; then
+  printf "  %smem_limit%s   : %s%.2f GiB%s\n" \
+    "$C_LABEL" "$C_RESET" "$C_VAL" "$Z_LIMIT" "$C_RESET"
+fi
+
+printf "  %scompression%s : %s%.2fx%s  %s%s%s\n\n" \
+  "$C_LABEL" "$C_RESET" "$C_VAL" "$Z_RATIO" "$C_RESET" \
+  "$C_LOGO" "${ZLOGO[4]}" "$C_RESET"
+
+# --- Swap devices ---------------------------------------------------------
+print_header "$ICON_SWAP  Swap devices"
+
+swapon --show=NAME,SIZE,USED,PRIO --bytes 2>/dev/null | \
+  awk 'NR==1 {next} {print $1, $2, $3, $4}' | \
+  while read -r name size used prio; do
+    [ -z "${name:-}" ] && continue
+    [ "${size:-0}" -eq 0 ] && continue
+
+    # percentage (rounded)
+    pct=$(( (used * 100 + size/2) / size ))
+    ((pct < 0))   && pct=0
+    ((pct > 100)) && pct=100
+
+    col="$(gauge_color_for "$pct")"
+    bar="$(gauge_bar "$pct" 24 "$col")"   # bg defaults to C_BAR_BG now
+
+    # human-readable GiB
+    read -r used_gib size_gib <<EOF
+$(awk -v u="$used" -v s="$size" 'BEGIN {printf "%.1f %.1f\n", u/1024/1024/1024, s/1024/1024/1024}')
+EOF
+
+    printf "  %s%-16s%s %s %s%5.1f/%-5.1f GiB%s (%3d%%) prio %d\n" \
+      "$C_LABEL" "$name" "$C_RESET" \
+      "$bar" \
+      "$C_VAL" "$used_gib" "$size_gib" "$C_RESET" \
+      "$pct" "$prio"
+  done
+
+echo
+
+# --- Memory summary -------------------------------------------------------
+print_header "$ICON_MEM  Memory"
+
+# Raw bytes for math
+eval "$(free -b | awk '
+/^Mem:/  { printf "MEM_TOTAL=%s MEM_USED=%s MEM_FREE=%s MEM_AVAIL=%s\n", $2,$3,$4,$7 }
+/^Swap:/ { printf "SWAP_TOTAL=%s SWAP_USED=%s SWAP_FREE=%s\n", $2,$3,$4 }
+')"
+
+mem_pct=0
+swap_pct=0
+if [[ ${MEM_TOTAL:-0} -gt 0 ]]; then
+  mem_pct=$(( (MEM_USED * 100 + MEM_TOTAL/2) / MEM_TOTAL ))
+fi
+if [[ ${SWAP_TOTAL:-0} -gt 0 ]]; then
+  swap_pct=$(( (SWAP_USED * 100 + SWAP_TOTAL/2) / SWAP_TOTAL ))
+fi
+
+mem_col=$(gauge_color_for "$mem_pct")
+swap_col=$(gauge_color_for "$swap_pct")
+mem_bar=$(gauge_bar "$mem_pct" 30 "$mem_col")
+swap_bar=$(gauge_bar "$swap_pct" 30 "$swap_col")
+
+# Pretty numbers from free -h
+free -h | awk -v label="$C_LABEL" -v val="$C_VAL" -v reset="$C_RESET" '
+NR==2 {
+  printf "  %sMem %s total=%s%s%s used=%s%s%s free=%s%s%s avail=%s%s%s\n",
+         label, reset,
+         val, $2, reset,
+         val, $3, reset,
+         val, $4, reset,
+         val, $7, reset;
+}
+NR==3 {
+  printf "  %sSwap%s total=%s%s%s used=%s%s%s free=%s%s%s\n",
+         label, reset,
+         val, $2, reset,
+         val, $3, reset,
+         val, $4, reset;
+}
+'
+
+printf "  %sMem use%s   %s %s%3d%%%s\n" \
+  "$C_LABEL" "$C_RESET" "$mem_bar" "$C_VAL" "$mem_pct" "$C_RESET"
+printf "  %sSwap use%s  %s %s%3d%%%s\n" \
+  "$C_LABEL" "$C_RESET" "$swap_bar" "$C_VAL" "$swap_pct" "$C_RESET"
+
+#+END_SRC
+
+* Swap tools
+** swaptop – top by VmSwap (btop-ish)
+#+BEGIN_SRC bash :tangle think/.local/bin/swaptop :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+interval="${1:-5}"
+
+# === Colors – keep in sync with swapfetch ===
+
+# Nerd Font style: same palette as swapfetch
+C_HDR=$'\e[1;36m'     # cyan bold (headers)
+C_LABEL=$'\e[1;33m'   # yellow bold (labels)
+C_VAL=$'\e[1;37m'     # white bold  (values)
+C_DIM=$'\e[2;37m'     # dim white   (background / secondary)
+C_OK=$'\e[1;32m'      # green
+C_WARM=$'\e[1;33m'    # yellow
+C_HOT=$'\e[1;31m'     # red
+C_RESET=$'\e[0m'
+C_BOLD=$'\033[1m'
+
+# Bar background: “12th” color – aligned with swapfetch’s style
+C_BAR_BG=$'\e[38;5;11m'
+
+# Logo/header color
+: "${C_LOGO:=$C_HDR}"
+
+gauge_color_for() {
+  local pct=$1
+  if   (( pct >= 90 )); then printf '%s' "$C_HOT"
+  elif (( pct >= 70 )); then printf '%s' "$C_WARM"
+  else                       printf '%s' "$C_OK"
+  fi
+}
+
+gauge_bar() {
+  local pct=$1
+  local width=${2:-24}
+  local col="${3:-$C_OK}"      # filled color
+  local bg="${4:-$C_BAR_BG}"   # unfilled “background”
+
+  ((pct < 0))   && pct=0
+  ((pct > 100)) && pct=100
+
+  local filled=$(( (pct * width + 50) / 100 ))
+  ((filled > width)) && filled=$width
+
+  local filled_str="" empty_str=""
+  local i
+  for ((i=1; i<=filled; i++)); do
+    filled_str+="█"
+  done
+  for ((; i<=width; i++)); do
+    empty_str+="█"
+  done
+
+  printf '%b' "${col}${filled_str}${bg}${empty_str}${C_RESET}"
+}
+
+# Use tput if available so we can move the cursor without nuking scrollback
+HAS_TPUT=0
+if command -v tput >/dev/null 2>&1; then
+  HAS_TPUT=1
+  tput civis 2>/dev/null || true
+  trap 'tput cnorm 2>/dev/null || true; exit' INT TERM
+fi
+
+# How many process rows we printed last time
+LAST_ROWS=0
+
+print_row() {
+  local idx="$1"
+  local line pid kb pct col bar mib cmdline
+
+  line=${_rows[idx]}
+  set -- $line
+  pid=$1
+  kb=$2
+
+  [[ -z "$pid" || -z "$kb" ]] && return 0
+
+  # percent of total swap
+  pct=$(( (kb * 100 + local_total_swap_kb/2) / local_total_swap_kb ))
+  ((pct < 0))   && pct=0
+  ((pct > 100)) && pct=100
+
+  col="$(gauge_color_for "$pct")"
+  bar="$(gauge_bar "$pct" 24 "$col" "$C_BAR_BG")"
+
+  # human readable MiB
+  mib=$(awk -v k="$kb" 'BEGIN {printf "%.1f", k/1024}')
+
+  # command line (shortened single-line)
+  cmdline=$(ps -p "$pid" -o comm=,args= 2>/dev/null || true)
+  cmdline=${cmdline# }
+  cmdline=${cmdline//$'\n'/ }
+  cmdline=${cmdline:0:60}
+
+  printf "%7s %7s MiB %3d%% %s %s\n" \
+    "$pid" "$mib" "$pct" "$bar" "$cmdline"
+}
+
+while :; do
+  # Terminal height (only if tput exists)
+  if (( HAS_TPUT )); then
+    term_lines=$(tput lines 2>/dev/null || echo 24)
+  else
+    term_lines=24
+  fi
+
+  # Total swap in KiB
+  local_total_swap_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+  (( local_total_swap_kb == 0 )) && local_total_swap_kb=1
+
+  # Collect processes sorted by VmSwap DESC
+  mapfile -t _rows < <(
+    awk '/^VmSwap:/ {print FILENAME, $2}' /proc/[0-9]*/status 2>/dev/null \
+      | sed 's#/proc/\([0-9]*\)/status#\1#' \
+      | sort -k2,2nr
+  )
+
+  rows_len=${#_rows[@]}
+  if (( rows_len == 0 )); then
+    current_rows=0
+  else
+    # 1 title + 1 header + 1 separator + 1 breathing line = 4
+    max_rows=$((term_lines - 4))
+    ((max_rows < 1)) && max_rows=1
+    current_rows=$rows_len
+    ((current_rows > max_rows)) && current_rows=$max_rows
+  fi
+
+  if (( HAS_TPUT )); then
+    # --- Header lines (each one: move, clear line, print) ---
+
+    tput cup 0 0 2>/dev/null
+    printf '\033[K'
+    printf '%b%s%b  (interval %ss)\n' \
+      "$C_HDR" "swaptop – top VmSwap users" "$C_RESET" "$interval"
+
+    tput cup 1 0 2>/dev/null
+    printf '\033[K'
+    printf '%b%-7s %-8s %-8s %-5s %-s%b\n' \
+      "$C_LABEL" "PID" "SWAP" "PCT" "BAR" "COMMAND" "$C_RESET"
+
+    tput cup 2 0 2>/dev/null
+    printf '\033[K'
+    printf '%s\n' "--------------------------------------------------------------------------"
+
+    if (( current_rows == 0 )); then
+      # No rows: print a single status line
+      tput cup 3 0 2>/dev/null
+      printf '\033[K'
+      printf "   (no processes with VmSwap)\n"
+    else
+      # Print each row at a fixed line, clearing only that line
+      for ((idx=0; idx<current_rows; idx++)); do
+        line_no=$((3 + idx))
+        tput cup "$line_no" 0 2>/dev/null
+        printf '\033[K'
+        print_row "$idx"
+      done
+    fi
+
+    # If we had more rows last time, blank the leftovers
+    if (( LAST_ROWS > current_rows )); then
+      for ((idx=current_rows; idx<LAST_ROWS; idx++)); do
+        line_no=$((3 + idx))
+        tput cup "$line_no" 0 2>/dev/null
+        printf '\033[K'
+      done
+    fi
+
+  else
+    # Fallback: dumb terminal – just print a fresh block each tick
+    printf '%b%s%b  (interval %ss)\n' \
+      "$C_HDR" "swaptop – top VmSwap users" "$C_RESET" "$interval"
+    printf '%b%-7s %-8s %-8s %-5s %-s%b\n' \
+      "$C_LABEL" "PID" "SWAP" "PCT" "BAR" "COMMAND" "$C_RESET"
+    printf '%s\n' "--------------------------------------------------------------------------"
+
+    if (( current_rows == 0 )); then
+      printf "   (no processes with VmSwap)\n"
+    else
+      for ((idx=0; idx<current_rows; idx++)); do
+        print_row "$idx"
+      done
+    fi
+  fi
+
+  LAST_ROWS=$current_rows
+  sleep "$interval"
+done
+#+END_SRC
+
+** xfce4-refresh – recycle XFCE desktop daemons via host-wrap
+#+begin_src bash :tangle think/.local/bin/xfce4-refresh :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+log() {
+  printf '[xfce4-refresh] %s\n' "$*"
+}
+
+kill_if_running() {
+  local name="$1"
+  if pgrep -x "$name" >/dev/null 2>&1; then
+    log "Killing $name…"
+    pkill -x "$name" || true
+  fi
+}
+
+start_with_host_wrap_if_missing() {
+  local name="$1"
+  if ! pgrep -x "$name" >/dev/null 2>&1; then
+    if command -v host-wrap >/dev/null 2>&1; then
+      log "Starting $name via host-wrap…"
+      nohup host-wrap "$name" >/dev/null 2>&1 &
+    else
+      log "host-wrap not found; starting $name directly…"
+      nohup "$name" >/dev/null 2>&1 &
+    fi
+  fi
+}
+
+log "Refreshing XFCE desktop daemons"
+
+# 1) Kill screensaver and leave it dead - handle truncated comm name
+if pgrep -x xfce4-screensav >/dev/null 2>&1 || pgrep -f /usr/bin/xfce4-screensaver >/dev/null 2>&1; then
+  log "Killing xfce4-screensaver..."
+  pkill -x xfce4-screensav || pkill -f /usr/bin/xfce4-screensaver || true
+fi
+
+# 2) Clipman: kill + restart (via host-wrap)
+kill_if_running xfce4-clipman
+start_with_host_wrap_if_missing xfce4-clipman
+
+# 3) Desktop: kill + restart (via host-wrap)
+kill_if_running xfdesktop
+start_with_host_wrap_if_missing xfdesktop
+
+# 4) Notifications: kill + restart (via host-wrap)
+if command -v xfce4-notifyd >/dev/null 2>&1; then
+  kill_if_running xfce4-notifyd
+  start_with_host_wrap_if_missing xfce4-notifyd
+fi
+
+# 5) xfrun4 - kill if it is hanging around - do not restart
+kill_if_running xfrun4
+
+# 6) Panel + settings: delegate to canonical healer
+if command -v xfce4-heal >/dev/null 2>&1; then
+  log "Delegating panel + settings restart to xfce4-heal…"
+  xfce4-heal
+elif command -v xfce4-panel >/dev/null 2>&1; then
+  # Fallback path if xfce4-heal is missing for some reason
+  if pgrep -x xfce4-panel >/dev/null 2>&1; then
+    log "xfce4-heal missing; trying xfce4-panel -r fallback…"
+    if ! xfce4-panel -r >/dev/null 2>&1; then
+      log "xfce4-panel -r failed, trying kill + restart via host-wrap/direct…"
+      kill_if_running xfce4-panel
+      start_with_host_wrap_if_missing xfce4-panel
+    fi
+  else
+    log "xfce4-heal missing; xfce4-panel not running, starting fresh via host-wrap…"
+    start_with_host_wrap_if_missing xfce4-panel
+  fi
+fi
+
+log "Done."
+#+end_src
+
+** xfce4-refresh-guardian – early panel refresh on high swap + panel revive
+#+BEGIN_SRC bash :tangle think/.local/bin/xfce4-refresh-guardian :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+# xfce4-refresh-guardian – early refresh trigger based on swap
+# and “is the panel actually visible?”
+
+set -euo pipefail
+
+SWAP_LIMIT="${SWAP_LIMIT:-80}"
+
+DO_RESTART=0
+if [[ "${1:-}" == "--restart" || "${1:-}" == "-r" ]]; then
+  DO_RESTART=1
+fi
+
+# --- helper: is the xfce4-panel actually alive (proc + window)? ---
+panel_is_alive=0
+
+if pgrep -x xfce4-panel >/dev/null 2>&1; then
+  # We have a process – now check for a real panel window if wmctrl exists.
+  if command -v wmctrl >/dev/null 2>&1; then
+    if wmctrl -lx 2>/dev/null | grep -qi "xfce4-panel.Xfce4-panel"; then
+      panel_is_alive=1
+    else
+      printf '[xfce4-refresh-guardian] xfce4-panel process found, but no panel window.\n'
+    fi
+  else
+    # No wmctrl? fall back to trusting the process
+    panel_is_alive=1
+  fi
+else
+  printf '[xfce4-refresh-guardian] No xfce4-panel process.\n'
+fi
+
+# If the panel is missing (no process OR no window), healing is top priority.
+if (( panel_is_alive == 0 )); then
+  printf '[xfce4-refresh-guardian] xfce4-panel is NOT alive, attempting heal via xfce4-heal…\n'
+  if command -v xfce4-heal >/dev/null 2>&1; then
+    xfce4-heal
+    # Give it a moment, then re-check both process + window.
+    sleep 1
+
+    panel_is_alive_after=0
+    if pgrep -x xfce4-panel >/dev/null 2>&1; then
+      if command -v wmctrl >/dev/null 2>&1; then
+        if wmctrl -lx 2>/dev/null | grep -qi "xfce4-panel.Xfce4-panel"; then
+          panel_is_alive_after=1
+        fi
+      else
+        panel_is_alive_after=1
+      fi
+    fi
+
+    if (( panel_is_alive_after == 1 )); then
+      printf '[xfce4-refresh-guardian] Panel is now running (process + window detected).\n'
+    else
+      printf '[xfce4-refresh-guardian] Heal attempted, but panel still not detected.\n'
+    fi
+  else
+    printf '[xfce4-refresh-guardian] xfce4-heal not found; cannot restore panel.\n'
+  fi
+
+  # Panel health is a higher priority than swap tuning – stop here.
+  exit 0
+fi
+
+# --- at this point: panel_is_alive == 1, proceed with swap threshold logic ---
+
+# Read swap from /proc/meminfo (KiB)
+swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+swap_free_kb=$(awk '/^SwapFree:/  {print $2}' /proc/meminfo)
+
+if (( swap_total_kb == 0 )); then
+  SWAP_PCT=0
+else
+  swap_used_kb=$((swap_total_kb - swap_free_kb))
+  SWAP_PCT=$(( (swap_used_kb * 100 + swap_total_kb/2) / swap_total_kb ))
+fi
+
+printf '[xfce4-refresh-guardian] THRESHOLD: SWAP=%d%% (limit %d%%)\n' \
+  "$SWAP_PCT" "$SWAP_LIMIT"
+
+if (( SWAP_PCT >= SWAP_LIMIT )); then
+  if (( DO_RESTART )); then
+    if command -v xfce4-refresh >/dev/null 2>&1; then
+      printf '[xfce4-refresh-guardian] Triggering xfce4-refresh (early recycle)…\n'
+      xfce4-refresh
+    else
+      printf '[xfce4-refresh-guardian] xfce4-refresh not found, nothing to do.\n'
+    fi
+  else
+    printf '[xfce4-refresh-guardian] Would run xfce4-refresh (dry run).\n'
+  fi
+else
+  printf '[xfce4-refresh-guardian] Below threshold, nothing to do.\n'
+fi
+#+END_SRC
+
+* swap-guardian systemd units
+#+BEGIN_SRC bash :tangle think/.config/systemd/user/early-refresh.service :mkdirp yes
+[Unit]
+Description=Early refresh based on RAM/SWAP thresholds
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env xfce4-refresh-guardian --restart
+KillMode=process
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle think/.config/systemd/user/early-refresh.timer :mkdirp yes
+[Unit]
+Description=Run early-refresh guardian periodically
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30s
+Unit=early-refresh.service
+
+[Install]
+WantedBy=default.target
+#+END_SRC
+
+Handy commands for “show me everything right now”:
+#+BEGIN_EXAMPLE
+# Timer status:
+systemctl --user status early-refresh.timer
+
+# Service status (last run):
+systemctl --user status early-refresh.service
+
+# See when it’s scheduled:
+systemctl --user list-timers 'early-refresh*'
+
+# And logs for the guardian:
+journalctl --user -u early-refresh.service --since "1 hour ago"
+
+# show the actual unit contents systemd is using
+systemctl --user cat early-refresh.timer early-refresh.service
+
+# run it immediately (without waiting for the timer)
+systemctl --user start early-refresh.service
+
+# watch logs live while you test
+journalctl --user -fu early-refresh.service
+
+# stop it completely
+systemctl --user disable --now early-refresh.timer
+#+END_EXAMPLE
+
+** xfce-show-desktop – toggle show-desktop and ensure xfdesktop
+#+BEGIN_SRC bash :tangle think/.local/bin/xfce4-show-desktop :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+log() {
+  printf '[xfce-show-desktop] %s\n' "$*"
+}
+
+ensure_xfdesktop() {
+  if ! pgrep -x xfdesktop >/dev/null 2>&1; then
+    log "xfdesktop not running, starting…"
+    if command -v host-wrap >/dev/null 2>&1; then
+      nohup host-wrap xfdesktop >/dev/null 2>&1 &
+    else
+      nohup xfdesktop >/dev/null 2>&1 &
+    fi
+  fi
+}
+
+toggle_show_desktop() {
+  if ! command -v wmctrl >/dev/null 2>&1; then
+    log "wmctrl not found, cannot toggle show desktop"
+    exit 1
+  fi
+
+  # _NET_SHOWING_DESKTOP: 0 = normal, 1 = show desktop
+  local state
+  state=$(xprop -root _NET_SHOWING_DESKTOP 2>/dev/null | awk '{print $3}' || echo 0)
+
+  if [[ "$state" = "0" ]]; then
+    log "Enabling show desktop"
+    wmctrl -k on
+  else
+    log "Disabling show desktop"
+    wmctrl -k off
+  fi
+}
+
+ensure_xfdesktop
+toggle_show_desktop
+#+END_SRC
+
+** xfce4-heal - restart XFCE settings + panel in a clean env
+#+BEGIN_SRC bash :tangle think/.local/bin/xfce4-heal :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+log() {
+  printf '[xfce4-heal] %s\n' "$*"
+}
+
+# Panel log file (for stdout/stderr of xfce4-panel)
+PANEL_LOG="${XDG_CACHE_HOME:-$HOME/.cache}/xfce4-panel-heal.log"
+mkdir -p "$(dirname "$PANEL_LOG")"
+log "xfce4-panel log: $PANEL_LOG"
+
+# Capture session env we actually want to preserve
+SESSION_PATH="${PATH:-/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin}"
+SESSION_LANG="${LANG:-en_AU.UTF-8}"
+
+SESSION_XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+SESSION_XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+SESSION_XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-XFCE}"
+SESSION_XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+SESSION_XDG_DATA_DIRS="${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+SESSION_XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+
+# Global menu / integration knobs
+SESSION_GTK_MODULES="${GTK_MODULES:-appmenu-gtk-module}"
+SESSION_UBUNTU_MENUPROXY="${UBUNTU_MENUPROXY:-1}"
+SESSION_QT_QPA_PLATFORMTHEME="${QT_QPA_PLATFORMTHEME:-gtk2}"
+
+# nocsd hook, force it for the panel if present
+NO_CSD_LIB="/usr/lib/x86_64-linux-gnu/libgtk3-nocsd.so.0"
+if [ ! -e "$NO_CSD_LIB" ]; then
+  NO_CSD_LIB=""
+fi
+
+log "Using PATH=${SESSION_PATH}"
+log "Using XDG_RUNTIME_DIR=${SESSION_XDG_RUNTIME_DIR}, XDG_SESSION_TYPE=${SESSION_XDG_SESSION_TYPE}, XDG_CURRENT_DESKTOP=${SESSION_XDG_CURRENT_DESKTOP}"
+log "Using XDG_DATA_DIRS=${SESSION_XDG_DATA_DIRS}, XDG_DATA_HOME=${SESSION_XDG_DATA_HOME}"
+log "Using GTK_MODULES=${SESSION_GTK_MODULES}, UBUNTU_MENUPROXY=${SESSION_UBUNTU_MENUPROXY}, QT_QPA_PLATFORMTHEME=${SESSION_QT_QPA_PLATFORMTHEME}"
+log "Using LD_PRELOAD=${NO_CSD_LIB:-<empty>} for panel tree"
+
+# Run the actual heal logic inside a minimal, clean environment.
+# Note: we do NOT carry over GIO_EXTRA_MODULES or other Guix glue here.
+env -i \
+  HOME="${HOME}" \
+  USER="${USER:-$LOGNAME}" \
+  SHELL="${SHELL:-/bin/bash}" \
+  TERM="${TERM:-xterm-256color}" \
+  DISPLAY="${DISPLAY:-:0}" \
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}" \
+  XDG_RUNTIME_DIR="${SESSION_XDG_RUNTIME_DIR}" \
+  XDG_SESSION_TYPE="${SESSION_XDG_SESSION_TYPE}" \
+  XDG_CURRENT_DESKTOP="${SESSION_XDG_CURRENT_DESKTOP}" \
+  XDG_CONFIG_HOME="${SESSION_XDG_CONFIG_HOME}" \
+  XDG_DATA_DIRS="${SESSION_XDG_DATA_DIRS}" \
+  XDG_DATA_HOME="${SESSION_XDG_DATA_HOME}" \
+  LANG="${SESSION_LANG}" \
+  PATH="${SESSION_PATH}" \
+  GTK_MODULES="${SESSION_GTK_MODULES}" \
+  UBUNTU_MENUPROXY="${SESSION_UBUNTU_MENUPROXY}" \
+  QT_QPA_PLATFORMTHEME="${SESSION_QT_QPA_PLATFORMTHEME}" \
+  GTK_CSD=0 \
+  LD_PRELOAD="${NO_CSD_LIB}" \
+  PANEL_LOG="${PANEL_LOG}" \
+  bash -c '
+    set -euo pipefail
+
+    log_inner() {
+      printf "[xfce4-heal] %s\n" "$*"
+    }
+
+    panel_log="${PANEL_LOG:-/dev/null}"
+
+    # Kill stale daemons if they exist
+    for name in xfce4-panel xfsettingsd; do
+      if pgrep -x "$name" >/dev/null 2>&1; then
+        log_inner "Killing $name…"
+        pkill -x "$name" || true
+      fi
+    done
+
+    # Wait briefly for them to die
+    for name in xfce4-panel xfsettingsd; do
+      for i in 1 2 3 4 5; do
+        if ! pgrep -x "$name" >/dev/null 2>&1; then
+          break
+        fi
+        sleep 0.2
+      done
+    done
+
+    # Start settings daemon
+    if command -v xfsettingsd >/dev/null 2>&1; then
+      log_inner "Starting xfsettingsd…"
+      nohup xfsettingsd >/dev/null 2>&1 &
+    else
+      log_inner "xfsettingsd not found in PATH."
+    fi
+
+    # Start panel, logging output
+    if command -v xfce4-panel >/dev/null 2>&1; then
+      log_inner "Starting xfce4-panel (logging to ${panel_log})…"
+      nohup xfce4-panel >>"${panel_log}" 2>&1 &
+    else
+      log_inner "xfce4-panel not found in PATH."
+    fi
+  '
+#+END_SRC
+
+** swap-heal – safe swap purge + desktop/Flatpak heal
+#+BEGIN_SRC bash :tangle think/.local/bin/swap-heal :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+set -euo pipefail
+
+log() { printf '[swap-heal] %s\n' "$*"; }
+
+# 1) Inspect RAM + swap
+mem_available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+swap_total_kb=$(awk '/^SwapTotal:/     {print $2}' /proc/meminfo)
+swap_free_kb=$(awk '/^SwapFree:/      {print $2}' /proc/meminfo)
+swap_used_kb=$((swap_total_kb - swap_free_kb))
+
+log "MemAvailable: ${mem_available_kb} KiB"
+log "Swap used:    ${swap_used_kb} KiB"
+
+if (( swap_total_kb == 0 )); then
+  log "No swap configured, nothing to do."
+  exit 0
+fi
+
+# Simple safety rule: need at least as much free RAM as swap in use
+needed_kb=${swap_used_kb}
+
+if (( mem_available_kb < needed_kb )) && [[ "${SWAP_HEAL_FORCE:-0}" != 1 ]]; then
+  log "Not enough free RAM to safely clear swap (need ${needed_kb} KiB)."
+  log "Set SWAP_HEAL_FORCE=1 if you really want to override this (risk of OOM)."
+  exit 1
+fi
+
+if [[ "${SWAP_HEAL_FORCE:-0}" == 1 ]]; then
+  log "SWAP_HEAL_FORCE=1 set, ignoring RAM safety check. This may OOM the system."
+else
+  log "Enough RAM available, proceeding with swap purge."
+fi
+
+# 2) Drop caches
+log "Dropping caches (vm.drop_caches=3)…"
+if ! sudo sh -c 'echo 3 > /proc/sys/vm/drop_caches'; then
+  log "WARNING: could not write vm.drop_caches; continuing anyway."
+fi
+
+# 3) swapoff + zramswap restart + swapon
+log "swapoff -a…"
+sudo swapoff -a
+
+log "Restarting zramswap.service if present…"
+if ! sudo systemctl restart zramswap.service 2>/dev/null; then
+  log "zramswap.service restart failed or unit not present; continuing."
+fi
+
+log "swapon -a…"
+sudo swapon -a
+
+# Make sure zram actually ends up as swap if it exists
+if [ -e /dev/zram0 ]; then
+  disksize=$(cat /sys/block/zram0/disksize 2>/dev/null || echo 0)
+  if [ "$disksize" -gt 0 ] && ! grep -q '^/dev/zram0' /proc/swaps; then
+    log "Enabling zram swap on /dev/zram0…"
+    if ! sudo swapon /dev/zram0 2>/dev/null; then
+      log "WARNING: swapon /dev/zram0 failed; zram still not active."
+    fi
+  else
+    log "zram0 already active or no disksize set, skipping swapon."
+  fi
+else
+  log "/dev/zram0 not present; nothing to enable."
+fi
+
+# 4) Heal XFCE desktop
+if command -v xfce4-heal >/dev/null 2>&1; then
+  log "Running xfce4-heal…"
+  xfce4-heal
+else
+  log "xfce4-heal not found; skipping."
+fi
+
+# 5) Heal Flatpak bridge + fontcache
+if command -v flatpak-desktop-bridge >/dev/null 2>&1; then
+  log "Refreshing Flatpak desktop bridge…"
+  flatpak-desktop-bridge
+fi
+
+if command -v flatpak-fontcache-refresh >/dev/null 2>&1; then
+  log "Refreshing Flatpak font cache…"
+  flatpak-fontcache-refresh
+fi
+
+log "swap-heal ritual complete."
+#+END_SRC

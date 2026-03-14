@@ -8,7 +8,7 @@
    dotspacemacs-excluded-packages '(vterm)
 
    ;; You had two dotspacemacs-additional-packages; merged to keep all
-   dotspacemacs-additional-packages '(mixed-pitch org-appear vterm doom-themes centaur-tabs)
+   dotspacemacs-additional-packages '(mixed-pitch org-appear vterm doom-themes centaur-tabs kurecolor)
 
    dotspacemacs-configuration-layers
    '(helm
@@ -67,6 +67,18 @@
    dotspacemacs-whitespace-cleanup nil))
 (defun dotspacemacs/user-env ()
   (spacemacs/load-spacemacs-env))
+;; Prefer GUIX_PROFILE/bin first in Emacs’ own PATH/exec-path
+(let ((gp (getenv "GUIX_PROFILE")))
+  (when (and gp (file-directory-p (expand-file-name "bin" gp)))
+    (add-to-list 'exec-path (expand-file-name "bin" gp))
+    (setenv "PATH" (concat (expand-file-name "bin" gp)
+                           path-separator
+                           (getenv "PATH")))))
+
+;; Treemacs: use whatever python3 is first in exec-path (i.e. Guix)
+(with-eval-after-load 'treemacs
+  (setq treemacs-python-executable (or (executable-find "python3") "python3")))
+
 (defun dotspacemacs/user-init ()
   (let* ((cache (expand-file-name "~/.spacemacs.d.claude/.cache/"))
          (elpa  (expand-file-name "elpa" cache))
@@ -214,6 +226,105 @@
       ;; no extra line padding
       (setq-local line-spacing 0))
     (add-hook 'vterm-mode-hook #'metsatron/vterm-fonts))
+  
+  (with-eval-after-load 'vterm
+    ;; optional: keep more history so scrolling up is useful
+    (setq vterm-max-scrollback 100000)
+  
+    (defun la/vterm-freeze-when-scrolled ()
+      "Freeze vterm output when not at EOB by enabling vterm-copy-mode."
+      (when (derived-mode-p 'vterm-mode)
+        (if (eobp)
+            (when vterm-copy-mode (vterm-copy-mode -1)) ; follow live output
+          (unless vterm-copy-mode (vterm-copy-mode 1))))) ; freeze view
+  
+    (defun la/vterm-install-freeze-hook ()
+      (add-hook 'post-command-hook #'la/vterm-freeze-when-scrolled nil t))
+  
+    (add-hook 'vterm-mode-hook #'la/vterm-install-freeze-hook)
+  
+    ;; handy helper to jump back to following mode
+    (defun la/vterm-follow-bottom ()
+      "Jump to end and resume following output."
+      (interactive)
+      (goto-char (point-max))
+      (when vterm-copy-mode (vterm-copy-mode -1))))
+  
+  (defun la/vterm--at-bottom-visible-p ()
+    "Return non-nil when point-max is fully visible in the selected window."
+    (let ((pm (point-max)))
+      (and (pos-visible-in-window-p pm)
+           (save-excursion
+             (goto-char pm)
+             (eq (window-end (selected-window) t) pm)))))
+  
+  (defun la/vterm-freeze-when-scrolled ()
+    "Freeze vterm output when not following the bottom."
+    (when (derived-mode-p 'vterm-mode)
+      (if (la/vterm--at-bottom-visible-p)
+          (when vterm-copy-mode (vterm-copy-mode -1))
+        (unless vterm-copy-mode (vterm-copy-mode 1)))))
+  
+  ;; VTERM: auto-freeze when scrolled, but never block typing
+  (with-eval-after-load 'vterm
+    ;; Bigger history is handy when scrolling
+    (setq vterm-max-scrollback 100000)
+  
+    ;; Commands that imply editing or sending input
+    (defvar la/vterm--write-commands
+      '(self-insert-command newline newline-and-indent open-line
+        vterm-yank vterm-send-string vterm-send-return
+        evil-insert evil-append evil-append-line
+        evil-open-below evil-open-above
+        evil-change evil-change-line evil-substitute evil-replace
+        evil-delete-char evil-delete-backward-char
+        evil-paste-after evil-paste-before)
+      "Commands that should not run while vterm-copy-mode is active.")
+  
+    (defun la/vterm--writing-command-p ()
+      (or (and (boundp 'evil-state)
+               (or (evil-insert-state-p) (evil-replace-state-p)))
+          (memq this-command la/vterm--write-commands)))
+  
+    ;; If a write-like command is about to run, unfreeze first
+    (defun la/vterm-prevent-read-only-errors ()
+      "Before commands that write, drop out of vterm-copy-mode."
+      (when (and (derived-mode-p 'vterm-mode)
+                 vterm-copy-mode
+                 (la/vterm--writing-command-p))
+        (vterm-copy-mode -1)
+        (goto-char (point-max))))
+  
+    ;; Detect when the bottom is actually visible
+    (defun la/vterm--at-bottom-visible-p ()
+      "Non-nil when point-max is fully visible in the selected window."
+      (let ((pm (point-max)))
+        (and (pos-visible-in-window-p pm)
+             (save-excursion
+               (goto-char pm)
+               (eq (window-end (selected-window) t) pm)))))
+  
+    ;; After any command, freeze if you scrolled off the bottom
+    (defun la/vterm-freeze-when-scrolled ()
+      "Enable vterm-copy-mode when not following the bottom."
+      (when (derived-mode-p 'vterm-mode)
+        (if (la/vterm--at-bottom-visible-p)
+            (when vterm-copy-mode (vterm-copy-mode -1))
+          (unless (or vterm-copy-mode (la/vterm--writing-command-p))
+            (vterm-copy-mode 1)))))
+  
+    (defun la/vterm-install-freeze-hooks ()
+      (add-hook 'pre-command-hook  #'la/vterm-prevent-read-only-errors nil t)
+      (add-hook 'post-command-hook #'la/vterm-freeze-when-scrolled    nil t))
+  
+    (add-hook 'vterm-mode-hook #'la/vterm-install-freeze-hooks)
+  
+    ;; Handy helper to jump back to the live prompt and follow again
+    (defun la/vterm-follow-bottom ()
+      "Jump to end and resume following output."
+      (interactive)
+      (goto-char (point-max))
+      (when vterm-copy-mode (vterm-copy-mode -1))))
   ;; Window moves on NEIO (leader + C-w)
   (spacemacs/set-leader-keys
     "wn" 'evil-window-left
@@ -422,6 +533,10 @@
   (with-eval-after-load 'doom-themes
     (setq doom-themes-enable-bold t
           doom-themes-enable-italic t))
+  
+  (add-to-list 'custom-theme-load-path (expand-file-name "~/.spacemacs.d.claude/themes"))
+  (load-theme 'doom-base16 t)
+  
   (with-eval-after-load 'vterm
     (define-key vterm-mode-map (kbd "C-q") #'vterm-send-next-key)
     (define-key vterm-mode-map (kbd "C-y") #'vterm-yank)

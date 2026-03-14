@@ -48,16 +48,28 @@ alias mkhttp="python3 -m http.server"
 alias json="python3 -m json.tool"
 alias perms="stat -c '%A %a %n'"
 alias neofetch="neofetch --ascii ~/.local/share/neofetch/CoplandOS.neofetch --colors 15 1 1 1 1 15 --ascii_colors 15 5 1"
+if [[ $- == *i* ]]; then
+  alias fastfetch=ffetch
+fi
 alias cpufetch='cpufetch --color "intel" --logo-short --logo-intel-old'
 alias heartfetch='brrtfetch $HOME/Pictures/brrtfetch/gifs/random/heart.gif'
 alias penguinfetch='brrtfetch $HOME/Pictures/brrtfetch/gifs/random/penguin-yoshi.gif'
 alias mariofetch='brrtfetch $HOME/Pictures/brrtfetch/gifs/random/mario.gif'
 alias tobifetch='brrtfetch $HOME/Pictures/brrtfetch/gifs/random/toby-fox.gif'
-alias v='nvim'
-alias vi='nvim'
-alias vim='nvim'
+alias v='$HOME/.guix-extra-profiles/core/core/bin/nvim'
+# alias vi='$HOME/.guix-extra-profiles/core/core/bin/nvim'
+alias vim='$HOME/.guix-extra-profiles/core/core/bin/nvim'
+function sudo() {
+    if [[ "$1" == "nvim" || "$1" == "vim" ]]; then
+        command sudo $HOME/.guix-extra-profiles/core/core/bin/nvim "${@:2}"
+    else
+        command sudo "$@"
+    fi
+}
 alias cd='z'
-alias ls='lsd'
+alias eza='eza --icons=always'
+alias ls='eza'
+# alias ls='lsd'
 alias find='command find'
 alias grep='command grep'
 alias ff='fd'                  # clean "fd"
@@ -66,8 +78,10 @@ alias ff0='fd -0'              # fd with NUL output
 alias rga='rg -n --color=auto'         # nice default for humans
 alias rgi='rg -n --color=auto -i'      # case-insensitive default
 alias rg0='rg -0 -n --color=never -l'  # NUL-delimited file list (for piping)
-alias bat='bat --theme "Solarized (dark)" --style full'
-alias cat='bat --theme "Solarized (dark)" --style plain --paging=never'
+alias bat='$HOME/.cargo/bin/bat --theme "Solarized (dark)" --style full'
+alias cat='$HOME/.cargo/bin/bat --theme "Solarized (dark)" --style plain --paging=never'
+
+# Flatpak Aliases
 alias flatseal='flatpak run com.github.tchx84.Flatseal'
 alias zen='flatpak run app.zen_browser.zen'
 alias discord='flatpak run com.discordapp.Discord'
@@ -104,9 +118,45 @@ alias wezterm='flatpak run org.wezfurlong.wezterm'
 alias pied_fp='flatpak run com.mikeasoft.pied'
 alias signal-desktop='exec host-wrap /usr/bin/signal-desktop --password-store="gnome-libsecret" "$@"'
 
+# Prefer host GLib stack for GIO tools
+_host_gio_dir() {
+  pkg-config --variable=giomoduledir gio-2.0 2>/dev/null || echo /usr/lib/x86_64-linux-gnu/gio/modules
+}
+
+hostenv() {
+  local gio_dir="$(_host_gio_dir)"
+  command env \
+    -u GI_TYPELIB_PATH \
+    -u GIO_MODULE_DIR \
+    -u GIO_EXTRA_MODULES \
+    -u LD_LIBRARY_PATH \
+    -u XDG_DATA_DIRS \
+    -u GSETTINGS_SCHEMA_DIR \
+    -u GSETTINGS_BACKEND \
+    -u GTK_PATH \
+    -u GTK_DATA_PREFIX \
+    -u GTK_EXE_PREFIX \
+    GIO_MODULE_DIR="$gio_dir" \
+    "$@"
+}
+
+# Always run these with hostenv
+alias gio='hostenv gio'
+alias gsettings='hostenv gsettings'
+alias gdbus='hostenv gdbus'
+alias dconf='hostenv dconf'
+alias glib-compile-schemas='hostenv glib-compile-schemas'
+
 # ffetch: fastfetch with WezTerm overlay when inside WezTerm
 ffetch() {
-  if [[ -n ${WEZTERM_EXECUTABLE-}${WEZTERM_VERSION-} ]]; then
+  # Optional debug - only fires if you export FFETCH_DEBUG=1
+  if [[ -n ${FFETCH_DEBUG-} ]]; then
+    printf '[ffetch] TERM="%s" WEZTERM_EXECUTABLE="%s" WEZTERM_VERSION="%s" WEZTERM_PANE="%s" TERM_PROGRAM="%s"\n' \
+      "${TERM-}" "${WEZTERM_EXECUTABLE-}" "${WEZTERM_VERSION-}" "${WEZTERM_PANE-}" "${TERM_PROGRAM-}" >&2
+  fi
+
+  if [[ ${TERM-} == wezterm ]] \
+     || [[ -n ${WEZTERM_PANE-}${TERM_PROGRAM-} ]]; then
     command fastfetch --config "$HOME/.config/fastfetch/wezterm.jsonc" "$@"
   else
     command fastfetch "$@"

@@ -9,7 +9,7 @@ GUIX_HOME := $(HOME)/.config/guix
 EXTRA := $(HOME)/.guix-extra-profiles
 
 # Stow packages you normally manage here
-STOW_PKGS ?= all linux debian think
+STOW_PKGS ?= all
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
         stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint
@@ -38,15 +38,23 @@ stow:
 
 # Safe stow with timestamped backups of real files
 safe-stow:
-| cd $(HOME)/.dotfiles && \
+| set -euo pipefail; \
+| cd $(HOME)/.dotfiles; \
 | for pkg in $(STOW_PKGS); do \
+|   echo ">> preview $$pkg"; \
 |   stow -n $$pkg 2>&1 \
 |     | sed -n 's/.*\* existing target is neither a link nor a directory: \(.*\)$$/\1/p' \
 |     | while read -r t; do \
-|         if [ -f "$(HOME)/$$t" ] && [ ! -L "$(HOME)/$$t" ]; then \
-|           cp -a "$(HOME)/$$t" "$(HOME)/$$t.bak.$$(date +%Y%m%d-%H%M%S)"; \
+|         case "$$t" in /*) abs="$$t" ;; *) abs="$(HOME)/$$t" ;; esac; \
+|         if [ -e "$$abs" ] && [ ! -L "$$abs" ]; then \
+|           ts=$$(date +%Y%m%d-%H%M%S); \
+|           echo "   backup $$abs -> $$abs.bak.$$ts"; \
+|           cp -a "$$abs" "$$abs.bak.$$ts"; \
+|           echo "   remove  $$abs"; \
+|           rm -rf "$$abs"; \
 |         fi; \
 |       done; \
+|   echo ">> stow $$pkg"; \
 |   stow $$pkg; \
 | done
 
@@ -63,3 +71,6 @@ include $(HOME)/.dotfiles/all/.mk/guix.mk
 include $(HOME)/.dotfiles/all/.mk/guix-substitutes.mk
 include $(HOME)/.dotfiles/all/.mk/snap.mk
 include $(HOME)/.dotfiles/all/.mk/appimage.mk
+include $(HOME)/.dotfiles/all/.mk/cargo.mk
+include $(HOME)/.dotfiles/all/.mk/homebrew.mk
+include $(HOME)/.dotfiles/all/.mk/npm.mk
