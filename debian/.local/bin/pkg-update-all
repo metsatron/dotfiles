@@ -37,6 +37,18 @@ EOF
   shift
 done
 
+# Flatpak scope toggles
+FLATPAK_UPDATE_USER="${FLATPAK_UPDATE_USER:-1}"     # default: user only
+FLATPAK_UPDATE_SYSTEM="${FLATPAK_UPDATE_SYSTEM:-0}" # default: no system
+
+# Sudo precheck toggle (kept available but OFF by default)
+REQUIRE_SUDO_PRECHECK="${REQUIRE_SUDO_PRECHECK:-0}"
+
+# Guix behavior
+GUIX_PULL="${GUIX_PULL:-0}"  # default: skip 'guix pull' (faster)
+GUIX_PROFILES_DEFAULT="$HOME/.guix-extra-profiles/core/core $HOME/.guix-extra-profiles/dev/dev"
+GUIX_PROFILES="${GUIX_PROFILES:-$GUIX_PROFILES_DEFAULT}"
+
 # ===== Helpers =====
 die(){ echo "ERROR: $*" >&2; exit 1; }
 have(){ command -v "$1" >/dev/null 2>&1; }
@@ -97,8 +109,11 @@ fi
 SUDO_NEEDED=0
 if have nala || have apt || have snap; then
   SUDO_NEEDED=1
-elif have flatpak; then
-  # We'll touch --system: remote-add/update/cleanup
+fi
+if have flatpak && [ "$FLATPAK_UPDATE_SYSTEM" = 1 ]; then
+  SUDO_NEEDED=1
+fi
+if [ "$REQUIRE_SUDO_PRECHECK" = 1 ]; then
   SUDO_NEEDED=1
 fi
 
@@ -126,74 +141,77 @@ if have snap; then
 fi
 
 # ===== Flatpak (explicit system + user) =====
-if have flatpak; then
-  # Ensure remotes exist in both scopes (system via sudo, user without)
-  run_sudo_block 'flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo'
-  run_tty        'flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo'
 
-  # Optional preflight: ensure required runtimes are present
+ensure_flathub() {
+  if [ "$FLATPAK_UPDATE_SYSTEM" = 1 ]; then
+    run_sudo_block 'flatpak remote-add --if-not-exists --system flathub https://flathub.org/repo/flathub.flatpakrepo'
+  fi
+  run_pipe 'flatpak --user remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo'
+}
+
+install_needed_runtimes() {
+  local scope="$1" who=""
+  [ "$scope" = "--system" ] && who="sudo"
+
+  local reqs base branch ref
+  reqs=$(flatpak list "$scope" --app --columns=runtime 2>/dev/null | awk 'NF' | sort -u) || true
+  [ -z "$reqs" ] && return 0
+
+  while IFS= read -r r; do
+    base="${r%/*/*}"
+    branch="${r##*/}"
+    ref="${base}//${branch}"
+    if [ "$who" = "sudo" ]; then
+      run_sudo_block "flatpak install -y $scope flathub \"$ref\" || true"
+    else
+      run_tty        "flatpak install -y $scope flathub \"$ref\" || true"
+    fi
+  done <<< "$reqs"
+}
+
+if command -v flatpak >/dev/null 2>&1; then
+  ensure_flathub
+
   if [ "$FLATPAK_FIX" -eq 1 ] && [ "${MODE:-}" != "dry" ]; then
-    # Collect required runtimes (read-only; no sudo needed to list)
-    sys_reqs="$(flatpak list --system --app --columns=runtime 2>/dev/null | awk 'NF' | sort -u || true)"
-    usr_reqs="$(flatpak list --user   --app --columns=runtime 2>/dev/null | awk 'NF' | sort -u || true)"
+    [ "$FLATPAK_UPDATE_SYSTEM" = 1 ] && install_needed_runtimes --system
+    [ "$FLATPAK_UPDATE_USER"   = 1 ] && install_needed_runtimes --user
 
-    # Convert runtime org.Foo.Platform/x86_64/47 -> install ref org.Foo.Platform//47
-    to_refs() { awk -F/ '{print $1"//"$NF}' | sort -u; }
-
-    sys_refs="$(printf '%s\n' "$sys_reqs" | to_refs | xargs)"
-    usr_refs="$(printf '%s\n' "$usr_reqs" | to_refs | xargs)"
-
-    # Install in batches; suppress control codes with TERM=dumb
-    if [ -n "$sys_refs" ]; then
-      run_sudo_block 'env TERM=dumb flatpak install -y --system flathub '"$sys_refs"' || true'
-    fi
-    if [ -n "$usr_refs" ]; then
-      run_tty "flatpak install -y --user flathub $usr_refs || true"
-    fi
-
-    # Pins & optional unpin
-    run_pipe "flatpak pin || true"
+    run_pipe "flatpak pin --system || true"
+    run_pipe "flatpak pin --user   || true"
     if [ "$FLATPAK_UNPIN" -eq 1 ]; then
-      run_pipe "flatpak pin --remove runtime/org.gnome.Platform/x86_64/43 || true"
-      run_pipe "flatpak pin --remove runtime/org.gnome.Platform/x86_64/45 || true"
+      run_tty "flatpak pin --remove --system runtime/org.gnome.Platform/x86_64/43 || true"
+      run_tty "flatpak pin --remove --system runtime/org.gnome.Platform/x86_64/45 || true"
+      run_tty "flatpak pin --remove --user   runtime/org.gnome.Platform/x86_64/43 || true"
+      run_tty "flatpak pin --remove --user   runtime/org.gnome.Platform/x86_64/45 || true"
     fi
   fi
 
-  # Updates + cleanup (both scopes). System in one sudo block; user pretty.
   if [ "${MODE:-}" = "dry" ]; then
-    run_pipe 'flatpak remote-ls --updates --system || true'
-    run_pipe 'flatpak remote-ls --updates --user   || true'
+    [ "$FLATPAK_UPDATE_SYSTEM" = 1 ] && run_tty 'flatpak remote-ls --updates --system || true'
+    [ "$FLATPAK_UPDATE_USER"   = 1 ] && run_tty 'flatpak remote-ls --updates --user   || true'
   else
-    run_sudo_block 'flatpak update -y --system; flatpak uninstall -y --unused --system || true'
-    run_tty       'flatpak update -y --user'
-    run_tty       'flatpak uninstall -y --unused --user || true'
+    [ "$FLATPAK_UPDATE_SYSTEM" = 1 ] && run_sudo_block 'flatpak update -y --system; flatpak uninstall -y --unused --system || true'
+    [ "$FLATPAK_UPDATE_USER"   = 1 ] && run_tty       'flatpak update -y --user;   flatpak uninstall -y --unused --user   || true'
   fi
 fi
 
 # ===== Guix (user profiles) =====
 if have guix; then
-  # Pull channels
-  run_pipe "guix pull"
-
-  # Update the default profile if it exists
-  [ -e "$HOME/.guix-profile" ] && run_pipe "guix package -u -p \"$HOME/.guix-profile\" || true"
-
-  if [ -d "$HOME/.guix-extra-profiles" ]; then
-    while IFS= read -r -d '' prof; do
-      run_pipe "guix package -u -p \"$prof\" || true"
-    done < <(find "$HOME/.guix-extra-profiles" -mindepth 2 -maxdepth 2 -type d -print0 2>/dev/null || true)
+  if [ "$GUIX_PULL" = 1 ]; then
+    run_pipe "guix pull"
   fi
 
-  # Optional GC (commented by default)
-  # run_pipe \"guix gc\"
-fi
-# ===== pipx =====
-if have pipx; then
-  if [ "${MODE:-}" = "dry" ]; then
-    run_pipe "pipx list --outdated"
-  else
-    run_tty  "pipx upgrade-all"
-  fi
+  # Update the classic default profile if present
+  [ -e "$HOME/.guix-profile" ] && run_pipe "guix package --profile=\"$HOME/.guix-profile\" -u || true"
+
+  # Update the profiles you actually use (core/dev by default)
+  for prof in $GUIX_PROFILES; do
+    [ -e "$prof" ] || continue
+    run_pipe "guix package --profile=\"$prof\" -u || true"
+  done
+
+  # Optional GC
+  # run_pipe "guix gc"
 fi
 
 # ===== pip (user-site, opt-in) =====

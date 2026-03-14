@@ -17,3 +17,12 @@
 ;; Speed up startup a touch
 (setq gc-cons-threshold (* 64 1024 1024))
 
+;; Prefer GUIX_PROFILE/bin inside Emacs so subprocesses (python3) are consistent.
+(let ((gp (getenv "GUIX_PROFILE")))
+  (when (and gp (file-directory-p (expand-file-name "bin" gp)))
+    (let ((bin (expand-file-name "bin" gp)))
+      (setenv "PATH" (concat bin path-separator (getenv "PATH")))
+      (add-to-list 'exec-path bin))))
+
+(with-eval-after-load 'treemacs
+  (setq treemacs-python-executable (or (executable-find "python3") "python3")))

@@ -1,0 +1,23 @@
+(let* ((tname (lc/get 'emacs 'syntax))
+       (fg   (lc/s tname :fg))
+       (bg   (lc/s tname :bg))
+       (kw   (lc/s tname :keyword))
+       (str  (lc/s tname :string))
+       (fnc  (lc/s tname :func))
+       (typ  (lc/s tname :type))
+       (com  (lc/s tname :comment))
+       (cst  (lc/s tname :const))
+       (err  (lc/s tname :error)))
+  ;; fonts
+  (set-face-attribute 'default nil :font (lc/font :mono))
+  (set-face-attribute 'fixed-pitch nil :font (lc/font :mono))
+  ;; faces
+  (custom-set-faces
+   `(default ((t (:foreground ,fg :background ,bg))))
+   `(font-lock-comment-face ((t (:foreground ,com :slant italic))))
+   `(font-lock-string-face  ((t (:foreground ,str))))
+   `(font-lock-keyword-face ((t (:foreground ,kw))))
+   `(font-lock-function-name-face ((t (:foreground ,fnc))))
+   `(font-lock-type-face ((t (:foreground ,typ))))
+   `(font-lock-constant-face ((t (:foreground ,cst))))
+   `(error ((t (:foreground ,err :weight bold))))))

@@ -1,0 +1,1 @@
+/home/metsatron/.emacs.d.spacemacs

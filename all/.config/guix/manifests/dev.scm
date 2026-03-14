@@ -1,4 +1,4 @@
-;; [[file:../../../../guix.org::*User profile manifests][User profile manifests:2]]
+;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:2]]
 (specifications->manifest
  '(
    "gcc-toolchain"
@@ -11,4 +11,4 @@
    "shfmt"
    "bear"
    ))
-;; User profile manifests:2 ends here
+;; Guix User profile manifests:2 ends here

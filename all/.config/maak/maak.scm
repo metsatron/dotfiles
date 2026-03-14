@@ -3,7 +3,11 @@
 ;; [[file:../../../loom.org::*Maak control plane (Scheme, XDG-friendly)][Maak control plane (Scheme, XDG-friendly):1]]
 (use-modules (srfi srfi-1)
              (srfi srfi-13)        ; string-prefix?, string-contains
-             (ice-9 popen) (ice-9 rdelim) (ice-9 match) (ice-9 pretty-print))
+             (ice-9 popen)
+             (ice-9 rdelim)
+             (ice-9 match)
+             (ice-9 pretty-print)
+             (ice-9 format))
 
 ;; Run one shell string via bash -lc <cmd>, print stdout, return exit code.
 (define (sh cmd)
@@ -22,146 +26,333 @@
 (define HOME (or (getenv "HOME") (error "HOME not set")))
 (define CORE-PROFILE (string-append HOME "/.guix-extra-profiles/core/core"))
 
-(define (mk-guix cmd) (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/guix.mk " cmd)))
-(define (mk-guix-root cmd) (sh (string-append "make -f " (getenv "HOME") "/.dotfiles/all/.mk/guix-root.mk " cmd)))
-(define (mk cmd) (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/flatpak.mk " cmd)))
+(define (mk-guix cmd)
+  (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/guix.mk " cmd)))
+
+(define (mk-guix-root cmd)
+  (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/guix-root.mk " cmd)))
+
+(define (mk cmd)
+  (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/flatpak.mk " cmd)))
+
 (define (mk-appimage cmd)
-(let* ((HOME (or (getenv "HOME") ""))
-(mk (string-append "make -f " HOME "/.dotfiles/all/.mk/appimage.mk " cmd)))
-(let* ((p (open-pipe* OPEN_READ "bash" "-lc" mk))
-(out (read-string p))
-(ec (close-pipe p)))
-(display out) ec)))
+  (let* ((HOME (or (getenv "HOME") ""))
+         (mk (string-append "make -f " HOME "/.dotfiles/all/.mk/appimage.mk " cmd)))
+    (let* ((p   (open-pipe* OPEN_READ "bash" "-lc" mk))
+           (out (read-string p))
+           (ec  (close-pipe p)))
+      (display out)
+      ec)))
 
 (define (with-core thunk)
   (let* ((cmd (string-append ". \"" CORE-PROFILE "/etc/profile\"; " (thunk))))
     (sh cmd)))
 
-(define (usage)
-  (display "Usage: loom <task>\nTry: loom list  or  loom --help\n"))
-
-;; Safety: ensure task constructor is always bound at top level
+;; Safety: ensure task constructor is always bound at top level (idempotent)
 (define task
   (lambda (name desc thunk)
     (list name desc thunk)))
 
 (define tasks
   (list
+   ;; --- Top level / meta ---
    (task 'list "List available tasks"
          (lambda ()
-           (for-each (lambda (t) (format #t "~a\t~a~%" (task-name t) (task-desc t))) tasks)
+           (for-each
+            (lambda (t)
+              (format #t "~a\t~a~%" (task-name t) (task-desc t)))
+            tasks)
            0))
-   (task 'all "TOC → tangle → ensure Guix dirs" (lambda () (sh "make all")))
-   (task 'stow "Safe stow (backup real files, then stow)" (lambda () (sh "make safe-stow")))
+
+   (task 'all "TOC -> tangle -> ensure Guix dirs"
+         (lambda () (sh "make all")))
+
+   ;; --- Stow / dotfiles ---
+   (task 'stow "Safe stow shared overlay only (all)"
+         (lambda () (sh "make safe-stow")))
+
+   (task 'stow:linux "Safe stow shared + linux overlays (all linux)"
+         (lambda () (sh "STOW_PKGS='all linux' make safe-stow")))
+
+   (task 'stow:debian "Safe stow shared + linux + debian overlays (all linux debian)"
+         (lambda () (sh "STOW_PKGS='all linux debian' make safe-stow")))
+
+   (task 'stow:think "Safe stow shared ThinkPad overlays (all linux debian think)"
+         (lambda () (sh "STOW_PKGS='all linux debian think' make safe-stow")))
+   (task 'stow:health
+         "Scan broken symlinks under $HOME, optionally clean Stow orphans"
+         (lambda ()
+           (sh "dotcortex-stow-health")))
+
    (task 'health "Show registrar, GTK module, and nvim path"
          (lambda ()
            (sh "pgrep -af appmenu-registrar || echo 'registrar: (none)'")
            (sh "printf 'GTK_MODULES=%s\\n' \"${GTK_MODULES:-}\"")
            (with-core (lambda () "command -v nvim; nvim --version | sed -n '1,2p'"))
-             0))
-   ;; PULL (does NOT bench)
-   (task 'guix:pull "guix pull (update channels)" (lambda () (mk-guix "guix-pull")))
+           0))
+
+   (task 'desktop:heal "Restart XFCE settings + panel in clean env"
+         (lambda () (sh "xfce4-heal")))
+
+   (task 'swap:heal
+         "Safe swap purge + XFCE/Flatpak heal (with RAM safety checks)"
+         (lambda ()
+           (sh "swap-heal")))
+
+   (task 'swap:heal!
+         "Force swap purge (SWAP_HEAL_FORCE=1) - may OOM the system"
+         (lambda ()
+           (sh "SWAP_HEAL_FORCE=1 swap-heal")))
+
+   ;; --- Guix user profile ---
+   (task 'guix:pull "guix pull (update channels)"
+         (lambda () (mk-guix "guix-pull")))
+
    (task 'guix:apply "Build core+dev profiles"
          (lambda () (sh "make guix-core guix-dev guix-nonguix")))
-   (task 'guix:git-bench "Probe guix channel mirrors and print the fastest URL (writes cache)"
+
+   (task 'guix:git-bench
+         "Probe guix channel mirrors and print the fastest URL (writes cache)"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/guix.mk guix-pull-bench")))
-   ;; PULL apply: use cached mirror only (or arg passed through)
-   (task 'guix:git-apply "Apply fastest guix pull mirror to ~/.config/guix/channels.scm"
+
+   (task 'guix:git-apply
+         "Apply fastest guix pull mirror to ~/.config/guix/channels.scm"
          (lambda () (sh "~/.dotfiles/all/.local/bin/guix-apply-pull-url")))
-   (task 'guix:dirs "Ensure ancillary Guix directories" (lambda () (mk-guix "guix-dirs")))
-   ;; (task 'guix:core "Build core profile from manifest" (lambda () (mk-guix "guix-core")))
-   ;; (task 'guix:dev "Build dev profile (depends on core)" (lambda () (mk-guix "guix-dev")))
-   ;; (task 'guix:nonguix "Build Nonguix profile from manifest" (lambda () (mk-guix "guix-nonguix")))
-   (task 'guix:gc "Collect unreferenced store items (reclaim disk space; safe)"
+
+   (task 'guix:dirs "Ensure ancillary Guix directories"
+         (lambda () (mk-guix "guix-dirs")))
+
+   ;; (task 'guix:core "Build core profile from manifest"
+   ;;       (lambda () (mk-guix "guix-core")))
+   ;; (task 'guix:dev "Build dev profile (depends on core)"
+   ;;       (lambda () (mk-guix "guix-dev")))
+   ;; (task 'guix:nonguix "Build Nonguix profile from manifest"
+   ;;       (lambda () (mk-guix "guix-nonguix")))
+
+   (task 'guix:gc
+         "Collect unreferenced store items (reclaim disk space; safe)"
          (lambda () (mk-guix "guix-gc")))
-   ;; Substitutes: bench+apply (never run on list/all)
-   (task 'guix:sub-bench "Benchmark Guix substitute servers and print best order"
+
+   ;; --- Guix substitute bench/apply ---
+   (task 'guix:sub-bench
+         "Benchmark Guix substitute servers and print best order"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/guix-substitutes.mk guix-sub-bench")))
-   (task 'guix:sub-apply "Apply the best substitute server order to guix-daemon"
+
+   (task 'guix:sub-apply
+         "Apply the best substitute server order to guix-daemon"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/guix-substitutes.mk guix-sub-apply")))
+
+   ;; --- Which binaries (user) ---
    (task 'which-nvim "Show nvim location and version"
-         (lambda () (with-core (lambda () "command -v nvim; nvim --version | sed -n '1,2p'"))
+         (lambda ()
+           (with-core (lambda () "command -v nvim; nvim --version | sed -n '1,2p'"))
            0))
-   (task 'which-zsh "Show nvim location and version"
-         (lambda () (with-core (lambda () "command -v zsh; zsh --version | sed -n '1,2p'"))
+
+   (task 'which-zsh "Show zsh location and version"
+         (lambda ()
+           (with-core (lambda () "command -v zsh; zsh --version | sed -n '1,2p'"))
            0))
-   ;; (task 'inkscape-timecapsule "Hint for running Inkscape from a past generation" (lambda () (sh "guix describe --generations; echo 'Usage: guix time-machine --generation=N -- shell --pure inkscape -- inkscape'") 0))
-   (task 'root:sync "Sync dotfiles configs into root (channels, manifest, nvim)"
+
+   ;; --- Root integration / Guix root ---
+   (task 'root:sync
+         "Sync dotfiles configs into root (channels, manifest, nvim)"
          (lambda () (sh "~/.dotfiles/all/.local/bin/root-sync")))
 
    (task 'guix:pull-root "guix pull for root using synced channels"
          (lambda () (mk-guix-root "guix-root-pull")))
+
    (task 'guix:root "Apply root manifest to root profile"
          (lambda () (mk-guix-root "guix-root-apply")))
+
    (task 'guix:gc-root "Collect unreferenced store items for root"
          (lambda () (mk-guix-root "guix-root-gc")))
-   (task 'root:config "Apply root-level configs that need sudo (Early OOM etc.)"
+
+   (task 'root:config
+         "Apply root-level configs that need sudo (Early OOM etc.)"
          (lambda () (sh "MODE=balanced ~/.dotfiles/think/.local/bin/earlyoom-balanced")))
-   (task 'root:earlyoom-dryrun "Show what earlyoom would kill, without killing"
-         (lambda () (sh "sudo systemctl stop earlyoom && sudo earlyoom --dryrun -m 5,3 -s 15,10 \
+
+   (task 'root:earlyoom-dryrun
+         "Show what earlyoom would kill, without killing"
+         (lambda ()
+           (sh "sudo systemctl stop earlyoom && sudo earlyoom --dryrun -m 5,3 -s 15,10 \
         --prefer '^(kdeconnectd|fluidsynth|jellyfin|[Oo]bsidian|Telegram|WebExtensions|qmmp)$' \
         --avoid  '^(floorp|thunar|gvfs.*)$'; sudo systemctl start earlyoom")))
+
    (task 'root:which-nvim "Show root nvim location and version"
-         (lambda () (sh "sudo -i sh -lc 'command -v nvim; nvim --version | sed -n \"1,2p\"'")))
-   (task 'flatpak:apply "Enforce exact match (set ENFORCE/UNINSTALL/FO... vars as needed)"
+         (lambda ()
+           (sh "sudo -i sh -lc 'command -v nvim; nvim --version | sed -n \"1,2p\"'")))
+
+   ;; --- Flatpak ---
+   (task 'flatpak:apply
+         "Enforce exact match (set ENFORCE/UNINSTALL/FO... vars as needed)"
          (lambda () (mk "flatpak-apply")))
-   (task 'flatpak:diff "Plan: desired (TSV) vs installed"
+
+   (task 'flatpak:diff "Plan: desired (SSV) vs installed"
          (lambda () (mk "flatpak-diff")))
+
    (task 'flatpak:bridge "Apply Flatpak fonts/cursors bridge"
-         (lambda () (sh "make bridge-flatpak")))
-   (task 'flatpak:x11 "Re-stow think/.xsessionrc & friends" (lambda () (sh "make x11-apply")))
-   (task 'flatpak:remotes "Ensure remotes (user+system) with clean env"
+         (lambda () (sh "make flatpak-bridge")))
+
+   (task 'flatpak:x11 "Re-stow think/.xsessionrc & friends"
+         (lambda () (sh "make x11-apply")))
+
+   (task 'flatpak:remotes
+         "Ensure remotes (user+system) with clean env"
          (lambda () (mk "flatpak-remotes")))
-   ;; (task 'flatpak:capture "Capture live apps → linux/.flatpak/manifest/apps.tsv" (lambda () (mk "flatpak-capture")))
-   ;; (task 'flatpak:sync "Additive apply (no removals)" (lambda () (mk "flatpak-sync")))
+
+   ;; (task 'flatpak:capture
+   ;;       "Capture live apps -> linux/.flatpak/manifest/apps.ssv"
+   ;;       (lambda () (mk "flatpak-capture")))
+   ;; (task 'flatpak:sync
+   ;;       "Additive apply (no removals)"
+   ;;       (lambda () (mk "flatpak-sync")))
+
    (task 'flatpak:perms-capture "Capture per-app permissions/overrides"
          (lambda () (mk "flatpak-perms-capture")))
+
    (task 'flatpak:perms-apply "Apply captured permissions/overrides"
          (lambda () (mk "flatpak-perms-apply")))
-   (task 'snap:sync "Install or refresh everything in the manifest, no removals"
+
+   ;; --- Snap ---
+   (task 'snap:sync
+         "Install or refresh everything in the manifest, no removals"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-apply")))
-   (task 'snap:apply "Install from manifest, uninstall extras (safe, keeps protected bases)"
+
+   (task 'snap:apply
+         "Install from manifest, uninstall extras (safe, keeps protected bases)"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-enforce")))
-   (task 'snap:apply! "Install from manifest, uninstall extras, allow protected removals"
+
+   (task 'snap:apply!
+         "Install from manifest, uninstall extras, allow protected removals"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-enforce-force")))
-   ;; (task 'snap:sync-dry "Dry run of sync" (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-apply-dry")))
+
+   ;; (task 'snap:sync-dry "Dry run of sync"
+   ;;       (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-apply-dry")))
+
    (task 'snap:prune "Remove all disabled snap revisions"
          (lambda () (sh "~/.dotfiles/all/.local/bin/snap-prune-disabled")))
-   ;; (task 'snap:autoremove-list "Dry run: prune disabled, remove unused content snaps and bases" (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove")))
-   (task 'snap:autoremove "Execute: same as above, with removals"
+
+   ;; (task 'snap:autoremove-list
+   ;;       "Dry run: prune disabled, remove unused content snaps and bases"
+   ;;       (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove")))
+
+   (task 'snap:autoremove
+         "Execute: same as above, with removals"
          (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove --yes")))
+
    (task 'snap:orphans "List orphaned user data dirs under ~/snap"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-list-orphans")))
-   ;; (task 'snap:purge-data! "Execute: also purge orphaned data dirs under ~/snap and /var/snap" (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove --yes --purge-data")))
+
+   ;; (task 'snap:purge-data!
+   ;;       "Execute: also purge orphaned data dirs under ~/snap and /var/snap"
+   ;;       (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove --yes --purge-data")))
+
    (task 'snap:connections "Show consumers of common content snaps"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-connections")))
-   (task 'snap:capture "Capture installed apps → all/.snap/manifest/apps.tsv"
+
+   (task 'snap:capture
+         "Capture installed apps -> all/.snap/manifest/apps.ssv"
          (lambda () (sh "~/.dotfiles/all/.local/bin/snap-capture")))
+
    (task 'snap:diff "Plan: show manifest vs installed"
          (lambda () (sh "~/.dotfiles/all/.local/bin/snap-diff")))
-   (task 'appimage:integrate "Install/enable appimaged user service from the newest AppImage"
+
+   ;; --- AppImage ---
+   (task 'appimage:integrate
+         "Install/enable appimaged user service from the newest AppImage"
          (lambda () (sh "~/.local/bin/appimage-integrator-setup")))
-   (task 'appimage:update "Update all AppImages (Auto-integrate, scrub desktops)"
+
+   (task 'appimage:update
+         "Update all AppImages (Auto-integrate, scrub desktops)"
          (lambda () (sh "make -f ~/.dotfiles/all/.mk/appimage.mk appimage-update")))
+
    ;; Back-compat alias
-   (task 'appimage:ail-scrub  "Deactivate/clean AIL bits (manual, safe to keep for later)"
+   (task 'appimage:ail-scrub
+         "Deactivate/clean AIL bits (manual, safe to keep for later)"
          (lambda () (sh "~/.local/bin/appimage-ail-scrub")))
-   (task 'appimage:health     "Show appimaged/AIL state and last 50 log lines"
+
+   (task 'appimage:health
+         "Show appimaged/AIL state and last 50 log lines"
          (lambda () (sh "~/.local/bin/appimage-health")))
-   (task 'appimage:inventory "Classify AppImages: supports/manual/dead and write TSVs"
+
+   (task 'appimage:inventory
+         "Classify AppImages: supports/manual/dead and write SSVs"
          (lambda () (sh "~/.local/bin/appimage-inventory")))
-))
+
+   ;; --- Cargo ---
+   (task 'cargo:capture "Capture live cargo to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/cargo-capture")))
+
+   (task 'cargo:diff "Plan: manifest vs live cargo"
+         (lambda () (sh "~/.local/bin/cargo-diff")))
+
+   (task 'cargo:sync
+         "Install or update only, no removals"
+         (lambda () (sh "ENFORCE=0 UNINSTALL=0 UPDATE=1 ~/.local/bin/cargo-apply")))
+
+   (task 'cargo:apply
+         "Enforce exact cargo state, allow removals"
+         (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/cargo-apply")))
+
+   (task 'cargo:health "Show DotCortex Rust env and versions"
+         (lambda () (sh "~/.local/bin/cargo-health")))
+
+   ;; --- Homebrew ---
+   (task 'brew:apply
+         "Enforce Homebrew state from DotCortex manifest"
+         (lambda ()
+           (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/brew-apply")))
+
+   (task 'brew:health
+         "Show Homebrew env and install it if missing"
+         (lambda ()
+           (sh "~/.local/bin/brew-health")))
+
+   ;; --- Apps (binary installers like kitty) ---
+   (task 'app:apply
+         "Apply app manifest (e.g. kitty upstream installer)"
+         (lambda ()
+           (sh "~/.local/bin/app-apply")))
+
+   (task 'app:health
+         "Check app level installs (kitty etc)"
+         (lambda ()
+           (sh "~/.local/bin/app-health")))
+
+   ;; --- Node ---
+   (task 'npm:capture "Capture live npm to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/npm-capture")))
+
+   (task 'npm:diff "Plan: manifest vs live npm"
+         (lambda () (sh "~/.local/bin/npm-diff")))
+
+   (task 'npm:sync
+         "Install or update only, no removals"
+         (lambda () (sh "ENFORCE=0 UNINSTALL=0 UPDATE=1 ~/.local/bin/npm-apply")))
+
+   (task 'npm:apply
+         "Enforce exact npm state, allow removals"
+         (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/npm-apply")))
+
+   (task 'npm:health "Show DotCortex Node env and versions"
+         (lambda () (sh "~/.local/bin/npm-health")))))
+
+;; --- Pretty printing for help ---
 
 (define (pad-right s width)
   (let ((n (string-length s)))
-    (if (>= n width) s (string-append s (make-string (- width n) #\space)))))
+    (if (>= n width)
+        s
+        (string-append s (make-string (- width n) #\space)))))
 
-(define (task-name-str t) (symbol->string (task-name t)))
+(define (task-name-str t)
+  (symbol->string (task-name t)))
 
 (define (print-group title pred)
-  (let* ((ts  (filter pred tasks))
-         (ts  (sort ts (lambda (a b) (string<? (task-name-str a)
-                                               (task-name-str b))))))
+  (let* ((ts (filter pred tasks))
+         (ts (sort ts (lambda (a b)
+                        (string<? (task-name-str a)
+                                  (task-name-str b))))))
     (when (pair? ts)
       (format #t "~a~%" title)
       (for-each
@@ -172,16 +363,54 @@
       (newline))))
 
 (define (print-groups)
+  ;; Main = everything that is not namespaced
   (print-group "Main commands"
-               (lambda (t) (not (string-contains (task-name-str t) ":"))))
+               (lambda (t)
+                 (let ((nm (task-name-str t)))
+                   (and (not (string-prefix? "guix:" nm))
+                        (not (string-prefix? "flatpak:" nm))
+                        (not (string-prefix? "snap:" nm))
+                        (not (string-prefix? "appimage:" nm))
+                        (not (string-prefix? "cargo:" nm))
+                        (not (string-prefix? "npm:" nm))
+                        (not (string-prefix? "root:" nm))
+                        (not (string-prefix? "stow:" nm))))))
+
+  (print-group "Stow / dotfiles commands"
+               (lambda (t)
+                 (let ((nm (task-name-str t)))
+                   (or (string=? nm "stow")
+                       (string-prefix? "stow:" nm)))))
+
   (print-group "Gnu Guix commands"
-               (lambda (t) (string-prefix? "guix:" (task-name-str t))))
+               (lambda (t)
+                 (string-prefix? "guix:" (task-name-str t))))
+
   (print-group "Flatpak commands"
-               (lambda (t) (string-prefix? "flatpak:" (task-name-str t))))
+               (lambda (t)
+                 (string-prefix? "flatpak:" (task-name-str t))))
+
   (print-group "Snap commands"
-               (lambda (t) (string-prefix? "snap:" (task-name-str t))))
+               (lambda (t)
+                 (string-prefix? "snap:" (task-name-str t))))
+
   (print-group "AppImage commands"
-               (lambda (t) (string-prefix? "appimage:" (task-name-str t)))))
+               (lambda (t)
+                 (string-prefix? "appimage:" (task-name-str t))))
+
+  (print-group "Cargo commands"
+               (lambda (t)
+                 (string-prefix? "cargo:" (task-name-str t))))
+
+  (print-group "npm commands"
+               (lambda (t)
+                 (string-prefix? "npm:" (task-name-str t))))
+
+  (print-group "Root commands"
+               (lambda (t)
+                 (string-prefix? "root:" (task-name-str t)))))
+
+;; --- Help / Version ---
 
 (define (usage)
   (display
@@ -194,53 +423,43 @@ Run COMMAND with ARGS, if given.
 COMMAND must be one of the sub-commands listed below:
 
 ")
-
-  (print-groups))
-
-(define (run name)
-  (let ((t (find (lambda (t) (eq? (task-name t) name)) tasks)))
-    (if t ((task-thunk t))
-        (begin (format #t "Unknown task: ~a\n" name) 1))))
-
-;; --- Help / Version ---
-(define (usage)
+  (print-groups)
+  (newline)
   (display
-"Usage: loom OPTION | COMMAND ARGS...
-Run COMMAND with ARGS, if given.
-
-  -h, --help            display this helpful text and exit
-  -V, --version         display version information and exit
-
-COMMAND must be one of the sub-commands listed below:
-
-  main commands
-    list                List available tasks
-    all                 TOC → tangle → ensure Guix dirs
-    stow                Safe stow (backup real files, then stow)
-    health              Show registrar, GTK module, and nvim path
-
-Tip: run 'loom list' to see everything.
+"Tip: run 'loom list' to see raw task names for scripting.
 "))
 
 (define (print-version)
   (display "QuickSilver Loom v0.1 (maak control plane)\n"))
 
-;; main: accepts `loom`, `loom -h/--help`, etc.
+;; --- Dispatch ---
+
+(define (run name)
+  (let ((t (find (lambda (t)
+                   (eq? (task-name t) name))
+                 tasks)))
+    (if t
+        ((task-thunk t))
+        (begin
+          (format #t "Unknown task: ~a\n" name)
+          1))))
+
+;; Strip a literal "--" and everything before it in ARGV
 (define (drop-dashdash xs)
-  (cond ((and (pair? xs) (string=? (car xs) "--")) (drop-dashdash (cdr xs)))
+  (cond ((and (pair? xs) (string=? (car xs) "--"))
+         (drop-dashdash (cdr xs)))
         (else xs)))
 
-;; in main
 (define (main args)
   (let* ((rest (drop-dashdash (cdr args))))
     (match rest
-      (()               (begin (usage) 0))
-      (("-h")           (begin (usage) 0))
-      (("--help")       (begin (usage) 0))
-      (("-V")           (begin (print-version) 0))
-      (("--version")    (begin (print-version) 0))
-      (("help")         (begin (usage) 0))
-      (("list")         (run 'list))
-      ((cmd . _more)    (run (string->symbol cmd)))
-      (_                (begin (usage) 1)))))
+      (()            (begin (usage) 0))
+      (("-h")        (begin (usage) 0))
+      (("--help")    (begin (usage) 0))
+      (("-V")        (begin (print-version) 0))
+      (("--version") (begin (print-version) 0))
+      (("help")      (begin (usage) 0))
+      (("list")      (run 'list))
+      ((cmd . _more) (run (string->symbol cmd)))
+      (_             (begin (usage) 1)))))
 ;; Maak control plane (Scheme, XDG-friendly):1 ends here
