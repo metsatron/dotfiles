@@ -1,4 +1,4 @@
-;; [[file:../../../../guix.org::*User profile manifests][User profile manifests:4]]
+;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:4]]
 ;; Nonguix-only user manifest.
 ;; Start empty so it never breaks builds; add packages you want from Nonguix.
 (specifications->manifest
@@ -11,4 +11,4 @@
    ;; "nvidia-driver"         ; Nonguix
    ;; "visual-studio-code"    ; Nonguix
   ))
-;; User profile manifests:4 ends here
+;; Guix User profile manifests:4 ends here
