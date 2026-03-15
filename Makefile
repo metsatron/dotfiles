@@ -52,9 +52,11 @@ safe-stow:
 |     | sed -n \
 |       -e 's/.*existing target is neither a link nor a directory: \(.*\)$$/\1/p' \
 |       -e 's/.*over existing target \(.*\) since neither.*/\1/p' \
+|       -e 's/.*existing target is not owned by stow: \(.*\)$$/\1/p' \
+|     | { grep -v '^HelmCortex$$' || true; } \
 |     | while read -r t; do \
 |         case "$$t" in /*) abs="$$t" ;; *) abs="$(HOME)/$$t" ;; esac; \
-|         if [ -e "$$abs" ] && [ ! -L "$$abs" ]; then \
+|         if [ -e "$$abs" ] || [ -L "$$abs" ]; then \
 |           ts=$$(date +%Y%m%d-%H%M%S); \
 |           echo "   backup $$abs -> $$abs.bak.$$ts"; \
 |           cp -a "$$abs" "$$abs.bak.$$ts"; \
