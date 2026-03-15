@@ -364,6 +364,16 @@ if command -v emacs &>/dev/null; then
   mkdir -p all/.app/manifest
   mkdir -p all/.homebrew/manifest
 
+  # LESSON: If /tmp has restrictive permissions (755 instead of 1777),
+  # emacs org-persist fails to create temp dirs. Set TMPDIR as fallback.
+  if ! touch /tmp/.dotcortex-perm-test 2>/dev/null; then
+    warn "/tmp is not writable — using ~/.cache/tmp as TMPDIR"
+    export TMPDIR="$HOME/.cache/tmp"
+    mkdir -p "$TMPDIR"
+  else
+    rm -f /tmp/.dotcortex-perm-test
+  fi
+
   make tangle 2>&1 || warn "Tangle had warnings (check output above)"
   ok "Tangled"
 else
@@ -373,9 +383,39 @@ fi
 # ══════════════════════════════════════════════════════════════
 # Phase 6: Stow
 # ══════════════════════════════════════════════════════════════
+# LESSONS LEARNED:
+#
+# 1. safe-stow's sed pattern must handle BOTH stow message formats:
+#    - stow <2.4: "existing target is neither a link nor a directory: FILE"
+#    - stow 2.4+: "cannot stow PKG/FILE over existing target FILE since neither..."
+#    The loom.org safe-stow target handles both. If using make safe-stow
+#    and it fails silently (doesn't backup), check the sed patterns.
+#
+# 2. HelmCortex symlink conflict: On machines where ~/HelmCortex is a
+#    user-managed symlink (e.g. T480s: ~/HelmCortex -> ~/mnt/x230/HelmCortex),
+#    stow cannot merge into it and reports "existing target is not owned
+#    by stow". Solution: use --ignore='HelmCortex' on those machines.
+#    On the X230 where ~/HelmCortex is a real directory, stow works fine.
+#
+# 3. Absolute symlinks in overlay dirs (e.g. .config/guix/current ->
+#    /var/guix/profiles/...) cause stow to abort. Remove them before
+#    stowing — they're machine-specific and shouldn't be stow-managed.
+#
+# 4. Backup files (.bak.TIMESTAMP) in $HOME can confuse stow on
+#    subsequent runs. Use --ignore='\.bak\.' to skip them.
+# ══════════════════════════════════════════════════════════════
 info "Phase 6: Stowing overlays"
 
 cd "$DOTCORTEX"
+
+# Remove absolute symlinks that stow can't handle
+find all/ linux/ debian/ -type l 2>/dev/null | while read -r link; do
+  target=$(readlink "$link" 2>/dev/null || true)
+  if [ -n "$target" ] && [[ "$target" = /* ]]; then
+    warn "Removing absolute symlink: $link -> $target"
+    rm "$link"
+  fi
+done
 
 # Detect which overlays to apply
 OVERLAYS="all"
@@ -391,8 +431,42 @@ if [ -d /sys/devices/platform/thinkpad_acpi ] || \
 fi
 
 info "Stowing: $OVERLAYS"
-STOW_PKGS="$OVERLAYS" make safe-stow 2>&1 || warn "Stow had conflicts (check output above)"
-ok "Stowed"
+
+# Detect if HelmCortex is a symlink (mounted machine)
+STOW_IGNORE=""
+if [ -L "$HOME/HelmCortex" ]; then
+  info "HelmCortex is a symlink — ignoring it during stow"
+  STOW_IGNORE="--ignore=HelmCortex"
+fi
+
+# Backup conflicting real files and stow each overlay
+for pkg in $OVERLAYS; do
+  info "Processing overlay: $pkg"
+
+  # Detect files that need backup (handles both stow message formats)
+  stow -n $pkg 2>&1 \
+    | sed -n \
+      -e 's/.*existing target is neither a link nor a directory: \(.*\)$/\1/p' \
+      -e 's/.*over existing target \(.*\) since neither.*/\1/p' \
+    | while read -r t; do
+        case "$t" in /*) abs="$t" ;; *) abs="$HOME/$t" ;; esac
+        if [ -e "$abs" ] && [ ! -L "$abs" ]; then
+          ts=$(date +%Y%m%d-%H%M%S)
+          info "  backup $abs -> $abs.bak.$ts"
+          cp -a "$abs" "$abs.bak.$ts"
+          rm -rf "$abs"
+        fi
+      done
+
+  # Stow with appropriate ignores
+  if stow $STOW_IGNORE --ignore='\.bak\.' $pkg 2>&1; then
+    ok "Stowed: $pkg"
+  else
+    warn "Stow $pkg had issues (check output above)"
+  fi
+done
+
+ok "All overlays processed"
 
 # ══════════════════════════════════════════════════════════════
 # Phase 7: pip packages
