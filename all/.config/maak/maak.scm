@@ -27,17 +27,17 @@
 (define CORE-PROFILE (string-append HOME "/.guix-extra-profiles/core/core"))
 
 (define (mk-guix cmd)
-  (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/guix.mk " cmd)))
+  (sh (string-append "make -f " HOME "/DotCortex/all/.mk/guix.mk " cmd)))
 
 (define (mk-guix-root cmd)
-  (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/guix-root.mk " cmd)))
+  (sh (string-append "make -f " HOME "/DotCortex/all/.mk/guix-root.mk " cmd)))
 
 (define (mk cmd)
-  (sh (string-append "make -f " HOME "/.dotfiles/all/.mk/flatpak.mk " cmd)))
+  (sh (string-append "make -f " HOME "/DotCortex/all/.mk/flatpak.mk " cmd)))
 
 (define (mk-appimage cmd)
   (let* ((HOME (or (getenv "HOME") ""))
-         (mk (string-append "make -f " HOME "/.dotfiles/all/.mk/appimage.mk " cmd)))
+         (mk (string-append "make -f " HOME "/DotCortex/all/.mk/appimage.mk " cmd)))
     (let* ((p   (open-pipe* OPEN_READ "bash" "-lc" mk))
            (out (read-string p))
            (ec  (close-pipe p)))
@@ -113,11 +113,11 @@
 
    (task 'guix:git-bench
          "Probe guix channel mirrors and print the fastest URL (writes cache)"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/guix.mk guix-pull-bench")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/guix.mk guix-pull-bench")))
 
    (task 'guix:git-apply
          "Apply fastest guix pull mirror to ~/.config/guix/channels.scm"
-         (lambda () (sh "~/.dotfiles/all/.local/bin/guix-apply-pull-url")))
+         (lambda () (sh "~/DotCortex/all/.local/bin/guix-apply-pull-url")))
 
    (task 'guix:dirs "Ensure ancillary Guix directories"
          (lambda () (mk-guix "guix-dirs")))
@@ -136,11 +136,11 @@
    ;; --- Guix substitute bench/apply ---
    (task 'guix:sub-bench
          "Benchmark Guix substitute servers and print best order"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/guix-substitutes.mk guix-sub-bench")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/guix-substitutes.mk guix-sub-bench")))
 
    (task 'guix:sub-apply
          "Apply the best substitute server order to guix-daemon"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/guix-substitutes.mk guix-sub-apply")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/guix-substitutes.mk guix-sub-apply")))
 
    ;; --- Which binaries (user) ---
    (task 'which-nvim "Show nvim location and version"
@@ -156,7 +156,7 @@
    ;; --- Root integration / Guix root ---
    (task 'root:sync
          "Sync dotfiles configs into root (channels, manifest, nvim)"
-         (lambda () (sh "~/.dotfiles/all/.local/bin/root-sync")))
+         (lambda () (sh "~/DotCortex/all/.local/bin/root-sync")))
 
    (task 'guix:pull-root "guix pull for root using synced channels"
          (lambda () (mk-guix-root "guix-root-pull")))
@@ -169,7 +169,7 @@
 
    (task 'root:config
          "Apply root-level configs that need sudo (Early OOM etc.)"
-         (lambda () (sh "MODE=balanced ~/.dotfiles/think/.local/bin/earlyoom-balanced")))
+         (lambda () (sh "MODE=balanced ~/DotCortex/think/.local/bin/earlyoom-balanced")))
 
    (task 'root:earlyoom-dryrun
          "Show what earlyoom would kill, without killing"
@@ -216,46 +216,46 @@
    ;; --- Snap ---
    (task 'snap:sync
          "Install or refresh everything in the manifest, no removals"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-apply")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/snap.mk snap-apply")))
 
    (task 'snap:apply
          "Install from manifest, uninstall extras (safe, keeps protected bases)"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-enforce")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/snap.mk snap-enforce")))
 
    (task 'snap:apply!
          "Install from manifest, uninstall extras, allow protected removals"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-enforce-force")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/snap.mk snap-enforce-force")))
 
    ;; (task 'snap:sync-dry "Dry run of sync"
-   ;;       (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-apply-dry")))
+   ;;       (lambda () (sh "make -f ~/DotCortex/all/.mk/snap.mk snap-apply-dry")))
 
    (task 'snap:prune "Remove all disabled snap revisions"
-         (lambda () (sh "~/.dotfiles/all/.local/bin/snap-prune-disabled")))
+         (lambda () (sh "~/DotCortex/all/.local/bin/snap-prune-disabled")))
 
    ;; (task 'snap:autoremove-list
    ;;       "Dry run: prune disabled, remove unused content snaps and bases"
-   ;;       (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove")))
+   ;;       (lambda () (sh "~/DotCortex/all/.local/bin/snap-autoremove")))
 
    (task 'snap:autoremove
          "Execute: same as above, with removals"
-         (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove --yes")))
+         (lambda () (sh "~/DotCortex/all/.local/bin/snap-autoremove --yes")))
 
    (task 'snap:orphans "List orphaned user data dirs under ~/snap"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-list-orphans")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/snap.mk snap-list-orphans")))
 
    ;; (task 'snap:purge-data!
    ;;       "Execute: also purge orphaned data dirs under ~/snap and /var/snap"
-   ;;       (lambda () (sh "~/.dotfiles/all/.local/bin/snap-autoremove --yes --purge-data")))
+   ;;       (lambda () (sh "~/DotCortex/all/.local/bin/snap-autoremove --yes --purge-data")))
 
    (task 'snap:connections "Show consumers of common content snaps"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/snap.mk snap-connections")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/snap.mk snap-connections")))
 
    (task 'snap:capture
          "Capture installed apps -> all/.snap/manifest/apps.ssv"
-         (lambda () (sh "~/.dotfiles/all/.local/bin/snap-capture")))
+         (lambda () (sh "~/DotCortex/all/.local/bin/snap-capture")))
 
    (task 'snap:diff "Plan: show manifest vs installed"
-         (lambda () (sh "~/.dotfiles/all/.local/bin/snap-diff")))
+         (lambda () (sh "~/DotCortex/all/.local/bin/snap-diff")))
 
    ;; --- AppImage ---
    (task 'appimage:integrate
@@ -264,7 +264,7 @@
 
    (task 'appimage:update
          "Update all AppImages (Auto-integrate, scrub desktops)"
-         (lambda () (sh "make -f ~/.dotfiles/all/.mk/appimage.mk appimage-update")))
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
 
    ;; Back-compat alias
    (task 'appimage:ail-scrub
@@ -335,7 +335,21 @@
          (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/npm-apply")))
 
    (task 'npm:health "Show DotCortex Node env and versions"
-         (lambda () (sh "~/.local/bin/npm-health")))))
+         (lambda () (sh "~/.local/bin/npm-health")))
+
+   ;; --- Pip ---
+   (task 'pip:capture "Capture live pip to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/pip-capture")))
+
+   (task 'pip:diff "Plan: manifest vs live pip"
+         (lambda () (sh "~/.local/bin/pip-diff")))
+
+   (task 'pip:apply
+         "Install missing pip packages from manifest"
+         (lambda () (sh "~/.local/bin/pip-apply")))
+
+   (task 'pip:health "Show DotCortex Python/pip env and versions"
+         (lambda () (sh "~/.local/bin/pip-health")))))
 
 ;; --- Pretty printing for help ---
 

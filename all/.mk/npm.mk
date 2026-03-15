@@ -1,4 +1,4 @@
-# ~/.dotfiles/all/.mk/npm.mk
+# ~/DotCortex/all/.mk/npm.mk
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 

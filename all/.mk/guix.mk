@@ -22,7 +22,7 @@ guix-dirs:
 # 1) BENCH → writes cache, prints URL (LOUD)
 guix-pull-bench: guix-dirs
 | set -Eeuo pipefail; \
-| BENCH="$(HOME)/.dotfiles/all/.local/bin/guix-bench-pull"; \
+| BENCH="$(HOME)/DotCortex/all/.local/bin/guix-bench-pull"; \
 | [ -x "$$BENCH" ] || { echo "guix-bench-pull not found/executable" >&2; exit 1; }; \
 | URL="$$( "$$BENCH" )" || URL=""; \
 | if [ -z "$$URL" ]; then echo "No URL found by bench" >&2; exit 1; fi; \

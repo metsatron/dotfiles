@@ -1,4 +1,4 @@
-# ~/.dotfiles/all/.mk/appimage.mk
+# ~/DotCortex/all/.mk/appimage.mk
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 

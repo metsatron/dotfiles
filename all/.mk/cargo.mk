@@ -1,4 +1,4 @@
-# ~/.dotfiles/all/.mk/cargo.mk
+# ~/DotCortex/all/.mk/cargo.mk
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
