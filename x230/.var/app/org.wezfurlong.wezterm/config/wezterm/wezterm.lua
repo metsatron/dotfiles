@@ -204,23 +204,16 @@ config.keys = {
 config.bold_brightens_ansi_colors = false
 config.term = 'wezterm'
 
+-- Start zsh directly on the host — no bash, no command echo, no cruft
+local guix_zsh = os.getenv('HOME') .. '/.guix-extra-profiles/core/core/bin/zsh'
+if os.getenv('FLATPAK_ID') then
+  config.default_prog = { 'flatpak-spawn', '--host', guix_zsh, '-l' }
+else
+  config.default_prog = { guix_zsh, '-l' }
+end
+
 -- left-stack mux (single, deferred)
 local mux = wezterm.mux
-
--- Prefer absolute path to flatpak-spawn inside the sandbox to avoid PATH overrides
-local function has(p)
-  local f = io.open(p, 'rb')
-  if f then f:close() return true end
-end
-
--- Host wrapper that works from host or sandbox panes
--- Use absolute Guix zsh path since /bin/sh doesn't have Guix profile in PATH
-local guix_zsh = os.getenv('HOME') .. '/.guix-extra-profiles/core/core/bin/zsh'
-local function host_cmdline(cmd)
-  local q = wezterm.shell_quote_arg(cmd .. '; exec ' .. guix_zsh .. ' -i')
-  local inner = 'if command -v flatpak-spawn >/dev/null 2>&1; then flatpak-spawn --host ' .. guix_zsh .. ' -lc ' .. q .. ' ; else ' .. guix_zsh .. ' -lc ' .. q .. ' ; fi'
-  return 'sh -lc ' .. wezterm.shell_quote_arg(inner)
-end
 
 wezterm.on('gui-startup', function(cmd)
   if os.getenv('WEZ_LEFT_STACK') ~= '1' then
@@ -235,17 +228,17 @@ wezterm.on('gui-startup', function(cmd)
   local tab, _pane_ignored, window = mux.spawn_window(cmd or {})
 
   -- defer until GUI window and initial pane exist
-  wezterm.time.call_after(0.05, function()
+  wezterm.time.call_after(0.3, function()
     local left = window and window:active_pane()
     if not left then return end
 
-    left:send_text(host_cmdline('clear && cd ~/DotCortex && fastfetch') .. string.char(13))
+    left:send_text('clear && cd ~/DotCortex && fastfetch\r')
 
     local right = left:split{ direction = 'Right', size = vs }
-    right:send_text(host_cmdline('cd ~/DotCortex && swaptop || clear') .. string.char(13))
+    right:send_text('cd ~/DotCortex && swaptop || clear\r')
 
     local bottom = left:split{ direction = 'Bottom', size = hs }
-    bottom:send_text(host_cmdline('swapfetch --watch 5 || printf "swapfetch not found\n"') .. string.char(13))
+    bottom:send_text('swapfetch --watch 5 || printf "swapfetch not found\\n"\r')
 
     -- maximize after layout
     local gw = window:gui_window()
