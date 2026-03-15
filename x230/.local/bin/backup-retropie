@@ -1,0 +1,146 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+NAME="retropie"
+
+# Resolve HOME even when run via sudo
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+
+# === CONFIG ===
+SRC="${USER_HOME}/RetroPie"
+BASE="/backup/backup-retropie"
+DEST="${BASE}/RetroPie"
+GUARD_FILE="${DEST}/.backup_guard"
+LOG="/tmp/backup_${NAME}_$(date +%Y%m%d_%H%M%S).log"
+LOCK="/tmp/backup_${NAME}.lock"
+
+RSYNC_RUN=( -aH --delete --info=stats2,progress2 --no-owner --no-group --exclude='.backup_guard' )
+RSYNC_DRY=( -anv --delete --itemize-changes --no-owner --no-group --exclude='.backup_guard' )
+
+# === ARGS ===
+MODE="" AUTO=0 USE_LOCK=1
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes" ;;
+    -n|--dry|--dry-run) MODE="dry" ;;
+    --auto) AUTO=1 ;;
+    --no-lock) USE_LOCK=0 ;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run] [-y|--yes] [--auto] [--no-lock]
+  -n, --dry-run   Dry-run only (no writes)
+  -y, --yes       Perform real sync
+  --auto          Non-interactive (must be combined with -n or -y)
+  --no-lock       Skip single-instance lock (not recommended)
+EOF
+      exit 0;;
+    *) echo "ERROR: Unknown arg: $1" >&2; exit 1;;
+  esac; shift
+done
+
+# === UTILS ===
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
+realp(){ readlink -f "$1" 2>/dev/null || echo "$1"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+lock(){
+  (( USE_LOCK )) || return 0
+  exec 9>"$LOCK" || true
+  flock -n 9 || die "Another ${NAME} run appears active (lock: $LOCK). Use --no-lock to override."
+  echo "$$" 1>&9 || true
+}
+
+# === SAFETY CHECKS ===
+safety_checks() {
+  [ -d "$SRC" ] || die "Missing source: $SRC"
+  mountpoint -q /backup || die "/backup is not mounted"
+  mkdir -p "$DEST"
+  [ -d "$BASE" ] || die "Missing base dir: $BASE"
+
+  local DEST_R; DEST_R="$(realp "$DEST")"
+  [ "$DEST_R" != "/backup" ] || die "Refusing to target /backup"
+  [ "$DEST_R" != "$BASE" ]   || die "Refusing to target base ($BASE); must be the RetroPie subdir"
+  [ -w "$DEST_R" ] || die "Destination not writable by $(id -un). Fix: sudo chown -R $(id -un):$(id -gn) '$DEST_R'"
+
+  # Create/update guard
+  if [ ! -f "$GUARD_FILE" ]; then
+    {
+      echo "mirror target for \$HOME/RetroPie"
+      echo "SRC=$(realp "$SRC")"
+      echo "DEST=$DEST_R"
+      echo "FSTYPE=$(findmnt -no FSTYPE --target "$DEST_R")"
+      echo "DEV=$(findmnt -no SOURCE --target "$DEST_R")"
+      echo "CREATED=$(date -Is)"
+    } > "$GUARD_FILE"
+    chmod 644 "$GUARD_FILE"
+  fi
+
+  # Quick sanity: ensure SRC isn't suspiciously empty (protect against bad paths)
+  local c; c=$(find "$SRC" -mindepth 1 -maxdepth 1 | head -n1 | wc -l)
+  (( c > 0 )) || die "Source looks empty: $SRC (bailing to avoid destructive mirror)"
+}
+
+# === PREVIEW / STATS ===
+rsync_sizes() {
+  rsync -an --delete --stats --exclude='.backup_guard' --no-owner --no-group \
+    "$(realp "$SRC")/" "$(realp "$DEST")/" 2>/dev/null |
+  awk -F': *' '
+    /Total file size:/ {gsub(/,| bytes/,"",$2); t=$2}
+    /Total transferred file size:/ {gsub(/,| bytes/,"",$2); x=$2}
+    END {print t? t:0, x? x:0}'
+}
+
+delete_count() {
+  rsync -an --delete --itemize-changes --exclude='.backup_guard' --no-owner --no-group \
+    "$(realp "$SRC")/" "$(realp "$DEST")/" |
+  awk 'BEGIN{c=0} /^\*deleting /{c++} END{print c}'
+}
+
+prompt_mode() {
+  local SRC_R DEST_R DEV FST total xfer free dels
+  SRC_R="$(realp "$SRC")"; DEST_R="$(realp "$DEST")"
+  DEV="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$DEST_R" 2>/dev/null || true)"
+  FST="$(findmnt -no FSTYPE --target "$DEST_R" 2>/dev/null || true)"
+  read -r total xfer < <(rsync_sizes); free="$(avail_bytes "$DEST_R")"
+  dels="$(delete_count)"
+
+  echo "------------------------------------------------------------"
+  echo "About to run rsync WITH --delete"
+  echo "FROM: $SRC_R"
+  echo "TO:   $DEST_R"
+  echo "DEV:  $DEV"
+  echo "FS:   $FST"
+  echo "CMD:  rsync ${RSYNC_RUN[*]} \"$SRC_R/\" \"$DEST_R/\""
+  echo "Size: total=$(hr "$total")  xfer~=$(hr "$xfer")  free=$(hr "$free")"
+  echo "Warn: would delete $dels path(s) at DEST"
+  [ "$xfer" -gt "$free" ] && echo "[warn] Estimated transfer exceeds free space"
+  echo "------------------------------------------------------------"
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+  read -rp "Type EXACT DEST path to confirm, or 'd' for dry-run, or 'n' to abort: " ans
+  case "$ans" in
+    n|N) exit 0 ;;
+    d|D) MODE="dry" ;;
+    *) [ "$ans" = "$DEST_R" ] || die "Confirmation mismatch. Aborting."; MODE="yes" ;;
+  esac
+}
+
+run_sync() {
+  local SRC_R DEST_R; SRC_R="$(realp "$SRC")"; DEST_R="$(realp "$DEST")"
+  if [ "$MODE" = "dry" ]; then
+    echo "[*] DRY-RUN start"
+    rsync "${RSYNC_DRY[@]}" "$SRC_R/" "$DEST_R/" | tee "$LOG"
+    echo "[*] DRY-RUN log: $LOG"
+  else
+    echo "[*] SYNC start"
+    ionice -c2 -n7 nice -n 19 rsync "${RSYNC_RUN[@]}" "$SRC_R/" "$DEST_R/" | tee "$LOG"
+    echo "[✓] SYNC complete. Log: $LOG"
+  fi
+}
+
+main(){ lock; safety_checks; prompt_mode; run_sync; } ; main "$@"
