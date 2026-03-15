@@ -74,9 +74,9 @@ safe-stow:
 preview-stow:
 | cd $(HOME)/DotCortex && stow -n $(STOW_PKGS) || true
 
-# X11 apply for think overlay
+# X11 apply for x230 overlay
 x11-apply: tangle
-| cd $(HOME)/DotCortex && stow think
+| cd $(HOME)/DotCortex && stow x230
 | @echo "✅ X11 applied."
 
 include $(HOME)/DotCortex/all/.mk/flatpak.mk

@@ -8,18 +8,27 @@ See `CLAUDE.md` for full architecture details, common workflows, and package man
 
 ## Critical Rules
 
-1. **Never edit tangled output** — files inside `all/`, `linux/`, `debian/`, `think/`, `be/`, `navi/`, `arch/`, `osx/` are generated. Edit the `.org` source at repo root instead.
-2. **Org files are canonical** — every config, script, and manifest is defined inside an org code block with a `:tangle` target.
-3. **Stow target is `$HOME`** — the repo lives at `~/DotCortex`.
-4. **Use `make safe-stow`** — it backs up existing files before stowing. Never use plain `stow` directly.
-5. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs.
+1. **Never edit tangled output** — files inside `all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `be/`, `navi/`, `arch/`, `osx/` are generated. Edit the `.org` source at repo root instead.
+2. **Never edit the Makefile directly** — it is tangled from `loom.org`. Edit `loom.org` instead, then `make tangle`.
+3. **Org files are canonical** — every config, script, and manifest is defined inside an org code block with a `:tangle` target.
+4. **Stow target is `$HOME`** — the repo lives at `~/DotCortex`.
+5. **Use `make safe-stow`** — it backs up existing files before stowing. Never use plain `stow` directly.
+6. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs.
+7. **Check Guix profiles before assuming tools aren't installed** — emacs, nvim, zsh, guile etc live at `~/.guix-extra-profiles/core/core/bin/`, not in system PATH.
 
 ## Build & Apply
 
 ```bash
 cd ~/DotCortex
 make tangle                                          # org → overlay files
-make safe-stow STOW_PKGS="all linux debian think"   # stow with backup
+
+# With loom (requires Guix guile + stowed maak.scm)
+loom stow:x230                                       # X230: all linux debian x230
+loom stow:t480s                                      # T480s: all linux debian devuan t480s
+loom stow:devuan                                     # shared: all linux devuan
+
+# Without loom (first stow, or systems without Guix)
+STOW_PKGS='all linux debian devuan t480s' make safe-stow
 ```
 
 ## Bootstrap (Fresh Machine)
@@ -42,6 +51,18 @@ done
 make tangle
 ```
 
+### Loom Bootstrap (Chicken-and-Egg)
+
+`loom` needs `~/.config/maak/maak.scm` (placed by stow) and Guix guile. You CANNOT use `loom stow:x230` for the first stow — use `make safe-stow` directly. `INSTALL.sh` handles this by pre-placing maak.scm before stow runs.
+
+### Guix Emacs Not in SSH PATH
+
+On Guix machines, emacs lives at `~/.guix-extra-profiles/core/core/bin/emacs`. It is NOT in the default SSH PATH. The `.zshenv` sources Guix profiles for all zsh invocations. For bash SSH sessions:
+
+```bash
+export PATH="$HOME/.guix-extra-profiles/core/core/bin:$PATH"
+```
+
 ### Guix on Non-systemd Systems (Devuan, sysv-init)
 
 The official Guix installer (`guix-install.sh`) requires interactive stdin and will fail when piped or run non-interactively. On sysv-init systems:
@@ -56,8 +77,15 @@ On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a harmless w
 
 ### Stow Conflicts
 
-- **safe-stow sed pattern**: Stow 2.4+ changed message format. The safe-stow target in `loom.org` handles both old and new formats. If backup isn't working, check the sed patterns.
-- **HelmCortex symlink**: On mounted machines where `~/HelmCortex` is a symlink, stow reports "not owned by stow". Use `--ignore='HelmCortex'`. The safe-stow target auto-retries with this flag.
+The safe-stow target handles three conflict message formats:
+
+1. `existing target is neither a link nor a directory: FILE` (stow <2.4)
+2. `cannot stow PKG/FILE over existing target FILE since neither...` (stow 2.4+)
+3. `existing target is not owned by stow: FILE` (foreign files/symlinks after repo rename)
+
+It filters out HelmCortex (user-managed symlink on mounted machines), backs up real files, then stows. On failure, auto-retries with `--ignore=HelmCortex`.
+
+- **"not owned by stow" after repo rename**: If the repo was renamed (`.dotfiles` → `DotCortex`), all old stow symlinks become foreign. Remove dangling symlinks first: `find ~ -maxdepth 5 -lname "*/.dotfiles/*" -not -path "*/.git/*" -delete`, then re-stow.
 - **Absolute symlinks**: Org files that tangle absolute symlinks (e.g. `.config/guix/current`) will cause stow to abort. Remove them from overlay dirs — they're machine-specific.
 
 ## Package Manifests
@@ -119,14 +147,21 @@ make safe-stow
 
 DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow any files into HelmCortex. HelmCortex owns all its own configs directly (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs).
 
-DotCortex's only touchpoint is the shell PATH entry adding `$HOME/HelmCortex/FORGE/bin` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
+DotCortex's only touchpoint is the shell PATH entry (in `.zshenv` and `.zshrc`) adding `$HOME/HelmCortex/FORGE/bin` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
 
 On multi-machine setups, HelmCortex may be mounted (e.g., `~/mnt/x230/HelmCortex`) and symlinked to `~/HelmCortex`.
 
 ## Multi-Machine Setup (Star Fleet)
 
-- **X230** (ThinkPad): HelmCortex native, overlays: `all linux debian think`
-- **T480s** (ThinkPad): HelmCortex mounted at `~/mnt/x230/`, symlinked to `~/HelmCortex`, overlays: `all linux debian`
+- **X230** (ThinkPad, Debian/systemd): HelmCortex native, overlays: `all linux debian x230`, verb: `loom stow:x230`
+- **T480s** (ThinkPad, Devuan/sysv-init): HelmCortex mounted, symlinked, overlays: `all linux debian devuan t480s`, verb: `loom stow:t480s`
 - Future machines: clone DotCortex, run `INSTALL.sh`, done
 
-The overlay system means machine-specific configs go in `think/` (or a new overlay) while shared configs live in `all/`.
+### Overlay Scoping
+
+- `all/` — cross-platform shared
+- `linux/` — Linux-only (host-wrap, Guix wrappers)
+- `debian/` — Debian-family (apt/nala)
+- `devuan/` — sysv-init shared (non-systemd daemons, XFCE panel launchers)
+- `x230/` — X230-specific (earlyoom, neofetch, fastfetch, GTK, wezterm, systemd services)
+- `t480s/` — T480s-specific (future per-machine configs)
