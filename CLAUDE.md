@@ -173,7 +173,13 @@ Or fix `/tmp` permissions: `sudo chmod 1777 /tmp`
 
 ## HelmCortex Integration
 
-DotCortex coexists with HelmCortex (the knowledge/project system). HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mnt/x230/HelmCortex`). DotCortex manages shell PATH entries that include `$HOME/HelmCortex/FORGE/bin` for tools like `auryn` (brain CLI), `claude-code-md-pipeline`, and other FORGE scripts.
+DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow any files into HelmCortex — HelmCortex owns all its own configs (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs) directly.
+
+DotCortex's only HelmCortex touchpoint is the shell PATH entry in `shell.org` that adds `$HOME/HelmCortex/FORGE/bin` to `$PATH` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
+
+HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mnt/x230/HelmCortex`).
+
+**Historical note**: HelmCortex configs were previously managed via `helmcortex.org` and stowed from `all/HelmCortex/`. This was decoupled in March 2026. The legacy org file is archived at `HelmCortex/ROOTS/DotRoot/helmcortex.org`.
 
 ## Multi-Machine Setup (Star Fleet)
 
