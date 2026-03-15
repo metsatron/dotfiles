@@ -137,6 +137,40 @@ wget https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz
 
 On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a warning about being unable to preload it. This is cosmetic — Guix works fine. Unset `LD_PRELOAD` if it bothers you.
 
+### safe-stow sed pattern doesn't match (stow 2.4+)
+
+Stow 2.4 changed its conflict message format. The old format was:
+
+```
+existing target is neither a link nor a directory: .bashrc
+```
+
+The new format is:
+
+```
+cannot stow DotCortex/all/.bashrc over existing target .bashrc since neither a link nor a directory
+```
+
+The safe-stow target in `loom.org` handles both patterns. If you see safe-stow failing to backup conflicting files, check the sed patterns match your stow version.
+
+### Stow fails with "existing target is not owned by stow: HelmCortex"
+
+On machines where `~/HelmCortex` is a user-managed symlink (e.g. T480s mount), stow cannot merge into it. Use `--ignore='HelmCortex'` on those machines. On the X230 where `~/HelmCortex` is a real directory, stow works fine. The safe-stow target auto-retries with `--ignore=HelmCortex` on failure.
+
+### Absolute symlinks in overlay dirs abort stow
+
+If an org file tangles an absolute symlink (e.g. `.config/guix/current -> /var/guix/...`), stow will refuse to manage it. Remove such symlinks from overlay dirs before stowing — they are machine-specific and should not be stow-managed. `INSTALL.sh` auto-cleans these.
+
+### Tangle fails with "Permission denied, /tmp/org-persist-"
+
+If `/tmp` has restrictive permissions (e.g. `755` instead of `1777`), emacs batch-mode tangle fails because `org-persist` can't create temp directories. Fix with:
+
+```bash
+TMPDIR=~/.cache/tmp make tangle
+```
+
+Or fix `/tmp` permissions: `sudo chmod 1777 /tmp`
+
 ## HelmCortex Integration
 
 DotCortex coexists with HelmCortex (the knowledge/project system). HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mnt/x230/HelmCortex`). DotCortex manages shell PATH entries that include `$HOME/HelmCortex/FORGE/bin` for tools like `auryn` (brain CLI), `claude-code-md-pipeline`, and other FORGE scripts.

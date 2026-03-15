@@ -54,6 +54,12 @@ The official Guix installer (`guix-install.sh`) requires interactive stdin and w
 
 On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a harmless warning. Ignore it or `unset LD_PRELOAD`.
 
+### Stow Conflicts
+
+- **safe-stow sed pattern**: Stow 2.4+ changed message format. The safe-stow target in `loom.org` handles both old and new formats. If backup isn't working, check the sed patterns.
+- **HelmCortex symlink**: On mounted machines where `~/HelmCortex` is a symlink, stow reports "not owned by stow". Use `--ignore='HelmCortex'`. The safe-stow target auto-retries with this flag.
+- **Absolute symlinks**: Org files that tangle absolute symlinks (e.g. `.config/guix/current`) will cause stow to abort. Remove them from overlay dirs — they're machine-specific.
+
 ## Package Manifests
 
 | Manager  | Org File       | Loom Verbs                      |
