@@ -15,7 +15,7 @@ ROOT_PULL_CACHE := $(ROOT_BENCH_DIR)/pull-url
 # Sync user channels and manifest to root
 .PHONY: guix-root-sync
 guix-root-sync:
-| $(HOME)/.dotfiles/all/.local/bin/root-sync
+| $(HOME)/DotCortex/all/.local/bin/root-sync
 
 # Pull using the channels already synced into root
 .PHONY: guix-root-pull
