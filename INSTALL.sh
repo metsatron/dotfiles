@@ -389,21 +389,44 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════
+# Phase 5.5: Pre-place loom + maak.scm (chicken-and-egg fix)
+# ══════════════════════════════════════════════════════════════
+# LESSON: loom needs ~/.config/maak/maak.scm (placed by stow)
+# and Guix guile. You CANNOT use `loom stow:x230` for the first
+# stow — but after this phase, loom will work for subsequent runs.
+# ══════════════════════════════════════════════════════════════
+info "Phase 5.5: Pre-placing loom and maak.scm"
+
+if [ -f "$DOTCORTEX/all/.config/maak/maak.scm" ]; then
+  mkdir -p "$HOME/.config/maak"
+  cp "$DOTCORTEX/all/.config/maak/maak.scm" "$HOME/.config/maak/maak.scm"
+  ok "Pre-placed maak.scm"
+fi
+
+if [ -f "$DOTCORTEX/all/.local/bin/loom" ]; then
+  mkdir -p "$HOME/.local/bin"
+  cp "$DOTCORTEX/all/.local/bin/loom" "$HOME/.local/bin/loom"
+  chmod +x "$HOME/.local/bin/loom"
+  ok "Pre-placed loom"
+fi
+
+# ══════════════════════════════════════════════════════════════
 # Phase 6: Stow
 # ══════════════════════════════════════════════════════════════
 # LESSONS LEARNED:
 #
-# 1. safe-stow's sed pattern must handle BOTH stow message formats:
+# 1. safe-stow's sed pattern must handle THREE stow message formats:
 #    - stow <2.4: "existing target is neither a link nor a directory: FILE"
 #    - stow 2.4+: "cannot stow PKG/FILE over existing target FILE since neither..."
-#    The loom.org safe-stow target handles both. If using make safe-stow
-#    and it fails silently (doesn't backup), check the sed patterns.
+#    - repo rename: "existing target is not owned by stow: FILE"
+#    The loom.org safe-stow target handles all three.
 #
 # 2. HelmCortex symlink conflict: On machines where ~/HelmCortex is a
 #    user-managed symlink (e.g. T480s: ~/HelmCortex -> ~/mnt/x230/HelmCortex),
 #    stow cannot merge into it and reports "existing target is not owned
-#    by stow". Solution: use --ignore='HelmCortex' on those machines.
-#    On the X230 where ~/HelmCortex is a real directory, stow works fine.
+#    by stow". Solution: the sed output is piped through
+#    { grep -v '^HelmCortex$' || true; } to filter it out.
+#    If stow still fails, we auto-retry with --ignore='HelmCortex'.
 #
 # 3. Absolute symlinks in overlay dirs (e.g. .config/guix/current ->
 #    /var/guix/profiles/...) cause stow to abort. Remove them before
@@ -417,7 +440,7 @@ info "Phase 6: Stowing overlays"
 cd "$DOTCORTEX"
 
 # Remove absolute symlinks that stow can't handle
-find all/ linux/ debian/ -type l 2>/dev/null | while read -r link; do
+find all/ linux/ debian/ devuan/ x230/ t480s/ -type l 2>/dev/null | while read -r link; do
   target=$(readlink "$link" 2>/dev/null || true)
   if [ -n "$target" ] && [[ "$target" = /* ]]; then
     warn "Removing absolute symlink: $link -> $target"
@@ -432,10 +455,30 @@ if [ -f /etc/debian_version ] || [ -f /etc/devuan_version ]; then
   OVERLAYS="$OVERLAYS linux debian"
 fi
 
-# ThinkPad detection
+# Devuan / sysv-init overlay (non-systemd daemons, XFCE panel launchers)
+if [ -f /etc/devuan_version ] || [ "$INIT_SYSTEM" = "sysv-init" ]; then
+  OVERLAYS="$OVERLAYS devuan"
+fi
+
+# ThinkPad detection — X230 vs T480s
 if [ -d /sys/devices/platform/thinkpad_acpi ] || \
-   dmidecode -s system-product-name 2>/dev/null | grep -qi thinkpad; then
-  OVERLAYS="$OVERLAYS think"
+   $SUDO dmidecode -s system-product-name 2>/dev/null | grep -qi thinkpad; then
+  PRODUCT=$($SUDO dmidecode -s system-product-name 2>/dev/null || echo "unknown")
+  case "$PRODUCT" in
+    *X230*|*x230*)
+      OVERLAYS="$OVERLAYS x230"
+      info "Detected ThinkPad X230"
+      ;;
+    *T480s*|*t480s*|*T480*)
+      OVERLAYS="$OVERLAYS t480s"
+      info "Detected ThinkPad T480s"
+      ;;
+    *)
+      # Generic ThinkPad — use x230 overlay as default
+      OVERLAYS="$OVERLAYS x230"
+      info "Detected ThinkPad: $PRODUCT (using x230 overlay)"
+      ;;
+  esac
 fi
 
 info "Stowing: $OVERLAYS"
@@ -451,17 +494,19 @@ fi
 for pkg in $OVERLAYS; do
   info "Processing overlay: $pkg"
 
-  # Detect files that need backup (handles both stow message formats)
-  stow -n $pkg 2>&1 \
+  # Detect files that need backup (handles all three stow message formats)
+  { stow -n $pkg 2>&1 || true; } \
     | sed -n \
       -e 's/.*existing target is neither a link nor a directory: \(.*\)$/\1/p' \
       -e 's/.*over existing target \(.*\) since neither.*/\1/p' \
+      -e 's/.*existing target is not owned by stow: \(.*\)$/\1/p' \
+    | { grep -v '^HelmCortex$' || true; } \
     | while read -r t; do
         case "$t" in /*) abs="$t" ;; *) abs="$HOME/$t" ;; esac
-        if [ -e "$abs" ] && [ ! -L "$abs" ]; then
+        if [ -e "$abs" ] || [ -L "$abs" ]; then
           ts=$(date +%Y%m%d-%H%M%S)
           info "  backup $abs -> $abs.bak.$ts"
-          cp -a "$abs" "$abs.bak.$ts"
+          cp -a "$abs" "$abs.bak.$ts" 2>/dev/null || true
           rm -rf "$abs"
         fi
       done

@@ -77,8 +77,14 @@
    (task 'stow:debian "Safe stow shared + linux + debian overlays (all linux debian)"
          (lambda () (sh "STOW_PKGS='all linux debian' make safe-stow")))
 
-   (task 'stow:think "Safe stow shared ThinkPad overlays (all linux debian think)"
-         (lambda () (sh "STOW_PKGS='all linux debian think' make safe-stow")))
+   (task 'stow:x230 "Safe stow X230 overlays (all linux debian x230)"
+         (lambda () (sh "STOW_PKGS='all linux debian x230' make safe-stow")))
+
+   (task 'stow:t480s "Safe stow T480s overlays (all linux debian devuan t480s)"
+         (lambda () (sh "STOW_PKGS='all linux debian devuan t480s' make safe-stow")))
+
+   (task 'stow:devuan "Safe stow shared + linux + devuan overlays (all linux devuan)"
+         (lambda () (sh "STOW_PKGS='all linux devuan' make safe-stow")))
    (task 'stow:health
          "Scan broken symlinks under $HOME, optionally clean Stow orphans"
          (lambda ()
@@ -169,7 +175,7 @@
 
    (task 'root:config
          "Apply root-level configs that need sudo (Early OOM etc.)"
-         (lambda () (sh "MODE=balanced ~/DotCortex/think/.local/bin/earlyoom-balanced")))
+         (lambda () (sh "MODE=balanced ~/DotCortex/x230/.local/bin/earlyoom-balanced")))
 
    (task 'root:earlyoom-dryrun
          "Show what earlyoom would kill, without killing"
@@ -193,7 +199,7 @@
    (task 'flatpak:bridge "Apply Flatpak fonts/cursors bridge"
          (lambda () (sh "make flatpak-bridge")))
 
-   (task 'flatpak:x11 "Re-stow think/.xsessionrc & friends"
+   (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
          (lambda () (sh "make x11-apply")))
 
    (task 'flatpak:remotes
