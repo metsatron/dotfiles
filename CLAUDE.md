@@ -161,15 +161,16 @@ On machines where `~/HelmCortex` is a user-managed symlink (e.g. T480s mount), s
 
 If an org file tangles an absolute symlink (e.g. `.config/guix/current -> /var/guix/...`), stow will refuse to manage it. Remove such symlinks from overlay dirs before stowing — they are machine-specific and should not be stow-managed. `INSTALL.sh` auto-cleans these.
 
-### Tangle fails with "Permission denied, /tmp/org-persist-"
+### /tmp permissions break tangle AND guix pull
 
-If `/tmp` has restrictive permissions (e.g. `755` instead of `1777`), emacs batch-mode tangle fails because `org-persist` can't create temp directories. Fix with:
+If `/tmp` has restrictive permissions (e.g. `755` instead of `1777`), two things break:
 
-```bash
-TMPDIR=~/.cache/tmp make tangle
-```
+1. **Tangle**: emacs `org-persist` can't create temp directories → `Permission denied, /tmp/org-persist-`
+2. **Guix pull/build**: sandbox can't bind-mount → `bind: Permission denied`
 
-Or fix `/tmp` permissions: `sudo chmod 1777 /tmp`
+Fix the root cause: `sudo chmod 1777 /tmp`
+
+Workaround for tangle only: `TMPDIR=~/.cache/tmp make tangle`
 
 ## HelmCortex Integration
 

@@ -365,11 +365,19 @@ if command -v emacs &>/dev/null; then
   mkdir -p all/.homebrew/manifest
 
   # LESSON: If /tmp has restrictive permissions (755 instead of 1777),
-  # emacs org-persist fails to create temp dirs. Set TMPDIR as fallback.
+  # BOTH emacs org-persist AND guix build sandboxes break with
+  # "Permission denied". Fix it at the root if we have sudo.
   if ! touch /tmp/.dotcortex-perm-test 2>/dev/null; then
-    warn "/tmp is not writable — using ~/.cache/tmp as TMPDIR"
-    export TMPDIR="$HOME/.cache/tmp"
-    mkdir -p "$TMPDIR"
+    warn "/tmp is not writable (permissions may be 755 instead of 1777)"
+    if [ -n "$SUDO" ]; then
+      info "Fixing /tmp permissions..."
+      $SUDO chmod 1777 /tmp
+      ok "/tmp permissions fixed"
+    else
+      warn "Cannot fix /tmp — using ~/.cache/tmp as TMPDIR for tangle"
+      export TMPDIR="$HOME/.cache/tmp"
+      mkdir -p "$TMPDIR"
+    fi
   else
     rm -f /tmp/.dotcortex-perm-test
   fi
