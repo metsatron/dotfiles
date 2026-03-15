@@ -117,7 +117,9 @@ make safe-stow
 
 ## HelmCortex Integration
 
-DotCortex coexists with HelmCortex (knowledge/project system) at `~/HelmCortex`. Shell PATH entries include `$HOME/HelmCortex/FORGE/bin` for tools like `auryn` (brain CLI) and `claude-code-md-pipeline`.
+DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow any files into HelmCortex. HelmCortex owns all its own configs directly (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs).
+
+DotCortex's only touchpoint is the shell PATH entry adding `$HOME/HelmCortex/FORGE/bin` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
 
 On multi-machine setups, HelmCortex may be mounted (e.g., `~/mnt/x230/HelmCortex`) and symlinked to `~/HelmCortex`.
 
