@@ -207,19 +207,17 @@ config.term = 'wezterm'
 -- left-stack mux (single, deferred)
 local mux = wezterm.mux
 
--- Prefer absolute path to flatpak-spawn inside the sandbox to avoid PATH overrides
-local function has(p)
-  local f = io.open(p, 'rb')
-  if f then f:close() return true end
-end
-
--- Host wrapper that works from host or sandbox panes
--- Use absolute Guix zsh path since /bin/sh doesn't have Guix profile in PATH
 local guix_zsh = os.getenv('HOME') .. '/.guix-extra-profiles/core/core/bin/zsh'
-local function host_cmdline(cmd)
-  local q = wezterm.shell_quote_arg(cmd .. '; exec ' .. guix_zsh .. ' -i')
-  local inner = 'if command -v flatpak-spawn >/dev/null 2>&1; then flatpak-spawn --host ' .. guix_zsh .. ' -lc ' .. q .. ' ; else ' .. guix_zsh .. ' -lc ' .. q .. ' ; fi'
-  return 'sh -lc ' .. wezterm.shell_quote_arg(inner)
+
+-- Build args to spawn a pane that runs cmd then drops to interactive zsh.
+-- Uses flatpak-spawn --host when inside the sandbox, direct zsh otherwise.
+local function host_pane_args(cmd)
+  local script = cmd .. '; exec ' .. guix_zsh .. ' -i'
+  if os.getenv('FLATPAK_ID') then
+    return { 'flatpak-spawn', '--host', guix_zsh, '-lc', script }
+  else
+    return { guix_zsh, '-lc', script }
+  end
 end
 
 wezterm.on('gui-startup', function(cmd)
@@ -231,23 +229,23 @@ wezterm.on('gui-startup', function(cmd)
   local vs = math.max(5, math.min(tonumber(os.getenv('VSPLIT') or '70'), 95)) / 100.0
   local hs = math.max(5, math.min(tonumber(os.getenv('HSPLIT') or '48'), 95)) / 100.0
 
-  -- create the window first
-  local tab, _pane_ignored, window = mux.spawn_window(cmd or {})
+  -- Each pane launches zsh directly with its command — no bash, no echo
+  local tab, left, window = mux.spawn_window({
+    args = host_pane_args('cd ~/DotCortex && fastfetch'),
+  })
 
-  -- defer until GUI window and initial pane exist
-  wezterm.time.call_after(0.05, function()
-    local left = window and window:active_pane()
-    if not left then return end
+  local right = left:split{
+    direction = 'Right', size = vs,
+    args = host_pane_args('cd ~/DotCortex && swaptop || clear'),
+  }
 
-    left:send_text(host_cmdline('clear && cd ~/DotCortex && fastfetch') .. string.char(13))
+  local bottom = left:split{
+    direction = 'Bottom', size = hs,
+    args = host_pane_args('swapfetch --watch 5 || printf "swapfetch not found\\n"'),
+  }
 
-    local right = left:split{ direction = 'Right', size = vs }
-    right:send_text(host_cmdline('cd ~/DotCortex && swaptop || clear') .. string.char(13))
-
-    local bottom = left:split{ direction = 'Bottom', size = hs }
-    bottom:send_text(host_cmdline('swapfetch --watch 5 || printf "swapfetch not found\n"') .. string.char(13))
-
-    -- maximize after layout
+  -- maximize after layout
+  wezterm.time.call_after(0.1, function()
     local gw = window:gui_window()
     if gw and gw.maximize then gw:maximize() end
   end)
