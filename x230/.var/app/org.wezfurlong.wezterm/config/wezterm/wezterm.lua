@@ -239,7 +239,7 @@ wezterm.on('gui-startup', function(cmd)
     local left = window and window:active_pane()
     if not left then return end
 
-    left:send_text(host_cmdline('cd ~/DotCortex && fastfetch') .. string.char(13))
+    left:send_text(host_cmdline('cd ~/DotCortex && clear && fastfetch') .. string.char(13))
 
     local right = left:split{ direction = 'Right', size = vs }
     right:send_text(host_cmdline('cd ~/DotCortex && swaptop || clear') .. string.char(13))
