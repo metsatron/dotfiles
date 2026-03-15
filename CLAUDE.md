@@ -14,13 +14,15 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
 - **Overlay dirs**: `all/` (shared), `linux/`, `debian/`, `arch/`, `osx/`, `think/` (hardware), `be/`, `navi/`
 - **Stow**: symlinks overlay contents into `$HOME`, stacked in priority order
 - **Loom**: Guile Scheme control plane (`~/.local/bin/loom`) with 50+ task verbs
+- **Loom requires Guix** — it uses Guix's guile interpreter. Without Guix, use `make` targets directly.
 
 ## Critical Rules
 
-1. **Never edit tangled output files** — edit the `.org` source and re-tangle
-2. **Org files are at repo root** — the overlay dirs contain only tangled output
-3. **Stow target is `$HOME`** — the repo must live at `~/DotCortex`
-4. **`make safe-stow`** backs up existing files before stowing — use it instead of `make stow`
+1. **Never edit tangled output files** — edit the `.org` source and re-tangle. Files inside `all/`, `linux/`, `debian/`, `think/`, `be/`, `navi/`, `arch/`, `osx/` are generated output.
+2. **Org files are at repo root** — the overlay dirs contain only tangled output.
+3. **Stow target is `$HOME`** — the repo must live at `~/DotCortex`.
+4. **`make safe-stow`** backs up existing files before stowing — use it instead of `make stow`.
+5. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs in `loom.org`.
 
 ## Common Workflows
 
@@ -29,7 +31,7 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
 cd ~/DotCortex && make tangle && make safe-stow STOW_PKGS="all linux debian think"
 
 # Edit a config
-# 1. Find the org source: grep for the config path in *.org
+# 1. Find the org source: grep -rn "tangle.*path/to/config" *.org
 # 2. Edit the org block
 # 3. make tangle && make safe-stow
 
@@ -40,6 +42,11 @@ loom flatpak:apply      # apply Flatpak manifest
 loom pip:apply          # install pip manifest
 loom npm:apply          # install npm manifest
 loom stow               # stow all overlays
+
+# Without loom (make targets work without Guix)
+make pip-apply
+make npm-apply
+make safe-stow
 ```
 
 ## Package Manifests
@@ -58,6 +65,26 @@ Each package manager has an `.org` file that tangles a manifest (`.ssv`) and hel
 | Homebrew | `homebrew.org` | `all/.homebrew/manifest/brews.ssv`    | `brew:apply`                      |
 | Apps     | `app.org`      | `all/.app/manifest/apps.ssv`          | `app:apply`                       |
 
+### SSV Manifest Format
+
+All manifests use space-separated values with `""` for empty fields:
+
+```
+# PKG VERSION EXTRA
+litellm "" ""
+openai "" ""
+```
+
+### Adding a New Package Manager
+
+1. Create `newpkg.org` at repo root
+2. Add a manifest SSV block with `:tangle all/.newpkg/manifest/packages.ssv`
+3. Add capture/diff/apply/health scripts with `:tangle all/.local/bin/newpkg-*`
+4. Add a `.mk` Makefile fragment with `:tangle all/.mk/newpkg.mk`
+5. Add `include $(HOME)/DotCortex/all/.mk/newpkg.mk` to the Makefile block in `loom.org`
+6. Add loom task verbs to the Scheme control plane in `loom.org`
+7. `make tangle` to generate everything
+
 ## Key Files
 
 - `Makefile` — build system entry point (tangle, stow, guix-dirs)
@@ -65,11 +92,64 @@ Each package manager has an `.org` file that tangles a manifest (`.ssv`) and hel
 - `shell.org` — bash/zsh rc, exports, aliases, functions, prompt
 - `style.org` — LainCore theme (fonts, colours, GTK, terminal, Emacs)
 - `INSTALL.sh` — bootstrap script for fresh machines
-- `README.org` — full documentation
+- `README.org` — full Org documentation (the original grimoire)
+
+## Bootstrap (Fresh Machine)
+
+```bash
+git clone --recursive https://gitlab.com/metsarono/dotfiles.git ~/DotCortex
+cd ~/DotCortex && bash INSTALL.sh
+```
+
+See `INSTALL.sh` for detailed phase-by-phase documentation including lessons learned on Guix installation, init system differences, and first-tangle bootstrapping.
+
+## Known Gotchas
+
+### First tangle fails with "No rule to make target .mk"
+
+The Makefile includes `.mk` fragment files that don't exist until after the first tangle. `INSTALL.sh` handles this by creating empty stubs. If running manually:
+
+```bash
+mkdir -p all/.mk
+for mk in flatpak guix guix-substitutes snap appimage cargo homebrew npm pip; do
+  [ -f "all/.mk/${mk}.mk" ] || touch "all/.mk/${mk}.mk"
+done
+make tangle
+```
+
+### Guix installer fails on non-interactive terminal
+
+The official `guix-install.sh` requires interactive stdin. If running via SSH, CI, or piped input, use the manual install method documented in `INSTALL.sh`.
+
+### Guix installer fails with "Missing commands: daemonize"
+
+On Devuan/sysv-init systems, install `daemonize` first: `sudo apt install daemonize`
+
+### Guix ftpmirror SSL errors
+
+The `ftpmirror.gnu.org` redirector sometimes sends you to mirrors with broken SSL certificates. Use `ftp.gnu.org` directly:
+
+```bash
+wget https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz
+```
+
+### LD_PRELOAD libgtk3-nocsd warning
+
+On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a warning about being unable to preload it. This is cosmetic — Guix works fine. Unset `LD_PRELOAD` if it bothers you.
 
 ## HelmCortex Integration
 
-DotCortex coexists with HelmCortex (the knowledge/project system). HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount). DotCortex manages shell PATH entries that include `$HOME/HelmCortex/FORGE/bin` for tools like `auryn`.
+DotCortex coexists with HelmCortex (the knowledge/project system). HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mnt/x230/HelmCortex`). DotCortex manages shell PATH entries that include `$HOME/HelmCortex/FORGE/bin` for tools like `auryn` (brain CLI), `claude-code-md-pipeline`, and other FORGE scripts.
+
+## Multi-Machine Setup (Star Fleet)
+
+DotCortex is designed for deployment across multiple machines:
+
+- **X230** (ThinkPad): HelmCortex native, FORGE/bin on PATH, overlays: `all linux debian think`
+- **T480s** (ThinkPad): HelmCortex mounted at `~/mnt/x230/`, symlinked to `~/HelmCortex`, overlays: `all linux debian`
+- Future machines: clone DotCortex, run `INSTALL.sh`, done
+
+The overlay system means machine-specific configs go in `think/` (or a new overlay) while shared configs live in `all/`.
 
 ## When Working on DotCortex
 
@@ -77,3 +157,4 @@ DotCortex coexists with HelmCortex (the knowledge/project system). HelmCortex li
 - Always edit `.org` source, never tangled output
 - Test with `make tangle` before stowing
 - Use `make preview-stow` to dry-run before applying
+- After adding new package manager support, add loom verbs AND make targets
