@@ -34,12 +34,12 @@ all: toc tangle guix-dirs
 
 # Plain stow
 stow:
-| cd $(HOME)/.dotfiles && stow $(STOW_PKGS)
+| cd $(HOME)/DotCortex && stow $(STOW_PKGS)
 
 # Safe stow with timestamped backups of real files
 safe-stow:
 | set -euo pipefail; \
-| cd $(HOME)/.dotfiles; \
+| cd $(HOME)/DotCortex; \
 | for pkg in $(STOW_PKGS); do \
 |   echo ">> preview $$pkg"; \
 |   stow -n $$pkg 2>&1 \
@@ -59,18 +59,19 @@ safe-stow:
 | done
 
 preview-stow:
-| cd $(HOME)/.dotfiles && stow -n $(STOW_PKGS) || true
+| cd $(HOME)/DotCortex && stow -n $(STOW_PKGS) || true
 
 # X11 apply for think overlay
 x11-apply: tangle
-| cd $(HOME)/.dotfiles && stow think
+| cd $(HOME)/DotCortex && stow think
 | @echo "✅ X11 applied."
 
-include $(HOME)/.dotfiles/all/.mk/flatpak.mk
-include $(HOME)/.dotfiles/all/.mk/guix.mk
-include $(HOME)/.dotfiles/all/.mk/guix-substitutes.mk
-include $(HOME)/.dotfiles/all/.mk/snap.mk
-include $(HOME)/.dotfiles/all/.mk/appimage.mk
-include $(HOME)/.dotfiles/all/.mk/cargo.mk
-include $(HOME)/.dotfiles/all/.mk/homebrew.mk
-include $(HOME)/.dotfiles/all/.mk/npm.mk
+include $(HOME)/DotCortex/all/.mk/flatpak.mk
+include $(HOME)/DotCortex/all/.mk/guix.mk
+include $(HOME)/DotCortex/all/.mk/guix-substitutes.mk
+include $(HOME)/DotCortex/all/.mk/snap.mk
+include $(HOME)/DotCortex/all/.mk/appimage.mk
+include $(HOME)/DotCortex/all/.mk/cargo.mk
+include $(HOME)/DotCortex/all/.mk/homebrew.mk
+include $(HOME)/DotCortex/all/.mk/npm.mk
+include $(HOME)/DotCortex/all/.mk/pip.mk
