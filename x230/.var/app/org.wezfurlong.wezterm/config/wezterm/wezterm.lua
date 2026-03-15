@@ -214,9 +214,11 @@ local function has(p)
 end
 
 -- Host wrapper that works from host or sandbox panes
+-- Use absolute Guix zsh path since /bin/sh doesn't have Guix profile in PATH
+local guix_zsh = os.getenv('HOME') .. '/.guix-extra-profiles/core/core/bin/zsh'
 local function host_cmdline(cmd)
-  local q = wezterm.shell_quote_arg(cmd .. '; exec zsh -i')
-  local inner = 'if command -v flatpak-spawn >/dev/null 2>&1; then flatpak-spawn --host zsh -lc ' .. q .. ' ; else zsh -lc ' .. q .. ' ; fi'
+  local q = wezterm.shell_quote_arg(cmd .. '; exec ' .. guix_zsh .. ' -i')
+  local inner = 'if command -v flatpak-spawn >/dev/null 2>&1; then flatpak-spawn --host ' .. guix_zsh .. ' -lc ' .. q .. ' ; else ' .. guix_zsh .. ' -lc ' .. q .. ' ; fi'
   return 'sh -lc ' .. wezterm.shell_quote_arg(inner)
 end
 
@@ -237,10 +239,10 @@ wezterm.on('gui-startup', function(cmd)
     local left = window and window:active_pane()
     if not left then return end
 
-    left:send_text(host_cmdline('cd ~/.dotfiles && fastfetch') .. string.char(13))
+    left:send_text(host_cmdline('cd ~/DotCortex && fastfetch') .. string.char(13))
 
     local right = left:split{ direction = 'Right', size = vs }
-    right:send_text(host_cmdline('cd ~/.dotfiles && stow all linux debian think; swaptop || clear') .. string.char(13))
+    right:send_text(host_cmdline('cd ~/DotCortex && swaptop || clear') .. string.char(13))
 
     local bottom = left:split{ direction = 'Bottom', size = hs }
     bottom:send_text(host_cmdline('swapfetch --watch 5 || printf "swapfetch not found\n"') .. string.char(13))
