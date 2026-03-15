@@ -8,10 +8,19 @@
 # and loom verbs.
 #
 # Usage:
-#   curl -sL <url>/INSTALL.sh | bash        # or
 #   cd ~/DotCortex && bash INSTALL.sh
 #
-# Idempotent — safe to re-run.
+# Idempotent — safe to re-run. Each phase checks whether its
+# work has already been done and skips if so.
+#
+# IMPORTANT: This script must be run from an interactive terminal.
+# The Guix installer requires stdin for confirmation prompts.
+# Do NOT pipe this script (e.g. curl | bash) — it will fail at
+# the Guix phase.
+#
+# Tested on:
+#   - Devuan 6 (excalibur) / sysv-init / x86_64
+#   - Debian 13 (trixie) / systemd / x86_64
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -30,6 +39,22 @@ else
 fi
 info "Detected: $PRETTY_NAME"
 
+# ── Detect init system ────────────────────────────────────────
+INIT_SYSTEM="unknown"
+if [ -d /run/systemd/system ]; then
+  INIT_SYSTEM="systemd"
+elif [ -f /sbin/init ] && /sbin/init --version 2>&1 | grep -qi sysv; then
+  INIT_SYSTEM="sysv-init"
+elif command -v openrc &>/dev/null; then
+  INIT_SYSTEM="openrc"
+else
+  # Devuan uses sysv-init but init --version may not report it
+  if [ -f /etc/devuan_version ]; then
+    INIT_SYSTEM="sysv-init"
+  fi
+fi
+info "Init system: $INIT_SYSTEM"
+
 # ── Root check ────────────────────────────────────────────────
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -37,7 +62,9 @@ if [ "$(id -u)" -ne 0 ]; then
   info "Running as user — will use sudo for system packages"
 fi
 
-# ── Phase 1: System dependencies via apt/nala ─────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 1: System dependencies via apt/nala
+# ══════════════════════════════════════════════════════════════
 info "Phase 1: Installing system dependencies"
 
 # Prefer nala if available, fall back to apt
@@ -56,7 +83,8 @@ PKGS=(
   make
   gcc
 
-  # Emacs (needed for tangle)
+  # Emacs (needed for org-mode tangle — emacs-nox is sufficient,
+  # no GUI required since we only use batch mode)
   emacs-nox
 
   # Python
@@ -64,18 +92,18 @@ PKGS=(
   python3-pip
   python3-venv
 
-  # Node.js (for npm globals)
+  # Node.js (for npm globals like Claude Code)
   nodejs
   npm
 
   # Shell utilities
-  keychain
-  zoxide
-  jq
-  tree
-  rsync
-  htop
-  neofetch
+  keychain       # SSH key agent
+  zoxide         # smart cd replacement
+  jq             # JSON processor
+  tree           # directory viewer
+  rsync          # file sync
+  htop           # process monitor
+  neofetch       # system info display
 
   # Build essentials for compiled packages
   build-essential
@@ -83,11 +111,20 @@ PKGS=(
   pkg-config
 )
 
+# LESSON: On Devuan (sysv-init), the Guix installer needs `daemonize`
+# to background the daemon. Without it, the installer fails with
+# "Missing commands: daemonize". Install it preemptively.
+if [ "$INIT_SYSTEM" = "sysv-init" ]; then
+  PKGS+=(daemonize)
+fi
+
 $SUDO $APT update -y
 $SUDO $APT install -y "${PKGS[@]}"
 ok "System packages installed"
 
-# ── Phase 2: Clone or locate DotCortex ────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 2: Clone or locate DotCortex
+# ══════════════════════════════════════════════════════════════
 info "Phase 2: Ensuring DotCortex is in place"
 
 DOTCORTEX="$HOME/DotCortex"
@@ -105,22 +142,187 @@ fi
 
 cd "$DOTCORTEX"
 
-# ── Phase 3: GNU Guix (user install) ─────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 3: GNU Guix
+# ══════════════════════════════════════════════════════════════
+# Guix provides the Guile Scheme interpreter that powers `loom`,
+# plus hermetic package management for dev tools (nvim, etc).
+#
+# LESSONS LEARNED:
+#
+# 1. The official guix-install.sh REQUIRES interactive stdin.
+#    It checks `read` and will fail with "Can't read standard
+#    input. Hint: don't pipe scripts into a shell." if stdin
+#    is not a terminal. You CANNOT use `yes | bash guix-install.sh`.
+#
+# 2. On Devuan/sysv-init, the installer needs the `daemonize`
+#    package (installed in Phase 1 above).
+#
+# 3. The ftpmirror.gnu.org redirector sometimes sends you to
+#    mirrors with broken SSL. If the official installer fails
+#    to download, use the manual method below which fetches
+#    from ftp.gnu.org directly.
+#
+# 4. After install, the daemon must be started manually on
+#    sysv-init systems (no systemd unit auto-activation).
+#
+# We try the official installer first. If it fails (common on
+# non-interactive runs), we fall back to manual installation.
+# ══════════════════════════════════════════════════════════════
 info "Phase 3: GNU Guix"
+
+GUIX_VERSION="1.5.0"
+GUIX_ARCH="x86_64-linux"
 
 if command -v guix &>/dev/null; then
   ok "Guix already installed"
 else
-  info "Installing GNU Guix (user daemon)..."
-  # Official Guix install script
-  cd /tmp
-  curl -sL https://git.savannah.gnu.org/cgit/guix.git/plain/etc/guix-install.sh -o guix-install.sh
-  chmod +x guix-install.sh
-  $SUDO bash guix-install.sh
-  ok "Guix installed — you may need to log out and back in"
+  info "Installing GNU Guix ${GUIX_VERSION}..."
+
+  # Try official installer first (needs interactive terminal)
+  GUIX_INSTALLED=false
+
+  if [ -t 0 ]; then
+    info "Attempting official installer (interactive)..."
+    cd /tmp
+    curl -sL https://git.savannah.gnu.org/cgit/guix.git/plain/etc/guix-install.sh -o guix-install.sh
+    chmod +x guix-install.sh
+    if $SUDO bash guix-install.sh; then
+      GUIX_INSTALLED=true
+      ok "Guix installed via official script"
+    else
+      warn "Official installer failed — falling back to manual install"
+    fi
+  else
+    warn "Non-interactive terminal — using manual install method"
+  fi
+
+  # Manual fallback
+  if [ "$GUIX_INSTALLED" = false ]; then
+    info "Manual Guix installation..."
+
+    GUIX_TARBALL="guix-binary-${GUIX_VERSION}.${GUIX_ARCH}.tar.xz"
+    GUIX_URL="https://ftp.gnu.org/gnu/guix/${GUIX_TARBALL}"
+
+    # Download
+    cd /tmp
+    if [ ! -f "$GUIX_TARBALL" ]; then
+      info "Downloading ${GUIX_TARBALL} (~130MB)..."
+      wget -q --show-progress "$GUIX_URL" -O "$GUIX_TARBALL"
+    fi
+
+    # Extract to /gnu/store and /var/guix
+    info "Extracting to /gnu/store..."
+    $SUDO mkdir -p /gnu/store
+    $SUDO tar --warning=no-timestamp -xf "$GUIX_TARBALL"
+    $SUDO mv var/guix /var/ 2>/dev/null || true
+    $SUDO mv gnu/store/* /gnu/store/ 2>/dev/null || true
+
+    # Create build users (guixbuilder01..10)
+    info "Creating build users..."
+    $SUDO groupadd --system guixbuild 2>/dev/null || true
+    for i in $(seq -w 1 10); do
+      $SUDO useradd -g guixbuild -G guixbuild \
+        -d /var/empty -s /usr/sbin/nologin \
+        -c "Guix build user $i" --system \
+        "guixbuilder$i" 2>/dev/null || true
+    done
+
+    # Symlink daemon and CLI into /usr/local/bin
+    $SUDO ln -sf /var/guix/profiles/per-user/root/current-guix/bin/guix-daemon \
+      /usr/local/bin/guix-daemon
+    $SUDO ln -sf /var/guix/profiles/per-user/root/current-guix/bin/guix \
+      /usr/local/bin/guix
+
+    # Set up root profile
+    $SUDO mkdir -p ~root/.config/guix
+    $SUDO ln -sf /var/guix/profiles/per-user/root/current-guix \
+      ~root/.config/guix/current 2>/dev/null || true
+
+    # Authorize the official CI substitute server
+    # This lets Guix download pre-built binaries instead of compiling
+    $SUDO /usr/local/bin/guix archive --authorize \
+      < /var/guix/profiles/per-user/root/current-guix/share/guix/ci.guix.gnu.org.pub \
+      2>/dev/null || true
+
+    # Start the daemon
+    if [ "$INIT_SYSTEM" = "sysv-init" ]; then
+      # Create sysv init script
+      $SUDO tee /etc/init.d/guix-daemon > /dev/null << 'INITSCRIPT'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          guix-daemon
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: GNU Guix daemon
+### END INIT INFO
+
+DAEMON=/usr/local/bin/guix-daemon
+DAEMON_ARGS="--build-users-group=guixbuild"
+PIDFILE=/var/run/guix-daemon.pid
+
+case "$1" in
+  start)
+    echo "Starting guix-daemon..."
+    daemonize -p "$PIDFILE" "$DAEMON" $DAEMON_ARGS
+    ;;
+  stop)
+    echo "Stopping guix-daemon..."
+    [ -f "$PIDFILE" ] && kill $(cat "$PIDFILE") && rm -f "$PIDFILE"
+    ;;
+  restart)
+    $0 stop; sleep 1; $0 start
+    ;;
+  status)
+    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+      echo "guix-daemon is running"
+    else
+      echo "guix-daemon is not running"
+    fi
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
+INITSCRIPT
+      $SUDO chmod +x /etc/init.d/guix-daemon
+      $SUDO update-rc.d guix-daemon defaults 2>/dev/null || true
+      $SUDO daemonize /usr/local/bin/guix-daemon --build-users-group=guixbuild
+      ok "Guix daemon started (sysv-init)"
+
+    elif [ "$INIT_SYSTEM" = "systemd" ]; then
+      # Systemd unit should already exist from the tarball
+      $SUDO systemctl enable guix-daemon 2>/dev/null || true
+      $SUDO systemctl start guix-daemon 2>/dev/null || true
+      ok "Guix daemon started (systemd)"
+
+    else
+      warn "Unknown init system — start guix-daemon manually:"
+      warn "  guix-daemon --build-users-group=guixbuild &"
+    fi
+
+    ok "Guix installed via manual method"
+  fi
+
+  # Set up user profile
+  mkdir -p "$HOME/.config/guix"
+  ln -sf /var/guix/profiles/per-user/"$(whoami)"/current-guix \
+    "$HOME/.config/guix/current" 2>/dev/null || true
+
+  # Make guix available in this session
+  GUIX_PROFILE="$HOME/.config/guix/current"
+  if [ -f "$GUIX_PROFILE/etc/profile" ]; then
+    . "$GUIX_PROFILE/etc/profile"
+  fi
+  export PATH="/usr/local/bin:$PATH"
 fi
 
-# ── Phase 4: Ensure directories ──────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 4: Ensure directories
+# ══════════════════════════════════════════════════════════════
 info "Phase 4: Creating standard directories"
 
 mkdir -p "$HOME/.local/bin"
@@ -128,24 +330,49 @@ mkdir -p "$HOME/.config"
 mkdir -p "$HOME/.npm-global"
 mkdir -p "$HOME/.guix-extra-profiles"
 
-# Set npm prefix if not already set
+# Set npm prefix to avoid needing sudo for global installs
 npm config set prefix "$HOME/.npm-global" 2>/dev/null || true
 
 ok "Directories ready"
 
-# ── Phase 5: Tangle ──────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 5: Tangle
+# ══════════════════════════════════════════════════════════════
+# LESSON: On first tangle, the Makefile tries to `include` all
+# .mk fragment files (flatpak.mk, guix.mk, pip.mk, etc). If
+# any don't exist yet (because they haven't been tangled), make
+# will fail with "No rule to make target". Solution: create
+# empty stubs for any missing .mk files before the first tangle.
+# ══════════════════════════════════════════════════════════════
 info "Phase 5: Tangling org files"
 
 cd "$DOTCORTEX"
 
 if command -v emacs &>/dev/null; then
+  # Ensure .mk stubs exist so Makefile includes don't fail
+  mkdir -p all/.mk
+  for mk in flatpak guix guix-substitutes snap appimage cargo homebrew npm pip; do
+    [ -f "all/.mk/${mk}.mk" ] || touch "all/.mk/${mk}.mk"
+  done
+
+  # Ensure manifest directories exist for tangle targets
+  mkdir -p all/.pip/manifest
+  mkdir -p all/.npm/manifest
+  mkdir -p all/.snap/manifest
+  mkdir -p all/.cargo/manifest
+  mkdir -p all/.appimage/inventory
+  mkdir -p all/.app/manifest
+  mkdir -p all/.homebrew/manifest
+
   make tangle 2>&1 || warn "Tangle had warnings (check output above)"
   ok "Tangled"
 else
   warn "Emacs not found — skipping tangle. Install emacs-nox and re-run."
 fi
 
-# ── Phase 6: Stow ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 6: Stow
+# ══════════════════════════════════════════════════════════════
 info "Phase 6: Stowing overlays"
 
 cd "$DOTCORTEX"
@@ -167,17 +394,21 @@ info "Stowing: $OVERLAYS"
 STOW_PKGS="$OVERLAYS" make safe-stow 2>&1 || warn "Stow had conflicts (check output above)"
 ok "Stowed"
 
-# ── Phase 7: pip packages ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 7: pip packages
+# ══════════════════════════════════════════════════════════════
 info "Phase 7: Installing pip packages from manifest"
 
 if [ -x "$HOME/.local/bin/pip-apply" ]; then
-  "$HOME/.local/bin/pip-apply"
+  "$HOME/.local/bin/pip-apply" || true
 elif [ -f "$DOTCORTEX/all/.local/bin/pip-apply" ]; then
-  bash "$DOTCORTEX/all/.local/bin/pip-apply"
+  bash "$DOTCORTEX/all/.local/bin/pip-apply" || true
 fi
 ok "Pip packages applied"
 
-# ── Phase 8: npm packages ────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 8: npm packages
+# ══════════════════════════════════════════════════════════════
 info "Phase 8: Installing npm packages from manifest"
 
 if [ -x "$HOME/.local/bin/npm-apply" ]; then
@@ -187,46 +418,71 @@ elif [ -f "$DOTCORTEX/all/.local/bin/npm-apply" ]; then
 fi
 ok "Npm packages applied"
 
-# ── Phase 9: Claude Code ─────────────────────────────────────
+# ══════════════════════════════════════════════════════════════
+# Phase 9: Claude Code
+# ══════════════════════════════════════════════════════════════
 info "Phase 9: Claude Code"
 
 if command -v claude &>/dev/null; then
   ok "Claude Code already installed"
 else
   info "Installing Claude Code via npm..."
-  npm install -g @anthropic-ai/claude-code 2>/dev/null || warn "Claude Code install failed — install manually"
+  npm install -g @anthropic-ai/claude-code 2>/dev/null \
+    || warn "Claude Code install failed — install manually: npm install -g @anthropic-ai/claude-code"
 fi
 
-# ── Phase 10: PATH sanity ────────────────────────────────────
-info "Phase 10: PATH verification"
+# ══════════════════════════════════════════════════════════════
+# Phase 10: PATH and shell integration
+# ══════════════════════════════════════════════════════════════
+info "Phase 10: PATH and shell integration"
 
-# Check that key paths are in bashrc
 BASHRC="$HOME/.bashrc"
-NEED_FORGE=true
 
-if grep -q 'HelmCortex/FORGE/bin' "$BASHRC" 2>/dev/null; then
-  NEED_FORGE=false
-fi
-
-if [ "$NEED_FORGE" = true ] && [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
-  cat >> "$BASHRC" << 'FORGE_PATH'
+# Ensure HelmCortex FORGE/bin is on PATH (for auryn, pipelines)
+if ! grep -q 'HelmCortex/FORGE/bin' "$BASHRC" 2>/dev/null; then
+  if [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
+    cat >> "$BASHRC" << 'FORGE_PATH'
 
 # HelmCortex FORGE bin (auryn, pipelines, scripts)
 if [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
   export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
 fi
 FORGE_PATH
-  ok "Added FORGE/bin to PATH in .bashrc"
+    ok "Added FORGE/bin to PATH in .bashrc"
+  fi
 fi
 
-# ── Done ──────────────────────────────────────────────────────
+# Ensure Guix profile is sourced in bashrc
+if ! grep -q 'guix/current' "$BASHRC" 2>/dev/null; then
+  cat >> "$BASHRC" << 'GUIX_PROFILE'
+
+# GNU Guix user profile
+GUIX_PROFILE="$HOME/.config/guix/current"
+if [ -f "$GUIX_PROFILE/etc/profile" ]; then
+  . "$GUIX_PROFILE/etc/profile"
+fi
+GUIX_PROFILE
+  ok "Added Guix profile sourcing to .bashrc"
+fi
+
+# ══════════════════════════════════════════════════════════════
+# Done
+# ══════════════════════════════════════════════════════════════
 echo ""
 echo "════════════════════════════════════════════════════"
 printf "${G}DotCortex bootstrap complete.${N}\n"
 echo ""
 echo "Next steps:"
-echo "  1. Log out and back in (or source ~/.bashrc)"
-echo "  2. Run 'guix pull' if Guix was just installed"
-echo "  3. Run 'loom' to see all available verbs"
-echo "  4. Fine-tune packages via nala.org, guix.org"
+echo "  1. Log out and back in (or: source ~/.bashrc)"
+echo "  2. guix pull             (update Guix channels — first run takes ~15 min)"
+echo "  3. loom                  (see all available loom verbs)"
+echo "  4. loom guix:apply       (install Guix packages from manifest)"
+echo ""
+echo "To capture current state of a package manager:"
+echo "  loom pip:capture         (or: pip-capture)"
+echo "  loom npm:capture         (or: npm-capture)"
+echo ""
+echo "To see what's drifted from the manifest:"
+echo "  loom pip:diff            (or: pip-diff)"
+echo "  loom npm:diff            (or: npm-diff)"
 echo "════════════════════════════════════════════════════"
