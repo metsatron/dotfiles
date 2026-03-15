@@ -45,7 +45,7 @@ nonguix-authorize-key:
 | set -Eeuo pipefail; \
 | if [ -r /usr/share/guix/nonguix.pub ]; then key=/usr/share/guix/nonguix.pub; \
 | elif [ -r /etc/guix/nonguix.pub ]; then key=/etc/guix/nonguix.pub; \
-| elif [ -r $(HOME)/.dotfiles/all/.config/guix/nonguix-signing-key.pub ]; then key=$(HOME)/.dotfiles/all/.config/guix/nonguix-signing-key.pub; \
+| elif [ -r $(HOME)/DotCortex/all/.config/guix/nonguix-signing-key.pub ]; then key=$(HOME)/DotCortex/all/.config/guix/nonguix-signing-key.pub; \
 | else echo "WARNING: nonguix key not found. Put it at all/.config/guix/nonguix-signing-key.pub and rerun." >&2; exit 0; fi; \
 | echo "Authorizing nonguix key: $$key"; \
 | sudo guix archive --authorize < "$$key"

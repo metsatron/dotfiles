@@ -1,12 +1,12 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-SNAP_MF       := $(HOME)/.dotfiles/all/.snap/manifest/apps.ssv
-SNAP_CAPTURE  := $(HOME)/.dotfiles/all/.local/bin/snap-capture
-SNAP_DIFF     := $(HOME)/.dotfiles/all/.local/bin/snap-diff
-SNAP_APPLY    := $(HOME)/.dotfiles/all/.local/bin/snap-apply-manifest
-SNAP_AUTO     := $(HOME)/.dotfiles/all/.local/bin/snap-autoremove
-SNAP_PRUNE    := $(HOME)/.dotfiles/all/.local/bin/snap-prune-disabled
+SNAP_MF       := $(HOME)/DotCortex/all/.snap/manifest/apps.ssv
+SNAP_CAPTURE  := $(HOME)/DotCortex/all/.local/bin/snap-capture
+SNAP_DIFF     := $(HOME)/DotCortex/all/.local/bin/snap-diff
+SNAP_APPLY    := $(HOME)/DotCortex/all/.local/bin/snap-apply-manifest
+SNAP_AUTO     := $(HOME)/DotCortex/all/.local/bin/snap-autoremove
+SNAP_PRUNE    := $(HOME)/DotCortex/all/.local/bin/snap-prune-disabled
 
 .PHONY: snap-capture snap-diff snap-apply snap-apply-dry snap-enforce snap-enforce-force \
         snap-autoremove snap-autoremove-yes snap-autoremove-purge snap-prune-disabled \
