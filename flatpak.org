@@ -7,7 +7,7 @@
 #+PROPERTY: header-args:makefile :comments no :padline no
 
 * Purpose
-Reproducible Flatpak state from your dotfiles, Guix style. One manifest file is the source of truth. Each line declares origin, id, branch, and scope. Scope is either =user= or =system=. The apply step is additive by default; exact enforcement with removals is opt in.
+Reproducible Flatpak state from your dotfiles, Guix style. Repo-backed Flatpaks and GitHub-release Flatpak bundles are both owned here. =loom flatpak:apply= is the single authority for Flatpak install, update, and uninstall decisions.
 
 * Flatpak single manifest
 Columns: ORIGIN, ID, BRANCH, SCOPE. Comments and blanks allowed.
@@ -56,12 +56,19 @@ flathub	org.freedesktop.Sdk 23.08 user
 flathub net.pcsx2.PCSX2 stable user
 flathub eu.betterbird.Betterbird stable user
 flathub org.atheme.audacious stable user
-flathub com.moonlight_stream.Moonlight user
-# pied-origin com.mikeasoft.pied master user
+flathub com.moonlight_stream.Moonlight stable user
+#+END_SRC
+
+* Flatpak release bundle manifest
+For Flatpak apps distributed as GitHub release bundles rather than OSTree remotes.
+Columns: REPO, ID, ASSET_NAME, SCOPE.
+#+BEGIN_SRC text :tangle linux/.flatpak/manifest/releases.ssv
+# repo id asset_name scope
+Elleo/pied com.mikeasoft.pied com.mikeasoft.pied.flatpak user
 #+END_SRC
 
 * Remotes setup
-Idempotent helper to ensure remotes exist before applying the manifest. Adjust the Pied URL if you use a custom one.
+Idempotent helper to ensure real Flatpak remotes exist before applying the manifest. GitHub release bundles are handled by dedicated Flatpak release helpers below, not as remotes.
 #+BEGIN_SRC bash :tangle linux/.local/bin/flatpak-remotes-setup :shebang "#!/usr/bin/env bash"
 #!/usr/bin/env bash
 set -euo pipefail
@@ -97,11 +104,6 @@ add_remote() {
 # Flathub for both scopes
 add_remote system flathub https://dl.flathub.org/repo/flathub.flatpakrepo
 add_remote user   flathub https://dl.flathub.org/repo/flathub.flatpakrepo
-
-# Pied: set the real URL if you have one (placeholder keeps idempotence)
-if ! flatpak remote-list --columns=name | grep -qx pied-origin; then
-  add_remote system pied-origin https://dl.flathub.org/repo/flathub.flatpakrepo || true
-fi
 #+END_SRC
 
 * Make targets
@@ -111,7 +113,7 @@ Include directly with =make -f all/.mk/flatpak.mk <target>= or add to your main 
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
+.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-release-diff flatpak-release-sync flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
 
 flatpak-remotes:
 | @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
@@ -124,6 +126,14 @@ flatpak-capture:
 flatpak-diff:
 | @chmod +x $(HOME)/.local/bin/flatpak-diff 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-diff
+
+flatpak-release-diff:
+| @chmod +x $(HOME)/.local/bin/flatpak-release-diff 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-release-diff
+
+flatpak-release-sync:
+| @chmod +x $(HOME)/.local/bin/flatpak-release-sync 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-release-sync
 
 # Additive only: installs + updates, no removals
 flatpak-sync: flatpak-remotes
@@ -197,8 +207,13 @@ Shows what would be installed and what would be removed to match the manifest.
 #+BEGIN_SRC bash :tangle linux/.local/bin/flatpak-diff :shebang "#!/usr/bin/env bash"
 set -euo pipefail
 MAN="${HOME}/DotCortex/linux/.flatpak/manifest/apps.ssv"
+REL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/releases.ssv"
+REL_DIFF_HELPER="${HOME}/.local/bin/flatpak-release-diff"
+[ -x "$REL_DIFF_HELPER" ] || REL_DIFF_HELPER="${HOME}/DotCortex/linux/.local/bin/flatpak-release-diff"
 
-desired_ids(){ awk '$0!~/^#/ && NF>=4{print $2, $4}' "$MAN" | sort -u; }
+desired_repo_ids(){ awk '$0!~/^#/ && NF>=4{print $2, $4}' "$MAN" | sort -u; }
+desired_release_ids(){ [ -f "$REL_MAN" ] && awk '$0!~/^#/ && NF>=4{print $2, $4}' "$REL_MAN" | sort -u || true; }
+desired_ids(){ { desired_repo_ids; desired_release_ids; } | sort -u; }
 installed_ids(){
   { flatpak --user list --app --columns=application | awk 'NF{print $1, "user"}'
     flatpak --system list --app --columns=application | awk 'NF{print $1, "system"}'; } \
@@ -218,6 +233,163 @@ join -v1 <(cut -d' ' -f1 "$d") <(cut -d' ' -f1 "$i") \
 echo "[plan] to uninstall:"
 join -v1 <(cut -d' ' -f1 "$i") <(cut -d' ' -f1 "$d") \
   | while read -r id; do grep -F "$id" "$i" | sed 's/^/  - /'; done || true
+
+if [ -x "$REL_DIFF_HELPER" ]; then
+  "$REL_DIFF_HELPER" || true
+fi
+#+END_SRC
+
+* GitHub release-backed Flatpak bundles
+These helpers keep Flatpak bundles cached under =${XDG_CACHE_HOME:-$HOME/.cache}/flatpak/releases= and install them through Flatpak, while still letting =loom flatpak:apply= own the full desired state.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/flatpak-release-sync :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+set -euo pipefail
+
+REL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/releases.ssv"
+CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/flatpak/releases"
+FORCE_SUDO_SYSTEM="${FORCE_SUDO_SYSTEM:-0}"
+
+CLEAN_ENV=(env -i HOME="$HOME" PATH="/usr/sbin:/usr/bin:/bin:${HOME}/.local/bin"
+  LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}"
+  TERM="${TERM:-xterm-256color}"
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}")
+
+[ -f "$REL_MAN" ] || exit 0
+
+gh_latest_json() {
+  local repo="$1" url="https://api.github.com/repos/${repo}/releases/latest"
+  if [ -n "${GH_TOKEN:-}" ]; then
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
+cache_dir() {
+  local app_id="$1"
+  printf '%s/%s\n' "$CACHE_BASE" "$app_id"
+}
+
+installed_version() {
+  local app_id="$1" scope="$2"
+  if [ "$scope" = user ]; then
+    { "${CLEAN_ENV[@]}" flatpak --user info "$app_id" 2>/dev/null | awk -F': *' '/^Version:/ {print $2}'; } || true
+  else
+    { "${CLEAN_ENV[@]}" flatpak --system info "$app_id" 2>/dev/null | awk -F': *' '/^Version:/ {print $2}'; } || true
+  fi
+}
+
+run_install() {
+  local scope="$1" bundle="$2"
+  if [ "$scope" = system ] && [ "$FORCE_SUDO_SYSTEM" = 1 ]; then
+    sudo "${CLEAN_ENV[@]}" flatpak install -y --system --bundle "$bundle"
+    return 0
+  fi
+  if [ "$scope" = user ]; then
+    "${CLEAN_ENV[@]}" flatpak install -y --user --bundle "$bundle"
+  else
+    if ! "${CLEAN_ENV[@]}" flatpak install -y --system --bundle "$bundle"; then
+      echo "Retrying with sudo: flatpak install --system --bundle $bundle" >&2
+      sudo "${CLEAN_ENV[@]}" flatpak install -y --system --bundle "$bundle"
+    fi
+  fi
+}
+
+sync_one() {
+  local repo="$1" app_id="$2" asset_name="$3" scope="$4"
+  local json latest_tag latest_ver asset_url asset_digest dir bundle old_name installed tmp
+
+  json="$(gh_latest_json "$repo")"
+  latest_tag="$(jq -r '.tag_name' <<<"$json")"
+  latest_ver="$(sed -E 's/^v//' <<<"$latest_tag")"
+  asset_url="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | .browser_download_url' <<<"$json" | head -n1)"
+  asset_digest="$(jq -r --arg name "$asset_name" '.assets[] | select(.name == $name) | (.digest // "")' <<<"$json" | head -n1)"
+
+  [ -n "$asset_url" ] || { echo "No asset named $asset_name for $repo" >&2; return 1; }
+
+  dir="$(cache_dir "$app_id")"
+  mkdir -p "$dir"
+  bundle="$dir/$asset_name"
+  old_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
+  if [ -n "$old_name" ] && [ "$old_name" != "$asset_name" ] && [ -f "$dir/$old_name" ]; then
+    rm -f "$dir/$old_name"
+  fi
+
+  if [ ! -s "$bundle" ] || [ "$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )" != "$asset_digest" ]; then
+    tmp="$bundle.part"
+    curl -fL "$asset_url" -o "$tmp"
+    mv -f "$tmp" "$bundle"
+  fi
+
+  printf '%s\n' "$json" > "$dir/latest.json"
+  printf '%s\n' "$latest_tag" > "$dir/tag"
+  printf '%s\n' "$asset_name" > "$dir/asset.name"
+  printf '%s\n' "$asset_url" > "$dir/asset.url"
+  printf '%s\n' "$asset_digest" > "$dir/asset.digest"
+
+  installed="$(installed_version "$app_id" "$scope")"
+  echo "  release: repo=$repo id=$app_id scope=$scope latest=$latest_ver installed=${installed:-none}"
+  run_install "$scope" "$bundle"
+}
+
+echo "== Syncing release-backed Flatpaks =="
+awk '$0!~/^#/ && NF>=4 {print $1 "\t" $2 "\t" $3 "\t" $4}' "$REL_MAN" \
+  | while IFS=$'\t' read -r repo app_id asset_name scope; do
+      sync_one "$repo" "$app_id" "$asset_name" "$scope"
+    done
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/flatpak-release-diff :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+set -euo pipefail
+
+REL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/releases.ssv"
+[ -f "$REL_MAN" ] || exit 0
+
+CLEAN_ENV=(env -i HOME="$HOME" PATH="/usr/sbin:/usr/bin:/bin:${HOME}/.local/bin"
+  LANG="${LANG:-C.UTF-8}" LC_ALL="${LC_ALL:-C.UTF-8}"
+  TERM="${TERM:-xterm-256color}"
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+  DBUS_SESSION_BUS_ADDRESS="${DBUS_SESSION_BUS_ADDRESS:-}")
+
+gh_latest_json() {
+  local repo="$1" url="https://api.github.com/repos/${repo}/releases/latest"
+  if [ -n "${GH_TOKEN:-}" ]; then
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
+installed_version() {
+  local app_id="$1" scope="$2"
+  if [ "$scope" = user ]; then
+    { "${CLEAN_ENV[@]}" flatpak --user info "$app_id" 2>/dev/null | awk -F': *' '/^Version:/ {print $2}'; } || true
+  else
+    { "${CLEAN_ENV[@]}" flatpak --system info "$app_id" 2>/dev/null | awk -F': *' '/^Version:/ {print $2}'; } || true
+  fi
+}
+
+echo "[release bundles]"
+awk '$0!~/^#/ && NF>=4 {print $1 "\t" $2 "\t" $3 "\t" $4}' "$REL_MAN" \
+  | while IFS=$'\t' read -r repo app_id asset_name scope; do
+      have="$(installed_version "$app_id" "$scope")"
+      if [ -z "$have" ]; then
+        echo "  + $app_id $scope (missing, release bundle from $repo)"
+        continue
+      fi
+      json="$(gh_latest_json "$repo")"
+      latest_tag="$(jq -r '.tag_name' <<<"$json")"
+      latest_ver="$(sed -E 's/^v//' <<<"$latest_tag")"
+      newest="$(printf '%s\n%s\n' "$have" "$latest_ver" | sort -V | tail -n1)"
+      if [ "$newest" = "$have" ]; then
+        echo "  = $app_id $scope ($have)"
+      else
+        echo "  ~ $app_id $scope ($have -> $latest_ver)"
+      fi
+    done
 #+END_SRC
 
 * Apply manifest with safe elevation
@@ -229,6 +401,9 @@ System-scoped actions try Polkit first; if denied, retry the specific command wi
 set -euo pipefail
 
 MAN="${HOME}/DotCortex/linux/.flatpak/manifest/apps.ssv"
+REL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/releases.ssv"
+REL_SYNC_HELPER="${HOME}/.local/bin/flatpak-release-sync"
+[ -x "$REL_SYNC_HELPER" ] || REL_SYNC_HELPER="${HOME}/DotCortex/linux/.local/bin/flatpak-release-sync"
 
 # defaults: installs + updates; removals only if UNINSTALL=1
 ENFORCE="${ENFORCE:-1}"
@@ -270,7 +445,10 @@ run_fp(){ local scope="$1"; shift; unset_ssl
 
 # ----- parsing & plan (normalize to TAB-delimited) -----
 desired_pairs(){
-  awk -v FS="$FS" -v OFS="$tab" '$0!~/^#/ && NF>=4{print $2,$4}' "$MAN" | sort -u
+  {
+    awk -v FS="$FS" -v OFS="$tab" '$0!~/^#/ && NF>=4{print $2,$4}' "$MAN"
+    [ -f "$REL_MAN" ] && awk -v FS="$FS" -v OFS="$tab" '$0!~/^#/ && NF>=4{print $2,$4}' "$REL_MAN" || true
+  } | sort -u
 }
 installed_pairs(){
   { "${CLEAN_ENV[@]}" flatpak --user   list --app --columns=application | awk -v OFS="$tab" 'NF{print $1,"user"}'
@@ -319,6 +497,10 @@ update_manifested(){
   mapfile -t IDS_SYS  < <(awk -v FS="$FS" '$0!~/^#/ && NF>=4 && $4=="system"{print $2}' "$MAN" | sort -u)
   if [ "${#IDS_SYS[@]}" -gt 0 ]; then
     run_fp system update -y "${IDS_SYS[@]}" || true
+  fi
+
+  if [ -x "$REL_SYNC_HELPER" ]; then
+    FORCE_SUDO_SYSTEM="$FORCE_SUDO_SYSTEM" "$REL_SYNC_HELPER"
   fi
 }
 

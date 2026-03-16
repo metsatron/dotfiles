@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
+.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-release-diff flatpak-release-sync flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
 
 flatpak-remotes:
 | @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
@@ -15,6 +15,14 @@ flatpak-capture:
 flatpak-diff:
 | @chmod +x $(HOME)/.local/bin/flatpak-diff 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-diff
+
+flatpak-release-diff:
+| @chmod +x $(HOME)/.local/bin/flatpak-release-diff 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-release-diff
+
+flatpak-release-sync:
+| @chmod +x $(HOME)/.local/bin/flatpak-release-sync 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-release-sync
 
 # Additive only: installs + updates, no removals
 flatpak-sync: flatpak-remotes

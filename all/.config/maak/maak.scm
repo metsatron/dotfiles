@@ -202,9 +202,13 @@
    (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
          (lambda () (sh "make x11-apply")))
 
-   (task 'flatpak:remotes
-         "Ensure remotes (user+system) with clean env"
-         (lambda () (mk "flatpak-remotes")))
+    (task 'flatpak:remotes
+          "Ensure remotes (user+system) with clean env"
+          (lambda () (mk "flatpak-remotes")))
+
+    (task 'flatpak:release-diff
+          "Check release-backed Flatpak bundles managed via GitHub"
+          (lambda () (mk "flatpak-release-diff")))
 
    ;; (task 'flatpak:capture
    ;;       "Capture live apps -> linux/.flatpak/manifest/apps.ssv"
@@ -263,10 +267,15 @@
    (task 'snap:diff "Plan: show manifest vs installed"
          (lambda () (sh "~/DotCortex/all/.local/bin/snap-diff")))
 
-   ;; --- AppImage ---
-   (task 'appimage:integrate
-         "Install/enable appimaged user service from the newest AppImage"
-         (lambda () (sh "~/.local/bin/appimage-integrator-setup")))
+    ;; --- AppImage ---
+    (task 'appimage:integrate
+          "Install/enable appimaged user service from the newest AppImage"
+          (lambda () (sh "~/.local/bin/appimage-integrator-setup")))
+
+    ;; --- GitHub release artifacts ---
+    (task 'gitrelease:apply
+          "Update all non-Flatpak GitHub release artifacts"
+          (lambda () (sh "make -f ~/DotCortex/all/.mk/gitrelease.mk gitrelease-apply")))
 
    (task 'appimage:update
          "Update all AppImages (Auto-integrate, scrub desktops)"
