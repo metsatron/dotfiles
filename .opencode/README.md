@@ -16,6 +16,7 @@ Layout:
 - `.opencode/memory/task-tracking.md` - canonical TODO and progress tracking locations
 - `.opencode/memory/wezterm-host-sendtext.md` - WezTerm host-pane and send_text behavior
 - `.opencode/memory/helmcortex-context.md` - cross-project doctrine and architecture context
+- `.opencode/memory/pvox-workflow.md` - stateless `pvox` speaking workflow and voice conventions
 - `.opencode/skills/helmcortex-pvox/SKILL.md` - speak through VoxForge `pvox` with Flatpak Pied models
 - `.opencode/skills/dotcortex-loom/SKILL.md` - mirrored DotCortex skill for OpenCode use
 - `.opencode/skills/dotcortex-package-manifests/SKILL.md` - focused package manifest operations skill
