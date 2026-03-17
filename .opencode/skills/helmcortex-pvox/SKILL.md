@@ -30,6 +30,12 @@ Use this skill when the task is about speaking text through VoxForge, checking P
 - Attention cue voice: `ClaudeMX` -> `es_MX-claude-high.onnx`
 - `pclip default` should follow the current Speech Dispatcher Piper default
 
+## Speaking Convention
+
+- Full answer or selected prose -> `Claude` / Amy Medium
+- Short completion, attention cue, or brief spoken summary -> `ClaudeMX`
+- Default cue text when useful: `Tudo pronto, meu comandante!`
+
 ## Preferred Speaking Path
 
 Default to direct `pvox` playback for interactive speech:
@@ -48,6 +54,12 @@ Short attention cues can use the Spanish Claude model:
 
 ```bash
 ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stream "Tudo pronto, meu comandante!"
+```
+
+Brief spoken summaries should also use `ClaudeMX` rather than Amy:
+
+```bash
+printf '%s' "resumo curto aqui" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stdin --stream
 ```
 
 Speech Dispatcher remains useful for `pclip default` and system voice routing:
@@ -86,6 +98,12 @@ Before speaking, verify:
 
 ```bash
 printf '%s' "your text here" | ~/HelmCortex/FORGE/VoxForge/bin/pvox say Claude --stdin
+```
+
+### Speak current response via raw stream
+
+```bash
+printf '%s' "your text here" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say Claude --stdin --stream
 ```
 
 ### Check current Speech Dispatcher voice

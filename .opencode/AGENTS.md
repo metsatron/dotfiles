@@ -27,6 +27,9 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 - For DotCortex-managed output, edit the root `.org` source and re-tangle rather than patching generated files directly
 - Canonical task tracking lives in HelmCortex Obsidian TODO files, not in repo comments or ad hoc notes
 - WezTerm Flatpak panes run on the host; `send_text` echo suppression requires a separate `stty -echo` injection first
+- VoxForge `pvox` is the speaking layer; long-form speech defaults to Amy Medium and short attention cues can use `ClaudeMX`
+- `pclip default` on `Meta+V` is the preferred user-driven way to hear selected assistant output aloud
+- When speech is requested, prefer `pvox say Claude --stdin`; when fast playback matters, prefer `pvox say Claude --stdin --stream` with `PVOX_PLAYER_RAW=aplay`
 
 ## OpenCode Memory
 
@@ -35,6 +38,7 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 - `.opencode/memory/task-tracking.md`
 - `.opencode/memory/wezterm-host-sendtext.md`
 - `.opencode/memory/helmcortex-context.md`
+- `.opencode/memory/pvox-workflow.md`
 
 ## Canonical Sources
 
