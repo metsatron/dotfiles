@@ -27,7 +27,8 @@
      markdown
      org
      spacemacs-layouts
-     (keyboard-layout :variables kl-layout 'colemak-neio-literal)
+     ;; keyboard-layout layer disabled: pin-neio handles all Colemak NEIO remapping
+     ;; (keyboard-layout :variables kl-layout 'colemak-neio-literal)
      (shell :variables shell-default-shell 'vterm
             shell-default-height 10 shell-default-position 'bottom))
 
@@ -67,7 +68,7 @@
    dotspacemacs-whitespace-cleanup nil))
 (defun dotspacemacs/user-env ()
   (spacemacs/load-spacemacs-env))
-;; Prefer GUIX_PROFILE/bin first in Emacs’ own PATH/exec-path
+;; Prefer GUIX_PROFILE/bin first in Emacs' own PATH/exec-path
 (let ((gp (getenv "GUIX_PROFILE")))
   (when (and gp (file-directory-p (expand-file-name "bin" gp)))
     (add-to-list 'exec-path (expand-file-name "bin" gp))
@@ -93,7 +94,9 @@
     (require 'recentf nil t)
     (when (fboundp 'recentf-mode) (recentf-mode 1)))
   (unless (boundp 'treemacs--buffer-name-prefix)
-    (defvar treemacs--buffer-name-prefix " *Treemacs-")))
+    (defvar treemacs--buffer-name-prefix " *Treemacs-"))
+  ;; Prevent evil-collection from touching NEIO-displaced keys
+  (setq evil-collection-key-blacklist '("h" "o" "H" "O")))
 
 (defun dotspacemacs/user-load () )
 
@@ -339,62 +342,75 @@
     (define-key evil-window-map "i" 'evil-window-up)
     (define-key evil-window-map "o" 'evil-window-right)
   
-    ;; ---- Pin NEIO & open-line on l/L ----
-    (defun metsatron/pin-neio ()
-      ;; make sure default o/O don’t leak through
-      (dolist (m '(evil-normal-state-map evil-motion-state-map evil-visual-state-map))
-        (when (boundp m)
-          (define-key (symbol-value m) (kbd "o") nil)
-          (define-key (symbol-value m) (kbd "O") nil)))
-      ;; movement on n/e/i/o (overriding map)
-      (evil-define-key* '(normal motion visual) 'global
-        (kbd "n") #'evil-backward-char
-        (kbd "e") #'evil-next-line
-        (kbd "i") #'evil-previous-line
-        (kbd "o") #'evil-forward-char)
-      ;; your “open line” on l / L in NORMAL
-      (evil-define-key* 'normal 'global
-        (kbd "l") #'evil-open-below
-        (kbd "L") #'evil-open-above))
+    ;; ---- NEIO Colemak Intercept Layer ----
+    ;; Uses evil-make-intercept-map to sit ABOVE evil-collection auxiliary keymaps
+    ;; in Evil's keymap lookup chain. This is the only way to reliably override
+    ;; evil-collection's per-mode rebinding of h and o.
   
-    ;; apply now that Evil is loaded
-    (metsatron/pin-neio)
+    (defvar metsatron/neio-intercept-map (make-sparse-keymap)
+      "Highest-priority keymap for NEIO Colemak layout.")
   
-    ;; --- Org: NEIO + l/L open-line, and keep it pinned ---
-    (with-eval-after-load 'evil-org
-      (defun metsatron/org-neio ()
-        ;; kill any lingering org local o/O
-        (define-key org-mode-map (kbd "o") nil)
-        (define-key org-mode-map (kbd "O") nil)
-        ;; NEIO movement in Normal/Motion
-        (evil-define-key* '(normal motion) org-mode-map
-          (kbd "n") #'evil-backward-char
-          (kbd "e") #'evil-next-line
-          (kbd "i") #'evil-previous-line
-          (kbd "o") #'evil-forward-char)
-        ;; open-line lives on l/L in Normal
-        (evil-define-key* 'normal org-mode-map
-          (kbd "l") #'evil-open-below
-          (kbd "L") #'evil-open-above)))
+    (define-minor-mode metsatron/neio-intercept-mode
+      "Global minor mode enforcing NEIO Colemak at intercept priority."
+      :global t
+      :keymap metsatron/neio-intercept-map)
   
-    ;; run when evil-org loads
-    (with-eval-after-load 'evil-org
-      (add-hook 'org-mode-hook #'metsatron/org-neio))
+    (metsatron/neio-intercept-mode 1)
   
-    ;; keyboard-layout can rewrite keys later; pin again after it loads
-    (with-eval-after-load 'keyboard-layout
-      (with-eval-after-load 'evil-org
-        (add-hook 'org-mode-hook #'metsatron/org-neio)
-        ;; also re-pin in already-open Org buffers
-        (dolist (b (buffer-list))
-          (with-current-buffer b
-            (when (derived-mode-p 'org-mode) (metsatron/org-neio))))))
+    ;; Register auxiliary keymaps for each state at intercept level
+    (dolist (state '(normal motion visual operator))
+      (evil-make-intercept-map
+       (evil-get-auxiliary-keymap metsatron/neio-intercept-map state t t)
+       state))
+  
+    ;; Movement keys for all relevant states
+    ;; h dispatches to whichever search system is active (ex-search or isearch)
+    (defun metsatron/search-next ()
+      "Jump to next search match (works with both / and * searches)."
+      (interactive)
+      (if (bound-and-true-p evil-ex-search-pattern)
+          (evil-ex-search-next)
+        (evil-search-next)))
+  
+    (defun metsatron/search-previous ()
+      "Jump to previous search match (works with both / and * searches)."
+      (interactive)
+      (if (bound-and-true-p evil-ex-search-pattern)
+          (evil-ex-search-previous)
+        (evil-search-previous)))
+  
+    (evil-define-key 'normal metsatron/neio-intercept-map
+      (kbd "n") #'evil-backward-char
+      (kbd "e") #'evil-next-line
+      (kbd "i") #'evil-previous-line
+      (kbd "o") #'evil-forward-char
+      (kbd "h") #'metsatron/search-next
+      (kbd "H") #'metsatron/search-previous
+      (kbd "k") #'evil-insert
+      (kbd "K") #'evil-insert-line
+      (kbd "l") #'evil-open-below
+      (kbd "L") #'evil-open-above)
+  
+    (evil-define-key '(motion visual) metsatron/neio-intercept-map
+      (kbd "n") #'evil-backward-char
+      (kbd "e") #'evil-next-line
+      (kbd "i") #'evil-previous-line
+      (kbd "o") #'evil-forward-char
+      (kbd "h") #'metsatron/search-next
+      (kbd "H") #'metsatron/search-previous)
+  
+    ;; Operator-pending: o must act as motion, not text-object prefix
+    (evil-define-key 'operator metsatron/neio-intercept-map
+      (kbd "o") #'evil-forward-char
+      (kbd "n") #'evil-backward-char
+      (kbd "e") #'evil-next-line
+      (kbd "i") #'evil-previous-line)
   
     ;; quick one-shot command if needed: M-x metsatron/org-neio on a buffer
   
     ;; ---- Visual i must not be a prefix; make it move up ----
-    (evil-define-key* 'visual 'global (kbd "i") #'evil-previous-line)
-    (evil-define-key* 'visual 'global (kbd "I") nil)
+    (define-key evil-visual-state-map (kbd "i") #'evil-previous-line)
+    (define-key evil-visual-state-map (kbd "I") nil)
   
     ;; ---- Keep selection after shift left/right ----
     (setq evil-shift-round nil)
@@ -435,38 +451,11 @@
       (if (and (boundp 'evil-state) (eq evil-state 'visual)) [up] (vector ?i)))
     (define-key key-translation-map (kbd "i") #'metsatron/translate-i-if-visual))
   
-  ;; Re-apply after packages that like to rewrite keys
-  (with-eval-after-load 'evil-collection
-    (with-eval-after-load 'evil (metsatron/pin-neio)))
-  (with-eval-after-load 'keyboard-layout
-    (with-eval-after-load 'evil (metsatron/pin-neio)))
-  
-  ;; And once at end of startup if Evil is present
-  (add-hook 'after-init-hook (lambda () (when (featurep 'evil) (metsatron/pin-neio))))
-  
-  ;; vterm: NEIO movement in Normal & Visual (vterm only)
+  ;; vterm: let Emacs/Evil see NEIO keys, not vterm
   (with-eval-after-load 'vterm
-    ;; Let Emacs/Evil see these keys, not vterm
     (when (boundp 'vterm-keymap-exceptions)
-      (dolist (k '("n" "e" "i" "o" "N" "E" "I" "O"))
-        (add-to-list 'vterm-keymap-exceptions k)))
-    ;; Bind NEIO in vterm buffers
-    (evil-define-key '(normal visual) vterm-mode-map
-      (kbd "n") #'evil-backward-char
-      (kbd "e") #'evil-next-line
-      (kbd "i") #'evil-previous-line
-      (kbd "o") #'evil-forward-char)
-    ;; Make sure Visual `i` wins over text-objects inside vterm
-    (define-key (evil-get-auxiliary-keymap vterm-mode-map 'visual t)
-      (kbd "i") #'evil-previous-line))
-  
-  (with-eval-after-load 'evil-collection
-    (with-eval-after-load 'vterm
-      (evil-define-key '(normal visual) vterm-mode-map
-        (kbd "n") #'evil-backward-char
-        (kbd "e") #'evil-next-line
-        (kbd "i") #'evil-previous-line
-        (kbd "o") #'evil-forward-char)))
+      (dolist (k '("n" "e" "i" "o" "h" "k" "N" "E" "I" "O" "H" "K"))
+        (add-to-list 'vterm-keymap-exceptions k))))
   (with-eval-after-load 'evil
     ;; Make sure the keys are what we expect in Visual state
     (define-key evil-visual-state-map (kbd "<") #'evil-shift-left)
@@ -540,6 +529,7 @@
   (with-eval-after-load 'vterm
     (define-key vterm-mode-map (kbd "C-q") #'vterm-send-next-key)
     (define-key vterm-mode-map (kbd "C-y") #'vterm-yank)
+    (define-key vterm-mode-map (kbd "S-<return>") (lambda () (interactive) (vterm-send-string "\n")))
     (setq vterm-max-scrollback 10000))
   (defun metsatron/setup-workbench ()
     "Right: two editor panes. Left: Treemacs side window. Bottom-left vterm."
@@ -691,6 +681,10 @@
   (dolist (map (list evil-normal-state-map evil-motion-state-map evil-visual-state-map))
     (define-key map (kbd "C-n") #'metsatron/new-tab)
     (define-key map (kbd "C-t") #'metsatron/go-home))
+  ;; Zoom: C-= increase, C-- decrease, C-0 reset
+  (global-set-key (kbd "C-=") #'text-scale-increase)
+  (global-set-key (kbd "C--") #'text-scale-decrease)
+  (global-set-key (kbd "C-0") #'text-scale-adjust)
   (defun metsatron/new-tab (&optional arg)
     "C-n: new tab. With C-u, prompt to open a file."
     (interactive "P")
