@@ -108,6 +108,8 @@ PKGS=(
   # Build essentials for compiled packages
   build-essential
   libssl-dev
+  libfreetype-dev
+  libfontconfig-dev
   pkg-config
 )
 
@@ -410,7 +412,7 @@ cd "$DOTCORTEX"
 if command -v emacs &>/dev/null; then
   # Ensure .mk stubs exist so Makefile includes don't fail
   mkdir -p all/.mk
-  for mk in flatpak guix guix-substitutes snap appimage cargo homebrew npm pip; do
+  for mk in flatpak guix guix-substitutes snap appimage cargo homebrew npm pip nala; do
     [ -f "all/.mk/${mk}.mk" ] || touch "all/.mk/${mk}.mk"
   done
 
