@@ -92,9 +92,8 @@ PKGS=(
   python3-pip
   python3-venv
 
-  # Node.js (for npm globals like Claude Code)
-  nodejs
-  npm
+  # Node.js / npm: provided by Guix core profile (Phase 3.5) or nodesource.
+  # NOT installed here — system npm conflicts with nodesource nodejs.
 
   # Shell utilities
   keychain       # SSH key agent
@@ -379,6 +378,13 @@ if command -v guix &>/dev/null; then
   fi
 else
   warn "Guix not available — skipping guix pull + core profile"
+fi
+
+# Add Guix core profile to PATH for remaining phases (npm, guile, etc)
+GUIX_CORE="$HOME/.guix-extra-profiles/core/core"
+if [ -d "$GUIX_CORE/bin" ]; then
+  export PATH="$GUIX_CORE/bin:$PATH"
+  info "Guix core profile on PATH: $GUIX_CORE/bin"
 fi
 
 # ══════════════════════════════════════════════════════════════
