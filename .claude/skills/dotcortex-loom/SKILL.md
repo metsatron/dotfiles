@@ -27,6 +27,9 @@ cd ~/DotCortex
 # Tangle all org files into overlay directories
 make tangle
 
+# Tangle a single org file (faster than full make tangle)
+tangle-one shell.org
+
 # Preview what stow would do (dry-run)
 make preview-stow
 
@@ -63,6 +66,12 @@ loom guix:pull          # Pull Guix channel updates
 loom flatpak:apply      # Apply Flatpak manifest
 loom flatpak:diff       # Show manifest vs installed diff
 loom flatpak:bridge     # Bridge fonts/themes into Flatpak sandboxes
+
+loom nala:apply         # Enforce nala/apt manifest (install missing)
+loom nala:diff          # Show manifest vs installed diff
+loom nala:capture       # Capture live apt packages to manifest
+loom nala:repos         # Ensure third-party apt repos configured
+loom nala:health        # Show nala/apt/dpkg status
 
 loom snap:apply         # Apply Snap manifest
 loom snap:diff          # Show manifest vs installed diff
@@ -129,7 +138,7 @@ loom npm:capture
 cd ~/DotCortex && bash INSTALL.sh
 ```
 
-This installs system deps (git, stow, emacs-nox, python3, nodejs, etc), tangles, stows, installs pip/npm manifests, and optionally installs GNU Guix.
+This installs system deps (git, stow, emacs-nox, python3, build-essential, etc), installs Guix, tangles, stows, and runs pip/npm/cargo manifests. Node.js/npm come from Guix core profile, not apt.
 
 ## Operating Notes
 
