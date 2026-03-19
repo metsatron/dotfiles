@@ -231,6 +231,18 @@
       (set (make-local-variable 'buffer-face-mode-face)
            '(:family "SFMono Nerd Font Mono" :height 100))
       (buffer-face-mode t)
+      ;; pin nobreak-space to same font — U+00A0 fallback causes flicker
+      ;; in Claude Code and other tools that emit non-breaking spaces
+      (face-remap-add-relative 'nobreak-space
+        :family "SFMono Nerd Font Mono" :underline nil)
+      ;; force uniform metrics for TUI characters (btop, ranger, ncdu)
+      ;; without this, Emacs silently falls back to fonts with different
+      ;; pixel metrics, causing line shifts and grid misalignment
+      (let ((fs (face-attribute 'default :fontset))
+            (nf "SFMono Nerd Font Mono"))
+        (set-fontset-font fs '(#x2500 . #x257F) nf nil 'prepend)  ; box-drawing
+        (set-fontset-font fs '(#x2580 . #x259F) nf nil 'prepend)  ; block elements
+        (set-fontset-font fs '(#x2800 . #x28FF) nf nil 'prepend)) ; braille (btop graphs)
       ;; line-spacing must be nil, not 0
       (setq-local line-spacing nil)
       ;; prevent truncation glyph artifacts
