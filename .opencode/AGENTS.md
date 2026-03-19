@@ -11,6 +11,8 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 5. Prefer `make safe-stow` over plain `stow`.
 6. Loom requires Guix's `guile`; when Loom is unavailable, use `make` targets directly.
 7. Check `~/.guix-extra-profiles/core/core/bin/` before assuming tools are missing.
+8. Use `.opencode/commands/skill-sync.md` when the local OpenCode layer needs to catch up with `.claude/`, `.agents/`, or `.codex/`.
+9. Use `.opencode/commands/todo.md` when routing or reviewing task items across DotCortex tracking files.
 
 ## Working Flow
 
@@ -30,6 +32,8 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 - VoxForge `pvox` is the speaking layer; long-form speech defaults to Amy Medium and short attention cues can use `ClaudeMX`
 - `pclip default` on `Meta+V` is the preferred user-driven way to hear selected assistant output aloud
 - When speech is requested, prefer `pvox say Claude --stdin`; when fast playback matters, prefer `pvox say Claude --stdin --stream` with `PVOX_PLAYER_RAW=aplay`
+- On major task completion, alert by default with `ClaudeMX: "Meu Comandante!"` followed by `Claude: "Check OpenCode!"` unless the user asks for silence
+- Antigravity belongs to DotCortex's `nala.org` layer, including install/repo metadata and user config tangles
 
 ## OpenCode Memory
 
@@ -39,6 +43,7 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 - `.opencode/memory/wezterm-host-sendtext.md`
 - `.opencode/memory/helmcortex-context.md`
 - `.opencode/memory/pvox-workflow.md`
+- `.opencode/memory/antigravity.md`
 
 ## Canonical Sources
 
@@ -46,5 +51,6 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 - `CLAUDE.md`
 - `README.org`
 - `.claude/skills/dotcortex-loom/SKILL.md`
+- `.opencode/skills/antigravity-config/SKILL.md`
 
 If this file and a canonical source diverge, trust the canonical source.

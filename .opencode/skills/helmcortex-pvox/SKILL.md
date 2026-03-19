@@ -35,6 +35,7 @@ Use this skill when the task is about speaking text through VoxForge, checking P
 - Full answer or selected prose -> `Claude` / Amy Medium
 - Short completion, attention cue, or brief spoken summary -> `ClaudeMX`
 - Default cue text when useful: `Tudo pronto, meu comandante!`
+- Default completion alert sequence -> `ClaudeMX: "Meu Comandante!"` then `Claude: "Check OpenCode!"`
 
 ## Preferred Speaking Path
 
@@ -54,6 +55,13 @@ Short attention cues can use the Spanish Claude model:
 
 ```bash
 ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stream "Tudo pronto, meu comandante!"
+```
+
+Default completion alert sequence:
+
+```bash
+PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stream "Meu Comandante!"
+PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say Claude --stream "Check OpenCode!"
 ```
 
 Brief spoken summaries should also use `ClaudeMX` rather than Amy:
@@ -131,3 +139,4 @@ printf '%s' "your text here" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge
 - Direct `pvox say` is currently the most reliable path for speaking assistant output in this environment
 - Raw `--stream` playback should prefer `aplay` first on this machine, with `ffplay` fallback
 - If `Meta+V` is bound to `pclip default`, selecting assistant output and invoking the shortcut should read it aloud with the current default voice
+- Unless the user asks for silence, major completions should use the default two-voice completion alert

@@ -13,6 +13,7 @@ OpenCode memory files:
 - `wezterm-host-sendtext.md` - WezTerm host-pane behavior and send_text pattern
 - `helmcortex-context.md` - DotCortex/HelmCortex architecture, WarMap doctrine, and terminal roadmap
 - `pvox-workflow.md` - reproducible VoxForge speaking workflow, voice defaults, and cue conventions
+- `antigravity.md` - Antigravity ownership, package source, and repeatable management flow
 
 Operating rule:
 
