@@ -19,6 +19,11 @@ Stateless reference for speaking through HelmCortex VoxForge.
 Use Amy Medium for full answers.
 Use `ClaudeMX` for short attention cues and brief spoken summaries such as `Tudo pronto, meu comandante!`.
 
+Default completion alert sequence:
+
+- `ClaudeMX` -> `Meu Comandante!`
+- `Claude` -> `Check OpenCode!`
+
 ## Preferred Commands
 
 ### Long-form speech
@@ -37,6 +42,13 @@ printf '%s' "your text here" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge
 
 ```bash
 ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stream "Tudo pronto, meu comandante!"
+```
+
+### Default completion alert
+
+```bash
+~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stream "Meu Comandante!"
+~/HelmCortex/FORGE/VoxForge/bin/pvox say Claude --stream "Check OpenCode!"
 ```
 
 ### Short spoken summary
@@ -63,3 +75,4 @@ printf '%s' "resumo curto aqui" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxFo
 - `pvox say ... --stream` is raw playback and should prefer `PVOX_PLAYER_RAW=aplay` on this machine
 - `pclip default` is for user-driven selected-text playback and is bound to `Meta+V`
 - Runtime truth lives in the JSON block inside `docs/pvox.md`, not stale prose or old scripts
+- Unless the user asks for silence, major completions should trigger the default two-voice completion alert
