@@ -16,31 +16,42 @@
      (directory-files-recursively root "\\.org\\'"))))
 
 (defun org-dblock-write:dotfiles-index (params)
-  "Populate a bullet list of Org files as links.
+  "Populate a bullet list of Org files as links with #+DESCRIPTION.
 Params: :dir, :glob, :exclude, :recursive"
-  (let* ((dir (expand-file-name (or (plist-get params :dir) default-directory)))
+  (let* ((dir (file-name-as-directory
+               (expand-file-name (or (plist-get params :dir) default-directory))))
          (glob (or (plist-get params :glob) "*.org"))
          (recursive (plist-get params :recursive))
          (exclude-str (or (plist-get params :exclude) ""))
          (exclude (split-string exclude-str "[ ,]+" t))
          (files (if recursive
                     (directory-files-recursively dir (wildcard-to-regexp glob))
-                  (directory-files dir nil glob t))))
+                  (directory-files dir t (wildcard-to-regexp glob) t))))
     (setq files (cl-remove-if
                  (lambda (f)
                    (let ((bn (file-name-nondirectory f)))
                      (or (member bn exclude)
-                         (string-match-p "/\\.git/" (expand-file-name f)))))
-                 (if recursive files
-                   (mapcar (lambda (f) (expand-file-name f dir)) files))))
+                         (not (file-regular-p f))
+                         (string-prefix-p "." bn)
+                         (string-match-p "/\\.git/" f))))
+                 files))
+    (setq files (sort files #'string<))
     (let ((orig (point)))
       (insert (mapconcat
                (lambda (f)
-                 (let* ((bn (file-name-nondirectory f))
-                        (title (file-name-sans-extension bn)))
-                   (format "- [[file:%s][%s]]" (file-relative-name f dir) title)))
-               files
-               "\n"))
+                 (let* ((name (file-name-sans-extension (file-name-nondirectory f)))
+                        (rel  (file-relative-name f dir))
+                        (desc (with-temp-buffer
+                                (insert-file-contents f nil 0 1024)
+                                (goto-char (point-min))
+                                (if (re-search-forward
+                                     "^#\\+DESCRIPTION:[ \t]+\\(.+\\)" nil t)
+                                    (match-string 1)
+                                  nil))))
+                   (if desc
+                       (format "- [[file:%s][%s]] -- %s" rel name desc)
+                     (format "- [[file:%s][%s]]" rel name))))
+               files "\n"))
       (when (= orig (point))
         (insert "- (no matching files)\n")))))
 
