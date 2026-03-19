@@ -8,7 +8,7 @@
    dotspacemacs-excluded-packages '(vterm)
 
    ;; You had two dotspacemacs-additional-packages; merged to keep all
-   dotspacemacs-additional-packages '(mixed-pitch org-appear vterm doom-themes centaur-tabs kurecolor)
+   dotspacemacs-additional-packages '(mixed-pitch org-appear vterm doom-themes centaur-tabs kurecolor vterm-anti-flicker-filter)
 
    dotspacemacs-configuration-layers
    '(helm
@@ -215,10 +215,33 @@
                 ;; (setq-local display-line-numbers 'relative)
                 (setq-local display-line-numbers t)
                 (display-line-numbers-mode 1))))
-  ;; --- VTERM: clean monospace, no extra spacing, no prettify-symbols ---
+  ;; --- VTERM: uniform font rendering, no jitter ---
   ;; line-spacing must be nil globally — 0 and nil differ in Emacs internals,
   ;; and vterm is sensitive to any non-nil value causing gaps/wobble.
   (setq-default line-spacing nil)
+  
+  ;; Prefer default font for symbols — SFMono covers most glyphs,
+  ;; only fall back to fontset when it genuinely lacks coverage.
+  (setq use-default-font-for-symbols t)
+  
+  ;; Anti-flicker for rapid redraws (Claude Code throbber, etc)
+  ;; The package hardcodes 16ms delay which adds noticeable input lag.
+  ;; We patch the timer to use a tunable value — lower = snappier but
+  ;; more flicker, higher = smoother but laggier. 4ms is a good balance.
+  (defvar metsatron/vterm-anti-flicker-delay 0.004
+    "Seconds to buffer vterm output before flushing. Default 0.004 (4ms).")
+  
+  (with-eval-after-load 'vterm
+    (when (require 'vterm-anti-flicker-filter nil t)
+      (vterm-anti-flicker-filter-mode 1)
+      ;; Override the hardcoded 16ms timer with our tunable delay
+      (advice-add 'vterm-anti-flicker--filter :around
+        (lambda (orig-fn proc input)
+          (cl-letf (((symbol-function 'run-at-time)
+                     (lambda (_delay repeat fn &rest args)
+                       (apply #'run-at-time metsatron/vterm-anti-flicker-delay
+                              repeat fn args))))
+            (funcall orig-fn proc input))))))
   
   (with-eval-after-load 'vterm
     (defun metsatron/vterm-fonts ()
@@ -232,17 +255,34 @@
            '(:family "SFMono Nerd Font Mono" :height 100))
       (buffer-face-mode t)
       ;; pin nobreak-space to same font — U+00A0 fallback causes flicker
-      ;; in Claude Code and other tools that emit non-breaking spaces
       (face-remap-add-relative 'nobreak-space
         :family "SFMono Nerd Font Mono" :underline nil)
-      ;; force uniform metrics for TUI characters (btop, ranger, ncdu)
-      ;; without this, Emacs silently falls back to fonts with different
-      ;; pixel metrics, causing line shifts and grid misalignment
+      ;; --- Nuclear fontset: map the ENTIRE BMP to one font ---
+      ;; vterm calculates each row's pixel height from the tallest glyph
+      ;; on that row. Any fallback font with different ascent/descent
+      ;; metrics causes rows to vary in height, compounding over the
+      ;; buffer into 10-50px of cumulative vertical shift. The only fix
+      ;; is to ensure every rendered glyph comes from the same font.
+      ;; We map the full Basic Multilingual Plane (#x0000-#xFFFF) to
+      ;; SFMono, then carve out the Nerd Font private-use area for
+      ;; Symbols Nerd Font Mono (icons that SFMono doesn't have).
       (let ((fs (face-attribute 'default :fontset))
-            (nf "SFMono Nerd Font Mono"))
-        (set-fontset-font fs '(#x2500 . #x257F) nf nil 'prepend)  ; box-drawing
-        (set-fontset-font fs '(#x2580 . #x259F) nf nil 'prepend)  ; block elements
-        (set-fontset-font fs '(#x2800 . #x28FF) nf nil 'prepend)) ; braille (btop graphs)
+            (nf (font-spec :family "SFMono Nerd Font Mono"))
+            (sf (font-spec :family "Symbols Nerd Font Mono")))
+        ;; Entire BMP — one font, uniform metrics
+        (set-fontset-font fs '(#x0000 . #xDFFF) nf nil 'prepend)
+        ;; Nerd Font icons (private use area) — only exception
+        (set-fontset-font fs '(#xE000 . #xF8FF) sf nil 'prepend)
+        ;; Supplementary private use (more Nerd Font icons)
+        (set-fontset-font fs '(#xF0000 . #xFFFFF) sf nil 'prepend)
+        ;; SMP coverage (emoji, math symbols etc)
+        (set-fontset-font fs '(#x10000 . #x1FFFF) nf nil 'prepend))
+      ;; Rescale Symbols Nerd Font to match SFMono cell height exactly.
+      ;; Adjust ratio if icons appear too tall/short vs surrounding text.
+      (setq-local face-font-rescale-alist
+                  '((".*Symbols Nerd Font.*" . 0.9)
+                    (".*Noto.*" . 0.85)
+                    (".*DejaVu.*" . 0.85)))
       ;; line-spacing must be nil, not 0
       (setq-local line-spacing nil)
       ;; prevent truncation glyph artifacts
