@@ -1,5 +1,5 @@
 #!/bin/zsh
-# ~/.zshenv — sourced for ALL zsh invocations (login, interactive, scripts, SSH)
+# ~/.zshenv -- sourced for ALL zsh invocations (login, interactive, scripts, SSH)
 # Keep minimal. Only PATH-critical entries belong here.
 
 # Core PATH entries
