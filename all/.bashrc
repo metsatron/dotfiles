@@ -25,7 +25,9 @@ fi
 if [ -f "$HOME/.env" ]; then
   while IFS= read -r _line || [ -n "$_line" ]; do
     _line="${_line%%#*}"                         # strip comments
-    case "$_line" in export\ *) _line="${_line#export };; esac
+    case "$_line" in
+      export\ *) _line="${_line#export }" ;;
+    esac
     case "$_line" in *=*) ;; *) continue ;; esac # skip non-assignments
     _key="${_line%%=*}"
     _key="${_key#"${_key%%[![:space:]]*}"}"       # trim leading whitespace
