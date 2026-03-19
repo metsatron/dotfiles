@@ -200,6 +200,7 @@ config.keys = {
     o.enable_scroll_bar = not o.enable_scroll_bar
     window:set_config_overrides(o)
   end)},
+  {key='Enter', mods='SHIFT', action=wezterm.action.SendString('\n')},
 }
 config.bold_brightens_ansi_colors = false
 config.term = 'wezterm'
@@ -208,17 +209,8 @@ config.term = 'wezterm'
 local mux = wezterm.mux
 
 local guix_zsh = os.getenv('HOME') .. '/.guix-extra-profiles/core/core/bin/zsh'
-
--- Build args to spawn a pane that runs cmd then drops to interactive zsh.
--- Uses flatpak-spawn --host when inside the sandbox, direct zsh otherwise.
-local function host_pane_args(cmd)
-  local script = cmd .. '; exec ' .. guix_zsh .. ' -i'
-  if os.getenv('FLATPAK_ID') then
-    return { 'flatpak-spawn', '--host', guix_zsh, '-lc', script }
-  else
-    return { guix_zsh, '-lc', script }
-  end
-end
+config.set_environment_variables = { LD_PRELOAD = '' }
+config.default_prog = { guix_zsh, '-l' }
 
 wezterm.on('gui-startup', function(cmd)
   if os.getenv('WEZ_LEFT_STACK') ~= '1' then
@@ -228,26 +220,31 @@ wezterm.on('gui-startup', function(cmd)
 
   local vs = math.max(5, math.min(tonumber(os.getenv('VSPLIT') or '70'), 95)) / 100.0
   local hs = math.max(5, math.min(tonumber(os.getenv('HSPLIT') or '48'), 95)) / 100.0
+  local CR = string.char(13)
 
-  -- Each pane launches zsh directly with its command — no bash, no echo
-  local tab, left, window = mux.spawn_window({
-    args = host_pane_args('cd ~/DotCortex && fastfetch'),
-  })
+  local tab, _pane, window = mux.spawn_window(cmd or {})
 
-  local right = left:split{
-    direction = 'Right', size = vs,
-    args = host_pane_args('cd ~/DotCortex && swaptop || clear'),
-  }
+  wezterm.time.call_after(0.05, function()
+    local left = window and window:active_pane()
+    if not left then return end
 
-  local bottom = left:split{
-    direction = 'Bottom', size = hs,
-    args = host_pane_args('swapfetch --watch 5 || printf "swapfetch not found\\n"'),
-  }
+    -- suppress echo first, then inject the real command after a tick
+    left:send_text('stty -echo' .. CR)
+    local right = left:split{ direction = 'Right', size = vs }
+    right:send_text('stty -echo' .. CR)
+    local bottom = left:split{ direction = 'Bottom', size = hs }
+    bottom:send_text('stty -echo' .. CR)
 
-  -- maximize after layout
-  wezterm.time.call_after(0.1, function()
-    local gw = window:gui_window()
-    if gw and gw.maximize then gw:maximize() end
+    wezterm.time.call_after(0.15, function()
+      left:send_text('clear && cd ~/DotCortex && fastfetch' .. CR)
+      right:send_text('clear && cd ~/DotCortex && swaptop || clear' .. CR)
+      bottom:send_text('clear && swapfetch --watch 5 || printf "swapfetch not found\\n"' .. CR)
+    end)
+
+    wezterm.time.call_after(0.1, function()
+      local gw = window:gui_window()
+      if gw and gw.maximize then gw:maximize() end
+    end)
   end)
 end)
 return config
