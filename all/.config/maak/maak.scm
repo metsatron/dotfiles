@@ -196,7 +196,7 @@
    (task 'flatpak:diff "Plan: desired (SSV) vs installed"
          (lambda () (mk "flatpak-diff")))
 
-   (task 'flatpak:bridge "Apply Flatpak fonts/cursors bridge"
+   (task 'flatpak:bridge "Apply Flatpak desktop + per-app bridges"
          (lambda () (sh "make flatpak-bridge")))
 
    (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
@@ -364,7 +364,23 @@
          (lambda () (sh "~/.local/bin/pip-apply")))
 
    (task 'pip:health "Show DotCortex Python/pip env and versions"
-         (lambda () (sh "~/.local/bin/pip-health")))))
+         (lambda () (sh "~/.local/bin/pip-health")))
+
+   ;; --- Nala / apt ---
+   (task 'nala:repos "Ensure third-party apt repos are configured"
+         (lambda () (sh "make nala-repos")))
+
+   (task 'nala:capture "Capture live apt manual packages to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/nala-capture")))
+
+   (task 'nala:diff "Plan: manifest vs live apt packages"
+         (lambda () (sh "~/.local/bin/nala-diff")))
+
+   (task 'nala:apply "Enforce nala manifest (install missing, no auto-remove)"
+         (lambda () (sh "make nala-apply")))
+
+   (task 'nala:health "Show nala/apt/dpkg status"
+         (lambda () (sh "~/.local/bin/nala-health")))))
 
 ;; --- Pretty printing for help ---
 

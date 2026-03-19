@@ -91,3 +91,4 @@ include $(HOME)/DotCortex/all/.mk/cargo.mk
 include $(HOME)/DotCortex/all/.mk/homebrew.mk
 include $(HOME)/DotCortex/all/.mk/npm.mk
 include $(HOME)/DotCortex/all/.mk/pip.mk
+include $(HOME)/DotCortex/all/.mk/nala.mk
