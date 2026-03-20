@@ -43,8 +43,12 @@ flatpak-perms-apply:
 | $(HOME)/.local/bin/flatpak-perms-apply
 
 flatpak-bridge:
+| @chmod +x $(HOME)/.local/bin/flatpak-perms-apply 2>/dev/null || true
+| $(HOME)/.local/bin/flatpak-perms-apply
 | @chmod +x $(HOME)/.local/bin/flatpak-desktop-bridge 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-desktop-bridge
+| @chmod +x $(HOME)/.local/bin/flatpak-obsidian-terminal-bridge $(HOME)/DotCortex/linux/.local/bin/flatpak-obsidian-terminal-bridge 2>/dev/null || true
+| @if [ -x "$(HOME)/.local/bin/flatpak-obsidian-terminal-bridge" ]; then $(HOME)/.local/bin/flatpak-obsidian-terminal-bridge; else $(HOME)/DotCortex/linux/.local/bin/flatpak-obsidian-terminal-bridge; fi || echo "WARN obsidian terminal bridge skipped"
 | @chmod +x $(HOME)/.local/bin/flatpak-betterbird-profile-bridge 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-betterbird-profile-bridge || echo "⚠ betterbird bridge skipped"
 | @chmod +x $(HOME)/.local/bin/flatpak-pcsx2-config-bridge 2>/dev/null || true
