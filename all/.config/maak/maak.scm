@@ -334,6 +334,42 @@
          (lambda ()
            (sh "~/.local/bin/app-health")))
 
+   ;; --- Bun ---
+   (task 'bun:capture "Capture live Bun globals to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/bun-capture")))
+
+   (task 'bun:diff "Plan: manifest vs live Bun globals"
+         (lambda () (sh "~/.local/bin/bun-diff")))
+
+   (task 'bun:sync
+         "Install or update only, no removals"
+         (lambda () (sh "ENFORCE=0 UNINSTALL=0 UPDATE=1 ~/.local/bin/bun-apply")))
+
+   (task 'bun:apply
+         "Enforce exact Bun global state, allow removals"
+         (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/bun-apply")))
+
+   (task 'bun:health "Show DotCortex Bun env and versions"
+         (lambda () (sh "~/.local/bin/bun-health")))
+
+   ;; --- Bunx ---
+   (task 'bunx:capture "Capture managed bunx launchers to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/bunx-capture")))
+
+   (task 'bunx:diff "Plan: manifest vs managed bunx launchers"
+         (lambda () (sh "~/.local/bin/bunx-diff")))
+
+   (task 'bunx:sync
+         "Create or update managed bunx launchers, no removals"
+         (lambda () (sh "ENFORCE=0 UNINSTALL=0 ~/.local/bin/bunx-apply")))
+
+   (task 'bunx:apply
+         "Enforce managed bunx launcher set, allow removals"
+         (lambda () (sh "ENFORCE=1 UNINSTALL=1 ~/.local/bin/bunx-apply")))
+
+   (task 'bunx:health "Show DotCortex bunx launcher state"
+         (lambda () (sh "~/.local/bin/bunx-health")))
+
    ;; --- Node ---
    (task 'npm:capture "Capture live npm to DotCortex SSV"
          (lambda () (sh "~/.local/bin/npm-capture")))
