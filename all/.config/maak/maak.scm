@@ -3,19 +3,14 @@
 ;; [[file:../../../loom.org::*Maak control plane (Scheme, XDG-friendly)][Maak control plane (Scheme, XDG-friendly):1]]
 (use-modules (srfi srfi-1)
              (srfi srfi-13)        ; string-prefix?, string-contains
-             (ice-9 popen)
-             (ice-9 rdelim)
              (ice-9 match)
              (ice-9 pretty-print)
              (ice-9 format))
 
-;; Run one shell string via bash -lc <cmd>, print stdout, return exit code.
+;; Run one shell string via bash -lc <cmd> with inherited TTY/stdout/stderr,
+;; so long-running tasks stream live output and color-capable tools keep ANSI.
 (define (sh cmd)
-  (let* ((p   (open-pipe* OPEN_READ "bash" "-lc" cmd))
-         (out (read-string p))
-         (ec  (close-pipe p)))
-    (display out)
-    ec))
+  (system* "bash" "-lc" cmd))
 
 (define (ok? code) (zero? code))
 (define (task name desc thunk) (list name desc thunk))
@@ -38,11 +33,7 @@
 (define (mk-appimage cmd)
   (let* ((HOME (or (getenv "HOME") ""))
          (mk (string-append "make -f " HOME "/DotCortex/all/.mk/appimage.mk " cmd)))
-    (let* ((p   (open-pipe* OPEN_READ "bash" "-lc" mk))
-           (out (read-string p))
-           (ec  (close-pipe p)))
-      (display out)
-      ec)))
+    (system* "bash" "-lc" mk)))
 
 (define (with-core thunk)
   (let* ((cmd (string-append ". \"" CORE-PROFILE "/etc/profile\"; " (thunk))))
@@ -272,14 +263,9 @@
           "Install/enable appimaged user service from the newest AppImage"
           (lambda () (sh "~/.local/bin/appimage-integrator-setup")))
 
-    ;; --- GitHub release artifacts ---
-    (task 'gitrelease:apply
-          "Update all non-Flatpak GitHub release artifacts"
-          (lambda () (sh "make -f ~/DotCortex/all/.mk/gitrelease.mk gitrelease-apply")))
-
-   (task 'appimage:update
-         "Update all AppImages (Auto-integrate, scrub desktops)"
-         (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
+    (task 'appimage:update
+          "Update all AppImages (Auto-integrate, scrub desktops)"
+          (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
 
    ;; Back-compat alias
    (task 'appimage:ail-scrub
@@ -409,11 +395,15 @@
    (task 'nala:capture "Capture live apt manual packages to DotCortex SSV"
          (lambda () (sh "~/.local/bin/nala-capture")))
 
-   (task 'nala:diff "Plan: manifest vs live apt packages"
-         (lambda () (sh "~/.local/bin/nala-diff")))
+    (task 'nala:diff "Plan: manifest vs live apt packages"
+          (lambda () (sh "~/.local/bin/nala-diff")))
 
-   (task 'nala:apply "Enforce nala manifest (install missing, no auto-remove)"
-         (lambda () (sh "make nala-apply")))
+    (task 'nala:release-diff
+          "Plan: GitHub release-backed .deb packages"
+          (lambda () (sh "make nala-release-diff")))
+
+    (task 'nala:apply "Enforce nala manifest and release-backed .deb installs"
+          (lambda () (sh "make nala-apply")))
 
    (task 'nala:health "Show nala/apt/dpkg status"
          (lambda () (sh "~/.local/bin/nala-health")))))
