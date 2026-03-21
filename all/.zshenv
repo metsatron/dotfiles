@@ -11,11 +11,19 @@ if [ -d "$HOME/.config/guix/current/bin" ]; then
 fi
 
 # Guix core profile (emacs, nvim, zsh, etc)
-if [ -r "$HOME/.guix-extra-profiles/core/core/etc/profile" ] && [ -z "${__GUIX_CORE_PROFILE_SOURCED+x}" ]; then
-  export __GUIX_CORE_PROFILE_SOURCED=1
-  export GUIX_PROFILE="$HOME/.guix-extra-profiles/core/core"
-  . "$GUIX_PROFILE/etc/profile"
-  [ -d "$GUIX_PROFILE/lib/locale" ] && export GUIX_LOCPATH="$GUIX_PROFILE/lib/locale"
+# Guard: skip if already sourced AND PATH actually contains the bin dir.
+# If the profile sourcing failed silently (e.g. store not ready at boot),
+# the guard var may be set but PATH won't have the bin dir — retry in that case.
+if [ -r "$HOME/.guix-extra-profiles/core/core/etc/profile" ]; then
+  case ":$PATH:" in
+    *":$HOME/.guix-extra-profiles/core/core/bin:"*) ;;  # already in PATH, skip
+    *)
+      export __GUIX_CORE_PROFILE_SOURCED=1
+      export GUIX_PROFILE="$HOME/.guix-extra-profiles/core/core"
+      . "$GUIX_PROFILE/etc/profile"
+      [ -d "$GUIX_PROFILE/lib/locale" ] && export GUIX_LOCPATH="$GUIX_PROFILE/lib/locale"
+      ;;
+  esac
 fi
 
 # HelmCortex FORGE bin (auryn, pipelines, sapphire-server)

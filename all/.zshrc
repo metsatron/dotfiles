@@ -6,7 +6,9 @@
 if [[ -f "$HOME/.env" ]]; then
   while IFS= read -r _line || [[ -n "$_line" ]]; do
     _line="${_line%%#*}"
-    case "$_line" in export\ *) _line="${_line#export }" ;; esac
+    case "$_line" in
+      export\ *) _line="${_line#export }" ;;
+    esac
     case "$_line" in *=*) ;; *) continue ;; esac
     _key="${_line%%=*}"
     _key="${_key#"${_key%%[![:space:]]*}"}"
@@ -23,6 +25,3 @@ if [[ $- == *i* ]]; then
     [ -f "$file" ] && source "$file"
   done
 fi
-
-# bun completions
-[ -s "/home/metsatron/DotCortex/all/.bun/_bun" ] && source "/home/metsatron/DotCortex/all/.bun/_bun"
