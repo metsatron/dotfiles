@@ -91,7 +91,7 @@ LC/fonts is expected to be set by style.org - this file must not override it."
 
 ;; ---- dynamic block: list root org files ------------------------------------
 (defun org-dblock-write:dotfiles-index (params)
-  "Bullet list of ROOT/*.org as links. Params: :dir, :glob, :exclude"
+  "Bullet list of ROOT/*.org as links with #+DESCRIPTION. Params: :dir, :glob, :exclude"
   (let* ((dir (file-name-as-directory
                (expand-file-name (or (plist-get params :dir) default-directory))))
          (glob (or (plist-get params :glob) "*.org"))
@@ -108,9 +108,18 @@ LC/fonts is expected to be set by style.org - this file must not override it."
     (let ((orig (point)))
       (insert (mapconcat
                (lambda (f)
-                 (format "- [[file:%s][%s]]"
-                         (file-relative-name f dir)
-                         (file-name-sans-extension (file-name-nondirectory f))))
+                 (let* ((name (file-name-sans-extension (file-name-nondirectory f)))
+                        (rel  (file-relative-name f dir))
+                        (desc (with-temp-buffer
+                                (insert-file-contents f nil 0 1024)
+                                (goto-char (point-min))
+                                (if (re-search-forward
+                                     "^#\\+DESCRIPTION:[ \t]+\\(.+\\)" nil t)
+                                    (match-string 1)
+                                  nil))))
+                   (if desc
+                       (format "- [[file:%s][%s]] -- %s" rel name desc)
+                     (format "- [[file:%s][%s]]" rel name))))
                files "\n"))
       (when (= orig (point)) (insert "- (no matching files)\n")))))
 
