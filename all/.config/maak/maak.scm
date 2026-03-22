@@ -3,14 +3,25 @@
 ;; [[file:../../../loom.org::*Maak control plane (Scheme, XDG-friendly)][Maak control plane (Scheme, XDG-friendly):1]]
 (use-modules (srfi srfi-1)
              (srfi srfi-13)        ; string-prefix?, string-contains
+             (ice-9 popen)
+             (ice-9 rdelim)
              (ice-9 match)
              (ice-9 pretty-print)
              (ice-9 format))
 
-;; Run one shell string via bash -lc <cmd> with inherited TTY/stdout/stderr,
-;; so long-running tasks stream live output and color-capable tools keep ANSI.
+;; Run one shell string via bash -lc <cmd>, stream stdout line-by-line.
 (define (sh cmd)
-  (system* "bash" "-lc" cmd))
+  (let* ((p  (open-pipe* OPEN_READ "bash" "-lc" cmd))
+         (ec (let loop ()
+               (let ((line (read-line p)))
+                 (if (eof-object? line)
+                     (close-pipe p)
+                     (begin
+                       (display line)
+                       (newline)
+                       (force-output)
+                       (loop)))))))
+    ec))
 
 (define (ok? code) (zero? code))
 (define (task name desc thunk) (list name desc thunk))
@@ -33,7 +44,11 @@
 (define (mk-appimage cmd)
   (let* ((HOME (or (getenv "HOME") ""))
          (mk (string-append "make -f " HOME "/DotCortex/all/.mk/appimage.mk " cmd)))
-    (system* "bash" "-lc" mk)))
+    (let* ((p   (open-pipe* OPEN_READ "bash" "-lc" mk))
+           (out (read-string p))
+           (ec  (close-pipe p)))
+      (display out)
+      ec)))
 
 (define (with-core thunk)
   (let* ((cmd (string-append ". \"" CORE-PROFILE "/etc/profile\"; " (thunk))))
@@ -263,9 +278,14 @@
           "Install/enable appimaged user service from the newest AppImage"
           (lambda () (sh "~/.local/bin/appimage-integrator-setup")))
 
-    (task 'appimage:update
-          "Update all AppImages (Auto-integrate, scrub desktops)"
-          (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
+    ;; --- GitHub release artifacts ---
+    (task 'gitrelease:apply
+          "Update all non-Flatpak GitHub release artifacts"
+          (lambda () (sh "make -f ~/DotCortex/all/.mk/gitrelease.mk gitrelease-apply")))
+
+   (task 'appimage:update
+         "Update all AppImages (Auto-integrate, scrub desktops)"
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
 
    ;; Back-compat alias
    (task 'appimage:ail-scrub
@@ -395,18 +415,56 @@
    (task 'nala:capture "Capture live apt manual packages to DotCortex SSV"
          (lambda () (sh "~/.local/bin/nala-capture")))
 
-    (task 'nala:diff "Plan: manifest vs live apt packages"
-          (lambda () (sh "~/.local/bin/nala-diff")))
+   (task 'nala:diff "Plan: manifest vs live apt packages"
+         (lambda () (sh "~/.local/bin/nala-diff")))
 
-    (task 'nala:release-diff
-          "Plan: GitHub release-backed .deb packages"
-          (lambda () (sh "make nala-release-diff")))
-
-    (task 'nala:apply "Enforce nala manifest and release-backed .deb installs"
-          (lambda () (sh "make nala-apply")))
+   (task 'nala:apply "Enforce nala manifest (install missing, no auto-remove)"
+         (lambda () (sh "make nala-apply")))
 
    (task 'nala:health "Show nala/apt/dpkg status"
-         (lambda () (sh "~/.local/bin/nala-health")))))
+         (lambda () (sh "~/.local/bin/nala-health")))
+
+   ;; --- Backup ---
+   (task 'backup:system
+         "Clean + mirror system to ironwolf02 (needs sudo)"
+         (lambda ()
+           (sh "sudo $HOME/.local/bin/backup-system-clean -y")
+           (sh "sudo $HOME/.local/bin/backup-system -y")))
+
+   (task 'backup:dotcortex
+         "Mirror ~/DotCortex to ironwolf02"
+         (lambda () (sh "backup-dotcortex -y")))
+
+   (task 'backup:nextcloud
+         "Dual sync Nextcloud to ZFS pool + ironwolf02"
+         (lambda () (sh "backup-nextcloud --auto -y")))
+
+   (task 'backup:helmcortex
+         "Run HelmCortex sacred sync"
+         (lambda () (sh "~/HelmCortex/FORGE/bin/helmcortex-sync")))
+
+   (task 'backup:games
+         "Mirror ~/Games to ironwolf01"
+         (lambda () (sh "backup-games --auto -y")))
+
+   (task 'backup:retropie
+         "Mirror ~/RetroPie to ironwolf01"
+         (lambda () (sh "backup-retropie --auto -y")))
+
+   (task 'backup:dedupe
+         "Hardlink deduplication (requires --root)"
+         (lambda () (sh "echo 'Usage: backup-dedupe --root PATH [-n|-y]'")))
+
+   (task 'backup:all
+         "Run all backups sequentially"
+         (lambda ()
+           (sh "sudo $HOME/.local/bin/backup-system-clean -y")
+           (sh "sudo $HOME/.local/bin/backup-system -y")
+           (sh "backup-dotcortex -y")
+           (sh "backup-nextcloud --auto -y")
+           (sh "~/HelmCortex/FORGE/bin/helmcortex-sync")
+           (sh "backup-games --auto -y")
+           (sh "backup-retropie --auto -y")))))
 
 ;; --- Pretty printing for help ---
 
@@ -445,7 +503,8 @@
                         (not (string-prefix? "cargo:" nm))
                         (not (string-prefix? "npm:" nm))
                         (not (string-prefix? "root:" nm))
-                        (not (string-prefix? "stow:" nm))))))
+                        (not (string-prefix? "stow:" nm))
+                        (not (string-prefix? "backup:" nm))))))
 
   (print-group "Stow / dotfiles commands"
                (lambda (t)
@@ -479,7 +538,11 @@
 
   (print-group "Root commands"
                (lambda (t)
-                 (string-prefix? "root:" (task-name-str t)))))
+                 (string-prefix? "root:" (task-name-str t))))
+
+  (print-group "Backup commands"
+               (lambda (t)
+                 (string-prefix? "backup:" (task-name-str t)))))
 
 ;; --- Help / Version ---
 
