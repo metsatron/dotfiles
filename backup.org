@@ -1,85 +1,1114 @@
 #+TITLE: Backup Loom: Linux
-#+DESCRIPTION: Backup strategies
+#+DESCRIPTION: Backup scripts (X230 scope)
 #+AUTHOR: Mètsàtron
 #+LANGUAGE: en
 #+PROPERTY: header-args :mkdirp yes :results silent
 #+PROPERTY: header-args:bash :comments both
 
-* Backup entrypoints
+* Mount helpers
 
-These are the canonical backup commands and their targets, after
-ironwolf01/ironwolf02 split.
+Shared helper function sourced by all backup scripts to check mount
+points directly (no symlink indirection).
 
-** System mirror – ironwolf02
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-mount-check :shebang "#!/usr/bin/env bash" :mkdirp yes
+# Shared mount-point checker for backup scripts.
+# Source this file, then call: require_mount /mnt/ironwolf01 [/mnt/ironwolf02 ...]
 
-- Script :: backup-system
-- Helper :: backup-system-clean
-- Target root :: /mnt/ironwolf02/backup-xubuntu/backup-xubuntu
-- Notes ::
-  - backup-system-clean prunes/reset the mirror root safely.
-  - backup-system rsyncs from / with your excludes and guard file:
-    =.backup_guard= marking “system mirror target (rsync from /)”.
+require_mount() {
+  for mp in "$@"; do
+    if ! mountpoint -q "$mp" 2>/dev/null; then
+      echo "ERROR: $mp is not mounted. Aborting." >&2
+      exit 1
+    fi
+  done
+}
+#+END_SRC
 
-** Dotfiles snapshot – ironwolf02
+* backup-system – System mirror to ironwolf02
 
-- Script :: backup-dotfiles
-- Source :: ~/DotCortex
-- Target root :: /mnt/ironwolf02/backup-dotfiles
-- Notes ::
-  - One dated subdir per run (YYYY-MM-DD or whatever your script uses).
-  - Requires /mnt/ironwolf02 mounted.
+Mirrors =/= to =/mnt/ironwolf02/backup-xubuntu/backup-xubuntu/= using
+rsync with filter rules. Guard file prevents writing to wrong target.
 
-** Nextcloud mirror – ZFS → ironwolf02
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-system :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
 
-- Script :: backup-nextcloud
-- Live data :: /mnt/fideco-pool/Nextcloud   (ZFS: fideco-pool)
-- Backup copy :: /mnt/ironwolf02/backup-nextcloud/Nextcloud
-- Notes ::
-  - Uses rsync from ZFS to ext4.
-  - Sanity check ensures /mnt/ironwolf02 is mounted before writing.
+# ===== CONFIG =====
+DEST_BASE="/mnt/ironwolf02/backup-xubuntu"
+DEST="${DEST_BASE}/backup-xubuntu"               # final mirror dir
+GUARD_FILE="${DEST}/.backup_guard"
+LOG="/tmp/backup_system_$(date +%Y%m%d_%H%M%S).log"
 
-** Games backup – ironwolf01
+# Resolve correct user home even under sudo (so filters come from your account)
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
 
-- Script :: backup-games
-- Target root :: /backup/backup-games
-- Disk :: ironwolf01 (mounted at /mnt/ironwolf01, with /backup -> /mnt/ironwolf01)
-- Notes ::
-  - Left exactly where it was before the new 12TB disk.
-  - This is your Steam / GOG / etc. mirror.
+# Filters: use env FILTERS_FILE if provided, else your user default
+FILTERS_FILE="${FILTERS_FILE:-$USER_HOME/.config/backup/system-filters.rsync}"
 
-** RetroPie backup – ironwolf01
+# Default rsync arg arrays (real vs dry)
+RSYNC_RUN=( -aAX --delete --numeric-ids --info=stats2,progress2 --no-owner --no-group --filter="merge $FILTERS_FILE" )
+RSYNC_DRY=( -aAXn --delete --itemize-changes --numeric-ids --no-owner --no-group --filter="merge $FILTERS_FILE" )
 
-- Script :: backup-retropie
-- Target root :: /backup/backup-retropie
-- Disk :: ironwolf01
-- Notes ::
-  - ROMs, configs, BIOS sets etc – same semantics as your existing script.
+# ===== ARGS =====
+MODE="" AUTO=0
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes";;
+    -n|--dry|--dry-run) MODE="dry";;
+    --auto) AUTO=1;;
+    --dest) DEST="${2:?}"; shift;;                       # optional override
+    --filters|--filter-file) FILTERS_FILE="${2:?}"; shift;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run | -y|--yes] [--auto]
+       [--dest PATH] [--filters FILE]
+Mirrors "/" into ${DEST} using rsync + your filter rules.
+Guards:
+  * Requires /mnt/ironwolf02 mounted; DEST must be under backup-xubuntu
+  * Must-type DEST confirmation (unless -n|-y provided)
+  * Creates/uses ${GUARD_FILE} sentinel
+EOF
+      exit 0;;
+    *) echo "Unknown option: $1" >&2; exit 1;;
+  esac; shift
+done
 
-** Dedupe helper
+# ===== Utils =====
+die(){ echo "ERROR: $*" >&2; exit 1; }
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
+canon(){ readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
 
-- Script :: backup-dedupe
-- Role :: Utility to trim duplicate trees across ironwolf01/ironwolf02/pool.
-- Notes ::
-  - No fixed target; run it explicitly against paths you choose.
+ensure_filters() {
+  [ -f "$FILTERS_FILE" ] || die "Missing filters file: $FILTERS_FILE"
+  [ -r "$FILTERS_FILE" ] || die "Filters not readable: $FILTERS_FILE"
+}
 
-* Maak verbs / loom bindings (wiring sketch)
+dest_sanity() {
+  # Mount check — direct, no symlinks
+  mountpoint -q /mnt/ironwolf02 || die "/mnt/ironwolf02 not mounted"
 
-Use this section as the wiring table when you edit =loom.org= /
-Maak config. Exact syntax depends on how you’re already defining
-verbs, so this is intentionally pseudo-code:
+  # DEST must live under backup-xubuntu, not be the mount root or /
+  local cdest; cdest="$(canon "$DEST")"
+  [[ "$cdest" == /mnt/ironwolf02/backup-xubuntu/* ]] || die "Refusing DEST outside /mnt/ironwolf02/backup-xubuntu: $cdest"
+  [[ "$cdest" != "/" && "$cdest" != "/mnt/ironwolf02" && "$cdest" != "/mnt/ironwolf02/" ]] || die "Refusing dangerous DEST: $cdest"
 
-- backup:system
-  - Run: =backup-system-clean && backup-system=
-- backup:dotcortex
-  - Run: =backup-dotfiles=
-- backup:helmcortex
-  - Run: =backup-nextcloud=
-- backup:games
-  - Run: =backup-games=
-- backup:retropie
-  - Run: =backup-retropie=
-- backup:dedupe
-  - Run: =backup-dedupe <ARGS>=
+  mkdir -p "$cdest"
 
-Adjust the verb names and mappings to match how you’ve actually
-layered HelmCortex vs DotCortex vs Nextcloud in Maak.
+  # Guard/sentinel: ensure this target *is* a system mirror target
+  if [ ! -f "$GUARD_FILE" ]; then
+    {
+      echo "system mirror target (rsync from /)"
+      echo "DEST=$(canon "$cdest")"
+      echo "FSTYPE=$(findmnt -no FSTYPE --target "$cdest")"
+      echo "DEV=$(findmnt -no SOURCE --target "$cdest")"
+      echo "CREATED=$(date -Is)"
+    } > "$GUARD_FILE"
+    chmod 644 "$GUARD_FILE"
+  else
+    grep -q "system mirror target (rsync from /)" "$GUARD_FILE" \
+      || die "Guard file exists but does not look like a system mirror target: $GUARD_FILE"
+  fi
+
+  # Ensure writable as your user (so non-root runs don't silently fail)
+  [ -w "$cdest" ] || die "Destination not writable by $(id -un). Try: sudo chown -R $(id -un):$(id -gn) '$cdest'"
+}
+
+stats() {
+  # Estimate with the SAME filters
+  rsync -aAXn --delete --stats --numeric-ids --no-owner --no-group \
+    --filter="merge $FILTERS_FILE" / "${DEST%/}/" \
+  | awk -F': *' '
+      /Total file size:/ {gsub(/,| bytes/,"",$2); t=$2}
+      /Total transferred file size:/ {gsub(/,| bytes/,"",$2); x=$2}
+      END {print t? t:0, x? x:0}'
+}
+
+prompt() {
+  local d dev; d="$(canon "$DEST")"
+  dev="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$d" 2>/dev/null || true)"
+  read -r t x < <(stats); f="$(avail_bytes "$d")"
+
+  echo "================ SYSTEM MIRROR ================"
+  echo "SRC : /"
+  echo "DEST: $d  ($dev)"
+  echo "CMD : rsync ${RSYNC_RUN[*]} / \"$d/\""
+  echo "Size total=$(hr "$t")  xfer~=$(hr "$x")  free=$(hr "$f")"
+  echo "Filters: $FILTERS_FILE"
+  echo "=============================================="
+
+  # If mode preselected, skip asking.
+  case "${MODE:-}" in
+    dry) echo "[DRY MODE] Skipping confirmation."; return ;;
+    yes) echo "[AUTO YES] Proceeding without prompt."; return ;;
+  esac
+  (( AUTO )) && { [ -n "$MODE" ] || die "--auto requires -n or -y"; return; }
+
+  # Must-type confirmation
+  read -rp "Type EXACT DEST path to confirm, or 'd' for dry-run, or 'n' to abort: " ans
+  case "$ans" in
+    n|N) exit 0;;
+    d|D) MODE="dry";;
+    *)   [[ "$(canon "$ans")" = "$d" ]] || die "Confirmation mismatch"; MODE="yes";;
+  esac
+}
+
+run() {
+  local d; d="$(canon "$DEST")"
+  if [ "${MODE:-}" = "dry" ]; then
+    rsync "${RSYNC_DRY[@]}" / "$d/" | tee "$LOG"
+  else
+    ionice -c2 -n7 nice -n 19 rsync "${RSYNC_RUN[@]}" / "$d/" | tee "$LOG"
+  fi
+  echo "Log: $LOG"
+}
+
+main() {
+  ensure_filters
+  dest_sanity
+  prompt
+  run
+}
+main "$@"
+#+END_SRC
+
+* backup-system-clean – Prune system mirror
+
+Removes cached / excluded files from the system mirror on ironwolf02
+using a cleanup filter list.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-system-clean :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
+
+ROOT_DEFAULT="/mnt/ironwolf02/backup-xubuntu/backup-xubuntu"
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+CLEAN_FILTER_DEFAULT="$USER_HOME/.config/backup/system-clean.rsync"
+CLEAN_FILTER="${CLEAN_FILTER:-$CLEAN_FILTER_DEFAULT}"
+LOG="/tmp/backup_system_clean_$(date +%Y%m%d_%H%M%S).log"
+
+MODE="" AUTO=0 ROOT="$ROOT_DEFAULT" DO_RM=0
+
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes";;
+    -n|--dry|--dry-run) MODE="dry";;
+    --auto) AUTO=1;;
+    --root) ROOT="${2:?}"; shift;;
+    --rm) DO_RM=1;;
+    --filter) CLEAN_FILTER="${2:?}"; shift;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run|-y|--yes] [--auto]
+       [--root PATH] [--filter FILE] [--rm]
+  --root PATH    Snapshot root to clean (default: $ROOT_DEFAULT)
+  --filter FILE  Cleanup filter file (default: $CLEAN_FILTER_DEFAULT)
+  --rm           Permanently delete instead of 'gio trash'
+EOF
+      exit 0;;
+    *) echo "Unknown: $1" >&2; exit 1;;
+  esac; shift
+done
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+need(){ command -v "$1" >/dev/null 2>&1 || die "Missing dependency: $1"; }
+
+trash_bucket() {
+  local mount="/mnt/ironwolf02"
+  local uid; uid="$(id -u)"
+  if [[ -d "$mount/.Trash-$uid" ]]; then
+    echo "$mount/.Trash-$uid"
+  elif [[ -d "$mount/.Trash/$uid" ]]; then
+    echo "$mount/.Trash/$uid"
+  else
+    echo "(no trash dir found on $mount)"
+  fi
+}
+
+safety() {
+  if [ ! -d "$ROOT" ]; then
+    echo "SKIP: $ROOT does not exist yet (first system backup not run?)"
+    exit 0
+  fi
+  [[ "$ROOT" == /mnt/ironwolf02/* ]] || die "Refusing to run outside /mnt/ironwolf02"
+  mountpoint -q /mnt/ironwolf02 || die "/mnt/ironwolf02 not mounted"
+  [ -f "$CLEAN_FILTER" ] || die "Missing cleanup filter: $CLEAN_FILTER"
+  [ -r "$CLEAN_FILTER" ] || die "Cleanup filter not readable"
+  (( DO_RM )) || need gio
+}
+
+# Build candidate list by expanding each '- pattern' as a glob under $ROOT.
+build_candidates() {
+  local tmp=/tmp/clean_candidates_all_$$.txt
+  : > "$tmp"
+  shopt -s nullglob dotglob globstar
+
+  while IFS= read -r line; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    local pat="${line#*- }"; pat="${pat#"${pat%%[![:space:]]*}"}"
+    [[ -z "$pat" ]] && continue
+    local glob
+    if [[ "$pat" == /* ]]; then
+      glob="$ROOT$pat"
+    else
+      glob="$ROOT/$pat"
+    fi
+    while IFS= read -r m; do
+      [[ -z "$m" ]] && continue
+      [[ "$m" == "$ROOT" || "$m" != "$ROOT"* ]] && continue
+      printf '%s\n' "$m" >> "$tmp"
+    done < <(compgen -G "$glob" || true)
+  done < "$CLEAN_FILTER"
+
+  sort -u "$tmp" |
+  awk '{
+    paths[NR]=$0; lens[NR]=length($0)
+  } END {
+    n=NR
+    for(i=1;i<=n;i++) idx[i]=i
+    for(i=1;i<=n;i++) for(j=i+1;j<=n;j++) if(lens[idx[i]]>lens[idx[j]]) {t=idx[i]; idx[i]=idx[j]; idx[j]=t}
+    keepc=0
+    for(k=1;k<=n;k++){
+      p=paths[idx[k]]
+      keep=1
+      for(m=1;m<=keepc;m++){
+        if (p==keepv[m] || index(p, keepv[m] "/")==1){ keep=0; break }
+      }
+      if(keep){ keepv[++keepc]=p }
+    }
+    for(m=1;m<=keepc;m++) print keepv[m]
+  }' > /tmp/clean_candidates_$$.txt
+
+  tr '\n' '\0' < /tmp/clean_candidates_$$.txt > /tmp/clean_candidates_$$.nul
+}
+
+summary() {
+  local total=0 count=0 path sz
+  while IFS= read -r -d '' path; do
+    if [ -d "$path" ]; then
+      sz=$(du -sb --apparent-size -- "$path" 2>/dev/null | awk '{print $1}')
+    else
+      sz=$(stat -c %s -- "$path" 2>/dev/null || echo 0)
+    fi
+    total=$(( total + sz ))
+    count=$(( count + 1 ))
+  done < /tmp/clean_candidates_$$.nul
+  echo "$count" "$total"
+}
+
+prompt() {
+  canon() { printf '%s' "$1" | sed 's:/*$::'; }
+  local dev; dev="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$ROOT" 2>/dev/null || true)"
+  local count bytes; read -r count bytes < <(summary)
+  echo "================ CLEAN PREVIEW ================"
+  echo "ROOT : $ROOT  ($dev)"
+  echo "RULE : $CLEAN_FILTER"
+  echo "Would purge: $count items  reclaim ~$(hr "$bytes")"
+  if (( DO_RM )); then
+    echo "Delete mode : PERMANENT (no Trash)"
+  else
+    echo "Trash bucket: $(trash_bucket)"
+  fi
+  echo "Sample:"
+  tr '\0' '\n' < /tmp/clean_candidates_$$.nul | head -n 30 | sed 's/^/  - /'
+  echo "=============================================="
+
+  case "${MODE:-}" in
+    dry) echo "[DRY MODE] Skipping confirmation."; return ;;
+    yes) echo "[AUTO YES] Proceeding without prompt."; return ;;
+  esac
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+
+  read -rp "Type EXACT ROOT path to confirm, or 'd' dry, 'n' abort: " ans
+  case "$ans" in
+    n|N) exit 0;;
+    d|D) MODE="dry";;
+    *)
+      [ "$(canon "$ans")" = "$(canon "$ROOT")" ] || die "Confirmation mismatch"
+      MODE="yes"
+      ;;
+  esac
+}
+
+do_clean() {
+  if [ "$MODE" = "dry" ]; then
+    echo "[DRY] Nothing deleted. See list above."
+    return
+  fi
+  local path ok=0 fail=0
+  while IFS= read -r -d '' path; do
+    if (( DO_RM )); then
+      if rm -rf --one-file-system -- "$path"; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    else
+      if gio trash -- "$path"; then ok=$((ok+1)); else fail=$((fail+1)); fi
+    fi
+  done < /tmp/clean_candidates_$$.nul
+  echo "[✓] Clean finished. OK=$ok FAIL=$fail"
+}
+
+main() {
+  safety
+  build_candidates
+  prompt
+  do_clean
+  [ -n "${LOG:-}" ] && tr '\0' '\n' < /tmp/clean_candidates_$$.nul > "$LOG" && echo "Log: $LOG"
+  rm -f /tmp/clean_candidates_$$.nul /tmp/clean_candidates_$$.txt /tmp/clean_candidates_all_$$.txt
+  echo "Log: $LOG"
+}
+main "$@"
+#+END_SRC
+
+* backup-dotcortex – Mirror DotCortex to ironwolf02
+
+Simple mirror of =~/DotCortex= to ironwolf02.
+No timestamped copies — just a current mirror.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-dotcortex :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
+
+SRC="$HOME/DotCortex"
+DESTS=(
+  /mnt/ironwolf02/backup-dotfiles/DotCortex
+)
+MOUNTS=( /mnt/ironwolf02 )
+
+RSYNC_RUN=( -aH --delete --info=stats2,progress2 --no-owner --no-group )
+RSYNC_DRY=( -anv --delete --itemize-changes --no-owner --no-group )
+
+MODE="" AUTO=0
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes";;
+    -n|--dry|--dry-run) MODE="dry";;
+    --auto) AUTO=1;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run] [-y|--yes] [--auto]
+Mirrors ~/DotCortex to ironwolf02.
+EOF
+      exit 0;;
+    *) echo "Unknown: $1" >&2; exit 1;;
+  esac; shift
+done
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+[ -d "$SRC" ] || die "Source not found: $SRC"
+
+for mp in "${MOUNTS[@]}"; do
+  mountpoint -q "$mp" || die "$mp is not mounted"
+done
+
+if (( AUTO )); then
+  [ -n "$MODE" ] || die "--auto requires -n or -y"
+elif [ -z "$MODE" ]; then
+  echo "SRC:  $SRC"
+  for d in "${DESTS[@]}"; do echo "DEST: $d"; done
+  read -rp "Proceed? [y/n/d(ry)] " ans
+  case "$ans" in
+    y|Y) MODE="yes";;
+    d|D) MODE="dry";;
+    *)   exit 0;;
+  esac
+fi
+
+for dest in "${DESTS[@]}"; do
+  mkdir -p "$dest"
+  echo "[*] Syncing to $dest"
+  if [ "$MODE" = "dry" ]; then
+    rsync "${RSYNC_DRY[@]}" "$SRC/" "$dest/"
+  else
+    rsync "${RSYNC_RUN[@]}" "$SRC/" "$dest/"
+  fi
+  echo "[✓] Done: $dest"
+  echo
+done
+#+END_SRC
+
+* backup-nextcloud – Dual sync (ZFS pool + ironwolf02)
+
+Mirrors =$HOME/Nextcloud= to both the ZFS pool and ironwolf02.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-nextcloud :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
+
+NAME="nextcloud"
+
+# SUDO-safe HOME
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+
+# === CONFIG ===
+SRC="${USER_HOME}/Nextcloud"
+DEST_POOL="/mnt/fideco-pool/Nextcloud"                   # ZFS (local pool)
+DEST_BACK="/mnt/ironwolf02/backup-nextcloud/Nextcloud"   # ext4 (backup disk)
+GUARD_POOL="${DEST_POOL}/.backup_guard"
+GUARD_BACK="${DEST_BACK}/.backup_guard"
+LOG="/tmp/backup_${NAME}_$(date +%Y%m%d_%H%M%S).log"
+LOCK="/tmp/backup_${NAME}.lock"
+
+RSYNC_RUN=( -aH --delete --info=stats2,progress2 --no-owner --no-group --exclude='.backup_guard' )
+RSYNC_DRY=( -anv --delete --itemize-changes --no-owner --no-group --exclude='.backup_guard' )
+
+# === ARGS ===
+MODE="" AUTO=0 USE_LOCK=1
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes" ;;
+    -n|--dry|--dry-run) MODE="dry" ;;
+    --auto) AUTO=1 ;;
+    --no-lock) USE_LOCK=0 ;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run] [-y|--yes] [--auto] [--no-lock]
+  -n, --dry-run   Dry-run only (no writes)
+  -y, --yes       Perform real sync
+  --auto          Non-interactive (must be combined with -n or -y)
+  --no-lock       Skip single-instance lock (not recommended)
+EOF
+      exit 0;;
+    *) echo "ERROR: Unknown arg: $1" >&2; exit 1;;
+  esac; shift
+done
+
+# === UTILS ===
+die(){ echo "ERROR: $*" >&2; exit 1; }
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
+realp(){ readlink -f "$1" 2>/dev/null || echo "$1"; }
+
+lock(){
+  (( USE_LOCK )) || return 0
+  exec 9>"$LOCK" || true
+  flock -n 9 || die "Another ${NAME} run appears active (lock: $LOCK). Use --no-lock to override."
+  echo "$$" 1>&9 || true
+}
+
+prep_dest() {
+  local d="$1" g="$2" label="$3"
+  mkdir -p "$d"
+  local D; D="$(realp "$d")"
+  [ -w "$D" ] || die "Destination not writable: $D (chown to you)"
+  if [ ! -f "$g" ]; then
+    {
+      echo "mirror target for \$HOME/Nextcloud"
+      echo "SRC=$(realp "$SRC")"
+      echo "DEST=$D"
+      echo "FSTYPE=$(findmnt -no FSTYPE --target "$D")"
+      echo "DEV=$(findmnt -no SOURCE --target "$D")"
+      echo "CREATED=$(date -Is)"
+    } > "$g"
+    chmod 644 "$g"
+  fi
+}
+
+stats_pair(){ # prints: total xfer dels free dev_str
+  local s="$1" d="$2"
+  local total xfer dels free dev
+  read -r total xfer < <( rsync -an --delete --stats --exclude='.backup_guard' --no-owner --no-group "$s/" "$d/" 2>/dev/null \
+    | awk -F': *' '/Total file size:/{gsub(/,| bytes/,"",$2);t=$2}/Total transferred file size:/{gsub(/,| bytes/,"",$2);x=$2}END{print t? t:0, x? x:0}' )
+  dels="$( rsync -an --delete --itemize-changes --exclude='.backup_guard' --no-owner --no-group "$s/" "$d/" | awk 'BEGIN{c=0} /^\*deleting /{c++} END{print c}' )"
+  free="$(avail_bytes "$d")"
+  dev="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$d" 2>/dev/null || true)"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$total" "$xfer" "$dels" "$free" "$dev"
+}
+
+sanity_checks() {
+  [ -d "$SRC" ] || die "Missing source: $SRC"
+  # mount safety — direct checks
+  mountpoint -q /mnt/fideco-pool || die "/mnt/fideco-pool is not mounted"
+  mountpoint -q /mnt/ironwolf02 || die "/mnt/ironwolf02 is not mounted"
+  prep_dest "$DEST_POOL" "$GUARD_POOL" "POOL"
+  prep_dest "$DEST_BACK" "$GUARD_BACK" "BACKUP"
+
+  # Source non-empty guard
+  local c; c=$(find "$SRC" -mindepth 1 -maxdepth 1 | head -n1 | wc -l)
+  (( c > 0 )) || die "Source looks empty: $SRC (bailing to avoid destructive mirror)"
+}
+
+prompt_dual() {
+  local S D1 D2 t1 x1 d1 f1 dev1 t2 x2 d2 f2 dev2
+  S="$(realp "$SRC")"; D1="$(realp "$DEST_POOL")"; D2="$(realp "$DEST_BACK")"
+
+  IFS=$'\t' read -r t1 x1 d1 f1 dev1 < <( stats_pair "$SRC" "$DEST_POOL" )
+  IFS=$'\t' read -r t2 x2 d2 f2 dev2 < <( stats_pair "$SRC" "$DEST_BACK"  )
+
+  echo "================ NEXTCLOUD DUAL SYNC ================"
+  echo "SRC : $S"
+  echo "POOL: $D1  ($dev1)"
+  echo "      total=$(hr "$t1")  xfer~=$(hr "$x1")  free=$(hr "$f1")  deletes~$d1"
+  echo "BACK: $D2  ($dev2)"
+  echo "      total=$(hr "$t2")  xfer~=$(hr "$x2")  free=$(hr "$f2")  deletes~$d2"
+  echo "CMDs (in order):"
+  echo "  rsync ${RSYNC_RUN[*]} \"$S/\" \"$D1/\""
+  echo "  rsync ${RSYNC_RUN[*]} \"$S/\" \"$D2/\""
+  (( x1 > f1 )) && echo "[warn] POOL: estimated transfer exceeds free space"
+  (( x2 > f2 )) && echo "[warn] BACK: estimated transfer exceeds free space"
+  echo "====================================================="
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+  read -rp "Type BOTH DEST paths (space-separated) to confirm, or 'd' dry, 'n' abort: " A B
+  case "$A" in
+    n|N) exit 0 ;;
+    d|D) MODE="dry" ;;
+    *)
+      [ "$A" = "$D1" ] && [ "$B" = "$D2" ] || die "Confirmation mismatch. Aborting."
+      MODE="yes"
+      ;;
+  esac
+}
+
+run_one() {
+  local s="$1" d="$2" label="$3"
+  if [ "$MODE" = "dry" ]; then
+    echo "[*] DRY → $label"
+    rsync "${RSYNC_DRY[@]}" "$s/" "$d/" | tee -a "$LOG"
+  else
+    echo "[*] SYNC → $label"
+    ionice -c2 -n7 nice -n 19 rsync "${RSYNC_RUN[@]}" "$s/" "$d/" | tee -a "$LOG"
+  fi
+}
+
+main(){ lock; sanity_checks; prompt_dual; run_one "$SRC" "$DEST_POOL" "POOL"; run_one "$SRC" "$DEST_BACK" "BACKUP"; echo "[✓] Done. Log: $LOG"; }
+main "$@"
+#+END_SRC
+
+* backup-games – Games mirror to ironwolf01
+
+Mirrors =$HOME/Games= to =/mnt/ironwolf01/backup-games/Games=.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-games :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
+
+# === CONFIG ===
+SRC="${HOME}/Games"
+BASE="/mnt/ironwolf01/backup-games"
+DEST="${BASE}/Games"
+GUARD_FILE="${DEST}/.backup_guard"
+LOG="/tmp/backup_games_$(date +%Y%m%d_%H%M%S).log"
+RSYNC_BASE_OPTS=( -aH --delete --info=stats2,progress2 --no-owner --no-group --exclude='.backup_guard' )
+RSYNC_DRY_OPTS=( -anv --delete --itemize-changes --no-owner --no-group --exclude='.backup_guard' )
+
+# === ARGS ===
+MODE="" AUTO=0
+while (($#)); do
+  case "$1" in
+    -y|--yes)     MODE="yes" ;;
+    -n|--dry|--dry-run) MODE="dry" ;;
+    --auto)       AUTO=1 ;;
+    -h|--help)
+      echo "Usage: $(basename "$0") [-n|--dry-run] [-y|--yes] [--auto]"
+      echo "  -y, --yes    Perform real sync"
+      echo "  -n           Dry-run"
+      echo "  --auto       Non-interactive (combine with -n or -y)"
+      exit 0 ;;
+    *) echo "ERROR: Unknown arg: $1" >&2; exit 1 ;;
+  esac; shift
+done
+
+# === UTILS ===
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
+src_real(){ readlink -f "$SRC"; }
+dest_real(){ readlink -f "$DEST" || echo "$DEST"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+# === SAFETY CHECKS ===
+safety_checks() {
+  mountpoint -q /mnt/ironwolf01 || die "/mnt/ironwolf01 is not mounted"
+  mkdir -p "$DEST"
+  [ -d "$BASE" ] || die "Missing base dir: $BASE"
+  [ "$(dest_real)" != "/mnt/ironwolf01" ] || die "Refusing to target mount root"
+  [ "$(dest_real)" != "$BASE" ] || die "Refusing to target $BASE (must be $DEST)"
+  # guard file
+  if [ ! -f "$GUARD_FILE" ]; then
+    echo "Creating guard file at $GUARD_FILE"
+    {
+      echo "This directory is the rsync mirror target for \$HOME/Games"
+      echo "SRC=$(src_real)"
+      echo "DEST=$(dest_real)"
+      echo "CREATED=$(date -Is)"
+    } | tee "$GUARD_FILE" >/dev/null
+    chmod 644 "$GUARD_FILE"
+  fi
+  [ -w "$(dest_real)" ] || die "Destination not writable by $(id -un). Fix: sudo chown -R $(id -un):$(id -gn) '$(dest_real)'"
+}
+
+# === PREVIEW / STATS ===
+rsync_stats() {
+  rsync -an --delete --stats "$(src_real)/" "$(dest_real)/" 2>/dev/null \
+  | awk -F': *' '
+    /Total file size:/ {gsub(/,| bytes/,"",$2); t=$2}
+    /Total transferred file size:/ {gsub(/,| bytes/,"",$2); x=$2}
+    END {print t? t:0, x? x:0}'
+}
+
+prompt_mode() {
+  local SRC_R; SRC_R="$(src_real)"
+  local DEST_R; DEST_R="$(dest_real)"
+  local dev; dev="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$DEST_R" 2>/dev/null || true)"
+
+  echo "------------------------------------------------------------"
+  echo "About to run rsync WITH --delete"
+  echo "FROM: $SRC_R"
+  echo "TO:   $DEST_R"
+  echo "DEV:  $dev"
+  echo "CMD:  rsync ${RSYNC_BASE_OPTS[*]} \"$SRC_R/\" \"$DEST_R/\""
+  echo "------------------------------------------------------------"
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+  read -rp "Type EXACT DEST path to confirm, or 'd' for dry-run, or 'n' to abort: " ans
+  case "$ans" in
+    n|N) exit 0 ;;
+    d|D) MODE="dry" ;;
+    *)
+      if [ "$ans" = "$DEST_R" ]; then MODE="yes"; else die "Confirmation mismatch. Aborting."; fi
+      ;;
+  esac
+}
+
+run_sync() {
+  local SRC_R; SRC_R="$(src_real)"
+  local DEST_R; DEST_R="$(dest_real)"
+
+  read -r total xfer < <(rsync_stats)
+  local free; free="$(avail_bytes "$DEST_R")"
+
+  echo "[info] Source total: $(hr "$total")"
+  echo "[info] Est. xfer:    $(hr "$xfer")"
+  echo "[info] Free on dest: $(hr "$free")"
+  [ "$xfer" -gt "$free" ] && echo "[warn] Estimated transfer exceeds free space"
+
+  if [ "${MODE:-}" = "dry" ]; then
+    echo "[*] DRY-RUN start"
+    rsync "${RSYNC_DRY_OPTS[@]}" "$SRC_R/" "$DEST_R/" | tee "$LOG"
+    echo "[*] DRY-RUN log: $LOG"
+  else
+    echo "[*] SYNC start"
+    rsync "${RSYNC_BASE_OPTS[@]}" "$SRC_R/" "$DEST_R/" | tee "$LOG"
+    echo "[✓] SYNC complete. Log: $LOG"
+  fi
+}
+
+main() {
+  safety_checks
+  prompt_mode
+  run_sync
+}
+main "$@"
+#+END_SRC
+
+* backup-retropie – RetroPie mirror to ironwolf01
+
+Mirrors =$HOME/RetroPie= to =/mnt/ironwolf01/backup-retropie/RetroPie=.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-retropie :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
+
+NAME="retropie"
+
+# Resolve HOME even when run via sudo
+USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+USER_HOME="${USER_HOME:-$HOME}"
+
+# === CONFIG ===
+SRC="${USER_HOME}/RetroPie"
+BASE="/mnt/ironwolf01/backup-retropie"
+DEST="${BASE}/RetroPie"
+GUARD_FILE="${DEST}/.backup_guard"
+LOG="/tmp/backup_${NAME}_$(date +%Y%m%d_%H%M%S).log"
+LOCK="/tmp/backup_${NAME}.lock"
+
+RSYNC_RUN=( -aH --delete --info=stats2,progress2 --no-owner --no-group --exclude='.backup_guard' )
+RSYNC_DRY=( -anv --delete --itemize-changes --no-owner --no-group --exclude='.backup_guard' )
+
+# === ARGS ===
+MODE="" AUTO=0 USE_LOCK=1
+while (($#)); do
+  case "$1" in
+    -y|--yes) MODE="yes" ;;
+    -n|--dry|--dry-run) MODE="dry" ;;
+    --auto) AUTO=1 ;;
+    --no-lock) USE_LOCK=0 ;;
+    -h|--help)
+      cat <<EOF
+Usage: $(basename "$0") [-n|--dry-run] [-y|--yes] [--auto] [--no-lock]
+  -n, --dry-run   Dry-run only (no writes)
+  -y, --yes       Perform real sync
+  --auto          Non-interactive (must be combined with -n or -y)
+  --no-lock       Skip single-instance lock (not recommended)
+EOF
+      exit 0;;
+    *) echo "ERROR: Unknown arg: $1" >&2; exit 1;;
+  esac; shift
+done
+
+# === UTILS ===
+hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
+avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
+realp(){ readlink -f "$1" 2>/dev/null || echo "$1"; }
+die(){ echo "ERROR: $*" >&2; exit 1; }
+
+lock(){
+  (( USE_LOCK )) || return 0
+  exec 9>"$LOCK" || true
+  flock -n 9 || die "Another ${NAME} run appears active (lock: $LOCK). Use --no-lock to override."
+  echo "$$" 1>&9 || true
+}
+
+# === SAFETY CHECKS ===
+safety_checks() {
+  [ -d "$SRC" ] || die "Missing source: $SRC"
+  mountpoint -q /mnt/ironwolf01 || die "/mnt/ironwolf01 is not mounted"
+  mkdir -p "$DEST"
+  [ -d "$BASE" ] || die "Missing base dir: $BASE"
+
+  local DEST_R; DEST_R="$(realp "$DEST")"
+  [ "$DEST_R" != "/mnt/ironwolf01" ] || die "Refusing to target mount root"
+  [ "$DEST_R" != "$BASE" ]   || die "Refusing to target base ($BASE); must be the RetroPie subdir"
+  [ -w "$DEST_R" ] || die "Destination not writable by $(id -un). Fix: sudo chown -R $(id -un):$(id -gn) '$DEST_R'"
+
+  # Create/update guard
+  if [ ! -f "$GUARD_FILE" ]; then
+    {
+      echo "mirror target for \$HOME/RetroPie"
+      echo "SRC=$(realp "$SRC")"
+      echo "DEST=$DEST_R"
+      echo "FSTYPE=$(findmnt -no FSTYPE --target "$DEST_R")"
+      echo "DEV=$(findmnt -no SOURCE --target "$DEST_R")"
+      echo "CREATED=$(date -Is)"
+    } > "$GUARD_FILE"
+    chmod 644 "$GUARD_FILE"
+  fi
+
+  # Quick sanity: ensure SRC isn't suspiciously empty
+  local c; c=$(find "$SRC" -mindepth 1 -maxdepth 1 | head -n1 | wc -l)
+  (( c > 0 )) || die "Source looks empty: $SRC (bailing to avoid destructive mirror)"
+}
+
+# === PREVIEW / STATS ===
+rsync_sizes() {
+  rsync -an --delete --stats --exclude='.backup_guard' --no-owner --no-group \
+    "$(realp "$SRC")/" "$(realp "$DEST")/" 2>/dev/null |
+  awk -F': *' '
+    /Total file size:/ {gsub(/,| bytes/,"",$2); t=$2}
+    /Total transferred file size:/ {gsub(/,| bytes/,"",$2); x=$2}
+    END {print t? t:0, x? x:0}'
+}
+
+delete_count() {
+  rsync -an --delete --itemize-changes --exclude='.backup_guard' --no-owner --no-group \
+    "$(realp "$SRC")/" "$(realp "$DEST")/" |
+  awk 'BEGIN{c=0} /^\*deleting /{c++} END{print c}'
+}
+
+prompt_mode() {
+  local SRC_R DEST_R DEV FST total xfer free dels
+  SRC_R="$(realp "$SRC")"; DEST_R="$(realp "$DEST")"
+  DEV="$(findmnt -no SOURCE,TARGET,FSTYPE --target "$DEST_R" 2>/dev/null || true)"
+  FST="$(findmnt -no FSTYPE --target "$DEST_R" 2>/dev/null || true)"
+  read -r total xfer < <(rsync_sizes); free="$(avail_bytes "$DEST_R")"
+  dels="$(delete_count)"
+
+  echo "------------------------------------------------------------"
+  echo "About to run rsync WITH --delete"
+  echo "FROM: $SRC_R"
+  echo "TO:   $DEST_R"
+  echo "DEV:  $DEV"
+  echo "FS:   $FST"
+  echo "CMD:  rsync ${RSYNC_RUN[*]} \"$SRC_R/\" \"$DEST_R/\""
+  echo "Size: total=$(hr "$total")  xfer~=$(hr "$xfer")  free=$(hr "$free")"
+  echo "Warn: would delete $dels path(s) at DEST"
+  [ "$xfer" -gt "$free" ] && echo "[warn] Estimated transfer exceeds free space"
+  echo "------------------------------------------------------------"
+
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"
+    return
+  fi
+  read -rp "Type EXACT DEST path to confirm, or 'd' for dry-run, or 'n' to abort: " ans
+  case "$ans" in
+    n|N) exit 0 ;;
+    d|D) MODE="dry" ;;
+    *) [ "$ans" = "$DEST_R" ] || die "Confirmation mismatch. Aborting."; MODE="yes" ;;
+  esac
+}
+
+run_sync() {
+  local SRC_R DEST_R; SRC_R="$(realp "$SRC")"; DEST_R="$(realp "$DEST")"
+  if [ "$MODE" = "dry" ]; then
+    echo "[*] DRY-RUN start"
+    rsync "${RSYNC_DRY[@]}" "$SRC_R/" "$DEST_R/" | tee "$LOG"
+    echo "[*] DRY-RUN log: $LOG"
+  else
+    echo "[*] SYNC start"
+    ionice -c2 -n7 nice -n 19 rsync "${RSYNC_RUN[@]}" "$SRC_R/" "$DEST_R/" | tee "$LOG"
+    echo "[✓] SYNC complete. Log: $LOG"
+  fi
+}
+
+main(){ lock; safety_checks; prompt_mode; run_sync; } ; main "$@"
+#+END_SRC
+
+* backup-dedupe – Hardlink deduplication utility
+
+No path changes needed — takes =--root= as argument. Included here
+for completeness and loom verb wiring.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/backup-dedupe :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -Eeuo pipefail
+
+NAME="dedupe"
+LOG="/tmp/backup_${NAME}_$(date +%Y%m%d_%H%M%S).log"
+
+ROOT="" MODE="" AUTO=0 ALLOW_XFS=0 BACKEND="" BACKEND_BIN="" CZK_MODE="v10+"
+HASH=BLAKE3
+THREADS=0
+FORCE_SUDO=auto   # auto|always|never
+
+usage(){ cat <<EOF
+Usage: $(basename "$0") --root PATH [-n|--dry-run|-y|--yes] [--auto] [--allow-crossfs]
+Safely hardlink duplicate files under PATH (single filesystem by default).
+
+Options:
+  --root PATH          Directory to dedupe
+  -n, --dry-run        Preview (no writes)
+  -y, --yes            Real run (perform hardlinks)
+  --auto               Non-interactive (must combine with -n or -y)
+  --allow-crossfs      Allow nested mounts under ROOT
+  --sudo               Force sudo even if ROOT seems writable
+  --no-sudo            Never use sudo
+EOF
+}
+
+die(){ echo "ERROR: $*" >&2; exit 1; }
+have(){ command -v "$1" >/dev/null 2>&1; }
+log(){ printf '%s\n' "$*" | tee -a "$LOG"; }
+abspath_of(){ command -v "$1"; }
+
+# ---------- args ----------
+while (($#)); do
+  case "$1" in
+    --root) ROOT="${2:?}"; shift;;
+    -n|--dry|--dry-run) MODE="dry";;
+    -y|--yes) MODE="yes";;
+    --auto) AUTO=1;;
+    --allow-crossfs) ALLOW_XFS=1;;
+    --sudo) FORCE_SUDO="always";;
+    --no-sudo) FORCE_SUDO="never";;
+    -h|--help) usage; exit 0;;
+    *) echo "Unknown: $1" >&2; usage; exit 1;;
+  esac; shift
+done
+[ -n "$ROOT" ] || die "--root required"
+
+# ---------- backend detect ----------
+pick_backend(){
+  if have czkawka_cli; then
+    BACKEND="czkawka"
+    BACKEND_BIN="$(abspath_of czkawka_cli)"
+    if czkawka_cli dup --help 2>/dev/null | grep -q -- '--delete-method'; then
+      CZK_MODE="v10+"
+    else
+      CZK_MODE="legacy"
+    fi
+    return
+  fi
+  if have jdupes; then BACKEND="jdupes"; BACKEND_BIN="jdupes"; return; fi
+  if have rdfind;  then BACKEND="rdfind"; BACKEND_BIN="rdfind"; return; fi
+  die "No czkawka_cli/jdupes/rdfind on PATH"
+}
+
+# ---------- safety ----------
+safety(){
+  [ -d "$ROOT" ] || die "No such dir: $ROOT"
+  case "$ROOT" in /|/mnt/ironwolf01|/mnt/ironwolf02|/mnt/fideco-pool) die "Refusing to target base root: $ROOT";; esac
+  local count
+  count=$(findmnt --noheadings --submounts --target "$ROOT" | wc -l | tr -d ' ')
+  if [ "$count" -gt 1 ] && [ "$ALLOW_XFS" -eq 0 ]; then
+    die "Nested mounts under $ROOT detected. Use --allow-crossfs if intentional."
+  fi
+}
+
+# ---------- sudo helpers ----------
+SUDO=""
+start_sudo_keepalive(){
+  [ "${MODE:-}" = "dry" ] && return 0
+  SUDO="sudo"
+  sudo -v || true
+  ( while true; do sleep 120; sudo -n true || exit; done ) 2>/dev/null &
+  SUDO_KEEPALIVE_PID=$!
+  trap 'kill ${SUDO_KEEPALIVE_PID:-0} 2>/dev/null || true' EXIT
+}
+need_sudo(){
+  case "$FORCE_SUDO" in
+    always) return 0;;
+    never)  return 1;;
+    auto)   [ -w "$ROOT" ] && return 1 || return 0;;
+  esac
+}
+
+# ---------- stats ----------
+fmt_bytes(){ numfmt --to=iec --suffix=B <<<"${1:-0}" 2>/dev/null || echo "${1:-0}B"; }
+saved_bytes(){
+  set +e +o pipefail
+  sudo find "$ROOT" -xdev -type f -printf '%i %n %s\n' 2>/dev/null \
+  | awk '{L[$1]=$2; S[$1]=$3} END{for(i in L) if(L[i]>1) saved+=(L[i]-1)*S[i]; print saved+0}'
+  local rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+  [ $rc -eq 0 ] || true
+}
+count_hardlink_files(){
+  set +e +o pipefail
+  sudo find "$ROOT" -xdev -type f -links +1 -printf . 2>/dev/null | wc -c
+  local rc=${PIPESTATUS[0]}
+  set -e -o pipefail
+  [ $rc -eq 0 ] || true
+}
+show_top_sets(){
+  local N="${1:-20}"
+  set +e +o pipefail
+  sudo find "$ROOT" -xdev -type f -printf '%i\t%n\t%s\t%p\n' 2>/dev/null \
+  | awk '{ ino=$1;n=$2;s=$3;p=$4; if(!(f[ino])) f[ino]=p; sz[ino]=s; ln[ino]=n }
+         END{ for(i in ln) if(ln[i]>1) printf "%s\tlinks=%d\tsize=%d\tsaved=%d\n",f[i],ln[i],sz[i],(ln[i]-1)*sz[i] }' \
+  | sort -k4,4nr -k2,2nr | head -"$N" \
+  | awk -F'\t' '{ cmd=sprintf("numfmt --to=iec --suffix=B <<< %s",$3); cmd|getline sz; close(cmd);
+                  cmd=sprintf("numfmt --to=iec --suffix=B <<< %s",$4); cmd|getline sv; close(cmd);
+                  printf "• %s  (links=%s, size=%s, saved=%s)\n",$1,gensub(/links=/,"","g",$2),sz,sv }'
+  set -e -o pipefail
+}
+
+# ---------- preview ----------
+preview(){
+  echo "============== DEDUPE PREVIEW =============="
+  echo -n "ROOT : $ROOT  "; findmnt -no SOURCE,TARGET,FSTYPE --target "$ROOT" 2>/dev/null || true
+  echo "TOOL : $BACKEND ($BACKEND_BIN)"
+  local dry real
+  case "$BACKEND" in
+    czkawka)
+      dry="$BACKEND_BIN dup -d $ROOT -t $HASH --thread-number $THREADS"
+      if [ "$CZK_MODE" = "v10+" ]; then
+        real="$BACKEND_BIN dup -d $ROOT -t $HASH --thread-number $THREADS --allow-hard-links --delete-method HARD"
+      else
+        real="$BACKEND_BIN dup -d $ROOT -t $HASH --thread-number $THREADS --hardlink"
+      fi
+      ;;
+    jdupes)
+      dry="jdupes -r $ROOT"
+      real="jdupes -rL $ROOT"
+      ;;
+    rdfind)
+      dry="rdfind -makeresultsfile false -dryrun true $ROOT"
+      real="rdfind -makeresultsfile false -makehardlinks true $ROOT"
+      ;;
+  esac
+  if need_sudo; then real="sudo $real"; fi
+  echo "DRY  : $dry"
+  echo "REAL : $real"
+  echo "============================================"
+}
+
+# ---------- runs ----------
+run_dry(){
+  local hl_before sb_before
+  hl_before=$(count_hardlink_files)
+  sb_before=$(saved_bytes)
+  log "[DRY] existing hardlinked files : $hl_before"
+  log "[DRY] existing logical saved    : $(fmt_bytes "$sb_before")"
+  case "$BACKEND" in
+    czkawka) "$BACKEND_BIN" dup -d "$ROOT" -t "$HASH" --thread-number "$THREADS" | tee -a "$LOG" ;;
+    jdupes)  jdupes -r "$ROOT" | tee -a "$LOG" ;;
+    rdfind)  rdfind -makeresultsfile false -dryrun true "$ROOT" | tee -a "$LOG" ;;
+  esac
+  log "[DRY] No changes."
+}
+
+run_real(){
+  if need_sudo; then start_sudo_keepalive; SUDO=sudo; fi
+  log "[run] hashing & linking… (log: $LOG)"
+
+  local hl_before sb_before
+  hl_before=$(count_hardlink_files)
+  sb_before=$(saved_bytes)
+
+  local rc=0
+  case "$BACKEND" in
+    czkawka)
+      if [ "$CZK_MODE" = "v10+" ]; then
+        set +e
+        $SUDO ionice -c2 -n7 nice -n 19 "$BACKEND_BIN" dup -d "$ROOT" -t "$HASH" --thread-number "$THREADS" \
+             --allow-hard-links --delete-method HARD | tee -a "$LOG"
+        rc=${PIPESTATUS[0]}; set -e
+      else
+        set +e
+        $SUDO ionice -c2 -n7 nice -n 19 "$BACKEND_BIN" dup -d "$ROOT" -t "$HASH" --thread-number "$THREADS" \
+             --hardlink | tee -a "$LOG"
+        rc=${PIPESTATUS[0]}; set -e
+      fi
+      ;;
+    jdupes) set +e; $SUDO jdupes -rL "$ROOT" | tee -a "$LOG"; rc=${PIPESTATUS[0]}; set -e ;;
+    rdfind) set +e; $SUDO rdfind -makeresultsfile false -makehardlinks true "$ROOT" | tee -a "$LOG"; rc=${PIPESTATUS[0]}; set -e ;;
+  esac
+  [ $rc -eq 0 ] || log "[warn] backend exited with code $rc"
+
+  # ----- FINAL SUMMARY (always) -----
+  local hl_after sb_after delta_hl delta_sb
+  hl_after=$(count_hardlink_files)
+  sb_after=$(saved_bytes)
+  delta_hl=$(( hl_after - hl_before ))
+  delta_sb=$(( sb_after - sb_before ))
+
+  log "-------------- RESULT SUMMARY --------------"
+  log "Hardlinked files before : $hl_before"
+  log "Hardlinked files after  : $hl_after"
+  log "Delta (files)           : $delta_hl"
+  log "Logical saved before    : $(fmt_bytes "$sb_before")"
+  log "Logical saved after     : $(fmt_bytes "$sb_after")"
+  log "Delta (saved)           : $(fmt_bytes "$delta_sb")"
+
+  if [ "$delta_hl" -eq 0 ] && [ "$delta_sb" -eq 0 ]; then
+    log "No new duplicates were hard-linked (either none found or already deduped)."
+  else
+    log ""
+    log "Top hard-linked sets (by saved size):"
+    show_top_sets 20 | tee -a "$LOG"
+  fi
+
+  log "[✓] Completed. Log: $LOG"
+}
+
+confirm(){
+  if (( AUTO )); then
+    [ -n "$MODE" ] || die "--auto requires -n or -y"; return
+  fi
+  read -rp "Type EXACT ROOT to confirm, or 'd' dry, 'n' abort: " ans
+  case "$ans" in
+    n|N) exit 0;;
+    d|D) MODE="dry";;
+    *) [ "$ans" = "$ROOT" ] || die "Confirmation mismatch"; MODE="yes";;
+  esac
+}
+
+main(){
+  pick_backend
+  safety
+  preview
+  confirm
+  log "[log] writing to: $LOG"
+  if [ "${MODE:-}" = "dry" ]; then run_dry; else run_real; fi
+}
+
+main "$@"
+#+END_SRC
