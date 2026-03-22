@@ -86,6 +86,7 @@ include $(HOME)/DotCortex/all/.mk/guix.mk
 include $(HOME)/DotCortex/all/.mk/guix-substitutes.mk
 include $(HOME)/DotCortex/all/.mk/snap.mk
 include $(HOME)/DotCortex/all/.mk/appimage.mk
+include $(HOME)/DotCortex/all/.mk/gitrelease.mk
 include $(HOME)/DotCortex/all/.mk/cargo.mk
 include $(HOME)/DotCortex/all/.mk/homebrew.mk
 include $(HOME)/DotCortex/all/.mk/bun.mk
