@@ -17,8 +17,9 @@ Leave VERSION empty to treat the currently installed version as canonical.
 # Captured from T480s 2026-03-15
 @anthropic-ai/claude-code "" "" "global" "registry" "" "" ""
 @github/copilot "" "" "global" "registry" "" "" ""
+@google/gemini-cli "" "" "global" "registry" "" "" ""
 @openai/codex "" "" "global" "registry" "" "" ""
-@siteboon/claude-code-ui "" "" "global" "registry" "" "" ""
+@siteboon/claude-code-ui "" "" "global" "registry" "" "" "cloudcli-setup"
 opencode-ai "" "" "global" "registry" "" "" ""
 #+END_SRC
 
@@ -29,15 +30,103 @@ opencode-ai "" "" "global" "registry" "" "" ""
 set -euo pipefail
 
 export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
+export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/local/sbin:$PATH"
+
+if [ -d "$HOME/.config/guix/current/bin" ]; then
+  export PATH="$HOME/.config/guix/current/bin:$PATH"
+fi
+
+# Prefer DotCortex-managed Guix Node/NPM over the host system toolchain.
+if [ -d "$HOME/.guix-extra-profiles/core/core/bin" ]; then
+  export PATH="$HOME/.guix-extra-profiles/core/core/bin:$PATH"
+fi
+
+if [ -d "$HOME/.guix-extra-profiles/core/core/lib/locale" ]; then
+  export GUIX_LOCPATH="${GUIX_LOCPATH:-$HOME/.guix-extra-profiles/core/core/lib/locale}"
+fi
 
 # Ensure the prefix directories exist for npm
 if [ ! -d "$NPM_CONFIG_PREFIX/lib/node_modules" ]; then
   mkdir -p "$NPM_CONFIG_PREFIX/lib/node_modules"
 fi
 
-# then whatever you already do to activate fnm / node / PATH
+if [ ! -d "$NPM_CONFIG_PREFIX/bin" ]; then
+  mkdir -p "$NPM_CONFIG_PREFIX/bin"
+fi
+
+export PATH="$NPM_CONFIG_PREFIX/bin:$PATH"
+
+unset LD_LIBRARY_PATH 2>/dev/null || true
 
 exec "$@"
+#+END_SRC
+
+* Package-specific npm post-apply hooks
+#+BEGIN_SRC bash :tangle all/.local/bin/npm-postapply :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/bin/npm-postapply
+set -euo pipefail
+
+pkg="${1:?package name required}"
+extra="${2:-}"
+RUN="${DOTCORTEX_NODE_ENV:-$HOME/DotCortex/all/.local/bin/dotcortex-node-env}"
+
+export NPM_CONFIG_PREFIX="${NPM_CONFIG_PREFIX:-$HOME/.npm-global}"
+
+pkg_dir="$NPM_CONFIG_PREFIX/lib/node_modules/$pkg"
+
+write_cloudcli_env() {
+  mkdir -p "$pkg_dir"
+  cat >"$pkg_dir/.env" <<EOF
+# Managed by DotCortex via npm.org
+SERVER_PORT=3001
+HOST=0.0.0.0
+VITE_PORT=5173
+DATABASE_PATH=$HOME/.cloudcli/auth.db
+CLAUDE_CLI_PATH=claude
+CONTEXT_WINDOW=160000
+WORKSPACES_ROOT=$HOME
+EOF
+}
+
+cloudcli_binary_healthy() {
+  [ -d "$pkg_dir" ] || return 1
+
+  "$RUN" node - "$pkg_dir" <<'EOF'
+const path = require('path');
+
+const pkgDir = process.argv[2];
+
+try {
+  require(path.join(pkgDir, 'node_modules', 'better-sqlite3'));
+  process.exit(0);
+} catch (error) {
+  process.stderr.write(String(error && error.message ? error.message : error) + '\n');
+  process.exit(1);
+}
+EOF
+}
+
+ensure_cloudcli_setup() {
+  [ -d "$pkg_dir" ] || return 0
+
+  write_cloudcli_env
+
+  if ! cloudcli_binary_healthy; then
+    echo "== npm postapply: rebuilding native modules for $pkg =="
+    "$RUN" npm rebuild -g "$pkg" better-sqlite3
+
+    if ! cloudcli_binary_healthy; then
+      echo "CloudCLI native module check still failed after rebuild" >&2
+      return 1
+    fi
+  fi
+}
+
+case "$extra" in
+  cloudcli-setup)
+    ensure_cloudcli_setup
+    ;;
+esac
 #+END_SRC
 
 * Capture current global npm → manifest
@@ -47,7 +136,7 @@ exec "$@"
 set -euo pipefail
 
 MAN="$HOME/DotCortex/all/.npm/manifest/global.ssv"
-RUN="$HOME/.local/bin/dotcortex-node-env"
+RUN="$HOME/DotCortex/all/.local/bin/dotcortex-node-env"
 
 mkdir -p "$(dirname "$MAN")"
 touch "$MAN"
@@ -102,7 +191,7 @@ echo "Updated $MAN"
 set -euo pipefail
 
 MAN="$HOME/DotCortex/all/.npm/manifest/global.ssv"
-RUN="$HOME/.local/bin/dotcortex-node-env"
+RUN="$HOME/DotCortex/all/.local/bin/dotcortex-node-env"
 
 tmp_want="$(mktemp)"
 tmp_have="$(mktemp)"
@@ -142,7 +231,7 @@ rm -f "$tmp_want" "$tmp_have"
 set -euo pipefail
 
 MAN="$HOME/DotCortex/all/.npm/manifest/global.ssv"
-RUN="$HOME/.local/bin/dotcortex-node-env"
+RUN="$HOME/DotCortex/all/.local/bin/dotcortex-node-env"
 
 ENFORCE="${ENFORCE:-1}"   # 1 = enforce manifest membership, 0 = installs only
 UNINSTALL="${UNINSTALL:-1}"
@@ -200,41 +289,33 @@ do
 
   installed_ver="${live_ver[$pkg]:-}"
 
-  if [ -n "$installed_ver" ]; then
-    # Already installed
-    if [ "$UPDATE" != "1" ]; then
-      # Do not touch existing packages in default mode
-      continue
-    fi
-
-    if [ -z "$version" ]; then
-      # No explicit version in manifest, treat installed version as canonical
-      continue
-    fi
-
-    if [ "$version" = "$installed_ver" ]; then
-      # Already at requested version
-      continue
-    fi
+  needs_install=0
+  if [ -z "$installed_ver" ]; then
+    needs_install=1
+  elif [ "$UPDATE" = "1" ] && [ -n "$version" ] && [ "$version" != "$installed_ver" ]; then
+    needs_install=1
   fi
 
-  # If we get here, pkg is missing or we are explicitly upgrading.
-  spec="$pkg"
-  if [ -n "$version" ]; then
-    spec="$pkg@$version"
+  if [ "$needs_install" = "1" ]; then
+    spec="$pkg"
+    if [ -n "$version" ]; then
+      spec="$pkg@$version"
+    fi
+
+    args=(install -g "$spec")
+
+    # Allow FLAGS column to carry extra npm args, comma-separated.
+    if [ -n "$flags" ]; then
+      IFS=',' read -ra FF <<<"$flags"
+      for f in "${FF[@]}"; do
+        [ -n "$f" ] && args+=("$f")
+      done
+    fi
+
+    "$RUN" npm "${args[@]}"
   fi
 
-  args=(install -g "$spec")
-
-  # Allow FLAGS column to carry extra npm args, comma-separated.
-  if [ -n "$flags" ]; then
-    IFS=',' read -ra FF <<<"$flags"
-    for f in "${FF[@]}"; do
-      [ -n "$f" ] && args+=("$f")
-    done
-  fi
-
-  "$RUN" npm "${args[@]}"
+  DOTCORTEX_NODE_ENV="$RUN" bash "$HOME/DotCortex/all/.local/bin/npm-postapply" "$pkg" "$extra"
 done < <(_emit_norm)
 
 # Optional uninstall of extras
@@ -258,7 +339,7 @@ echo "Done."
 # ~/DotCortex/all/.local/bin/npm-health
 set -euo pipefail
 
-"$HOME/.local/bin/dotcortex-node-env" bash -lc '
+"$HOME/DotCortex/all/.local/bin/dotcortex-node-env" bash -c '
 echo "NODE      = $(command -v node || echo missing)"
 echo "NPM       = $(command -v npm || echo missing)"
 echo "node ver  = $(node --version 2>/dev/null || echo n/a)"
