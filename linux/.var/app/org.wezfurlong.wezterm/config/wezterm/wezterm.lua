@@ -160,9 +160,19 @@ local function _tab_title(tab)
   local pane = tab.active_pane
   local title = ''
   if pane then
-    local proc_info = pane:get_foreground_process_info()
-    if proc_info and proc_info.name then
+    local ok, proc_info = pcall(function()
+      return pane:get_foreground_process_info()
+    end)
+    if ok and proc_info and proc_info.name then
       title = _basename(proc_info.name)
+    end
+    if title == '' then
+      local ok_name, proc_name = pcall(function()
+        return pane:get_foreground_process_name()
+      end)
+      if ok_name and proc_name and #proc_name > 0 then
+        title = _basename(proc_name)
+      end
     end
     if title == '' then
       local pt = pane:get_title()
@@ -205,13 +215,14 @@ config.keys = {
 config.bold_brightens_ansi_colors = false
 config.term = 'wezterm'
 
--- left-stack mux (single, deferred)
+-- shell & env
 local mux = wezterm.mux
 
 local guix_zsh = os.getenv('HOME') .. '/.guix-extra-profiles/core/core/bin/zsh'
 config.set_environment_variables = { LD_PRELOAD = '' }
 config.default_prog = { guix_zsh, '-l' }
 
+-- left-stack mux (single, deferred)
 wezterm.on('gui-startup', function(cmd)
   if os.getenv('WEZ_LEFT_STACK') ~= '1' then
     mux.spawn_window(cmd or {})

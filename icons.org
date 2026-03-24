@@ -1,0 +1,239 @@
+#+TITLE: Icons and Themes Helpers
+#+DESCRIPTION: Keep icon and theme caches out of DotCortex
+#+AUTHOR: Metsatron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* Home sync helper
+Keep icon payloads in DotCortex, but make the live home theme directories real
+directories so generated icon caches stay in =$HOME= instead of leaking back
+into the repo through stow symlinks.
+
+#+BEGIN_SRC python :tangle all/.local/bin/icons-home-sync :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import argparse
+import shutil
+import subprocess
+from pathlib import Path
+
+
+SYNC_MAP = (
+    ("all/.icons", ".icons"),
+    ("linux/.icons", ".icons"),
+    ("all/.local/share/icons", ".local/share/icons"),
+    ("linux/.local/share/icons", ".local/share/icons"),
+)
+ICON_ROOTS = (".icons", ".local/share/icons")
+CACHE_NAMES = {"icon-theme.cache", ".icon-theme.cache"}
+SKIP_NAMES = CACHE_NAMES | {".git"}
+
+
+def remove_path(path: Path) -> None:
+    if path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path)
+    elif path.exists() or path.is_symlink():
+        path.unlink()
+
+
+def ensure_real_dir(path: Path, dry_run: bool) -> None:
+    if dry_run:
+        if path.is_symlink():
+            print(f"plan detach root {path}")
+        elif not path.exists():
+            print(f"plan mkdir {path}")
+        return
+    if path.is_symlink():
+        path.unlink()
+    elif path.exists() and not path.is_dir():
+        path.unlink()
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def sync_dir(srcs: list[Path], dst: Path, dry_run: bool) -> None:
+    if dry_run:
+        if dst.is_symlink():
+            print(f"plan detach theme {dst}")
+        elif dst.exists() and not dst.is_dir():
+            print(f"plan replace non-dir {dst}")
+        elif not dst.exists():
+            print(f"plan mkdir {dst}")
+    else:
+        if dst.is_symlink() or (dst.exists() and not dst.is_dir()):
+            remove_path(dst)
+        dst.mkdir(parents=True, exist_ok=True)
+
+    desired: dict[str, Path] = {}
+    for src in srcs:
+        for child in sorted(src.iterdir()):
+            if child.name in SKIP_NAMES:
+                continue
+            desired[child.name] = child
+
+    if dst.exists() and dst.is_dir() and not dst.is_symlink():
+        for existing in sorted(dst.iterdir()):
+            if existing.name in CACHE_NAMES:
+                continue
+            if existing.name not in desired:
+                if dry_run:
+                    print(f"plan remove stale {existing}")
+                else:
+                    remove_path(existing)
+
+    for name, child in sorted(desired.items()):
+        target = dst / name
+        child_resolved = child.resolve(strict=False)
+        if target.is_symlink() and target.resolve(strict=False) == child_resolved:
+            continue
+        if dry_run:
+            print(f"plan link {target} -> {child}")
+            continue
+        if target.exists() or target.is_symlink():
+            remove_path(target)
+        target.symlink_to(child)
+
+
+def remove_repo_caches(repo_root: Path, dry_run: bool) -> int:
+    removed = 0
+    seen: set[Path] = set()
+    for src_rel, _dst_rel in SYNC_MAP:
+        src_root = repo_root / src_rel
+        if not src_root.exists():
+            continue
+        for cache_name in CACHE_NAMES:
+            for cache_path in src_root.rglob(cache_name):
+                if cache_path in seen:
+                    continue
+                seen.add(cache_path)
+                if dry_run:
+                    print(f"plan remove repo cache {cache_path}")
+                else:
+                    remove_path(cache_path)
+                removed += 1
+    return removed
+
+
+def sync_entry(srcs: list[Path], dst_root: Path, dry_run: bool) -> bool:
+    src = srcs[-1]
+    dst = dst_root / src.name
+    if src.is_dir():
+        sync_dir(srcs, dst, dry_run)
+    else:
+        src_resolved = src.resolve(strict=False)
+        if dst.is_symlink() and dst.resolve(strict=False) == src_resolved:
+            return False
+        if dry_run:
+            print(f"plan link {dst} -> {src}")
+        else:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if dst.exists() or dst.is_symlink():
+                remove_path(dst)
+            dst.symlink_to(src)
+    return True
+
+
+def rebuild_caches(home_root: Path, dry_run: bool) -> int:
+    gtk_cache = shutil.which("gtk-update-icon-cache")
+    if not gtk_cache:
+        return 0
+    count = 0
+    for theme in sorted(home_root.iterdir()):
+        if not theme.is_dir() or theme.is_symlink():
+            continue
+        if not (theme / "index.theme").is_file():
+            continue
+        for stale in (theme / ".icon-theme.cache", theme / "icon-theme.cache"):
+            if stale.exists() or stale.is_symlink():
+                if dry_run:
+                    print(f"plan remove stale cache {stale}")
+                else:
+                    stale.unlink()
+        if dry_run:
+            print(f"plan cache {theme}")
+        else:
+            subprocess.run([gtk_cache, "-f", "-t", str(theme)], check=False)
+        count += 1
+    return count
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Keep icon payloads repo-backed while rebuilding icon caches in real home directories."
+    )
+    parser.add_argument(
+        "--repo-root",
+        default=str(Path.home() / "DotCortex"),
+        help="DotCortex repo root",
+    )
+    parser.add_argument("--dry-run", action="store_true", help="show planned actions only")
+    args = parser.parse_args()
+
+    repo_root = Path(args.repo_root).expanduser().resolve()
+    home = Path.home()
+    repo_caches_removed = remove_repo_caches(repo_root, args.dry_run)
+    synced = 0
+
+    sync_roots: dict[str, list[Path]] = {}
+    for src_rel, dst_rel in SYNC_MAP:
+        src_root = repo_root / src_rel
+        if not src_root.exists():
+            continue
+        sync_roots.setdefault(dst_rel, []).append(src_root)
+
+    for dst_rel, src_roots in sync_roots.items():
+        dst_root = home / dst_rel
+        ensure_real_dir(dst_root, args.dry_run)
+        entries: dict[str, list[Path]] = {}
+        for src_root in src_roots:
+            for src in sorted(src_root.iterdir()):
+                if src.name in SKIP_NAMES:
+                    continue
+                entries.setdefault(src.name, []).append(src)
+        for name in sorted(entries):
+            if sync_entry(entries[name], dst_root, args.dry_run):
+                synced += 1
+
+    cached = 0
+    for icon_rel in ICON_ROOTS:
+        icon_root = home / icon_rel
+        if icon_root.exists():
+            cached += rebuild_caches(icon_root, args.dry_run)
+
+    mode = "planned" if args.dry_run else "linked"
+    print(
+        f"icons-home-sync: {mode}_entries={synced} "
+        f"repo_caches_removed={repo_caches_removed} cache_roots={cached}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+* Stow ignores for cache-backed icon roots
+#+BEGIN_SRC conf :tangle all/.stow-local-ignore :comments no
+^/\.icons(/|$)
+^/\.local/share/icons(/|$)
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.stow-local-ignore :comments no
+^/\.icons(/|$)
+^/\.local/share/icons(/|$)
+#+END_SRC
+
+* Makefile fragment
+#+BEGIN_SRC makefile :tangle all/.mk/icons.mk :padline no
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+
+.PHONY: icons-sync
+
+icons-sync:
+| @HELPER="$(HOME)/.local/bin/icons-home-sync"; \
+| if [ ! -x "$$HELPER" ]; then HELPER="$(HOME)/DotCortex/all/.local/bin/icons-home-sync"; fi; \
+| chmod +x "$$HELPER" 2>/dev/null || true; \
+| "$$HELPER"
+#+END_SRC
