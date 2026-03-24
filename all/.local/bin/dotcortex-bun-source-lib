@@ -1,0 +1,369 @@
+#!/usr/bin/env bash
+# Shared helper library for Bun source builds
+
+# [[file:../../../bun.org::*Shared helper library for Bun source builds][Shared helper library for Bun source builds:1]]
+# ~/DotCortex/all/.local/bin/dotcortex-bun-source-lib
+set -euo pipefail
+
+DOTCORTEX_ROOT="${DOTCORTEX_ROOT:-$HOME/DotCortex}"
+BUN_SOURCE_MANIFEST="${BUN_SOURCE_MANIFEST:-$DOTCORTEX_ROOT/all/.local/share/dotcortex/manifests/bun/source.ssv}"
+BUN_SOURCE_STATE_ROOT="${BUN_SOURCE_STATE_ROOT:-${XDG_STATE_HOME:-$HOME/.local/state}/dotcortex/bun-source}"
+BUN_SOURCE_ONLY="${BUN_SOURCE_ONLY:-}"
+DOTCORTEX_BUN_ENV="${DOTCORTEX_BUN_ENV:-$HOME/.local/bin/dotcortex-bun-env}"
+
+sha256_file() {
+  local path="$1"
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$path" | awk '{print $1}'
+  else
+    shasum -a 256 "$path" | awk '{print $1}'
+  fi
+}
+
+sha256_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  else
+    shasum -a 256 | awk '{print $1}'
+  fi
+}
+
+bun_source_rows() {
+  python3 - "$BUN_SOURCE_MANIFEST" <<'PY'
+import os
+import shlex
+import sys
+
+manifest = os.path.expanduser(sys.argv[1])
+if not os.path.exists(manifest):
+    raise SystemExit(0)
+
+with open(manifest, encoding="utf-8") as fh:
+    for lineno, raw in enumerate(fh, 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        fields = shlex.split(line, posix=True)
+        if len(fields) != 9:
+            sys.stderr.write(f"{manifest}:{lineno}: expected 9 fields, got {len(fields)}\n")
+            raise SystemExit(1)
+        sys.stdout.write("\t".join(fields) + "\n")
+PY
+}
+
+bun_source_safe_name() {
+  printf '%s\n' "$1" | tr '/: ' '___'
+}
+
+bun_source_state_dir() {
+  printf '%s/%s\n' "$BUN_SOURCE_STATE_ROOT" "$(bun_source_safe_name "$1")"
+}
+
+bun_source_root_abs() {
+  local root="$1"
+
+  case "$root" in
+    /*)
+      printf '%s\n' "$root"
+      ;;
+    ~*)
+      printf '%s\n' "${root/#\~/$HOME}"
+      ;;
+    *)
+      printf '%s\n' "$DOTCORTEX_ROOT/$root"
+      ;;
+  esac
+}
+
+bun_source_workdir_abs() {
+  local root="$1" subdir="$2" root_abs
+
+  root_abs="$(bun_source_root_abs "$root")"
+  if [ -z "$subdir" ] || [ "$subdir" = "." ]; then
+    printf '%s\n' "$root_abs"
+  else
+    printf '%s\n' "$root_abs/$subdir"
+  fi
+}
+
+bun_source_bun_version_or_missing() {
+  local bun_home bin_path
+
+  if command -v bun >/dev/null 2>&1; then
+    bun --version
+    return 0
+  fi
+
+  bun_home="${BUN_INSTALL:-$HOME/.bun}"
+  bin_path="$bun_home/bin/bun"
+  if [ -x "$bin_path" ]; then
+    "$bin_path" --version
+  else
+    printf 'missing\n'
+  fi
+}
+
+bun_source_hash_existing_files() {
+  local path
+  declare -A seen=()
+
+  for path in "$@"; do
+    [ -n "$path" ] || continue
+    if [ -n "${seen[$path]:-}" ]; then
+      continue
+    fi
+    seen["$path"]=1
+    if [ -f "$path" ]; then
+      printf '%s=%s\n' "$path" "$(sha256_file "$path")"
+    fi
+  done
+}
+
+bun_source_effective_install_cmd() {
+  local root_abs="$1" workdir_abs="$2" install_cmd="$3"
+
+  case "$install_cmd" in
+    none)
+      printf '%s\n' ""
+      ;;
+    "")
+      if [ -f "$root_abs/bun.lock" ] || [ -f "$root_abs/bun.lockb" ] || [ -f "$workdir_abs/bun.lock" ] || [ -f "$workdir_abs/bun.lockb" ]; then
+        printf '%s\n' 'bun install --frozen-lockfile'
+      else
+        printf '%s\n' 'bun install'
+      fi
+      ;;
+    *)
+      printf '%s\n' "$install_cmd"
+      ;;
+  esac
+}
+
+bun_source_effective_build_cmd() {
+  local build_cmd="$1"
+
+  case "$build_cmd" in
+    ""|none)
+      printf '%s\n' ""
+      ;;
+    *)
+      printf '%s\n' "$build_cmd"
+      ;;
+  esac
+}
+
+bun_source_effective_health_cmd() {
+  local health_cmd="$1"
+
+  case "$health_cmd" in
+    ""|none)
+      printf '%s\n' ""
+      ;;
+    *)
+      printf '%s\n' "$health_cmd"
+      ;;
+  esac
+}
+
+bun_source_is_git_repo() {
+  local root_abs="$1"
+  git -C "$root_abs" rev-parse --is-inside-work-tree >/dev/null 2>&1
+}
+
+bun_source_source_fingerprint() {
+  local root_abs="$1" status head worktree_diff cached_diff submodules
+
+  if [ ! -d "$root_abs" ]; then
+    printf '%s\n' 'missing'
+    return 0
+  fi
+
+  if bun_source_is_git_repo "$root_abs"; then
+    head="$(git -C "$root_abs" rev-parse HEAD 2>/dev/null || printf 'unknown')"
+    status="$(git -C "$root_abs" status --porcelain=v1 --untracked-files=normal 2>/dev/null || true)"
+    submodules="$(git -C "$root_abs" submodule status --recursive 2>/dev/null || true)"
+    worktree_diff=""
+    cached_diff=""
+
+    if [ -n "$status" ]; then
+      worktree_diff="$(git -C "$root_abs" diff --no-ext-diff HEAD 2>/dev/null | sha256_stdin)"
+      cached_diff="$(git -C "$root_abs" diff --cached --no-ext-diff 2>/dev/null | sha256_stdin)"
+    fi
+
+    {
+      printf 'head=%s\n' "$head"
+      printf 'status=%s\n' "$status"
+      printf 'worktree_diff=%s\n' "$worktree_diff"
+      printf 'cached_diff=%s\n' "$cached_diff"
+      printf 'submodules=%s\n' "$submodules"
+    } | sha256_stdin
+    return 0
+  fi
+
+  {
+    printf 'root=%s\n' "$root_abs"
+    bun_source_hash_existing_files \
+      "$root_abs/package.json" \
+      "$root_abs/bun.lock" \
+      "$root_abs/bun.lockb" \
+      "$root_abs/bunfig.toml"
+  } | sha256_stdin
+}
+
+bun_source_install_fingerprint() {
+  local root_abs="$1" workdir_abs="$2" install_cmd="$3"
+
+  {
+    printf 'bun=%s\n' "$(bun_source_bun_version_or_missing)"
+    printf 'system=%s|%s\n' "$(uname -s)" "$(uname -m)"
+    printf 'install=%s\n' "$install_cmd"
+    bun_source_hash_existing_files \
+      "$root_abs/package.json" \
+      "$root_abs/bun.lock" \
+      "$root_abs/bun.lockb" \
+      "$root_abs/bunfig.toml" \
+      "$workdir_abs/package.json" \
+      "$workdir_abs/bun.lock" \
+      "$workdir_abs/bun.lockb" \
+      "$workdir_abs/bunfig.toml"
+  } | sha256_stdin
+}
+
+bun_source_build_fingerprint() {
+  local root_abs="$1" workdir_abs="$2" install_cmd="$3" build_cmd="$4"
+
+  {
+    printf 'build=%s\n' "$build_cmd"
+    printf 'source=%s\n' "$(bun_source_source_fingerprint "$root_abs")"
+    printf 'install=%s\n' "$(bun_source_install_fingerprint "$root_abs" "$workdir_abs" "$install_cmd")"
+  } | sha256_stdin
+}
+
+bun_source_fingerprint_matches() {
+  local stamp_path="$1" fingerprint="$2"
+
+  [ -f "$stamp_path" ] || return 1
+  [ "$(<"$stamp_path")" = "$fingerprint" ]
+}
+
+bun_source_write_fingerprint() {
+  local stamp_path="$1" fingerprint="$2"
+
+  mkdir -p "$(dirname "$stamp_path")"
+  printf '%s\n' "$fingerprint" >"$stamp_path"
+}
+
+bun_source_submodule_declared() {
+  local root="$1" gitmodules="$DOTCORTEX_ROOT/.gitmodules"
+
+  [ -f "$gitmodules" ] || return 1
+  git -C "$DOTCORTEX_ROOT" config -f "$gitmodules" --get-regexp '^submodule\..*\.path$' 2>/dev/null \
+    | awk '{print $2}' \
+    | grep -Fxq "$root"
+}
+
+bun_source_ensure_checkout() {
+  local update="$1" name="$2" mode="$3" root="$4" repo="$5" ref="$6"
+  local root_abs parent origin branch
+
+  root_abs="$(bun_source_root_abs "$root")"
+
+  case "$mode" in
+    submodule)
+      if [[ "$root" = /* || "$root" = ~* ]]; then
+        echo "!! [$name] submodule ROOT must be repo-relative: $root" >&2
+        return 1
+      fi
+      if ! bun_source_submodule_declared "$root"; then
+        echo "!! [$name] submodule path is not declared in $DOTCORTEX_ROOT/.gitmodules: $root" >&2
+        return 1
+      fi
+      echo ">> [$name] sync submodule: $root"
+      git -C "$DOTCORTEX_ROOT" submodule update --init --recursive -- "$root"
+      if [ "$update" = "1" ]; then
+        echo ">> [$name] update submodule from remote"
+        git -C "$DOTCORTEX_ROOT" submodule update --remote --recursive -- "$root"
+      fi
+      if [ -n "$repo" ]; then
+        origin="$(git -C "$root_abs" remote get-url origin 2>/dev/null || true)"
+        if [ -n "$origin" ] && [ "$origin" != "$repo" ]; then
+          echo "!! [$name] submodule origin mismatch: expected $repo, got $origin" >&2
+          return 1
+        fi
+      fi
+      ;;
+
+    git)
+      parent="$(dirname "$root_abs")"
+      mkdir -p "$parent"
+      if [ ! -d "$root_abs/.git" ]; then
+        if [ -z "$repo" ]; then
+          echo "!! [$name] MODE=git requires REPO" >&2
+          return 1
+        fi
+        echo ">> [$name] clone git source: $repo -> $root_abs"
+        git clone "$repo" "$root_abs"
+      fi
+
+      if ! bun_source_is_git_repo "$root_abs"; then
+        echo "!! [$name] expected a git checkout at $root_abs" >&2
+        return 1
+      fi
+
+      if [ -n "$repo" ]; then
+        origin="$(git -C "$root_abs" remote get-url origin 2>/dev/null || true)"
+        if [ -z "$origin" ]; then
+          git -C "$root_abs" remote add origin "$repo"
+        elif [ "$origin" != "$repo" ]; then
+          echo "!! [$name] git origin mismatch: expected $repo, got $origin" >&2
+          return 1
+        fi
+      fi
+
+      if [ "$update" = "1" ]; then
+        echo ">> [$name] fetch latest git refs"
+        git -C "$root_abs" fetch --all --tags --prune
+      fi
+
+      if [ -n "$ref" ]; then
+        git -C "$root_abs" checkout "$ref"
+        if [ "$update" = "1" ] && git -C "$root_abs" rev-parse --verify "origin/$ref" >/dev/null 2>&1; then
+          git -C "$root_abs" merge --ff-only "origin/$ref"
+        fi
+      elif [ "$update" = "1" ]; then
+        branch="$(git -C "$root_abs" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+        if [ -n "$branch" ]; then
+          git -C "$root_abs" pull --ff-only origin "$branch"
+        fi
+      fi
+      ;;
+
+    local)
+      if [ ! -d "$root_abs" ]; then
+        echo "!! [$name] local source tree missing: $root_abs" >&2
+        return 1
+      fi
+      ;;
+
+    *)
+      echo "!! [$name] unsupported MODE: $mode" >&2
+      return 1
+      ;;
+  esac
+}
+
+bun_source_run_step() {
+  local name="$1" phase="$2" workdir_abs="$3" cmd="$4"
+
+  [ -n "$cmd" ] || return 0
+
+  if [ ! -d "$workdir_abs" ]; then
+    echo "!! [$name] workdir missing for $phase: $workdir_abs" >&2
+    return 1
+  fi
+
+  echo ">> [$name] $phase: $cmd"
+  "$DOTCORTEX_BUN_ENV" bash -lc 'cd "$1" && eval "$2"' bash "$workdir_abs" "$cmd"
+}
+# Shared helper library for Bun source builds:1 ends here
