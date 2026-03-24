@@ -1,0 +1,276 @@
+#+TITLE: Git Releases Loom: Declarative, Literate & Reproducible
+#+DESCRIPTION: Git release automation
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:text :comments no
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+
+
+** gitrelease - GitHub release artifacts with cache-aware updates
+#+BEGIN_SRC bash :tangle all/.local/bin/gitrelease :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :mkdirp yes
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+# Prefer stowed config, but fall back to the repo copy so the tool works right
+# after tangling even before a restow.
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gitrelease.d"
+REPO_CONF_DIR="$HOME/DotCortex/all/.config/gitrelease.d"
+DL_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/gitrelease"
+APPIMG_DIR="$HOME/Applications"
+
+mkdir -p "$DL_DIR" "$APPIMG_DIR"
+
+require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 2; }; }
+
+# --- helpers ---------------------------------------------------------------
+
+# curl JSON of latest release; unauthenticated works, GH_TOKEN optional to lift rate limits
+gh_latest_json() {
+  local repo="$1"
+  local url="https://api.github.com/repos/$repo/releases/latest"
+  if [[ -n "${GH_TOKEN:-}" ]]; then
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
+json_asset_url() {
+  # $1=json $2=regex -> first matching asset url
+  jq -r --arg re "$2" '.assets[].browser_download_url | select(test($re))' <<<"$1" | head -n1
+}
+
+json_asset_name() {
+  jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re)) | .name' <<<"$1" | head -n1
+}
+
+json_asset_digest() {
+  jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re)) | (.digest // "")' <<<"$1" | head -n1
+}
+
+normalize_ver() { sed -E 's/^v//' <<<"$1"; }
+
+cache_dir() {
+  local app="$1"
+  printf '%s/%s\n' "$DL_DIR" "$app"
+}
+
+write_cache_meta() {
+  local dir="$1" json="$2" url="$3" name="$4" tag="$5" digest="$6"
+  mkdir -p "$dir"
+  printf '%s\n' "$json" > "$dir/latest.json"
+  printf '%s\n' "$url" > "$dir/asset.url"
+  printf '%s\n' "$name" > "$dir/asset.name"
+  printf '%s\n' "$tag" > "$dir/tag"
+  printf '%s\n' "$digest" > "$dir/asset.digest"
+}
+
+cache_asset() {
+  local app="$1" json="$2" url="$3" name="$4" tag="$5" digest="$6"
+  local dir asset cached_name cached_tag cached_digest tmp
+
+  dir="$(cache_dir "$app")"
+  mkdir -p "$dir"
+  asset="$dir/$name"
+
+  cached_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
+  cached_tag="$( [ -f "$dir/tag" ] && cat "$dir/tag" || true )"
+  cached_digest="$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )"
+
+  if [ -n "$cached_name" ] && [ "$cached_name" != "$name" ] && [ -f "$dir/$cached_name" ]; then
+    rm -f "$dir/$cached_name"
+  fi
+
+  if [ -s "$asset" ]; then
+    if [ -n "$digest" ] && [ "$cached_digest" = "$digest" ]; then
+      write_cache_meta "$dir" "$json" "$url" "$name" "$tag" "$digest"
+      echo "$asset"
+      return 0
+    fi
+    if [ -z "$digest" ] && [ "$cached_tag" = "$tag" ]; then
+      write_cache_meta "$dir" "$json" "$url" "$name" "$tag" "$digest"
+      echo "$asset"
+      return 0
+    fi
+  fi
+
+  tmp="$asset.part"
+  curl -fL "$url" -o "$tmp"
+  mv -f "$tmp" "$asset"
+  write_cache_meta "$dir" "$json" "$url" "$name" "$tag" "$digest"
+  echo "$asset"
+}
+
+find_conf() {
+  local app="$1"
+  if [ -r "$CONF_DIR/$app.conf" ]; then
+    printf '%s\n' "$CONF_DIR/$app.conf"
+    return 0
+  fi
+  if [ -r "$REPO_CONF_DIR/$app.conf" ]; then
+    printf '%s\n' "$REPO_CONF_DIR/$app.conf"
+    return 0
+  fi
+  return 1
+}
+
+deb_installed_ver() {
+  # $1=package name, returns version or empty
+  dpkg-query -W -f='${Version}\n' "$1" 2>/dev/null || true
+}
+
+appimage_current_ver() {
+  # crude: parse "name-x.y.z-x86_64.AppImage" in ~/Applications
+  local name="$1"
+  ls "$APPIMG_DIR"/"$name"-*.AppImage 2>/dev/null | sed -nE "s#^.*${name}-([^-]+).*.AppImage#\1#p" | sort -V | tail -n1
+}
+
+flatpak_installed_ver() {
+  # $1=app id
+  flatpak info "$1" 2>/dev/null | awk -F': *' '/^Version:/ {print $2}'
+}
+
+# --- verbs -----------------------------------------------------------------
+usage() {
+  cat <<EOF
+Usage:
+  gitrelease list
+  gitrelease cache <app>
+  gitrelease update <app>
+  gitrelease update-all
+Apps are defined as conf files in: $CONF_DIR
+Fallback repo configs are read from: $REPO_CONF_DIR
+EOF
+}
+
+list_apps() {
+  local dir file
+  for dir in "$CONF_DIR" "$REPO_CONF_DIR"; do
+    [ -d "$dir" ] || continue
+    for file in "$dir"/*.conf; do
+      [ -e "$file" ] || continue
+      basename "$file" .conf
+    done
+  done | sort -u
+}
+
+show_cache() {
+  local app="$1" dir
+  dir="$(cache_dir "$app")"
+  if [ ! -d "$dir" ]; then
+    echo "No cache for $app ($dir)"
+    return 1
+  fi
+
+  echo "cache dir: $dir"
+  [ -f "$dir/tag" ] && printf 'tag: %s\n' "$(cat "$dir/tag")"
+  [ -f "$dir/asset.name" ] && printf 'asset: %s\n' "$(cat "$dir/asset.name")"
+  [ -f "$dir/asset.digest" ] && printf 'digest: %s\n' "$(cat "$dir/asset.digest")"
+  [ -f "$dir/asset.url" ] && printf 'url: %s\n' "$(cat "$dir/asset.url")"
+}
+
+update_one() {
+  local app="$1" conf json latest_tag latest_ver asset_url asset_name asset_digest cached_asset have
+  conf="$(find_conf "$app")" || { echo "No config for $app ($CONF_DIR/$app.conf or $REPO_CONF_DIR/$app.conf)"; return 1; }
+  # shellcheck disable=SC1090
+  source "$conf"
+
+  # required vars from conf: NAME, REPO, TYPE, ASSET_RE, (DEB_PKG|APPIMG_NAME)
+  : "${NAME:?}"; : "${REPO:?}"; : "${TYPE:?}"; : "${ASSET_RE:?}"
+
+  require jq curl
+
+  json="$(gh_latest_json "$REPO")"
+  latest_tag="$(jq -r '.tag_name' <<<"$json")"
+  latest_ver="$(normalize_ver "$latest_tag")"
+  asset_url="$(json_asset_url "$json" "$ASSET_RE")"
+  asset_name="$(json_asset_name "$json" "$ASSET_RE")"
+  asset_digest="$(json_asset_digest "$json" "$ASSET_RE")"
+
+  [[ -n "$asset_url" ]] || { echo "No asset matched for $NAME ($ASSET_RE)"; return 1; }
+  [[ -n "$asset_name" ]] || { echo "Matched asset URL but no asset name for $NAME"; return 1; }
+
+  cached_asset="$(cache_asset "$app" "$json" "$asset_url" "$asset_name" "$latest_tag" "$asset_digest")"
+
+  case "$TYPE" in
+    deb)
+      : "${DEB_PKG:?}"
+      have="$(deb_installed_ver "$DEB_PKG")"
+      if [[ -n "$have" && "$(dpkg --compare-versions "$have" ge "$latest_ver"; echo $?)" -eq 0 ]]; then
+        echo "[deb] $NAME is up-to-date ($have >= $latest_ver) [cache: $cached_asset]"; return 0
+      fi
+      sudo dpkg -i "$cached_asset"
+      echo "[deb] Installed $NAME $latest_ver from $cached_asset"
+      ;;
+    appimage)
+      : "${APPIMG_NAME:?}"
+      have="$(appimage_current_ver "$APPIMG_NAME")"
+      if [[ -n "$have" && "$(printf '%s\n%s\n' "$have" "$latest_ver" | sort -V | tail -n1)" == "$have" ]]; then
+        echo "[appimage] $NAME is up-to-date ($have >= $latest_ver) [cache: $cached_asset]"; return 0
+      fi
+      chmod +x "$cached_asset"
+      dest="$APPIMG_DIR/$APPIMG_NAME-$latest_ver.AppImage"
+      cp -f "$cached_asset" "$dest"
+      ln -sf "$dest" "$APPIMG_DIR/$APPIMG_NAME-latest.AppImage"
+      echo "[appimage] Installed $NAME $latest_ver → $dest [cache: $cached_asset]"
+      ;;
+    *)
+      echo "Unknown TYPE: $TYPE"; return 1;;
+  esac
+}
+
+case "${1:-}" in
+  list) list_apps ;;
+  cache) shift; show_cache "${1:?app}" ;;
+  update) shift; update_one "${1:?app}";;
+  update-all)
+    ok=0; for a in $(list_apps); do update_one "$a" || ok=1; done; exit $ok;;
+  *) usage; exit 1;;
+esac
+#+END_SRC
+
+
+** .deb
+#+BEGIN_EXAMPLE
+NAME="Pandoc"
+REPO="jgm/pandoc"
+TYPE="deb"
+DEB_PKG="pandoc"
+# pick correct arch; common Ubuntu arches are amd64/arm64
+ARCH="$(dpkg --print-architecture)"
+ASSET_RE="^pandoc-.*-linux-${ARCH}\.deb$"
+#+END_EXAMPLE
+
+** .AppImage
+#+BEGIN_EXAMPLE
+NAME="ExampleApp"
+REPO="owner/repo"
+TYPE="appimage"
+APPIMG_NAME="ExampleApp"
+ASSET_RE="ExampleApp-.*-x86_64\.AppImage$"
+#+END_EXAMPLE
+
+** Make targets
+#+BEGIN_SRC makefile :tangle all/.mk/gitrelease.mk :padline no :comments none
+# GitHub release artifact targets. Flatpak bundles are owned by flatpak.org.
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+
+.PHONY: gitrelease-apply gitrelease-cache
+
+gitrelease-apply:
+| @chmod +x $(HOME)/.local/bin/gitrelease 2>/dev/null || true
+| $(HOME)/.local/bin/gitrelease update-all
+
+gitrelease-cache:
+| @chmod +x $(HOME)/.local/bin/gitrelease 2>/dev/null || true
+| $(HOME)/.local/bin/gitrelease list | while read -r app; do [ -n "$$app" ] && $(HOME)/.local/bin/gitrelease cache "$$app" || true; done
+#+END_SRC
+
+** Use it:
+gitrelease list
+gitrelease update pandoc
+gitrelease update-all
