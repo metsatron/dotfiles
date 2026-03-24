@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: nala-repos nala-capture nala-diff nala-release-diff nala-release-sync nala-sync nala-apply nala-health
+.PHONY: nala-repos nala-capture nala-diff nala-sync nala-apply nala-health
 
 nala-repos:
 | @chmod +x $(HOME)/.local/bin/nala-repos-setup 2>/dev/null || true
@@ -15,14 +15,6 @@ nala-capture:
 nala-diff:
 | @chmod +x $(HOME)/.local/bin/nala-diff 2>/dev/null || true
 | $(HOME)/.local/bin/nala-diff
-
-nala-release-diff:
-| @chmod +x $(HOME)/.local/bin/nala-release-diff 2>/dev/null || true
-| $(HOME)/.local/bin/nala-release-diff
-
-nala-release-sync:
-| @chmod +x $(HOME)/.local/bin/nala-release-sync 2>/dev/null || true
-| $(HOME)/.local/bin/nala-release-sync
 
 nala-sync: nala-repos
 | @chmod +x $(HOME)/.local/bin/nala-apply 2>/dev/null || true
