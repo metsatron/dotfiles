@@ -11,19 +11,36 @@ set -Eeuo pipefail
 # ===== CONFIG =====
 DEST_BASE="/mnt/ironwolf02/backup-xubuntu"
 DEST="${DEST_BASE}/backup-xubuntu"               # final mirror dir
-GUARD_FILE="${DEST}/.backup_guard"
+GUARD_FILE=""
+OWNER_FILE=""
 LOG="/tmp/backup_system_$(date +%Y%m%d_%H%M%S).log"
 
-# Resolve correct user home even under sudo (so filters come from your account)
-USER_HOME="${SUDO_USER:+$(getent passwd "$SUDO_USER" | cut -d: -f6)}"
+# Resolve the real backup owner even when the script is launched via sudo.
+BACKUP_USER="${SUDO_USER:-$(id -un)}"
+BACKUP_GROUP="${SUDO_GID:+$(getent group "$SUDO_GID" | cut -d: -f1)}"
+BACKUP_GROUP="${BACKUP_GROUP:-$(id -gn "$BACKUP_USER")}"
+USER_HOME="$(getent passwd "$BACKUP_USER" | cut -d: -f6)"
 USER_HOME="${USER_HOME:-$HOME}"
+
+refresh_dest_paths() {
+  local base="${DEST%/}"
+  GUARD_FILE="${base}/.backup_guard"
+  OWNER_FILE="${base}/.backup_owner"
+}
+refresh_dest_paths
 
 # Filters: use env FILTERS_FILE if provided, else your user default
 FILTERS_FILE="${FILTERS_FILE:-$USER_HOME/.config/backup/system-filters.rsync}"
 
+# Keep backup trees owned by the real user even when rsync runs as root.
+RSYNC_OWNERSHIP=()
+if [ -n "${SUDO_USER:-}" ]; then
+  RSYNC_OWNERSHIP=( "--chown=${BACKUP_USER}:${BACKUP_GROUP}" )
+fi
+
 # Default rsync arg arrays (real vs dry)
-RSYNC_RUN=( -aAX --delete --numeric-ids --info=stats2,progress2 --no-owner --no-group --filter="merge $FILTERS_FILE" )
-RSYNC_DRY=( -aAXn --delete --itemize-changes --numeric-ids --no-owner --no-group --filter="merge $FILTERS_FILE" )
+RSYNC_RUN=( -aAX --delete --numeric-ids --info=stats2,progress2 --no-owner --no-group "${RSYNC_OWNERSHIP[@]}" --filter="merge $FILTERS_FILE" )
+RSYNC_DRY=( -aAXn --delete --itemize-changes --numeric-ids --no-owner --no-group "${RSYNC_OWNERSHIP[@]}" --filter="merge $FILTERS_FILE" )
 
 # ===== ARGS =====
 MODE="" AUTO=0
@@ -48,12 +65,34 @@ EOF
     *) echo "Unknown option: $1" >&2; exit 1;;
   esac; shift
 done
+refresh_dest_paths
 
 # ===== Utils =====
 die(){ echo "ERROR: $*" >&2; exit 1; }
 hr(){ command -v numfmt >/dev/null 2>&1 && numfmt --to=iec --suffix=B "$1" || echo "$1 B"; }
 avail_bytes(){ df -P -B1 "$1" | awk 'NR==2{print $4}'; }
 canon(){ readlink -f -- "$1" 2>/dev/null || printf '%s' "$1"; }
+dest_writable() {
+  local path="$1"
+  if [ -n "${SUDO_USER:-}" ]; then
+    sudo -u "$BACKUP_USER" test -w "$path"
+  else
+    [ -w "$path" ]
+  fi
+}
+repair_dest_ownership() {
+  local path="$1" want="${BACKUP_USER}:${BACKUP_GROUP}"
+  [ -n "${SUDO_USER:-}" ] || return 0
+  if [ -f "$OWNER_FILE" ] && [ "$(cat "$OWNER_FILE" 2>/dev/null || true)" = "$want" ]; then
+    chown "$want" "$path" "$GUARD_FILE" "$OWNER_FILE" 2>/dev/null || true
+    return 0
+  fi
+  echo "[*] Repairing destination ownership to $want"
+  chown -R "$want" "$path"
+  printf '%s\n' "$want" > "$OWNER_FILE"
+  chown "$want" "$OWNER_FILE"
+  chmod 644 "$OWNER_FILE"
+}
 
 ensure_filters() {
   [ -f "$FILTERS_FILE" ] || die "Missing filters file: $FILTERS_FILE"
@@ -70,6 +109,8 @@ dest_sanity() {
   [[ "$cdest" != "/" && "$cdest" != "/mnt/ironwolf02" && "$cdest" != "/mnt/ironwolf02/" ]] || die "Refusing dangerous DEST: $cdest"
 
   mkdir -p "$cdest"
+  DEST="$(canon "$cdest")"
+  refresh_dest_paths
 
   # Guard/sentinel: ensure this target *is* a system mirror target
   if [ ! -f "$GUARD_FILE" ]; then
@@ -86,8 +127,10 @@ dest_sanity() {
       || die "Guard file exists but does not look like a system mirror target: $GUARD_FILE"
   fi
 
+  repair_dest_ownership "$DEST"
+
   # Ensure writable as your user (so non-root runs don't silently fail)
-  [ -w "$cdest" ] || die "Destination not writable by $(id -un). Try: sudo chown -R $(id -un):$(id -gn) '$cdest'"
+  dest_writable "$DEST" || die "Destination not writable by $BACKUP_USER. Try: sudo chown -R $BACKUP_USER:$BACKUP_GROUP '$DEST'"
 }
 
 stats() {
