@@ -26,11 +26,13 @@ Use `dotcortex-loom` for normal operating tasks and `dotcortex-package-manifests
 
 ## Critical Safety Rules
 
-1. Follow `INSTALL.sh` as the bootstrap entry point unless there is a clear reason to do a manual repair.
-2. Never edit tangled overlay output to fix bootstrap issues; fix the root `.org` source or bootstrap process.
-3. Never edit `Makefile` directly; it is tangled from `loom.org`.
-4. Use `make safe-stow` for the first stow.
-5. Do not assume Loom works before `maak.scm` is in place and Guix's `guile` is available.
+1. Never touch any `.claude` path or `CLAUDE.md` unless the user explicitly names that exact path for direct modification.
+2. Follow `INSTALL.sh` as the bootstrap entry point unless there is a clear reason to do a manual repair.
+3. Never edit tangled overlay output to fix bootstrap issues; fix the root `.org` source or bootstrap process.
+4. Never edit `Makefile` directly; it is tangled from `loom.org`.
+5. Use `make safe-stow` for the first stow.
+6. Do not assume Loom works before `maak.scm` is in place and Guix's `guile` is available.
+7. Verify bootstrap claims with fresh command output from the current session.
 
 ## Bootstrap Entry Point
 
@@ -189,3 +191,4 @@ When finishing a bootstrap task:
 - call out whether `.mk` stubs were needed
 - mention any Guix, init-system, or PATH constraints
 - mention whether the machine is targeting `x230`, `t480s`, or shared `devuan`
+- do not say the machine is healthy without the relevant fresh verification evidence

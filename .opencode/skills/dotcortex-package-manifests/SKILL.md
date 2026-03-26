@@ -26,12 +26,14 @@ Use `dotcortex-loom` instead when the task is broader than manifest management.
 
 ## Critical Safety Rules
 
-1. Never edit tangled output in overlay directories directly.
-2. Edit the owning root `.org` file.
-3. Never edit `Makefile` directly; edit `loom.org` if the task truly requires control-plane changes.
-4. Preserve existing manifest structure and formatting conventions.
-5. Prefer Loom verbs when available; otherwise use the matching `make` targets or existing helper scripts.
-6. Check Guix profile bins before assuming package tools are unavailable.
+1. Never touch any `.claude` path or `CLAUDE.md` unless the user explicitly names that exact path for direct modification.
+2. Never edit tangled output in overlay directories directly.
+3. Edit the owning root `.org` file.
+4. Never edit `Makefile` directly; edit `loom.org` if the task truly requires control-plane changes.
+5. Preserve existing manifest structure and formatting conventions.
+6. Prefer Loom verbs when available; otherwise use the matching `make` targets or existing helper scripts.
+7. Check Guix profile bins before assuming package tools are unavailable.
+8. Verify manifest changes with fresh tangle, diff, health, or apply evidence before claiming success.
 
 ## Repo Root
 
@@ -182,3 +184,4 @@ When completing a manifest task:
 - mention whether `make tangle` was run
 - mention whether apply, diff, or health commands were run
 - call out any Guix, bootstrap, or machine-specific constraints
+- keep the change surgical and avoid unrelated manifest churn
