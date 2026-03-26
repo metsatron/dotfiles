@@ -190,12 +190,15 @@
    (task 'flatpak:bridge "Apply Flatpak desktop + per-app bridges"
          (lambda () (sh "make flatpak-bridge")))
 
-   (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
-         (lambda () (sh "make x11-apply")))
+    (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
+          (lambda () (sh "make x11-apply")))
 
-    (task 'flatpak:remotes
-          "Ensure remotes (user+system) with clean env"
-          (lambda () (mk "flatpak-remotes")))
+    (task 'icons:sync "Copy icon/theme trees into home and rebuild caches"
+          (lambda () (sh "make icons-sync")))
+
+     (task 'flatpak:remotes
+           "Ensure remotes (user+system) with clean env"
+           (lambda () (mk "flatpak-remotes")))
 
     (task 'flatpak:release-diff
           "Check release-backed Flatpak bundles managed via GitHub"
@@ -335,12 +338,31 @@
           "Enforce exact Bun global state, allow removals"
           (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/bun-apply")))
 
-    (task 'bun:health "Show DotCortex Bun env and versions"
-          (lambda () (sh "~/.local/bin/bun-health")))
+     (task 'bun:health "Show DotCortex Bun env and versions"
+           (lambda () (sh "~/.local/bin/bun-health")))
 
-    ;; --- Bunx ---
-    (task 'bunx:capture "Capture managed bunx launchers to DotCortex SSV"
-          (lambda () (sh "~/.local/bin/bunx-capture")))
+     (task 'bun-source:diff
+           "Plan: Bun source manifests vs local checkout/build state"
+           (lambda () (sh "~/.local/bin/bun-source-diff")))
+
+     (task 'bun-source:sync
+           "Ensure Bun source checkouts exist, no installs or builds"
+           (lambda () (sh "~/.local/bin/bun-source-sync")))
+
+     (task 'bun-source:apply
+           "Sync Bun source checkouts and rebuild only when fingerprints change"
+           (lambda () (sh "~/.local/bin/bun-source-apply")))
+
+     (task 'bun-source:update
+           "Intentionally advance Bun source checkouts to newer upstream state"
+           (lambda () (sh "~/.local/bin/bun-source-update")))
+
+     (task 'bun-source:health "Show Bun source checkout/build health"
+           (lambda () (sh "~/.local/bin/bun-source-health")))
+
+     ;; --- Bunx ---
+     (task 'bunx:capture "Capture managed bunx launchers to DotCortex SSV"
+           (lambda () (sh "~/.local/bin/bunx-capture")))
 
     (task 'bunx:diff "Plan: manifest vs managed bunx launchers"
           (lambda () (sh "~/.local/bin/bunx-diff")))
