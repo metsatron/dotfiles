@@ -7,15 +7,23 @@ import subprocess
 from pathlib import Path
 
 
-SYNC_MAP = (
+ICON_SYNC_MAP = (
     ("all/.icons", ".icons"),
     ("linux/.icons", ".icons"),
     ("all/.local/share/icons", ".local/share/icons"),
     ("linux/.local/share/icons", ".local/share/icons"),
 )
-ICON_ROOTS = (".icons", ".local/share/icons")
+
+THEME_SYNC_MAP = (
+    ("all/.themes", ".themes"),
+    ("linux/.themes", ".themes"),
+    ("all/.local/share/themes", ".local/share/themes"),
+    ("linux/.local/share/themes", ".local/share/themes"),
+)
+
 CACHE_NAMES = {"icon-theme.cache", ".icon-theme.cache"}
-SKIP_NAMES = CACHE_NAMES | {".git"}
+ROOT_SKIP_NAMES = {".git"}
+ICON_SKIP_NAMES = CACHE_NAMES | ROOT_SKIP_NAMES
 
 
 def remove_path(path: Path) -> None:
@@ -39,7 +47,7 @@ def ensure_real_dir(path: Path, dry_run: bool) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def sync_dir(srcs: list[Path], dst: Path, dry_run: bool) -> None:
+def sync_icon_dir(srcs: list[Path], dst: Path, dry_run: bool) -> None:
     if dry_run:
         if dst.is_symlink():
             print(f"plan detach theme {dst}")
@@ -55,7 +63,7 @@ def sync_dir(srcs: list[Path], dst: Path, dry_run: bool) -> None:
     desired: dict[str, Path] = {}
     for src in srcs:
         for child in sorted(src.iterdir()):
-            if child.name in SKIP_NAMES:
+            if child.name in ICON_SKIP_NAMES:
                 continue
             desired[child.name] = child
 
@@ -85,7 +93,7 @@ def sync_dir(srcs: list[Path], dst: Path, dry_run: bool) -> None:
 def remove_repo_caches(repo_root: Path, dry_run: bool) -> int:
     removed = 0
     seen: set[Path] = set()
-    for src_rel, _dst_rel in SYNC_MAP:
+    for src_rel, _dst_rel in ICON_SYNC_MAP:
         src_root = repo_root / src_rel
         if not src_root.exists():
             continue
@@ -102,11 +110,11 @@ def remove_repo_caches(repo_root: Path, dry_run: bool) -> int:
     return removed
 
 
-def sync_entry(srcs: list[Path], dst_root: Path, dry_run: bool) -> bool:
+def sync_icon_entry(srcs: list[Path], dst_root: Path, dry_run: bool) -> bool:
     src = srcs[-1]
     dst = dst_root / src.name
     if src.is_dir():
-        sync_dir(srcs, dst, dry_run)
+        sync_icon_dir(srcs, dst, dry_run)
     else:
         src_resolved = src.resolve(strict=False)
         if dst.is_symlink() and dst.resolve(strict=False) == src_resolved:
@@ -121,13 +129,60 @@ def sync_entry(srcs: list[Path], dst_root: Path, dry_run: bool) -> bool:
     return True
 
 
-def rebuild_caches(home_root: Path, dry_run: bool) -> int:
+def is_under_any(path: Path, roots: list[Path]) -> bool:
+    resolved = path.resolve(strict=False)
+    for root in roots:
+        root_resolved = root.resolve(strict=False)
+        try:
+            resolved.relative_to(root_resolved)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def sync_theme_entries(src_roots: list[Path], dst_root: Path, dry_run: bool) -> int:
+    desired: dict[str, Path] = {}
+    for src_root in src_roots:
+        for src in sorted(src_root.iterdir()):
+            if src.name in ROOT_SKIP_NAMES:
+                continue
+            desired[src.name] = src
+
+    synced = 0
+    if dst_root.exists() and dst_root.is_dir() and not dst_root.is_symlink():
+        for existing in sorted(dst_root.iterdir()):
+            if existing.name in desired:
+                continue
+            if existing.is_symlink() and is_under_any(existing, src_roots):
+                if dry_run:
+                    print(f"plan remove stale {existing}")
+                else:
+                    existing.unlink()
+
+    for name, src in sorted(desired.items()):
+        dst = dst_root / name
+        src_resolved = src.resolve(strict=False)
+        if dst.is_symlink() and dst.resolve(strict=False) == src_resolved:
+            continue
+        if dry_run:
+            action = "relink" if dst.exists() or dst.is_symlink() else "link"
+            print(f"plan {action} {dst} -> {src}")
+        else:
+            if dst.exists() or dst.is_symlink():
+                remove_path(dst)
+            dst.symlink_to(src)
+        synced += 1
+    return synced
+
+
+def rebuild_caches(themes: set[Path], dry_run: bool) -> int:
     gtk_cache = shutil.which("gtk-update-icon-cache")
     if not gtk_cache:
         return 0
     count = 0
-    for theme in sorted(home_root.iterdir()):
-        if not theme.is_dir() or theme.is_symlink():
+    for theme in sorted(themes):
+        if not theme.exists() or not theme.is_dir() or theme.is_symlink():
             continue
         if not (theme / "index.theme").is_file():
             continue
@@ -140,14 +195,19 @@ def rebuild_caches(home_root: Path, dry_run: bool) -> int:
         if dry_run:
             print(f"plan cache {theme}")
         else:
-            subprocess.run([gtk_cache, "-f", "-t", str(theme)], check=False)
+            subprocess.run(
+                [gtk_cache, "-f", "-t", str(theme)],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
         count += 1
     return count
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Keep icon payloads repo-backed while rebuilding icon caches in real home directories."
+        description="Keep repo-backed icons and themes while rebuilding only local icon caches in home roots."
     )
     parser.add_argument(
         "--repo-root",
@@ -161,9 +221,10 @@ def main() -> int:
     home = Path.home()
     repo_caches_removed = remove_repo_caches(repo_root, args.dry_run)
     synced = 0
+    icon_themes_to_rebuild: set[Path] = set()
 
     sync_roots: dict[str, list[Path]] = {}
-    for src_rel, dst_rel in SYNC_MAP:
+    for src_rel, dst_rel in ICON_SYNC_MAP:
         src_root = repo_root / src_rel
         if not src_root.exists():
             continue
@@ -175,18 +236,29 @@ def main() -> int:
         entries: dict[str, list[Path]] = {}
         for src_root in src_roots:
             for src in sorted(src_root.iterdir()):
-                if src.name in SKIP_NAMES:
+                if src.name in ICON_SKIP_NAMES:
                     continue
                 entries.setdefault(src.name, []).append(src)
         for name in sorted(entries):
-            if sync_entry(entries[name], dst_root, args.dry_run):
+            if sync_icon_entry(entries[name], dst_root, args.dry_run):
                 synced += 1
+                dst = dst_root / name
+                if dst.exists() and dst.is_dir() and not dst.is_symlink():
+                    icon_themes_to_rebuild.add(dst)
 
-    cached = 0
-    for icon_rel in ICON_ROOTS:
-        icon_root = home / icon_rel
-        if icon_root.exists():
-            cached += rebuild_caches(icon_root, args.dry_run)
+    theme_roots: dict[str, list[Path]] = {}
+    for src_rel, dst_rel in THEME_SYNC_MAP:
+        src_root = repo_root / src_rel
+        if not src_root.exists():
+            continue
+        theme_roots.setdefault(dst_rel, []).append(src_root)
+
+    for dst_rel, src_roots in theme_roots.items():
+        dst_root = home / dst_rel
+        ensure_real_dir(dst_root, args.dry_run)
+        synced += sync_theme_entries(src_roots, dst_root, args.dry_run)
+
+    cached = rebuild_caches(icon_themes_to_rebuild, args.dry_run)
 
     mode = "planned" if args.dry_run else "linked"
     print(
