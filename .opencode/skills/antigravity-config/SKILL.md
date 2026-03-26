@@ -47,7 +47,7 @@ Use this skill when the user wants to configure Antigravity on this machine.
 2. Update the owning source blocks there
 3. Run `tangle-one nala.org` or `make tangle`
 4. Apply package/repo changes with `loom nala:apply` or the `nala-*` helpers if needed
-5. Apply config changes with `make safe-stow`, `make preview-stow`, or `stow linux` as appropriate
+5. Apply config changes with `make preview-stow`, `make safe-stow`, or the relevant Loom stow verb as appropriate
 6. Re-read the generated files if needed to confirm exact output
 7. Tell the user whether Antigravity likely needs reload or full restart
 8. If you hotfix the live Antigravity files first, port the same change back into `nala.org` before finishing
@@ -57,6 +57,7 @@ Use this skill when the user wants to configure Antigravity on this machine.
 - Do not treat Antigravity as a Flatpak target unless the user explicitly reopens that migration
 - Do not confuse Google Antigravity with the separate Antigravity Agent account-management tool
 - Keep unrelated package-manager churn out of Antigravity-only work
+- Do not claim the live config is correct without fresh verification evidence
 
 ## Shift+Enter Pattern
 
