@@ -46,7 +46,7 @@ Antigravity belongs to DotCortex's `nala.org` layer on this machine.
 1. Edit `nala.org`
 2. Run `tangle-one nala.org` or `make tangle`
 3. Apply package/repo changes with `loom nala:apply` or the corresponding `nala-*` helpers when relevant
-4. Apply config changes with `make safe-stow` or `stow linux`
+4. Apply config changes with `make preview-stow`, `make safe-stow`, or the relevant Loom stow verb
 5. Restart Antigravity if terminal behavior or keybindings do not reload live
 
 ## Hotfix Discipline

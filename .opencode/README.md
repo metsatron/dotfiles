@@ -14,6 +14,7 @@ Layout:
 - `.opencode/commands/commit.md` - structured DotCortex commit workflow
 - `.opencode/commands/todo.md` - route and review TODO work in DotCortex tracking files
 - `.opencode/commands/tangle-one.md` - tangle a single owning DotCortex org file quickly
+- `.opencode/commands/loom.md` - document the `/loom` Loom-first convention and how to route Loom-aware requests
 - `.opencode/commands/configure-antigravity.md` - Antigravity configuration workflow through DotCortex
 - `.opencode/commands/skill-sync.md` - audit and sync missing OpenCode-local workflows, skills, and guidance
 - `.opencode/notes/source-map.md` - where each note came from
@@ -34,5 +35,6 @@ Layout:
 - `.opencode/templates/task-patterns.md` - reusable task execution patterns
 - `.opencode/workflows/dotcortex-edit-flow.md` - safe edit, tangle, and stow flow
 - `.opencode/workflows/bootstrap-checklist.md` - fresh machine and bootstrap checklist
+- `.opencode/workflows/source-adaptation.md` - Bruce Lee filter for adapting external agent ideas into OpenCode-owned guidance
 
 Note: this repo now has an `.opencode/` directory. I did not create or rely on `.codex/`.

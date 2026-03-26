@@ -2,6 +2,9 @@
 
 This directory adapts reusable Claude memory into OpenCode-local reference notes.
 
+Those source memories are reference-only and are never a write target during
+OpenCode work.
+
 Sources were read from:
 
 - `~/.claude/projects/-home-metsatron-mnt-x230-HelmCortex/memory/`

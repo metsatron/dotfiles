@@ -10,11 +10,14 @@ Root `.org` files are canonical. Overlay directories are generated output.
 
 ## Critical Rules
 
-1. Never edit tangled output under overlay directories.
-2. Never edit `Makefile` directly; it is tangled from `loom.org`.
-3. Use `make safe-stow` rather than raw `stow`.
-4. Repo location is expected to be `~/DotCortex`.
-5. New package manager support follows the existing pattern: `.org` source, SSV manifest, helper scripts, `.mk` fragment, Loom verbs.
+1. Never touch any `.claude` path or `CLAUDE.md` unless the user explicitly names that exact path for direct modification.
+2. Never edit tangled output under overlay directories.
+3. Never edit `Makefile` directly; it is tangled from `loom.org`.
+4. Use `make safe-stow` rather than raw `stow`.
+5. Repo location is expected to be `~/DotCortex`.
+6. New package manager support follows the existing pattern: `.org` source, SSV manifest, helper scripts, `.mk` fragment, Loom verbs.
+7. Do not claim completion without fresh verification evidence.
+8. Plan first when work is likely to span 3 or more files or alter control-plane behavior.
 
 ## Overlay Scope
 
@@ -102,3 +105,5 @@ Current manager sources:
 ## HelmCortex Boundary
 
 DotCortex and HelmCortex are decoupled. DotCortex should not stow files into HelmCortex. The main integration point is PATH wiring for `~/HelmCortex/FORGE/bin`.
+
+Claude-facing docs and skills may be read as reference, but OpenCode adaptations should land in `.opencode/` or DotCortex-owned files only.
