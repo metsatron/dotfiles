@@ -92,6 +92,7 @@ x11-apply: tangle
 | @echo "✅ X11 applied."
 
 include $(HOME)/DotCortex/all/.mk/flatpak.mk
+include $(HOME)/DotCortex/all/.mk/icons.mk
 include $(HOME)/DotCortex/all/.mk/guix.mk
 include $(HOME)/DotCortex/all/.mk/guix-substitutes.mk
 include $(HOME)/DotCortex/all/.mk/snap.mk
