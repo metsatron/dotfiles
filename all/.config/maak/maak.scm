@@ -3,25 +3,14 @@
 ;; [[file:../../../loom.org::*Maak control plane (Scheme, XDG-friendly)][Maak control plane (Scheme, XDG-friendly):1]]
 (use-modules (srfi srfi-1)
              (srfi srfi-13)        ; string-prefix?, string-contains
-             (ice-9 popen)
-             (ice-9 rdelim)
              (ice-9 match)
              (ice-9 pretty-print)
              (ice-9 format))
 
-;; Run one shell string via bash -lc <cmd>, stream stdout line-by-line.
+;; Run one shell string via bash -lc <cmd> with inherited TTY/stdout/stderr,
+;; so long-running tasks stream live output and color-capable tools keep ANSI.
 (define (sh cmd)
-  (let* ((p  (open-pipe* OPEN_READ "bash" "-lc" cmd))
-         (ec (let loop ()
-               (let ((line (read-line p)))
-                 (if (eof-object? line)
-                     (close-pipe p)
-                     (begin
-                       (display line)
-                       (newline)
-                       (force-output)
-                       (loop)))))))
-    ec))
+  (system* "bash" "-lc" cmd))
 
 (define (ok? code) (zero? code))
 (define (task name desc thunk) (list name desc thunk))
@@ -44,11 +33,7 @@
 (define (mk-appimage cmd)
   (let* ((HOME (or (getenv "HOME") ""))
          (mk (string-append "make -f " HOME "/DotCortex/all/.mk/appimage.mk " cmd)))
-    (let* ((p   (open-pipe* OPEN_READ "bash" "-lc" mk))
-           (out (read-string p))
-           (ec  (close-pipe p)))
-      (display out)
-      ec)))
+    (system* "bash" "-lc" mk)))
 
 (define (with-core thunk)
   (let* ((cmd (string-append ". \"" CORE-PROFILE "/etc/profile\"; " (thunk))))
@@ -205,12 +190,15 @@
    (task 'flatpak:bridge "Apply Flatpak desktop + per-app bridges"
          (lambda () (sh "make flatpak-bridge")))
 
-   (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
-         (lambda () (sh "make x11-apply")))
+    (task 'flatpak:x11 "Re-stow x230/.xsessionrc & friends"
+          (lambda () (sh "make x11-apply")))
 
-    (task 'flatpak:remotes
-          "Ensure remotes (user+system) with clean env"
-          (lambda () (mk "flatpak-remotes")))
+    (task 'icons:sync "Copy icon/theme trees into home and rebuild caches"
+          (lambda () (sh "make icons-sync")))
+
+     (task 'flatpak:remotes
+           "Ensure remotes (user+system) with clean env"
+           (lambda () (mk "flatpak-remotes")))
 
     (task 'flatpak:release-diff
           "Check release-backed Flatpak bundles managed via GitHub"
@@ -278,14 +266,9 @@
           "Install/enable appimaged user service from the newest AppImage"
           (lambda () (sh "~/.local/bin/appimage-integrator-setup")))
 
-    ;; --- GitHub release artifacts ---
-    (task 'gitrelease:apply
-          "Update all non-Flatpak GitHub release artifacts"
-          (lambda () (sh "make -f ~/DotCortex/all/.mk/gitrelease.mk gitrelease-apply")))
-
-   (task 'appimage:update
-         "Update all AppImages (Auto-integrate, scrub desktops)"
-         (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
+    (task 'appimage:update
+          "Update all AppImages (Auto-integrate, scrub desktops)"
+          (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
 
    ;; Back-compat alias
    (task 'appimage:ail-scrub
@@ -355,12 +338,31 @@
           "Enforce exact Bun global state, allow removals"
           (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/bun-apply")))
 
-    (task 'bun:health "Show DotCortex Bun env and versions"
-          (lambda () (sh "~/.local/bin/bun-health")))
+     (task 'bun:health "Show DotCortex Bun env and versions"
+           (lambda () (sh "~/.local/bin/bun-health")))
 
-    ;; --- Bunx ---
-    (task 'bunx:capture "Capture managed bunx launchers to DotCortex SSV"
-          (lambda () (sh "~/.local/bin/bunx-capture")))
+     (task 'bun-source:diff
+           "Plan: Bun source manifests vs local checkout/build state"
+           (lambda () (sh "~/.local/bin/bun-source-diff")))
+
+     (task 'bun-source:sync
+           "Ensure Bun source checkouts exist, no installs or builds"
+           (lambda () (sh "~/.local/bin/bun-source-sync")))
+
+     (task 'bun-source:apply
+           "Sync Bun source checkouts and rebuild only when fingerprints change"
+           (lambda () (sh "~/.local/bin/bun-source-apply")))
+
+     (task 'bun-source:update
+           "Intentionally advance Bun source checkouts to newer upstream state"
+           (lambda () (sh "~/.local/bin/bun-source-update")))
+
+     (task 'bun-source:health "Show Bun source checkout/build health"
+           (lambda () (sh "~/.local/bin/bun-source-health")))
+
+     ;; --- Bunx ---
+     (task 'bunx:capture "Capture managed bunx launchers to DotCortex SSV"
+           (lambda () (sh "~/.local/bin/bunx-capture")))
 
     (task 'bunx:diff "Plan: manifest vs managed bunx launchers"
           (lambda () (sh "~/.local/bin/bunx-diff")))
@@ -415,14 +417,23 @@
    (task 'nala:capture "Capture live apt manual packages to DotCortex SSV"
          (lambda () (sh "~/.local/bin/nala-capture")))
 
-   (task 'nala:diff "Plan: manifest vs live apt packages"
-         (lambda () (sh "~/.local/bin/nala-diff")))
+    (task 'nala:diff "Plan: manifest vs live apt packages"
+          (lambda () (sh "~/.local/bin/nala-diff")))
 
-   (task 'nala:apply "Enforce nala manifest (install missing, no auto-remove)"
-         (lambda () (sh "make nala-apply")))
+    (task 'nala:release-diff
+          "Plan: GitHub release-backed .deb packages"
+          (lambda () (sh "make nala-release-diff")))
+
+    (task 'nala:apply "Enforce nala manifest and release-backed .deb installs"
+          (lambda () (sh "make nala-apply")))
 
    (task 'nala:health "Show nala/apt/dpkg status"
          (lambda () (sh "~/.local/bin/nala-health")))
+
+   ;; --- GitHub release artifacts ---
+   (task 'gitrelease:apply
+         "Update all non-Flatpak GitHub release artifacts"
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/gitrelease.mk gitrelease-apply")))
 
    ;; --- Backup ---
    (task 'backup:system

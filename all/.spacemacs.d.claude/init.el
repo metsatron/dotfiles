@@ -8,7 +8,7 @@
    dotspacemacs-excluded-packages '(vterm)
 
    ;; You had two dotspacemacs-additional-packages; merged to keep all
-   dotspacemacs-additional-packages '(mixed-pitch org-appear vterm doom-themes centaur-tabs kurecolor)
+   dotspacemacs-additional-packages '(mixed-pitch org-appear vterm doom-themes centaur-tabs kurecolor ellsp)
 
    dotspacemacs-configuration-layers
    '(helm
@@ -697,4 +697,21 @@
     (add-hook 'emacs-startup-hook
               (lambda ()
                 (recentf-cleanup)
-                (spacemacs-buffer/goto-buffer)))))
+                (spacemacs-buffer/goto-buffer))))
+  ;; Ensure npm-global bin (~/.npm-global/bin) is on exec-path so eask is findable
+  (let ((npm-bin (expand-file-name "~/.npm-global/bin")))
+    (unless (member npm-bin exec-path)
+      (add-to-list 'exec-path npm-bin)
+      (setenv "PATH" (concat npm-bin path-separator (getenv "PATH")))))
+  
+  ;; Register ellsp with eglot as the server for emacs-lisp-mode
+  (with-eval-after-load 'eglot
+    (add-to-list 'eglot-server-programs
+                 '(emacs-lisp-mode . ("eask" "exec" "ellsp"))))
+  
+  ;; Auto-start eglot only inside Eask-managed projects (checks for Eask file)
+  (add-hook 'emacs-lisp-mode-hook
+            (lambda ()
+              (when (and (buffer-file-name)
+                         (locate-dominating-file (buffer-file-name) "Eask"))
+                (eglot-ensure)))))

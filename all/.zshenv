@@ -42,5 +42,28 @@ if [ -d "$HOME/.npm-global/bin" ]; then
   export PATH="$HOME/.npm-global/bin:$PATH"
 fi
 
+claude_native_dir=
+
+for claude_base in \
+  "$HOME/.config/Claude/claude-code" \
+  "$HOME/.config/Claude/claude-code-vm"
+do
+  [ -d "$claude_base" ] || continue
+  claude_native_dir="$(command ls -1d "$claude_base"/* 2>/dev/null | sort -V | tail -n 1)"
+  if [ -n "$claude_native_dir" ] && [ -x "$claude_native_dir/claude" ]; then
+    export PATH="$claude_native_dir:$PATH"
+    break
+  fi
+done
+
+if [ -z "$claude_native_dir" ] && [ -d "$HOME/.antigravity/extensions" ]; then
+  claude_native_dir="$(command ls -1d "$HOME"/.antigravity/extensions/anthropic.claude-code-*/resources/native-binary 2>/dev/null | sort -V | tail -n 1)"
+  if [ -n "$claude_native_dir" ] && [ -x "$claude_native_dir/claude" ]; then
+    export PATH="$claude_native_dir:$PATH"
+  fi
+fi
+
+unset claude_base claude_native_dir
+
 # Stop Guix libs leaking into host binaries
 unset LD_LIBRARY_PATH 2>/dev/null

@@ -1,5 +1,5 @@
 #+TITLE: Nala Loom: DotCortex
-#+DESCRIPTION: Debian nala package manager and Antigravity editor config
+#+DESCRIPTION: Debian nala package manager, release-backed .deb sync, and Antigravity editor config
 #+AUTHOR: Mètsàtron
 #+LANGUAGE: en
 #+PROPERTY: header-args :mkdirp yes :results silent
@@ -54,6 +54,7 @@ xclip "" cli shared ""
 xdotool "" cli shared ""
 xmlstarlet "" cli shared ""
 detox "" cli shared ""
+git-filter-repo "" cli shared ""
 jdupes "" cli shared ""
 rdfind "" cli shared ""
 plocate "" cli shared ""
@@ -71,6 +72,8 @@ gthumb "" desktop shared ""
 seahorse "" desktop shared ""
 picom "" desktop shared ""
 pluma "" desktop shared ""
+audacity "" desktop shared ""
+baobab "" desktop shared ""
 
 # --- XFCE Plugins ---
 xfce4-appmenu-plugin "" xfce shared ""
@@ -135,24 +138,40 @@ samba "" network shared ""
 # --- Third-party (require repos from repos.ssv) ---
 signal-desktop "" third-party shared ""
 brave-browser "" third-party shared ""
+gh "" third-party shared ""
 antigravity "" third-party shared ""
 
 # --- Ubuntu-only ---
 ubuntu-restricted-addons "" system ubuntu-only ""
 ppa-purge "" system ubuntu-only ""
 zram-tools "" system ubuntu-only ""
+mate-disk-usage-analyzer "" desktop ubuntu-only ""
 #+END_SRC
 
 * Third-party repos manifest
 Columns: NAME, TYPE, KEY_URL, REPO_SPEC, OS_MATCH, EXTRA
 - TYPE: =key+sources= (GPG key + .sources file), =key+list= (GPG key + .list file), =ppa= (Ubuntu PPA)
 - OS_MATCH: =all=, =devuan=, =ubuntu=
+- REPO_SPEC may use ={{ARCH}}= for the current =dpkg --print-architecture=
 
 #+BEGIN_SRC text :tangle debian/.nala/manifest/repos.ssv :padline no :comments none
 # NAME TYPE KEY_URL REPO_SPEC OS_MATCH EXTRA
 signal-desktop key+sources "https://updates.signal.org/desktop/apt/keys.asc" "https://updates.signal.org/static/desktop/apt/signal-desktop.sources" all ""
 brave-browser-release key+sources "https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg" "https://brave-browser-apt-release.s3.brave.com/brave-browser-release.sources" all ""
+github-cli key+list "https://cli.github.com/packages/githubcli-archive-keyring.gpg" "deb [arch={{ARCH}} signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" all "/etc/apt/keyrings/githubcli-archive-keyring.gpg"
 antigravity key+list "https://us-central1-apt.pkg.dev/doc/repo-signing-key.gpg" "deb [signed-by=/etc/apt/keyrings/antigravity-repo-key.gpg] https://us-central1-apt.pkg.dev/projects/antigravity-auto-updater-dev/ antigravity-debian main" all "/etc/apt/keyrings/antigravity-repo-key.gpg"
+#+END_SRC
+
+* GitHub release-backed .deb manifest
+For Debian-family apps distributed as GitHub release artifacts instead of apt repos.
+Columns: REPO, PKG, ASSET_NAME_OR_GLOB, ARCH, SCOPE, EXTRA
+- PKG is the Debian package name from the .deb metadata, not the asset filename.
+- ARCH: =amd64=, =arm64=, =all=, or =any=
+- SCOPE: =shared=, =devuan-only=, =ubuntu-only=
+
+#+BEGIN_SRC text :tangle debian/.nala/manifest/releases.ssv :padline no :comments none
+# repo package asset_name_or_glob arch scope extra
+anomalyco/opencode open-code opencode-desktop-linux-amd64.deb amd64 shared ""
 #+END_SRC
 
 * Repos setup script
@@ -175,6 +194,7 @@ if [ -f /etc/os-release ]; then
 fi
 IS_DEVUAN=0
 [ -f /etc/devuan_version ] && IS_DEVUAN=1
+ARCH="$(dpkg --print-architecture)"
 
 scope_matches() {
   local scope="$1"
@@ -209,6 +229,8 @@ while IFS='|' read -r name type key_url repo_spec os_match _extra; do
     continue
   fi
 
+  repo_spec="${repo_spec//\{\{ARCH\}\}/$ARCH}"
+
   case "$type" in
     key+sources)
       # key_url is GPG key, repo_spec is URL to .sources file
@@ -221,6 +243,7 @@ while IFS='|' read -r name type key_url repo_spec os_match _extra; do
       fi
 
       echo "  add $name repo..."
+      sudo install -d -m 755 "$(dirname "$keyring")" "$(dirname "$sources_file")"
 
       # Download and install key
       if [ -n "$key_url" ]; then
@@ -229,6 +252,7 @@ while IFS='|' read -r name type key_url repo_spec os_match _extra; do
         else
           wget -qO- "$key_url" | gpg --dearmor | sudo tee "$keyring" >/dev/null
         fi
+        sudo chmod go+r "$keyring"
       fi
 
       # Download and install sources file
@@ -263,7 +287,7 @@ while IFS='|' read -r name type key_url repo_spec os_match _extra; do
       fi
 
       echo "  add $name repo..."
-      sudo mkdir -p "$(dirname "$keyring")"
+      sudo install -d -m 755 "$(dirname "$keyring")" "$(dirname "$list_file")"
 
       if [ -n "$key_url" ]; then
         if echo "$key_url" | grep -q '\.gpg$'; then
@@ -271,6 +295,7 @@ while IFS='|' read -r name type key_url repo_spec os_match _extra; do
         else
           wget -qO- "$key_url" | gpg --dearmor --yes | sudo tee "$keyring" >/dev/null
         fi
+        sudo chmod go+r "$keyring"
       fi
 
       printf '%s\n' "$repo_spec" | sudo tee "$list_file" >/dev/null
@@ -297,8 +322,197 @@ if [ "$CHANGED" -eq 1 ]; then
   echo "Repos changed, updating package lists..."
   APT="apt-get"
   command -v nala &>/dev/null && APT="nala"
-  sudo $APT update -y
+  sudo $APT update
 fi
+#+END_SRC
+
+* Release-backed .deb sync
+#+BEGIN_SRC bash :tangle debian/.local/bin/nala-release-sync :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+MAN="${NALA_RELEASES_SSV:-$HOME/.nala/manifest/releases.ssv}"
+CACHE_BASE="${XDG_CACHE_HOME:-$HOME/.cache}/nala/releases"
+
+[ -f "$MAN" ] || exit 0
+
+OS_ID="unknown"
+if [ -f /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="$ID"
+fi
+IS_DEVUAN=0
+[ -f /etc/devuan_version ] && IS_DEVUAN=1
+ARCH="$(dpkg --print-architecture)"
+
+scope_matches() {
+  local scope="$1"
+  case "$scope" in
+    shared|"") return 0 ;;
+    devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
+    ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
+    *) return 0 ;;
+  esac
+}
+
+arch_matches() {
+  local want="$1"
+  case "$want" in
+    any|all|"") return 0 ;;
+    "$ARCH") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+detect_apt() {
+  if command -v nala &>/dev/null; then
+    printf '%s\n' nala
+  else
+    printf '%s\n' apt-get
+  fi
+}
+
+gh_latest_json() {
+  local repo="$1" url="https://api.github.com/repos/${repo}/releases/latest"
+  if [ -n "${GH_TOKEN:-}" ]; then
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
+normalize_ver() {
+  sed -E 's/^v//' <<<"$1"
+}
+
+installed_version() {
+  local pkg="$1"
+  dpkg-query -W -f='${Version}\n' "$pkg" 2>/dev/null || true
+}
+
+cache_dir() {
+  local pkg="$1"
+  printf '%s/%s\n' "$CACHE_BASE" "$pkg"
+}
+
+write_cache_meta() {
+  local dir="$1" json="$2" tag="$3" name="$4" url="$5" digest="$6"
+  mkdir -p "$dir"
+  printf '%s\n' "$json" > "$dir/latest.json"
+  printf '%s\n' "$tag" > "$dir/tag"
+  printf '%s\n' "$name" > "$dir/asset.name"
+  printf '%s\n' "$url" > "$dir/asset.url"
+  printf '%s\n' "$digest" > "$dir/asset.digest"
+}
+
+install_local_deb() {
+  local apt_bin="$1" bundle="$2"
+  echo "  -> installing $(basename "$bundle") with $apt_bin"
+  if sudo "$apt_bin" install -y "$bundle"; then
+    return 0
+  fi
+  if [ "$apt_bin" = "nala" ]; then
+    echo "  -> nala local install failed, retrying with apt-get"
+    sudo apt-get install -y "$bundle"
+    return 0
+  fi
+  echo "  -> apt local install failed, retrying with dpkg + apt-get -f"
+  sudo dpkg -i "$bundle" || sudo apt-get install -f -y
+}
+
+sync_one() {
+  local apt_bin="$1" repo="$2" pkg="$3" asset_glob="$4" want_arch="$5" scope="$6"
+  local json latest_tag latest_ver asset_name asset_url asset_digest dir bundle tmp old_name cached_digest cached_tag installed
+  local bundle_pkg bundle_ver effective_pkg compare_ver
+  local asset_entry_name asset_entry_url asset_entry_digest
+
+  if ! scope_matches "$scope"; then
+    echo "  skip $pkg (scope=$scope, this=$OS_ID)"
+    return 0
+  fi
+
+  if ! arch_matches "$want_arch"; then
+    echo "  skip $pkg (arch=$want_arch, this=$ARCH)"
+    return 0
+  fi
+
+  json="$(gh_latest_json "$repo")"
+  latest_tag="$(jq -r '.tag_name' <<<"$json")"
+  latest_ver="$(normalize_ver "$latest_tag")"
+
+  while IFS=$'\t' read -r asset_entry_name asset_entry_url asset_entry_digest; do
+    case "$asset_entry_name" in
+      $asset_glob)
+        asset_name="$asset_entry_name"
+        asset_url="$asset_entry_url"
+        asset_digest="$asset_entry_digest"
+        break
+        ;;
+    esac
+  done < <(jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<<"$json")
+
+  [ -n "${asset_url:-}" ] || {
+    echo "  ! no release asset matching $asset_glob for $repo" >&2
+    return 1
+  }
+
+  dir="$(cache_dir "$pkg")"
+  mkdir -p "$dir"
+  bundle="$dir/$asset_name"
+  old_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
+  cached_digest="$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )"
+  cached_tag="$( [ -f "$dir/tag" ] && cat "$dir/tag" || true )"
+
+  if [ -n "$old_name" ] && [ "$old_name" != "$asset_name" ] && [ -f "$dir/$old_name" ]; then
+    rm -f "$dir/$old_name"
+  fi
+
+  if [ ! -s "$bundle" ] \
+    || { [ -n "$asset_digest" ] && [ "$cached_digest" != "$asset_digest" ]; } \
+    || { [ -z "$asset_digest" ] && [ "$cached_tag" != "$latest_tag" ]; }; then
+    tmp="$bundle.part"
+    curl -fL "$asset_url" -o "$tmp"
+    mv -f "$tmp" "$bundle"
+  fi
+
+  write_cache_meta "$dir" "$json" "$latest_tag" "$asset_name" "$asset_url" "$asset_digest"
+
+  bundle_pkg="$(dpkg-deb -f "$bundle" Package 2>/dev/null || true)"
+  bundle_ver="$(dpkg-deb -f "$bundle" Version 2>/dev/null || true)"
+  effective_pkg="$pkg"
+  [ -n "$bundle_ver" ] && compare_ver="$bundle_ver" || compare_ver="$latest_ver"
+
+  if [ -n "$bundle_pkg" ] && [ "$bundle_pkg" != "$pkg" ]; then
+    echo "  ! manifest package $pkg differs from deb metadata $bundle_pkg; using deb metadata"
+    effective_pkg="$bundle_pkg"
+  fi
+
+  installed="$(installed_version "$effective_pkg")"
+  echo "  release: pkg=$effective_pkg arch=$want_arch latest=$compare_ver installed=${installed:-none}"
+  if [ -n "$installed" ] && dpkg --compare-versions "$installed" ge "$compare_ver"; then
+    echo "  -> already current, skipping install for $effective_pkg"
+    return 0
+  fi
+
+  install_local_deb "$apt_bin" "$bundle"
+}
+
+APT_BIN="$(detect_apt)"
+
+echo "== Syncing release-backed .deb packages =="
+while IFS='|' read -r repo pkg asset_glob want_arch scope _extra; do
+  [ -n "$repo" ] || continue
+  sync_one "$APT_BIN" "$repo" "$pkg" "$asset_glob" "$want_arch" "$scope"
+done < <(
+  awk -v FS='[ \t]+' '
+    function dq(s){ return (s == "\"\"" ? "" : s) }
+    /^[ \t]*#/ || NF==0 { next }
+    {
+      printf "%s|%s|%s|%s|%s|%s\n",
+        dq($1), dq($2), dq($3), dq($4), dq($5), dq($6)
+    }
+  ' "$MAN"
+)
 #+END_SRC
 
 * Apply script
@@ -308,6 +522,8 @@ set -euo pipefail
 MAN="${NALA_SSV:-$HOME/.nala/manifest/packages.ssv}"
 ENFORCE="${ENFORCE:-1}"
 UNINSTALL="${UNINSTALL:-0}"
+REL_SYNC_HELPER="${HOME}/.local/bin/nala-release-sync"
+[ -x "$REL_SYNC_HELPER" ] || REL_SYNC_HELPER="${HOME}/DotCortex/debian/.local/bin/nala-release-sync"
 
 if [ ! -f "$MAN" ]; then
   echo "No manifest at $MAN" >&2
@@ -340,7 +556,7 @@ if command -v nala &>/dev/null; then
   APT="nala"
 else
   echo "nala not found, installing..."
-  sudo apt-get update -y
+  sudo apt-get update
   sudo apt-get install -y nala || {
     echo "nala install failed, falling back to apt-get"
     APT="apt-get"
@@ -396,6 +612,10 @@ else
       exit 1
     fi
   }
+fi
+
+if [ -x "$REL_SYNC_HELPER" ]; then
+  "$REL_SYNC_HELPER"
 fi
 
 echo "Done."
@@ -512,6 +732,8 @@ Icon=antigravity
 set -euo pipefail
 
 MAN="${NALA_SSV:-$HOME/.nala/manifest/packages.ssv}"
+REL_DIFF_HELPER="${HOME}/.local/bin/nala-release-diff"
+[ -x "$REL_DIFF_HELPER" ] || REL_DIFF_HELPER="${HOME}/DotCortex/debian/.local/bin/nala-release-diff"
 
 if [ ! -f "$MAN" ]; then
   echo "No manifest at $MAN" >&2
@@ -568,6 +790,121 @@ fi
 echo
 echo "Manifest: $(wc -l < "$wanted_tmp") packages for this OS"
 echo "Installed: $(wc -l < "$have_tmp") total dpkg packages"
+
+if [ -x "$REL_DIFF_HELPER" ]; then
+  echo
+  "$REL_DIFF_HELPER" || true
+fi
+#+END_SRC
+
+* Release-backed .deb diff
+#+BEGIN_SRC bash :tangle debian/.local/bin/nala-release-diff :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+MAN="${NALA_RELEASES_SSV:-$HOME/.nala/manifest/releases.ssv}"
+
+[ -f "$MAN" ] || exit 0
+
+OS_ID="unknown"
+if [ -f /etc/os-release ]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  OS_ID="$ID"
+fi
+IS_DEVUAN=0
+[ -f /etc/devuan_version ] && IS_DEVUAN=1
+ARCH="$(dpkg --print-architecture)"
+
+scope_matches() {
+  local scope="$1"
+  case "$scope" in
+    shared|"") return 0 ;;
+    devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
+    ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
+    *) return 0 ;;
+  esac
+}
+
+arch_matches() {
+  local want="$1"
+  case "$want" in
+    any|all|"") return 0 ;;
+    "$ARCH") return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+gh_latest_json() {
+  local repo="$1" url="https://api.github.com/repos/${repo}/releases/latest"
+  if [ -n "${GH_TOKEN:-}" ]; then
+    curl -fsSL -H "Authorization: Bearer $GH_TOKEN" "$url"
+  else
+    curl -fsSL "$url"
+  fi
+}
+
+normalize_ver() {
+  sed -E 's/^v//' <<<"$1"
+}
+
+installed_version() {
+  local pkg="$1"
+  dpkg-query -W -f='${Version}\n' "$pkg" 2>/dev/null || true
+}
+
+echo "[release-backed debs]"
+while IFS='|' read -r repo pkg asset_glob want_arch scope _extra; do
+  [ -n "$repo" ] || continue
+
+  if ! scope_matches "$scope"; then
+    echo "  . $pkg skipped (scope=$scope, this=$OS_ID)"
+    continue
+  fi
+
+  if ! arch_matches "$want_arch"; then
+    echo "  . $pkg skipped (arch=$want_arch, this=$ARCH)"
+    continue
+  fi
+
+  json="$(gh_latest_json "$repo")"
+  latest_tag="$(jq -r '.tag_name' <<<"$json")"
+  latest_ver="$(normalize_ver "$latest_tag")"
+  resolved_asset_name=""
+  while IFS=$'\t' read -r asset_entry_name _asset_entry_url _asset_entry_digest; do
+    case "$asset_entry_name" in
+      $asset_glob)
+        resolved_asset_name="$asset_entry_name"
+        break
+        ;;
+    esac
+  done < <(jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<<"$json")
+
+  if [ -z "$resolved_asset_name" ]; then
+    echo "  ? $pkg (no release asset matching $asset_glob in $repo)"
+    continue
+  fi
+
+  have="$(installed_version "$pkg")"
+  if [ -z "$have" ]; then
+    echo "  + $pkg (missing -> $latest_ver, asset $resolved_asset_name)"
+    continue
+  fi
+
+  if dpkg --compare-versions "$have" ge "$latest_ver"; then
+    echo "  = $pkg ($have, asset $resolved_asset_name)"
+  else
+    echo "  ~ $pkg ($have -> $latest_ver, asset $resolved_asset_name)"
+  fi
+done < <(
+  awk -v FS='[ \t]+' '
+    function dq(s){ return (s == "\"\"" ? "" : s) }
+    /^[ \t]*#/ || NF==0 { next }
+    {
+      printf "%s|%s|%s|%s|%s|%s\n",
+        dq($1), dq($2), dq($3), dq($4), dq($5), dq($6)
+    }
+  ' "$MAN"
+)
 #+END_SRC
 
 * Capture script
@@ -651,6 +988,14 @@ installed_count=$(dpkg-query -W -f='x\n' | wc -l)
 manual_count=$(apt-mark showmanual | wc -l)
 echo "Dpkg:  $installed_count installed, $manual_count manual"
 
+REL_MAN="${NALA_RELEASES_SSV:-$HOME/.nala/manifest/releases.ssv}"
+if [ -f "$REL_MAN" ]; then
+  release_count=$(awk -v FS='[ \t]+' '!/^[ \t]*#/ && NF { c++ } END { print c+0 }' "$REL_MAN")
+  echo "Rels:  $release_count GitHub-backed .deb entries"
+else
+  echo "Rels:  no release manifest found at $REL_MAN"
+fi
+
 # Third-party repos
 repo_count=$(ls /etc/apt/sources.list.d/ 2>/dev/null | wc -l)
 echo "Repos: $repo_count in sources.list.d/"
@@ -663,7 +1008,7 @@ ls /etc/apt/sources.list.d/ 2>/dev/null | sed 's/^/  /'
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: nala-repos nala-capture nala-diff nala-sync nala-apply nala-health
+.PHONY: nala-repos nala-capture nala-diff nala-release-diff nala-release-sync nala-sync nala-apply nala-health
 
 nala-repos:
 | @chmod +x $(HOME)/.local/bin/nala-repos-setup 2>/dev/null || true
@@ -676,6 +1021,14 @@ nala-capture:
 nala-diff:
 | @chmod +x $(HOME)/.local/bin/nala-diff 2>/dev/null || true
 | $(HOME)/.local/bin/nala-diff
+
+nala-release-diff:
+| @chmod +x $(HOME)/.local/bin/nala-release-diff 2>/dev/null || true
+| $(HOME)/.local/bin/nala-release-diff
+
+nala-release-sync:
+| @chmod +x $(HOME)/.local/bin/nala-release-sync 2>/dev/null || true
+| $(HOME)/.local/bin/nala-release-sync
 
 nala-sync: nala-repos
 | @chmod +x $(HOME)/.local/bin/nala-apply 2>/dev/null || true

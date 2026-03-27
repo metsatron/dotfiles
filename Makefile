@@ -71,7 +71,17 @@ safe-stow:
 |     echo ">> stow $$pkg conflict — retrying with --ignore=HelmCortex"; \
 |     stow --ignore='HelmCortex' --ignore='\.bak\.' $$pkg; \
 |   fi; \
-| done
+| done; \
+| case " $(STOW_PKGS) " in \
+|   *" all "*|*" linux "*) \
+|     HELPER="$(HOME)/.local/bin/icons-home-sync"; \
+|     [ -x "$$HELPER" ] || HELPER="$(HOME)/DotCortex/all/.local/bin/icons-home-sync"; \
+|     if [ -x "$$HELPER" ]; then \
+|       echo ">> icons-sync"; \
+|       "$$HELPER"; \
+|     fi; \
+|     ;; \
+| esac
 
 preview-stow:
 | cd $(HOME)/DotCortex && stow -n $(STOW_PKGS) || true
@@ -82,11 +92,11 @@ x11-apply: tangle
 | @echo "✅ X11 applied."
 
 include $(HOME)/DotCortex/all/.mk/flatpak.mk
+include $(HOME)/DotCortex/all/.mk/icons.mk
 include $(HOME)/DotCortex/all/.mk/guix.mk
 include $(HOME)/DotCortex/all/.mk/guix-substitutes.mk
 include $(HOME)/DotCortex/all/.mk/snap.mk
 include $(HOME)/DotCortex/all/.mk/appimage.mk
-include $(HOME)/DotCortex/all/.mk/gitrelease.mk
 include $(HOME)/DotCortex/all/.mk/cargo.mk
 include $(HOME)/DotCortex/all/.mk/homebrew.mk
 include $(HOME)/DotCortex/all/.mk/bun.mk
@@ -94,3 +104,4 @@ include $(HOME)/DotCortex/all/.mk/bunx.mk
 include $(HOME)/DotCortex/all/.mk/npm.mk
 include $(HOME)/DotCortex/all/.mk/pip.mk
 include $(HOME)/DotCortex/all/.mk/nala.mk
+include $(HOME)/DotCortex/all/.mk/gitrelease.mk
