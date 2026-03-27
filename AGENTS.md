@@ -8,13 +8,14 @@ See `CLAUDE.md` for full architecture details, common workflows, and package man
 
 ## Critical Rules
 
-1. **Never edit tangled output** — files inside `all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `be/`, `navi/`, `arch/`, `osx/` are generated. Edit the `.org` source at repo root instead.
-2. **Never edit the Makefile directly** — it is tangled from `loom.org`. Edit `loom.org` instead, then `make tangle`.
-3. **Org files are canonical** — every config, script, and manifest is defined inside an org code block with a `:tangle` target.
-4. **Stow target is `$HOME`** — the repo lives at `~/DotCortex`.
-5. **Use `make safe-stow`** — it backs up existing files before stowing. Never use plain `stow` directly.
-6. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs.
-7. **Check Guix profiles before assuming tools aren't installed** — emacs, nvim, zsh, guile etc live at `~/.guix-extra-profiles/core/core/bin/`, not in system PATH.
+1. **Never touch any `.claude` path or `CLAUDE.md` unless the user explicitly names that exact path for direct modification** — all `.claude` directories and files anywhere, plus `CLAUDE.md`, are Claude-owned, must be treated as read-only reference material by default, and must never be created, edited, deleted, moved, symlinked, or synced as part of DotCortex/OpenCode work.
+2. **Never edit tangled output** — files inside `all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `be/`, `navi/`, `arch/`, `osx/` are generated. Edit the `.org` source at repo root instead.
+3. **Never edit the Makefile directly** — it is tangled from `loom.org`. Edit `loom.org` instead, then `make tangle`.
+4. **Org files are canonical** — every config, script, and manifest is defined inside an org code block with a `:tangle` target.
+5. **Stow target is `$HOME`** — the repo lives at `~/DotCortex`.
+6. **Use `make safe-stow`** — it backs up existing files before stowing. Never use plain `stow` directly.
+7. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs.
+8. **Check Guix profiles before assuming tools aren't installed** — emacs, nvim, zsh, guile etc live at `~/.guix-extra-profiles/core/core/bin/`, not in system PATH.
 
 ## Build & Apply
 

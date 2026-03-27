@@ -4,9 +4,20 @@
 (defconst metsatron-claude-cache
   (expand-file-name "~/.spacemacs.d.claude/.cache/"))
 
+(defconst metsatron-eln-cache
+  (expand-file-name "~/.cache/emacs/eln-cache/"))
+
 ;; Ensure directories exist
 (when (not (file-directory-p metsatron-claude-cache))
   (make-directory metsatron-claude-cache t))
+(when (not (file-directory-p metsatron-eln-cache))
+  (make-directory metsatron-eln-cache t))
+
+;; Keep native-comp output out of ~/.emacs.d so repo-backed profiles stay clean.
+(when (fboundp 'startup-redirect-eln-cache)
+  (startup-redirect-eln-cache metsatron-eln-cache))
+(when (boundp 'native-comp-eln-load-path)
+  (setq native-comp-eln-load-path (list metsatron-eln-cache)))
 
 ;; Put ELPA here (pre-package-initialization)
 (setq package-user-dir (expand-file-name "elpa" metsatron-claude-cache))
