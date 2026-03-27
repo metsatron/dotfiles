@@ -24,3 +24,7 @@ Adapted from Claude memory for better OpenCode collaboration.
 - Do not break adjacent behavior while fixing one issue
 - Track significant work in the HelmCortex TODO files using Obsidian Tasks format
 - Assume late-night, highly iterative terminal work is normal
+- In DotCortex, userland-first is a hard architectural rule, not a preference
+- Prefer user-scoped package flows before any system/global/manual path: `pip.org`, Guix Home and user profiles, user Flatpak flows, `bun.org`, and comparable userland layers
+- Cross-platform tools that should work on Linux, macOS, and Windows belong in the shared `all` scope unless there is a real platform-specific constraint
+- Never create ad hoc source checkouts, wrapper scripts, or unmanaged local-bin entries for packaged tools inside DotCortex

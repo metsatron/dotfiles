@@ -2,6 +2,8 @@
 
 This directory was built from the current Claude-facing repo guidance.
 
+Those source files were treated as read-only reference material.
+
 Primary inputs:
 
 - `AGENTS.md` - repo-safe editing rules, stow guidance, overlay rules, machine layout
