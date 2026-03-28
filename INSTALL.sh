@@ -589,6 +589,36 @@ done
 ok "All overlays processed"
 
 # ══════════════════════════════════════════════════════════════
+# Phase 6.5: Bootstrap pip for Guix Python
+# ══════════════════════════════════════════════════════════════
+# LESSON: Guix pip 24.0 ships with a vendored resolvelib that has
+# an internal API mismatch — `pip list`, `pip show`, and `pip install`
+# all fail with ImportError on RequirementInformation. The Guix
+# package was never fixed. Bootstrapping pip 26+ via get-pip.py
+# into ~/.local/lib/python3.11/ resolves this and ensures pip-apply
+# installs packages under the correct Guix Python (3.11), not the
+# system Python (3.10 via apt).
+# ══════════════════════════════════════════════════════════════
+info "Phase 6.5: Bootstrap pip for Guix Python"
+
+GUIX_PYTHON="$HOME/.guix-extra-profiles/core/core/bin/python3"
+if [ -x "$GUIX_PYTHON" ]; then
+  GUIX_PIP_VER=$("$GUIX_PYTHON" -m pip --version 2>/dev/null | awk '{print $2}' || echo "0")
+  # Guix pip 24.x has the resolvelib bug — bootstrap if version < 25
+  GUIX_PIP_MAJOR=$(echo "$GUIX_PIP_VER" | cut -d. -f1)
+  if [ "${GUIX_PIP_MAJOR:-0}" -lt 25 ] 2>/dev/null; then
+    info "Guix pip $GUIX_PIP_VER is broken (resolvelib bug) — bootstrapping pip 26+ via get-pip.py"
+    curl -sS https://bootstrap.pypa.io/get-pip.py | "$GUIX_PYTHON" - --user \
+      && ok "Guix Python pip bootstrapped to 26+" \
+      || warn "get-pip.py failed — pip packages may not install correctly"
+  else
+    ok "Guix pip $GUIX_PIP_VER is fine"
+  fi
+else
+  warn "Guix core Python not found at $GUIX_PYTHON — skipping pip bootstrap"
+fi
+
+# ══════════════════════════════════════════════════════════════
 # Phase 7: pip packages
 # ══════════════════════════════════════════════════════════════
 info "Phase 7: Installing pip packages from manifest"
