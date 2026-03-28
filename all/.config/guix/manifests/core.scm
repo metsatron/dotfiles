@@ -31,14 +31,14 @@
    "cdemu-client" "cdemu-daemon"
    "node"
 
-   "python" "python-pip"
+   "python"
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly"
    "python-send2trash" "python-websockets" "python-unidecode" "python-wheel"
 
    "smem"
 
-   "rust"
-   ;; Moved to Cargo:
+   ;; rust/cargo managed via dotcortex-rust-env (rustup) — not Guix
+   ;; cargo crates managed via cargo.org
    ;; "starship"
    ;; "ripgrep"      ; now cargo ripgrep
    ;; "fd"           ; now cargo fd-find
