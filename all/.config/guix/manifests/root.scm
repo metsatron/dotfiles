@@ -17,8 +17,7 @@
    "flatpak"
    ;; "cdemu-client" "cdemu-daemon"
 
-   "cargo"
-   ;; Removed here, migrated to Cargo:
+   ;; rust/cargo managed via dotcortex-rust-env (rustup) — not Guix
    ;; "ripgrep"
    ;; "fd"
    ;; "bat"
