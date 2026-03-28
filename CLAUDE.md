@@ -21,25 +21,29 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
 1. **Never edit tangled output files** — edit the `.org` source and re-tangle. Files inside overlay dirs (`all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `be/`, `navi/`, `arch/`, `osx/`) are generated output.
 2. **Org files are at repo root** — the overlay dirs contain only tangled output.
 3. **Stow target is `$HOME`** — the repo must live at `~/DotCortex`.
-4. **`make safe-stow`** backs up existing files before stowing — use it instead of `make stow`.
+4. **Stow via loom** — use `loom stow:x230` or `loom stow:t480s`, not `make safe-stow`. The `make safe-stow` target is only for first-time bootstrap before loom is functional.
 5. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs in `loom.org`.
+6. **Never suggest next steps after editing org files** — do not tell the user to tangle or stow. The user knows the workflow (`tangle-one <file>.org`, `loom all`, `loom stow:*`). Never suggest `make tangle`.
 
 ## Common Workflows
 
 ```bash
 # Full rebuild (X230)
-cd ~/DotCortex && make tangle && loom stow:x230
+cd ~/DotCortex && loom all && loom stow:x230
 
 # Full rebuild (T480s)
-cd ~/DotCortex && make tangle && loom stow:t480s
+cd ~/DotCortex && loom all && loom stow:t480s
 
-# Without loom (make targets work without Guix)
+# Tangle a single file
+tangle-one term.org
+
+# Without loom (make targets work without Guix, bootstrap only)
 make tangle && STOW_PKGS='all linux debian devuan t480s' make safe-stow
 
 # Edit a config
 # 1. Find the org source: grep -rn "tangle.*path/to/config" *.org
 # 2. Edit the org block
-# 3. make tangle && loom stow:t480s (or stow:x230)
+# 3. tangle-one <file>.org && loom stow:t480s (or stow:x230)
 
 # Loom verbs (requires Guix guile)
 loom                    # list all verbs
