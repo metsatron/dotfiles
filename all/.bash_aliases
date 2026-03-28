@@ -4,7 +4,14 @@
 # Mètsàtron's Aliases
 # --------------------------------------------------
 
-# Add more here
+# Loom fuzzy picker — invoke loom verbs via fzf
+loomf() {
+  local verb
+  verb=$(loom list | fzf --height=50% --layout=reverse --border \
+    --prompt='loom> ' --preview-window=down:1:wrap | awk '{print $1}')
+  [ -n "$verb" ] && loom "$verb"
+}
+
 alias pip='/usr/bin/pip'
 
 # Dircolors and color aliases
