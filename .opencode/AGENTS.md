@@ -15,6 +15,7 @@ Use this directory as OpenCode's local mirror of the repo guidance.
 9. Use `.opencode/commands/skill-sync.md` when the local OpenCode layer needs to catch up with `.claude/`, `.agents/`, or `.codex/`.
 10. Use `.opencode/commands/todo.md` when routing or reviewing task items across DotCortex tracking files.
 11. Interpret `/loom` as a Loom-first routing convention, not a fixed procedure; use `.opencode/commands/loom.md` plus the Loom skill, then infer the right verb from the rest of the request.
+12. Treat `.claude/settings.local.json` hooks and permissions as read-only source material; adapt only the useful manual workflow, never present Claude hooks as active OpenCode features.
 
 ## Build & Apply
 
@@ -49,6 +50,7 @@ loom stow:devuan                        # shared: all linux devuan
 - Prefer minimal edits that fix exactly one thing at a time
 - Take what works, leave what does not, and rewrite it for OpenCode and DotCortex instead of copying client-specific machinery
 - Re-read the current file state before iterative fixes to avoid stale assumptions
+- Use subagents for broad exploration, verbose output, or browser-heavy inspection so main context stays focused
 - For DotCortex-managed output, edit the root `.org` source and re-tangle rather than patching generated files directly
 - Do not claim completion without fresh verification evidence from the current session
 - Plan first when a change is likely to span 3 or more files or alters control-plane behavior
@@ -83,6 +85,13 @@ loom stow:devuan                        # shared: all linux devuan
 - `.opencode/memory/helmcortex-context.md`
 - `.opencode/memory/pvox-workflow.md`
 - `.opencode/memory/antigravity.md`
+
+## OpenCode Skills
+
+- `.opencode/skills/context-hygiene/SKILL.md`
+- `.opencode/skills/dotcortex-gotchas/SKILL.md`
+- `.opencode/skills/dotcortex-multihost/SKILL.md`
+- `.opencode/skills/dotcortex-packages/SKILL.md`
 
 ## Canonical Sources And Read-Only References
 
