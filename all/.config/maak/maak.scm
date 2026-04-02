@@ -85,11 +85,18 @@
          (lambda ()
            (sh "pgrep -af appmenu-registrar || echo 'registrar: (none)'")
            (sh "printf 'GTK_MODULES=%s\\n' \"${GTK_MODULES:-}\"")
+           (sh "xfconf-query -c xsettings -p /Gtk/ShellShowsMenubar 2>/dev/null || echo 'Gtk/ShellShowsMenubar: (unset)'")
+           (sh "xfconf-query -c xsettings -p /Gtk/ShellShowsAppmenu 2>/dev/null || echo 'Gtk/ShellShowsAppmenu: (unset)'")
            (with-core (lambda () "command -v nvim; nvim --version | sed -n '1,2p'"))
            0))
 
    (task 'desktop:heal "Restart XFCE settings + panel in clean env"
-         (lambda () (sh "xfce4-heal")))
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/xfce4-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/x230/.local/bin/xfce4-heal\"; \"$HELPER\"")))
+
+   (task 'desktop:appmenu "Configure XFCE appmenu xsettings and registrar"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/xfce-appmenu-configure\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/xfce-appmenu-configure\"; \"$HELPER\"")))
 
    (task 'swap:heal
          "Safe swap purge + XFCE/Flatpak heal (with RAM safety checks)"
