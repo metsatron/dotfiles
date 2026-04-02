@@ -2,12 +2,12 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: claude-plugins-apply claude-plugins-health
+.PHONY: claude-apply claude-health
 
-claude-plugins-apply:
+claude-apply:
 | @chmod +x $(HOME)/.local/bin/claude-plugins-apply 2>/dev/null || true
 | $(HOME)/.local/bin/claude-plugins-apply
 
-claude-plugins-health:
+claude-health:
 | @chmod +x $(HOME)/.local/bin/claude-plugins-health 2>/dev/null || true
 | $(HOME)/.local/bin/claude-plugins-health

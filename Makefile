@@ -20,6 +20,9 @@ lint:
 # Make tangle depend on lint
 tangle: lint
 
+# Guix profile sets EMACSLOADPATH without trailing : which hides default lisp paths (cl-lib etc)
+export EMACSLOADPATH := $(if $(EMACSLOADPATH),$(addsuffix :,$(EMACSLOADPATH)),)
+
 EMACS_BATCH = $(EMACS) --batch -Q \
   --eval "(setq create-lockfiles nil make-backup-files nil auto-save-default nil backup-inhibited t vc-make-backup-files nil)"
 
@@ -41,8 +44,9 @@ stow:
 #   "existing target is neither a link nor a directory: FILE"
 # to:
 #   "cannot stow PKG/FILE over existing target FILE since neither a link nor a directory"
-# We match both patterns. We also skip absolute-symlink warnings and
-# "not owned by stow" errors (e.g. ~/HelmCortex symlink on mounted machines).
+# We match both patterns plus:
+#   "existing target is not owned by stow: FILE"
+#   "existing target is stowed to a different package: FILE => ..."
 safe-stow:
 | set -euo pipefail; \
 | cd $(HOME)/DotCortex; \
@@ -53,6 +57,7 @@ safe-stow:
 |       -e 's/.*existing target is neither a link nor a directory: \(.*\)$$/\1/p' \
 |       -e 's/.*over existing target \(.*\) since neither.*/\1/p' \
 |       -e 's/.*existing target is not owned by stow: \(.*\)$$/\1/p' \
+|       -e 's/.*existing target is stowed to a different package: \(.*\) =>.*/\1/p' \
 |     | { grep -v '^HelmCortex$$' || true; } \
 |     | while read -r t; do \
 |         case "$$t" in /*) abs="$$t" ;; *) abs="$(HOME)/$$t" ;; esac; \
