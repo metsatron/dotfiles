@@ -485,9 +485,9 @@
            (sh "backup-retropie --auto -y")))
 
    ;; --- Tmux ---
-   (task 'tmux:bootstrap
+   (task 'tmux:apply
          "Install TPM and tmux plugins (resurrect, continuum, yank)"
-         (lambda () (sh "~/.local/bin/tmux-bootstrap")))
+         (lambda () (sh "~/.local/bin/tmux-apply")))
 
    (task 'tmux:health
          "Show tmux, TPM, plugin, and resurrect state"
@@ -503,6 +503,13 @@
 
    ;; --- Pipx ---
    ;; (task 'pipx:apply ...)
+
+   ;; --- Claude Code ---
+   (task 'claude:apply "Install Claude Code plugins from manifest"
+         (lambda () (sh "~/.local/bin/claude-plugins-apply")))
+
+   (task 'claude:health "Show installed Claude Code plugins vs manifest"
+         (lambda () (sh "~/.local/bin/claude-plugins-health")))
 
    ))
 ;; --- Pretty printing for help ---
