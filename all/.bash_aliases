@@ -164,6 +164,11 @@ alias gdbus='hostenv gdbus'
 alias dconf='hostenv dconf'
 alias glib-compile-schemas='hostenv glib-compile-schemas'
 
+# Claude Code model shortcuts
+alias cch='claude --model claude-haiku-4-5'
+alias ccs='claude --model claude-sonnet-4-6'
+alias cco='claude --model claude-opus-4-6'
+
 # ffetch: fastfetch with WezTerm overlay when inside WezTerm
 ffetch() {
   # Optional debug - only fires if you export FFETCH_DEBUG=1
