@@ -40,3 +40,5 @@ export aquaria_data_path=~/.config/aquaria
 export qt_qpa_platformtheme=gtk2
 export MOZ_X11_EGL=1
 . "$HOME/.cargo/env"
+
+. "$HOME/.local/share/../bin/env"
