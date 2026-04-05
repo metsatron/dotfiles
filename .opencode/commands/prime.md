@@ -4,11 +4,6 @@ Use this at the start of a fresh DotCortex session to orient quickly without ove
 
 ## Base Steps
 
-If the user provides an explicit handoff, note path, or working-note path, read that first and treat it as the primary orientation source.
-
-- For Obsidian-style note paths such as `LOGS/...`, use Obsidian CLI to read the note instead of searching the filesystem first.
-- Do not do broad repo or vault discovery when an explicit handoff path was provided unless that note tells you to.
-
 1. Read the top-level repo structure
 2. Read recent history with `git log --oneline -15`
 3. Check current state with `git status --short`
@@ -42,6 +37,5 @@ Then inspect the matching org file or area only as needed.
 
 - Keep the orientation concise
 - Load context just in time, not just in case
-- When a handoff path is given, prefer path-first orientation over repo-first orientation
 - Prefer canonical org sources over generated overlays during orientation
 - Flag likely 3+ file or control-plane changes early so implementation does not start blind

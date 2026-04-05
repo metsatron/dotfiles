@@ -32,13 +32,11 @@ if [ -d "$HOME/.cargo/bin" ] ; then
 fi
 
 # DXC compiler
-if [ -d "$HOME/.cargo/bin" ] ; then
-    PATH="~/dxc-artifacts/bin:$PATH"
+if [ -d "$HOME/dxc-artifacts/bin" ] ; then
+    PATH="$HOME/dxc-artifacts/bin:$PATH"
 fi
 
 export aquaria_data_path=~/.config/aquaria
 export qt_qpa_platformtheme=gtk2
 export MOZ_X11_EGL=1
-. "$HOME/.cargo/env"
-
-. "$HOME/.local/share/../bin/env"
+[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
