@@ -12,15 +12,15 @@ npm-diff:
 | @chmod +x $(HOME)/.local/bin/npm-diff 2>/dev/null || true
 | $(HOME)/.local/bin/npm-diff
 
-# Install anything new from the manifest, do not uninstall extras, do not touch existing versions.
+# Install missing packages and update tracked packages, but do not uninstall extras.
 npm-sync:
 | @chmod +x $(HOME)/.local/bin/npm-apply 2>/dev/null || true
-| ENFORCE=0 UNINSTALL=0 UPDATE=0 $(HOME)/.local/bin/npm-apply
+| ENFORCE=0 UNINSTALL=0 UPDATE=1 $(HOME)/.local/bin/npm-apply
 
-# Strict apply, install and enforce manifest membership, but do not auto upgrade versions.
+# Strict apply, install/update tracked packages, and enforce manifest membership.
 npm-apply:
 | @chmod +x $(HOME)/.local/bin/npm-apply 2>/dev/null || true
-| ENFORCE=1 UNINSTALL=1 UPDATE=0 $(HOME)/.local/bin/npm-apply
+| ENFORCE=1 UNINSTALL=1 UPDATE=1 $(HOME)/.local/bin/npm-apply
 
 npm-health:
 | @chmod +x $(HOME)/.local/bin/npm-health 2>/dev/null || true
