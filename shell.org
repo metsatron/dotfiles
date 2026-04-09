@@ -130,6 +130,15 @@ fi
 # Core PATH entries
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/local/sbin:$PATH"
 
+# Homebrew / Linuxbrew
+if [ -d "/home/linuxbrew/.linuxbrew/bin" ]; then
+  export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}"
+  export PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+elif [ -d "/opt/homebrew/bin" ]; then
+  export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
+  export PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+fi
+
 # Guix current channel
 if [ -d "$HOME/.config/guix/current/bin" ]; then
   export PATH="$HOME/.config/guix/current/bin:$PATH"
@@ -154,7 +163,7 @@ if [ -r "$HOME/.guix-extra-profiles/core/core/etc/profile" ]; then
 fi
 
 # HelmCortex FORGE bin (auryn, pipelines, sapphire-server)
-if [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
+if [ -d "$HOME/HelmCortex/FORGE/bin" ] && ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
   export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
 fi
 
@@ -472,13 +481,97 @@ if [ -z "$HOST" ] || [ -z "$MOUNT_NAME" ]; then
 fi
 
 MNT="$HOME/mnt/$MOUNT_NAME"
-mkdir -p "$MNT"
+mkdir -p "$HOME/mnt"
 
-if mountpoint -q "$MNT"; then
+MOUNT_OWNED=0
+SSHFS_PID=
+SSHFS_LOST=0
+SSHFS_LOG="$(mktemp "${TMPDIR:-/tmp}/sshfs-open-home.${MOUNT_NAME}.XXXXXX")"
+
+report() {
+  printf '%s\n' "$*" >&2
+}
+
+report_fail() {
+  report "sshfs-open-home: $*"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Mount ${HOST} failed" "$*"
+  fi
+}
+
+dump_sshfs_log() {
+  if [ -s "$SSHFS_LOG" ]; then
+    while IFS= read -r line; do
+      report "sshfs: $line"
+    done <"$SSHFS_LOG"
+  fi
+}
+
+is_mounted() {
+  grep -F " $MNT " /proc/self/mountinfo >/dev/null 2>&1
+}
+
+force_unmount() {
+  (fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || umount -l "$MNT" || true) >/dev/null 2>&1
+}
+
+monitor_mount_loss() {
+  local mount_miss_count=0
+
+  while :; do
+    if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+      SSHFS_LOST=1
+      break
+    fi
+
+    if is_mounted; then
+      mount_miss_count=0
+    else
+      mount_miss_count=$((mount_miss_count + 1))
+      if [ "$mount_miss_count" -ge 3 ]; then
+        SSHFS_LOST=1
+        break
+      fi
+    fi
+
+    sleep 2
+  done
+
+  if [ "$SSHFS_LOST" -eq 1 ] && is_mounted; then
+    report "sshfs-open-home: mount ${MOUNT_NAME} lost; unmounting ${MOUNT_NAME}."
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send "Mount ${HOST} lost" "Unmounting ${MOUNT_NAME}."
+    fi
+    force_unmount
+  fi
+}
+
+cleanup() {
+  if [ "$MOUNT_OWNED" -eq 1 ] && is_mounted; then
+    if [ "$SSHFS_LOST" -eq 1 ]; then
+      force_unmount
+    else
+      (fusermount3 -u "$MNT" || fusermount -u "$MNT" || fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || umount -l "$MNT" || true) >/dev/null 2>&1
+    fi
+  fi
+
+  if [ -n "${SSHFS_LOG:-}" ]; then
+    rm -f "$SSHFS_LOG"
+  fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+if is_mounted; then
   if timeout 2 ls "$MNT" >/dev/null 2>&1; then
     exec thunar "$MNT"
   fi
-  (fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || true) >/dev/null 2>&1
+  force_unmount
+fi
+
+if ! mkdir -p "$MNT" 2>/dev/null; then
+  force_unmount
+  mkdir -p "$MNT"
 fi
 
 if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
@@ -497,18 +590,93 @@ if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
   done
 fi
 
-if sshfs "${HOST}:" "$MNT" \
+MOUNT_OWNED=1
+sshfs -f "${HOST}:" "$MNT" \
   -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,ConnectTimeout=8,ConnectionAttempts=1,Compression=no,idmap=user,dir_cache=yes,dcache_timeout=30,dcache_stat_timeout=30,dcache_link_timeout=30,dcache_dir_timeout=30,auto_cache,attr_timeout=30,entry_timeout=30,negative_timeout=5,max_conns=4 \
-  </dev/null
-then
-  exec thunar "$MNT"
+  </dev/null >"$SSHFS_LOG" 2>&1 &
+SSHFS_PID=$!
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if is_mounted && timeout 2 ls "$MNT" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+    wait "$SSHFS_PID" || true
+    MOUNT_OWNED=0
+    dump_sshfs_log
+    report_fail "SSHFS exited before the mount became ready."
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! (is_mounted && timeout 2 ls "$MNT" >/dev/null 2>&1); then
+  if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+    wait "$SSHFS_PID" || true
+  fi
+  MOUNT_OWNED=0
+  dump_sshfs_log
+  report_fail "SSHFS never finished mounting ${MOUNT_NAME}."
+  exit 1
 fi
+
+rm -f "$SSHFS_LOG"
+SSHFS_LOG=
+
+monitor_mount_loss &
+trap - EXIT HUP INT TERM
+MOUNT_OWNED=0
+thunar "$MNT" >/dev/null 2>&1 &
+
+exit 0
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/sshfs-emergency-unmount-home :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -euo pipefail
+
+HOST="${1:-}"
+MOUNT_NAME="${2:-${1:-}}"
+
+if [ -z "$HOST" ] || [ -z "$MOUNT_NAME" ]; then
+  printf 'Usage: %s HOST [MOUNT_NAME]\n' "${0##*/}" >&2
+  exit 2
+fi
+
+MNT="$HOME/mnt/$MOUNT_NAME"
+
+is_mounted() {
+  grep -F " $MNT " /proc/self/mountinfo >/dev/null 2>&1
+}
+
+report() {
+  printf '%s\n' "$*" >&2
+}
+
+report_fail() {
+  report "sshfs-emergency-unmount-home: $*"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Unmount ${HOST} failed" "$*"
+  fi
+}
+
+if ! is_mounted; then
+  report "sshfs-emergency-unmount-home: ${MOUNT_NAME} is not mounted."
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Unmount ${HOST}" "${MOUNT_NAME} is not mounted."
+  fi
+  exit 0
+fi
+
+if ! (fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || umount -l "$MNT") >/dev/null 2>&1; then
+  report_fail "Could not unmount ${MOUNT_NAME}."
+  exit 1
+fi
+
+report "sshfs-emergency-unmount-home: ${MOUNT_NAME} disconnected."
 
 if command -v notify-send >/dev/null 2>&1; then
-  notify-send "Mount ${HOST} failed" "Try ssh ${HOST} in a terminal to confirm access."
+  notify-send "Unmount ${HOST}" "${MOUNT_NAME} was disconnected."
 fi
-
-exit 1
 #+END_SRC
 
 #+BEGIN_SRC conf :tangle linux/.local/share/applications/mount-t430.desktop :mkdirp yes :comments no
@@ -531,6 +699,30 @@ Name=Mount X230
 Comment=Mount the X230 home directory over SSH
 Exec=/home/metsatron/.local/bin/sshfs-open-home x230
 Icon=folder-remote
+Terminal=false
+StartupNotify=false
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/unmount-x230.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Emergency Unmount X230
+Comment=Force-unmount the X230 home directory
+Exec=/home/metsatron/.local/bin/sshfs-emergency-unmount-home x230
+Icon=process-stop
+Terminal=false
+StartupNotify=false
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/unmount-t430.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Emergency Unmount T430
+Comment=Force-unmount the T430 home directory
+Exec=/home/metsatron/.local/bin/sshfs-emergency-unmount-home t430
+Icon=process-stop
 Terminal=false
 StartupNotify=false
 #+END_SRC
@@ -635,6 +827,22 @@ fi
 # Stop runtime loader from picking Guix libs for host binaries like /bin/ps
 unset LD_LIBRARY_PATH
 
+# Only add PATH entries that are actually traversable; dead mounts can make
+# /usr/bin/env fail interpreter lookup with ENOTCONN.
+path_dir_healthy() {
+  [ -d "$1" ] || return 1
+  ls -d "$1" >/dev/null 2>&1
+}
+
+# Homebrew / Linuxbrew
+if path_dir_healthy "/home/linuxbrew/.linuxbrew/bin"; then
+  export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}"
+  export PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+elif path_dir_healthy "/opt/homebrew/bin"; then
+  export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
+  export PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+fi
+
 # Shared SSH agent for shells and GUI-launched tools
 if [ -x "$HOME/.local/bin/ssh-agent-ensure" ]; then
   eval "$("$HOME/.local/bin/ssh-agent-ensure" --print)"
@@ -670,7 +878,7 @@ dedupe_path_var() {
 
 # fnm: tell it the shell explicitly to avoid calling `ps`
 FNM_PATH="/home/metsatron/.local/share/fnm"
-if [ -d "$FNM_PATH" ]; then
+if path_dir_healthy "$FNM_PATH"; then
   export PATH="$FNM_PATH:$PATH"
   if [ -n "$ZSH_VERSION" ]; then
     eval "$(fnm env --shell=zsh --use-on-cd)"
@@ -684,7 +892,7 @@ fi
 
 # Optional user-defined PATH extras (works even if array not set)
 for dir in ${custom_paths:+${custom_paths[@]}}; do
-  [ -d "$dir" ] && PATH="$dir:$PATH"
+  path_dir_healthy "$dir" && PATH="$dir:$PATH"
 done
 
 <<shared-claude-path>>
@@ -766,7 +974,7 @@ for dir in \
   "$HOME/HelmCortex/FORGE/VoxForge/scripts" \
   "$HOME/stl/prefix"
 do
-  [[ -d "$dir" ]] && path+="$dir"
+  path_dir_healthy "$dir" && path+="$dir"
 done
 
 #+END_SRC

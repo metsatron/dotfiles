@@ -10,13 +10,97 @@ if [ -z "$HOST" ] || [ -z "$MOUNT_NAME" ]; then
 fi
 
 MNT="$HOME/mnt/$MOUNT_NAME"
-mkdir -p "$MNT"
+mkdir -p "$HOME/mnt"
 
-if mountpoint -q "$MNT"; then
+MOUNT_OWNED=0
+SSHFS_PID=
+SSHFS_LOST=0
+SSHFS_LOG="$(mktemp "${TMPDIR:-/tmp}/sshfs-open-home.${MOUNT_NAME}.XXXXXX")"
+
+report() {
+  printf '%s\n' "$*" >&2
+}
+
+report_fail() {
+  report "sshfs-open-home: $*"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send "Mount ${HOST} failed" "$*"
+  fi
+}
+
+dump_sshfs_log() {
+  if [ -s "$SSHFS_LOG" ]; then
+    while IFS= read -r line; do
+      report "sshfs: $line"
+    done <"$SSHFS_LOG"
+  fi
+}
+
+is_mounted() {
+  grep -F " $MNT " /proc/self/mountinfo >/dev/null 2>&1
+}
+
+force_unmount() {
+  (fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || umount -l "$MNT" || true) >/dev/null 2>&1
+}
+
+monitor_mount_loss() {
+  local mount_miss_count=0
+
+  while :; do
+    if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+      SSHFS_LOST=1
+      break
+    fi
+
+    if is_mounted; then
+      mount_miss_count=0
+    else
+      mount_miss_count=$((mount_miss_count + 1))
+      if [ "$mount_miss_count" -ge 3 ]; then
+        SSHFS_LOST=1
+        break
+      fi
+    fi
+
+    sleep 2
+  done
+
+  if [ "$SSHFS_LOST" -eq 1 ] && is_mounted; then
+    report "sshfs-open-home: mount ${MOUNT_NAME} lost; unmounting ${MOUNT_NAME}."
+    if command -v notify-send >/dev/null 2>&1; then
+      notify-send "Mount ${HOST} lost" "Unmounting ${MOUNT_NAME}."
+    fi
+    force_unmount
+  fi
+}
+
+cleanup() {
+  if [ "$MOUNT_OWNED" -eq 1 ] && is_mounted; then
+    if [ "$SSHFS_LOST" -eq 1 ]; then
+      force_unmount
+    else
+      (fusermount3 -u "$MNT" || fusermount -u "$MNT" || fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || umount -l "$MNT" || true) >/dev/null 2>&1
+    fi
+  fi
+
+  if [ -n "${SSHFS_LOG:-}" ]; then
+    rm -f "$SSHFS_LOG"
+  fi
+}
+
+trap cleanup EXIT HUP INT TERM
+
+if is_mounted; then
   if timeout 2 ls "$MNT" >/dev/null 2>&1; then
     exec thunar "$MNT"
   fi
-  (fusermount3 -uz "$MNT" || fusermount -uz "$MNT" || true) >/dev/null 2>&1
+  force_unmount
+fi
+
+if ! mkdir -p "$MNT" 2>/dev/null; then
+  force_unmount
+  mkdir -p "$MNT"
 fi
 
 if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
@@ -35,15 +119,42 @@ if [ -n "${DISPLAY:-}${WAYLAND_DISPLAY:-}" ]; then
   done
 fi
 
-if sshfs "${HOST}:" "$MNT" \
+MOUNT_OWNED=1
+sshfs -f "${HOST}:" "$MNT" \
   -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,ConnectTimeout=8,ConnectionAttempts=1,Compression=no,idmap=user,dir_cache=yes,dcache_timeout=30,dcache_stat_timeout=30,dcache_link_timeout=30,dcache_dir_timeout=30,auto_cache,attr_timeout=30,entry_timeout=30,negative_timeout=5,max_conns=4 \
-  </dev/null
-then
-  exec thunar "$MNT"
+  </dev/null >"$SSHFS_LOG" 2>&1 &
+SSHFS_PID=$!
+
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  if is_mounted && timeout 2 ls "$MNT" >/dev/null 2>&1; then
+    break
+  fi
+  if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+    wait "$SSHFS_PID" || true
+    MOUNT_OWNED=0
+    dump_sshfs_log
+    report_fail "SSHFS exited before the mount became ready."
+    exit 1
+  fi
+  sleep 1
+done
+
+if ! (is_mounted && timeout 2 ls "$MNT" >/dev/null 2>&1); then
+  if ! kill -0 "$SSHFS_PID" 2>/dev/null; then
+    wait "$SSHFS_PID" || true
+  fi
+  MOUNT_OWNED=0
+  dump_sshfs_log
+  report_fail "SSHFS never finished mounting ${MOUNT_NAME}."
+  exit 1
 fi
 
-if command -v notify-send >/dev/null 2>&1; then
-  notify-send "Mount ${HOST} failed" "Try ssh ${HOST} in a terminal to confirm access."
-fi
+rm -f "$SSHFS_LOG"
+SSHFS_LOG=
 
-exit 1
+monitor_mount_loss &
+trap - EXIT HUP INT TERM
+MOUNT_OWNED=0
+thunar "$MNT" >/dev/null 2>&1 &
+
+exit 0
