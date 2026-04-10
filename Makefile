@@ -46,18 +46,25 @@ stow:
 #   "cannot stow PKG/FILE over existing target FILE since neither a link nor a directory"
 # We match both patterns plus:
 #   "existing target is not owned by stow: FILE"
-#   "existing target is stowed to a different package: FILE => ..."
+# If preview reports "existing target is stowed to a different package",
+# abort before backing up/removing anything: that target is already repo-owned.
 safe-stow:
 | set -euo pipefail; \
 | cd $(HOME)/DotCortex; \
 | for pkg in $(STOW_PKGS); do \
+|   preview_file=$$(mktemp); \
 |   echo ">> preview $$pkg"; \
-|   { stow -n $$pkg 2>&1 || true; } \
-|     | sed -n \
+|   stow -n --ignore='\.bak\.' $$pkg >"$$preview_file" 2>&1 || true; \
+|   if grep -q 'existing target is stowed to a different package:' "$$preview_file"; then \
+|     cat "$$preview_file"; \
+|     rm -f "$$preview_file"; \
+|     exit 1; \
+|   fi; \
+|   sed -n \
 |       -e 's/.*existing target is neither a link nor a directory: \(.*\)$$/\1/p' \
 |       -e 's/.*over existing target \(.*\) since neither.*/\1/p' \
 |       -e 's/.*existing target is not owned by stow: \(.*\)$$/\1/p' \
-|       -e 's/.*existing target is stowed to a different package: \(.*\) =>.*/\1/p' \
+|       "$$preview_file" \
 |     | { grep -v '^HelmCortex$$' || true; } \
 |     | while read -r t; do \
 |         case "$$t" in /*) abs="$$t" ;; *) abs="$(HOME)/$$t" ;; esac; \
@@ -69,6 +76,7 @@ safe-stow:
 |           rm -rf "$$abs"; \
 |         fi; \
 |       done; \
+|   rm -f "$$preview_file"; \
 |   echo ">> stow $$pkg"; \
 |   if stow --ignore='\.bak\.' $$pkg 2>&1; then \
 |     true; \
