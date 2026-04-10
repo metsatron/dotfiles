@@ -24,6 +24,7 @@
    "fastfetch" "wfetch" "uwufetch" "macchina"
    "rofi"
    ;; "kitty"
+   "deskflow"
    "gimp" "inkscape" "birdtray" "icedove" "gnome-boxes"
    "vlc"
    ;; "audacity"
