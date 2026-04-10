@@ -5,6 +5,15 @@
 # Core PATH entries
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/local/sbin:$PATH"
 
+# Homebrew / Linuxbrew
+if [ -d "/home/linuxbrew/.linuxbrew/bin" ]; then
+  export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}"
+  export PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+elif [ -d "/opt/homebrew/bin" ]; then
+  export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/opt/homebrew}"
+  export PATH="$HOMEBREW_PREFIX/bin:$HOMEBREW_PREFIX/sbin:$PATH"
+fi
+
 # Guix current channel
 if [ -d "$HOME/.config/guix/current/bin" ]; then
   export PATH="$HOME/.config/guix/current/bin:$PATH"
@@ -29,7 +38,7 @@ if [ -r "$HOME/.guix-extra-profiles/core/core/etc/profile" ]; then
 fi
 
 # HelmCortex FORGE bin (auryn, pipelines, sapphire-server)
-if [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
+if [ -d "$HOME/HelmCortex/FORGE/bin" ] && ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
   export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
 fi
 
