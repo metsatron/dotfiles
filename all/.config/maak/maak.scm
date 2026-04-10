@@ -81,12 +81,13 @@
          (lambda ()
            (sh "dotcortex-stow-health")))
 
-   (task 'health "Show registrar, GTK module, and nvim path"
-         (lambda ()
-           (sh "pgrep -af appmenu-registrar || echo 'registrar: (none)'")
-           (sh "printf 'GTK_MODULES=%s\\n' \"${GTK_MODULES:-}\"")
-           (sh "xfconf-query -c xsettings -p /Gtk/ShellShowsMenubar 2>/dev/null || echo 'Gtk/ShellShowsMenubar: (unset)'")
-           (sh "xfconf-query -c xsettings -p /Gtk/ShellShowsAppmenu 2>/dev/null || echo 'Gtk/ShellShowsAppmenu: (unset)'")
+    (task 'health "Show registrar, GTK module, and nvim path"
+          (lambda ()
+            (sh "pgrep -af appmenu-registrar || echo 'registrar process: (none)'")
+            (sh "gdbus call --session --dest com.canonical.AppMenu.Registrar --object-path /com/canonical/AppMenu/Registrar --method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1 && echo 'registrar bus: reachable' || echo 'registrar bus: unreachable'")
+            (sh "printf 'GTK_MODULES=%s\\n' \"${GTK_MODULES:-}\"")
+            (sh "xfconf-query -c xsettings -p /Gtk/ShellShowsMenubar 2>/dev/null || echo 'Gtk/ShellShowsMenubar: (unset)'")
+            (sh "xfconf-query -c xsettings -p /Gtk/ShellShowsAppmenu 2>/dev/null || echo 'Gtk/ShellShowsAppmenu: (unset)'")
            (with-core (lambda () "command -v nvim; nvim --version | sed -n '1,2p'"))
            0))
 
@@ -94,9 +95,9 @@
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/xfce4-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/x230/.local/bin/xfce4-heal\"; \"$HELPER\"")))
 
-   (task 'desktop:appmenu "Configure XFCE appmenu xsettings and registrar"
+   (task 'desktop:appmenu "Configure XFCE appmenu and refresh panel/session daemons"
          (lambda ()
-           (sh "HELPER=\"$HOME/.local/bin/xfce-appmenu-configure\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/xfce-appmenu-configure\"; \"$HELPER\"")))
+           (sh "HELPER=\"$HOME/.local/bin/xfce4-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/x230/.local/bin/xfce4-heal\"; \"$HELPER\"")))
 
    (task 'swap:heal
          "Safe swap purge + XFCE/Flatpak heal (with RAM safety checks)"
@@ -402,6 +403,15 @@
 
    (task 'npm:health "Show DotCortex Node env and versions"
          (lambda () (sh "~/.local/bin/npm-health")))
+
+   ;; --- Fonts ---
+   (task 'fonts:triage
+         "Move bulky NerdFont variants + OpenType extras out of overlay to ~/.local/share/fonts/{NerdFontExtra,OpenTypeExtra}"
+         (lambda ()
+           (sh "~/.local/bin/fonts-nerdfont-extra-triage && ~/.local/bin/fonts-opentype-extra-triage")))
+
+   (task 'fonts:cache "Rebuild fontconfig cache"
+         (lambda () (sh "fc-cache -f")))
 
    ;; --- Pip ---
    (task 'pip:capture "Capture live pip to DotCortex SSV"
