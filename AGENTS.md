@@ -1,9 +1,10 @@
-# DotCortex — Agent Instructions
+# DotCortex - Agent Instructions
 
 ## What This Is
 
-DotCortex is a literate, declarative, reproducible dotfiles system. Org-mode files at the repo root are the single source of truth. They tangle into overlay directories which GNU Stow symlinks into `$HOME`.
+DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. Org-mode files are the single source of truth. They tangle into overlay directories which GNU Stow symlinks into `$HOME`.
 
+See `agents.org`, `skills.org`, and `hooks.org` for the shared agent schema and harness-specific split.
 See `CLAUDE.md` for full architecture details, common workflows, and package manifest reference.
 
 ## Critical Rules
@@ -97,11 +98,11 @@ It filters out HelmCortex (user-managed symlink on mounted machines), backs up r
 | NPM      | `npm.org`      | `npm:apply`, `npm:diff`         |
 | Guix     | `guix.org`     | `guix:apply`, `guix:pull`       |
 | Flatpak  | `flatpak.org`  | `flatpak:apply`, `flatpak:diff` |
-| Snap     | `snap.org`     | `snap:apply`, `snap:diff`       |
-| Cargo    | `cargo.org`    | `cargo:apply`, `cargo:diff`     |
-| AppImage | `appimage.org` | `appimage:update`               |
-| Homebrew | `homebrew.org` | `brew:apply`                    |
-| Apps     | `app.org`      | `app:apply`                     |
+| Snap     | `snap.org`      | `snap:apply`, `snap:diff`       |
+| Cargo    | `cargo.org`     | `cargo:apply`, `cargo:diff`     |
+| AppImage | `appimage.org`  | `appimage:update`               |
+| Homebrew | `homebrew.org`  | `brew:apply`                    |
+| Apps     | `app.org`       | `app:apply`                     |
 
 ### Adding a New Package Manager
 
@@ -150,7 +151,7 @@ DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex do
 
 DotCortex's only touchpoint is the shell PATH entry (in `.zshenv` and `.zshrc`) adding `$HOME/HelmCortex/FORGE/bin` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
 
-On multi-machine setups, HelmCortex may be mounted (e.g., `~/mnt/x230/HelmCortex`) and symlinked to `~/HelmCortex`.
+On multi-machine setups, HelmCortex may be mounted (e.g. `~/mnt/x230/HelmCortex`) and symlinked to `~/HelmCortex`.
 
 ## Multi-Machine Setup (Star Fleet)
 
@@ -161,8 +162,21 @@ On multi-machine setups, HelmCortex may be mounted (e.g., `~/mnt/x230/HelmCortex
 ### Overlay Scoping
 
 - `all/` — cross-platform shared
-- `linux/` — Linux-only (host-wrap, Guix wrappers)
-- `debian/` — Debian-family (apt/nala)
-- `devuan/` — sysv-init shared (non-systemd daemons, XFCE panel launchers)
-- `x230/` — X230-specific (earlyoom, neofetch, fastfetch, GTK, wezterm, systemd services)
-- `t480s/` — T480s-specific (future per-machine configs)
+- `linux/` — Linux-only (Guix is Linux-only, so `host-wrap` lives here)
+- `debian/` — Debian-family shared (apt/nala packages)
+- `devuan/` — sysv-init shared (non-systemd daemons, desktop launchers for XFCE panel scripts)
+- `x230/` — X230-specific (earlyoom, neofetch/fastfetch configs, GTK settings, wezterm, systemd services)
+- `t480s/` — T480s-specific (future machine-specific configs)
+
+### .zshenv for SSH PATH
+
+The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh invocations (login, interactive, scripts, SSH). This ensures `emacs`, `nvim`, `guile`, and other Guix tools are available over SSH without manual PATH setup.
+
+## When Working on DotCortex
+
+- Always edit `.org` source, never tangled output
+- The Makefile is tangled from `loom.org` — edit `loom.org`, not Makefile
+- Test with `make tangle` before stowing
+- Use `make preview-stow` to dry-run before applying
+- After adding new package manager support, add loom verbs AND make targets
+- When searching for a tool, check Guix profiles (`~/.guix-extra-profiles/core/core/bin/`) before assuming it's not installed
