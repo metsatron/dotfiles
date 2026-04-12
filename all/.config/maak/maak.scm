@@ -511,15 +511,22 @@
    (task 'pip:health "Show DotCortex Python/pip env and versions"
          (lambda () (sh "~/.local/bin/pip-health")))
 
-   ;; --- Pipx ---
-   ;; (task 'pipx:apply ...)
+    ;; --- Pipx ---
+    ;; (task 'pipx:apply ...)
 
-   ;; --- Claude Code ---
-   (task 'claude:apply "Install Claude Code plugins from manifest"
-         (lambda () (sh "~/.local/bin/claude-plugins-apply")))
+    ;; --- Agent schema ---
+    (task 'agents:apply "Tangle agent docs, skills, commands, and hooks"
+          (lambda () (sh "~/DotCortex/all/.local/bin/agents-apply")))
 
-   (task 'claude:health "Show installed Claude Code plugins vs manifest"
-         (lambda () (sh "~/.local/bin/claude-plugins-health")))
+    (task 'agents:health "Show agent docs and generated output roots"
+          (lambda () (sh "printf 'AGENTS.md\n'; sed -n '1,12p' AGENTS.md; printf '\nCLAUDE.md\n'; sed -n '1,12p' CLAUDE.md; printf '\n.agents/skills\n'; find .agents/skills -maxdepth 2 -name SKILL.md | sort | sed -n '1,12p'; printf '\n.claude/skills\n'; find .claude/skills -maxdepth 2 -name SKILL.md | sort | sed -n '1,12p'")))
+
+    ;; --- Claude plugin helpers ---
+    (task 'claude:apply "Install Claude plugins from the managed manifest"
+          (lambda () (sh "~/.local/bin/claude-plugins-apply")))
+
+    (task 'claude:health "Show installed Claude plugins vs manifest"
+          (lambda () (sh "~/.local/bin/claude-plugins-health")))
 
    ))
 ;; --- Pretty printing for help ---
@@ -561,7 +568,12 @@
                         (not (string-prefix? "root:" nm))
                         (not (string-prefix? "stow:" nm))
                         (not (string-prefix? "tmux:" nm))
-                        (not (string-prefix? "backup:" nm))))))
+                         (not (string-prefix? "backup:" nm))
+                         (not (string-prefix? "agents:" nm))))))
+
+  (print-group "Agent commands"
+               (lambda (t)
+                 (string-prefix? "agents:" (task-name-str t))))
 
   (print-group "Stow / dotfiles commands"
                (lambda (t)

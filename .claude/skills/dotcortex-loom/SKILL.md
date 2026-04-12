@@ -85,6 +85,13 @@ loom stow               # Stow all overlays
 loom stow:health        # Check symlink health
 ```
 
+## Apply-Style Workflows
+
+Loom apply flows are part of this skill. Use `loom <verb>` directly for apply, diff, capture, stow, and rebuild actions.
+
+- Do not create a separate `loom-apply` skill.
+- Keep the apply logic in Loom verbs and this shared skill only.
+
 ## Editing Configs
 
 CRITICAL: Never edit files inside `all/`, `linux/`, `debian/`, `think/` etc directly. These are tangled output. Edit the `.org` source file instead.
