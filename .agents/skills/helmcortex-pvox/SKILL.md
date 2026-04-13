@@ -1,6 +1,6 @@
 ---
 name: helmcortex-pvox
-description: Speak through VoxForge pvox with Flatpak Pied models.
+description: Use HelmCortex VoxForge pvox to speak text, stream transcripts, inspect voice mappings, and work against Flatpak-managed Pied models.
 ---
 
 # HelmCortex PVOX Operations

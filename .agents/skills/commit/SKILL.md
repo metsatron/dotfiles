@@ -47,8 +47,9 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
 7. Show `git log -1` to confirm.
 
 ## Rules
+
 - If there are no changes, say so and stop.
 - If changes span multiple unrelated scopes, suggest splitting into multiple commits.
 - If the user's hint conflicts with what the diff shows, trust the diff.
 - Do not push unless explicitly asked.
-- Remember: .org files are the source of truth, tangled output files are generated.
+- Remember: `.org` files are the source of truth, tangled output files are generated.

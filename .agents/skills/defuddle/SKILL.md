@@ -1,6 +1,6 @@
 ---
 name: defuddle
-description: Extract clean markdown from web pages using Defuddle CLI.
+description: Extract clean markdown from web pages using Defuddle CLI, removing clutter, navigation, and ads.
 ---
 
 # Defuddle

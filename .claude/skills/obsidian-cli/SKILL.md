@@ -7,14 +7,12 @@ description: Use the official Obsidian CLI to act on a live vault, including not
 
 Use this skill when the task needs the running Obsidian app, live vault state, or the official `obsidian` CLI rather than plain filesystem edits.
 
-## Trigger Conditions
+## Use This Skill For
 
-Load this skill when any of these are true:
-
-- the user wants to read, create, append, prepend, move, rename, or delete notes through Obsidian
-- the user asks to work with daily notes, tasks, tags, backlinks, sync history, Bases, or file history
-- the task involves plugin or theme development and needs `obsidian eval`, screenshots, console logs, CSS inspection, or DOM inspection
-- the user is asking for vault automation or shell workflows built around the official CLI
+- reading, creating, appending, prepending, moving, renaming, or deleting notes through Obsidian
+- working with daily notes, tasks, tags, backlinks, sync history, Bases, or file history
+- plugin or theme development that needs `obsidian eval`, screenshots, console logs, CSS inspection, or DOM inspection
+- vault automation or shell workflows built around the official CLI
 
 Do not load it for pure Markdown authoring, `.base` editing, `.canvas` editing, or GUI-only explanation. Use the format skills for file syntax work.
 
