@@ -1,6 +1,6 @@
 ---
 name: dotcortex-packages
-description: DotCortex package-manager architecture and add-a-manager guidance.
+description: Package manager manifests (guix, pip, npm, flatpak, snap, cargo, appimage, homebrew), SSV format, adding new package managers.
 ---
 
 # DotCortex Package Manifests

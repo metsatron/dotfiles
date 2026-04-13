@@ -1,6 +1,6 @@
 ---
 name: dotcortex-multihost
-description: Machine overlays, mounts, and HelmCortex boundary guidance.
+description: Multi-machine deployment (X230, T480s), overlay scoping, HelmCortex integration, bootstrap fresh machines.
 ---
 
 # DotCortex Multi-Machine Setup (Star Fleet)

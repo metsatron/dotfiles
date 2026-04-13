@@ -1,6 +1,6 @@
 ---
 name: gh
-description: GitHub CLI for repository operations and PR workflows.
+description: GitHub CLI for repo operations, PR management, issue tracking, checking NEXUS repos for updates and releases.
 ---
 
 # GitHub CLI (gh)
