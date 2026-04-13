@@ -82,7 +82,6 @@ Treat the browser as the user's live personal workspace, not a sandbox.
 ### Space Risk Profile
 
 - Perplexity Spaces contain editable metadata and additional management controls.
-- The Space view exposed text such as `Ask anything about SteinerCore: Auryn`, `Files`, `Add links`, `Edit custom instructions`, and other administrative surfaces.
 - This makes broad selectors especially dangerous there.
 - A representative risky element is an `<a href="/spaces/...">` wrapper around the Space badge/title in the thread header; avoid clicking container/header chips when trying to target the composer.
 
@@ -93,10 +92,7 @@ Treat the browser as the user's live personal workspace, not a sandbox.
 
 ### Perplexity Actions Confirmed Unsafe Without Exact Targeting
 
-- Any `browser_type` using `input`
-- Any `browser_type` using `textarea`
-- Any `browser_type` using `[role='textbox']`
-- Any `browser_type` using `[contenteditable='true']`
+- Any `browser_type` using `input`, `textarea`, `[role='textbox']`, or `[contenteditable='true']`
 - Any attempt to infer the composer from broad editable selectors
 
 ### Perplexity Procedure Before Typing
@@ -127,8 +123,8 @@ If exact composer identification is not possible with confidence, stop and repor
 
 ### Selection Rule
 
-- If the user wants the exact webpage operated, use the browser plugin carefully.
-- If the user wants Perplexity's search/model capabilities, prefer `perplexity-web-mcp` first.
+If the user wants the exact webpage operated, use the browser plugin carefully.
+If the user wants Perplexity's search/model capabilities, prefer `perplexity-web-mcp` first.
 
 ## Local Debugging Commands
 

@@ -1,6 +1,6 @@
 ---
 name: dotcortex-gotchas
-description: Central troubleshooting notes for known DotCortex failures.
+description: Troubleshooting DotCortex issues — stow conflicts, tangle failures, Guix installer problems, /tmp permissions.
 ---
 
 # DotCortex Known Gotchas
@@ -23,13 +23,13 @@ make tangle
 
 ## Loom bootstrap (chicken-and-egg)
 
-`loom` needs `~/.config/maak/maak.scm` (placed by stow) and Guix guile. You CANNOT use `loom stow:x230` for the first stow — use `make safe-stow` directly. `INSTALL.sh` handles this by pre-placing `maak.scm` before stow runs (Phase 5.5).
+`loom` needs `~/.config/maak/maak.scm` (placed by stow) and Guix guile. You CANNOT use `loom stow:x230` for the first stow — use `make safe-stow` directly. `INSTALL.sh` handles this by pre-placing `maak.scm` before stow runs.
 
 After the first `make safe-stow`, loom is functional and can be used for all subsequent stow operations.
 
 ## Guix emacs not in SSH PATH
 
-On Guix machines, emacs lives at `~/.guix-extra-profiles/core/core/bin/emacs`. It is NOT in the default SSH PATH. The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh invocations including non-interactive SSH. If using bash over SSH, add the Guix profile to PATH manually:
+On Guix machines, emacs lives at `~/.guix-extra-profiles/core/core/bin/emacs`. NOT in the default SSH PATH. The `.zshenv` (tangled from `shell.org`) sources Guix profiles for ALL zsh invocations including non-interactive SSH. For bash over SSH:
 
 ```bash
 export PATH="$HOME/.guix-extra-profiles/core/core/bin:$PATH"
@@ -53,7 +53,7 @@ Stow has three different conflict message formats across versions and situations
 2. `cannot stow PKG/FILE over existing target FILE since neither...` (stow 2.4+)
 3. `existing target is not owned by stow: FILE` (foreign files/symlinks after repo rename)
 
-The safe-stow target in `loom.org` matches all three with sed patterns, filters out HelmCortex (which is always a user-managed symlink on mounted machines), backs up real files, removes them, then stows. If stow still fails, it auto-retries with `--ignore=HelmCortex`.
+The safe-stow target matches all three with sed patterns, filters out HelmCortex, backs up real files, removes them, then stows. If stow still fails, it auto-retries with `--ignore=HelmCortex`.
 
 ## Guix installer fails on non-interactive terminal
 
@@ -73,27 +73,25 @@ wget https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz
 
 ## LD_PRELOAD libgtk3-nocsd warning
 
-On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a warning about being unable to preload it. This is cosmetic — Guix works fine. Unset `LD_PRELOAD` if it bothers you.
+On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a harmless warning. Ignore it or `unset LD_PRELOAD`.
 
 ## Absolute symlinks in overlay dirs abort stow
 
-If an org file tangles an absolute symlink (e.g. `.config/guix/current -> /var/guix/...`), stow will refuse to manage it. Remove such symlinks from overlay dirs before stowing — they are machine-specific and should not be stow-managed. `INSTALL.sh` auto-cleans these.
+If an org file tangles an absolute symlink (e.g. `.config/guix/current -> /var/guix/...`), stow will refuse to manage it. Remove such symlinks from overlay dirs before stowing — they are machine-specific. `INSTALL.sh` auto-cleans these.
 
 ## /tmp permissions break tangle AND guix pull
 
 If `/tmp` has restrictive permissions (e.g. `755` instead of `1777`), two things break:
 
-1. **Tangle**: emacs `org-persist` can't create temp directories -> `Permission denied, /tmp/org-persist-`
-2. **Guix pull/build**: sandbox can't bind-mount -> `bind: Permission denied`
+1. **Tangle**: emacs `org-persist` can't create temp directories
+2. **Guix pull/build**: sandbox can't bind-mount
 
-Fix the root cause: `sudo chmod 1777 /tmp`
-
-Workaround for tangle only: `TMPDIR=~/.cache/tmp make tangle`
+Fix: `sudo chmod 1777 /tmp`. Tangle-only workaround: `TMPDIR=~/.cache/tmp make tangle`
 
 ## pipefail interaction with grep -v
 
-Under `set -euo pipefail`, `grep -v PATTERN` returns exit code 1 when it filters ALL lines (nothing passes through). This kills the pipeline. Always wrap: `{ grep -v PATTERN || true; }`
+Under `set -euo pipefail`, `grep -v PATTERN` returns exit code 1 when it filters ALL lines. Kills the pipeline. Always wrap: `{ grep -v PATTERN || true; }`
 
 ## Guix substituter display bug
 
-`guix package` occasionally crashes with `Wrong type argument in position 1: #f` during substitute download progress display. This is a cosmetic bug in `guix/progress.scm`. Retry the command — most substitutes will already be cached so it's fast.
+`guix package` occasionally crashes with `Wrong type argument in position 1: #f` during substitute download progress display. Cosmetic — retry the command.
