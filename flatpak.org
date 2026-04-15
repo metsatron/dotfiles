@@ -114,7 +114,7 @@ Include directly with =make -f all/.mk/flatpak.mk <target>= or add to your main 
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-release-diff flatpak-release-sync flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
+.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-release-diff flatpak-release-sync flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset flatpak-ds4-udev-install
 
 flatpak-remotes:
 | @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
@@ -171,6 +171,10 @@ flatpak-bridge:
 flatpak-bridge-reset:
 | @chmod +x $(HOME)/.local/bin/flatpak-desktop-bridge-reset 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-desktop-bridge-reset
+
+flatpak-ds4-udev-install:
+| @chmod +x $(HOME)/.local/bin/ds4-udev-install 2>/dev/null || true
+| $(HOME)/.local/bin/ds4-udev-install
 #+END_SRC
 
 * Capture live state into the manifest
@@ -1345,8 +1349,9 @@ so Moonlight does not see drift at rest.
 
 Moonlight uses SDL2 for gamepad input. The kernel flatness alone is not
 enough — SDL must also be told to honour it via
-=SDL_LINUX_JOYSTICK_DEADZONES=1=. That override is applied once by
-=flatpak override= (see below) and persists across launches.
+=SDL_LINUX_JOYSTICK_DEADZONES=1=. The launcher below now passes the required
+SDL environment variables on every run, and the setup helper still persists
+them via =flatpak override= so the Flatpak state is visible and stable.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/ds4-right-deadzone :shebang "#!/usr/bin/env bash" :mkdirp yes
 # ~/.local/bin/ds4-right-deadzone
@@ -1361,11 +1366,52 @@ set -euo pipefail
 DEADZONE_L="${DS4_DEADZONE_L:-45}"
 DEADZONE_R="${DS4_DEADZONE_R:-35}"
 WAIT_SECS=20
+TARGET_VENDOR="054c"
 
 matches_target_name() {
   local name="$1"
   [[ "$name" == "Sony Interactive Entertainment Wireless Controller" ]] \
     || [[ "$name" == "Wireless Controller" ]]
+}
+
+read_sysfs_id() {
+  local evsys="$1" key="$2" path=""
+
+  for path in \
+    "$evsys/device/id/$key" \
+    "$evsys/device/device/id/$key" \
+    "$evsys/device/../id/$key"
+  do
+    if [[ -r "$path" ]]; then
+      tr '[:upper:]' '[:lower:]' <"$path"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+matches_target_ids() {
+  local evsys="$1" vendor product
+
+  vendor="$(read_sysfs_id "$evsys" vendor 2>/dev/null || true)"
+  product="$(read_sysfs_id "$evsys" product 2>/dev/null || true)"
+
+  [[ "$vendor" == "$TARGET_VENDOR" ]] || return 1
+  [[ "$product" == "05c4" || "$product" == "09cc" ]]
+}
+
+normalize_event_path() {
+  local dev="$1"
+
+  if [[ "$dev" == event* ]]; then
+    dev="/dev/input/$dev"
+  fi
+
+  [[ "$dev" == /dev/input/event* ]] || return 1
+  [[ -e "$dev" ]] || return 1
+
+  printf '%s\n' "$dev"
 }
 
 find_controller_event() {
@@ -1376,7 +1422,9 @@ find_controller_event() {
     name_file="$evsys/device/name"
     [[ -r "$name_file" ]] || continue
     name="$(<"$name_file")"
-    matches_target_name "$name" || continue
+    if ! matches_target_ids "$evsys" && ! matches_target_name "$name"; then
+      continue
+    fi
     if evdev-joystick --showcal "$dev" >/dev/null 2>&1; then
       printf '%s\n' "$dev"
       return 0
@@ -1385,24 +1433,8 @@ find_controller_event() {
   return 1
 }
 
-main() {
-  command -v evdev-joystick >/dev/null 2>&1 || {
-    echo "Missing required command: evdev-joystick (apt install joystick)" >&2
-    exit 1
-  }
-
-  local dev=""
-  for ((i=0; i<WAIT_SECS; i++)); do
-    if dev="$(find_controller_event)"; then
-      break
-    fi
-    sleep 1
-  done
-
-  if [[ -z "$dev" ]]; then
-    echo "DS4 controller not found after ${WAIT_SECS}s" >&2
-    exit 1
-  fi
+apply_deadzone() {
+  local dev="$1"
 
   # ABS_X = axis 0, ABS_Y = axis 1 (left stick — higher deadzone absorbs ADC bleed from right stick)
   evdev-joystick --evdev "$dev" --axis 0 --deadzone "$DEADZONE_L"
@@ -1410,6 +1442,37 @@ main() {
   # ABS_RX = axis 3, ABS_RY = axis 4 (right stick)
   evdev-joystick --evdev "$dev" --axis 3 --deadzone "$DEADZONE_R"
   evdev-joystick --evdev "$dev" --axis 4 --deadzone "$DEADZONE_R"
+}
+
+main() {
+  command -v evdev-joystick >/dev/null 2>&1 || {
+    echo "Missing required command: evdev-joystick (apt install joystick)" >&2
+    exit 1
+  }
+
+  local requested_dev="${1:-${DS4_EVENT_DEV:-}}"
+  local dev=""
+
+  if [[ -n "$requested_dev" ]]; then
+    dev="$(normalize_event_path "$requested_dev")" || {
+      echo "Expected /dev/input/event* or event*; got: $requested_dev" >&2
+      exit 1
+    }
+  else
+    for ((i=0; i<WAIT_SECS; i++)); do
+      if dev="$(find_controller_event)"; then
+        break
+      fi
+      sleep 1
+    done
+  fi
+
+  if [[ -z "$dev" ]]; then
+    echo "DS4 controller not found after ${WAIT_SECS}s" >&2
+    exit 1
+  fi
+
+  apply_deadzone "$dev"
 
   echo "Applied left-stick deadzone ${DEADZONE_L}, right-stick deadzone ${DEADZONE_R} to ${dev}"
   evdev-joystick --showcal "$dev"
@@ -1437,6 +1500,16 @@ set -euo pipefail
 
 APP_ID="com.moonlight_stream.Moonlight"
 
+command -v flatpak >/dev/null 2>&1 || {
+  echo "Missing required command: flatpak" >&2
+  exit 1
+}
+
+flatpak info "$APP_ID" >/dev/null 2>&1 || {
+  echo "Flatpak app not installed: $APP_ID" >&2
+  exit 1
+}
+
 echo "Disabling SDL HIDAPI globally (forces evdev path where flat values apply)"
 flatpak override --user --env=SDL_JOYSTICK_HIDAPI=0 "$APP_ID"
 flatpak override --user --env=SDL_JOYSTICK_HIDAPI_PS4=0 "$APP_ID"
@@ -1446,9 +1519,11 @@ flatpak override --user --env=SDL_LINUX_JOYSTICK_DEADZONES=1 "$APP_ID"
 
 echo "Done."
 echo
-echo "Run ds4-right-deadzone (with sudo) before launching Moonlight:"
-echo "  sudo ~/.local/bin/ds4-right-deadzone"
-echo "  flatpak run $APP_ID"
+echo "Current Flatpak overrides:"
+flatpak override --user --show "$APP_ID" || true
+echo
+echo "Launch with the wrapper so the SDL env is also injected at runtime:"
+echo "  ~/.local/bin/moonlight-ds4-right-deadzone"
 #+END_SRC
 
 ** Moonlight launcher with DS4 deadzone
@@ -1459,11 +1534,30 @@ set -euo pipefail
 APP_ID="com.moonlight_stream.Moonlight"
 SETUP="$HOME/.local/bin/flatpak-moonlight-ds4-setup"
 DEADZONE_SCRIPT="$HOME/.local/bin/ds4-right-deadzone"
+UDEV_INSTALLER="$HOME/.local/bin/ds4-udev-install"
+UDEV_RULE="/etc/udev/rules.d/85-ds4-deadzone.rules"
+FLATPAK_ENV=(
+  --env=SDL_JOYSTICK_HIDAPI=0
+  --env=SDL_JOYSTICK_HIDAPI_PS4=0
+  --env=SDL_LINUX_JOYSTICK_DEADZONES=1
+)
+UDEV_BOOTSTRAPPED=0
 
 if [ -x "$SETUP" ]; then
   "$SETUP"
 else
+  flatpak override --user --env=SDL_JOYSTICK_HIDAPI=0 "$APP_ID"
+  flatpak override --user --env=SDL_JOYSTICK_HIDAPI_PS4=0 "$APP_ID"
   flatpak override --user --env=SDL_LINUX_JOYSTICK_DEADZONES=1 "$APP_ID"
+fi
+
+if [[ ! -r "$UDEV_RULE" && -x "$UDEV_INSTALLER" ]]; then
+  echo "Installing DS4 udev rule for future launches..."
+  if "$UDEV_INSTALLER"; then
+    UDEV_BOOTSTRAPPED=1
+  else
+    echo "WARNING: could not install the DS4 udev rule automatically" >&2
+  fi
 fi
 
 # Try running directly first (works if user has write access to /dev/input/event*
@@ -1472,13 +1566,87 @@ if [ "$(id -u)" -eq 0 ]; then
   "$DEADZONE_SCRIPT"
 elif "$DEADZONE_SCRIPT" 2>/dev/null; then
   true
+elif [ "$UDEV_BOOTSTRAPPED" -eq 1 ]; then
+  echo "DS4 udev rule was just installed; skipping a second privilege prompt for this launch" >&2
 elif command -v pkexec >/dev/null 2>&1; then
-  pkexec "$DEADZONE_SCRIPT" || echo "WARNING: ds4-right-deadzone failed — drift may occur" >&2
+  pkexec "$DEADZONE_SCRIPT" || echo "WARNING: ds4-right-deadzone failed — drift may occur until a udev rule or direct device access is in place" >&2
 else
-  echo "WARNING: cannot elevate to run $DEADZONE_SCRIPT — drift may occur" >&2
+  echo "WARNING: cannot elevate to run $DEADZONE_SCRIPT — drift may occur until a udev rule or direct device access is in place" >&2
 fi
 
-exec flatpak run "$APP_ID"
+exec flatpak run "${FLATPAK_ENV[@]}" "$APP_ID"
+#+END_SRC
+
+** Managed udev hotplug rule
+If the deadzone still depends on =pkexec= at launch time, move the privilege
+boundary to udev instead. DotCortex now tangles the rule into the home overlay
+and installs it into =/etc/udev/rules.d/= via a small helper script. The
+Moonlight launcher also attempts that install automatically the first time it
+sees the rule is missing.
+
+#+BEGIN_SRC conf :tangle linux/.local/share/udev/rules.d/85-ds4-deadzone.rules :mkdirp yes :comments no
+# Managed by DotCortex via flatpak.org.
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="05c4", RUN+="/home/metsatron/.local/bin/ds4-right-deadzone /dev/input/%k"
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_JOYSTICK}=="1", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="09cc", RUN+="/home/metsatron/.local/bin/ds4-right-deadzone /dev/input/%k"
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/ds4-udev-install :shebang "#!/usr/bin/env bash" :mkdirp yes
+#!/usr/bin/env bash
+set -euo pipefail
+
+RULE_NAME="85-ds4-deadzone.rules"
+OWNER_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+OWNER_HOME="$(getent passwd "$OWNER_USER" | cut -d: -f6)"
+RULE_SRC="$OWNER_HOME/.local/share/udev/rules.d/$RULE_NAME"
+RULE_DEST="/etc/udev/rules.d/$RULE_NAME"
+APPLIER="$OWNER_HOME/.local/bin/ds4-right-deadzone"
+
+run_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    "$@"
+  else
+    sudo "$@"
+  fi
+}
+
+command -v udevadm >/dev/null 2>&1 || {
+  echo "Missing required command: udevadm" >&2
+  exit 1
+}
+
+[[ -r "$RULE_SRC" ]] || {
+  echo "Missing managed rule source: $RULE_SRC" >&2
+  echo "Tangle and stow DotCortex first so the rule lands under ~/.local/share." >&2
+  exit 1
+}
+
+run_root install -d -m 0755 /etc/udev/rules.d
+run_root install -m 0644 "$RULE_SRC" "$RULE_DEST"
+run_root udevadm control --reload-rules
+
+echo "Installed $RULE_DEST from $RULE_SRC"
+
+if [[ -x "$APPLIER" ]]; then
+  if run_root "$APPLIER"; then
+    echo "Applied DS4 deadzone immediately for the currently connected controller."
+  else
+    echo "Rule installed; replug the DS4 or run $APPLIER after connecting it." >&2
+  fi
+else
+  echo "Rule installed; replug the DS4 after connecting DotCortex's ~/.local/bin into place." >&2
+fi
+#+END_SRC
+
+Install it reproducibly with either:
+
+#+BEGIN_SRC sh
+~/.local/bin/ds4-udev-install
+#+END_SRC
+
+or:
+
+#+BEGIN_SRC sh
+make -f all/.mk/flatpak.mk flatpak-ds4-udev-install
 #+END_SRC
 
 * Desktop launchers
@@ -1550,7 +1718,12 @@ ENFORCE=1 UNINSTALL=1 make -f all/.mk/flatpak.mk flatpak-apply
 FORCE_SUDO_SYSTEM=1 ENFORCE=1 UNINSTALL=1 make -f all/.mk/flatpak.mk flatpak-apply
 #+END_SRC
 
-5. Capture any ad hoc installs back into git:
+5. Install the host-side DS4 udev rule:
+#+BEGIN_SRC sh
+make -f all/.mk/flatpak.mk flatpak-ds4-udev-install
+#+END_SRC
+
+6. Capture any ad hoc installs back into git:
 #+BEGIN_SRC sh
 make -f all/.mk/flatpak.mk flatpak-capture
 git add linux/.flatpak/manifest/apps.ssv && git commit -m "Update Flatpak manifest"
