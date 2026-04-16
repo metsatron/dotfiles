@@ -1,6 +1,7 @@
 ---
 name: handoff
 description: Session Handoff
+model: claude-sonnet-4-6
 ---
 
 # Session Handoff

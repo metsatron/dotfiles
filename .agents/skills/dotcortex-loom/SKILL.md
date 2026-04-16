@@ -1,6 +1,7 @@
 ---
 name: dotcortex-loom
 description: Operate the DotCortex literate dotfiles system — tangle org files, stow overlays, run loom verbs for package management (pip, npm, guix, flatpak, snap, cargo, appimage, homebrew), and bootstrap fresh machines.
+model: claude-haiku-4-5-20251001
 ---
 
 # DotCortex Loom Operations

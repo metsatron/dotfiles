@@ -1,6 +1,7 @@
 ---
 name: handoff-verify
 description: Fresh-Context Verification
+model: claude-haiku-4-5-20251001
 ---
 
 # Fresh-Context Verification

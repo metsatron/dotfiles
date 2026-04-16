@@ -1,6 +1,7 @@
 ---
 name: obsidian-cli
 description: Use the official Obsidian CLI to act on a live vault, including note CRUD, daily notes, search, tasks, properties, sync, Bases, history, and plugin or theme debugging.
+model: claude-haiku-4-5-20251001
 ---
 
 # Obsidian CLI

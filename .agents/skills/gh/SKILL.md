@@ -1,6 +1,7 @@
 ---
 name: gh
 description: GitHub CLI for repo operations, PR management, issue tracking, checking NEXUS repos for updates and releases.
+model: claude-haiku-4-5-20251001
 ---
 
 # GitHub CLI (gh)

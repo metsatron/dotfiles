@@ -1,6 +1,7 @@
 ---
 name: reflect
 description: Session Reflection
+model: claude-sonnet-4-6
 ---
 
 # Session Reflection

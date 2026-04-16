@@ -1,6 +1,7 @@
 ---
 name: dotcortex-package-manifests
 description: Manage DotCortex package manifests from root Org sources.
+model: claude-haiku-4-5-20251001
 ---
 
 # DotCortex Package Manifest Operations
