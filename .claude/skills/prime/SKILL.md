@@ -1,6 +1,7 @@
 ---
 name: prime
 description: DotCortex Orientation
+model: claude-haiku-4-5-20251001
 ---
 
 # DotCortex Orientation
