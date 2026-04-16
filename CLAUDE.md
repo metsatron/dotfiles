@@ -44,8 +44,18 @@ Harness-exclusive config lives in its own directory. Nothing crosses these bound
 | `.codex/` | Codex only | Codex-specific config and skills |
 | `.agents/` | Universal (non-Claude) | Skills and config for OpenCode, Codex, and future agents |
 
-Skills that should work everywhere tangle to **both** `.agents/skills/X/SKILL.md` and `.claude/skills/X/SKILL.md`.
-Harness-exclusive skills tangle only to that harness's skills directory.
+Skills are authored in =skills.org= with one of three emission modes:
+
+| Mode | Tangle target | Scope | Deploy |
+|------|--------------|-------|--------|
+| Stow-global | =all/.claude/skills/X/SKILL.md= + =all/.agents/skills/X/SKILL.md= | All sessions on all machines | =loom stow:*= → =~/.claude/skills/= |
+| DotCortex-scoped | =.claude/skills/X/SKILL.md= + =.agents/skills/X/SKILL.md= | Only when CWD is DotCortex | No stow needed — loaded by CWD |
+| Direct-global | =~/.claude/skills/X/SKILL.md= (absolute) | All sessions, no stow cycle | Write directly |
+
+Current DotCortex-scoped skills: =dotcortex-*= (loom, bootstrap, gotchas, multihost, package-manifests, packages), =helmcortex-nexus=.
+All other skills in =skills.org= are stow-global.
+
+HelmCortex and its workspaces (FORGE, bridge) maintain their own skill harnesses compiled by =helmcortex-compile= from =FORGE/harness/{workspace}/SKILLS.md=. These may intentionally override global skills with project-specific content. Never duplicate a purely generic skill in a project harness — if it has no project-specific content, rely on the global version.
 
 ## Research Protocol
 
@@ -300,4 +310,4 @@ The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh 
 
 ## Claude Code Rules
 
-- **Skills are in `.claude/skills/`** -- authored in `skills.org`, never edited directly. Universal skills also have a copy in `.agents/skills/` for other harnesses.
+- **Skills are in `.claude/skills/`** -- authored in `skills.org`, never edited directly. Stow-global skills tangle to `all/.claude/skills/` and are stowed to `~/.claude/skills/`. DotCortex-scoped skills tangle to `.claude/skills/` and are active only when CWD is DotCortex. HelmCortex and its workspaces manage their own skills via `FORGE/harness/{workspace}/SKILLS.md` compiled by `helmcortex-compile`.
