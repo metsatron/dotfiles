@@ -1,6 +1,7 @@
 ---
 name: helmcortex-nexus
 description: Inspect and refresh HelmCortex NEXUS/git mirrors.
+model: claude-haiku-4-5-20251001
 ---
 
 # HelmCortex NEXUS

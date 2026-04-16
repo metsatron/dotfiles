@@ -1,6 +1,7 @@
 ---
 name: obsidian-markdown
 description: Create and edit Obsidian Flavored Markdown with wikilinks, embeds, callouts, properties, comments, tags, math, and other note-specific syntax.
+model: claude-sonnet-4-6
 ---
 
 # Obsidian Markdown

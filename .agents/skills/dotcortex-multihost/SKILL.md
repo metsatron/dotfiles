@@ -1,6 +1,7 @@
 ---
 name: dotcortex-multihost
 description: Multi-machine deployment (X230, T480s), overlay scoping, HelmCortex integration, bootstrap fresh machines.
+model: claude-haiku-4-5-20251001
 ---
 
 # DotCortex Multi-Machine Setup (Star Fleet)

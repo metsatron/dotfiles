@@ -49,14 +49,41 @@ Harness-exclusive skills tangle only to that harness's skills directory.
 
 ## Research Protocol
 
-When uncertain about external tooling, APIs, library behavior, or current best practices, produce a **Perplexity research prompt** for the user to run rather than exploring speculatively and burning tokens. Format it as a fenced block:
+Before investigating unknown tool APIs, agent conventions, external system behavior,
+or any problem where you would otherwise spend more than 3 tool calls speculating --
+surface a Perplexity prompt for Mètsàtron to run, then stop and wait.
+
+**Format -- output this verbatim, then stop:**
 
 ```
 PERPLEXITY RESEARCH PROMPT:
-[specific question -- include tool names, version numbers, and exactly what you need to determine]
+[single-focus question -- include tool names, version numbers, and exactly what you need to determine]
 ```
 
-Use this for: undocumented tool behavior, version compatibility questions, best practices for unfamiliar libraries, and anything requiring current web knowledge. Pause and produce the prompt rather than guessing.
+Do not continue speculating while waiting. Do not attempt to answer the question yourself.
+This applies to: architecture decisions, model capability questions, library version
+edge-cases, and any situation where a 30-second web search collapses a multi-step rabbit hole.
+
+This also applies when genuinely unsure of the best approach and synthesising from
+the internet would improve the solution quality. Planning in Perplexity before
+executing here is cheaper than burning tokens in circles.
+
+## Model Guidance
+
+- Main session model cannot be changed autonomously -- use `/model sonnet|haiku` yourself.
+- **Opus is currently not viable.** Use `claude-sonnet-4-6` with thinking `high` or `max`
+  for architecture, debugging, and novel problems.
+- Subagents (via the Agent tool):
+  - **Haiku (`claude-haiku-4-5-20251001`)** -- mechanical execution: file ops, grep,
+    glob, reading files, git log/status, quick lookups. Zero ambiguity only.
+  - **Sonnet (`claude-sonnet-4-6`)** -- standard coding, debugging, most tasks.
+  - **Sonnet + thinking high/max** -- architecture, deep multi-file analysis, complex
+    refactors. Never default all subagents to this tier.
+- When spawning subagents via the Agent tool, always set the `model` parameter
+  explicitly. Never let it default to the current session model for all subagents.
+- Never silently switch model -- state which model and why, one line.
+- Model hints per skill are in each skill's `model:` frontmatter field in `.claude/skills/`.
+  Respect them when spawning subagents for skill-scoped work.
 
 ## Build & Apply
 

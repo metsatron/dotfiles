@@ -1,6 +1,7 @@
 ---
 name: context-hygiene
 description: Keep context lean and delegate heavy exploration.
+model: claude-sonnet-4-6
 ---
 
 # Context Window Hygiene
