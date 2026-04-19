@@ -169,3 +169,265 @@ def register(ctx):
 #+BEGIN_SRC yaml :tangle ~/.hermes/plugins/file-safety-preflight/plugin.yaml
 <<plugin-file-safety-preflight-yaml>>
 #+END_SRC
+
+* Agent Router
+
+** Plugin metadata
+
+#+NAME: plugin-agent-router-yaml
+#+BEGIN_SRC yaml :tangle no
+name: agent-router
+version: "1.0"
+description: >
+  Routes tasks to appropriate AI agents based on provider capacity,
+  task complexity, and workspace rules. Queries ai-usage for quotas.
+#+END_SRC
+
+** agent_router.py - Routing logic
+
+#+NAME: plugin-agent-router-logic
+#+BEGIN_SRC python :tangle no
+"""Agent routing orchestration for Hermes.
+
+Routes tasks to appropriate agents based on ai-usage --json output,
+provider quotas, task complexity, and workspace rules.
+"""
+
+import json
+import subprocess
+from pathlib import Path
+from typing import Dict, Any, Tuple, Optional
+
+class AgentRouter:
+    """Routes tasks to optimal AI agents based on provider capacity."""
+    
+    # Provider model mappings (heavy/complex tasks → heavy model, light/fast tasks → light model)
+    PROVIDER_MODELS = {
+        "codex": {
+            "heavy": "gpt-5.4",
+            "light": "gpt-5.4-mini"
+        },
+        "claude": {
+            "heavy": "claude-sonnet-4-6",
+            "light": "claude-haiku-4-5"
+        },
+        "opencode": {
+            "heavy": "minimax-2.7",
+            "light": "gemma-4"
+        },
+        "gemini": {
+            "heavy": "gemini-1.5-pro",
+            "light": "gemini-1.5-flash"
+        }
+    }
+    
+    # Task types requiring specific agents
+    TASK_ROUTING = {
+        "complex-coding": ["claude", "codex"],
+        "fast-coding": ["opencode", "gemini"],
+        "research": ["claude", "gemini"],
+        "planning": ["claude"],
+        "simple-edits": ["opencode", "gemini"]
+    }
+    
+    def __init__(self):
+        self.usage_data = None
+        self._refresh_usage()
+    
+    def _refresh_usage(self):
+        """Refresh ai-usage data."""
+        try:
+            result = subprocess.run(
+                ["ai-usage", "--json"],
+                capture_output=True,
+                text=True,
+                timeout=10
+            )
+            if result.returncode == 0:
+                self.usage_data = json.loads(result.stdout)
+            else:
+                print(f"WARNING: ai-usage failed: {result.stderr}")
+                self.usage_data = {}
+        except Exception as e:
+            print(f"WARNING: ai-usage unavailable: {e}")
+            self.usage_data = {}
+    
+    def _get_provider_capacity(self, provider: str) -> float:
+        """Calculate remaining capacity (0.0 to 1.0) for provider."""
+        provider_data = self.usage_data.get(provider, {})
+        if not provider_data:
+            return 0.5  # Default if unknown
+        
+        caps = provider_data.get("caps", {})
+        used = provider_data.get("usage", {})
+        
+        # Calculate remaining percentage across isotropic and output caps
+        isotropic_cap = max(caps.get("isotropic_requests_1_day", 0), 1)
+        isotropic_used = used.get("isotropic_requests_1_day", 0)
+        
+        output_cap = max(caps.get("output_tokens_per_day", 0), 1)
+        output_used = used.get("output_tokens_per_day", 0)
+        
+        isotropic_pct = 1.0 - (isotropic_used / isotropic_cap)
+        output_pct = 1.0 - (output_used / output_cap)
+        
+        # Use the most restrictive capacity
+        return max(0.0, min(isotropic_pct, output_pct))
+    
+    def _is_over_quota(self, provider: str, threshold: float = 0.8) -> bool:
+        """Check if provider is over quota threshold."""
+        return self._get_provider_capacity(provider) < (1.0 - threshold)
+    
+    def route_task(self, task_description: str, workspace_context: Dict[str, Any]) -> Tuple[str, str]:
+        """
+        Route task to optimal agent based on rules, quotas, and availability.
+        
+        Returns: (agent_name, model_name)
+        """
+        self._refresh_usage()
+        
+        # Determine task type from description and context
+        task_type = self._classify_task(task_description, workspace_context)
+        
+        # Get preferred providers for this task type
+        preferred = self.TASK_ROUTING.get(task_type, ["claude", "codex"])
+        
+        # Filter by capacity
+        available = []
+        for provider in preferred:
+            if self._is_over_quota(provider, threshold=0.8):
+                # Provider over 80% quota - skip
+                continue
+            capacity = self._get_provider_capacity(provider)
+            available.append((provider, capacity))
+        
+        # If all preferred providers over quota, fall back to free tier
+        if not available:
+            free_tier = ["opencode"]
+            for provider in free_tier:
+                available.append((provider, 1.0))
+        
+        # Sort by capacity (highest first)
+        available.sort(key=lambda x: x[1], reverse=True)
+        
+        selected_provider = available[0][0]
+        
+        # Determine model weight (heavy vs light)
+        model_weight = self._assess_complexity(task_description, workspace_context)
+        model = self.PROVIDER_MODELS[selected_provider][model_weight]
+        
+        return selected_provider, model
+    
+    def _classify_task(self, description: str, context: Dict[str, Any]) -> str:
+        """Classify task type from description and context."""
+        desc_lower = description.lower()
+        
+        # Simple keyword-based classification
+        if any(k in desc_lower for k in ["refactor", "rewrite", "complex", "architecture"]):
+            return "complex-coding"
+        elif any(k in desc_lower for k in ["fast", "quick", "simple", "edit", "patch"]):
+            return "simple-edits"
+        elif any(k in desc_lower for k in ["research", "investigate", "discover", "find"]):
+            return "research"
+        elif any(k in desc_lower for k in ["plan", "design", "strategy"]):
+            return "planning"
+        else:
+            return "fast-coding"
+    
+    def _assess_complexity(self, description: str, context: Dict[str, Any]) -> str:
+        """Assess if task needs heavy or light model."""
+        desc_lower = description.lower()
+        
+        # Heavy model indicators
+        heavy_indicators = [
+            "complex", "refactor", "architecture", "design",
+            "comprehensive", "deep", "thorough", "investigate"
+        ]
+        
+        # Light model indicators
+        light_indicators = [
+            "quick", "fast", "simple", "patch", "edit",
+            "small", "minor", "fix"
+        ]
+        
+        heavy_count = sum(1 for k in heavy_indicators if k in desc_lower)
+        light_count = sum(1 for k in light_indicators if k in desc_lower)
+        
+        if heavy_count > light_count:
+            return "heavy"
+        else:
+            return "light"
+
+
+def register_router(ctx):
+    """Register agent router with Hermes."""
+    router = AgentRouter()
+    
+    def route_pre_llm(**kwargs):
+        """Pre-LLM hook: inject routing context."""
+        user_msg = kwargs.get("user_message", "")
+        context = kwargs.get("context", {})
+        
+        if user_msg:
+            agent, model = router.route_task(user_msg, context)
+            routing_info = f"[AGENT ROUTER] Task routed to: {agent} ({model})"
+            return {"context": routing_info}
+        
+        return {}
+    
+    ctx.register_hook("pre_llm_call", route_pre_llm)
+#+END_SRC
+
+*** Plugin emission to ~/.hermes/plugins/
+
+**** agent_router.py
+
+#+BEGIN_SRC python :tangle ~/.hermes/plugins/agent-router/agent_router.py
+<<plugin-agent-router-logic>>
+#+END_SRC
+
+**** plugin.yaml
+
+#+BEGIN_SRC yaml :tangle ~/.hermes/plugins/agent-router/plugin.yaml
+<<plugin-agent-router-yaml>>
+#+END_SRC
+
+*** CLI helper for testing
+
+#+BEGIN_SRC python :tangle ~/.local/bin/hermes-route-task :shebang "#!/usr/bin/env python3"
+"""Test the agent router from command line."""
+
+import sys
+import json
+from pathlib import Path
+
+# Add the plugin directory to path so agent_router.py is importable
+sys.path.insert(0, str(Path.home() / ".hermes" / "plugins" / "agent-router"))
+
+from agent_router import AgentRouter
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: hermes-route-task \"task description\" [workspace-context-json]")
+        sys.exit(1)
+    
+    description = sys.argv[1]
+    context = {}
+    
+    if len(sys.argv) > 2:
+        try:
+            context = json.loads(sys.argv[2])
+        except json.JSONDecodeError:
+            print(f"Invalid JSON for context: {sys.argv[2]}")
+            sys.exit(1)
+    
+    router = AgentRouter()
+    agent, model = router.route_task(description, context)
+    
+    print(f"Task: {description}")
+    print(f"Routed to: {agent} ({model})")
+    print(f"Provider capacity: {router._get_provider_capacity(agent):.1%}")
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
