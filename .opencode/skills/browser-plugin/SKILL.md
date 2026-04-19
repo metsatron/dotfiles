@@ -136,5 +136,4 @@ npx @different-ai/opencode-browser self-test
 ```
 
 ## Session Lesson From This Failure
-
 The correct response to uncertainty on Perplexity was to remain on the original thread, keep inspecting read-only, and refuse broad typing. The mistake came from improvising on a sacred, stateful page with non-specific selectors.
