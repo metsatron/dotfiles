@@ -494,6 +494,11 @@
            (sh "backup-games --auto -y")
            (sh "backup-retropie --auto -y")))
 
+   (task 'dotcortex:clean-backups
+         "Move backup-like files out of DotCortex into a timestamped Downloads archive"
+         (lambda ()
+           (sh "~/.local/bin/dotcortex-clean-backups --auto -y")))
+
    ;; --- Tmux ---
    (task 'tmux:apply
          "Install TPM and tmux plugins (resurrect, continuum, yank)"
@@ -524,6 +529,10 @@
     ;; --- Claude plugin helpers ---
     (task 'claude:apply "Install Claude plugins from the managed manifest"
           (lambda () (sh "~/.local/bin/claude-plugins-apply")))
+
+    (task 'hermes:apply-plugins
+          "Create ~/.hermes/plugins and tangle Hermes plugin sources into place"
+          (lambda () (sh "mkdir -p ~/.hermes/plugins && make tangle")))
 
     (task 'claude:health "Show installed Claude plugins vs manifest"
           (lambda () (sh "~/.local/bin/claude-plugins-health")))
@@ -569,6 +578,7 @@
                         (not (string-prefix? "stow:" nm))
                         (not (string-prefix? "tmux:" nm))
                          (not (string-prefix? "backup:" nm))
+                         (not (string-prefix? "dotcortex:" nm))
                          (not (string-prefix? "agents:" nm))))))
 
   (print-group "Agent commands"
@@ -616,6 +626,10 @@
   (print-group "Backup commands"
                (lambda (t)
                  (string-prefix? "backup:" (task-name-str t)))))
+
+  (print-group "DotCortex commands"
+               (lambda (t)
+                 (string-prefix? "dotcortex:" (task-name-str t))))
 
 ;; --- Help / Version ---
 
