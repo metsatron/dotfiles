@@ -69,14 +69,6 @@ safe-stow:
 |     | while read -r t; do \
 |         case "$$t" in /*) abs="$$t" ;; *) abs="$(HOME)/$$t" ;; esac; \
 |         if [ -e "$$abs" ] || [ -L "$$abs" ]; then \
-|           if [ "$$t" = ".config/opencode/opencode.json" ]; then \
-|             HELPER="$(HOME)/.local/bin/dotcortex-opencode-config-merge-guard"; \
-|             [ -x "$$HELPER" ] || HELPER="$(HOME)/DotCortex/all/.local/bin/dotcortex-opencode-config-merge-guard"; \
-|             if [ -x "$$HELPER" ]; then \
-|               "$$HELPER" apply; \
-|               continue; \
-|             fi; \
-|           fi; \
 |           ts=$$(date +%Y%m%d-%H%M%S); \
 |           echo "   backup $$abs -> $$abs.bak.$$ts"; \
 |           cp -a "$$abs" "$$abs.bak.$$ts"; \

@@ -494,11 +494,6 @@
            (sh "backup-games --auto -y")
            (sh "backup-retropie --auto -y")))
 
-   (task 'dotcortex:clean-backups
-         "Move backup-like files out of DotCortex into a timestamped Downloads archive"
-         (lambda ()
-           (sh "~/.local/bin/dotcortex-clean-backups --auto -y")))
-
    ;; --- Tmux ---
    (task 'tmux:apply
          "Install TPM and tmux plugins (resurrect, continuum, yank)"
@@ -516,26 +511,15 @@
    (task 'pip:health "Show DotCortex Python/pip env and versions"
          (lambda () (sh "~/.local/bin/pip-health")))
 
-    ;; --- Pipx ---
-    ;; (task 'pipx:apply ...)
+   ;; --- Pipx ---
+   ;; (task 'pipx:apply ...)
 
-    ;; --- Agent schema ---
-    (task 'agents:apply "Tangle agent docs, skills, commands, and hooks"
-          (lambda () (sh "~/DotCortex/all/.local/bin/agents-apply")))
+   ;; --- Claude Code ---
+   (task 'claude:apply "Install Claude Code plugins from manifest"
+         (lambda () (sh "~/.local/bin/claude-plugins-apply")))
 
-    (task 'agents:health "Show agent docs and generated output roots"
-          (lambda () (sh "printf 'AGENTS.md\n'; sed -n '1,12p' AGENTS.md; printf '\nCLAUDE.md\n'; sed -n '1,12p' CLAUDE.md; printf '\n.agents/skills\n'; find .agents/skills -maxdepth 2 -name SKILL.md | sort | sed -n '1,12p'; printf '\n.claude/skills\n'; find .claude/skills -maxdepth 2 -name SKILL.md | sort | sed -n '1,12p'")))
-
-    ;; --- Claude plugin helpers ---
-    (task 'claude:apply "Install Claude plugins from the managed manifest"
-          (lambda () (sh "~/.local/bin/claude-plugins-apply")))
-
-    (task 'hermes:apply-plugins
-          "Create ~/.hermes/plugins and tangle Hermes plugin sources into place"
-          (lambda () (sh "mkdir -p ~/.hermes/plugins && make tangle")))
-
-    (task 'claude:health "Show installed Claude plugins vs manifest"
-          (lambda () (sh "~/.local/bin/claude-plugins-health")))
+   (task 'claude:health "Show installed Claude Code plugins vs manifest"
+         (lambda () (sh "~/.local/bin/claude-plugins-health")))
 
    ))
 ;; --- Pretty printing for help ---
@@ -577,13 +561,7 @@
                         (not (string-prefix? "root:" nm))
                         (not (string-prefix? "stow:" nm))
                         (not (string-prefix? "tmux:" nm))
-                         (not (string-prefix? "backup:" nm))
-                         (not (string-prefix? "dotcortex:" nm))
-                         (not (string-prefix? "agents:" nm))))))
-
-  (print-group "Agent commands"
-               (lambda (t)
-                 (string-prefix? "agents:" (task-name-str t))))
+                        (not (string-prefix? "backup:" nm))))))
 
   (print-group "Stow / dotfiles commands"
                (lambda (t)
@@ -626,10 +604,6 @@
   (print-group "Backup commands"
                (lambda (t)
                  (string-prefix? "backup:" (task-name-str t)))))
-
-  (print-group "DotCortex commands"
-               (lambda (t)
-                 (string-prefix? "dotcortex:" (task-name-str t))))
 
 ;; --- Help / Version ---
 
