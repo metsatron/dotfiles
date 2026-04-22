@@ -58,6 +58,15 @@
    (task 'all "TOC -> tangle -> ensure Guix dirs"
          (lambda () (sh "make all")))
 
+   (task 'hooks:install
+         "Install tracked DotCortex git hooks for this checkout"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/dotcortex-install-git-hooks\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/all/.local/bin/dotcortex-install-git-hooks\"; \"$HELPER\"")))
+
+   (task 'hooks:health
+         "Show the active git hooks path for this checkout"
+         (lambda () (sh "git config --get core.hooksPath || echo '(unset)'")))
+
    ;; --- Stow / dotfiles ---
    (task 'stow "Safe stow shared overlay only (all)"
          (lambda () (sh "make safe-stow")))
@@ -95,9 +104,9 @@
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/xfce4-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/x230/.local/bin/xfce4-heal\"; \"$HELPER\"")))
 
-   (task 'desktop:appmenu "Configure XFCE appmenu and refresh panel/session daemons"
+   (task 'desktop:appmenu "Configure XFCE appmenu xsettings and registrar"
          (lambda ()
-           (sh "HELPER=\"$HOME/.local/bin/xfce4-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/x230/.local/bin/xfce4-heal\"; \"$HELPER\"")))
+           (sh "HELPER=\"$HOME/.local/bin/xfce-appmenu-configure\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/xfce-appmenu-configure\"; \"$HELPER\"")))
 
    (task 'swap:heal
          "Safe swap purge + XFCE/Flatpak heal (with RAM safety checks)"
@@ -460,8 +469,8 @@
            (sh "sudo $HOME/.local/bin/backup-system -y")))
 
    (task 'backup:dotcortex
-         "Mirror ~/DotCortex to ironwolf02"
-         (lambda () (sh "backup-dotcortex -y")))
+         "Mirror ~/DotCortex to ironwolf02 (or push to X230 from T480s)"
+         (lambda () (sh "$HOME/.local/bin/backup-dotcortex -y")))
 
    (task 'backup:nextcloud
          "Dual sync Nextcloud to ZFS pool + ironwolf02"
@@ -488,11 +497,16 @@
          (lambda ()
            (sh "sudo $HOME/.local/bin/backup-system-clean -y")
            (sh "sudo $HOME/.local/bin/backup-system -y")
-           (sh "backup-dotcortex -y")
-           (sh "backup-nextcloud --auto -y")
+           (sh "$HOME/.local/bin/backup-dotcortex -y")
+           (sh "$HOME/.local/bin/backup-nextcloud --auto -y")
            (sh "~/HelmCortex/FORGE/bin/helmcortex-sync")
            (sh "backup-games --auto -y")
            (sh "backup-retropie --auto -y")))
+
+   (task 'dotcortex:clean-backups
+         "Move backup-like files out of DotCortex into a timestamped Downloads archive"
+         (lambda ()
+           (sh "~/.local/bin/dotcortex-clean-backups --auto -y")))
 
    ;; --- Tmux ---
    (task 'tmux:apply
@@ -514,9 +528,20 @@
    ;; --- Pipx ---
    ;; (task 'pipx:apply ...)
 
+   ;; --- Agent schema ---
+   (task 'agents:apply "Tangle agent docs, skills, commands, and hooks"
+         (lambda () (sh "~/DotCortex/all/.local/bin/agents-apply")))
+
+   (task 'agents:health "Show agent docs and generated output roots"
+         (lambda () (sh "printf 'AGENTS.md\n'; sed -n '1,12p' AGENTS.md; printf '\nCLAUDE.md\n'; sed -n '1,12p' CLAUDE.md; printf '\n.agents/skills\n'; find .agents/skills -maxdepth 2 -name SKILL.md | sort | sed -n '1,12p'; printf '\n.claude/skills\n'; find .claude/skills -maxdepth 2 -name SKILL.md | sort | sed -n '1,12p'")))
+
    ;; --- Claude Code ---
    (task 'claude:apply "Install Claude Code plugins from manifest"
          (lambda () (sh "~/.local/bin/claude-plugins-apply")))
+
+   (task 'hermes:apply-plugins
+         "Create ~/.hermes/plugins and tangle Hermes plugin sources into place"
+         (lambda () (sh "mkdir -p ~/.hermes/plugins && make tangle")))
 
    (task 'claude:health "Show installed Claude Code plugins vs manifest"
          (lambda () (sh "~/.local/bin/claude-plugins-health")))
@@ -561,7 +586,13 @@
                         (not (string-prefix? "root:" nm))
                         (not (string-prefix? "stow:" nm))
                         (not (string-prefix? "tmux:" nm))
-                        (not (string-prefix? "backup:" nm))))))
+                        (not (string-prefix? "backup:" nm))
+                        (not (string-prefix? "dotcortex:" nm))
+                        (not (string-prefix? "agents:" nm))))))
+
+  (print-group "Agent commands"
+               (lambda (t)
+                 (string-prefix? "agents:" (task-name-str t))))
 
   (print-group "Stow / dotfiles commands"
                (lambda (t)
@@ -604,6 +635,10 @@
   (print-group "Backup commands"
                (lambda (t)
                  (string-prefix? "backup:" (task-name-str t)))))
+
+  (print-group "DotCortex commands"
+               (lambda (t)
+                 (string-prefix? "dotcortex:" (task-name-str t))))
 
 ;; --- Help / Version ---
 
