@@ -1,7 +1,6 @@
 ---
 name: dotcortex-loom
 description: Operate the DotCortex literate dotfiles system — tangle org files, stow overlays, run loom verbs for package management (pip, npm, guix, flatpak, snap, cargo, appimage, homebrew), and bootstrap fresh machines.
-model: claude-haiku-4-5-20251001
 ---
 
 # DotCortex Loom Operations
@@ -12,6 +11,14 @@ Use this skill when the task involves DotCortex configuration, dotfiles manageme
 
 DotCortex lives at `~/DotCortex`. All commands assume this as the working directory unless stated otherwise.
 
+## Trigger Conditions
+
+- User asks to install/manage packages via loom
+- User wants to edit a dotfile, shell config, or system service
+- User mentions tangle, stow, loom, or overlay
+- User wants to set up a new machine or bootstrap
+- User asks about DotCortex architecture
+
 ## Core Build Commands
 
 ```bash
@@ -20,27 +27,22 @@ cd ~/DotCortex
 # Tangle all org files into overlay directories
 make tangle
 
-# Tangle a single org file (faster, preferred for focused changes)
+# Tangle a single org file (faster than full make tangle)
 tangle-one shell.org
 
 # Preview what stow would do (dry-run)
 make preview-stow
 
-# Stow with loom (normal workflow, requires Guix)
-loom stow:x230          # X230: all linux debian x230
-loom stow:t480s         # T480s: all linux debian devuan t480s
-loom stow:devuan        # shared: all linux devuan
-
-# Without loom (bootstrap or no Guix)
-STOW_PKGS='all linux debian devuan t480s' make safe-stow
+# Safely stow with automatic backups of conflicts
+make safe-stow STOW_PKGS="all linux debian think"
 
 # Full rebuild
-make tangle && loom stow:t480s
+make tangle && make safe-stow STOW_PKGS="all linux debian think"
 ```
 
 ## Loom Verbs (Guile Control Plane)
 
-Loom requires Guix guile. Without guile, use make targets or scripts directly.
+Loom requires Guix guile. If guile is not available, use the make targets or scripts directly.
 
 ```bash
 # List all available verbs
@@ -85,7 +87,7 @@ loom stow:health        # Check symlink health
 
 ## Editing Configs
 
-CRITICAL: Never edit files inside `all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, etc. directly. These are tangled output. Edit the `.org` source file instead.
+CRITICAL: Never edit files inside `all/`, `linux/`, `debian/`, `think/` etc directly. These are tangled output. Edit the `.org` source file instead.
 
 To find which org file owns a config:
 
@@ -95,40 +97,53 @@ grep -rn "tangle.*path/to/config" *.org
 ```
 
 Common mappings:
-- `~/.bashrc` / `~/.zshrc` -> `shell.org`
-- `~/.config/maak/maak.scm` -> `loom.org`
-- `Makefile` -> `loom.org` (the Makefile template block)
-- GTK/terminal themes -> `style.org`
-- Guix manifests -> `guix.org`
+- `~/.bashrc` → `shell.org`
+- `~/.zshrc` → `shell.org`
+- `~/.bash_exports` → `shell.org`
+- `~/.config/maak/maak.scm` → `loom.org`
+- `Makefile` → `loom.org` (the Makefile block is in loom.org)
+- GTK/terminal themes → `style.org`
+- Guix manifests → `guix.org`
 
 ## Package Manifest Format
 
-All manifests use SSV (space-separated values):
+All manifests use SSV (space-separated values) with comment headers:
 
 ```
+# ~/DotCortex/all/.pip/manifest/packages.ssv
 # PKG VERSION EXTRA
 litellm "" ""
 openai "" ""
 ```
 
+Empty `""` means "use latest" or "no value".
+
 ## Adding a New Package to a Manifest
 
 1. Edit the org file (e.g., `pip.org`)
 2. Add a row to the manifest `#+BEGIN_SRC text` block
-3. Run `tangle-one pip.org` to regenerate the SSV file
+3. Run `make tangle` to regenerate the SSV file
 4. Run the apply verb: `loom pip:apply`
 
-Or use the capture verb to auto-detect what is installed:
+Or use the capture verb to auto-detect what's installed:
 
 ```bash
 loom pip:capture    # Appends any new packages to manifest
 loom npm:capture
 ```
 
+## Bootstrap (Fresh Machine)
+
+```bash
+cd ~/DotCortex && bash INSTALL.sh
+```
+
+This installs system deps (git, stow, emacs-nox, python3, build-essential, etc), installs Guix, tangles, stows, and runs pip/npm/cargo manifests. Node.js/npm come from Guix core profile, not apt.
+
 ## Operating Notes
 
 - Org files at repo root are the single source of truth
 - `make safe-stow` creates timestamped backups before overwriting
-- Overlays stack in priority order: `all` -> `linux` -> `debian` -> `devuan`/`x230`/`t480s` (later wins)
+- Overlays stack: `all` → `linux` → `debian` → `think` (later wins)
 - The Makefile includes fragment `.mk` files from `all/.mk/`
 - Loom runs via Guix's guile — without Guix, use make targets directly
