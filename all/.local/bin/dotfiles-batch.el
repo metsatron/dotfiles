@@ -160,27 +160,6 @@ LC/fonts is expected to be set by style.org - this file must not override it."
           (org-babel-tangle))
         (kill-buffer)))))
 
-(defun dotfiles-batch-tangle-files (root &rest relfiles)
-  "Tangle only RELFILES from ROOT."
-  (interactive "DRoot:\nsFiles: ")
-  (setq root (file-name-as-directory (expand-file-name root)))
-  (lc/batch-boot-if-needed root)
-  (let ((org-confirm-babel-evaluate nil))
-    (dolist (rel relfiles)
-      (let ((f (expand-file-name rel root)))
-        (message ">> TANGLE %s" f)
-        (with-current-buffer (find-file-noselect f)
-          (org-mode)
-          (if (string= (file-name-nondirectory f) "style.org")
-              (condition-case _
-                  (progn
-                    (org-babel-goto-named-src-block "loom-style")
-                    (org-babel-execute-src-block))
-                (error
-                 (message "loom-style failed in %s" f)))
-            (org-babel-tangle))
-          (kill-buffer))))))
-
 (provide 'dotfiles-batch)
 ;;; dotfiles-batch.el ends here
 ;; Maak control plane (Scheme, XDG-friendly):2 ends here

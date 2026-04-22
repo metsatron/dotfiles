@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-release-diff flatpak-release-sync flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset flatpak-ds4-udev-install
+.PHONY: flatpak-remotes flatpak-capture flatpak-diff flatpak-release-diff flatpak-release-sync flatpak-sync flatpak-apply flatpak-perms-capture flatpak-perms-apply flatpak-bridge flatpak-bridge-reset
 
 flatpak-remotes:
 | @chmod +x $(HOME)/.local/bin/flatpak-remotes-setup 2>/dev/null || true
@@ -59,7 +59,3 @@ flatpak-bridge:
 flatpak-bridge-reset:
 | @chmod +x $(HOME)/.local/bin/flatpak-desktop-bridge-reset 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-desktop-bridge-reset
-
-flatpak-ds4-udev-install:
-| @chmod +x $(HOME)/.local/bin/ds4-udev-install 2>/dev/null || true
-| $(HOME)/.local/bin/ds4-udev-install
