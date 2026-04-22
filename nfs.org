@@ -1,0 +1,236 @@
+#+TITLE: NFS Fleet: DotCortex
+#+DESCRIPTION: NFS server/client setup across the Star Fleet
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+
+* Fleet map
+
+| Role   | Machine | OS               | Overlay |
+|--------+---------+------------------+---------|
+| Server | X230    | Ubuntu/systemd   | x230    |
+| Client | T480s   | Devuan/sysv-init | t480s   |
+
+Transport: NFSv4 over trusted LAN. Hostnames used throughout — resolves via
+=/etc/hosts= entries pinned by the setup scripts, so router DNS outages and
+ISP-level interference do not affect mounts.
+
+** When the server relocates
+1. Update the IP in the T480s host fragment below
+2. =tangle-one nfs.org=
+3. =loom stow:t480s= (or whichever clients need updating)
+4. Re-run =nfs-client-setup= on each client — updates =/etc/hosts=, reloads autofs
+
+** Adding a new client node
+1. Add its IP(s) to the X230 host fragment and exports fragment below
+2. Copy the T480s client section, adjust overlay prefix and mount paths
+3. =tangle-one nfs.org && loom stow:x230 && loom stow:<newmachine>=
+4. Re-run =nfs-server-setup= on X230 — idempotent, picks up new entries
+5. Run =nfs-client-setup= on the new machine
+
+** Replacing the storage server
+The NFS server role is currently X230. When it moves to a new machine:
+1. Deploy =nfs-server-setup= on the new machine (tangle its overlay section first)
+2. Update each client's host fragment IP and re-run =nfs-client-setup=
+3. Retire the old server section or keep it as a template
+
+* X230 — NFS Server
+
+** Host entries: X230 knows its clients
+Injected into =/etc/hosts= by =nfs-server-setup= (idempotent, guarded block).
+T480s has two interfaces; both are registered so the mount works over eth or wifi.
+Add one line per new client interface.
+
+#+BEGIN_SRC text :tangle x230/.local/share/dotcortex/nfs/hosts-nfs.conf :padline no :comments none
+# Star Fleet NFS clients — add new nodes here
+192.168.0.26   t480s t480s-eth
+192.168.0.24   t480s-wlan
+#+END_SRC
+
+** Exports: X230 serves registered clients
+Injected into =/etc/exports= by =nfs-server-setup=.
+One line per client interface — both t480s interfaces permitted so the client
+can connect from either ethernet or wifi without changing anything on the server.
+
+Options:
+- =rw= — read/write
+- =sync= — writes committed to disk before ACK (safe)
+- =no_subtree_check= — skip subtree verification (stable handles on rename)
+- =no_root_squash= — UID 0 maps to UID 0; safe because same user on both sides,
+  trusted LAN only — remove if the trust model changes
+
+#+BEGIN_SRC text :tangle x230/.local/share/dotcortex/nfs/exports.conf :padline no :comments none
+# Star Fleet exports — add one line per client interface
+/home/metsatron   t480s(rw,sync,no_subtree_check,no_root_squash)
+/home/metsatron   t480s-wlan(rw,sync,no_subtree_check,no_root_squash)
+#+END_SRC
+
+** Setup script: nfs-server-setup
+Run on X230 after =tangle-one nfs.org && loom stow:x230=.
+Safe to re-run whenever the fleet changes.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/nfs-server-setup :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+CONF="${HOME}/.local/share/dotcortex/nfs"
+HOSTS_FRAG="${CONF}/hosts-nfs.conf"
+EXPORTS_FRAG="${CONF}/exports.conf"
+MARKER_START="# BEGIN DOTCORTEX-NFS"
+MARKER_END="# END DOTCORTEX-NFS"
+
+die() { printf 'nfs-server-setup: %s\n' "$*" >&2; exit 1; }
+
+[ -f "$HOSTS_FRAG" ]   || die "missing $HOSTS_FRAG — run: tangle-one nfs.org && loom stow:x230"
+[ -f "$EXPORTS_FRAG" ] || die "missing $EXPORTS_FRAG — run: tangle-one nfs.org && loom stow:x230"
+
+# Idempotent block injection: strips existing DOTCORTEX-NFS block then appends.
+inject_block() {
+  local target="$1" src="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if grep -qF "$MARKER_START" "$target" 2>/dev/null; then
+    awk "/^${MARKER_START}$/{skip=1} !skip{print} /^${MARKER_END}$/{skip=0}" \
+      "$target" > "$tmp"
+  else
+    cat "$target" > "$tmp" 2>/dev/null || true
+  fi
+  { printf '\n%s\n' "$MARKER_START"; cat "$src"; printf '%s\n' "$MARKER_END"; } >> "$tmp"
+  sudo cp "$tmp" "$target"
+  rm -f "$tmp"
+}
+
+echo "[1/5] nfs-kernel-server..."
+dpkg -s nfs-kernel-server &>/dev/null || sudo apt-get install -y nfs-kernel-server
+
+echo "[2/5] /etc/hosts (client aliases)..."
+inject_block /etc/hosts "$HOSTS_FRAG"
+
+echo "[3/5] /etc/exports..."
+sudo touch /etc/exports
+inject_block /etc/exports "$EXPORTS_FRAG"
+
+echo "[4/5] exportfs -ra..."
+sudo exportfs -ra
+sudo exportfs -v
+
+echo "[5/5] nfs-kernel-server service..."
+sudo systemctl enable --now nfs-kernel-server
+
+echo
+echo "=== X230 NFS server ready ==="
+echo "Active exports:"
+sudo exportfs -v
+#+END_SRC
+
+* T480s — NFS Client
+
+** Host entries: T480s knows the server
+Injected into =/etc/hosts= by =nfs-client-setup=.
+When the server relocates: update the IP here, tangle, stow, re-run =nfs-client-setup=.
+Pinning via =/etc/hosts= bypasses router DNS — mounts survive ISP or router disruption.
+
+#+BEGIN_SRC text :tangle t480s/.local/share/dotcortex/nfs/hosts-nfs.conf :padline no :comments none
+# NFS server — update IP when server relocates, then re-run nfs-client-setup
+192.168.0.4   x230
+#+END_SRC
+
+** Autofs master entry
+Dropped into =/etc/auto.master.d/= — does not modify =/etc/auto.master= directly.
+=/- = means direct map (absolute mount paths, not relative to a parent directory).
+=--ghost= keeps mount point directories visible even when unmounted.
+=--timeout=300= auto-unmounts after 5 min idle; autofs remounts on next access.
+
+#+BEGIN_SRC text :tangle t480s/.local/share/dotcortex/nfs/nfs-direct.autofs :padline no :comments none
+/- /etc/auto.direct --timeout=300 --ghost
+#+END_SRC
+
+** Autofs direct map
+Each line is one on-demand NFS mount.
+Format: =/local/absolute/path  -options  server:/remote/path=
+Add new mount points here for additional shares or future servers.
+
+Mount options:
+- =fstype=nfs4= — NFSv4 explicitly
+- =rsize/wsize=131072= — 128 KiB I/O size (bulk reads for Obsidian/git)
+- =soft,timeo=30,retrans=2= — return EIO after ~60s instead of hanging;
+  prevents desktop freeze when server goes offline
+- =intr= — allow signals to interrupt stalled NFS calls
+- =async,noatime= — performance: async writes, no atime updates
+
+#+BEGIN_SRC text :tangle t480s/.local/share/dotcortex/nfs/auto.direct :padline no :comments none
+# x230 home — mounts on first access, auto-unmounts after idle
+/home/metsatron/mnt/x230  -fstype=nfs4,rsize=131072,wsize=131072,async,noatime,soft,timeo=30,retrans=2,intr  x230:/home/metsatron
+#+END_SRC
+
+** Setup script: nfs-client-setup
+Run on T480s after =tangle-one nfs.org && loom stow:t480s=.
+Safe to re-run when the server relocates or fleet changes.
+
+#+BEGIN_SRC bash :tangle t480s/.local/bin/nfs-client-setup :shebang "#!/usr/bin/env bash"
+set -euo pipefail
+
+CONF="${HOME}/.local/share/dotcortex/nfs"
+HOSTS_FRAG="${CONF}/hosts-nfs.conf"
+AUTOFS_MASTER="${CONF}/nfs-direct.autofs"
+AUTOFS_DIRECT="${CONF}/auto.direct"
+MARKER_START="# BEGIN DOTCORTEX-NFS"
+MARKER_END="# END DOTCORTEX-NFS"
+
+die() { printf 'nfs-client-setup: %s\n' "$*" >&2; exit 1; }
+
+[ -f "$HOSTS_FRAG" ]    || die "missing $HOSTS_FRAG — run: tangle-one nfs.org && loom stow:t480s"
+[ -f "$AUTOFS_MASTER" ] || die "missing $AUTOFS_MASTER — run: tangle-one nfs.org && loom stow:t480s"
+[ -f "$AUTOFS_DIRECT" ] || die "missing $AUTOFS_DIRECT — run: tangle-one nfs.org && loom stow:t480s"
+
+inject_block() {
+  local target="$1" src="$2"
+  local tmp
+  tmp="$(mktemp)"
+  if grep -qF "$MARKER_START" "$target" 2>/dev/null; then
+    awk "/^${MARKER_START}$/{skip=1} !skip{print} /^${MARKER_END}$/{skip=0}" \
+      "$target" > "$tmp"
+  else
+    cat "$target" > "$tmp" 2>/dev/null || true
+  fi
+  { printf '\n%s\n' "$MARKER_START"; cat "$src"; printf '%s\n' "$MARKER_END"; } >> "$tmp"
+  sudo cp "$tmp" "$target"
+  rm -f "$tmp"
+}
+
+echo "[1/6] nfs-common + autofs..."
+NEED=()
+dpkg -s nfs-common &>/dev/null || NEED+=(nfs-common)
+dpkg -s autofs     &>/dev/null || NEED+=(autofs)
+[ ${#NEED[@]} -eq 0 ] || sudo apt-get install -y "${NEED[@]}"
+
+echo "[2/6] /etc/hosts (server alias)..."
+inject_block /etc/hosts "$HOSTS_FRAG"
+
+echo "[3/6] /etc/auto.master.d/..."
+sudo install -d -m 755 /etc/auto.master.d
+sudo install -m 644 "$AUTOFS_MASTER" /etc/auto.master.d/nfs-direct.autofs
+
+echo "[4/6] /etc/auto.direct..."
+sudo touch /etc/auto.direct
+inject_block /etc/auto.direct "$AUTOFS_DIRECT"
+
+echo "[5/6] mount point..."
+mkdir -p "${HOME}/mnt/x230"
+
+echo "[6/6] autofs..."
+sudo service autofs restart
+
+echo
+echo "=== T480s NFS client ready ==="
+echo "Trigger mount with: ls ${HOME}/mnt/x230"
+#+END_SRC
+
+* SSHFS — Legacy launcher (x230)
+These are kept as application menu entries and the underlying script for manual
+SSHFS use or fallback. The autostart entry at =~/.config/autostart/mount-x230.desktop=
+should be removed once NFS via autofs is confirmed stable — it was created manually
+(not from this org file) and is not reproducible.
+
+The =sshfs-open-home= script in =shell.org= remains useful for SSHFS to other hosts
+(e.g. t430) and should not be removed.
