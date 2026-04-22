@@ -1,16 +1,17 @@
 #!/usr/bin/env sh
 # Start the registrar inside the real X session so exported menus and the
 # panel plugin meet on the same session bus.
-registrar_reachable() {
+registrar_has_owner() {
   command -v gdbus >/dev/null 2>&1 || return 1
   gdbus call --session \
-    --dest com.canonical.AppMenu.Registrar \
-    --object-path /com/canonical/AppMenu/Registrar \
-    --method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+    --dest org.freedesktop.DBus \
+    --object-path /org/freedesktop/DBus \
+    --method org.freedesktop.DBus.NameHasOwner \
+    com.canonical.AppMenu.Registrar 2>/dev/null | grep -q '(true,'
 }
 
 APPMENU_REGISTRAR=
-if ! registrar_reachable; then
+if ! registrar_has_owner; then
   pkill -x appmenu-registrar >/dev/null 2>&1 || true
 
   if command -v appmenu-registrar >/dev/null 2>&1; then
