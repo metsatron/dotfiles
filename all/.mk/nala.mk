@@ -29,7 +29,6 @@ nala-sync: nala-repos
 | ENFORCE=0 UNINSTALL=0 $(HOME)/.local/bin/nala-apply
 
 nala-apply: nala-repos
-| sudo nala upgrade
 | @chmod +x $(HOME)/.local/bin/nala-apply 2>/dev/null || true
 | ENFORCE=1 UNINSTALL=0 $(HOME)/.local/bin/nala-apply
 
