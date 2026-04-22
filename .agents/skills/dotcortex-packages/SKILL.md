@@ -1,6 +1,6 @@
 ---
 name: dotcortex-packages
-description: Package manager manifests (guix, pip, npm, flatpak, snap, cargo, appimage, homebrew), SSV format, adding new package managers
+description: Package manager manifests (guix, pip, npm, flatpak, snap, cargo, appimage, homebrew), SSV format, adding new package managers.
 model: claude-haiku-4-5-20251001
 ---
 
