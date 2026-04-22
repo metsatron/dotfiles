@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+CACHE_PATH = Path.home() / ".hermes" / "runtime" / "usage-state.json"
+DEFAULT_AI_USAGE = Path.home() / ".local" / "bin" / "ai-usage"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Normalize ai-usage --json output into Hermes usage state."
+    )
+    parser.add_argument(
+        "--ai-usage",
+        default=str(DEFAULT_AI_USAGE),
+        help="Path to ai-usage executable (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--providers",
+        default="codex,claude,copilot,cursor,antigravity,gemini,openrouter,deepinfra",
+        help="Comma-separated providers to probe via ai-usage",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=("auto", "normal", "conserve", "burn"),
+        default="auto",
+        help="Override recommended mode (default: auto)",
+    )
+    parser.add_argument(
+        "--write-cache",
+        action="store_true",
+        help="Write normalized output to ~/.hermes/runtime/usage-state.json",
+    )
+    return parser.parse_args()
+
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def parse_iso(ts: str | None) -> datetime | None:
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def minutes_until(ts: str | None) -> int | None:
+    dt = parse_iso(ts)
+    if dt is None:
+        return None
+    delta = dt - datetime.now(timezone.utc)
+    return max(0, int(delta.total_seconds() // 60))
+
+
+def normalize_window(raw: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+    used = raw.get("usedPercent")
+    if used is None:
+        return None
+    try:
+        used_val = float(used)
+    except (TypeError, ValueError):
+        return None
+    remaining = max(0.0, 100.0 - used_val)
+    resets_at = raw.get("resetsAt")
+    return {
+        "used_percent": used_val,
+        "remaining_percent": remaining,
+        "window_minutes": raw.get("windowMinutes"),
+        "resets_at": resets_at,
+        "minutes_to_reset": minutes_until(resets_at),
+        "reset_description": raw.get("resetDescription"),
+    }
+
+
+def canonical_budget_kind(provider: str, usage: dict[str, Any], item: dict[str, Any]) -> str:
+    if usage.get("openRouterUsage") is not None:
+        return "credit_balance"
+    if any(isinstance(usage.get(key), dict) for key in ("primary", "secondary", "tertiary")):
+        return "windowed_quota"
+    if provider == "deepinfra":
+        return "token_cost"
+    return "unknown"
+
+
+def normalize_item(item: dict[str, Any]) -> dict[str, Any]:
+    provider = str(item.get("provider") or "unknown")
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    openrouter_usage = usage.get("openRouterUsage") if isinstance(usage.get("openRouterUsage"), dict) else None
+    provider_cost = usage.get("providerCost") if isinstance(usage.get("providerCost"), dict) else None
+    windows = {
+        "short": normalize_window(usage.get("primary")),
+        "long": normalize_window(usage.get("secondary")),
+        "extra": normalize_window(usage.get("tertiary")),
+    }
+    windows = {k: v for k, v in windows.items() if v is not None}
+    status = str(item.get("state") or "unknown")
+    error = raw.get("error") if isinstance(raw.get("error"), dict) else None
+    login_method = None
+    identity = usage.get("identity") if isinstance(usage.get("identity"), dict) else {}
+    if isinstance(identity, dict):
+        login_method = identity.get("loginMethod")
+    if not login_method:
+        login_method = usage.get("loginMethod")
+    budget_kind = canonical_budget_kind(provider, usage, item)
+
+    burnable = False
+    conserve = False
+    healthy = status == "ok"
+
+    short = windows.get("short")
+    longw = windows.get("long")
+    if provider == "codex" and short:
+        mins = short.get("minutes_to_reset")
+        rem = short.get("remaining_percent")
+        if mins is not None and rem is not None and mins <= 480 and rem >= 20:
+            burnable = True
+        if longw:
+            mins2 = longw.get("minutes_to_reset")
+            rem2 = longw.get("remaining_percent")
+            if mins2 is not None and rem2 is not None and mins2 <= 720 and rem2 >= 5:
+                burnable = True
+    if provider in {"openrouter", "deepinfra"}:
+        conserve = True
+    if provider == "gemini" and short and float(short.get("used_percent", 0)) >= 100:
+        healthy = False
+    if error is not None:
+        healthy = False
+
+    priority_score = 0
+    if healthy:
+        priority_score += 20
+    if burnable:
+        priority_score += 30
+    if conserve:
+        priority_score -= 20
+    if provider == "openrouter" and openrouter_usage:
+        if float(openrouter_usage.get("balance", 0) or 0) <= 0:
+            priority_score -= 15
+    return {
+        "status": "unavailable" if status == "error" else status,
+        "label": item.get("label"),
+        "source": item.get("source"),
+        "login_method": login_method,
+        "budget": {"kind": budget_kind},
+        "windows": windows,
+        "credits": raw.get("credits") if isinstance(raw.get("credits"), dict) else None,
+        "provider_cost": provider_cost,
+        "openrouter_usage": openrouter_usage,
+        "burnable": burnable,
+        "conserve": conserve,
+        "healthy": healthy,
+        "priority_score": priority_score,
+        "raw_summary": item.get("summary"),
+        "error": error,
+    }
+
+
+def recommend_mode(providers: dict[str, Any]) -> str:
+    codex = providers.get("codex") or {}
+    short = ((codex.get("windows") or {}).get("short") or {})
+    longw = ((codex.get("windows") or {}).get("long") or {})
+    if codex.get("healthy"):
+        mins = short.get("minutes_to_reset")
+        rem = short.get("remaining_percent")
+        if mins is not None and rem is not None and mins <= 480 and rem >= 20:
+            return "burn"
+        mins2 = longw.get("minutes_to_reset")
+        rem2 = longw.get("remaining_percent")
+        if mins2 is not None and rem2 is not None and mins2 <= 720 and rem2 >= 5:
+            return "burn"
+    openrouter = providers.get("openrouter") or {}
+    gemini = providers.get("gemini") or {}
+    nvidia_available = True
+    if openrouter.get("healthy") is False and gemini.get("healthy") is not False and nvidia_available:
+        return "conserve"
+    return "normal"
+
+
+def main() -> int:
+    args = parse_args()
+    cmd = [args.ai_usage, "--json", "--providers", args.providers]
+    proc = subprocess.run(cmd, capture_output=True, text=True)
+    if proc.returncode != 0:
+        raise SystemExit(proc.stderr.strip() or proc.stdout.strip() or f"ai-usage failed with {proc.returncode}")
+    payload = json.loads(proc.stdout)
+    if not isinstance(payload, list):
+        raise SystemExit("ai-usage JSON was not a list")
+    providers = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        provider = str(item.get("provider") or "unknown")
+        providers[provider] = normalize_item(item)
+    mode = recommend_mode(providers) if args.mode == "auto" else args.mode
+    state = {
+        "generated_at": iso_now(),
+        "source": "ai-usage --json",
+        "ttl_seconds": 300,
+        "mode_recommendation": mode,
+        "providers": providers,
+    }
+    text = json.dumps(state, indent=2, sort_keys=True)
+    print(text)
+    if args.write_cache:
+        CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        CACHE_PATH.write_text(text + "\n", encoding="utf-8")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
