@@ -5,11 +5,16 @@
 # --------------------------------------------------
 
 # Loom fuzzy picker — invoke loom verbs via fzf
-loomf() {
-  local verb
-  verb=$(loom list | fzf --height=50% --layout=reverse --border \
-    --prompt='loom> ' --preview-window=down:1:wrap | awk '{print $1}')
-  [ -n "$verb" ] && loom "$verb"
+loompick() {
+  local query=${1-}
+  loom list | fzf --height=50% --layout=reverse --border \
+    --prompt='loom> ' --query="$query" --preview-window=down:1:wrap | awk '{print $1}'
+}
+
+loom-fzf() {
+    local verb
+    verb=$(loompick "$1")
+    [ -n "$verb" ] && loom "$verb"
 }
 
 alias pip='/usr/bin/pip'
