@@ -1,5 +1,6 @@
 # DotCortex — Literate Dotfiles System
 
+
 ## What This Is
 
 DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. Org-mode files are the single source of truth. They tangle into overlay directories which GNU Stow symlinks into `$HOME`.
@@ -7,58 +8,135 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
 ## Architecture
 
 ```
-*.org files  →  make tangle  →  overlay dirs  →  make safe-stow  →  $HOME
+*.org files  ->  tangle  ->  overlay dirs  ->  loom stow  ->  $HOME
 ```
 
 - **Org files** (root level): canonical source for all configs, scripts, manifests
 - **Overlay dirs**: `all/` (shared), `linux/`, `debian/`, `devuan/` (sysv-init), `x230/` (X230 ThinkPad), `t480s/` (T480s ThinkPad), `arch/`, `osx/`, `be/`, `navi/`
 - **Stow**: symlinks overlay contents into `$HOME`, stacked in priority order
-- **Loom**: Guile Scheme control plane (`~/.local/bin/loom`) with 50+ task verbs
-- **Loom requires Guix** — it uses Guix's guile interpreter. Without Guix, use `make` targets directly.
+- **Loom**: Guile Scheme control plane (`~/.local/bin/loom`) with 50+ task verbs -- requires Guix guile. Without Guix, use `make` targets directly.
 
 ## Critical Rules
 
-1. **Never edit tangled output files** — edit the `.org` source and re-tangle. Files inside overlay dirs (`all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `be/`, `navi/`, `arch/`, `osx/`) are generated output.
-2. **Org files are at repo root** — the overlay dirs contain only tangled output.
-3. **Stow target is `$HOME`** — the repo must live at `~/DotCortex`.
-4. **Stow via loom** — use `loom stow:x230` or `loom stow:t480s`, not `make safe-stow`. The `make safe-stow` target is only for first-time bootstrap before loom is functional.
-5. **Follow existing patterns** — new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs in `loom.org`.
-6. **Never suggest next steps after editing org files** — do not tell the user to tangle or stow. The user knows the workflow (`tangle-one <file>.org`, `loom all`, `loom stow:*`). Never suggest `make tangle`.
+1. **Never edit tangled output** -- files inside overlay dirs (`all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `be/`, `navi/`, `arch/`, `osx/`) are generated. Edit the `.org` source at repo root instead.
+2. **Never edit the Makefile directly** -- it is tangled from `loom.org`. Edit `loom.org` instead.
+3. **Org files are canonical** -- every config, script, and manifest is defined inside an org code block with a `:tangle` target.
+4. **Stow target is `$HOME`** -- the repo lives at `~/DotCortex`.
+5. **Stow via loom** -- use `loom stow:x230` or `loom stow:t480s` for normal operations. `make safe-stow` is only for first-time bootstrap before loom is functional, or when Guix is unavailable. Never use plain `stow` directly.
+6. **Follow existing patterns** -- new package managers get: `.org` file + SSV manifest + capture/diff/apply/health scripts + `.mk` Makefile fragment + loom verbs in `loom.org`.
+7. **Check Guix profiles before assuming tools aren't installed** -- emacs, nvim, zsh, guile, and other Guix tools live at `~/.guix-extra-profiles/core/core/bin/`, not in system PATH.
+8. **All agent work lives in `.org` files** -- skills, hooks, plugins, custom instructions, and settings are authored in org source at repo root and emitted by tangle. Never write directly to harness directories. This includes:
+   - New skills: add to `skills.org` with the correct tangle target(s)
+   - New hooks or settings: `hooks.org`
+   - New Claude plugins: `hooks.org` (plugins.ssv + settings.json)
+   - New OpenCode plugins: `npm.org` (bun install) and `hooks.org` (opencode config block)
+   - New custom instructions: `agents.org` (this file)
+9. **Skills over commands** -- skills are universal across harnesses; harness-specific commands are not portable. Add new agent capabilities as skills in `skills.org`, not as commands.
+10. **Never commit from a dirty tracked worktree** -- if `git diff --name-only` shows tracked unstaged changes, stop. Do not commit "just your files" and leave the rest dirty. Split the work intentionally or ask.
+11. **Never commit generated output without canonical source** -- if `all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `AGENTS.md`, `CLAUDE.md`, or `Makefile` changed, the corresponding `.org` source must be included in the same commit.
+12. **Commit only on explicit instruction** -- do not create commits or push/pull between machines unless the user explicitly asks for commit/sync behavior. Local edits and verification are fine; history changes require consent.
+13. **Cross-machine sync is explicit** -- for work that must exist on both T480s and X230, use one canonical upstream, `git pull --ff-only` before editing on a machine, and push immediately after an approved commit. Uncommitted work on one machine is not synchronization.
+14. **Operate on the target repo root** -- when tangling or running git in mounted/mirrored checkouts, target the actual repo containing the file, not an assumed `~/DotCortex` path. Never assume the local machine repo is the intended target.
 
-## Common Workflows
+15. **Change Safety Protocol** -- When editing any file, especially config files:
+    - **Read first** -- Always read the full file before making changes. Do not edit a file you have not read completely.
+    - **Check file state before touching** -- Use `ls -la` or `stat` to verify the file exists and its current timestamp. Never assume a file is in an expected state.
+    - **Checkpoint destructive ops** -- Before making destructive edits to a config file (rewrite, revert, restore from backup), make a timestamped backup: `cp file file.backup-$(date +%Y%m%d-%H%M%S)`.
+    - **Never revert to old backup without permission** -- If something goes wrong, do NOT grab an old backup without explicit user confirmation. Ask first.
+    - **Stop on edit failure** -- If an edit goes wrong (tool error, file corrupted, structure broken), STOP immediately. Do not continue editing to "fix it". Call `reflect` or ask the user what to do.
+    - **No panic edits** -- If you made a mistake, do NOT rush to fix it. Embarrassment and urgency cause more damage. Pause, think, then proceed carefully.
+    - **Verify incrementally** -- After each edit, verify the file is in the expected state with `head` or `tail`. If something looks wrong, stop.
+    - **Restore is destruction** -- Restoring a file overwrites current state with older state. This is always destructive. Require explicit permission before restoring any file, especially non-DotCortex config files in `~/.hermes/`, `~/.config/`, etc.
+
+## Agent Config Scoping
+
+Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
+
+| Path | Harness | Notes |
+|------|---------|-------|
+| `.claude/` | Claude Code only | `CLAUDE.md`, settings, skills, hooks |
+| `.opencode/` | OpenCode only | Plugins, bun packages, OpenCode-specific skills |
+| `.codex/` | Codex only | Codex-specific config and skills |
+| `.agents/` | Universal (non-Claude) | Skills and config for OpenCode, Codex, and future agents |
+
+Skills are authored in =skills.org= with one of three emission modes:
+
+| Mode | Tangle target | Scope | Deploy |
+|------|--------------|-------|--------|
+| Stow-global | =all/.claude/skills/X/SKILL.md= + =all/.agents/skills/X/SKILL.md= | All sessions on all machines | =loom stow:*= → =~/.claude/skills/= |
+| DotCortex-scoped | =.claude/skills/X/SKILL.md= + =.agents/skills/X/SKILL.md= | Only when CWD is DotCortex | No stow needed — loaded by CWD |
+| Direct-global | =~/.claude/skills/X/SKILL.md= (absolute) | All sessions, no stow cycle | Write directly |
+
+Current DotCortex-scoped skills: =dotcortex-*= (loom, bootstrap, gotchas, multihost, package-manifests, packages), =helmcortex-nexus=.
+All other skills in =skills.org= are stow-global.
+
+HelmCortex and its workspaces (FORGE, bridge) maintain their own skill harnesses compiled by =helmcortex-compile= from =FORGE/harness/{workspace}/SKILLS.md=. These may intentionally override global skills with project-specific content. Never duplicate a purely generic skill in a project harness — if it has no project-specific content, rely on the global version.
+
+## Research Protocol
+
+Before investigating unknown tool APIs, agent conventions, external system behavior,
+or any problem where you would otherwise spend more than 3 tool calls speculating --
+surface a Perplexity prompt for Mètsàtron to run, then stop and wait.
+
+**Format -- output this verbatim, then stop:**
+
+```
+PERPLEXITY RESEARCH PROMPT:
+[single-focus question -- include tool names, version numbers, and exactly what you need to determine]
+```
+
+Do not continue speculating while waiting. Do not attempt to answer the question yourself.
+This applies to: architecture decisions, model capability questions, library version
+edge-cases, and any situation where a 30-second web search collapses a multi-step rabbit hole.
+
+This also applies when genuinely unsure of the best approach and synthesising from
+the internet would improve the solution quality. Planning in Perplexity before
+executing here is cheaper than burning tokens in circles.
+
+## Model Guidance
+
+- Main session model cannot be changed autonomously -- use `/model sonnet|haiku` yourself.
+- **Opus is currently not viable.** Use `claude-sonnet-4-6` with thinking `high` or `max`
+  for architecture, debugging, and novel problems.
+- Subagents (via the Agent tool):
+  - **Haiku (`claude-haiku-4-5-20251001`)** -- mechanical execution: file ops, grep,
+    glob, reading files, git log/status, quick lookups. Zero ambiguity only.
+  - **Sonnet (`claude-sonnet-4-6`)** -- standard coding, debugging, most tasks.
+  - **Sonnet + thinking high/max** -- architecture, deep multi-file analysis, complex
+    refactors. Never default all subagents to this tier.
+- When spawning subagents via the Agent tool, always set the `model` parameter
+  explicitly. Never let it default to the current session model for all subagents.
+- Never silently switch model -- state which model and why, one line.
+- Model hints per skill are in each skill's `model:` frontmatter field in `.claude/skills/`.
+  Respect them when spawning subagents for skill-scoped work.
+
+## Build & Apply
 
 ```bash
-# Full rebuild (X230)
-cd ~/DotCortex && loom all && loom stow:x230
+cd ~/DotCortex
 
-# Full rebuild (T480s)
-cd ~/DotCortex && loom all && loom stow:t480s
+# Tangle all org files into overlay directories
+make tangle
 
-# Tangle a single file
-tangle-one term.org
+# Tangle a single org file (faster, preferred for focused changes)
+tangle-one agents.org
 
-# Without loom (make targets work without Guix, bootstrap only)
-make tangle && STOW_PKGS='all linux debian devuan t480s' make safe-stow
+# Preview what stow would do (dry-run)
+make preview-stow
 
-# Edit a config
-# 1. Find the org source: grep -rn "tangle.*path/to/config" *.org
-# 2. Edit the org block
-# 3. tangle-one <file>.org && loom stow:t480s (or stow:x230)
+# Stow with loom (normal workflow, requires Guix)
+loom stow:x230     # X230: all linux debian x230
+loom stow:t480s    # T480s: all linux debian devuan t480s
+loom stow:devuan   # shared: all linux devuan
 
-# Loom verbs (requires Guix guile)
-loom                    # list all verbs
+# Without loom (bootstrap, or systems without Guix)
+STOW_PKGS='all linux debian devuan t480s' make safe-stow
+
+# Package management
 loom guix:apply         # apply Guix manifest
 loom flatpak:apply      # apply Flatpak manifest
 loom pip:apply          # install pip manifest
 loom npm:apply          # install npm manifest
-loom stow:x230          # stow X230 overlays (all linux debian x230)
-loom stow:t480s         # stow T480s overlays (all linux debian devuan t480s)
-loom stow:devuan        # stow shared + linux + devuan only
-
-# Without loom (make targets work without Guix)
-make pip-apply
-make npm-apply
-make safe-stow
 ```
 
 ## Package Manifests
@@ -90,21 +168,45 @@ openai "" ""
 ### Adding a New Package Manager
 
 1. Create `newpkg.org` at repo root
-2. Add a manifest SSV block with `:tangle all/.newpkg/manifest/packages.ssv`
-3. Add capture/diff/apply/health scripts with `:tangle all/.local/bin/newpkg-*`
-4. Add a `.mk` Makefile fragment with `:tangle all/.mk/newpkg.mk`
+2. Add a manifest SSV block: `:tangle all/.newpkg/manifest/packages.ssv`
+3. Add capture/diff/apply/health scripts: `:tangle all/.local/bin/newpkg-*`
+4. Add a `.mk` Makefile fragment: `:tangle all/.mk/newpkg.mk`
 5. Add `include $(HOME)/DotCortex/all/.mk/newpkg.mk` to the Makefile block in `loom.org`
 6. Add loom task verbs to the Scheme control plane in `loom.org`
 7. `make tangle` to generate everything
 
 ## Key Files
 
-- `Makefile` — build system entry point (tangle, stow, guix-dirs) — **tangled from `loom.org`**, never edit directly
-- `loom.org` — control plane, Makefile template, batch helpers
-- `shell.org` — bash/zsh rc, exports, aliases, functions, prompt, `.zshenv` (SSH PATH)
-- `style.org` — LainCore theme (fonts, colours, GTK, terminal, Emacs)
-- `INSTALL.sh` — bootstrap script for fresh machines
-- `README.org` — full Org documentation (the original grimoire)
+- `Makefile` -- build entry point -- **tangled from `loom.org`**, never edit directly
+- `loom.org` -- control plane, Makefile template, batch helpers
+- `agents.org` -- source of truth for `AGENTS.md`, `CLAUDE.md`, and global `~/.claude/CLAUDE.md`
+- `skills.org` -- all agent skills (universal and harness-exclusive)
+- `hooks.org` -- Claude settings, hooks, OpenCode config, plugin manifests
+- `shell.org` -- bash/zsh rc, exports, aliases, functions, `.zshenv` (SSH PATH)
+- `style.org` -- LainCore theme (fonts, colours, GTK, terminal, Emacs)
+- `INSTALL.sh` -- bootstrap script for fresh machines
+- `README.org` -- full Org documentation (the original grimoire)
+
+## Finding What Owns a Config
+
+```bash
+grep -rn "tangle.*path/to/config" *.org
+```
+
+## Loom (Control Plane)
+
+Loom is a Guile Scheme CLI (`~/.local/bin/loom`) that wraps make targets and adds batch operations. **Loom requires Guix** -- it uses Guix's guile interpreter. Without Guix, use `make` targets directly:
+
+```bash
+# With loom (requires Guix guile)
+loom pip:apply
+loom flatpak:diff
+
+# Without loom (make targets work anywhere)
+make pip-apply
+make npm-apply
+make safe-stow
+```
 
 ## Bootstrap (Fresh Machine)
 
@@ -113,17 +215,11 @@ git clone --recursive https://gitlab.com/metsarono/dotfiles.git ~/DotCortex
 cd ~/DotCortex && bash INSTALL.sh
 ```
 
-See `INSTALL.sh` for detailed phase-by-phase documentation including lessons learned on Guix installation, init system differences, and first-tangle bootstrapping.
+See `INSTALL.sh` for the full phase-by-phase bootstrap process.
 
-## Known Gotchas
+### First Tangle Needs Stubs
 
-### Makefile is tangled output — never edit it directly
-
-The Makefile is tangled from `loom.org`. Any direct edits will be overwritten by the next `make tangle`. Always edit the Makefile template block in `loom.org` instead, then re-tangle.
-
-### First tangle fails with "No rule to make target .mk"
-
-The Makefile includes `.mk` fragment files that don't exist until after the first tangle. `INSTALL.sh` handles this by creating empty stubs. If running manually:
+The Makefile includes `.mk` fragment files that don't exist until after the first tangle. Create empty stubs:
 
 ```bash
 mkdir -p all/.mk
@@ -133,88 +229,66 @@ done
 make tangle
 ```
 
-### Loom bootstrap (chicken-and-egg)
+### Loom Bootstrap (Chicken-and-Egg)
 
-`loom` needs `~/.config/maak/maak.scm` (placed by stow) and Guix guile. You CANNOT use `loom stow:x230` for the first stow — use `make safe-stow` directly. `INSTALL.sh` handles this by pre-placing `maak.scm` before stow runs (Phase 5.5).
+`loom` needs `~/.config/maak/maak.scm` (placed by stow) and Guix guile. You **cannot** use `loom stow:x230` for the first stow -- use `make safe-stow` directly. `INSTALL.sh` handles this by pre-placing `maak.scm` before stow runs.
 
-After the first `make safe-stow`, loom is functional and can be used for all subsequent stow operations.
+### Guix Emacs Not in SSH PATH
 
-### Guix emacs not in SSH PATH
-
-On Guix machines, emacs lives at `~/.guix-extra-profiles/core/core/bin/emacs`. It is NOT in the default SSH PATH. The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh invocations including non-interactive SSH. If using bash over SSH, add the Guix profile to PATH manually:
+On Guix machines, emacs lives at `~/.guix-extra-profiles/core/core/bin/emacs`. NOT in the default SSH PATH. `.zshenv` sources Guix profiles for all zsh invocations. For bash over SSH:
 
 ```bash
 export PATH="$HOME/.guix-extra-profiles/core/core/bin:$PATH"
 ```
 
-### "not owned by stow" after repo rename (.dotfiles → DotCortex)
+### Guix on Non-systemd Systems (Devuan, sysv-init)
 
-If the repo was renamed, all old stow symlinks become foreign (pointing to the old path). Stow reports "existing target is not owned by stow" for every file. Remove dangling symlinks first:
+1. Install `daemonize` first: `sudo apt-get install -y daemonize`
+2. Use the manual install method in `INSTALL.sh` (the official `guix-install.sh` requires interactive stdin)
+3. Use `ftp.gnu.org` directly -- the `ftpmirror.gnu.org` redirector sometimes has broken SSL
+
+## Known Gotchas
+
+### Stow Conflicts
+
+`safe-stow` handles three conflict message formats across stow versions. It filters HelmCortex (user-managed symlink), backs up real files, removes them, then stows. On failure, auto-retries with `--ignore=HelmCortex`.
+
+After repo rename (`.dotfiles` -> `DotCortex`), remove dangling symlinks first:
 
 ```bash
 find ~ -maxdepth 5 -lname "*/.dotfiles/*" -not -path "*/.git/*" -delete
 ```
 
-Then re-stow. The safe-stow target handles this conflict type automatically with its third sed pattern.
+### /tmp Permissions Break Tangle and Guix Pull
 
-### safe-stow handles three stow conflict message formats
+If `/tmp` has restrictive permissions (`755` instead of `1777`), both fail:
 
-Stow has three different conflict message formats across versions and situations:
+- Tangle: emacs `org-persist` can't create temp directories
+- Guix pull/build: sandbox can't bind-mount
 
-1. `existing target is neither a link nor a directory: FILE` (stow <2.4)
-2. `cannot stow PKG/FILE over existing target FILE since neither...` (stow 2.4+)
-3. `existing target is not owned by stow: FILE` (foreign files/symlinks after repo rename)
+Fix: `sudo chmod 1777 /tmp`. Tangle-only workaround: `TMPDIR=~/.cache/tmp make tangle`
 
-The safe-stow target in `loom.org` matches all three with sed patterns, filters out HelmCortex (which is always a user-managed symlink on mounted machines), backs up real files, removes them, then stows. If stow still fails, it auto-retries with `--ignore=HelmCortex`.
+### pipefail + grep -v
 
-### Guix installer fails on non-interactive terminal
+Under `set -euo pipefail`, `grep -v PATTERN` exits 1 when all lines are filtered. Wrap: `{ grep -v PATTERN || true; }`
 
-The official `guix-install.sh` requires interactive stdin. If running via SSH, CI, or piped input, use the manual install method documented in `INSTALL.sh`.
+### LD_PRELOAD Warning
 
-### Guix installer fails with "Missing commands: daemonize"
+Systems with `libgtk3-nocsd` in `LD_PRELOAD` emit a harmless warning on Guix commands. Ignore it or `unset LD_PRELOAD`.
 
-On Devuan/sysv-init systems, install `daemonize` first: `sudo apt install daemonize`
+### Guix Substituter Display Bug
 
-### Guix ftpmirror SSL errors
+`guix package` occasionally crashes with `Wrong type argument in position 1: #f` during substitute progress display. Cosmetic only -- retry the command.
 
-The `ftpmirror.gnu.org` redirector sometimes sends you to mirrors with broken SSL certificates. Use `ftp.gnu.org` directly:
+### Absolute Symlinks in Overlay Dirs Abort Stow
 
-```bash
-wget https://ftp.gnu.org/gnu/guix/guix-binary-1.5.0.x86_64-linux.tar.xz
-```
-
-### LD_PRELOAD libgtk3-nocsd warning
-
-On systems with `libgtk3-nocsd` in `LD_PRELOAD`, Guix commands emit a warning about being unable to preload it. This is cosmetic — Guix works fine. Unset `LD_PRELOAD` if it bothers you.
-
-### Absolute symlinks in overlay dirs abort stow
-
-If an org file tangles an absolute symlink (e.g. `.config/guix/current -> /var/guix/...`), stow will refuse to manage it. Remove such symlinks from overlay dirs before stowing — they are machine-specific and should not be stow-managed. `INSTALL.sh` auto-cleans these.
-
-### /tmp permissions break tangle AND guix pull
-
-If `/tmp` has restrictive permissions (e.g. `755` instead of `1777`), two things break:
-
-1. **Tangle**: emacs `org-persist` can't create temp directories → `Permission denied, /tmp/org-persist-`
-2. **Guix pull/build**: sandbox can't bind-mount → `bind: Permission denied`
-
-Fix the root cause: `sudo chmod 1777 /tmp`
-
-Workaround for tangle only: `TMPDIR=~/.cache/tmp make tangle`
-
-### pipefail interaction with grep -v
-
-Under `set -euo pipefail`, `grep -v PATTERN` returns exit code 1 when it filters ALL lines (nothing passes through). This kills the pipeline. Always wrap: `{ grep -v PATTERN || true; }`
-
-### Guix substituter display bug
-
-`guix package` occasionally crashes with `Wrong type argument in position 1: #f` during substitute download progress display. This is a cosmetic bug in `guix/progress.scm`. Retry the command — most substitutes will already be cached so it's fast.
+If an org file tangles an absolute symlink (e.g. `.config/guix/current`), stow refuses to manage it. Remove it from the overlay dir -- they're machine-specific. `INSTALL.sh` auto-cleans these.
 
 ## HelmCortex Integration
 
-DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow any files into HelmCortex — HelmCortex owns all its own configs (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs) directly.
+DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow files into HelmCortex -- HelmCortex owns all its own configs (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs) directly.
 
-DotCortex's only HelmCortex touchpoint is the shell PATH entry in `shell.org` / `.zshenv` that adds `$HOME/HelmCortex/FORGE/bin` to `$PATH` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
+DotCortex's only HelmCortex touchpoint: the shell PATH entry in `.zshenv` adding `$HOME/HelmCortex/FORGE/bin` to `$PATH` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
 
 HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mnt/x230/HelmCortex`).
 
@@ -222,20 +296,19 @@ HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mn
 
 ## Multi-Machine Setup (Star Fleet)
 
-DotCortex is designed for deployment across multiple machines:
-
-- **X230** (ThinkPad, Debian/systemd): HelmCortex native, overlays: `all linux debian x230`, loom verb: `loom stow:x230`
-- **T480s** (ThinkPad, Devuan/sysv-init): HelmCortex mounted at `~/mnt/x230/`, symlinked to `~/HelmCortex`, overlays: `all linux debian devuan t480s`, loom verb: `loom stow:t480s`
+- **X230** (ThinkPad, Debian/systemd): HelmCortex native, overlays: `all linux debian x230`, verb: `loom stow:x230`
+- The x230 checkout of this repo lives at `/home/metsatron/DotCortex` on host `x230` (`git remote x230`).
+- **T480s** (ThinkPad, Devuan/sysv-init): HelmCortex mounted + symlinked, overlays: `all linux debian devuan t480s`, verb: `loom stow:t480s`
 - Future machines: clone DotCortex, run `INSTALL.sh`, done
 
-### Overlay scoping
+### Overlay Scoping
 
-- `all/` — cross-platform (works on Linux, macOS, etc)
-- `linux/` — Linux-only (Guix is Linux-only, so `host-wrap` lives here)
-- `debian/` — Debian-family shared (apt/nala packages)
-- `devuan/` — sysv-init shared (non-systemd daemons, desktop launchers for XFCE panel scripts)
-- `x230/` — X230-specific (earlyoom, neofetch/fastfetch configs, GTK settings, wezterm, systemd services)
-- `t480s/` — T480s-specific (future machine-specific configs)
+- `all/` -- cross-platform (works on Linux, macOS, etc)
+- `linux/` -- Linux-only (Guix is Linux-only, so `host-wrap` lives here)
+- `debian/` -- Debian-family shared (apt/nala packages)
+- `devuan/` -- sysv-init shared (non-systemd daemons, desktop launchers for XFCE panel scripts)
+- `x230/` -- X230-specific (earlyoom, neofetch/fastfetch configs, GTK settings, wezterm, systemd services)
+- `t480s/` -- T480s-specific (future machine-specific configs)
 
 ### .zshenv for SSH PATH
 
@@ -244,8 +317,13 @@ The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh 
 ## When Working on DotCortex
 
 - Always edit `.org` source, never tangled output
-- The Makefile is tangled from `loom.org` — edit `loom.org`, not Makefile
-- Test with `make tangle` before stowing
-- Use `make preview-stow` to dry-run before applying
-- After adding new package manager support, add loom verbs AND make targets
+- The Makefile is tangled from `loom.org` -- edit `loom.org`, not Makefile
+- New skills, hooks, plugins, and agent instructions are authored in `.org` files, never in emitted harness directories
+- Use `make preview-stow` for a dry-run before applying
+- After adding a new package manager, add loom verbs AND make targets
 - When searching for a tool, check Guix profiles (`~/.guix-extra-profiles/core/core/bin/`) before assuming it's not installed
+- When uncertain about external tools or APIs, issue a Perplexity research prompt rather than exploring speculatively
+
+## Claude Code Rules
+
+- **Skills are in `.claude/skills/`** -- authored in `skills.org`, never edited directly. Stow-global skills tangle to `all/.claude/skills/` and are stowed to `~/.claude/skills/`. DotCortex-scoped skills tangle to `.claude/skills/` and are active only when CWD is DotCortex. HelmCortex and its workspaces manage their own skills via `FORGE/harness/{workspace}/SKILLS.md` compiled by `helmcortex-compile`.
