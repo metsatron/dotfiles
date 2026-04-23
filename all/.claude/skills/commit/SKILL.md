@@ -41,16 +41,27 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
    Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
    ```
 
-5. **Stage specific files** — NEVER use `git add .` or `git add -A`. Add files by name. If unsure which files belong, ask.
+5. **Refresh visibility before staging:**
+   - If the work changes outstanding tasks, update the relevant `~/HelmCortex/LOGS/TODO/{workspace}.md` file.
+   - If the work is machine-specific, update `~/HelmCortex/LOGS/TODO/Machines/{hostname}.md`.
+   - If a durable lesson crystallized, run or recommend `/reflect` and persist the lesson to the narrowest real source of truth before committing.
+   - If no TODO or reflection update is warranted, say so briefly in the commit report.
 
-6. **Commit** using a HEREDOC for the message to preserve formatting.
+6. **Stage specific files** — NEVER use `git add .` or `git add -A`. Add files by name. If unsure which files belong, ask.
 
-7. Show `git log -1` to confirm.
+7. **Commit** using a HEREDOC for the message to preserve formatting.
+
+8. Show `git log -1` to confirm.
 
 ## Rules
 
 - If there are no changes, say so and stop.
+- Refuse to commit from a dirty tracked worktree. If tracked unstaged changes exist outside the intended commit, stop and ask the user whether to split, stage, or stash them first.
 - If changes span multiple unrelated scopes, suggest splitting into multiple commits.
 - If the user's hint conflicts with what the diff shows, trust the diff.
+- Never commit generated/tangled output without the canonical `.org` source in the same commit.
+- Never use `git add .`, `git add -A`, or a broad pathspec that sweeps unrelated files into the commit.
+- When the user asks for cross-machine sync, use `git pull --ff-only` before work on the target machine and push immediately after the approved commit.
 - Do not push unless explicitly asked.
 - Remember: `.org` files are the source of truth, tangled output files are generated.
+- Commit closeout is a visibility gate: TODO state and reflection-worthy lessons should not be left only in chat context.
