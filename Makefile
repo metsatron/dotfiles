@@ -125,4 +125,3 @@ include $(HOME)/DotCortex/all/.mk/bunx.mk
 include $(HOME)/DotCortex/all/.mk/npm.mk
 include $(HOME)/DotCortex/all/.mk/pip.mk
 include $(HOME)/DotCortex/all/.mk/nala.mk
-include $(HOME)/DotCortex/all/.mk/gitrelease.mk
