@@ -39,6 +39,19 @@
   (let* ((cmd (string-append ". \"" CORE-PROFILE "/etc/profile\"; " (thunk))))
     (sh cmd)))
 
+(define (git-submodules-latest-cmd)
+  (string-append
+   "git submodule foreach --recursive '"
+   "branch=$(git -C \"$toplevel/$name\" remote show origin | sed -n \"s#.*HEAD branch: ##p\"); "
+   "if [ -z \"$branch\" ]; then branch=$(git config -f \"$toplevel/.gitmodules\" --get submodule.$name.branch || echo master); fi; "
+   "git fetch origin \"$branch\" && git checkout -q FETCH_HEAD'"))
+
+(define (git-submodules-sync-cmd)
+  "git submodule sync --recursive && git submodule update --init --recursive")
+
+(define (git-submodules-status-cmd)
+  "git submodule status --recursive")
+
 ;; Safety: ensure task constructor is always bound at top level (idempotent)
 (define task
   (lambda (name desc thunk)
@@ -66,6 +79,23 @@
    (task 'hooks:health
          "Show the active git hooks path for this checkout"
          (lambda () (sh "git config --get core.hooksPath || echo '(unset)'")))
+
+   ;; --- Git maintenance ---
+   (task 'git:submodules
+         "Update all submodules to the latest commit on their tracked branch"
+         (lambda () (sh (git-submodules-latest-cmd))))
+
+   (task 'git:submodules:latest
+         "Alias for git:submodules"
+         (lambda () (sh (git-submodules-latest-cmd))))
+
+   (task 'git:submodules:sync
+         "Sync submodule URLs and initialize/update recursively"
+         (lambda () (sh (git-submodules-sync-cmd))))
+
+   (task 'git:submodules:status
+         "Show recursive submodule status"
+         (lambda () (sh (git-submodules-status-cmd))))
 
    ;; --- Stow / dotfiles ---
    (task 'stow "Safe stow shared overlay only (all)"
@@ -564,6 +594,7 @@
                         (not (string-prefix? "stow:" nm))
                         (not (string-prefix? "tmux:" nm))
                         (not (string-prefix? "backup:" nm))
+                        (not (string-prefix? "git:" nm))
                         (not (string-prefix? "dotcortex:" nm))
                         (not (string-prefix? "agents:" nm))))))
 
@@ -612,6 +643,10 @@
   (print-group "Backup commands"
                (lambda (t)
                  (string-prefix? "backup:" (task-name-str t)))))
+
+  (print-group "Git commands"
+               (lambda (t)
+                 (string-prefix? "git:" (task-name-str t))))
 
   (print-group "DotCortex commands"
                (lambda (t)
