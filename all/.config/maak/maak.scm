@@ -358,25 +358,6 @@
      (task 'bun:health "Show DotCortex Bun env and versions"
            (lambda () (sh "~/.local/bin/bun-health")))
 
-     (task 'bun-source:diff
-           "Plan: Bun source manifests vs local checkout/build state"
-           (lambda () (sh "~/.local/bin/bun-source-diff")))
-
-     (task 'bun-source:sync
-           "Ensure Bun source checkouts exist, no installs or builds"
-           (lambda () (sh "~/.local/bin/bun-source-sync")))
-
-     (task 'bun-source:apply
-           "Sync Bun source checkouts and rebuild only when fingerprints change"
-           (lambda () (sh "~/.local/bin/bun-source-apply")))
-
-     (task 'bun-source:update
-           "Intentionally advance Bun source checkouts to newer upstream state"
-           (lambda () (sh "~/.local/bin/bun-source-update")))
-
-     (task 'bun-source:health "Show Bun source checkout/build health"
-           (lambda () (sh "~/.local/bin/bun-source-health")))
-
      ;; --- Bunx ---
      (task 'bunx:capture "Capture managed bunx launchers to DotCortex SSV"
            (lambda () (sh "~/.local/bin/bunx-capture")))
@@ -457,10 +438,6 @@
          (lambda () (sh "~/.local/bin/nala-health")))
 
    ;; --- GitHub release artifacts ---
-   (task 'gitrelease:apply
-         "Update all non-Flatpak GitHub release artifacts"
-         (lambda () (sh "make -f ~/DotCortex/all/.mk/gitrelease.mk gitrelease-apply")))
-
    ;; --- Backup ---
    (task 'backup:system
          "Clean + mirror system to ironwolf02 (needs sudo)"
