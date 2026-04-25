@@ -42,10 +42,11 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
    ```
 
 5. **Refresh visibility before staging:**
-   - If the work changes outstanding tasks, update the relevant `~/HelmCortex/LOGS/TODO/{workspace}.md` file.
+   - If the work completes or changes outstanding tasks, mark them done in the relevant `~/HelmCortex/LOGS/TODO/{workspace}.md` file.
+   - If the work surfaces follow-up tasks not already tracked, add them to the relevant TODO file — do not leave loose ends only in the commit message or chat context.
    - If the work is machine-specific, update `~/HelmCortex/LOGS/TODO/Machines/{hostname}.md`.
    - If a durable lesson crystallized, run or recommend `/reflect` and persist the lesson to the narrowest real source of truth before committing.
-   - If no TODO or reflection update is warranted, say so briefly in the commit report.
+   - If no TODO or reflection update is warranted, say so explicitly in the commit report.
 
 6. **Stage specific files** — NEVER use `git add .` or `git add -A`. Add files by name. If unsure which files belong, ask.
 
