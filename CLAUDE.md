@@ -37,8 +37,9 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
 12. **Commit only on explicit instruction** -- do not create commits or push/pull between machines unless the user explicitly asks for commit/sync behavior. Local edits and verification are fine; history changes require consent.
 13. **Cross-machine sync is explicit** -- for work that must exist on both T480s and X230, use one canonical upstream, `git pull --ff-only` before editing on a machine, and push immediately after an approved commit. Uncommitted work on one machine is not synchronization.
 14. **Operate on the target repo root** -- when tangling or running git in mounted/mirrored checkouts, target the actual repo containing the file, not an assumed `~/DotCortex` path. Never assume the local machine repo is the intended target.
+15. **"Take care of it" means preserve intent** -- when the user says to "take care of it" about a staged or tracked change, stage and commit the current intended content unless the user explicitly asks for source edits. Do not delete, revert, or silently rewrite it. If a plan was already proposed, "take care of it" means execute that plan.
 
-15. **Change Safety Protocol** -- When editing any file, especially config files:
+16. **Change Safety Protocol** -- When editing any file, especially config files:
     - **Read first** -- Always read the full file before making changes. Do not edit a file you have not read completely.
     - **Check file state before touching** -- Use `ls -la` or `stat` to verify the file exists and its current timestamp. Never assume a file is in an expected state.
     - **Checkpoint destructive ops** -- Before making destructive edits to a config file (rewrite, revert, restore from backup), make a timestamped backup: `cp file file.backup-$(date +%Y%m%d-%H%M%S)`.
