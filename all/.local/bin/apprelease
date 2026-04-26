@@ -1,0 +1,365 @@
+#!/usr/bin/env bash
+# apprelease — Multi-forge release fetcher for AppImages
+
+# [[file:../../../appimage.org::*apprelease — Multi-forge release fetcher for AppImages][apprelease — Multi-forge release fetcher for AppImages:1]]
+set -Eeuo pipefail
+
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/apprelease.d"
+REPO_CONF_DIR="$HOME/DotCortex/all/.config/apprelease.d"
+DL_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/apprelease"
+APPIMG_DIR="$HOME/Applications"
+
+mkdir -p "$DL_DIR" "$APPIMG_DIR"
+
+require() { command -v "$1" >/dev/null 2>&1 || { echo "Missing: $1" >&2; exit 2; }; }
+
+normalize_ver() { sed -E 's/^v//' <<<"$1"; }
+
+cache_dir() { printf '%s/%s\n' "$DL_DIR" "$1"; }
+
+write_cache_meta() {
+    local dir="$1" tag="$2" name="$3" url="$4" digest="$5"
+    mkdir -p "$dir"
+    printf '%s\n' "$tag"    > "$dir/tag"
+    printf '%s\n' "$name"   > "$dir/asset.name"
+    printf '%s\n' "$url"    > "$dir/asset.url"
+    printf '%s\n' "${digest:-}" > "$dir/asset.digest"
+    touch "$dir/etag"
+}
+
+etag_get() {
+    local url="$1" etag_file="$2"
+    local etag=""
+    [[ -f "$etag_file" ]] && etag="$(cat "$etag_file")"
+    if [[ -n "$etag" ]]; then
+        curl -sL -H "If-None-Match: \"$etag\"" -w "%{http_code}" -o /dev/null "$url"
+    else
+        echo "000"
+    fi
+}
+
+etag_save() {
+    local url="$1" etag_file="$2"
+    local etag=""
+    etag="$(curl -sI -H "If-None-Match: \"$(cat "$etag_file" 2>/dev/null || echo "")\"" "$url" 2>/dev/null | awk -F: '/^etag:/ {gsub(/[ "]/,"",$2); print $2}')"
+    if [[ -n "$etag" ]]; then
+        printf '%s' "$etag" > "$etag_file"
+    fi
+}
+
+json_asset_url() {
+    jq -r --arg re "$2" '.assets[].browser_download_url | select(test($re))' <<<"$1" | head -n1
+}
+
+json_asset_name() {
+    jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re)) | .name' <<<"$1" | head -n1
+}
+
+json_asset_digest() {
+    jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re)) | .digest // ""' <<<"$1" | head -n1
+}
+
+normalize_release_json() {
+    local json="$1"
+    if jq -e 'type == "array"' <<<"$json" >/dev/null 2>&1; then
+        jq '.[0]' <<<"$json"
+    else
+        echo "$json"
+    fi
+}
+
+forge_release_json() {
+    local forge="$1" repo="$2" base_url="${3:-}" token="${4:-}"
+    case "$forge" in
+        github)
+            local url="https://api.github.com/repos/$repo/releases/latest"
+            if [[ -n "$token" ]]; then
+                curl -fsSL -H "Authorization: Bearer $token" "$url"
+            else
+                curl -fsSL "$url"
+            fi
+            ;;
+        gitlab)
+            local project_id="${repo%%/*}"
+            local slug="${repo#*/}"
+            local encoded_proj
+            encoded_proj="$(python3 -c "import urllib.parse; print(urllib.parse.quote('$project_id/$slug'))" 2>/dev/null || echo "$project_id/$slug")"
+            curl -fsSL "https://gitlab.com/api/v4/projects/$encoded_proj/releases?per_page=1"
+            ;;
+        codeberg)
+            curl -fsSL "https://codeberg.org/api/v1/repos/$repo/releases?limit=1"
+            ;;
+        forgejo)
+            [[ -z "$base_url" ]] && { echo "ERROR: FORGE_BASE_URL required for forgejo" >&2; return 1; }
+            curl -fsSL "${base_url}/api/v1/repos/${repo}/releases?limit=1${token:+&token=$token}"
+            ;;
+        *)
+            echo "ERROR: unknown FORGE: $forge" >&2; return 1
+            ;;
+    esac
+}
+
+forge_tags_json() {
+    local forge="$1" repo="$2" base_url="${3:-}" token="${4:-}"
+    case "$forge" in
+        github)
+            curl -fsSL "https://api.github.com/repos/$repo/tags?per_page=1"
+            ;;
+        gitlab)
+            local encoded_proj
+            encoded_proj="$(python3 -c "import urllib.parse; print(urllib.parse.quote('$repo'))" 2>/dev/null || echo "$repo")"
+            curl -fsSL "https://gitlab.com/api/v4/projects/$encoded_proj/repository/tags?per_page=1"
+            ;;
+        codeberg)
+            curl -fsSL "https://codeberg.org/api/v1/repos/$repo/tags?limit=1"
+            ;;
+        forgejo)
+            [[ -z "$base_url" ]] && { echo "ERROR: FORGE_BASE_URL required for forgejo" >&2; return 1; }
+            curl -fsSL "${base_url}/api/v1/repos/${repo}/tags?limit=1${token:+&token=$token}"
+            ;;
+        *)
+            echo "ERROR: unknown FORGE: $forge" >&2; return 1
+            ;;
+    esac
+}
+
+github_latest_tag() { jq -r 'if .tag_name then .tag_name else empty end' <<<"$1"; }
+github_asset_url()  { jq -r --arg re "$2" '.assets[] | select(.name | test($re; "i")) | .browser_download_url' <<<"$1" | head -n1; }
+github_asset_name() { jq -r --arg re "$2" '.assets[] | select(.name | test($re; "i")) | .name' <<<"$1" | head -n1; }
+
+gitlab_latest_tag()   { jq -r 'if .tag_name then .tag_name else .name end' <<<"$1" | head -n1; }
+gitlab_asset_url()    { jq -r --arg re "$2" '.assets[] | select(.link.url | test($re; "i")) | .link.url' <<<"$1" | head -n1; }
+gitlab_asset_name()   { jq -r --arg re "$2" '.assets[] | select(.link.url | test($re; "i")) | .name' <<<"$1" | head -n1; }
+
+codeberg_latest_tag() { jq -r 'if .tag_name then .tag_name else .name end' <<<"$1" | head -n1; }
+codeberg_asset_url()  { jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re; "i")) | .browser_download_url' <<<"$1" | head -n1; }
+codeberg_asset_name() { jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re; "i")) | .name' <<<"$1" | head -n1; }
+
+forgejo_latest_tag() { jq -r 'if .tag_name then .tag_name else .name end' <<<"$1" | head -n1; }
+forgejo_asset_url()  { jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re; "i")) | .browser_download_url' <<<"$1" | head -n1; }
+forgejo_asset_name() { jq -r --arg re "$2" '.assets[] | select(.browser_download_url | test($re; "i")) | .name' <<<"$1" | head -n1; }
+
+appimage_current_ver() {
+    local name="$1"
+    ls "$APPIMG_DIR"/"$name"-*.AppImage 2>/dev/null | \
+        while IFS= read -r f; do
+            [[ -L "$f" ]] && continue
+            basename "$f"
+        done | \
+        sed -nE "s#^${name}-([0-9][^-]*).*.AppImage#\1#p" | \
+        sort -V | tail -n1 || true
+}
+
+find_conf() {
+    local app="$1"
+    if [[ -r "$CONF_DIR/$app.conf" ]]; then
+        printf '%s\n' "$CONF_DIR/$app.conf"; return 0
+    fi
+    if [[ -r "$REPO_CONF_DIR/$app.conf" ]]; then
+        printf '%s\n' "$REPO_CONF_DIR/$app.conf"; return 0
+    fi
+    return 1
+}
+
+usage() {
+    cat <<EOF
+Usage: apprelease <verb> [app]
+  list                list all conf-managed apps
+  update <app>        update a single conf-managed app
+  update-all          update all conf-managed apps
+  cache <app>         show cache state for an app
+  health <app>        check forge reachability (no download)
+Verbs affect only apps with conf files in:
+  $CONF_DIR/  (user overrides)
+  $REPO_CONF_DIR/  (DotCortex defaults)
+EOF
+}
+
+list_apps() {
+    local dir file
+    for dir in "$CONF_DIR" "$REPO_CONF_DIR"; do
+        [[ -d "$dir" ]] || continue
+        for file in "$dir"/*.conf; do
+            [[ -e "$file" ]] || continue
+            basename "$file" .conf
+        done
+    done | sort -u
+}
+
+show_cache() {
+    local app="$1" dir
+    dir="$(cache_dir "$app")"
+    if [[ ! -d "$dir" ]]; then
+        echo "No cache for $app"; return 1
+    fi
+    echo "cache: $dir"
+    [[ -f "$dir/tag" ]]         && printf '  tag:     %s\n' "$(cat "$dir/tag")"
+    [[ -f "$dir/asset.name" ]]  && printf '  asset:   %s\n' "$(cat "$dir/asset.name")"
+    [[ -f "$dir/asset.url" ]]   && printf '  url:     %s\n' "$(cat "$dir/asset.url")"
+    [[ -f "$dir/etag" ]]        && printf '  etag:    %s\n' "$(cat "$dir/etag")"
+}
+
+health_check() {
+    local app="$1" conf forge repo base_url
+    conf="$(find_conf "$app")" || { echo "No conf for $app"; return 1; }
+    source "$conf"
+    : "${FORGE?}" "${NAME?}"
+    if [[ "$FORGE" == "dead" ]]; then
+        echo "[dead] $NAME is marked dead"; return 1
+    fi
+    if [[ "$FORGE" == "direct" ]]; then
+        if curl -sfI --max-time 10 "$DIRECT_URL" >/dev/null 2>&1; then
+            echo "[ok] $NAME direct URL reachable"; return 0
+        else
+            echo "[fail] $NAME direct URL unreachable"; return 1
+        fi
+    fi
+    local json
+    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" 2>&1)" || {
+        echo "[fail] $NAME forge API unreachable: $json"; return 1
+    }
+    json="$(normalize_release_json "$json")"
+    if jq -e '.message' <<<"$json" >/dev/null 2>&1; then
+        local msg; msg="$(jq -r '.message' <<<"$json")"
+        echo "[fail] $NAME API error: $msg"; return 1
+    fi
+    echo "[ok] $NAME forge API reachable"; return 0
+}
+
+update_one() {
+    local app="$1" conf json latest_tag latest_ver asset_url asset_name
+    local cached_asset have installed_ver dest
+    conf="$(find_conf "$app")" || { echo "[skip] $app: no conf"; return 0; }
+    source "$conf"
+    : "${FORGE?}" "${NAME?}" "${APPIMG_NAME?}" "${ASSET_RE?}"
+
+    if [[ "$FORGE" == "dead" ]]; then
+        echo "[dead] $NAME is marked dead — skipping"
+        return 0
+    fi
+
+    local dir; dir="$(cache_dir "$app")"
+
+    if [[ "$FORGE" == "direct" ]]; then
+        require curl
+    echo "[conf] $NAME: direct URL mode"
+    installed_ver="$(appimage_current_ver "$APPIMG_NAME")"
+    echo "[conf] $NAME installed: ${installed_ver:-none}"
+    mkdir -p "$dir"
+    local tmp asset_final
+        tmp="$dir/cursor-latest.AppImage"
+        if ! curl -fL "$DIRECT_URL" -o "$tmp" 2>/dev/null; then
+            echo "[fail] $NAME: download failed"; return 1
+        fi
+        asset_name="$(basename "$DIRECT_URL")"
+        local fetched_ver
+        fetched_ver="$(echo "$asset_name" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || echo "unknown")"
+        if [[ -n "$installed_ver" && "$installed_ver" == "$fetched_ver" ]]; then
+            echo "[skip] $NAME is up-to-date ($installed_ver)"
+            rm -f "$tmp"
+            return 0
+        fi
+        asset_final="$APPIMG_DIR/$APPIMG_NAME-$fetched_ver.AppImage"
+        mv -f "$tmp" "$asset_final"
+        chmod +x "$asset_final"
+        ln -sf "$asset_final" "$APPIMG_DIR/$APPIMG_NAME-latest.AppImage"
+        echo "[conf] $NAME updated: $fetched_ver → $asset_final"
+        return 0
+    fi
+
+    require jq curl
+    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" 2>&1)" || {
+        echo "[fail] $NAME: forge API unreachable"; return 1
+    }
+    json="$(normalize_release_json "$json")"
+
+    if jq -e '.message' <<<"$json" >/dev/null 2>&1; then
+        local msg; msg="$(jq -r '.message' <<<"$json")"
+        echo "[fail] $NAME: $msg"; return 1
+    fi
+
+    case "$FORGE" in
+        github)
+            latest_tag="$(github_latest_tag "$json")"
+            asset_url="$(github_asset_url "$json" "$ASSET_RE")"
+            asset_name="$(github_asset_name "$json" "$ASSET_RE")"
+            ;;
+        gitlab)
+            latest_tag="$(gitlab_latest_tag "$json")"
+            asset_url="$(gitlab_asset_url "$json" "$ASSET_RE")"
+            asset_name="$(gitlab_asset_name "$json" "$ASSET_RE")"
+            ;;
+        codeberg)
+            latest_tag="$(codeberg_latest_tag "$json")"
+            asset_url="$(codeberg_asset_url "$json" "$ASSET_RE")"
+            asset_name="$(codeberg_asset_name "$json" "$ASSET_RE")"
+            ;;
+        forgejo)
+            latest_tag="$(forgejo_latest_tag "$json")"
+            asset_url="$(forgejo_asset_url "$json" "$ASSET_RE")"
+            asset_name="$(forgejo_asset_name "$json" "$ASSET_RE")"
+            ;;
+        *)
+            echo "[fail] $NAME: unknown FORGE=$FORGE"; return 1
+            ;;
+    esac
+
+    [[ -z "$latest_tag" ]] && { echo "[fail] $NAME: could not get latest tag"; return 1; }
+    [[ -z "$asset_url" ]]  && { echo "[fail] $NAME: no asset matched $ASSET_RE"; return 1; }
+    [[ -z "$asset_name" ]] && { echo "[warn] $NAME: matched URL but no asset name"; asset_name="unknown"; }
+
+    latest_ver="$(normalize_ver "$latest_tag")"
+    installed_ver="$(appimage_current_ver "$APPIMG_NAME")"
+
+    echo "[conf] $NAME installed: ${installed_ver:-none}  latest: $latest_ver"
+
+    if [[ -n "$installed_ver" && "$(printf '%s\n%s\n' "$installed_ver" "$latest_ver" | sort -V | tail -n1)" == "$installed_ver" ]]; then
+        echo "[skip] $NAME is up-to-date ($installed_ver >= $latest_ver)"
+        write_cache_meta "$dir" "$latest_tag" "$asset_name" "$asset_url" ""
+        return 0
+    fi
+
+    mkdir -p "$dir"
+    local tmp cached_asset
+    tmp="$dir/$asset_name.part"
+    cached_asset="$dir/$asset_name"
+
+    echo "[conf] $NAME: downloading $asset_url"
+    if ! curl -fL "$asset_url" -o "$tmp" 2>&1; then
+        echo "[fail] $NAME: download failed"; rm -f "$tmp"; return 1
+    fi
+    mv -f "$tmp" "$cached_asset"
+    chmod +x "$cached_asset"
+
+    dest="$APPIMG_DIR/$APPIMG_NAME-$latest_ver.AppImage"
+    cp -f "$cached_asset" "$dest"
+    chmod +x "$dest"
+    ln -sf "$dest" "$APPIMG_DIR/$APPIMG_NAME-latest.AppImage"
+
+    # Remove old versions of the same app
+    for old in "$APPIMG_DIR"/"$APPIMG_NAME"-*.AppImage; do
+        [[ -L "$old" ]] && continue
+        [[ "$old" == "$dest" ]] && continue
+        echo "[conf] $NAME: removing old version $(basename "$old")"
+        rm -f "$old"
+    done
+
+    write_cache_meta "$dir" "$latest_tag" "$asset_name" "$asset_url" ""
+    echo "[conf] $NAME updated: $latest_ver → $dest"
+}
+
+case "${1:-}" in
+    list)   list_apps ;;
+    cache)  show_cache "${2:?app}" ;;
+    health) health_check "${2:?app}" ;;
+    update) shift; update_one "${1:?app}" ;;
+    update-all)
+        ok=0
+        for a in $(list_apps); do
+            update_one "$a" || ok=$?
+        done
+        exit $ok
+        ;;
+    *) usage; exit 1 ;;
+esac
+# apprelease — Multi-forge release fetcher for AppImages:1 ends here

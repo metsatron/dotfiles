@@ -1,13 +1,19 @@
 #!/usr/bin/env bash
 # Inventory tool
-# Reads overrides from the tangled SSV.
+# Reads overrides from the tangled SSV. Classifies apps as:
+# - ZSync-capable (HAS_UPDATE_INFO=yes, embedded update info)
+# - Conf-managed (listed in apprelease.d/ conf files)
+# - Dead (in dead-overrides.ssv)
+# - Unmanaged (no update info, no conf)
+
 
 # [[file:../../../appimage.org::*Inventory tool][Inventory tool:1]]
-#!/usr/bin/env bash
 set -Eeuo pipefail
 APPS_DIR="${APPS_DIR:-$HOME/Applications}"
 INV_DIR="${INV_DIR:-$HOME/DotCortex/all/.appimage/inventory}"
 TOOL="$APPS_DIR/appimageupdatetool-x86_64.AppImage"
+CONF_DIR="$HOME/.config/apprelease.d"
+REPO_CONF_DIR="$HOME/DotCortex/all/.config/apprelease.d"
 
 mkdir -p "$INV_DIR"
 
@@ -17,153 +23,159 @@ man_ssv="$INV_DIR/manual.ssv"
 dead_ssv="$INV_DIR/dead.ssv"
 dead_over="$INV_DIR/dead-overrides.ssv"
 
-printf "FILE NAME HAS_UPDATE_INFO UPDATE_KIND NOTE\n" >"$all_ssv"
+printf "FILE NAME HAS_UPDATE_INFO UPDATE_KIND NOTE MANAGED_BY\n" >"$all_ssv"
 
-# Optional strict mode: require -j to succeed (0/1) to keep in "supports".
 STRICT="${STRICT:-1}"
-# If set to 1, treat GitHub 403 rate-limit as temporarily OK (keeps in supports)
 RELAX_ON_403="${RELAX_ON_403:-0}"
 
-# Run a command quietly and return only its exit code (no ABRT spew).
 quiet_rc() {
-  # Use a subshell with set +e so nonzero/signal exits don't bubble,
-  # and redirect both streams away.
-  ( set +e; "$@"; exit $? ) >/dev/null 2>&1
-  echo $?
+    ( set +e; "$@"; exit $? ) >/dev/null 2>&1
+    echo $?
+}
+
+# Build list of conf-managed app names (for MANAGED_BY column)
+conf_apps=""
+for dir in "$CONF_DIR" "$REPO_CONF_DIR"; do
+    for f in "$dir"/*.conf 2>/dev/null; do
+        [[ -f "$f" ]] || continue
+        app="$(basename "$f" .conf)"
+        conf_apps="$conf_apps $app"
+    done
+done
+
+is_conf_managed() {
+    local name="$1"
+    for ca in $conf_apps; do
+        if [[ "$ca" == "$name" ]]; then return 0; fi
+    done
+    return 1
+}
+
+# Build set of dead overrides
+declare -A dead_set
+if [[ -f "$dead_over" ]]; then
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^# ]] && continue
+        line="$(echo "$line" | sed 's/[[:space:]]//g')"
+        [[ -n "$line" ]] && dead_set["$line"]=1
+    done < "$dead_over"
+fi
+
+is_dead() {
+    local base="$1"
+    [[ "${dead_set[$base]}" == "1" ]] && return 0
+    return 1
 }
 
 shopt -s nullglob
 for f in "$APPS_DIR"/*.AppImage; do
-  base="$(basename -- "$f")"; name="${base%.AppImage}"
-  has="no"; kind=""; note=""
+    base="$(basename -- "$f")"
+    name="${base%.AppImage}"
+    has="no"; kind=""; note=""; managed="unmanaged"
 
-  if [[ -x "$TOOL" ]]; then
-    # Describe; treat output as data even if rc != 0
-    desc_out="$("$TOOL" -d "$f" 2>&1 || true)"
-
-    if grep -q '^[[:space:]]*Update information type:' <<<"$desc_out"; then
-      has="yes"
-      kind="$(sed -n 's/^[[:space:]]*Update information type:[[:space:]]*//p' <<<"$desc_out" | head -n1)"
-
-      if [[ "$STRICT" = "1" ]]; then
-        # Try up to 3 times with small backoff to avoid GitHub 403s
-        tries=0
-        chk_rc=255
-        j_out=""
-        while (( tries < 3 )); do
-          set +e
-          j_out="$("$TOOL" -j "$f" 2>&1)"
-          chk_rc=$?
-          set -e
-          if [[ $chk_rc -eq 0 || $chk_rc -eq 1 ]]; then
-            break
-          fi
-          # If rate-limited, brief backoff
-          if grep -q 'HTTP status 403' <<<"$j_out"; then
-            sleep 2
-          else
-            # non-403 failure; no point retrying
-            break
-          fi
-          ((tries++))
-        done
-
-        if [[ $chk_rc -eq 0 || $chk_rc -eq 1 ]]; then
-          note="ok"
-        else
-          if grep -q 'HTTP status 403' <<<"$j_out"; then
-            note="github-403"
-            if [[ "${RELAX_ON_403:-0}" = "1" ]]; then
-              :  # keep in supports
-            else
-              has="no"   # demote to manual under strict policy
-            fi
-          elif grep -qi 'None of the artifacts matched the pattern' <<<"$j_out"; then
-            note="invalid-pattern"; has="no"
-          else
-            note="broken-update-info-$chk_rc"; has="no"
-          fi
-        fi
-      else
-        note="ok"
-      fi
-    else
-      if   grep -qi 'could not find update information' <<<"$desc_out"; then
-        note="no-update-info"
-      elif grep -qi 'None of the artifacts matched the pattern' <<<"$desc_out"; then
-        note="invalid-pattern"
-      else
-        note="tool-error"
-      fi
+    if is_dead "$base"; then
+        managed="dead"
+        printf "%s %s %s %s %s %s\n" "$base" "$name" "$has" "$kind" "dead" "$managed" >>"$all_ssv"
+        continue
     fi
-  else
-    note="no-tool"
-  fi
 
-  printf "%s %s %s %s %s\n" "$base" "$name" "$has" "$kind" "$note" >>"$all_ssv"
+    if is_conf_managed "$name"; then
+        # Conf-managed: check if it's actually installed and report
+        if [[ -x "$f" ]]; then
+            managed="conf:$name"
+            has="no"; kind="conf"; note="apprelease-managed"
+        else
+            managed="conf:$name"
+            has="no"; kind="conf"; note="not-executable"
+        fi
+        printf "%s %s %s %s %s %s\n" "$base" "$name" "$has" "$kind" "$note" "$managed" >>"$all_ssv"
+        continue
+    fi
+
+    if [[ -x "$TOOL" ]]; then
+        desc_out="$("$TOOL" -d "$f" 2>&1 || true)"
+
+        if grep -q '^[[:space:]]*Update information type:' <<<"$desc_out"; then
+            has="yes"
+            kind="$(sed -n 's/^[[:space:]]*Update information type:[[:space:]]*//p' <<<"$desc_out" | head -n1)"
+
+            if [[ "$STRICT" = "1" ]]; then
+                tries=0; chk_rc=255; j_out=""
+                while (( tries < 3 )); do
+                    set +e
+                    j_out="$("$TOOL" -j "$f" 2>&1)"
+                    chk_rc=$?
+                    set -e
+                    [[ $chk_rc -eq 0 || $chk_rc -eq 1 ]] && break
+                    if grep -q 'HTTP status 403' <<<"$j_out"; then
+                        sleep 2
+                    else
+                        break
+                    fi
+                    ((tries++))
+                done
+
+                if [[ $chk_rc -eq 0 || $chk_rc -eq 1 ]]; then
+                    note="ok"; managed="zsync"
+                else
+                    if grep -q 'HTTP status 403' <<<"$j_out"; then
+                        note="github-403"
+                        managed="zsync"
+                        [[ "${RELAX_ON_403:-0}" != "1" ]] && has="no"
+                    elif grep -qi 'None of the artifacts matched' <<<"$j_out"; then
+                        note="invalid-pattern"; has="no"; managed="unmanaged"
+                    else
+                        note="broken-update-info-$chk_rc"; has="no"; managed="unmanaged"
+                    fi
+                fi
+            else
+                note="ok"; managed="zsync"
+            fi
+        else
+            if grep -qi 'could not find update information' <<<"$desc_out"; then
+                note="no-update-info"
+            elif grep -qi 'None of the artifacts matched' <<<"$desc_out"; then
+                note="invalid-pattern"
+            else
+                note="tool-error"
+            fi
+        fi
+    else
+        note="no-tool"
+    fi
+
+    printf "%s %s %s %s %s %s\n" "$base" "$name" "$has" "$kind" "$note" "$managed" >>"$all_ssv"
 done
 shopt -u nullglob
 
-# Build a filtered view of all.ssv that excludes dead overrides
-filtered_all="$(mktemp)"
-if [[ -f "$dead_over" ]]; then
-  awk '
-    NR==FNR {
-      # read overrides; skip comments/blanks
-      if ($0 !~ /^[[:space:]]*#/ && $0 !~ /^[[:space:]]*$/) dead[$0]=1
-      next
-    }
-    FNR==1 { print; next }              # header
-    !($1 in dead) { print }             # keep rows not in dead
-  ' "$dead_over" "$all_ssv" > "$filtered_all"
-else
-  cp "$all_ssv" "$filtered_all"
-fi
-
-{ head -n1 "$filtered_all"; awk 'NR>1 && $3=="yes"' "$filtered_all"; } >"$sup_ssv"
-{ head -n1 "$filtered_all"; awk 'NR>1 && $3=="no"'  "$filtered_all"; } >"$man_ssv"
-
-# dead.ssv = explicit human call via overrides
-: >"$dead_ssv"
-if [[ -f "$dead_over" ]]; then
-  while IFS= read -r line; do
-    [[ -z "$line" || "$line" =~ ^# ]] && continue
-    # Allow entries with spaces WITHOUT quoting in the SSV (no quotes needed)
-    if awk -v w="$line" 'NR>1 && $1==w' "$all_ssv" >/dev/null; then
-      printf "%s\n" "$line" >>"$dead_ssv"
-    fi
-  done <"$dead_over"
-fi
+# Write filtered views
+awk 'NR==1 {print; next} $6=="zsync" || $6 ~ /^conf:/ {print}' "$all_ssv" >"$sup_ssv"
+awk 'NR==1 {print; next} $6=="unmanaged" {print}' "$all_ssv" >"$man_ssv"
+awk 'NR==1 {print; next} $6=="dead" {print}' "$all_ssv" >"$dead_ssv"
 
 ORG_FILE="${ORG_FILE:-$HOME/DotCortex/appimage.org}"
-
 if [[ -f "$ORG_FILE" ]]; then
-  # inject into named blocks (only ones that exist will change)
-  appimage-org-inject "$ORG_FILE" appimage-inventory-all      "$all_ssv" || true
-  appimage-org-inject "$ORG_FILE" appimage-inventory-supports "$sup_ssv" || true
-  appimage-org-inject "$ORG_FILE" appimage-inventory-manual   "$man_ssv" || true
-  # If you later add the dead block back, this line will start updating it automatically:
-  appimage-org-inject "$ORG_FILE" appimage-inventory-dead     "$dead_ssv" || true
-
-  echo "updated blocks in $ORG_FILE:"
-  echo "  - appimage-inventory-all"
-  echo "  - appimage-inventory-supports"
-  echo "  - appimage-inventory-manual"
-  # echo "  - appimage-inventory-dead"    # uncomment if you re-add that block
+    appimage-org-inject "$ORG_FILE" appimage-inventory-all "$all_ssv" || true
+    appimage-org-inject "$ORG_FILE" appimage-inventory-supports "$sup_ssv" || true
+    appimage-org-inject "$ORG_FILE" appimage-inventory-manual "$man_ssv" || true
+    echo "updated blocks in $ORG_FILE:"
+    echo " - appimage-inventory-all"
+    echo " - appimage-inventory-supports"
+    echo " - appimage-inventory-manual"
 else
-  echo "note: $ORG_FILE not found; skipped org injection."
+    echo "note: $ORG_FILE not found; skipped org injection."
 fi
 
 sup_n=$(($(wc -l <"$sup_ssv")-1))
 man_n=$(($(wc -l <"$man_ssv")-1))
-dead_n=$(wc -l <"$dead_ssv" | awk '{print $1}')
+dead_n=$(($(wc -l <"$dead_ssv")-1))
 echo "== inventory =="
-echo "supports: $sup_n"
-echo "manual:   $man_n"
-echo "dead:     $dead_n"
+echo "supports (zsync+conf): $sup_n"
+echo "manual/unmanaged: $man_n"
+echo "dead: $dead_n"
 echo "wrote:"
-echo "  $all_ssv"
-echo "  $sup_ssv"
-echo "  $man_ssv"
-echo "  $dead_ssv (from $dead_over)"
+echo " $all_ssv"
+echo " $sup_ssv"
+echo " $man_ssv"
+echo " $dead_ssv"
 # Inventory tool:1 ends here
