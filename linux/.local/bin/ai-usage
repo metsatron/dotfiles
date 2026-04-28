@@ -14,6 +14,7 @@ import threading
 import textwrap
 import urllib.error
 import urllib.request
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -42,6 +43,15 @@ FGY = tc("#cbcbcb")  # base04
 GY = tc("#6a6a6a")   # base03
 WH = tc("#ffffff")   # base07
 BAR_BG = "\033[38;5;11m"  # swapfetch solid bar background slot
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+ANTIGRAVITY_BASE_DIR = Path.home() / ".antigravity-kit"
+ANTIGRAVITY_TOKENS_FILE = ANTIGRAVITY_BASE_DIR / "tokens.json"
+ANTIGRAVITY_ACTIVE_PROFILE = ANTIGRAVITY_BASE_DIR / "active"
+ANTIGRAVITY_TOKEN_URL = "https://oauth2.googleapis.com/token"
+ANTIGRAVITY_CLOUD_CODE_BASE_URL = "https://cloudcode-pa.googleapis.com"
+ANTIGRAVITY_QUOTA_API_URL = f"{ANTIGRAVITY_CLOUD_CODE_BASE_URL}/v1internal:fetchAvailableModels"
+ANTIGRAVITY_LOAD_CODE_ASSIST_URL = f"{ANTIGRAVITY_CLOUD_CODE_BASE_URL}/v1internal:loadCodeAssist"
+ANTIGRAVITY_USER_AGENT = "antigravity/1.11.3 Darwin/arm64"
 
 NF = {
     "check": "\uf058",
@@ -122,10 +132,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ProviderSpec(
         "antigravity",
         "Antigravity",
-        "antigravity_usage",
+        "antigravity_kit",
         codexbar_provider="antigravity",
         fuelcheck_provider=None,
-        note="antigravity-usage quota probe with CodexBar fallback.",
+        note="antigravity-kit auth quota probe with CodexBar fallback.",
     ),
     ProviderSpec(
         "gemini",
@@ -204,6 +214,10 @@ def compact_json(obj: Any, limit: int = 240) -> str:
     if len(text) <= limit:
         return text
     return text[: limit - 3] + "..."
+
+
+def strip_ansi_codes(text: str) -> str:
+    return ANSI_ESCAPE_RE.sub("", text).replace("\r", "\n")
 
 
 def last_meaningful_line(*texts: str) -> str:
@@ -563,8 +577,13 @@ def format_antigravity_models(snapshot: dict[str, Any], width: int | None = None
     for model in models:
         if not isinstance(model, dict):
             continue
-        label = str(model.get("label") or model.get("modelId") or "Unknown")
-        remaining = model.get("remainingPercentage")
+        label = str(model.get("name") or model.get("label") or model.get("modelId") or "Unknown")
+        remaining = model.get("percentage")
+        if not isinstance(remaining, (int, float)):
+            remaining = model.get("remainingPercentage")
+        if not isinstance(remaining, (int, float)):
+            remaining = model.get("remainingFraction")
+
         if isinstance(remaining, (int, float)):
             pct = float(remaining)
             if pct <= 1.0:
@@ -574,8 +593,11 @@ def format_antigravity_models(snapshot: dict[str, Any], width: int | None = None
         else:
             remaining_text = "  ?%"
             bar = format_bar(0.0, 20)
-        reset_text = format_countdown(model.get("resetTime")) or "?"
-        reset_text = reset_text.replace(f"{FGY}{NF['hourglass']} ", "").replace(R, "")
+        reset_value = model.get("resetTime")
+        if isinstance(reset_value, str) and reset_value.strip():
+            reset_text = format_countdown(reset_value) or reset_value.strip()
+        else:
+            reset_text = "?"
         lines.append(f"  {FGY}{label[:label_width]:<{label_width}}{R} {bar} {remaining_text:>3}  {FGY}{NF['hourglass']} {reset_text}{R}")
 
     return lines
@@ -982,51 +1004,345 @@ def fetch_fuelcheck(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any
     }
 
 
-def fetch_antigravity_usage(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
-    exe = shutil.which("antigravity-usage")
+def load_antigravity_token_store() -> dict[str, Any]:
+    if not ANTIGRAVITY_TOKENS_FILE.exists():
+        return {}
+
+    try:
+        content = ANTIGRAVITY_TOKENS_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+
+    try:
+        data = json.loads(content)
+    except json.JSONDecodeError:
+        return {}
+
+    return data if isinstance(data, dict) else {}
+
+
+def antigravity_active_email(store: dict[str, Any]) -> str | None:
+    if ANTIGRAVITY_ACTIVE_PROFILE.is_symlink():
+        try:
+            active_name = ANTIGRAVITY_ACTIVE_PROFILE.resolve(strict=False).name
+        except OSError:
+            active_name = ""
+        if active_name and active_name in store:
+            return active_name
+
+    if len(store) == 1:
+        return next(iter(store))
+
+    if store:
+        return sorted(store)[0]
+
+    return None
+
+
+def antigravity_refresh_token(store: dict[str, Any], email: str) -> str | None:
+    entry = store.get(email)
+    if not isinstance(entry, dict):
+        return None
+
+    refresh_token = entry.get("refreshToken")
+    if not isinstance(refresh_token, str) or not refresh_token.strip():
+        return None
+    if refresh_token == "[keychain]":
+        return None
+    return refresh_token
+
+
+def antigravity_client_credentials(exe: str) -> tuple[str | None, str | None]:
+    try:
+        source = Path(exe).read_text(encoding="utf-8")
+    except OSError:
+        return None, None
+
+    client_id_match = re.search(r'CLIENT_ID\s*=\s*"([^"]+)"', source)
+    client_secret_match = re.search(r'CLIENT_SECRET\s*=\s*"([^"]+)"', source)
+    client_id = client_id_match.group(1) if client_id_match else None
+    client_secret = client_secret_match.group(1) if client_secret_match else None
+    return client_id, client_secret
+
+
+def antigravity_post_json(
+    url: str,
+    body: dict[str, Any],
+    timeout_seconds: float,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request_headers = {
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    request = urllib.request.Request(
+        url,
+        method="POST",
+        headers=request_headers,
+        data=json.dumps(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            text = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        text = error.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(text or f"HTTP {error.code}") from error
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid JSON response from Antigravity") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Unexpected Antigravity response shape")
+
+    return parsed
+
+
+def antigravity_post_form(
+    url: str,
+    body: dict[str, Any],
+    timeout_seconds: float,
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request_headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "application/json",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    request = urllib.request.Request(
+        url,
+        method="POST",
+        headers=request_headers,
+        data=urllib.parse.urlencode(body).encode("utf-8"),
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            text = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        text = error.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(text or f"HTTP {error.code}") from error
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid JSON response from Antigravity") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Unexpected Antigravity response shape")
+
+    return parsed
+
+
+def antigravity_get_json(
+    url: str,
+    access_token: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            text = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as error:
+        text = error.read().decode("utf-8", errors="replace").strip()
+        raise RuntimeError(text or f"HTTP {error.code}") from error
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Invalid JSON response from Antigravity") from exc
+
+    if not isinstance(parsed, dict):
+        raise RuntimeError("Unexpected Antigravity response shape")
+
+    return parsed
+
+
+def antigravity_refresh_access_token(
+    refresh_token: str,
+    client_id: str,
+    client_secret: str,
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    body = {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
+    }
+    return antigravity_post_form(
+        ANTIGRAVITY_TOKEN_URL,
+        body,
+        timeout_seconds,
+    )
+
+
+def antigravity_fetch_project_id(access_token: str, timeout_seconds: float) -> dict[str, Any]:
+    body = {"metadata": {"ideType": "ANTIGRAVITY"}}
+    return antigravity_post_json(
+        ANTIGRAVITY_LOAD_CODE_ASSIST_URL,
+        body,
+        timeout_seconds,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": "antigravity/windows/amd64",
+        },
+    )
+
+
+def antigravity_fetch_quota(access_token: str, project_id: str, timeout_seconds: float) -> dict[str, Any]:
+    body = {"project": project_id or "bamboo-precept-lgxtn"}
+    return antigravity_post_json(
+        ANTIGRAVITY_QUOTA_API_URL,
+        body,
+        timeout_seconds,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "User-Agent": ANTIGRAVITY_USER_AGENT,
+        },
+    )
+
+
+def fetch_antigravity_quota(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
+    exe = shutil.which("antigravity-kit")
     if not exe:
         return {
             "provider": spec.key,
             "label": spec.label,
             "state": "missing",
             "source": "",
-            "summary": "antigravity-usage is not installed or not reachable.",
+            "summary": "antigravity-kit is not installed or not reachable.",
+            "raw": None,
+        }
+
+    store = load_antigravity_token_store()
+    email = antigravity_active_email(store)
+    if not email:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "missing",
+            "source": "tokens",
+            "summary": "No Antigravity account found in ~/.antigravity-kit/tokens.json.",
+            "raw": None,
+        }
+
+    refresh_token = antigravity_refresh_token(store, email)
+    if not refresh_token:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "missing",
+            "source": "tokens",
+            "summary": f"No readable refresh token found for {email}.",
+            "raw": None,
+        }
+
+    client_id, client_secret = antigravity_client_credentials(exe)
+    if not client_id or not client_secret:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "missing",
+            "source": "binary",
+            "summary": "Could not extract Antigravity OAuth client credentials.",
             "raw": None,
         }
 
     try:
-        proc = run_command([exe, "quota", "--json", "--all-models"], timeout_seconds)
-    except subprocess.TimeoutExpired:
+        token_response = antigravity_refresh_access_token(refresh_token, client_id, client_secret, timeout_seconds)
+        access_token = token_response["access_token"]
+        user_info = antigravity_get_json("https://www.googleapis.com/oauth2/v2/userinfo", access_token, timeout_seconds)
+        project_info = antigravity_fetch_project_id(access_token, timeout_seconds)
+        quota_result = antigravity_fetch_quota(
+            access_token,
+            str(project_info.get("cloudaicompanionProject") or "bamboo-precept-lgxtn"),
+            timeout_seconds,
+        )
+    except (RuntimeError, urllib.error.URLError, OSError, ValueError) as exc:
         return {
             "provider": spec.key,
             "label": spec.label,
-            "state": "timeout",
+            "state": "error",
             "source": "local",
-            "summary": f"Timed out after {timeout_seconds:g}s waiting for antigravity-usage.",
+            "summary": f"Antigravity fetch failed: {exc}",
+            "raw": None,
+        }
+    except KeyError:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "error",
+            "source": "local",
+            "summary": "Antigravity token refresh did not return an access token.",
             "raw": None,
         }
 
-    docs = parse_json_docs(proc.stdout)
-    item = choose_provider_doc(docs, spec.key)
+    subscription_tier = project_info.get("paidTier", {}).get("id") if isinstance(project_info.get("paidTier"), dict) else None
+    if not subscription_tier and isinstance(project_info.get("currentTier"), dict):
+        subscription_tier = project_info["currentTier"].get("id")
 
-    if isinstance(item, dict):
+    models: list[dict[str, Any]] = []
+    raw_models = quota_result.get("models")
+    if isinstance(raw_models, dict):
+        for name, info in raw_models.items():
+            if not isinstance(info, dict):
+                continue
+            quota_info = info.get("quotaInfo")
+            if not isinstance(quota_info, dict):
+                continue
+            remaining_fraction = quota_info.get("remainingFraction")
+            if not isinstance(remaining_fraction, (int, float)):
+                continue
+            pct = int(round(max(0.0, min(1.0, float(remaining_fraction))) * 100))
+            if "gemini" in name.lower() or "claude" in name.lower():
+                models.append({
+                    "name": name,
+                    "percentage": pct,
+                    "resetTime": quota_info.get("resetTime") or "",
+                })
+
+    raw: dict[str, Any] = {
+        "email": str(user_info.get("email") or email),
+        "method": "auth quota",
+        "models": sorted(models, key=lambda model: str(model.get("name", ""))),
+    }
+    if subscription_tier:
+        raw["subscriptionTier"] = subscription_tier
+    if quota_result.get("isForbidden"):
+        raw["isForbidden"] = True
+
+    if quota_result.get("isForbidden"):
         return {
             "provider": spec.key,
             "label": spec.label,
-            "state": "ok",
+            "state": "error",
             "source": "local",
-            "summary": summarize_usage(item),
-            "raw": item,
+            "summary": "Account forbidden (403).",
+            "raw": raw,
         }
 
-    summary = last_meaningful_line(proc.stdout, proc.stderr)
     return {
         "provider": spec.key,
         "label": spec.label,
-        "state": "error" if proc.returncode else "ok",
+        "state": "ok",
         "source": "local",
-        "summary": summary or "No JSON payload returned by antigravity-usage.",
-        "raw": None,
+        "summary": str(subscription_tier or user_info.get("email") or "antigravity-kit"),
+        "raw": raw,
     }
 
 
@@ -1220,8 +1536,8 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
     if spec.kind == "deepinfra":
         return fetch_deepinfra(timeout_seconds)
 
-    if spec.kind == "antigravity_usage":
-        result = fetch_antigravity_usage(spec, timeout_seconds)
+    if spec.kind == "antigravity_kit":
+        result = fetch_antigravity_quota(spec, timeout_seconds)
         if result["state"] == "missing" and spec.codexbar_provider:
             return fetch_codexbar(spec, timeout_seconds)
         return result
@@ -1431,6 +1747,9 @@ def render_text(results: list[dict[str, Any]]) -> None:
                 print(f"  {FGY}Account: {email}{R}")
             if isinstance(method, str) and method:
                 print(f"  {FGY}Method: {method}{R}")
+            subscription = raw.get("subscriptionTier")
+            if isinstance(subscription, str) and subscription:
+                print(f"  {FGY}Subscription: {subscription}{R}")
 
             model_lines = format_antigravity_models(raw, width=width)
             if model_lines:
