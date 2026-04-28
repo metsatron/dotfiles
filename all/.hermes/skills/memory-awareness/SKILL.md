@@ -37,8 +37,8 @@ Use this skill when a task involves memory, `/reflect`, `MEMORY.md`, `USER.md`, 
 - `.agents/MEMORY.md` and `.agents/USER.md`
 - `.opencode/MEMORY.md` and `.opencode/USER.md`
 - `.hermes/memories/MEMORY.md` and `.hermes/memories/USER.md`
-- `FORGE/bridge/my_brain_auryn/`
-- `FORGE/bridge/my_brain_helmastra/`
+- `FORGE/brain/auryn/`
+- `FORGE/brain/helmastra/`
 
 ## Workflow
 
@@ -50,9 +50,9 @@ Use this skill when a task involves memory, `/reflect`, `MEMORY.md`, `USER.md`, 
 
 ## Soul Pointers
 
-- Auryn quarters: `FORGE/bridge/my_brain_auryn/`
-- HelmAstra quarters: `FORGE/bridge/my_brain_helmastra/`
-- HelmAstra authored soul: `FORGE/bridge/my_brain_helmastra/SOUL.md`
-- HelmAstra authored name card: `FORGE/bridge/my_brain_helmastra/HELMASTRA.md`
-- HelmAstra compiled runtime law: `FORGE/bridge/my_brain_helmastra/AGENTS.md`
+- Auryn quarters: `FORGE/brain/auryn/`
+- HelmAstra quarters: `FORGE/brain/helmastra/`
+- HelmAstra authored soul: `FORGE/brain/helmastra/SOUL.md`
+- HelmAstra authored name card: `FORGE/brain/helmastra/HELMASTRA.md`
+- HelmAstra compiled runtime law: `FORGE/brain/helmastra/AGENTS.md`
 
