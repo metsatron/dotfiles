@@ -326,11 +326,27 @@
          "Show appimaged/AIL state and last 50 log lines"
          (lambda () (sh "~/.local/bin/appimage-health")))
 
-   (task 'appimage:inventory
-         "Classify AppImages: supports/manual/dead and write SSVs"
-         (lambda () (sh "~/.local/bin/appimage-inventory")))
+(task 'appimage:inventory
+  "Classify AppImages: supports/manual/dead and write SSVs"
+  (lambda () (sh "~/.local/bin/appimage-inventory")))
 
-   ;; --- Cargo ---
+(task 'appimage:apply
+  "Hybrid update: ZSync pass + conf pass (alias for appimage:update)"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/appimage.mk appimage-update")))
+
+(task 'appimage:release-list
+  "List all conf-managed AppImages"
+  (lambda () (sh "~/.local/bin/apprelease list")))
+
+(task 'appimage:release-update-all
+  "Update all conf-managed AppImages via apprelease"
+  (lambda () (sh "~/.local/bin/apprelease update-all")))
+
+(task 'appimage:release-health
+  "Check forge reachability for all conf-managed AppImages"
+  (lambda () (sh "for a in $(~/.local/bin/apprelease list); do ~/.local/bin/apprelease health \"$a\" 2>&1 || true; done")))
+
+;; --- Cargo ---
    (task 'cargo:capture "Capture live cargo to DotCortex SSV"
          (lambda () (sh "~/.local/bin/cargo-capture")))
 
@@ -642,7 +658,7 @@
 
   (print-group "Backup commands"
                (lambda (t)
-                 (string-prefix? "backup:" (task-name-str t)))))
+                 (string-prefix? "backup:" (task-name-str t))))
 
   (print-group "Git commands"
                (lambda (t)
@@ -650,7 +666,7 @@
 
   (print-group "DotCortex commands"
                (lambda (t)
-                 (string-prefix? "dotcortex:" (task-name-str t))))
+                 (string-prefix? "dotcortex:" (task-name-str t)))))
 
 ;; --- Help / Version ---
 
