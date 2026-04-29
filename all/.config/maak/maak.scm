@@ -433,6 +433,10 @@
          "Install or update only, no removals"
          (lambda () (sh "ENFORCE=0 UNINSTALL=0 UPDATE=1 ~/.local/bin/npm-apply")))
 
+   (task 'npm:update
+         "Install missing and update outdated packages, no removals"
+         (lambda () (sh "ENFORCE=1 UNINSTALL=0 UPDATE=1 ~/.local/bin/npm-apply")))
+
    (task 'npm:apply
          "Enforce exact npm state, allow removals"
          (lambda () (sh "ENFORCE=1 UNINSTALL=1 UPDATE=1 ~/.local/bin/npm-apply")))
@@ -561,10 +565,6 @@
    ;; --- Claude Code ---
    (task 'claude:apply "Install Claude Code plugins from manifest"
          (lambda () (sh "~/.local/bin/claude-plugins-apply")))
-
-   (task 'hermes:apply-plugins
-         "Create ~/.hermes/plugins and tangle Hermes plugin sources into place"
-         (lambda () (sh "mkdir -p ~/.hermes/plugins && make tangle")))
 
    (task 'claude:health "Show installed Claude Code plugins vs manifest"
          (lambda () (sh "~/.local/bin/claude-plugins-health")))
