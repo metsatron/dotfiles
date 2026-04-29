@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: npm-capture npm-diff npm-sync npm-apply npm-health
+.PHONY: npm-capture npm-diff npm-sync npm-update npm-apply npm-health
 
 npm-capture:
 | @chmod +x $(HOME)/.local/bin/npm-capture 2>/dev/null || true
@@ -16,6 +16,11 @@ npm-diff:
 npm-sync:
 | @chmod +x $(HOME)/.local/bin/npm-apply 2>/dev/null || true
 | ENFORCE=0 UNINSTALL=0 UPDATE=0 $(HOME)/.local/bin/npm-apply
+
+# Install missing and update outdated packages, no removals.
+npm-update:
+| @chmod +x $(HOME)/.local/bin/npm-apply 2>/dev/null || true
+| ENFORCE=1 UNINSTALL=0 UPDATE=1 $(HOME)/.local/bin/npm-apply
 
 # Strict apply, install and enforce manifest membership, but do not auto upgrade versions.
 npm-apply:
