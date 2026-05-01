@@ -53,6 +53,13 @@ if [ -d "$HOME/.npm-global/bin" ]; then
   export PATH="$HOME/.npm-global/bin:$PATH"
 fi
 
+# Shared SSH agent for all zsh invocations, including noninteractive SSH
+# commands like `ssh host 'git fetch'`. Keep the key-unlock prompt in the
+# interactive exports path; `.zshenv` only needs the agent env.
+if [ -x "$HOME/.local/bin/ssh-agent-ensure" ]; then
+  eval "$("$HOME/.local/bin/ssh-agent-ensure" --print)"
+fi
+
 # Priority: ~/.local/bin/claude (canonical) > ~/.config/Claude native app >
 # Antigravity/VSCodium extension > npm global.
 # Always prepend the best native binary so it wins over any npm-installed claude.
