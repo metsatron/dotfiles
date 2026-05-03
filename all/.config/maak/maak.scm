@@ -664,6 +664,10 @@
                (lambda (t)
                  (string-prefix? "git:" (task-name-str t))))
 
+  (print-group "Git commands"
+               (lambda (t)
+                 (string-prefix? "git:" (task-name-str t))))
+
   (print-group "DotCortex commands"
                (lambda (t)
                  (string-prefix? "dotcortex:" (task-name-str t)))))
