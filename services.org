@@ -1120,3 +1120,742 @@ fi
 
 log "swap-heal ritual complete."
 #+END_SRC
+
+* Agent Session Daemon
+Phase-2 telemetry foundation for agent sessions.
+
+=tmux-session= remains the transport/attach/create launcher. =agent-session=
+is the human-facing CLI after entering or creating a tmux session.
+=agent-sessiond= is the authoritative daemon and writes state under
+=ROOTS/DotRoot/agent-session/=. LOGS are notes/TODO storage, not a session
+source. The =ROOTS/AgentRoot/session-index.json= (written by FORGE/bin/agent-session)
+is the cross-agent session truth; agent-sessiond reads it for summary counts only.
+
+** agent-sessiond
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-sessiond :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/DotCortex/ROOTS/DotRoot/agent-session}"
+INTERVAL="${AGENT_SESSIOND_INTERVAL:-10}"
+PROC_PATTERNS=(opencode opencode-telegram claude codex hermes pi-agent sapphire)
+
+usage() {
+  cat <<'EOF'
+Usage: agent-sessiond <once|watch|status>
+
+Commands:
+  once    collect one snapshot and write JSON atomically
+  watch   collect repeatedly every AGENT_SESSIOND_INTERVAL seconds, default 10
+  status  print a summary of the latest local state snapshot
+EOF
+}
+
+need_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "agent-sessiond: python3 is required for JSON emission" >&2
+    exit 1
+  fi
+}
+
+state_file() {
+  local host
+  host="$(hostname 2>/dev/null || echo unknown)"
+  printf '%s/state.%s.json\n' "$STATE_DIR" "$host"
+}
+
+latest_state_file() {
+  printf '%s/state.latest.json\n' "$STATE_DIR"
+}
+
+collect_once() {
+  need_python
+  mkdir -p "$STATE_DIR"
+
+  local host timestamp workdir outfile latest tmp latest_tmp session_index
+  host="$(hostname 2>/dev/null || echo unknown)"
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/agent-sessiond.XXXXXX")"
+  outfile="$STATE_DIR/state.$host.json"
+  latest="$(latest_state_file)"
+  tmp="$outfile.tmp.$$"
+  latest_tmp="$latest.tmp.$$"
+
+  # Resolve session-index path (AGENT_SESSION_INDEX env overrides hostname default)
+  session_index="${AGENT_SESSION_INDEX:-}"
+  if [ -z "$session_index" ]; then
+    case "$host" in
+      ThinkPad-T480s|t480s) session_index="$HOME/mnt/x230/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+      *) session_index="$HOME/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+    esac
+  fi
+
+  cleanup_collect() {
+    rm -rf "$workdir" "$tmp" "$latest_tmp"
+  }
+  trap cleanup_collect RETURN
+  trap 'cleanup_collect; exit 0' INT TERM
+
+  printf '%s\n' "$host"          >"$workdir/hostname"
+  printf '%s\n' "$timestamp"     >"$workdir/timestamp"
+  printf '%s\n' "$session_index" >"$workdir/session-index-path"
+
+  if command -v tmux >/dev/null 2>&1; then
+    tmux list-sessions -F '#{session_id}	#{session_name}	#{session_windows}	#{?session_attached,attached,detached}	#{session_created}' >"$workdir/tmux-sessions" 2>/dev/null || true
+    tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_index}	#{pane_id}	#{pane_active}	#{pane_current_path}	#{pane_current_command}	#{pane_pid}' >"$workdir/tmux-panes" 2>/dev/null || true
+  else
+    : >"$workdir/tmux-sessions"
+    : >"$workdir/tmux-panes"
+  fi
+
+  : >"$workdir/processes"
+  for pattern in "${PROC_PATTERNS[@]}"; do
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      pid="${line%%[[:space:]]*}"
+      command="${line#"$pid"}"
+      command="${command#"${command%%[![:space:]]*}"}"
+      case "$pid:$command" in
+        "$$:"*|"$BASHPID:"*|*"/agent-sessiond "*|*" agent-sessiond "*|*"pgrep -af $pattern"*)
+          continue
+          ;;
+      esac
+      printf '%s\t%s\t%s\n' "$pattern" "$pid" "$command" >>"$workdir/processes"
+    done < <(pgrep -af "$pattern" 2>/dev/null || true)
+  done
+
+  if command -v telegram-agent-host >/dev/null 2>&1; then
+    if telegram-agent-host status >"$workdir/telegram.out" 2>"$workdir/telegram.err"; then
+      printf '0\n' >"$workdir/telegram.exit"
+    else
+      printf '%s\n' "$?" >"$workdir/telegram.exit"
+    fi
+    printf '1\n' >"$workdir/telegram.available"
+  else
+    : >"$workdir/telegram.out"
+    printf 'telegram-agent-host not found\n' >"$workdir/telegram.err"
+    printf '127\n' >"$workdir/telegram.exit"
+    printf '0\n'   >"$workdir/telegram.available"
+  fi
+
+  python3 - "$workdir" >"$tmp" <<'PY'
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import sys
+from datetime import datetime, timezone
+
+root = pathlib.Path(sys.argv[1])
+home = pathlib.Path.home()
+
+warnings = []
+
+try:
+    PAGE_SIZE_KB = os.sysconf("SC_PAGESIZE") // 1024
+except (AttributeError, ValueError, OSError):
+    PAGE_SIZE_KB = 4
+
+
+def read_text(name):
+    return (root / name).read_text(errors="replace")
+
+def read_lines(name):
+    return [ln for ln in read_text(name).splitlines() if ln]
+
+def parse_tsv(lines, fields):
+    rows = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < len(fields):
+            parts.extend([""] * (len(fields) - len(parts)))
+        rows.append(dict(zip(fields, parts[:len(fields)])))
+    return rows
+
+def iso_from_mtime(mt):
+    return (datetime.fromtimestamp(mt, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"))
+
+
+# ── /proc metrics (Linux only; all fields guarded) ────────────────────────────
+def proc_metrics(pid_str):
+    m = {"ppid": None, "pgid": None, "sid": None, "proc_status": None,
+         "cwd": None, "cpu_ticks": None, "rss_kb": None,
+         "io_read_bytes": None, "io_write_bytes": None}
+    try:
+        m["cwd"] = os.readlink(f"/proc/{pid_str}/cwd")
+    except OSError:
+        pass
+    try:
+        raw   = pathlib.Path(f"/proc/{pid_str}/stat").read_text()
+        after = raw[raw.rfind(")") + 2:]
+        f     = after.split()
+        m["proc_status"] = f[0]
+        m["ppid"]        = int(f[1])
+        m["pgid"]        = int(f[2])
+        m["sid"]         = int(f[3])
+        m["cpu_ticks"]   = int(f[11]) + int(f[12])
+        m["rss_kb"]      = int(f[21]) * PAGE_SIZE_KB
+    except Exception:
+        pass
+    try:
+        for line in pathlib.Path(f"/proc/{pid_str}/io").read_text().splitlines():
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k == "read_bytes":
+                m["io_read_bytes"] = int(v.strip())
+            elif k == "write_bytes":
+                m["io_write_bytes"] = int(v.strip())
+    except Exception:
+        pass
+    return m
+
+
+# ── session ID extraction from cmdline ────────────────────────────────────────
+_RESUME_RE       = re.compile(r"(?:--resume|-s)[= ]([A-Za-z0-9/_.:@-]{8,})")
+_CODEX_RESUME_RE = re.compile(r"\bresume\s+([A-Za-z0-9/_.:@-]{8,})")
+
+def session_id_from_cmdline(cmdline, agent):
+    m = _RESUME_RE.search(cmdline)
+    if m:
+        return m.group(1), "cmdline_flag"
+    if agent == "codex":
+        m = _CODEX_RESUME_RE.search(cmdline)
+        if m:
+            return m.group(1), "cmdline_subcommand"
+    return None, None
+
+
+# ── capabilities (binary presence) ───────────────────────────────────────────
+CAPABILITY_BINS = [
+    "python3", "pgrep", "tmux", "fzf",
+    "claude", "opencode", "codex", "hermes",
+    "auryn", "auryn-chan", "helmastra", "codex-astra",
+    "gemma-pi", "gemini-pi", "sapphire", "ductor", "pi-agent",
+    "telegram-agent-host", "obsidian",
+]
+capabilities = {k: shutil.which(k) is not None for k in CAPABILITY_BINS}
+
+
+# ── party registry ────────────────────────────────────────────────────────────
+# type=harness  : agent with a native session store and resume command
+# type=consort  : meta-agent / consort that runs inside a harness (no own store)
+# type=infrastructure : supporting service (transport, gateway, bridge)
+PARTY_STATIC = [
+    {"id": "claude",      "type": "harness",
+     "binary": "claude",  "store_path": str(home / ".claude/projects"),
+     "store_type": "jsonl_dir", "resume_cmd": "claude --resume {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "opencode",    "type": "harness",
+     "binary": "opencode", "store_path": str(home / ".local/share/opencode/opencode.db"),
+     "store_type": "sqlite", "resume_cmd": "opencode -s {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "codex",       "type": "harness",
+     "binary": "codex",   "store_path": str(home / ".codex/sessions"),
+     "store_type": "jsonl_dir", "resume_cmd": "codex resume {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "hermes",      "type": "harness",
+     "binary": "hermes",  "store_path": str(home / ".hermes/state.db"),
+     "store_type": "sqlite", "resume_cmd": "hermes --resume {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "antigravity", "type": "harness",
+     "binary": None,      "store_path": str(home / ".gemini/antigravity"),
+     "store_type": "mixed_dir", "resume_cmd": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "auryn",       "type": "consort",
+     "binary": "auryn",   "harness": "claude",
+     "telegram": True, "tmux": True,
+     "memory": "HelmCortex/ROOTS", "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "auryn-chan",   "type": "consort",
+     "binary": "auryn-chan", "harness": "claude",
+     "telegram": True, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "helmastra",   "type": "consort",
+     "binary": "helmastra", "harness": "opencode",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "codex-astra", "type": "consort",
+     "binary": "codex-astra", "harness": "codex",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "gemma",       "type": "consort",
+     "binary": "gemma-pi", "harness": "ollama", "model": "gemma",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "gemini",      "type": "consort",
+     "binary": "gemini-pi", "harness": "gemini", "model": "gemini",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "ductor",      "type": "consort",
+     "binary": "ductor",  "harness": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "sapphire",    "type": "consort",
+     "binary": "sapphire", "harness": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "pi-agent",    "type": "consort",
+     "binary": "pi-agent", "harness": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "telegram-agent-host", "type": "infrastructure",
+     "binary": "telegram-agent-host", "role": "telegram_gateway"},
+    {"id": "opencode-telegram",   "type": "infrastructure",
+     "binary": None, "process_pattern": "opencode-telegram",
+     "role": "telegram_opencode_bridge"},
+    {"id": "tmux",                "type": "infrastructure",
+     "binary": "tmux", "role": "transport"},
+]
+
+party = []
+for entry in PARTY_STATIC:
+    e = dict(entry)
+    b = e.get("binary")
+    e["binary_present"] = (shutil.which(b) is not None) if b else None
+    party.append(e)
+
+
+# ── raw processes + /proc enrichment ─────────────────────────────────────────
+raw_procs = []
+seen = set()
+for row in parse_tsv(read_lines("processes"), ["pattern", "pid", "command"]):
+    key = (row["pattern"], row["pid"], row["command"])
+    if key in seen:
+        continue
+    seen.add(key)
+    raw_procs.append({**row, **proc_metrics(row["pid"])})
+
+
+# ── tmux ──────────────────────────────────────────────────────────────────────
+tmux_sessions = parse_tsv(read_lines("tmux-sessions"),
+    ["id", "name", "windows", "attached", "created"])
+tmux_panes = parse_tsv(read_lines("tmux-panes"),
+    ["session", "window_index", "window_name", "pane_index",
+     "pane_id", "active", "current_path", "current_command", "pid"])
+pane_by_pid = {p["pid"]: p for p in tmux_panes if p.get("pid")}
+
+
+# ── pid_session_links (evidence table) ───────────────────────────────────────
+pid_session_links = []
+for proc in raw_procs:
+    pid   = proc["pid"]
+    agent = proc["pattern"]
+    sid, sid_src = session_id_from_cmdline(proc["command"], agent)
+    pane = pane_by_pid.get(pid)
+    confidence = ("high"   if (sid and pane) else
+                  "medium" if sid else
+                  "low"    if pane else "none")
+    pid_session_links.append({
+        "pid":               pid,
+        "agent":             agent,
+        "cmdline":           proc["command"][:200],
+        "session_id":        sid,
+        "session_id_source": sid_src,
+        "cwd":               proc.get("cwd"),
+        "ppid":              proc.get("ppid"),
+        "tmux_pane_id":      pane.get("pane_id")      if pane else None,
+        "tmux_session_name": pane.get("session")      if pane else None,
+        "tmux_window_index": pane.get("window_index") if pane else None,
+        "confidence":        confidence,
+    })
+links_by_pid = {ln["pid"]: ln for ln in pid_session_links}
+
+
+# ── active_agents ─────────────────────────────────────────────────────────────
+active_agents = []
+for proc in raw_procs:
+    pid = proc["pid"]
+    lnk = links_by_pid.get(pid, {})
+    active_agents.append({
+        "pattern":           proc["pattern"],
+        "pid":               pid,
+        "ppid":              proc.get("ppid"),
+        "pgid":              proc.get("pgid"),
+        "sid":               proc.get("sid"),
+        "proc_status":       proc.get("proc_status"),
+        "command":           proc["command"],
+        "cwd":               proc.get("cwd"),
+        "cpu_ticks":         proc.get("cpu_ticks"),
+        "rss_kb":            proc.get("rss_kb"),
+        "io_read_bytes":     proc.get("io_read_bytes"),
+        "io_write_bytes":    proc.get("io_write_bytes"),
+        "session_id":        lnk.get("session_id"),
+        "session_id_source": lnk.get("session_id_source"),
+        "tmux_pane_id":      lnk.get("tmux_pane_id"),
+        "tmux_session_name": lnk.get("tmux_session_name"),
+        "link_confidence":   lnk.get("confidence"),
+    })
+
+
+# ── native_stores ─────────────────────────────────────────────────────────────
+native_stores = {}
+
+claude_root = home / ".claude/projects"
+if claude_root.exists():
+    files  = [f for f in claude_root.rglob("*.jsonl") if "/subagents/" not in f.as_posix()]
+    newest = max((f.stat().st_mtime for f in files), default=None)
+    native_stores["claude"] = {
+        "path": str(claude_root), "type": "jsonl_dir", "present": True,
+        "session_count": len(files),
+        "newest_mtime":  iso_from_mtime(newest) if newest else None,
+    }
+else:
+    native_stores["claude"] = {
+        "path": str(claude_root), "type": "jsonl_dir", "present": False,
+        "session_count": 0, "newest_mtime": None,
+    }
+
+opencode_db = home / ".local/share/opencode/opencode.db"
+if opencode_db.exists():
+    try:
+        conn = sqlite3.connect(f"file:{opencode_db}?mode=ro", uri=True)
+        cnt  = conn.execute("select count(*) from session where time_archived is null").fetchone()[0]
+        conn.close()
+        native_stores["opencode"] = {
+            "path": str(opencode_db), "type": "sqlite", "present": True,
+            "session_count": cnt,
+            "newest_mtime":  iso_from_mtime(opencode_db.stat().st_mtime),
+        }
+    except Exception as exc:
+        warnings.append(f"opencode: sqlite probe failed: {exc}")
+        native_stores["opencode"] = {
+            "path": str(opencode_db), "type": "sqlite", "present": True,
+            "session_count": None, "newest_mtime": None,
+        }
+else:
+    native_stores["opencode"] = {
+        "path": str(opencode_db), "type": "sqlite", "present": False,
+        "session_count": 0, "newest_mtime": None,
+    }
+
+# Codex: primary path is sessions/; logs_2.sqlite may be a newer store format
+codex_sessions = home / ".codex/sessions"
+codex_sqlite   = home / ".codex/logs_2.sqlite"
+codex_entry    = {
+    "path": str(codex_sessions), "type": "jsonl_dir",
+    "present": codex_sessions.exists(),
+    "session_count": 0, "newest_mtime": None,
+}
+if codex_sessions.exists():
+    files  = list(codex_sessions.rglob("*.jsonl"))
+    newest = max((f.stat().st_mtime for f in files), default=None)
+    codex_entry["session_count"] = len(files)
+    codex_entry["newest_mtime"]  = iso_from_mtime(newest) if newest else None
+if codex_sqlite.exists():
+    codex_entry["fallback_path"] = str(codex_sqlite)
+    codex_entry["fallback_type"] = "sqlite"
+    if not codex_sessions.exists():
+        warnings.append(
+            f"codex: {codex_sessions} not found; {codex_sqlite} present"
+            " — store format may have changed")
+native_stores["codex"] = codex_entry
+
+# Hermes: canonical store is state.db; legacy fallback is sessions/*.json
+hermes_db       = home / ".hermes/state.db"
+hermes_sessions = home / ".hermes/sessions"
+hermes_entry    = {
+    "path": str(hermes_db), "type": "sqlite",
+    "present": False, "session_count": 0, "newest_mtime": None,
+}
+if hermes_db.exists():
+    try:
+        conn = sqlite3.connect(f"file:{hermes_db}?mode=ro", uri=True)
+        cnt  = conn.execute("select count(*) from sessions where ended_at is null").fetchone()[0]
+        conn.close()
+        hermes_entry.update({
+            "present": True, "session_count": cnt,
+            "newest_mtime": iso_from_mtime(hermes_db.stat().st_mtime),
+        })
+    except Exception as exc:
+        hermes_entry["present"] = True
+        warnings.append(f"hermes: state.db probe failed: {exc}")
+elif hermes_sessions.exists():
+    files = list(hermes_sessions.glob("session_*.json"))
+    hermes_entry.update({
+        "path": str(hermes_sessions), "type": "json_dir",
+        "present": True, "session_count": len(files),
+    })
+    warnings.append("hermes: state.db not found; legacy sessions/ dir present")
+else:
+    warnings.append(
+        "hermes: no native store found"
+        " (checked ~/.hermes/state.db and ~/.hermes/sessions/)")
+native_stores["hermes"] = hermes_entry
+
+# Antigravity: protobuf conversations + plaintext brain entries
+ag_root = home / ".gemini/antigravity"
+if ag_root.exists():
+    conv_dir  = ag_root / "conversations"
+    brain_dir = ag_root / "brain"
+    pb_cnt    = len(list(conv_dir.glob("*.pb"))) if conv_dir.exists() else 0
+    brain_cnt = (sum(1 for p in brain_dir.iterdir() if p.is_dir())
+                 if brain_dir.exists() else 0)
+    native_stores["antigravity"] = {
+        "path": str(ag_root), "type": "mixed_dir", "present": True,
+        "session_count":  max(pb_cnt, brain_cnt),
+        "pb_conversations": pb_cnt, "brain_entries": brain_cnt,
+        "newest_mtime": None,
+    }
+else:
+    native_stores["antigravity"] = {
+        "path": str(ag_root), "type": "mixed_dir", "present": False,
+        "session_count": 0, "newest_mtime": None,
+    }
+
+
+# ── sessions index summary ────────────────────────────────────────────────────
+index_path_str   = read_text("session-index-path").strip()
+sessions_summary = {
+    "index_path":         index_path_str,
+    "index_exists":       False,
+    "index_generated_at": None,
+    "counts": {"open": 0, "closed": 0, "unknown": 0, "abandoned": 0, "total": 0},
+}
+if index_path_str:
+    index_path = pathlib.Path(index_path_str)
+    if index_path.exists():
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            entries = payload.get("sessions", [])
+            counts  = {"open": 0, "closed": 0, "unknown": 0, "abandoned": 0,
+                       "total": len(entries)}
+            for s in entries:
+                st = s.get("status") or "unknown"
+                if st in counts:
+                    counts[st] += 1
+            newest_ts = max(
+                (s.get("indexedat") or "" for s in entries), default=None,
+            ) or None
+            sessions_summary.update({
+                "index_exists":       True,
+                "index_generated_at": newest_ts,
+                "counts":             counts,
+            })
+        except Exception as exc:
+            warnings.append(f"sessions: index read failed: {exc}")
+    else:
+        warnings.append(f"sessions: index not found at {index_path_str}")
+
+
+# ── telegram ──────────────────────────────────────────────────────────────────
+try:
+    tg_available = read_text("telegram.available").strip() == "1"
+except Exception:
+    tg_available = False
+try:
+    tg_exit = int(read_text("telegram.exit").strip() or "0")
+except Exception:
+    tg_exit = None
+
+telegram = {
+    "host_available": tg_available,
+    "host_exit_code":  tg_exit,
+    "host_stdout":     read_lines("telegram.out"),
+    "host_stderr":     read_lines("telegram.err"),
+}
+
+
+# ── final assembly ────────────────────────────────────────────────────────────
+state = {
+    "schema":            "agent-sessiond.v2",
+    "host":              read_text("hostname").strip(),
+    "generated_at":      read_text("timestamp").strip(),
+    "party":             party,
+    "active_agents":     active_agents,
+    "sessions":          sessions_summary,
+    "native_stores":     native_stores,
+    "pid_session_links": pid_session_links,
+    "telegram":          telegram,
+    "tmux":              {"sessions": tmux_sessions, "panes": tmux_panes},
+    "capabilities":      capabilities,
+    "warnings":          warnings,
+}
+
+json.dump(state, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+
+  mv "$tmp" "$outfile"
+  cp "$outfile" "$latest_tmp"
+  mv "$latest_tmp" "$latest"
+  printf 'agent-sessiond: wrote %s and %s\n' "$outfile" "$latest"
+}
+
+print_status() {
+  need_python
+  local file
+  file="$(state_file)"
+  if [ ! -s "$file" ]; then
+    echo "agent-sessiond: no state file found at $file" >&2
+    exit 1
+  fi
+
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    state = json.load(fh)
+
+tmux_sess  = state.get("tmux", {}).get("sessions", [])
+tmux_panes = state.get("tmux", {}).get("panes", [])
+active     = state.get("active_agents", [])
+stores     = state.get("native_stores", {})
+idx        = state.get("sessions", {})
+warns      = state.get("warnings", [])
+
+print(f"agent-sessiond state: {path}")
+print(f"schema : {state.get('schema', '?')}")
+print(f"host   : {state.get('host', '?')}")
+print(f"time   : {state.get('generated_at', '?')}")
+print(f"tmux   : {len(tmux_sess)} sessions  {len(tmux_panes)} panes")
+if tmux_sess:
+    names = ", ".join(s.get("name", "") for s in tmux_sess if s.get("name"))
+    print(f"         {names}")
+
+if active:
+    print(f"live   : {len(active)} process(es)")
+    for a in active:
+        sid   = a.get("session_id") or "?"
+        pane  = a.get("tmux_pane_id") or "no-pane"
+        rss   = a.get("rss_kb")
+        rss_s = f"  rss={rss}KB" if rss else ""
+        conf  = a.get("link_confidence") or "?"
+        print(f"         {a['pattern']}  pid={a['pid']}  sid={sid}"
+              f"  pane={pane}{rss_s}  [{conf}]")
+else:
+    print("live   : none")
+
+counts = idx.get("counts", {})
+if any(counts.get(k, 0) for k in ("open", "closed", "unknown", "abandoned")):
+    print(f"index  : {counts.get('open',0)} open  {counts.get('closed',0)} closed"
+          f"  {counts.get('unknown',0)} unknown  {counts.get('abandoned',0)} abandoned")
+    if not idx.get("index_exists"):
+        print("         (index not found — run FORGE/bin/agent-session scan)")
+
+present = sorted(k for k, v in stores.items() if isinstance(v, dict) and v.get("present"))
+absent  = sorted(k for k, v in stores.items() if isinstance(v, dict) and not v.get("present"))
+if present:
+    print(f"stores : present={','.join(present)}")
+if absent:
+    print(f"         absent={','.join(absent)}")
+
+for w in warns:
+    print(f"WARN   : {w}")
+PY
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  once)
+    collect_once
+    ;;
+  watch)
+    while :; do
+      collect_once
+      sleep "$INTERVAL"
+    done
+    ;;
+  status)
+    print_status
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+#+END_SRC
+
+** agent-session
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-session :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/DotCortex/ROOTS/DotRoot/agent-session}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+agent_sessiond_bin() {
+  if command -v agent-sessiond >/dev/null 2>&1; then
+    command -v agent-sessiond
+  elif [ -x "$SCRIPT_DIR/agent-sessiond" ]; then
+    printf '%s/agent-sessiond\n' "$SCRIPT_DIR"
+  else
+    echo "agent-session: agent-sessiond not found in PATH or $SCRIPT_DIR" >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: agent-session <scan|status|json>
+
+Commands:
+  scan    run agent-sessiond once
+  status  print agent-sessiond status
+  json    print latest local state JSON
+EOF
+}
+
+state_file() {
+  local host
+  host="$(hostname 2>/dev/null || echo unknown)"
+  printf '%s/state.%s.json\n' "$STATE_DIR" "$host"
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  scan)
+    exec "$(agent_sessiond_bin)" once
+    ;;
+  status)
+    exec "$(agent_sessiond_bin)" status
+    ;;
+  json)
+    file="$(state_file)"
+    if [ ! -s "$file" ]; then
+      echo "agent-session: no state file found at $file" >&2
+      exit 1
+    fi
+    exec cat "$file"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+#+END_SRC
+
+** Makefile Fragment
+#+BEGIN_SRC makefile :tangle all/.mk/sessions.mk :padline no
+# ~/DotCortex/all/.mk/sessions.mk
+.RECIPEPREFIX := |
+.PHONY: sessions-once sessions-watch sessions-status
+
+AGENT_SESSIOND ?= $(firstword $(wildcard $(HOME)/.local/bin/agent-sessiond $(HOME)/DotCortex/all/.local/bin/agent-sessiond))
+AGENT_SESSION ?= $(firstword $(wildcard $(HOME)/.local/bin/agent-session $(HOME)/DotCortex/all/.local/bin/agent-session))
+
+sessions-once:
+| @chmod +x $(AGENT_SESSIOND) $(AGENT_SESSION) 2>/dev/null || true
+| $(AGENT_SESSIOND) once
+
+sessions-watch:
+| @chmod +x $(AGENT_SESSIOND) $(AGENT_SESSION) 2>/dev/null || true
+| $(AGENT_SESSIOND) watch
+
+sessions-status:
+| @chmod +x $(AGENT_SESSIOND) $(AGENT_SESSION) 2>/dev/null || true
+| $(AGENT_SESSIOND) status
+#+END_SRC
