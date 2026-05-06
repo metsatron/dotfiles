@@ -1920,12 +1920,13 @@ agent_sessiond_bin() {
 
 usage() {
   cat <<'EOF'
-Usage: agent-session <scan|status|json>
+Usage: agent-session <scan|status|json|close>
 
 Commands:
-  scan    run agent-sessiond once
-  status  print agent-sessiond status
-  json    print latest local state JSON
+  scan         run agent-sessiond once
+  status       print agent-sessiond status
+  json         print latest local state JSON
+  close <id>   mark session as closed in session-index.json
 EOF
 }
 
@@ -1933,6 +1934,23 @@ state_file() {
   local host
   host="$(hostname 2>/dev/null || echo unknown)"
   printf '%s/state.%s.json\n' "$STATE_DIR" "$host"
+}
+
+index_file_path() {
+  if [ -n "${AGENT_SESSION_INDEX:-}" ]; then
+    printf '%s\n' "$AGENT_SESSION_INDEX"
+    return
+  fi
+  if [ -n "${AGENT_TOP_INDEX:-}" ]; then
+    printf '%s\n' "$AGENT_TOP_INDEX"
+    return
+  fi
+  local host
+  host="$(hostname 2>/dev/null || echo unknown)"
+  case "$host" in
+    ThinkPad-T480s|t480s) printf '%s\n' "$HOME/mnt/x230/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+    *)                    printf '%s\n' "$HOME/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+  esac
 }
 
 cmd="${1:-status}"
@@ -1950,6 +1968,47 @@ case "$cmd" in
       exit 1
     fi
     exec cat "$file"
+    ;;
+  close)
+    sid="${2:-}"
+    if [ -z "$sid" ]; then
+      echo "Usage: agent-session close <session_id>" >&2
+      exit 1
+    fi
+    ifile="$(index_file_path)"
+    if [ ! -f "$ifile" ]; then
+      echo "agent-session close: index file not found: $ifile" >&2
+      exit 1
+    fi
+    python3 - "$sid" "$ifile" <<'PY'
+import json, os, sys, time
+sid   = sys.argv[1]
+ifile = sys.argv[2]
+with open(ifile) as f:
+    idx = json.load(f)
+sessions = idx.get("sessions", [])
+found = [s for s in sessions
+         if (s.get("id") or "") == sid or (s.get("id") or "").startswith(sid)]
+if len(found) > 1:
+    print(f"agent-session close: ambiguous prefix '{sid}' matches {len(found)} sessions", file=sys.stderr)
+    sys.exit(1)
+if not found:
+    print(f"agent-session close: session not found: {sid}", file=sys.stderr)
+    sys.exit(1)
+s = found[0]
+if s.get("status") in ("closed", "abandoned"):
+    print(f"agent-session close: already {s['status']}: {s.get('id')}", file=sys.stderr)
+    sys.exit(2)
+old = s.get("status", "unknown")
+s["status"]   = "closed"
+s["indexedat"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+tmp = ifile + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(idx, f, indent=2)
+    f.write("\n")
+os.replace(tmp, ifile)
+print(f"closed: {s['id']} [{old} → closed]  {s.get('agent', '')}  {(s.get('openquestion') or '')[:60]}")
+PY
     ;;
   -h|--help|help)
     usage
@@ -1973,7 +2032,7 @@ Function key plan (Phase 2N+):
 
 Action backends:
   resume  → party[].resume_cmd template; spawn in new tmux pane
-  close   → agent-session close <id>  (verb not yet implemented — Phase 2M gap)
+  close   → agent-session close <id>  (writes session-index.json status=closed)
   stop    → kill -TERM <pid>
   kill    → kill -KILL <pid>
   pgkill  → kill -KILL -<pgid>
@@ -2006,6 +2065,17 @@ _find_agentd() {
     printf '%s/agent-sessiond\n' "$SCRIPT_DIR"
   else
     echo "agent-top: agent-sessiond not found" >&2
+    exit 1
+  fi
+}
+
+_find_agent_session() {
+  if command -v agent-session >/dev/null 2>&1; then
+    command -v agent-session
+  elif [ -x "$SCRIPT_DIR/agent-session" ]; then
+    printf '%s/agent-session\n' "$SCRIPT_DIR"
+  else
+    echo "agent-top: agent-session not found" >&2
     exit 1
   fi
 }
@@ -2461,12 +2531,14 @@ PY
 }
 
 run_tui() {
-  local agentd
+  local agentd agent_session
   agentd="$(_find_agentd)"
-  python3 - "$agentd" <<'PY'
+  agent_session="$(_find_agent_session)"
+  python3 - "$agentd" "$agent_session" <<'PY'
 import curses, json, os, shlex, subprocess, sys, time
 
-AGENTD     = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
+AGENTD        = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
+AGENT_SESSION = sys.argv[2] if len(sys.argv) > 2 else "agent-session"
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
 
@@ -2600,7 +2672,7 @@ class TUI:
         "  F4                 toggle closed/archive visibility",
         "",
         " Destructive  (Phase 2O — not yet wired)",
-        "  F7                 close/archive session",
+        "  F7                 close session (marks index as closed)",
         "  F8                 stop  (SIGTERM)",
         "  F9                 kill  (SIGKILL)",
         "  K                  pkill by process group",
@@ -2838,9 +2910,10 @@ class TUI:
             self._action_refresh()
         elif key == curses.KEY_F6:
             self._action_resume()
-        elif key in (curses.KEY_F7, curses.KEY_F8, curses.KEY_F9):
+        elif key == curses.KEY_F7:
+            self._action_close()
+        elif key in (curses.KEY_F8, curses.KEY_F9):
             lbl = {
-                curses.KEY_F7: "F7 close/archive",
                 curses.KEY_F8: "F8 stop (SIGTERM)",
                 curses.KEY_F9: "F9 kill (SIGKILL)",
             }.get(key, "action")
@@ -2930,6 +3003,45 @@ class TUI:
             self.set_status("Refresh timed out")
         except Exception as e:
             self.set_status(f"Refresh error: {e}")
+
+    def _action_close(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        sid = r.get("session_id") or ""
+        if not sid:
+            self.set_status(
+                f"No session_id  pid={r.get('pid')} [{r.get('pattern')}]"
+            )
+            return
+        ist = r.get("_ist") or ""
+        if ist in ("closed", "abandoned"):
+            self.set_status(f"Already {ist}: {short_sid(sid)}")
+            return
+        agent  = r.get("pattern") or "?"
+        title_s = (r.get("_title") or "")[:25]
+        tail   = f" {title_s}" if title_s else ""
+        prompt = f" Close {short_sid(sid)} [{agent}]{tail}? [y/N] "
+        if not self._confirm(prompt):
+            self.set_status("Close cancelled")
+            return
+        dbg(f"close: {agent} sid={sid[:12]}")
+        try:
+            result = subprocess.run(
+                [AGENT_SESSION, "close", sid],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                self.reload()
+                self.set_status(f"Closed: {short_sid(sid)} [{agent}]")
+            else:
+                err = (result.stderr or result.stdout or "unknown error").strip()[:60]
+                self.set_status(f"Close failed: {err}")
+        except subprocess.TimeoutExpired:
+            self.set_status("Close timed out")
+        except Exception as e:
+            self.set_status(f"Close error: {e}")
 
     def _action_resume(self):
         r = self._sel_row()
