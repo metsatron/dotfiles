@@ -61,6 +61,7 @@ Commands:
   jump <pid|session>   switch tmux to the agent's pane
   resume <session_id>  resume a session via its harness
   show <session_id>    show full session details
+  tui / top            interactive curses operator console
   help                 show this help
 
 Options:
@@ -498,6 +499,535 @@ hr()
 PY
 }
 
+run_tui() {
+  local agentd
+  agentd="$(_find_agentd)"
+  python3 - "$agentd" <<'PY'
+import curses, json, os, shlex, subprocess, sys, time
+
+AGENTD     = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
+STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+
+PROVIDER_MAP = {
+    "claude": "anthropic", "opencode": "multi",    "codex": "openai",
+    "hermes": "anthropic", "auryn":    "anthropic", "auryn-chan": "anthropic",
+    "helmastra": "openai", "antigravity": "google",
+}
+RESUME_ARGV = {
+    "claude":   lambda s: ["claude",   "--resume", s],
+    "opencode": lambda s: ["opencode", "-s",       s],
+    "codex":    lambda s: ["codex",    "resume",   s],
+    "hermes":   lambda s: ["hermes",   "--resume", s],
+}
+SORT_FIELDS = ["tier", "agent", "pid", "rss", "io_write", "status", "title"]
+
+def fmt_kb(kb):
+    n = (kb or 0) * 1024
+    if not n:
+        return "—"
+    for unit, thr in [("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)]:
+        if n >= thr:
+            return f"{n/thr:.0f}{unit}"
+    return f"{n}B"
+
+def short_sid(s):
+    return (s[-12:] if s and len(s) > 12 else s) or "—"
+
+def cwd_base(path):
+    if not path:
+        return "—"
+    home = os.path.expanduser("~")
+    p = ("~" + path[len(home):]) if path.startswith(home) else path
+    return p.rstrip("/").split("/")[-1] or p
+
+def tier_of(a):
+    if a.get("session_id") and a.get("tmux_pane_id"):
+        return "HIGH"
+    if a.get("session_id"):
+        return "MED"
+    if a.get("tmux_pane_id"):
+        return "LOW"
+    return "NONE"
+
+def tier_ord(t):
+    return {"HIGH": 0, "MED": 1, "LOW": 2, "NONE": 3}.get(t, 4)
+
+def load_data(show_closed=False):
+    state = {}
+    if STATE_FILE and os.path.isfile(STATE_FILE):
+        try:
+            state = json.loads(open(STATE_FILE).read())
+        except Exception:
+            pass
+    index = {}
+    if INDEX_FILE and os.path.isfile(INDEX_FILE):
+        try:
+            raw = json.loads(open(INDEX_FILE).read())
+            lst = raw.get("sessions", []) if isinstance(raw, dict) else raw
+            index = {s.get("id"): s for s in lst if isinstance(s, dict) and s.get("id")}
+        except Exception:
+            pass
+    rows = []
+    for a in (state.get("active_agents") or []):
+        tier = tier_of(a)
+        idx  = index.get(a.get("session_id")) or {}
+        ist  = idx.get("status") or ""
+        if not show_closed and ist in ("closed", "abandoned"):
+            continue
+        r = dict(a)
+        r["_tier"]  = tier
+        r["_prov"]  = PROVIDER_MAP.get(a.get("pattern") or "", "—")
+        r["_title"] = idx.get("openquestion") or idx.get("title") or ""
+        r["_ist"]   = ist or "—"
+        r["_idx"]   = idx
+        rows.append(r)
+    return state, rows
+
+def sort_rows(rows, sf):
+    def key(r):
+        if sf == "tier":     return (tier_ord(r["_tier"]), r.get("pattern", ""))
+        if sf == "agent":    return (r.get("pattern", ""), tier_ord(r["_tier"]))
+        if sf == "pid":      return (r.get("pid") or 0,)
+        if sf == "rss":      return (-(r.get("rss_kb") or 0),)
+        if sf == "io_write": return (-(r.get("io_write_bytes") or 0),)
+        if sf == "status":   return (r.get("_ist", ""), r.get("pattern", ""))
+        if sf == "title":    return (r.get("_title", "").lower(),)
+        return (0,)
+    return sorted(rows, key=key)
+
+def filter_rows(rows, q):
+    if not q:
+        return rows
+    ql = q.lower()
+    def m(r):
+        return any(ql in (v or "").lower() for v in [
+            r.get("pattern"), str(r.get("pid") or ""),
+            r.get("session_id"), r.get("_title"),
+            r.get("cwd"), r.get("_ist"), r.get("_prov"),
+        ])
+    return [r for r in rows if m(r)]
+
+class TUI:
+    HELP = [
+        " agent-top  —  interactive operator console",
+        "",
+        " Navigation",
+        "  Up/Down  j/k       move selection",
+        "  PgUp / PgDn        scroll pages",
+        "  Home / End         jump top/bottom",
+        "",
+        " Actions",
+        "  Enter              jump to tmux pane",
+        "  Space / i          show session details",
+        "  F5                 refresh (agent-sessiond once)",
+        "  F6                 resume selected session",
+        "",
+        " Display",
+        "  F2                 cycle sort field",
+        "  F3                 incremental search  (Esc clears)",
+        "  F4                 toggle closed/archive visibility",
+        "",
+        " Destructive  (Phase 2O — not yet wired)",
+        "  F7                 close/archive session",
+        "  F8                 stop  (SIGTERM)",
+        "  F9                 kill  (SIGKILL)",
+        "  K                  pkill by process group",
+        "",
+        " Quit",
+        "  q / F10            quit",
+        "  F1                 this help",
+        "",
+        " Press any key to close",
+    ]
+
+    def __init__(self, scr):
+        self.scr         = scr
+        self.sel         = 0
+        self.offset      = 0
+        self.sort_idx    = 0
+        self.query       = ""
+        self.searching   = False
+        self.show_closed = False
+        self.status_msg  = ""
+        self.status_ts   = 0.0
+        self.state       = {}
+        self.all_rows    = []
+        self.visible     = []
+        self.reload()
+        curses.curs_set(0)
+        scr.timeout(5000)
+        self._init_colors()
+
+    def _init_colors(self):
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except Exception:
+            bg = curses.COLOR_BLACK
+        curses.init_pair(1, curses.COLOR_GREEN,  bg)
+        curses.init_pair(2, curses.COLOR_CYAN,   bg)
+        curses.init_pair(3, curses.COLOR_YELLOW, bg)
+        curses.init_pair(7, curses.COLOR_BLACK,  curses.COLOR_WHITE)
+
+    def tier_attr(self, t):
+        return {
+            "HIGH": curses.color_pair(1) | curses.A_BOLD,
+            "MED":  curses.color_pair(2),
+            "LOW":  curses.color_pair(3),
+            "NONE": curses.A_DIM,
+        }.get(t, curses.A_NORMAL)
+
+    def reload(self):
+        self.state, self.all_rows = load_data(self.show_closed)
+        self.refresh_visible()
+
+    def refresh_visible(self):
+        sf = SORT_FIELDS[self.sort_idx]
+        rows = sort_rows(self.all_rows, sf)
+        self.visible = filter_rows(rows, self.query)
+        if self.sel >= len(self.visible):
+            self.sel = max(0, len(self.visible) - 1)
+
+    def set_status(self, msg):
+        self.status_msg = msg
+        self.status_ts  = time.time()
+
+    def draw(self):
+        h, w = self.scr.getmaxyx()
+        if h < 5 or w < 40:
+            try:
+                self.scr.addstr(0, 0, "Terminal too small (need 40x5)")
+            except curses.error:
+                pass
+            self.scr.refresh()
+            return
+        self.scr.erase()
+        self._draw_header(0, w)
+        self._draw_col_hdr(1, w)
+        table_h = h - 3
+        if self.sel < self.offset:
+            self.offset = self.sel
+        elif self.sel >= self.offset + table_h:
+            self.offset = self.sel - table_h + 1
+        for i in range(table_h):
+            ri = self.offset + i
+            if ri >= len(self.visible):
+                break
+            self._draw_row(2 + i, w, self.visible[ri], ri == self.sel)
+        self._draw_status(h - 1, w)
+        self.scr.refresh()
+
+    def _col_widths(self, w):
+        fixed = [
+            ("TIER", 5), ("AGENT", 10), ("PID", 7), ("SESSION", 14),
+            ("STATUS", 8), ("PROV", 9), ("RSS", 6), ("PS", 3),
+            ("PANE", 14), ("CWD", 12),
+        ]
+        used = 2 + sum(cw for _, cw in fixed) + len(fixed)
+        return fixed + [("TITLE", max(4, w - used - 1))]
+
+    def _draw_header(self, y, w):
+        st  = self.state
+        hst = st.get("host", "?")
+        gat = (st.get("generated_at") or "")[:19]
+        sch = st.get("schema", "?")
+        sf  = SORT_FIELDS[self.sort_idx]
+        cf  = "  +closed" if self.show_closed else ""
+        hdr = (f" agent-top  {hst}  {gat}  schema:{sch}"
+               f"  active:{len(self.all_rows)}  vis:{len(self.visible)}"
+               f"  sort:{sf}{cf}")
+        try:
+            self.scr.addstr(y, 0, hdr[:w - 1].ljust(w - 1),
+                            curses.A_REVERSE | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def _draw_col_hdr(self, y, w):
+        cols = self._col_widths(w)
+        line = "  " + " ".join(f"{name:<{cw}}" for name, cw in cols)
+        try:
+            self.scr.addstr(y, 0, line[:w - 1], curses.A_DIM)
+        except curses.error:
+            pass
+
+    def _draw_row(self, y, w, r, sel):
+        tier = r["_tier"]
+        cols = self._col_widths(w)
+        tw   = cols[-1][1]
+        ps   = (r.get("proc_status") or "?")[:3]
+        fields = [
+            f"{tier:<5}",
+            f"{(r.get('pattern') or '?')[:10]:<10}",
+            f"{str(r.get('pid') or '?'):<7}",
+            f"{short_sid(r.get('session_id')):<14}",
+            f"{r.get('_ist', '—')[:8]:<8}",
+            f"{r.get('_prov', '—')[:9]:<9}",
+            f"{fmt_kb(r.get('rss_kb'))[:6]:<6}",
+            f"{ps:<3}",
+            f"{(r.get('tmux_pane_id') or '—')[:14]:<14}",
+            f"{cwd_base(r.get('cwd'))[:12]:<12}",
+            f"{(r.get('_title') or '')[:tw]:<{tw}}",
+        ]
+        line = "  " + " ".join(fields)
+        try:
+            if sel:
+                self.scr.addstr(y, 0, line[:w - 1], curses.color_pair(7))
+            else:
+                self.scr.addstr(y, 0, line[:w - 1])
+                self.scr.addstr(y, 2, f"{tier:<5}", self.tier_attr(tier))
+        except curses.error:
+            pass
+
+    def _draw_status(self, y, w):
+        if self.searching:
+            bar = f" /{self.query}█  Esc:clear  Enter:done"
+        elif self.status_msg and (time.time() - self.status_ts) < 5:
+            bar = f" {self.status_msg}"
+        else:
+            bar = (" F1:help  F2:sort  F3:search  F4:±closed"
+                   "  F5:refresh  Enter:jump  Spc:show  F6:resume  F10:quit")
+        try:
+            self.scr.addstr(y, 0, bar[:w - 1].ljust(w - 1), curses.A_REVERSE)
+        except curses.error:
+            pass
+
+    def run(self):
+        while True:
+            self.draw()
+            key = self.scr.getch()
+            if key == curses.ERR:
+                self.reload()
+                continue
+            if self.searching:
+                self._search_key(key)
+            elif not self._normal_key(key):
+                break
+
+    def _search_key(self, key):
+        if key == 27:
+            self.searching = False
+            self.query = ""
+            self.refresh_visible()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.query = self.query[:-1]
+            self.refresh_visible()
+        elif key == ord('\n'):
+            self.searching = False
+        elif 32 <= key < 127:
+            self.query += chr(key)
+            self.refresh_visible()
+
+    def _normal_key(self, key):
+        n  = len(self.visible)
+        h, _ = self.scr.getmaxyx()
+        pg = max(1, h - 3)
+        if key in (ord('q'), curses.KEY_F10):
+            return False
+        elif key in (curses.KEY_UP, ord('k')):
+            self.sel = max(0, self.sel - 1)
+        elif key in (curses.KEY_DOWN, ord('j')):
+            self.sel = min(max(0, n - 1), self.sel + 1)
+        elif key == curses.KEY_PPAGE:
+            self.sel = max(0, self.sel - pg)
+        elif key == curses.KEY_NPAGE:
+            self.sel = min(max(0, n - 1), self.sel + pg)
+        elif key == curses.KEY_HOME:
+            self.sel = 0
+        elif key == curses.KEY_END:
+            self.sel = max(0, n - 1)
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r')):
+            self._action_jump()
+        elif key in (ord(' '), ord('i')):
+            self._action_show()
+        elif key == curses.KEY_F1:
+            self._overlay(self.HELP, " Help ")
+        elif key == curses.KEY_F2:
+            self.sort_idx = (self.sort_idx + 1) % len(SORT_FIELDS)
+            self.refresh_visible()
+            self.set_status(f"Sort: {SORT_FIELDS[self.sort_idx]}")
+        elif key == curses.KEY_F3:
+            self.searching = True
+        elif key == curses.KEY_F4:
+            self.show_closed = not self.show_closed
+            self.reload()
+            self.set_status(f"Closed sessions: {'shown' if self.show_closed else 'hidden'}")
+        elif key == curses.KEY_F5:
+            self._action_refresh()
+        elif key == curses.KEY_F6:
+            self._action_resume()
+        elif key in (curses.KEY_F7, curses.KEY_F8, curses.KEY_F9):
+            lbl = {
+                curses.KEY_F7: "F7 close/archive",
+                curses.KEY_F8: "F8 stop (SIGTERM)",
+                curses.KEY_F9: "F9 kill (SIGKILL)",
+            }.get(key, "action")
+            self.set_status(f"Phase 2O: {lbl} not wired yet")
+        elif key == ord('K'):
+            self.set_status("Phase 2O: K pkill not wired yet")
+        return True
+
+    def _sel_row(self):
+        if self.visible and 0 <= self.sel < len(self.visible):
+            return self.visible[self.sel]
+        return None
+
+    def _action_jump(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        pane = r.get("tmux_pane_id")
+        if not pane:
+            self.set_status(
+                f"No tmux pane  pid={r.get('pid')} [{r.get('pattern')}]"
+                f"  conf={r.get('link_confidence')}"
+            )
+            return
+        if os.environ.get("TMUX"):
+            try:
+                subprocess.run(["tmux", "switch-client", "-t", pane], check=False)
+                self.set_status(f"Switched to pane {pane}")
+            except Exception as e:
+                self.set_status(f"tmux error: {e}")
+        else:
+            self.set_status(f"Not in tmux — run: tmux switch-client -t {pane}")
+
+    def _action_show(self):
+        r = self._sel_row()
+        if not r:
+            return
+        _, w  = self.scr.getmaxyx()
+        idx   = r.get("_idx") or {}
+        agent = r.get("pattern") or "?"
+        sid   = r.get("session_id") or "?"
+        cwd_v = idx.get("cwd") or r.get("cwd") or ""
+        argv  = RESUME_ARGV.get(agent, lambda s: [])(sid)
+        if argv and cwd_v:
+            resume_s = f"cd {shlex.quote(cwd_v)} && {shlex.join(argv)}"
+        elif argv:
+            resume_s = shlex.join(argv)
+        else:
+            resume_s = f"(no command for {agent})"
+        mw = min(74, w - 4)
+        lines = [
+            f" {sid}",
+            "",
+            f" agent:    {agent}",
+            f" status:   {r.get('_ist', '—')}",
+            f" provider: {r.get('_prov', '—')}",
+            f" model:    —",
+            f" machine:  {idx.get('machine') or '—'}",
+            f" cwd:      {cwd_v or '—'}",
+            f" date:     {idx.get('sessiondate') or '—'}",
+            f" signal:   {idx.get('signal') or '—'}",
+            f" question: {(idx.get('openquestion') or '')[:mw - 12]}",
+            "",
+            f" pid:      {r.get('pid') or '—'}",
+            f" proc:     {r.get('proc_status') or '—'}",
+            f" rss:      {fmt_kb(r.get('rss_kb'))}",
+            f" pane:     {r.get('tmux_pane_id') or '—'}",
+            f" live_cwd: {r.get('cwd') or '—'}",
+            "",
+            f" resume:   {resume_s[:mw - 12]}",
+            "",
+            " Press any key to close",
+        ]
+        self._overlay(lines, " Session Details ", w_hint=mw)
+
+    def _action_refresh(self):
+        try:
+            subprocess.run([AGENTD, "once"], capture_output=True, timeout=30)
+            self.reload()
+            gat = (self.state.get("generated_at") or "")[:19]
+            self.set_status(f"Refreshed at {gat}")
+        except subprocess.TimeoutExpired:
+            self.set_status("Refresh timed out")
+        except Exception as e:
+            self.set_status(f"Refresh error: {e}")
+
+    def _action_resume(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        idx   = r.get("_idx") or {}
+        agent = r.get("pattern") or ""
+        sid   = r.get("session_id") or ""
+        cwd_v = idx.get("cwd") or r.get("cwd") or ""
+        if not sid:
+            self.set_status("No session_id for selected row")
+            return
+        argv_fn = RESUME_ARGV.get(agent)
+        if not argv_fn:
+            self.set_status(f"No resume command for agent '{agent}'")
+            return
+        argv = argv_fn(sid)
+        ist = r.get("_ist") or ""
+        if ist in ("closed", "abandoned"):
+            if not self._confirm(f" Session is {ist}. Resume anyway? [y/N] "):
+                self.set_status("Resume cancelled")
+                return
+        curses.endwin()
+        if cwd_v:
+            print(f"  cd {shlex.quote(cwd_v)}")
+            try:
+                os.chdir(cwd_v)
+            except Exception:
+                pass
+        print(f"  {shlex.join(argv)}")
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            print(f"agent-top: exec failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def _confirm(self, prompt):
+        h, w = self.scr.getmaxyx()
+        cw  = min(len(prompt) + 6, w - 4)
+        win = curses.newwin(3, cw, (h - 3) // 2, (w - cw) // 2)
+        win.box()
+        try:
+            win.addstr(1, 1, prompt[:cw - 2])
+        except curses.error:
+            pass
+        win.refresh()
+        k = win.getch()
+        return 32 <= k < 127 and chr(k).lower() == 'y'
+
+    def _overlay(self, lines, title="", w_hint=None):
+        h, w = self.scr.getmaxyx()
+        mw = w_hint if w_hint else min(60, w - 4)
+        mh = min(len(lines) + 2, h - 2)
+        win = curses.newwin(mh, mw, (h - mh) // 2, (w - mw) // 2)
+        win.box()
+        if title:
+            tx = max(0, (mw - len(title)) // 2)
+            try:
+                win.addstr(0, tx, title[:mw - 2], curses.A_BOLD)
+            except curses.error:
+                pass
+        for i, line in enumerate(lines):
+            if i + 1 >= mh - 1:
+                break
+            try:
+                win.addstr(i + 1, 1, line[:mw - 2])
+            except curses.error:
+                pass
+        win.refresh()
+        win.getch()
+
+def _main(stdscr):
+    TUI(stdscr).run()
+
+if not STATE_FILE or not os.path.isfile(STATE_FILE):
+    sys.exit(f"agent-top tui: state file not found: {STATE_FILE or '(unset)'}")
+
+curses.wrapper(_main)
+PY
+}
+
 cmd="${1:-once}"
 show_all="false"
 
@@ -537,6 +1067,9 @@ case "$cmd" in
     ;;
   show)
     run_show "${2:-}"
+    ;;
+  tui|top|interactive)
+    run_tui
     ;;
   help|-h|--help)
     usage
