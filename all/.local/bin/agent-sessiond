@@ -278,6 +278,126 @@ def ppid_chain_walk(pid_str, pane_pid_set, max_depth=32):
     return None, chain
 
 
+# ── model context window table (static, source always labeled "model_table") ─
+CONTEXT_WINDOW_SIZES = {
+    "claude-opus-4-7":   200000, "claude-opus-4-5":   200000,
+    "claude-sonnet-4-6": 200000, "claude-sonnet-4-5": 200000,
+    "claude-haiku-4-5":  200000,
+}
+
+def _ctx_window(model):
+    if not model:
+        return None
+    if model in CONTEXT_WINDOW_SIZES:
+        return CONTEXT_WINDOW_SIZES[model]
+    for k, v in CONTEXT_WINDOW_SIZES.items():
+        if model.startswith(k):
+            return v
+    return None
+
+
+# ── claude model/context probe (read project JSONL) ──────────────────────────
+_CLAUDE_PROJECTS_DIR = home / ".claude/projects"
+
+def _claude_model_probe(pid_str, session_id):
+    """Return model/usage dict from the most recent assistant JSONL entry."""
+    try:
+        sf   = _CLAUDE_SESSIONS_DIR / f"{pid_str}.json"
+        data = json.loads(sf.read_text())
+        cwd  = data.get("cwd") or ""
+        if not cwd:
+            return {}
+        encoded = cwd.replace("/", "-")
+        jf = _CLAUDE_PROJECTS_DIR / encoded / f"{session_id}.jsonl"
+        if not jf.exists():
+            for d in _CLAUDE_PROJECTS_DIR.iterdir():
+                c = d / f"{session_id}.jsonl"
+                if c.exists():
+                    jf = c
+                    break
+            else:
+                return {}
+        with open(jf, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read().decode(errors="replace")
+        model = None
+        usage = {}
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                msg   = entry.get("message", {})
+                if msg.get("role") == "assistant" and msg.get("model") and msg.get("usage"):
+                    model = msg["model"]
+                    usage = msg["usage"]
+            except Exception:
+                pass
+        if not model:
+            return {}
+        inp = ((usage.get("input_tokens") or 0) +
+               (usage.get("cache_read_input_tokens") or 0) +
+               (usage.get("cache_creation_input_tokens") or 0))
+        win = _ctx_window(model)
+        pct = round(inp / win * 100, 1) if (win and inp) else None
+        return {
+            "provider":              "anthropic",
+            "provider_source":       "claude_jsonl",
+            "model":                 model,
+            "model_source":          "claude_jsonl",
+            "model_confidence":      "high",
+            "context_size":          inp or None,
+            "context_size_source":   "claude_jsonl",
+            "context_window":        win,
+            "context_window_source": "model_table" if win else "unknown",
+            "context_percent":       pct,
+        }
+    except Exception:
+        return {}
+
+
+# ── codex model probe (read logs_2.sqlite) ───────────────────────────────────
+_CODEX_LOG_DB   = home / ".codex/logs_2.sqlite"
+_CODEX_MODEL_RE = re.compile(r'\bmodel=([A-Za-z0-9._:/-]+)')
+
+def _codex_model_probe(pid_str):
+    """Extract most-recent model for this PID from Codex logs_2.sqlite."""
+    if not _CODEX_LOG_DB.exists():
+        return {}
+    try:
+        conn = sqlite3.connect(f"file:{_CODEX_LOG_DB}?mode=ro", uri=True)
+        rows = conn.execute(
+            "SELECT feedback_log_body FROM logs "
+            "WHERE process_uuid LIKE ? AND feedback_log_body LIKE '%model=%' "
+            "ORDER BY ts DESC, ts_nanos DESC LIMIT 50",
+            (f"pid:{pid_str}:%",)
+        ).fetchall()
+        conn.close()
+        for (body,) in rows:
+            if not body:
+                continue
+            mm = _CODEX_MODEL_RE.search(body)
+            if mm:
+                return {
+                    "provider":              "openai",
+                    "provider_source":       "codex_log",
+                    "model":                 mm.group(1),
+                    "model_source":          "codex_log",
+                    "model_confidence":      "high",
+                    "context_size":          None,
+                    "context_size_source":   "unknown",
+                    "context_window":        None,
+                    "context_window_source": "unknown",
+                    "context_percent":       None,
+                }
+    except Exception:
+        pass
+    return {}
+
+
 # ── capabilities (binary presence) ───────────────────────────────────────────
 CAPABILITY_BINS = [
     "python3", "pgrep", "tmux", "fzf",
@@ -466,35 +586,62 @@ if _oc_db.exists():
             _conn = sqlite3.connect(f"file:{_oc_db}?mode=ro", uri=True)
             for _sid in _oc_sids:
                 _row = _conn.execute(
-                    "SELECT json_extract(data,'$.model.providerID'),"
-                    "       json_extract(data,'$.model.modelID') "
+                    "SELECT json_extract(data,'$.providerID'),"
+                    "       json_extract(data,'$.modelID'),"
+                    "       json_extract(data,'$.tokens.input'),"
+                    "       json_extract(data,'$.tokens.cache.read') "
                     "FROM message "
                     "WHERE session_id=? "
-                    "  AND json_extract(data,'$.model.providerID') IS NOT NULL "
+                    "  AND json_extract(data,'$.providerID') IS NOT NULL "
                     "ORDER BY time_created DESC LIMIT 1",
                     (_sid,)
                 ).fetchone()
                 if _row and _row[0]:
-                    _model_by_sid[_sid] = {"provider": _row[0], "model": _row[1] or "—"}
+                    _ctx_inp = (_row[2] or 0) + (_row[3] or 0)
+                    _model_by_sid[_sid] = {
+                        "provider":     _row[0],
+                        "model":        _row[1] or "—",
+                        "context_size": _ctx_inp if _ctx_inp > 0 else None,
+                    }
             _conn.close()
         except Exception as _exc:
             warnings.append(f"opencode model probe: {_exc}")
 
 for ln in pid_session_links:
-    _sid = ln.get("session_id")
-    if _sid and _sid in _model_by_sid:
-        _mi = _model_by_sid[_sid]
-        ln["provider"]         = _mi["provider"]
-        ln["provider_source"]  = "opencode_db"
-        ln["model"]            = _mi["model"]
-        ln["model_source"]     = "opencode_db"
-        ln["model_confidence"] = "high"
-    else:
-        ln["provider"]         = None
-        ln["provider_source"]  = "unknown"
-        ln["model"]            = None
-        ln["model_source"]     = "unknown"
-        ln["model_confidence"] = "none"
+    _sid   = ln.get("session_id")
+    _agent = ln.get("agent")
+    _kind  = ln.get("fd_session_kind")
+    _pid   = ln.get("pid")
+    _extra = {}
+    if _kind == "opencode" and _sid and _sid in _model_by_sid:
+        _mi  = _model_by_sid[_sid]
+        _ctx = _mi.get("context_size")
+        _extra = {
+            "provider":              _mi["provider"],
+            "provider_source":       "opencode_db",
+            "model":                 _mi["model"],
+            "model_source":          "opencode_db",
+            "model_confidence":      "high",
+            "context_size":          _ctx,
+            "context_size_source":   "opencode_db" if _ctx else "unknown",
+            "context_window":        None,
+            "context_window_source": "unknown",
+            "context_percent":       None,
+        }
+    elif _kind == "claude" and _sid and _pid:
+        _extra = _claude_model_probe(_pid, _sid)
+    elif _agent in ("codex", "codex-astra") and _pid:
+        _extra = _codex_model_probe(_pid)
+    ln["provider"]              = _extra.get("provider")
+    ln["provider_source"]       = _extra.get("provider_source")       or "unknown"
+    ln["model"]                 = _extra.get("model")
+    ln["model_source"]          = _extra.get("model_source")          or "unknown"
+    ln["model_confidence"]      = _extra.get("model_confidence")      or "none"
+    ln["context_size"]          = _extra.get("context_size")
+    ln["context_size_source"]   = _extra.get("context_size_source")   or "unknown"
+    ln["context_window"]        = _extra.get("context_window")
+    ln["context_window_source"] = _extra.get("context_window_source") or "unknown"
+    ln["context_percent"]       = _extra.get("context_percent")
 
 
 # ── active_agents ─────────────────────────────────────────────────────────────
@@ -525,11 +672,16 @@ for proc in raw_procs:
         "tmux_pane_pid":     lnk.get("tmux_pane_pid"),
         "tmux_link_source":  lnk.get("tmux_link_source"),
         "link_confidence":   lnk.get("confidence"),
-        "provider":          lnk.get("provider"),
-        "provider_source":   lnk.get("provider_source"),
-        "model":             lnk.get("model"),
-        "model_source":      lnk.get("model_source"),
-        "model_confidence":  lnk.get("model_confidence"),
+        "provider":              lnk.get("provider"),
+        "provider_source":       lnk.get("provider_source"),
+        "model":                 lnk.get("model"),
+        "model_source":          lnk.get("model_source"),
+        "model_confidence":      lnk.get("model_confidence"),
+        "context_size":          lnk.get("context_size"),
+        "context_size_source":   lnk.get("context_size_source"),
+        "context_window":        lnk.get("context_window"),
+        "context_window_source": lnk.get("context_window_source"),
+        "context_percent":       lnk.get("context_percent"),
     })
 
 
