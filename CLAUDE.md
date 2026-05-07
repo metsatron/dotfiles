@@ -49,6 +49,31 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     - **Verify incrementally** -- After each edit, verify the file is in the expected state with `head` or `tail`. If something looks wrong, stop.
     - **Restore is destruction** -- Restoring a file overwrites current state with older state. This is always destructive. Require explicit permission before restoring any file, especially non-DotCortex config files in `~/.hermes/`, `~/.config/`, etc.
 
+17. **TaskHandoff Protocol** -- When planning work for executor agents (Codex, Antigravity, Hermes,
+    or any cloud substrate), emit a structured =TaskHandoff= JSON object rather than prose prompts
+    or narrative instructions. Schema defined at =HelmCortex/FORGE/brain/helmcortex/AGENTS.md= →
+    TaskHandoff Protocol section. Key constraints: paths must be verified against live harness (never
+    invented); =allow_git= field controls git permissions for the receiving agent; =NEXUS/= and =LOGS/=
+    are forbidden by default. Never emit essays, long explanations, or unverified path hierarchies
+    between agent handoffs.
+
+18. **Colemak-NEIO Interaction Law** -- All interactive terminal tools and TUIs built for this
+    system must not assume QWERTY/Vim movement keys. Mètsàtron uses **Colemak-NEIO**. Default
+    directional movement bindings for any new TUI or interactive script:
+    - `n` = left / back / previous / close modal
+    - `e` = down / next row
+    - `i` = up / previous row
+    - `o` = right / open / confirm / enter column
+    Additional constraints:
+    - `h` means find/search-next in Colemak-NEIO — never use it as "left"
+    - `k` means insert — never use it as "up"
+    - `l` means newline/open-line — never use it as "right"
+    - Never use `h/j/k/l` as the primary movement contract in any TUI
+    - Never remap or steal `u/U` or `i/I` for directional movement without explicit instruction
+    - Every important action must have a mnemonic letter binding alongside any F-key
+    - Vim-style `j/k` may only exist as optional compatibility aliases, never as the
+      primary documented bindings
+
 ## Agent Config Scoping
 
 Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
