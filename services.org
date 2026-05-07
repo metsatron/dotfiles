@@ -1245,6 +1245,7 @@ import re
 import shutil
 import sqlite3
 import sys
+import time
 from datetime import datetime, timezone
 
 root = pathlib.Path(sys.argv[1])
@@ -1426,6 +1427,8 @@ def _ctx_window(model):
             return v
     return None
 
+_STALE_THRESH_S = 86400  # metadata older than 24h is stale
+
 
 # ── claude model/context probe (read project JSONL) ──────────────────────────
 _CLAUDE_PROJECTS_DIR = home / ".claude/projects"
@@ -1474,6 +1477,7 @@ def _claude_model_probe(pid_str, session_id):
                (usage.get("cache_creation_input_tokens") or 0))
         win = _ctx_window(model)
         pct = round(inp / win * 100, 1) if (win and inp) else None
+        mts = jf.stat().st_mtime
         return {
             "provider":              "anthropic",
             "provider_source":       "claude_jsonl",
@@ -1485,6 +1489,7 @@ def _claude_model_probe(pid_str, session_id):
             "context_window":        win,
             "context_window_source": "model_table" if win else "unknown",
             "context_percent":       pct,
+            "metadata_ts":           mts,
         }
     except Exception:
         return {}
@@ -1501,13 +1506,13 @@ def _codex_model_probe(pid_str):
     try:
         conn = sqlite3.connect(f"file:{_CODEX_LOG_DB}?mode=ro", uri=True)
         rows = conn.execute(
-            "SELECT feedback_log_body FROM logs "
+            "SELECT feedback_log_body, ts FROM logs "
             "WHERE process_uuid LIKE ? AND feedback_log_body LIKE '%model=%' "
             "ORDER BY ts DESC, ts_nanos DESC LIMIT 50",
             (f"pid:{pid_str}:%",)
         ).fetchall()
         conn.close()
-        for (body,) in rows:
+        for (body, ts) in rows:
             if not body:
                 continue
             mm = _CODEX_MODEL_RE.search(body)
@@ -1523,6 +1528,7 @@ def _codex_model_probe(pid_str):
                     "context_window":        None,
                     "context_window_source": "unknown",
                     "context_percent":       None,
+                    "metadata_ts":           float(ts) if ts else None,
                 }
     except Exception:
         pass
@@ -1720,7 +1726,8 @@ if _oc_db.exists():
                     "SELECT json_extract(data,'$.providerID'),"
                     "       json_extract(data,'$.modelID'),"
                     "       json_extract(data,'$.tokens.input'),"
-                    "       json_extract(data,'$.tokens.cache.read') "
+                    "       json_extract(data,'$.tokens.cache.read'),"
+                    "       time_created "
                     "FROM message "
                     "WHERE session_id=? "
                     "  AND json_extract(data,'$.providerID') IS NOT NULL "
@@ -1729,10 +1736,12 @@ if _oc_db.exists():
                 ).fetchone()
                 if _row and _row[0]:
                     _ctx_inp = (_row[2] or 0) + (_row[3] or 0)
+                    _mts = _row[4] / 1000.0 if _row[4] else None
                     _model_by_sid[_sid] = {
                         "provider":     _row[0],
                         "model":        _row[1] or "—",
                         "context_size": _ctx_inp if _ctx_inp > 0 else None,
+                        "metadata_ts":  _mts,
                     }
             _conn.close()
         except Exception as _exc:
@@ -1758,6 +1767,7 @@ for ln in pid_session_links:
             "context_window":        None,
             "context_window_source": "unknown",
             "context_percent":       None,
+            "metadata_ts":           _mi.get("metadata_ts"),
         }
     elif _kind == "claude" and _sid and _pid:
         _extra = _claude_model_probe(_pid, _sid)
@@ -1773,6 +1783,10 @@ for ln in pid_session_links:
     ln["context_window"]        = _extra.get("context_window")
     ln["context_window_source"] = _extra.get("context_window_source") or "unknown"
     ln["context_percent"]       = _extra.get("context_percent")
+    _mts = _extra.get("metadata_ts")
+    ln["metadata_ts"]           = _mts
+    ln["metadata_age_s"]        = round(time.time() - _mts) if _mts else None
+    ln["metadata_stale"]        = (ln["metadata_age_s"] or 0) > _STALE_THRESH_S
 
 
 # ── active_agents ─────────────────────────────────────────────────────────────
@@ -1813,6 +1827,9 @@ for proc in raw_procs:
         "context_window":        lnk.get("context_window"),
         "context_window_source": lnk.get("context_window_source"),
         "context_percent":       lnk.get("context_percent"),
+        "metadata_ts":           lnk.get("metadata_ts"),
+        "metadata_age_s":        lnk.get("metadata_age_s"),
+        "metadata_stale":        lnk.get("metadata_stale"),
     })
 
 
@@ -2657,7 +2674,6 @@ if entry:
     _la = next(iter(live_agents), {})
     row("provider",    f"{_la.get('provider') or '—'}  [{_la.get('provider_source') or 'unknown'}]")
     row("model",       f"{_la.get('model') or '—'}  [{_la.get('model_source') or 'unknown'}]")
-    row("context",     "—")
     row("machine",     entry.get("machine"))
     row("cwd",         entry.get("cwd"))
     row("sessiondate", entry.get("sessiondate"))
@@ -2687,10 +2703,19 @@ if live_agents:
         row("confidence", a.get("link_confidence"))
         row("provider",   f"{a.get('provider') or '—'}  [{a.get('provider_source') or 'unknown'}]")
         row("model",      f"{a.get('model') or '—'}  [{a.get('model_source') or 'unknown'}]")
-        _cpct = a.get("context_percent")
+        _cpct  = a.get("context_percent")
+        _age   = a.get("metadata_age_s")
+        _stale = a.get("metadata_stale")
+        def _fmt_age(s):
+            if s is None: return "—"
+            if s < 60:    return f"{s}s"
+            if s < 3600:  return f"{s//60}m"
+            if s < 86400: return f"{s//3600}h"
+            return f"{s//86400}d"
         row("ctx_size",   f"{fmt_tok(a.get('context_size'))}  [{a.get('context_size_source') or 'unknown'}]")
         row("ctx_window", f"{fmt_tok(a.get('context_window'))}  [{a.get('context_window_source') or 'unknown'}]")
         row("ctx_pct",    f"{_cpct:.1f}%" if _cpct is not None else "—")
+        row("meta_age",   f"{_fmt_age(_age)}{'  [stale]' if _stale else ''}")
         row("tmux_pane",  a.get("tmux_pane_id"))
         row("rss",        f"{a.get('rss_kb') or 0} KB")
         row("live_cwd",   a.get("cwd"))
@@ -2801,6 +2826,8 @@ def load_data(show_closed=False):
         r["_ctx_win"]    = a.get("context_window")
         r["_ctx_win_src"]= a.get("context_window_source") or "unknown"
         r["_ctx_pct"]    = a.get("context_percent")
+        r["_meta_stale"] = a.get("metadata_stale") or False
+        r["_meta_age"]   = a.get("metadata_age_s")
         r["_title"] = idx.get("openquestion") or idx.get("title") or ""
         r["_ist"]   = ist or "—"
         r["_mach"]  = idx.get("machine") or state_host
@@ -3010,7 +3037,10 @@ class TUI:
         ps   = (r.get("proc_status") or "?")[:3]
         mach = (r.get("_mach") or "—")[:8]
         cpct = r.get("_ctx_pct")
-        ctx_s = f"{cpct:.0f}%" if cpct is not None else "—"
+        if cpct is not None:
+            ctx_s = ("~" if r.get("_meta_stale") else "") + f"{cpct:.0f}%"
+        else:
+            ctx_s = "—"
         fields = [
             f"{tier:<5}",
             f"{(r.get('pattern') or '?')[:10]:<10}",
@@ -3178,6 +3208,14 @@ class TUI:
         else:
             resume_s = f"(no command for {agent})"
         mw = min(74, w - 4)
+        def _fmt_age(s):
+            if s is None: return "—"
+            if s < 60:    return f"{s}s"
+            if s < 3600:  return f"{s//60}m"
+            if s < 86400: return f"{s//3600}h"
+            return f"{s//86400}d"
+        _meta_age   = r.get("_meta_age")
+        _meta_stale = r.get("_meta_stale")
         lines = [
             f" {sid}",
             "",
@@ -3189,6 +3227,7 @@ class TUI:
             f" ctx_size: {fmt_ctx(r.get('_ctx_size'))}  [{r.get('_ctx_src', 'unknown')}]",
             f" ctx_win:  {fmt_ctx(r.get('_ctx_win'))}  [{r.get('_ctx_win_src', 'unknown')}]",
             f" ctx_pct:  {f\"{r.get('_ctx_pct'):.1f}%\" if r.get('_ctx_pct') is not None else '—'}",
+            f" meta_age: {_fmt_age(_meta_age)}{'  [stale]' if _meta_stale else ''}",
             f" cwd:      {cwd_v or '—'}",
             f" date:     {idx.get('sessiondate') or '—'}",
             f" signal:   {idx.get('signal') or '—'}",
