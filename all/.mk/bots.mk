@@ -1,42 +1,40 @@
 # Makefile Fragment
 
 
-# [[file:../../telegram-agents.org::*Makefile Fragment][Makefile Fragment:1]]
-# ~/DotCortex/all/.mk/telegram-agents.mk
+# [[file:../../bots.org::*Makefile Fragment][Makefile Fragment:1]]
+# ~/DotCortex/all/.mk/bots.mk
 .RECIPEPREFIX := |
-.PHONY: telegram-agents-list telegram-agents-status telegram-agents-enable
-.PHONY: telegram-agents-disable telegram-agents-start telegram-agents-stop
-.PHONY: telegram-agents-sync telegram-agents-switch
+.PHONY: bots-list bots-status bots-enable bots-disable bots-start bots-stop bots-sync bots-switch
 
-telegram-agents-list:
+bots-list:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host list
 
-telegram-agents-status:
+bots-status:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host status
 
-telegram-agents-enable:
+bots-enable:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host enable $(AGENT)
 
-telegram-agents-disable:
+bots-disable:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host disable $(AGENT)
 
-telegram-agents-start:
+bots-start:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host start
 
-telegram-agents-stop:
+bots-stop:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host stop
 
-telegram-agents-sync:
+bots-sync:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host sync
 
-telegram-agents-switch:
+bots-switch:
 | @chmod +x $(HOME)/.local/bin/telegram-agent-host 2>/dev/null || true
 | $(HOME)/.local/bin/telegram-agent-host switch $(MACHINE)
 # Makefile Fragment:1 ends here
