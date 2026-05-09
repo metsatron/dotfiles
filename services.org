@@ -2232,6 +2232,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
 _DEFAULT_STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/DotCortex/ROOTS/DotRoot/agent-session}"
 export AGENT_TOP_STATE="${AGENT_SESSIOND_STATE:-${_DEFAULT_STATE_DIR}/state.latest.json}"
+export AGENT_TOP_STATE_DIR="${AGENT_TOP_STATE_DIR:-${_DEFAULT_STATE_DIR}}"
+export AGENT_TOP_EXTRA_DIRS="${AGENT_TOP_EXTRA_DIRS:-${HOME}/mnt/x230/DotCortex/ROOTS/DotRoot/agent-session}"
 REFRESH_SECS="${AGENT_TOP_REFRESH:-5}"
 if [ -z "${AGENT_TOP_INDEX:-}" ]; then
   case "$(hostname 2>/dev/null || echo unknown)" in
@@ -2268,20 +2270,26 @@ usage() {
 Usage: agent-top [CMD] [OPTIONS]
 
 Commands:
-  once [--all]         render agent state once (default)
-  watch [--all]        refresh every N seconds until interrupted
-  json                 print raw agent-sessiond state JSON
-  refresh              trigger agent-sessiond scan once
+  once [--all] [--refresh] [--all-hosts]
+               render agent state once (default)
+  watch [--all] [--all-hosts]
+               refresh every N seconds
+  json         print raw agent-sessiond state JSON
+  refresh [--all-hosts]
+               trigger local scan (+ remote SSH copy if --all-hosts)
+  hosts        list discovered host state files
   jump <pid|session>   switch tmux to the agent's pane
   resume <session_id>  resume a session via its harness
   show <session_id>    show full session details
-  tui / top            interactive curses operator console
+  tui [--all-hosts]    interactive curses operator console
   keytest              interactive key code diagnostic
   help                 show this help
 
 Options:
-  --all  include NONE-confidence/noisy processes
-         (AGENT_TOP_REFRESH controls watch interval, default 5s)
+  --all        include NONE-confidence/noisy processes
+  --all-hosts  aggregate state from all discovered machines
+               (AGENT_TOP_REFRESH controls watch interval, default 5s)
+               (AGENT_TOP_EXTRA_DIRS overrides extra state dirs, colon-separated)
 EOF
 }
 
@@ -2292,7 +2300,11 @@ import datetime, json, os, sys
 
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", os.path.expanduser("~/HelmCortex/ROOTS/AgentRoot/session-index.json"))
-SHOW_ALL = "$show_all" == "true"
+SHOW_ALL   = "$show_all" == "true"
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 
 BOLD = "\033[1m"
 DIM  = "\033[2m"
@@ -2386,15 +2398,60 @@ def compute_tier(agent):
     return ("NONE", DIM)
 
 
-if not STATE_FILE or not os.path.isfile(STATE_FILE):
-    print(f"\033[31mERROR: state file not found: {STATE_FILE or '(unset)'}\033[0m", file=sys.stderr)
-    sys.exit(1)
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
 
-try:
-    with open(STATE_FILE) as f:
-        state = json.load(f)
-except Exception as e:
-    print(f"\033[31mERROR: {e}\033[0m", file=sys.stderr)
+
+def load_all_states(single_file, all_hosts, state_dir, extra_dirs):
+    if not all_hosts:
+        f = single_file or os.path.join(state_dir, "state.latest.json")
+        if not os.path.isfile(f):
+            return []
+        try:
+            return [(json.load(open(f)), f)]
+        except Exception as e:
+            print(f"\033[31mERROR: {e}\033[0m", file=sys.stderr)
+            sys.exit(1)
+    dirs = [state_dir] + extra_dirs
+    found = discover_state_files(dirs)
+    if not found:
+        f = os.path.join(state_dir, "state.latest.json")
+        if os.path.isfile(f):
+            try:
+                return [(json.load(open(f)), f)]
+            except Exception:
+                pass
+        return []
+    results = []
+    for _, (path, _) in sorted(found.items()):
+        try:
+            results.append((json.load(open(path)), path))
+        except Exception:
+            continue
+    return results
+
+
+states = load_all_states(STATE_FILE, ALL_HOSTS, STATE_DIR, EXTRA_DIRS)
+if not states:
+    err = "no state files found" if ALL_HOSTS else f"state file not found: {STATE_FILE or '(unset)'}"
+    print(f"\033[31mERROR: {err}\033[0m", file=sys.stderr)
     sys.exit(1)
 
 index = {}
@@ -2407,13 +2464,41 @@ if os.path.isfile(INDEX_FILE):
     except Exception:
         pass
 
-schema   = state.get("schema", "?")
-host     = state.get("host", "?")
-gen_at   = (state.get("generated_at") or "")[:19]
-warnings = state.get("warnings") or []
-agents   = state.get("active_agents") or []
-stores   = state.get("native_stores") or {}
-sessions = state.get("sessions") or {}
+_host_list  = []
+_gen_at_list = []
+_all_agents  = []
+_seen_keys   = set()
+_warnings    = []
+_stores      = {}
+_sessions    = {}
+
+for _st, _spath in states:
+    _h = _st.get("host", "?")
+    if _h not in _host_list:
+        _host_list.append(_h)
+    _g = (_st.get("generated_at") or "")[:19]
+    if _g:
+        _gen_at_list.append((_g, _h))
+    _warnings.extend(_st.get("warnings") or [])
+    if not _stores:
+        _stores = _st.get("native_stores") or {}
+    if not _sessions:
+        _sessions = _st.get("sessions") or {}
+    for _a in (_st.get("active_agents") or []):
+        _key = (_h, _a.get("pid"), _a.get("session_id"))
+        if _key not in _seen_keys:
+            _seen_keys.add(_key)
+            _a2 = dict(_a)
+            _a2["_state_host"] = _h
+            _all_agents.append(_a2)
+
+schema   = states[0][0].get("schema", "?")
+host     = "  ".join(short_machine(h) for h in _host_list) if len(_host_list) > 1 else (_host_list[0] if _host_list else "?")
+gen_at   = max((_g for _g, _ in _gen_at_list), default="?")
+warnings = _warnings
+agents   = _all_agents
+stores   = _stores
+sessions = _sessions
 
 agents_with_tiers = [(a, compute_tier(a)) for a in agents]
 visible = [a for a, (tier, _) in agents_with_tiers if SHOW_ALL or tier != "NONE"]
@@ -2447,14 +2532,22 @@ if SHOW_ALL and tier_counts.get("NONE"):
     summary += f"   {DIM}NONE{RST} {tier_counts.get('NONE')}"
 summary += f"   {wc}warnings{RST} {len(warnings)}"
 print(summary)
-try:
-    gen_dt    = datetime.datetime.fromisoformat(gen_at)
-    state_age = (datetime.datetime.now() - gen_dt).total_seconds()
-    if state_age > 3600:
-        age_label = f"{int(state_age // 86400)}d" if state_age >= 86400 else f"{int(state_age // 3600)}h"
-        print(f"  {YLW}STATE STALE: generated {age_label} ago — run: agent-top refresh{RST}")
-except Exception:
-    pass
+_stale_msgs = []
+_now_utc = datetime.datetime.utcnow()
+for _st, _sp in states:
+    try:
+        _g  = (_st.get("generated_at") or "")[:19]
+        _h  = _st.get("host", "?")
+        _gd = datetime.datetime.fromisoformat(_g)
+        _age = (_now_utc - _gd).total_seconds()
+        if _age > 3600:
+            _lbl = f"{int(_age // 86400)}d" if _age >= 86400 else f"{int(_age // 3600)}h"
+            _stale_msgs.append(f"{short_machine(_h)} {_lbl} ago")
+    except Exception:
+        pass
+if _stale_msgs:
+    _rc = "agent-top refresh --all-hosts" if ALL_HOSTS else "agent-top refresh"
+    print(f"  {YLW}STATE STALE: {', '.join(_stale_msgs)} — run: {_rc}{RST}")
 print()
 
 if visible:
@@ -2470,13 +2563,13 @@ if visible:
         model    = short_model(a.get("model"))
         cpct     = a.get("context_percent")
         ctx_s    = (("~" if a.get("metadata_stale") else "") + f"{cpct:.0f}%") if cpct is not None else "—"
-        mach     = host
+        mach     = a.get("_state_host") or (_host_list[0] if _host_list else "?")
         question = "—"
         if a.get("session_id") and a.get("session_id") in index:
             idx_item = index[a.get("session_id")]
             q        = idx_item.get("openquestion") or ""
             question = q[:35] if len(q) > 35 else q
-            mach     = idx_item.get("machine") or host
+            mach     = idx_item.get("machine") or a.get("_state_host") or mach
         mach_s = short_machine(mach)
         print(
             f"  {tier_color}{tier_label:<5}{RST} "
@@ -2526,9 +2619,108 @@ PY
 }
 
 run_refresh() {
+  local all_hosts="${1:-false}"
   local agentd
   agentd="$(_find_agentd)"
-  exec "$agentd" once
+  printf 'Refreshing local state...\n'
+  "$agentd" once
+  if [ "$all_hosts" = "true" ]; then
+    printf 'Refreshing X230 state...\n'
+    if ssh -o ConnectTimeout=5 -o BatchMode=yes x230 \
+         'command -v agent-sessiond >/dev/null 2>&1' 2>/dev/null; then
+      local _remote_host
+      _remote_host="$(ssh x230 'hostname 2>/dev/null || echo unknown')"
+      local _remote_state_json
+      _remote_state_json="$(ssh x230 "sh -c 'agent-sessiond once >/dev/null 2>&1; \
+        cat ~/DotCortex/ROOTS/DotRoot/agent-session/state.${_remote_host}.json' 2>/dev/null")"
+      if [ -n "$_remote_state_json" ]; then
+        printf '%s' "$_remote_state_json" \
+          > "${AGENT_TOP_STATE_DIR}/state.${_remote_host}.json"
+        printf 'agent-top: fetched X230 state (%s)\n' "${_remote_host}"
+      else
+        printf 'agent-top: X230 refresh ran but state fetch failed\n' >&2
+      fi
+    else
+      printf 'agent-top: X230 not reachable or agent-sessiond not found — skipping\n' >&2
+    fi
+  fi
+}
+
+run_hosts() {
+  python3 <<PY
+import datetime, json, os
+
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+
+BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"; YLW = "\033[33m"; RST = "\033[0m"
+
+def age_str(secs):
+    if secs < 60:    return f"{int(secs)}s"
+    if secs < 3600:  return f"{int(secs//60)}m"
+    if secs < 86400: return f"{int(secs//3600)}h"
+    return f"{int(secs//86400)}d"
+
+def short_machine(host):
+    if not host: return "—"
+    h = str(host); hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if "t430"  in hl: return "T430"
+    if "vultr" in hl: return "Vultr"
+    if "vps"   in hl: return "VPS"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h[:8]
+
+# Deduplicate by host_key, prefer highest mtime
+found = {}  # host_key -> (path, mtime)
+for d in [STATE_DIR] + EXTRA_DIRS:
+    if not os.path.isdir(d):
+        continue
+    try:
+        for fn in os.listdir(d):
+            if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                continue
+            host_key = fn[6:-5]
+            path = os.path.join(d, fn)
+            if not os.path.isfile(path):
+                continue
+            mtime = os.path.getmtime(path)
+            if host_key not in found or mtime > found[host_key][1]:
+                found[host_key] = (path, mtime)
+    except OSError:
+        continue
+
+print(BOLD + "AGENT-SESSION HOST STATE FILES" + RST)
+print(DIM + "─" * 78 + RST)
+print(DIM + f"  {'HOST':<18} {'AGE':<6} {'PROCS':>6}  {'GENERATED':<19}  PATH" + RST)
+
+now_utc = datetime.datetime.utcnow()
+for host_key, (path, _) in sorted(found.items()):
+    try:
+        with open(path) as f:
+            s = json.load(f)
+        gen_at  = (s.get("generated_at") or "")[:19]
+        n_procs = len(s.get("active_agents") or [])
+        try:
+            gen_dt  = datetime.datetime.fromisoformat(gen_at)
+            age_s   = (now_utc - gen_dt).total_seconds()
+            age_lbl = age_str(age_s)
+            stale   = age_s > 3600
+        except Exception:
+            age_lbl, stale = "?", False
+        color  = YLW if stale else GRN
+        mshort = short_machine(host_key)
+        print(f"  {color}{mshort:<18}{RST} {age_lbl:<6} {n_procs:>6}  {gen_at:<19}  {path}")
+    except Exception as e:
+        print(f"  {YLW}{host_key:<18}{RST} (error: {e})  {path}")
+
+if not found:
+    print(f"  {YLW}No host state files found.{RST}")
+    print(f"  Run: agent-top refresh --all-hosts")
+print()
+PY
 }
 
 run_jump() {
@@ -2770,16 +2962,21 @@ PY
 }
 
 run_tui() {
+  local all_hosts="${1:-false}"
   local agentd agent_session
   agentd="$(_find_agentd)"
   agent_session="$(_find_agent_session)"
-  python3 - "$agentd" "$agent_session" <<'PY'
+  python3 - "$agentd" "$agent_session" "$all_hosts" <<'PY'
 import curses, datetime, json, os, shlex, signal, subprocess, sys, time
 
-AGENTD        = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
-AGENT_SESSION = sys.argv[2] if len(sys.argv) > 2 else "agent-session"
+AGENTD         = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
+AGENT_SESSION  = sys.argv[2] if len(sys.argv) > 2 else "agent-session"
+ALL_HOSTS_FLAG = (sys.argv[3] if len(sys.argv) > 3 else "false") == "true"
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 
 # Family hints only — not used for display; actual provider/model comes from state JSON.
 PROVIDER_MAP = {
@@ -2852,13 +3049,59 @@ def tier_of(a):
 def tier_ord(t):
     return {"HIGH": 0, "MED": 1, "LOW": 2, "NONE": 3}.get(t, 4)
 
-def load_data(show_closed=False):
-    state = {}
-    if STATE_FILE and os.path.isfile(STATE_FILE):
+def discover_state_files_tui(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
         try:
-            state = json.loads(open(STATE_FILE).read())
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+
+def load_all_states_tui(single_file, all_hosts, state_dir, extra_dirs):
+    if not all_hosts:
+        f = single_file or os.path.join(state_dir, "state.latest.json")
+        if not os.path.isfile(f):
+            return []
+        try:
+            return [(json.load(open(f)), f)]
         except Exception:
-            pass
+            return []
+    dirs = [state_dir] + extra_dirs
+    found = discover_state_files_tui(dirs)
+    if not found:
+        f = os.path.join(state_dir, "state.latest.json")
+        if os.path.isfile(f):
+            try:
+                return [(json.load(open(f)), f)]
+            except Exception:
+                pass
+        return []
+    results = []
+    for _, (path, _) in sorted(found.items()):
+        try:
+            results.append((json.load(open(path)), path))
+        except Exception:
+            continue
+    return results
+
+
+def load_data(show_closed=False, all_hosts=False):
+    states_loaded = load_all_states_tui(
+        STATE_FILE if not all_hosts else "",
+        all_hosts, STATE_DIR, EXTRA_DIRS)
     index = {}
     if INDEX_FILE and os.path.isfile(INDEX_FILE):
         try:
@@ -2867,35 +3110,43 @@ def load_data(show_closed=False):
             index = {s.get("id"): s for s in lst if isinstance(s, dict) and s.get("id")}
         except Exception:
             pass
-    state_host = state.get("host") or "?"
     rows = []
-    for a in (state.get("active_agents") or []):
-        tier = tier_of(a)
-        idx  = index.get(a.get("session_id")) or {}
-        ist  = idx.get("status") or ""
-        if not show_closed and ist in ("closed", "abandoned"):
-            continue
-        r = dict(a)
-        r["_tier"]       = tier
-        r["_prov"]       = a.get("provider")              or "—"
-        r["_prov_src"]   = a.get("provider_source")       or "unknown"
-        r["_model"]      = a.get("model")                 or "—"
-        r["_model_src"]  = a.get("model_source")          or "unknown"
-        r["_model_conf"] = a.get("model_confidence")      or "none"
-        r["_ctx_size"]   = a.get("context_size")
-        r["_ctx_src"]    = a.get("context_size_source")   or "unknown"
-        r["_ctx_win"]    = a.get("context_window")
-        r["_ctx_win_src"]= a.get("context_window_source") or "unknown"
-        r["_ctx_pct"]    = a.get("context_percent")
-        r["_meta_stale"] = a.get("metadata_stale") or False
-        r["_meta_age"]   = a.get("metadata_age_s")
-        r["_title"] = idx.get("openquestion") or idx.get("title") or ""
-        r["_ist"]   = ist or "—"
-        r["_mach"]       = idx.get("machine") or state_host
-        r["_mach_short"] = short_machine(r["_mach"])
-        r["_idx"]        = idx
-        rows.append(r)
-    return state, rows
+    seen_keys = set()
+    for st, _path in states_loaded:
+        state_host = st.get("host") or "?"
+        for a in (st.get("active_agents") or []):
+            key = (state_host, a.get("pid"), a.get("session_id"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            tier = tier_of(a)
+            idx  = index.get(a.get("session_id")) or {}
+            ist  = idx.get("status") or ""
+            if not show_closed and ist in ("closed", "abandoned"):
+                continue
+            r = dict(a)
+            r["_tier"]       = tier
+            r["_prov"]       = a.get("provider")              or "—"
+            r["_prov_src"]   = a.get("provider_source")       or "unknown"
+            r["_model"]      = a.get("model")                 or "—"
+            r["_model_src"]  = a.get("model_source")          or "unknown"
+            r["_model_conf"] = a.get("model_confidence")      or "none"
+            r["_ctx_size"]   = a.get("context_size")
+            r["_ctx_src"]    = a.get("context_size_source")   or "unknown"
+            r["_ctx_win"]    = a.get("context_window")
+            r["_ctx_win_src"]= a.get("context_window_source") or "unknown"
+            r["_ctx_pct"]    = a.get("context_percent")
+            r["_meta_stale"] = a.get("metadata_stale") or False
+            r["_meta_age"]   = a.get("metadata_age_s")
+            r["_title"]      = idx.get("openquestion") or idx.get("title") or ""
+            r["_ist"]        = ist or "—"
+            r["_state_host"] = state_host
+            r["_mach"]       = idx.get("machine") or state_host
+            r["_mach_short"] = short_machine(r["_mach"])
+            r["_idx"]        = idx
+            rows.append(r)
+    primary = states_loaded[0][0] if states_loaded else {}
+    return states_loaded, primary, rows
 
 def sort_rows(rows, sf):
     def key(r):
@@ -2975,8 +3226,10 @@ class TUI:
         self.query       = ""
         self.searching   = False
         self.show_closed = False
+        self.all_hosts   = ALL_HOSTS_FLAG
         self.status_msg  = ""
         self.status_ts   = 0.0
+        self.states      = []
         self.state       = {}
         self.all_rows    = []
         self.visible     = []
@@ -3010,7 +3263,7 @@ class TUI:
         }.get(t, curses.A_NORMAL)
 
     def reload(self):
-        self.state, self.all_rows = load_data(self.show_closed)
+        self.states, self.state, self.all_rows = load_data(self.show_closed, self.all_hosts)
         self.refresh_visible()
 
     def refresh_visible(self):
@@ -3069,24 +3322,32 @@ class TUI:
         return fixed + [("TITLE", max(4, w - used - 1))]
 
     def _draw_header(self, y, w):
-        st        = self.state
-        hst       = st.get("host", "?")
-        hst_short = short_machine(hst)
-        gat       = (st.get("generated_at") or "")[:19]
-        sch       = st.get("schema", "?")
-        sf        = SORT_FIELDS[self.sort_idx]
-        cf        = "  +closed" if self.show_closed else ""
-        stale_flag = ""
-        try:
-            gen_dt    = datetime.datetime.fromisoformat(gat)
-            state_age = (datetime.datetime.now() - gen_dt).total_seconds()
-            if state_age > 3600:
-                stale_flag = "  [STALE]"
-        except Exception:
-            pass
-        hdr = (f" agent-top  {hst_short}  {gat}  schema:{sch}"
+        sch = self.state.get("schema", "?")
+        sf  = SORT_FIELDS[self.sort_idx]
+        cf  = "  +closed" if self.show_closed else ""
+        ah  = "  [all-hosts]" if self.all_hosts else ""
+        stale_flag  = ""
+        newest_gat  = ""
+        host_shorts = []
+        now_utc = datetime.datetime.utcnow()
+        for st, _p in (self.states if self.states else [(self.state, "")]):
+            _hst = st.get("host", "?")
+            _hs  = short_machine(_hst)
+            if _hs not in host_shorts:
+                host_shorts.append(_hs)
+            _gat = (st.get("generated_at") or "")[:19]
+            if _gat > newest_gat:
+                newest_gat = _gat
+            try:
+                _gd = datetime.datetime.fromisoformat(_gat)
+                if (now_utc - _gd).total_seconds() > 3600:
+                    stale_flag = "  [STALE]"
+            except Exception:
+                pass
+        hosts_str = ",".join(host_shorts) if host_shorts else "?"
+        hdr = (f" agent-top  {hosts_str}  {newest_gat}  schema:{sch}"
                f"  active:{len(self.all_rows)}  vis:{len(self.visible)}"
-               f"  sort:{sf}{cf}{stale_flag}")
+               f"  sort:{sf}{cf}{ah}{stale_flag}")
         try:
             self.scr.addstr(y, 0, hdr[:w - 1].ljust(w - 1),
                             curses.A_REVERSE | curses.A_BOLD)
@@ -3323,9 +3584,32 @@ class TUI:
     def _action_refresh(self):
         try:
             subprocess.run([AGENTD, "once"], capture_output=True, timeout=30)
+            if self.all_hosts:
+                try:
+                    chk = subprocess.run(
+                        ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                         "x230", "command -v agent-sessiond >/dev/null 2>&1"],
+                        capture_output=True, timeout=8)
+                    if chk.returncode == 0:
+                        r = subprocess.run(
+                            ["ssh", "x230", "sh", "-c",
+                             "agent-sessiond once >/dev/null 2>&1; "
+                             "cat ~/DotCortex/ROOTS/DotRoot/agent-session/state.$(hostname).json"],
+                            capture_output=True, timeout=35)
+                        if r.returncode == 0 and r.stdout:
+                            import json as _json
+                            _d = _json.loads(r.stdout)
+                            _rh = _d.get("host", "")
+                            if _rh:
+                                _lp = os.path.join(STATE_DIR, f"state.{_rh}.json")
+                                with open(_lp, "wb") as _f:
+                                    _f.write(r.stdout)
+                except Exception:
+                    pass
             self.reload()
             gat = (self.state.get("generated_at") or "")[:19]
-            self.set_status(f"Refreshed at {gat}")
+            suffix = "  (all-hosts)" if self.all_hosts else ""
+            self.set_status(f"Refreshed at {gat}{suffix}")
         except subprocess.TimeoutExpired:
             self.set_status("Refresh timed out")
         except Exception as e:
@@ -3491,7 +3775,7 @@ class TUI:
 def _main(stdscr):
     TUI(stdscr).run()
 
-if not STATE_FILE or not os.path.isfile(STATE_FILE):
+if not ALL_HOSTS_FLAG and (not STATE_FILE or not os.path.isfile(STATE_FILE)):
     sys.exit(f"agent-top tui: state file not found: {STATE_FILE or '(unset)'}")
 
 # When run via heredoc, fd 0 is a pipe; restore /dev/tty so curses can read keys
@@ -3553,15 +3837,18 @@ show_all="false"
 case "$cmd" in
   once|"")
     do_refresh="false"
+    all_hosts="false"
     for _arg in "${@:2}"; do
       case "$_arg" in
-        --all)     show_all="true" ;;
-        --refresh) do_refresh="true" ;;
+        --all)       show_all="true" ;;
+        --refresh)   do_refresh="true" ;;
+        --all-hosts) all_hosts="true" ;;
       esac
     done
     if [ "$do_refresh" = "true" ]; then
       "$(_find_agentd)" once >/dev/null 2>&1 || true
     fi
+    export AGENT_TOP_ALL_HOSTS="$all_hosts"
     run_once "$show_all"
     ;;
   json)
@@ -3571,11 +3858,19 @@ case "$cmd" in
     fi
     exec cat "$AGENT_TOP_STATE"
     ;;
+  hosts)
+    run_hosts
+    ;;
   watch)
-    if [ "${2:-}" = "--all" ]; then
-      show_all="true"
-    fi
+    all_hosts="false"
+    for _arg in "${@:2}"; do
+      case "$_arg" in
+        --all)       show_all="true" ;;
+        --all-hosts) all_hosts="true" ;;
+      esac
+    done
     trap 'exit 0' INT TERM
+    export AGENT_TOP_ALL_HOSTS="$all_hosts"
     while true; do
       clear
       run_once "$show_all" || true
@@ -3583,7 +3878,9 @@ case "$cmd" in
     done
     ;;
   refresh)
-    run_refresh
+    all_hosts="false"
+    [ "${2:-}" = "--all-hosts" ] && all_hosts="true"
+    run_refresh "$all_hosts"
     ;;
   jump)
     run_jump "${2:-}"
@@ -3595,7 +3892,9 @@ case "$cmd" in
     run_show "${2:-}"
     ;;
   tui|top|interactive)
-    run_tui
+    all_hosts="false"
+    [ "${2:-}" = "--all-hosts" ] && all_hosts="true"
+    run_tui "$all_hosts"
     ;;
   keytest)
     run_keytest
