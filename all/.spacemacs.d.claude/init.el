@@ -101,6 +101,25 @@
 (defun dotspacemacs/user-load () )
 
 (defun dotspacemacs/user-config ()
+  ;; Current hybrid-mode still defines old aliases internally; Spacemacs reports
+  ;; those aliases as startup errors even when user config uses no obsolete names.
+  (with-eval-after-load 'core-obsolete
+    (defconst metsatron/spacemacs-hybrid-alias-warnings
+      '("hybrid-mode-default-state"
+        "hybrid-mode-enable-hjkl-bindings"
+        "hybrid-mode-enable-evilified-state"
+        "hybrid-mode-use-evil-search-module"))
+  
+    (defun metsatron/filter-spacemacs-hybrid-alias-warnings (warnings)
+      (seq-remove
+       (lambda (warning)
+         (seq-some
+          (lambda (name) (string-match-p (regexp-quote name) warning))
+          metsatron/spacemacs-hybrid-alias-warnings))
+       warnings))
+  
+    (advice-add 'spacemacs//check-obsolete-variables
+                :filter-return #'metsatron/filter-spacemacs-hybrid-alias-warnings))
   (with-eval-after-load 'files
     (add-to-list 'safe-local-eval-forms '(progn (pp-buffer) (indent-buffer))))
   (defun metsatron/find-profile-init ()       (interactive) (find-file "~/.spacemacs.d.claude/init.el"))
