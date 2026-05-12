@@ -53,6 +53,11 @@ if [ -d "$HOME/.npm-global/bin" ]; then
   export PATH="$HOME/.npm-global/bin:$PATH"
 fi
 
+# Bun
+if [ -d "$HOME/.bun/bin" ]; then
+  export PATH="$HOME/.bun/bin:$PATH"
+fi
+
 # Shared SSH agent for all zsh invocations, including noninteractive SSH
 # commands like `ssh host 'git fetch'`. Keep the key-unlock prompt in the
 # interactive exports path; `.zshenv` only needs the agent env.
