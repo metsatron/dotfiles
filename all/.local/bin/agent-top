@@ -700,17 +700,118 @@ run_jump() {
     exit 1
   fi
   python3 - "$target" <<'PY'
-import json, os, re, subprocess, sys
+import json, os, re, shlex, socket, subprocess, sys
 
 TARGET     = sys.argv[1]
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
 
-if not STATE_FILE or not os.path.isfile(STATE_FILE):
-    print(f"agent-top: state file not found: {STATE_FILE or '(unset)'}", file=sys.stderr)
+RESUME_ARGV = {
+    "claude":   lambda s: ["claude",   "--resume", s],
+    "opencode": lambda s: ["opencode", "-s",       s],
+    "codex":    lambda s: ["codex",    "resume",   s],
+    "hermes":   lambda s: ["hermes",   "--resume", s],
+}
+
+def local_hostname():
+    return socket.gethostname()
+
+def short_machine(host):
+    if not host:
+        return ""
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def ssh_available(alias):
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", alias, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+def load_states():
+    paths = []
+    if ALL_HOSTS:
+        paths = [p for p, _m in discover_state_files([STATE_DIR] + EXTRA_DIRS).values()]
+    elif STATE_FILE and os.path.isfile(STATE_FILE):
+        paths = [STATE_FILE]
+    elif os.path.isfile(os.path.join(STATE_DIR, "state.latest.json")):
+        paths = [os.path.join(STATE_DIR, "state.latest.json")]
+    rows = []
+    for path in paths:
+        try:
+            state = json.loads(open(path).read())
+        except Exception:
+            continue
+        host = state.get("host") or ""
+        for a in state.get("active_agents", []) or []:
+            r = dict(a)
+            r["_state_host"] = host
+            rows.append(r)
+    return rows
+
+def load_index():
+    if not INDEX_FILE or not os.path.isfile(INDEX_FILE):
+        return {}
+    try:
+        payload = json.loads(open(INDEX_FILE).read())
+        sessions = payload.get("sessions", []) if isinstance(payload, dict) else payload
+        return {s.get("id"): s for s in sessions if isinstance(s, dict) and s.get("id")}
+    except Exception:
+        return {}
+
+agents = load_states()
+if not agents:
+    print("agent-top: no state rows found", file=sys.stderr)
     sys.exit(1)
-
-state  = json.loads(open(STATE_FILE).read())
-agents = state.get("active_agents") or []
 
 hit = None
 if re.fullmatch(r'\d+', TARGET):
@@ -729,10 +830,31 @@ if not hit:
     print(f"agent-top: no live agent found for '{TARGET}'", file=sys.stderr)
     sys.exit(1)
 
+idx = load_index().get(hit.get("session_id")) or {}
+for k, v in idx.items():
+    hit.setdefault(k, v)
+
+host = owner_host(hit)
+alias = None if is_local_host(host) else ssh_alias_for_host(host)
 pane_id = hit.get("tmux_pane_id")
 if not pane_id:
+    sid = hit.get("session_id") or ""
+    argv_fn = RESUME_ARGV.get(hit.get("pattern") or "")
+    if alias and sid and argv_fn:
+        remote = shell_join_remote(hit.get("cwd") or idx.get("cwd") or "", argv_fn(sid))
+        print(shlex.join(["ssh", "-t", alias, remote]))
+        sys.exit(0)
     print(f"agent-top: pid={hit.get('pid')} ({hit.get('pattern')}) has no tmux pane  [confidence={hit.get('link_confidence')}]")
     sys.exit(1)
+
+if alias:
+    remote = f"tmux switch-client -t {shlex.quote(pane_id)} || tmux attach -t {shlex.quote(pane_id)}"
+    cmd = ["ssh", "-t", alias, remote]
+    print(shlex.join(cmd))
+    if not ssh_available(alias):
+        print(f"{short_machine(host)} offline; jump command not run.", file=sys.stderr)
+        sys.exit(1)
+    os.execvp(cmd[0], cmd)
 
 in_tmux = bool(os.environ.get("TMUX"))
 if in_tmux:
@@ -751,12 +873,97 @@ run_resume() {
     exit 1
   fi
   python3 - "$target" <<'PY'
-import json, os, shlex, sys
+import json, os, shlex, socket, subprocess, sys
 from pathlib import Path
 
 TARGET     = sys.argv[1]
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+
+def local_hostname():
+    return socket.gethostname()
+
+def short_machine(host):
+    if not host:
+        return ""
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def ssh_available(alias):
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", alias, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+def load_live_rows():
+    paths = []
+    if ALL_HOSTS:
+        paths = [p for p, _m in discover_state_files([STATE_DIR] + EXTRA_DIRS).values()]
+    elif STATE_FILE and os.path.isfile(STATE_FILE):
+        paths = [STATE_FILE]
+    elif os.path.isfile(os.path.join(STATE_DIR, "state.latest.json")):
+        paths = [os.path.join(STATE_DIR, "state.latest.json")]
+    rows = []
+    for path in paths:
+        try:
+            state = json.loads(open(path).read())
+        except Exception:
+            continue
+        host = state.get("host") or ""
+        for a in state.get("active_agents", []) or []:
+            r = dict(a)
+            r["_state_host"] = host
+            rows.append(r)
+    return rows
 
 entry = None
 if INDEX_FILE and os.path.isfile(INDEX_FILE):
@@ -773,11 +980,14 @@ if INDEX_FILE and os.path.isfile(INDEX_FILE):
                 print(f"  {m.get('id')} [{m.get('agent')}] {m.get('status')}", file=sys.stderr)
             sys.exit(1)
 
-if not entry and STATE_FILE and os.path.isfile(STATE_FILE):
-    state = json.loads(open(STATE_FILE).read())
-    live  = next((a for a in state.get("active_agents", []) if a.get("session_id") == TARGET), None)
-    if live:
-        entry = {"id": TARGET, "agent": live.get("pattern"), "cwd": live.get("cwd")}
+live_rows = load_live_rows()
+live = next((a for a in live_rows if a.get("session_id") == (entry or {}).get("id", TARGET)), None)
+if not entry and live:
+    entry = {"id": TARGET, "agent": live.get("pattern"), "cwd": live.get("cwd")}
+if entry and live:
+    for k, v in live.items():
+        entry.setdefault(k, v)
+    entry["_state_host"] = live.get("_state_host") or entry.get("_state_host")
 
 if not entry:
     print(f"agent-top: session not found: {TARGET}", file=sys.stderr)
@@ -800,6 +1010,20 @@ if not argv:
         print(f"  file: {entry['file']}")
     sys.exit(0)
 
+host = owner_host(entry)
+if not is_local_host(host):
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        print(f"agent-top: no ssh alias for host '{host}'", file=sys.stderr)
+        sys.exit(1)
+    remote = shell_join_remote(cwd, argv)
+    cmd = ["ssh", "-t", alias, remote]
+    print(f"  {shlex.join(cmd)}", flush=True)
+    if not ssh_available(alias):
+        print(f"{short_machine(host)} offline; resume command not run.", file=sys.stderr)
+        sys.exit(1)
+    os.execvp(cmd[0], cmd)
+
 if cwd:
     print(f"  cd {shlex.quote(cwd)}")
     os.chdir(cwd)
@@ -815,12 +1039,16 @@ run_show() {
     exit 1
   fi
   python3 - "$target" <<'PY'
-import json, os, re, shlex, sys
+import json, os, re, shlex, socket, sys
 from pathlib import Path
 
 TARGET     = sys.argv[1]
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
 
 BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"
 YLW  = "\033[33m"; RST = "\033[0m"
@@ -832,6 +1060,95 @@ def fmt_tok(n):
     if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
     if n >= 1_000:     return f"{n/1_000:.1f}k"
     return str(n)
+
+def local_hostname():
+    return socket.gethostname()
+
+def short_machine(host):
+    if not host:
+        return ""
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def display_resume_command(row, agent, sid, cwd):
+    resume = {
+        "claude":   ["claude", "--resume", sid],
+        "opencode": ["opencode", "-s", sid],
+        "codex":    ["codex", "resume", sid],
+        "hermes":   ["hermes", "--resume", sid],
+    }.get(agent)
+    if not resume:
+        return f"(no command for {agent})"
+    host = owner_host(row)
+    if is_local_host(host):
+        return shell_join_remote(cwd, resume)
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return f"(no ssh alias for {host})"
+    return shlex.join(["ssh", "-t", alias, shell_join_remote(cwd, resume)])
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+def load_live_agents():
+    paths = []
+    if ALL_HOSTS:
+        paths = [p for p, _m in discover_state_files([STATE_DIR] + EXTRA_DIRS).values()]
+    elif STATE_FILE and os.path.isfile(STATE_FILE):
+        paths = [STATE_FILE]
+    elif os.path.isfile(os.path.join(STATE_DIR, "state.latest.json")):
+        paths = [os.path.join(STATE_DIR, "state.latest.json")]
+    rows = []
+    for path in paths:
+        try:
+            state = json.loads(open(path).read())
+        except Exception:
+            continue
+        host = state.get("host") or ""
+        for a in state.get("active_agents", []) or []:
+            r = dict(a)
+            r["_state_host"] = host
+            rows.append(r)
+    return rows
 
 is_pid = bool(re.fullmatch(r'\d+', TARGET))
 
@@ -850,15 +1167,12 @@ if INDEX_FILE and os.path.isfile(INDEX_FILE) and not is_pid:
                 print(f"  {m.get('id')} [{m.get('agent')}]", file=sys.stderr)
             sys.exit(1)
 
-live_agents = []
-if STATE_FILE and os.path.isfile(STATE_FILE):
-    state      = json.loads(open(STATE_FILE).read())
-    all_agents = state.get("active_agents", [])
-    if is_pid:
-        live_agents = [a for a in all_agents if str(a.get("pid")) == TARGET]
-    else:
-        sid_target  = entry["id"] if entry else TARGET
-        live_agents = [a for a in all_agents if a.get("session_id") == sid_target]
+all_agents = load_live_agents()
+if is_pid:
+    live_agents = [a for a in all_agents if str(a.get("pid")) == TARGET]
+else:
+    sid_target  = entry["id"] if entry else TARGET
+    live_agents = [a for a in all_agents if a.get("session_id") == sid_target]
 
 if not entry and not live_agents:
     print(f"agent-top: not found: {TARGET}", file=sys.stderr)
@@ -883,18 +1197,28 @@ if entry:
     row("signal",      entry.get("signal"))
     row("openquestion",entry.get("openquestion"))
     row("source",      entry.get("file"))
-    RESUME = {
-        "claude":   f"claude --resume {shlex.quote(sid)}",
-        "opencode": f"opencode -s {shlex.quote(sid)}",
-        "codex":    f"codex resume {shlex.quote(sid)}",
-        "hermes":   f"hermes --resume {shlex.quote(sid)}",
-    }
+    _live = next(iter(live_agents), {})
+    merged = dict(entry)
+    if _live:
+        merged["_state_host"] = _live.get("_state_host") or merged.get("_state_host")
+    host = owner_host(merged)
+    run_on = "local" if is_local_host(host) else (ssh_alias_for_host(host) or f"unknown:{host}")
+    row("host",        host)
+    row("run_on",      run_on)
     cwd    = entry.get("cwd") or ""
-    cmd    = RESUME.get(agent, "")
-    prefix = f"cd {shlex.quote(cwd)} && " if (cmd and cwd) else ""
-    row("resume", f"{prefix}{cmd}" if cmd else f"(no command for {agent})")
+    row("resume", display_resume_command(merged, agent, sid, cwd))
 else:
     print(f"  {BOLD}{TARGET}{RST}  {DIM}(not in index){RST}")
+    if live_agents:
+        _live = live_agents[0]
+        host = owner_host(_live)
+        run_on = "local" if is_local_host(host) else (ssh_alias_for_host(host) or f"unknown:{host}")
+        agent = _live.get("pattern") or "?"
+        sid = _live.get("session_id") or TARGET
+        cwd = _live.get("cwd") or ""
+        row("host",        host)
+        row("run_on",      run_on)
+        row("resume",      display_resume_command(_live, agent, sid, cwd))
 
 if live_agents:
     print()
@@ -938,7 +1262,7 @@ run_tui() {
   agentd="$(_find_agentd)"
   agent_session="$(_find_agent_session)"
   python3 - "$agentd" "$agent_session" "$all_hosts" "$no_refresh" <<'PY'
-import curses, datetime, json, os, shlex, signal, subprocess, sys, time
+import curses, datetime, json, os, shlex, signal, socket, subprocess, sys, time
 
 AGENTD         = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
 AGENT_SESSION  = sys.argv[2] if len(sys.argv) > 2 else "agent-session"
@@ -997,6 +1321,64 @@ def short_machine(host):
     if "vps"   in hl: return "VPS"
     if h.startswith("ThinkPad-"): return h[9:]
     return h[:8]
+
+def local_hostname():
+    return socket.gethostname()
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def row_owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def ssh_command_for(host, remote_script):
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return None
+    return ["ssh", "-t", alias, remote_script]
+
+def ssh_available(alias):
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", alias, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def resume_argv_for(agent, sid):
+    fn = RESUME_ARGV.get(agent)
+    return fn(sid) if fn else []
+
+def resume_command_for_row(r):
+    idx = r.get("_idx") or {}
+    agent = r.get("pattern") or ""
+    sid = r.get("session_id") or ""
+    cwd_v = idx.get("cwd") or r.get("cwd") or ""
+    argv = resume_argv_for(agent, sid)
+    if not argv:
+        return "", [], cwd_v, agent, sid
+    host = row_owner_host(r)
+    if is_local_host(host):
+        return shell_join_remote(cwd_v, argv), argv, cwd_v, agent, sid
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return f"(no ssh alias for {host})", [], cwd_v, agent, sid
+    remote = shell_join_remote(cwd_v, argv)
+    cmd = ["ssh", "-t", alias, remote]
+    return shlex.join(cmd), cmd, cwd_v, agent, sid
 
 def short_model(m, width=16):
     if not m:
@@ -1601,13 +1983,37 @@ class TUI:
         if not r:
             self.set_status("No row selected")
             return
+        host = row_owner_host(r)
         pane = r.get("tmux_pane_id")
         if not pane:
-            self.set_status(
-                f"No tmux pane  pid={r.get('pid')} [{r.get('pattern')}]"
-                f"  conf={r.get('link_confidence')}"
-            )
+            display, _cmd, _cwd, _agent, _sid = resume_command_for_row(r)
+            if display and not is_local_host(host):
+                self.set_status(display)
+            else:
+                self.set_status(
+                    f"No tmux pane  pid={r.get('pid')} [{r.get('pattern')}]"
+                    f"  conf={r.get('link_confidence')}"
+                )
             return
+        if not is_local_host(host):
+            alias = ssh_alias_for_host(host)
+            if not alias:
+                self.set_status(f"No ssh alias for host '{host}'")
+                return
+            if not ssh_available(alias):
+                self.set_status(f"{short_machine(host)} offline; jump command not run.")
+                return
+            remote = f"tmux switch-client -t {shlex.quote(pane)} || tmux attach -t {shlex.quote(pane)}"
+            cmd = ["ssh", "-t", alias, remote]
+            self.set_status(shlex.join(cmd))
+            dbg(f"jump remote: {shlex.join(cmd)}")
+            self._end_curses()
+            print(f"  {shlex.join(cmd)}")
+            try:
+                os.execvp(cmd[0], cmd)
+            except OSError as e:
+                print(f"agent-top: exec failed: {e}", file=sys.stderr)
+                sys.exit(1)
         if os.environ.get("TMUX"):
             try:
                 subprocess.run(["tmux", "switch-client", "-t", pane], check=False)
@@ -1626,13 +2032,11 @@ class TUI:
         agent = r.get("pattern") or "?"
         sid   = r.get("session_id") or "?"
         cwd_v = idx.get("cwd") or r.get("cwd") or ""
-        argv  = RESUME_ARGV.get(agent, lambda s: [])(sid)
-        if argv and cwd_v:
-            resume_s = f"cd {shlex.quote(cwd_v)} && {shlex.join(argv)}"
-        elif argv:
-            resume_s = shlex.join(argv)
-        else:
+        resume_s, _cmd, _cwd, _agent, _sid = resume_command_for_row(r)
+        if not resume_s:
             resume_s = f"(no command for {agent})"
+        host_v = row_owner_host(r)
+        run_on = "local" if is_local_host(host_v) else (ssh_alias_for_host(host_v) or f"unknown:{host_v}")
         mw = min(74, w - 4)
         def _fmt_age(s):
             if s is None: return "—"
@@ -1649,6 +2053,8 @@ class TUI:
             "",
             f" agent:    {agent}",
             f" status:   {r.get('_ist', '—')}",
+            f" host:     {host_v or '—'}",
+            f" run_on:   {run_on}",
             f" machine:  {r.get('_mach_short') or '—'}  ({r.get('_mach') or '—'})",
             f" provider: {r.get('_prov', '—')}  [{r.get('_prov_src', 'unknown')}]",
             f" model:    {r.get('_model') or '—'}  [{r.get('_model_src', 'unknown')}]",
@@ -1776,16 +2182,36 @@ class TUI:
         if not sid:
             self.set_status("No session_id for selected row")
             return
-        argv_fn = RESUME_ARGV.get(agent)
-        if not argv_fn:
+        argv = resume_argv_for(agent, sid)
+        if not argv:
             self.set_status(f"No resume command for agent '{agent}'")
             return
-        argv = argv_fn(sid)
         ist = r.get("_ist") or ""
         if ist in ("closed", "abandoned"):
             if not self._confirm(f" Session is {ist}. Resume anyway? [y/N] "):
                 self.set_status("Resume cancelled")
                 return
+        host = row_owner_host(r)
+        if not is_local_host(host):
+            alias = ssh_alias_for_host(host)
+            if not alias:
+                self.set_status(f"No ssh alias for host '{host}'")
+                return
+            remote = shell_join_remote(cwd_v, argv)
+            cmd = ["ssh", "-t", alias, remote]
+            display = shlex.join(cmd)
+            self.set_status(display)
+            if not ssh_available(alias):
+                self.set_status(f"{short_machine(host)} offline; resume command not run.")
+                return
+            dbg(f"resume remote: {display}")
+            self._end_curses()
+            print(f"  {display}")
+            try:
+                os.execvp(cmd[0], cmd)
+            except OSError as e:
+                print(f"agent-top: exec failed: {e}", file=sys.stderr)
+                sys.exit(1)
         dbg(f"resume: exec {agent} sid={sid[:12]} cwd={cwd_v[:30]!r}")
         self._end_curses()
         if cwd_v:
@@ -1950,12 +2376,15 @@ case "$cmd" in
     run_refresh "$all_hosts"
     ;;
   jump)
+    export AGENT_TOP_ALL_HOSTS="$(mode_default)"
     run_jump "${2:-}"
     ;;
   resume)
+    export AGENT_TOP_ALL_HOSTS="$(mode_default)"
     run_resume "${2:-}"
     ;;
   show)
+    export AGENT_TOP_ALL_HOSTS="$(mode_default)"
     run_show "${2:-}"
     ;;
   tui|top|interactive)
