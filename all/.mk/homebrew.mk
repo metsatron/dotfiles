@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: brew-apply brew-health github-release-apply
+.PHONY: brew-apply brew-health
 
 brew-apply:
 | @chmod +x $(HOME)/.local/bin/brew-apply 2>/dev/null || true
@@ -11,7 +11,3 @@ brew-apply:
 brew-health:
 | @chmod +x $(HOME)/.local/bin/brew-health 2>/dev/null || true
 | $(HOME)/.local/bin/brew-health
-
-github-release-apply:
-| @chmod +x $(HOME)/.local/bin/github-release-apply 2>/dev/null || true
-| $(HOME)/.local/bin/github-release-apply
