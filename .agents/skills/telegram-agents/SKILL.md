@@ -47,15 +47,15 @@ telegram-agent-host bring
 
 | Agent | Description |
 |-------|-------------|
-| opencode | OpenCode + Telegram bot |
-| claudecode | Claude Code desktop |
-| hermes | Hermes agent (not yet installed) |
-| codex | OpenAI Codex |
-| pi-agent | Pi Coding Agent |
+| opencode | OpenCode + Telegram bot (WORKING) |
+| claudecode | Claude Code (MCP send/receive) |
+| hermes | Hermes native gateway (WORKING) |
+| codex | OpenAI Codex (no bot yet) |
+| pi-agent | Pi Coding Agent (no bot yet) |
 
 ## Hosts Configuration
 
-The file `all/.telegram-agents/hosts.conf` defines which agents run on which machines:
+The file `all/.bots/hosts.conf` defines which agents run on which machines:
 
 ```
 thinkpad-t480s|opencode|t480s
