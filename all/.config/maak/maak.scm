@@ -346,6 +346,16 @@
   "Check forge reachability for all conf-managed AppImages"
   (lambda () (sh "for a in $(~/.local/bin/apprelease list); do ~/.local/bin/apprelease health \"$a\" 2>&1 || true; done")))
 
+;; --- Logseq ---
+(task 'logseq:launch "Launch Logseq DB (starts ttyd if needed)"
+      (lambda () (sh "logseq-db")))
+
+(task 'logseq:api "Check Logseq HTTP API connectivity"
+      (lambda () (sh "logseq-api check")))
+
+(task 'logseq:tangle "Tangle logseq.org — launcher, plugin, API script"
+      (lambda () (sh (string-append "tangle-one " HOME "/DotCortex/logseq.org"))))
+
 ;; --- Cargo ---
    (task 'cargo:capture "Capture live cargo to DotCortex SSV"
          (lambda () (sh "~/.local/bin/cargo-capture")))
@@ -548,6 +558,23 @@
          "Launch or attach to the DotCortex tmux session"
          (lambda () (sh "~/.local/bin/tmux-session")))
 
+   ;; --- Agent sessions ---
+   (task 'sessions:once
+         "Collect one agent-sessiond telemetry snapshot"
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/sessions.mk sessions-once")))
+
+   (task 'sessions:watch
+         "Run agent-sessiond telemetry scanner loop"
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/sessions.mk sessions-watch")))
+
+   (task 'sessions:status
+         "Show latest agent-sessiond telemetry summary"
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/sessions.mk sessions-status")))
+
+   (task 'sessions:top
+         "Render live agent process cockpit"
+         (lambda () (sh "make -f ~/DotCortex/all/.mk/sessions.mk sessions-top")))
+
    ;; --- Pip (pipx) ---
    (task 'pip:health "Show DotCortex Python/pip env and versions"
          (lambda () (sh "~/.local/bin/pip-health")))
@@ -609,6 +636,7 @@
                         (not (string-prefix? "root:" nm))
                         (not (string-prefix? "stow:" nm))
                         (not (string-prefix? "tmux:" nm))
+                        (not (string-prefix? "sessions:" nm))
                         (not (string-prefix? "backup:" nm))
                         (not (string-prefix? "git:" nm))
                         (not (string-prefix? "dotcortex:" nm))
@@ -655,6 +683,10 @@
   (print-group "Tmux commands"
                (lambda (t)
                  (string-prefix? "tmux:" (task-name-str t))))
+
+  (print-group "Sessions commands"
+               (lambda (t)
+                 (string-prefix? "sessions:" (task-name-str t))))
 
   (print-group "Backup commands"
                (lambda (t)
