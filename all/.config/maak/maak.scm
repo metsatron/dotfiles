@@ -115,6 +115,10 @@
 
    (task 'stow:devuan "Safe stow shared + linux + devuan overlays (all linux devuan)"
          (lambda () (sh "STOW_PKGS='all linux devuan' make safe-stow")))
+
+   (task 'stow:s24 "Safe stow S24 overlays (all termux s24)"
+         (lambda () (sh "STOW_PKGS='all termux s24' make safe-stow")))
+
    (task 'stow:health
          "Scan broken symlinks under $HOME, optionally clean Stow orphans"
          (lambda ()
@@ -496,6 +500,14 @@
 
    (task 'nala:health "Show nala/apt/dpkg status"
          (lambda () (sh "~/.local/bin/nala-health")))
+
+   ;; --- Termux (Android) ---
+   (task 'termux-pkg:apply
+         "Install Termux packages from manifest"
+         (lambda () (sh "~/.local/bin/termux-pkg-apply")))
+
+   (task 'termux-pkg:health "Show Termux package environment"
+         (lambda () (sh "~/.local/bin/termux-pkg-health")))
 
    ;; --- GitHub release artifacts ---
    ;; --- Backup ---

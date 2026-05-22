@@ -127,3 +127,4 @@ include $(HOME)/DotCortex/all/.mk/pip.mk
 include $(HOME)/DotCortex/all/.mk/nala.mk
 include $(HOME)/DotCortex/all/.mk/bots.mk
 include $(HOME)/DotCortex/all/.mk/sessions.mk
+include $(HOME)/DotCortex/all/.mk/termux.mk
