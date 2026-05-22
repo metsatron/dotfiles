@@ -90,6 +90,19 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     - If a subagent, tool, or template defaults to =main=, correct it immediately and flag
       the source.
 
+20. **Private Mutable App Config Boundary** -- DotCortex is public, declarative source. It must
+    not own whole mutable GUI/app config trees that contain tokens, browser caches, machine state,
+    local databases, cookies, or UI-written runtime settings.
+    - Private mutable app config directories belong in `~/HelmCortex/NEXUS/stow/` and are
+      deployed with `helmstow`, not tangled or stowed from DotCortex.
+    - DotCortex may own public launchers, package manifests, wrappers, and small token-free text
+      defaults, but only when the source is genuinely declarative and safe for a public repo.
+    - If an app writes secrets into its config directory, move that directory out of DotCortex
+      entirely before adding templates, migrations, ignore rules, or abstractions.
+    - Never solve a secret-bearing config problem by keeping the live directory in `all/` with
+      extra `.gitignore` rules. Move ownership to HelmCortex first, then keep only the DotCortex
+      bits the user actually asked to manage.
+
 ## Agent Config Scoping
 
 Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
@@ -325,6 +338,32 @@ Systems with `libgtk3-nocsd` in `LD_PRELOAD` emit a harmless warning on Guix com
 ### Absolute Symlinks in Overlay Dirs Abort Stow
 
 If an org file tangles an absolute symlink (e.g. `.config/guix/current`), stow refuses to manage it. Remove it from the overlay dir -- they're machine-specific. `INSTALL.sh` auto-cleans these.
+
+### Flatpak Audio Dead After PulseAudio Restart (T480s)
+
+Killing PulseAudio (`pulseaudio -k`) destroys `/run/flatpak/pulse/` which `flatpak-session-helper`
+created at login. The helper does not recreate it automatically when PA restarts. Flatpak apps
+(FireDragon, etc.) have `PULSE_SERVER=unix:/run/flatpak/pulse/native` baked into their sandbox
+env, but the socket is gone. Menu restart reuses the existing sandbox with a stale dead tmpfs
+bind-mount -- it does not help.
+
+Fix:
+
+
+```bash
+# 1. Recreate the socket directory
+sudo mkdir -p /run/flatpak/pulse
+sudo chown $USER:$USER /run/flatpak /run/flatpak/pulse
+ln -s /run/user/1000/pulse/native /run/flatpak/pulse/native
+touch /run/flatpak/pulse/config
+
+# 2. Verify it's connectable
+PULSE_SERVER=unix:/run/flatpak/pulse/native pactl info
+
+# 3. Full kill + relaunch the Flatpak app (NOT menu restart)
+pkill firedragon   # or whichever app
+# then reopen from launcher
+```
 
 ## HelmCortex Integration
 
