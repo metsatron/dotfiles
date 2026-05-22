@@ -335,6 +335,32 @@ Systems with `libgtk3-nocsd` in `LD_PRELOAD` emit a harmless warning on Guix com
 
 If an org file tangles an absolute symlink (e.g. `.config/guix/current`), stow refuses to manage it. Remove it from the overlay dir -- they're machine-specific. `INSTALL.sh` auto-cleans these.
 
+### Flatpak Audio Dead After PulseAudio Restart (T480s)
+
+Killing PulseAudio (`pulseaudio -k`) destroys `/run/flatpak/pulse/` which `flatpak-session-helper`
+created at login. The helper does not recreate it automatically when PA restarts. Flatpak apps
+(FireDragon, etc.) have `PULSE_SERVER=unix:/run/flatpak/pulse/native` baked into their sandbox
+env, but the socket is gone. Menu restart reuses the existing sandbox with a stale dead tmpfs
+bind-mount -- it does not help.
+
+Fix:
+
+
+```bash
+# 1. Recreate the socket directory
+sudo mkdir -p /run/flatpak/pulse
+sudo chown $USER:$USER /run/flatpak /run/flatpak/pulse
+ln -s /run/user/1000/pulse/native /run/flatpak/pulse/native
+touch /run/flatpak/pulse/config
+
+# 2. Verify it's connectable
+PULSE_SERVER=unix:/run/flatpak/pulse/native pactl info
+
+# 3. Full kill + relaunch the Flatpak app (NOT menu restart)
+pkill firedragon   # or whichever app
+# then reopen from launcher
+```
+
 ## HelmCortex Integration
 
 DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow files into HelmCortex -- HelmCortex owns all its own configs (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs) directly.
