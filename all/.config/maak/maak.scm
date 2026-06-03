@@ -116,6 +116,12 @@
    (task 'stow:devuan "Safe stow shared + linux + devuan overlays (all linux devuan)"
          (lambda () (sh "STOW_PKGS='all linux devuan' make safe-stow")))
 
+   (task 'stow:openmandriva "Safe stow OpenMandriva overlays (all linux openmandriva)"
+         (lambda () (sh "STOW_PKGS='all linux openmandriva' make safe-stow")))
+
+   (task 'stow:t480 "Safe stow T480 OpenMandriva overlays (all linux openmandriva t480)"
+         (lambda () (sh "STOW_PKGS='all linux openmandriva t480' make safe-stow")))
+
    (task 'stow:s24 "Safe stow S24 overlays (all termux s24)"
          (lambda () (sh "STOW_PKGS='all termux s24' make safe-stow")))
 
@@ -501,6 +507,28 @@
    (task 'nala:health "Show nala/apt/dpkg status"
          (lambda () (sh "~/.local/bin/nala-health")))
 
+   ;; --- DNF / OpenMandriva ---
+   (task 'dnf:capture "Capture live DNF user-installed packages to DotCortex SSV"
+         (lambda () (sh "~/.local/bin/dnf-capture")))
+
+   (task 'dnf:diff "Plan: manifest vs live RPM packages"
+         (lambda () (sh "~/.local/bin/dnf-diff")))
+
+   (task 'dnf:sync
+         "Install missing DNF packages without distro-sync first"
+         (lambda () (sh "make dnf-sync")))
+
+   (task 'dnf:apply
+         "Distro-sync then install OpenMandriva DNF manifest packages"
+         (lambda () (sh "make dnf-apply")))
+
+   (task 'dnf:sonicde-xlibre
+         "Install SonicDE and XLibre with --allowerasing"
+         (lambda () (sh "make dnf-sonicde-xlibre")))
+
+   (task 'dnf:health "Show DNF/RPM status"
+         (lambda () (sh "~/.local/bin/dnf-health")))
+
    ;; --- Termux (Android) ---
    (task 'termux-pkg:apply
          "Install Termux packages from manifest"
@@ -643,6 +671,7 @@
                         (not (string-prefix? "flatpak:" nm))
                         (not (string-prefix? "snap:" nm))
                         (not (string-prefix? "appimage:" nm))
+                        (not (string-prefix? "dnf:" nm))
                         (not (string-prefix? "cargo:" nm))
                         (not (string-prefix? "npm:" nm))
                         (not (string-prefix? "root:" nm))
@@ -675,6 +704,10 @@
   (print-group "Snap commands"
                (lambda (t)
                  (string-prefix? "snap:" (task-name-str t))))
+
+  (print-group "DNF / OpenMandriva commands"
+               (lambda (t)
+                 (string-prefix? "dnf:" (task-name-str t))))
 
   (print-group "AppImage commands"
                (lambda (t)
