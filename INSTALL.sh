@@ -2,10 +2,11 @@
 # ═══════════════════════════════════════════════════════════════
 # DotCortex Bootstrap — Mètsàtron's Star Fleet Provisioner
 # ═══════════════════════════════════════════════════════════════
-# Gets a fresh Debian/Devuan machine to the point where `loom`
-# and `make tangle && make safe-stow` work. After this script
-# finishes, the operator can refine via nala.org, guix manifests,
-# and loom verbs.
+# Gets a fresh Linux machine to the point where `loom`
+# and `make tangle && make safe-stow` work. Debian/Devuan
+# system packages are managed through nala/apt; OpenMandriva
+# system packages are managed through the DNF manifest in dnf.org.
+# After this script finishes, the operator can refine via loom verbs.
 #
 # Usage:
 #   cd ~/DotCortex && bash INSTALL.sh
@@ -21,6 +22,7 @@
 # Tested on:
 #   - Devuan 6 (excalibur) / sysv-init / x86_64
 #   - Debian 13 (trixie) / systemd / x86_64
+#   - OpenMandriva Cooker / systemd / x86_64
 # ═══════════════════════════════════════════════════════════════
 set -euo pipefail
 
@@ -38,6 +40,20 @@ else
   fail "Cannot detect OS — /etc/os-release missing"
 fi
 info "Detected: $PRETTY_NAME"
+
+PLATFORM="unknown"
+case "${ID:-}" in
+  debian|ubuntu) PLATFORM="debian" ;;
+  devuan) PLATFORM="devuan" ;;
+  openmandriva|openmandriva-cooker|openmandriva-rome) PLATFORM="openmandriva" ;;
+esac
+
+case " ${ID_LIKE:-} " in
+  *" debian "*) [ "$PLATFORM" = "unknown" ] && PLATFORM="debian" ;;
+  *" openmandriva "*) [ "$PLATFORM" = "unknown" ] && PLATFORM="openmandriva" ;;
+esac
+
+info "Platform lane: $PLATFORM"
 
 # ── Detect init system ────────────────────────────────────────
 INIT_SYSTEM="unknown"
@@ -62,73 +78,107 @@ if [ "$(id -u)" -ne 0 ]; then
   info "Running as user — will use sudo for system packages"
 fi
 
+DOTCORTEX="${DOTCORTEX:-$HOME/DotCortex}"
+
 # ══════════════════════════════════════════════════════════════
-# Phase 1: System dependencies via apt/nala
+# Phase 1: System dependencies via platform package manager
 # ══════════════════════════════════════════════════════════════
 info "Phase 1: Installing system dependencies"
 
-# Prefer nala if available, fall back to apt
-APT="apt-get"
-if command -v nala &>/dev/null; then
-  APT="nala"
-  info "Using nala"
-fi
+case "$PLATFORM" in
+  debian|devuan)
+    # Prefer nala if available, fall back to apt
+    APT="apt-get"
+    if command -v nala &>/dev/null; then
+      APT="nala"
+      info "Using nala"
+    fi
 
-PKGS=(
-  # Core tools
-  git
-  stow
-  curl
-  wget
-  make
-  gcc
+    PKGS=(
+      # Core tools
+      git
+      stow
+      curl
+      wget
+      make
+      gcc
 
-  # Emacs (needed for org-mode tangle — emacs-nox is sufficient,
-  # no GUI required since we only use batch mode)
-  emacs-nox
+      # Emacs (needed for org-mode tangle — emacs-nox is sufficient,
+      # no GUI required since we only use batch mode)
+      emacs-nox
 
-  # Python
-  python3
-  python3-pip
-  python3-venv
+      # Python
+      python3
+      python3-pip
+      python3-venv
 
-  # Node.js / npm: provided by Guix core profile (Phase 3.5) or nodesource.
-  # NOT installed here — system npm conflicts with nodesource nodejs.
+      # Node.js / npm: provided by Guix core profile (Phase 3.5) or nodesource.
+      # NOT installed here — system npm conflicts with nodesource nodejs.
 
-  # Shell utilities
-  keychain       # SSH key agent
-  zoxide         # smart cd replacement
-  jq             # JSON processor
-  tree           # directory viewer
-  rsync          # file sync
-  htop           # process monitor
-  neofetch       # system info display
+      # Shell utilities
+      keychain       # SSH key agent
+      zoxide         # smart cd replacement
+      jq             # JSON processor
+      tree           # directory viewer
+      rsync          # file sync
+      htop           # process monitor
+      neofetch       # system info display
 
-  # Build essentials for compiled packages
-  build-essential
-  libssl-dev
-  libfreetype-dev
-  libfontconfig-dev
-  pkg-config
-)
+      # Build essentials for compiled packages
+      build-essential
+      libssl-dev
+      libfreetype-dev
+      libfontconfig-dev
+      pkg-config
+    )
 
-# LESSON: On Devuan (sysv-init), the Guix installer needs `daemonize`
-# to background the daemon. Without it, the installer fails with
-# "Missing commands: daemonize". Install it preemptively.
-if [ "$INIT_SYSTEM" = "sysv-init" ]; then
-  PKGS+=(daemonize)
-fi
+    # LESSON: On Devuan (sysv-init), the Guix installer needs `daemonize`
+    # to background the daemon. Without it, the installer fails with
+    # "Missing commands: daemonize". Install it preemptively.
+    if [ "$INIT_SYSTEM" = "sysv-init" ]; then
+      PKGS+=(daemonize)
+    fi
 
-$SUDO $APT update -y
-$SUDO $APT install -y "${PKGS[@]}"
+    $SUDO $APT update -y
+    $SUDO $APT install -y "${PKGS[@]}"
+    ;;
+
+  openmandriva)
+    if ! command -v dnf &>/dev/null; then
+      fail "OpenMandriva detected but dnf is not available"
+    fi
+
+    DNF_MAN="$DOTCORTEX/openmandriva/.dnf/manifest/packages.ssv"
+    DNF_APPLY="$DOTCORTEX/openmandriva/.local/bin/dnf-apply"
+
+    if [ -f "$DNF_MAN" ] && [ -f "$DNF_APPLY" ]; then
+      info "Using DotCortex OpenMandriva DNF manifest"
+      DNF_CATEGORIES="${DNF_CATEGORIES:-bootstrap cli}" \
+        DNF_SSV="$DNF_MAN" \
+        bash "$DNF_APPLY"
+    else
+      warn "DotCortex DNF manifest not available yet; installing minimal bootstrap packages directly"
+      warn "Re-run after clone/tangle to enforce dnf.org fully"
+      $SUDO dnf --refresh distro-sync -y
+      $SUDO dnf --refresh install -y --allowerasing \
+        git stow curl wget make gcc gcc-c++ clang emacs-nox \
+        python3 python3-pip python-virtualenv nodejs npm zsh \
+        keychain jq tree rsync htop pkgconf \
+        lib64openssl-devel freetype-devel fontconfig-devel
+    fi
+    ;;
+
+  *)
+    fail "Unsupported platform lane: $PLATFORM. Add a package-manager phase before bootstrapping."
+    ;;
+esac
+
 ok "System packages installed"
 
 # ══════════════════════════════════════════════════════════════
 # Phase 2: Clone or locate DotCortex
 # ══════════════════════════════════════════════════════════════
 info "Phase 2: Ensuring DotCortex is in place"
-
-DOTCORTEX="$HOME/DotCortex"
 
 if [ -d "$DOTCORTEX/.git" ]; then
   ok "DotCortex already cloned at $DOTCORTEX"
@@ -418,7 +468,7 @@ cd "$DOTCORTEX"
 if command -v emacs &>/dev/null; then
   # Ensure .mk stubs exist so Makefile includes don't fail
   mkdir -p all/.mk
-  for mk in flatpak guix guix-substitutes snap appimage cargo homebrew npm pip nala; do
+  for mk in flatpak guix guix-substitutes snap appimage cargo homebrew npm pip nala dnf; do
     [ -f "all/.mk/${mk}.mk" ] || touch "all/.mk/${mk}.mk"
   done
 
@@ -430,6 +480,7 @@ if command -v emacs &>/dev/null; then
   mkdir -p all/.appimage/inventory
   mkdir -p all/.app/manifest
   mkdir -p all/.homebrew/manifest
+  mkdir -p openmandriva/.dnf/manifest
 
   # LESSON: If /tmp has restrictive permissions (755 instead of 1777),
   # BOTH emacs org-persist AND guix build sandboxes break with
@@ -507,7 +558,7 @@ info "Phase 6: Stowing overlays"
 cd "$DOTCORTEX"
 
 # Remove absolute symlinks that stow can't handle
-find all/ linux/ debian/ devuan/ x230/ t480s/ -type l 2>/dev/null | while read -r link; do
+find all/ linux/ debian/ devuan/ openmandriva/ x230/ t480s/ t480/ -type l 2>/dev/null | while read -r link; do
   target=$(readlink "$link" 2>/dev/null || true)
   if [ -n "$target" ] && [[ "$target" = /* ]]; then
     warn "Removing absolute symlink: $link -> $target"
@@ -518,32 +569,42 @@ done
 # Detect which overlays to apply
 OVERLAYS="all"
 
-if [ -f /etc/debian_version ] || [ -f /etc/devuan_version ]; then
-  OVERLAYS="$OVERLAYS linux debian"
-fi
+case "$PLATFORM" in
+  debian)
+    OVERLAYS="$OVERLAYS linux debian"
+    ;;
+  devuan)
+    OVERLAYS="$OVERLAYS linux debian devuan"
+    ;;
+  openmandriva)
+    OVERLAYS="$OVERLAYS linux openmandriva"
+    ;;
+esac
 
-# Devuan / sysv-init overlay (non-systemd daemons, XFCE panel launchers)
-if [ -f /etc/devuan_version ] || [ "$INIT_SYSTEM" = "sysv-init" ]; then
-  OVERLAYS="$OVERLAYS devuan"
-fi
-
-# ThinkPad detection — X230 vs T480s
-if [ -d /sys/devices/platform/thinkpad_acpi ] || \
-   $SUDO dmidecode -s system-product-name 2>/dev/null | grep -qi thinkpad; then
+# ThinkPad detection — X230 vs T480s vs T480
+PRODUCT="unknown"
+if [ -r /sys/class/dmi/id/product_name ]; then
+  PRODUCT=$(cat /sys/class/dmi/id/product_name 2>/dev/null || echo "unknown")
+elif command -v dmidecode &>/dev/null; then
   PRODUCT=$($SUDO dmidecode -s system-product-name 2>/dev/null || echo "unknown")
+fi
+
+if [ -d /sys/devices/platform/thinkpad_acpi ] || echo "$PRODUCT" | grep -qi thinkpad; then
   case "$PRODUCT" in
     *X230*|*x230*)
       OVERLAYS="$OVERLAYS x230"
       info "Detected ThinkPad X230"
       ;;
-    *T480s*|*t480s*|*T480*)
+    *T480s*|*t480s*)
       OVERLAYS="$OVERLAYS t480s"
       info "Detected ThinkPad T480s"
       ;;
+    *T480*|*t480*)
+      OVERLAYS="$OVERLAYS t480"
+      info "Detected ThinkPad T480"
+      ;;
     *)
-      # Generic ThinkPad — use x230 overlay as default
-      OVERLAYS="$OVERLAYS x230"
-      info "Detected ThinkPad: $PRODUCT (using x230 overlay)"
+      info "Detected ThinkPad: $PRODUCT (no machine-specific overlay)"
       ;;
   esac
 fi
@@ -699,34 +760,17 @@ fi
 # ══════════════════════════════════════════════════════════════
 info "Phase 10: PATH and shell integration"
 
-BASHRC="$HOME/.bashrc"
-
-# Ensure HelmCortex FORGE/bin is on PATH (for auryn, pipelines)
-if ! grep -q 'HelmCortex/FORGE/bin' "$BASHRC" 2>/dev/null; then
-  if [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
-    cat >> "$BASHRC" << 'FORGE_PATH'
-
-# HelmCortex FORGE bin (auryn, pipelines, scripts)
-if [ -d "$HOME/HelmCortex/FORGE/bin" ]; then
-  export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
-fi
-FORGE_PATH
-    ok "Added FORGE/bin to PATH in .bashrc"
+# Shell integration is owned by shell.org and deployed through stow.
+# Do not append to .bashrc/.zshrc here; that creates undeclared drift.
+for shell_file in "$HOME/.zshenv" "$HOME/.zshrc" "$HOME/.bashrc"; do
+  if [ -L "$shell_file" ]; then
+    ok "Stowed shell file: $shell_file -> $(readlink "$shell_file")"
+  elif [ -e "$shell_file" ]; then
+    warn "Shell file exists but is not a stowed symlink: $shell_file"
+  else
+    warn "Shell file missing after stow: $shell_file"
   fi
-fi
-
-# Ensure Guix profile is sourced in bashrc
-if ! grep -q 'guix/current' "$BASHRC" 2>/dev/null; then
-  cat >> "$BASHRC" << 'GUIX_PROFILE'
-
-# GNU Guix user profile
-GUIX_PROFILE="$HOME/.config/guix/current"
-if [ -f "$GUIX_PROFILE/etc/profile" ]; then
-  . "$GUIX_PROFILE/etc/profile"
-fi
-GUIX_PROFILE
-  ok "Added Guix profile sourcing to .bashrc"
-fi
+done
 
 # ══════════════════════════════════════════════════════════════
 # Done
@@ -736,10 +780,19 @@ echo "════════════════════════�
 printf "${G}DotCortex bootstrap complete.${N}\n"
 echo ""
 echo "Next steps:"
-echo "  1. Set zsh as default shell:"
-echo "     GUIX_ZSH=\$HOME/.guix-extra-profiles/core/core/bin/zsh"
-echo "     grep -qxF \"\$GUIX_ZSH\" /etc/shells || echo \"\$GUIX_ZSH\" | sudo tee -a /etc/shells"
-echo "     chsh -s \"\$GUIX_ZSH\""
+case "$PLATFORM" in
+  openmandriva)
+    echo "  1. Set zsh as default shell:"
+    echo "     grep -qxF /usr/bin/zsh /etc/shells || echo /usr/bin/zsh | sudo tee -a /etc/shells"
+    echo "     chsh -s /usr/bin/zsh"
+    ;;
+  *)
+    echo "  1. Set zsh as default shell:"
+    echo "     GUIX_ZSH=\$HOME/.guix-extra-profiles/core/core/bin/zsh"
+    echo "     grep -qxF \"\$GUIX_ZSH\" /etc/shells || echo \"\$GUIX_ZSH\" | sudo tee -a /etc/shells"
+    echo "     chsh -s \"\$GUIX_ZSH\""
+    ;;
+esac
 echo "  2. Log out and back in (or: source ~/.zshenv && exec zsh)"
 echo "  3. loom                  (verify all loom verbs work)"
 echo "  4. loom flatpak:apply    (install Flatpak apps from manifest)"
@@ -753,4 +806,5 @@ echo ""
 echo "Machine-specific stow verbs:"
 echo "  loom stow:x230           (X230: all linux debian x230)"
 echo "  loom stow:t480s          (T480s: all linux debian devuan t480s)"
+echo "  loom stow:t480           (T480: all linux openmandriva t480)"
 echo "════════════════════════════════════════════════════"
