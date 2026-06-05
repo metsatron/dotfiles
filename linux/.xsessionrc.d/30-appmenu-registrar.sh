@@ -12,6 +12,7 @@ registrar_has_owner() {
 
 APPMENU_REGISTRAR=
 if ! registrar_has_owner; then
+  pkill -x appmenu-registr >/dev/null 2>&1 || true
   pkill -x appmenu-registrar >/dev/null 2>&1 || true
 
   if command -v appmenu-registrar >/dev/null 2>&1; then
