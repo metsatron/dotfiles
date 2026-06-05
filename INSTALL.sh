@@ -80,6 +80,19 @@ fi
 
 DOTCORTEX="${DOTCORTEX:-$HOME/DotCortex}"
 
+install_openmandriva_term_guard() {
+  local guard="/etc/profile.d/00-dotcortex-term.sh"
+
+  info "Installing OpenMandriva TERM guard"
+  $SUDO tee "$guard" >/dev/null <<'PROFILE'
+# DotCortex/OpenMandriva compatibility guard.
+# OpenMandriva's /etc/profile.d/60alias.sh assumes TERM is set.
+[ -n "${TERM:-}" ] || export TERM=xterm-256color
+PROFILE
+  $SUDO chmod 0644 "$guard"
+  ok "OpenMandriva TERM guard installed: $guard"
+}
+
 # ══════════════════════════════════════════════════════════════
 # Phase 1: System dependencies via platform package manager
 # ══════════════════════════════════════════════════════════════
@@ -166,6 +179,8 @@ case "$PLATFORM" in
         keychain jq tree rsync htop pkgconf \
         lib64openssl-devel freetype-devel fontconfig-devel
     fi
+
+    install_openmandriva_term_guard
     ;;
 
   *)
