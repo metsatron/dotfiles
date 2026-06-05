@@ -103,6 +103,16 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
       extra `.gitignore` rules. Move ownership to HelmCortex first, then keep only the DotCortex
       bits the user actually asked to manage.
 
+21. **No network addresses in DotCortex** -- IP addresses (LAN, Tailscale, public), hostname→IP
+    mappings, and port numbers that expose network topology must never appear in any tangled org
+    source block or overlay file. DotCortex is a public repo — network topology is machine-local.
+    - For scripts that need IPs: use an env file pattern — tangle a =*.env.template= with blank
+      placeholder values; actual IPs live in a machine-local =*.env= that is never committed.
+    - SSH config with fleet hostnames, IPs, or ports belongs in a machine-local file written
+      directly to the target machine, not tangled from DotCortex source.
+    - If you are about to write any IP address into an org tangle block, stop immediately and
+      use the env file pattern instead. No exceptions.
+
 ## Agent Config Scoping
 
 Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
