@@ -124,9 +124,6 @@
    (task 'stow:t480s "Safe stow T480s overlays (all linux debian devuan t480s)"
          (lambda () (sh "STOW_PKGS='all linux debian devuan t480s' make safe-stow")))
 
-   (task 'stow:z1x "Safe stow Z1X WSL2 overlays (all linux debian z1x)"
-         (lambda () (sh "STOW_PKGS='all linux debian z1x' make safe-stow")))
-
    (task 'stow:devuan "Safe stow shared + linux + devuan overlays (all linux devuan)"
          (lambda () (sh "STOW_PKGS='all linux devuan' make safe-stow")))
 
