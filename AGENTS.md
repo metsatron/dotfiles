@@ -41,7 +41,7 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
 11. **Never commit generated output without canonical source** -- if `all/`, `linux/`, `debian/`, `devuan/`, `x230/`, `t480s/`, `AGENTS.md`, `CLAUDE.md`, or `Makefile` changed, the corresponding `.org` source must be included in the same commit.
 12. **Commit verified work via `/commit`; never push without explicit instruction** -- after useful verified work, commit via the `/commit` skill (which emits the post-commit sync reminder). Do not push or pull between machines unless explicitly asked — pushing triggers multi-machine sync. Stage only intended files; never commit unrelated tracked-file dirt.
 12a. **Never run `git pull` on a remote machine without explicit per-machine instruction** -- `git pull` on a remote machine via SSH is as destructive as `git push`. It can silently overwrite uncommitted working state if the incoming changes don't conflict (git fast-forward succeeds even with an otherwise-dirty tree). Never chain `git pull && loom stow:X` on a remote unless the user has explicitly said "pull and stow on X". The correct sync flow is: commit locally → push (with explicit permission) → user pulls on each other machine themselves. Use `dotcortex-pull` for any pull that must be automated — it checks for dirty state first and aborts.
-13. **Cross-machine sync is explicit** -- for work that must exist on both T480s and X230, use one canonical upstream, `git pull --ff-only` before editing on a machine, and push immediately after an approved commit. Uncommitted work on one machine is not synchronization.
+13. **Cross-machine sync is explicit** -- for work that must exist on T480s, T480, and X230, use one canonical upstream, `git pull --ff-only` before editing on a machine, and push immediately after an approved commit. Uncommitted work on one machine is not synchronization.
 14. **Operate on the target repo root** -- when tangling or running git in mounted/mirrored checkouts, target the actual repo containing the file, not an assumed `~/DotCortex` path. Never assume the local machine repo is the intended target.
 15. **"Take care of it" means preserve intent** -- when the user says to "take care of it" about a staged or tracked change, stage and commit the current intended content unless the user explicitly asks for source edits. Do not delete, revert, or silently rewrite it. If a plan was already proposed, "take care of it" means execute that plan.
 
@@ -391,6 +391,7 @@ HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mn
 - **X230** (ThinkPad, Debian/systemd): HelmCortex native, overlays: `all linux debian x230`, verb: `loom stow:x230`
 - The x230 checkout of this repo lives at `/home/metsatron/DotCortex` on host `x230` (`git remote x230`).
 - **T480s** (ThinkPad, Devuan/sysv-init): HelmCortex mounted + symlinked, overlays: `all linux debian devuan t480s`, verb: `loom stow:t480s`
+- **T480** (ThinkPad, OpenMandriva/DNF): SSH alias `t480`, overlays: `all linux openmandriva t480`, verb: `loom stow:t480`
 - Future machines: clone DotCortex, run `INSTALL.sh`, done
 
 ### Overlay Scoping
