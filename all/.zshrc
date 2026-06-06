@@ -25,6 +25,3 @@ if [[ $- == *i* ]]; then
     [ -f "$file" ] && source "$file"
   done
 fi
-
-# bun completions
-[ -s "/home/metsatron/DotCortex/all/.bun/_bun" ] && source "/home/metsatron/DotCortex/all/.bun/_bun"
