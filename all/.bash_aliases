@@ -186,7 +186,7 @@ ffetch() {
   fi
 
   if [[ ${TERM-} == wezterm ]] \
-     || [[ -n ${WEZTERM_PANE-}${TERM_PROGRAM-} ]]; then
+     || [[ -n ${WEZTERM_PANE-} ]]; then
     command fastfetch --config "$HOME/.config/fastfetch/wezterm.jsonc" "$@"
   else
     command fastfetch "$@"
