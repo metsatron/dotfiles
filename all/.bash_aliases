@@ -185,7 +185,9 @@ ffetch() {
       "${TERM-}" "${WEZTERM_EXECUTABLE-}" "${WEZTERM_VERSION-}" "${WEZTERM_PANE-}" "${TERM_PROGRAM-}" >&2
   fi
 
-  if [[ ${TERM-} == wezterm ]] \
+  if [[ -n ${KITTY_WINDOW_ID-} ]]; then
+    command fastfetch "$@"
+  elif [[ ${TERM-} == wezterm ]] \
      || [[ -n ${WEZTERM_PANE-} ]]; then
     command fastfetch --config "$HOME/.config/fastfetch/wezterm.jsonc" "$@"
   else
