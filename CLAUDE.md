@@ -385,10 +385,14 @@ HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mn
 
 ## Multi-Machine Setup (Star Fleet)
 
+**System provenance for each machine lives in SystemCodex:**
+=HelmCortex/CORTEX/GoldenAge_Loom/SteinerCortex/SystemCodex/Machines/=
+Check there first when working on a specific machine — init system, service management, Tailscale, storage, and known quirks are documented per-machine. Update it whenever the system state changes.
+
 - **X230** (ThinkPad, Debian/systemd): HelmCortex native, overlays: `all linux debian x230`, verb: `loom stow:x230`
 - The x230 checkout of this repo lives at `/home/metsatron/DotCortex` on host `x230` (`git remote x230`).
 - **T480s** (ThinkPad, Devuan/sysv-init): HelmCortex mounted + symlinked, overlays: `all linux debian devuan t480s`, verb: `loom stow:t480s`
-- **T480** (ThinkPad, OpenMandriva/DNF): SSH alias `t480`, overlays: `all linux openmandriva t480`, verb: `loom stow:t480`
+- **T480** (ThinkPad, Vendefoul Wolf/Devuan/sysv-init): SSH alias `t480`, overlays: `all linux t480`, verb: `STOW_PKGS="all linux t480" make safe-stow`; ISO says "OpenRC" but installed system is Devuan sysv-init — use `service`, not `rc-service`
 - **S24** (Samsung Galaxy S24 Ultra, Android/Termux): SSH alias `s24`, overlays: `all termux s24`, verb: `loom stow:s24`; no Guix, use `STOW_PKGS='all termux s24' make safe-stow` if loom unavailable
 - Future machines: clone DotCortex, run `INSTALL.sh`, done
 
