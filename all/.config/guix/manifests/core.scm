@@ -4,8 +4,7 @@
 ;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:1]]
 (specifications->manifest
  '(
-   "git"
-   ;; "git-extras"   ; unknown package in current channels (2026-06-10) — blocked entire core apply; restore if it returns or pin a channel that has it
+   "git" "git-extras"
    "jq" "direnv" "htop" "btop" "ranger"
    "maak" "guile" "chafa"
    "glibc-locales"   ; for UTF-8 locales
