@@ -20,6 +20,8 @@
    "zsh-vi-mode" "zsh-autosuggestions" "zsh-history-substring-search"
    "tmux"
    "moreutils"
+   "borg"            ; helmcortex-borg multi-endpoint backup
+   "inotify-tools"   ; helmcortex-borg watch verb (inotifywait)
    "flatpak"
    "fastfetch" "wfetch" "uwufetch" "macchina"
    "rofi"
