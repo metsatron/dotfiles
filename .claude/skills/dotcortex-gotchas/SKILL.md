@@ -56,6 +56,18 @@ Stow has three different conflict message formats across versions and situations
 
 The safe-stow target matches all three with sed patterns, filters out HelmCortex, backs up real files, removes them, then stows. If stow still fails, it auto-retries with `--ignore=HelmCortex`.
 
+## "unknown package" for packages that definitely exist — stale guix binary, not channels
+
+If `guix show <pkg>` or a manifest apply rejects packages that demonstrably exist (fastfetch, deskflow, borg at an ancient version), check WHICH guix answered before touching the manifest:
+
+```bash
+type -a guix          # fossil: /usr/local/bin/guix (bootstrap seed, frozen at install version)
+ls -la ~/.config/guix/current   # per-user current — the real one after guix pull
+~/.config/guix/current/bin/guix --version
+```
+
+Root cause chain: if the `~/.config/guix/current` symlink is broken or missing, the `.zshenv` `[ -d ... ]` guard silently skips the PATH prepend and every shell — including loom's clean-guix-env wrapper — falls through to the 1.4.0 fossil. The error then looks exactly like channel drift. Fix: `loom guix:pull` (recreates the symlink), then re-validate with the explicit current path before commenting anything out of a manifest. Never gut a manifest on the fossil's testimony (X230, 2026-06-10).
+
 ## Guix installer fails on non-interactive terminal
 
 The official `guix-install.sh` requires interactive stdin. If running via SSH, CI, or piped input, use the manual install method documented in `INSTALL.sh`.
