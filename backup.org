@@ -551,6 +551,156 @@ rsync -aH --no-owner --no-group --info=stats2,progress2 "$SRC/" "${REMOTE_HOST}:
 echo "[✓] Done: ${REMOTE_HOST}:${REMOTE_DEST}"
 #+END_SRC
 
+* dotcortex-borg – Versioned encrypted DotCortex backup (borg)
+
+Borg sibling of HelmCortex's =helmcortex-borg=. One encrypted repo per endpoint at
+=<endpoint>/Borg/DotCortex=; covers the FULL =~/DotCortex= checkout including =.git=
+and untracked local state. Complements (does not replace) the rsync mirrors —
+the legacy DotCortex backups on the ironwolf drives are NEVER deleted: they hold
+unique files stripped from the repo and not tracked anywhere else.
+
+Passphrases: =~/.config/dotcortex-borg/{endpoint}.pass= — provisioned via
+=helmstow= from =NEXUS/stow/= (DotCortex is public; secrets never live here).
+Key exports go to =NEXUS/keys/borg/=.
+
+#+BEGIN_SRC bash :tangle x230/.local/bin/dotcortex-borg :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -euo pipefail
+
+BASE="$HOME/DotCortex"
+PASS_DIR="$HOME/.config/dotcortex-borg"
+STATE_DIR="$HOME/.local/state/dotcortex-borg"
+PROBE_TIMEOUT=5
+ARCHIVE_PREFIX="dotcortex"
+COMPRESSION="zstd,3"
+KEEP_POLICY=(--keep-within 48H --keep-daily 14 --keep-weekly 8 --keep-monthly 12)
+
+# name|type|location|enabled
+ENDPOINTS=(
+  "secret-ssd|mount|/mnt/secret-ssd|1"
+  "t480s|ssh|t480s:Borg/DotCortex|1"
+)
+
+usage() {
+  cat <<'EOF'
+Usage:
+  dotcortex-borg init | create [--dry-run] | prune | check | list | status
+EOF
+  exit 1
+}
+
+fail() { echo "[x] $*" >&2; return 1; }
+note() { echo "[*] $*"; }
+
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/lock"
+flock -n 9 || { echo "[x] another dotcortex-borg operation holds the lock" >&2; exit 1; }
+
+probe_path() { timeout "$PROBE_TIMEOUT" stat "$1" >/dev/null 2>&1; }
+
+assert_canary_uuid() {
+  local path="$1" mp dev fstype uuid canary expected
+  mp="$(timeout "$PROBE_TIMEOUT" findmnt -rn -o TARGET --target "$path")" \
+    || { fail "no mounted FS for $path"; return 1; }
+  canary="$mp/.canary"
+  [[ -f "$canary" ]] || { fail "missing canary at $canary"; return 1; }
+  dev="$(timeout "$PROBE_TIMEOUT" findmnt -rn -o SOURCE --target "$path")" \
+    || { fail "cannot determine device for $mp"; return 1; }
+  uuid="$(blkid -s UUID -o value "$dev" 2>/dev/null)" \
+    || { fail "cannot read UUID for $dev"; return 1; }
+  expected="$(grep -E '^BACKUP_CANARY_UUID=' "$canary" | cut -d= -f2)"
+  [[ -n "$expected" ]] || { fail "canary missing BACKUP_CANARY_UUID in $canary"; return 1; }
+  [[ "$uuid" == "$expected" ]] \
+    || { fail "UUID mismatch for $mp (have $uuid, expected $expected)"; return 1; }
+}
+
+endpoint_fields() { IFS='|' read -r EP_NAME EP_TYPE EP_LOC EP_ENABLED <<<"$1"; }
+
+endpoint_repo() {
+  case "$EP_TYPE" in
+    mount) printf '%s/Borg/DotCortex' "$EP_LOC" ;;
+    ssh)   printf '%s' "$EP_LOC" ;;
+  esac
+}
+
+endpoint_ready() {
+  local passfile="$PASS_DIR/$EP_NAME.pass"
+  [[ -f "$passfile" ]] \
+    || { fail "$EP_NAME: missing passphrase at $passfile — provision via helmstow from NEXUS" || true; return 1; }
+  case "$EP_TYPE" in
+    mount)
+      probe_path "$EP_LOC" || { fail "$EP_NAME: $EP_LOC unreachable" || true; return 1; }
+      assert_canary_uuid "$EP_LOC" || { fail "$EP_NAME: canary verification failed" || true; return 1; }
+      ;;
+    ssh)
+      ssh -o ConnectTimeout="$PROBE_TIMEOUT" "${EP_LOC%%:*}" true 2>/dev/null \
+        || { fail "$EP_NAME: cannot reach ${EP_LOC%%:*}" || true; return 1; }
+      ;;
+  esac
+  export BORG_PASSCOMMAND="cat $passfile"
+}
+
+for_each_enabled() {
+  local action="$1" any=0
+  for entry in "${ENDPOINTS[@]}"; do
+    endpoint_fields "$entry"
+    [[ "$EP_ENABLED" == "1" ]] || continue
+    any=1
+    echo
+    note "endpoint: $EP_NAME ($EP_TYPE -> $EP_LOC)"
+    if ! endpoint_ready; then echo "[!] $EP_NAME skipped."; continue; fi
+    "$action" "$(endpoint_repo)" || echo "[!] $EP_NAME: $action reported errors."
+  done
+  [[ "$any" == "1" ]] || fail "no enabled endpoints"
+}
+
+require_borg() { command -v borg >/dev/null 2>&1 || fail "borg not on PATH — Guix core profile provides it"; }
+
+do_init() {
+  local repo="$1"
+  if [[ "$EP_TYPE" == "mount" ]]; then mkdir -p "$repo"; else
+    ssh "${EP_LOC%%:*}" "mkdir -p \"$(dirname "${EP_LOC#*:}")\""
+  fi
+  if borg list "$repo" >/dev/null 2>&1; then note "$EP_NAME: repo already initialized"; return 0; fi
+  borg init --encryption=repokey-blake2 "$repo"
+  borg key export "$repo" "$STATE_DIR/key-$EP_NAME.txt"
+  note "$EP_NAME: initialized; key export at $STATE_DIR/key-$EP_NAME.txt — move to NEXUS/keys/borg/"
+}
+
+DRY_RUN=""
+do_create() {
+  local repo="$1" extra=(--stats)
+  [[ -n "$DRY_RUN" ]] && extra=(--dry-run --list)
+  borg create "${extra[@]}" --compression "$COMPRESSION" --exclude-caches \
+    --exclude '*/nohup.out' \
+    "$repo::$ARCHIVE_PREFIX-{now:%Y-%m-%d_%H%M%S}" "$BASE"
+}
+
+do_prune() {
+  borg prune --list --glob-archives "$ARCHIVE_PREFIX-*" "${KEEP_POLICY[@]}" "$1"
+  borg compact "$1"
+}
+
+do_check()  { borg check "$1"; }
+do_list()   { borg list "$1"; }
+do_status() {
+  local last
+  last="$(borg list --last 1 --format '{archive}{TAB}{time}{NL}' "$1" 2>/dev/null || true)"
+  if [[ -n "$last" ]]; then echo "[ok] $EP_NAME: last archive: $last"
+  else echo "[!] $EP_NAME: repo reachable but no archives (or not initialized)"; fi
+}
+
+cmd="${1-}"; shift || true
+case "$cmd" in
+  init)   require_borg; for_each_enabled do_init ;;
+  create) require_borg; [[ "${1-}" == "--dry-run" || "${1-}" == "-n" ]] && DRY_RUN=1; for_each_enabled do_create ;;
+  prune)  require_borg; for_each_enabled do_prune ;;
+  check)  require_borg; for_each_enabled do_check ;;
+  list)   require_borg; for_each_enabled do_list ;;
+  status) require_borg; for_each_enabled do_status ;;
+  *) usage ;;
+esac
+#+END_SRC
+
 * backup-nextcloud – Dual sync (ZFS pool + ironwolf02)
 
 Mirrors =$HOME/Nextcloud= to both the ZFS pool and ironwolf02.
