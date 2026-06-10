@@ -367,6 +367,31 @@
   "Check forge reachability for all conf-managed AppImages"
   (lambda () (sh "for a in $(~/.local/bin/apprelease list); do ~/.local/bin/apprelease health \"$a\" 2>&1 || true; done")))
 
+;; --- Plasmoid (pinned Plasma 6 panel applets) ---
+(task 'plasmoid:apply
+      "Install/upgrade pinned Plasma applets from manifest (verifies commit lock)"
+      (lambda () (mk "plasmoid-apply")))
+
+(task 'plasmoid:diff "Show manifest vs installed applet state"
+      (lambda () (mk "plasmoid-diff")))
+
+(task 'plasmoid:health "Show Plasma 6 tooling, installed applets, kwin toggle state"
+      (lambda () (mk "plasmoid-health")))
+
+(task 'plasmoid:reload "Replace plasmashell to pick up applet changes"
+      (lambda () (mk "plasmoid-reload")))
+
+(task 'kwin:borderless-status "Show BorderlessMaximizedWindows state"
+      (lambda () (mk "kwin-borderless-status")))
+
+(task 'kwin:borderless-on
+      "Hide titlebars on maximized windows (backs up kwinrc, live reconfigure)"
+      (lambda () (mk "kwin-borderless-on")))
+
+(task 'kwin:borderless-off
+      "Restore titlebars on maximized windows"
+      (lambda () (mk "kwin-borderless-off")))
+
 ;; --- Logseq ---
 (task 'logseq:launch "Launch Logseq DB (starts ttyd if needed)"
       (lambda () (sh "logseq-db")))
