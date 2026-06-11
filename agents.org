@@ -478,6 +478,57 @@ from the human operator per the staged rollout law. Stage 2+ has NOT begun: as o
 - One tool, one user. No shared =agent= account: a shared account destroys the audit
   trail and couples revocations.
 
+*** Canonical uid/gid map — FLEET LAW
+NFS access decisions are numeric; uids/gids MUST match on every machine. Never let
+=useradd= auto-assign an agent uid (the first rollout landed on 1001, which collides
+with the =fuse= group on X230 — corrected same day).
+
+| principal | uid/gid |
+|-----------|---------|
+| group =cortex= (shared repo work) | 2000 |
+| =agent-codex= | 2001 |
+| =agent-claude= | 2002 |
+| =agent-gemini= | 2003 |
+| =agent-antigravity= | 2004 |
+| =agent-opencode= | 2005 |
+| =agent-hermes= | 2010 |
+| =agent-pi= | 2011 |
+
+Each agent's primary group is its own (same number as uid); =cortex= is
+supplementary. The human operator is also a =cortex= member.
+
+*** Shared repo access — the cortex group pattern (proven 2026-06-11)
+Agents work in the SAME worktrees as the human — no per-agent clones (ruled out:
+disk cost, and it never solved the big private repo). Mechanism:
+1. *Traverse-only ACL on the human home*: =setfacl -m g:cortex:--x /home/<human>= —
+   agents path-walk to known repo paths but cannot list or read the home. (ZFS
+   needs =acltype=posixacl=; X230's rpool already had it.)
+2. *Group-share each repo*: =chgrp -R cortex REPO && chmod -R g+rwX REPO=, setgid on
+   all dirs (=find REPO -type d -exec chmod g+s {} +=), =git config
+   core.sharedRepository group=, =umask 002= for all writers.
+3. *Lock the vaults AFTER the pass*: secrets subtrees get =chmod -R o-rwx,g-rwx=
+   (HelmCortex/NEXUS is metsatron-only again). Untracked secret files (=.env=,
+   =*.pass=) keep 600 and are untouched by =g+rwX= (X never adds x to plain files,
+   and 600 files gain only group bits if they had none — verify the vault list
+   after every pass).
+4. *Per-agent git config* (belongs in tool bootstrap): identity
+   (=agent-<tool>= / =agent-<tool>@<host>.local=) and
+   =git config --global --add safe.directory <repo>= — git refuses cross-owner
+   repos without it (CVE-2022-24765 guard).
+
+*Caveat stated plainly*: group access to =.git= exposes all tracked history. Secrets
+must therefore never be tracked — which is already standing law.
+
+*** NFS gotchas for agent users (cost an hour; do not rediscover)
+- With =manage-gids=y= (mountd), the server IGNORES the client's AUTH_SYS group list
+  and looks up groups *server-side by numeric uid*. The agent user (with matching
+  uid AND =cortex= membership) must exist on the NFS *server* before access works.
+- The server caches uid→group lookups: after creating/changing a server-side agent
+  user, flush with =exportfs -f= and
+  =echo 1 > /proc/net/rpc/auth.unix.gid/flush=, or the old denial persists.
+- NFS clients also cache ACCESS denials briefly — test with a fresh path when in
+  doubt.
+
 *** Home directory layout
 Standard =useradd -m= homes under =/home/agent-<tool>/=, mode 750:
 - =.ssh/= (700) — the agent's own identity, generated in place, never imported
@@ -608,8 +659,23 @@ done
 set -euo pipefail
 
 AGENTS="codex claude gemini antigravity opencode hermes pi"
+CORTEX_GID=2000
 APPLY=0
 ONLY=""
+
+uid_of() {
+  # Canonical fleet uid/gid map — NFS is numeric; never auto-assign.
+  case "$1" in
+    codex) echo 2001 ;;
+    claude) echo 2002 ;;
+    gemini) echo 2003 ;;
+    antigravity) echo 2004 ;;
+    opencode) echo 2005 ;;
+    hermes) echo 2010 ;;
+    pi) echo 2011 ;;
+    *) echo "" ;;
+  esac
+}
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -629,19 +695,35 @@ run() {
   fi
 }
 
+if ! getent group cortex >/dev/null 2>&1; then
+  run sudo groupadd -g "$CORTEX_GID" cortex
+fi
+
 for tool in $AGENTS; do
   [ -n "$ONLY" ] && [ "$tool" != "$ONLY" ] && continue
   user="agent-$tool"
-  if id "$user" >/dev/null 2>&1; then
-    echo "exists: $user (skip)"
+  uid="$(uid_of "$tool")"
+  if [ -z "$uid" ]; then
+    echo "no canonical uid for $tool — extend the map first (skip)"
     continue
   fi
-  # GECOS field: no colons (passwd delimiter), keep it plain
-  run sudo useradd --create-home --shell /bin/bash \
-    --comment "Agent user $tool - rule 22 Category B-C" "$user"
-  run sudo passwd -l "$user"
-  run sudo chmod 750 "/home/$user"
+  if id "$user" >/dev/null 2>&1; then
+    have_uid="$(id -u "$user")"
+    [ "$have_uid" != "$uid" ] && echo "WARNING: $user has uid $have_uid, canon is $uid — reconcile manually"
+    echo "exists: $user (skip create)"
+  else
+    # GECOS field: no colons (passwd delimiter), keep it plain
+    run sudo groupadd -g "$uid" "$user"
+    run sudo useradd --uid "$uid" --gid "$uid" --create-home --shell /bin/bash \
+      --comment "Agent user $tool - rule 22 Category B-C" "$user"
+    run sudo passwd -l "$user"
+    run sudo chmod 750 "/home/$user"
+  fi
+  run sudo usermod -aG cortex "$user"
 done
+
+echo "NFS note: if this host serves NFS with manage-gids, flush after changes:"
+echo "  sudo exportfs -f && echo 1 | sudo tee /proc/net/rpc/auth.unix.gid/flush"
 
 [ "$APPLY" -eq 0 ] && echo "(dry-run complete — re-run with --apply after approval)"
 exit 0
@@ -748,7 +830,12 @@ for tool in $AGENTS; do
   run sudo -u "$user" -H mkdir -p \
     "$home/.npm-global" "$home/.local/bin" "$home/.local/pipx" "$home/.config"
   run sudo -u "$user" -H sh -c "grep -q npm-global '$home/.npmrc' 2>/dev/null || printf 'prefix=%s/.npm-global\n' '$home' >> '$home/.npmrc'"
-  run sudo -u "$user" -H sh -c "grep -q npm-global/bin '$home/.profile' 2>/dev/null || printf 'export PATH=\"\$HOME/.npm-global/bin:\$HOME/.local/bin:\$PATH\"\n' >> '$home/.profile'"
+  run sudo -u "$user" -H sh -c "grep -q npm-global/bin '$home/.profile' 2>/dev/null || printf 'export PATH=\"\$HOME/.npm-global/bin:\$HOME/.local/bin:\$PATH\"\numask 002\n' >> '$home/.profile'"
+  run sudo -u "$user" -H git config --global user.name "$user"
+  run sudo -u "$user" -H git config --global user.email "$user@$(hostname | tr 'A-Z' 'a-z').local"
+  run sudo -u "$user" -H git config --global --add safe.directory "/home/metsatron/DotCortex"
+  run sudo -u "$user" -H git config --global --add safe.directory "/home/metsatron/HelmCortex"
+  run sudo -u "$user" -H git config --global --add safe.directory "/home/metsatron/mnt/x230/HelmCortex"
 done
 
 [ "$APPLY" -eq 0 ] && echo "(dry-run complete — re-run with --apply after approval)"
