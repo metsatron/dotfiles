@@ -115,6 +115,28 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     - If you are about to write any IP address into an org tangle block, stop immediately and
       use the env file pattern instead. No exceptions.
 
+22. **Agent Capability Categories** -- agents and AI-adjacent services are not all the same
+    shape. Every agent/service belongs to exactly one category, and its bootstrap follows
+    that category's pattern. Do not give a Category A service Category B powers.
+    - **Category A — containerized keyless API services**: API-backed routing/serving with no
+      filesystem authority. Pattern: no SSH keys, no human home mount, no repo checkout, no
+      agent CLIs, no ssh-agent socket, no Docker socket, no broad host mounts; non-root,
+      dropped capabilities, explicit env allowlist (no silent inheritance from login shells),
+      hash-locked dependencies, loopback-only binding unless explicitly changed; unsupported
+      routes fail loud — never silent fallback to host behaviour.
+    - **Category B — host CLI agents**: interactive agents that genuinely need toolchains,
+      repo work, or supervised escalation. Per-agent Unix users with their own substrates
+      (shell basics, package profiles, npm prefix / pipx under the agent's own home, git
+      config, controlled repo access). Never assume an agent user can reuse the human
+      operator's tools or home.
+    - **Category C — persistent narrow agents**: 24/7 daemons. Own users, sudo limited to
+      enumerated root-owned wrappers, no human keys, no backup-destruction capability.
+    - **Category D — client-side agents**: scoped to one client environment, per-client
+      revocable identities, never trusted with personal-mesh credentials.
+    - Container env files are explicit allowlists: no broad =.env= import without filtering.
+      Docker env-files take values literally — strip =export= prefixes and surrounding quotes
+      when deriving from shell-sourced env files.
+
 ## Agent Config Scoping
 
 Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
