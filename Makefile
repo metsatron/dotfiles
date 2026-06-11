@@ -116,6 +116,7 @@ include $(HOME)/DotCortex/all/.mk/flatpak.mk
 include $(HOME)/DotCortex/all/.mk/icons.mk
 include $(HOME)/DotCortex/all/.mk/guix.mk
 include $(HOME)/DotCortex/all/.mk/guix-substitutes.mk
+include $(HOME)/DotCortex/all/.mk/agent-guix.mk
 include $(HOME)/DotCortex/all/.mk/snap.mk
 include $(HOME)/DotCortex/all/.mk/appimage.mk
 include $(HOME)/DotCortex/all/.mk/cargo.mk
