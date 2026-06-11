@@ -38,7 +38,7 @@ HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mn
 ## Bootstrap (Fresh Machine)
 
 ```bash
-git clone --recursive https://gitlab.com/metsarono/dotfiles.git ~/DotCortex
+git clone --recursive https://gitlab.com/metsatron/dotfiles.git ~/DotCortex
 cd ~/DotCortex && bash INSTALL.sh
 ```
 

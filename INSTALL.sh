@@ -201,7 +201,7 @@ elif [ -d "$DOTCORTEX" ]; then
   warn "DotCortex directory exists but is not a git repo"
 else
   info "Cloning DotCortex..."
-  git clone --recursive https://gitlab.com/metsarono/dotfiles.git "$DOTCORTEX"
+  git clone --recursive https://gitlab.com/metsatron/dotfiles.git "$DOTCORTEX"
   cd "$DOTCORTEX" && git submodule update --recursive --remote
   ok "DotCortex cloned"
 fi

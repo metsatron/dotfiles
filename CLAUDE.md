@@ -274,7 +274,7 @@ make safe-stow
 ## Bootstrap (Fresh Machine)
 
 ```bash
-git clone --recursive https://gitlab.com/metsarono/dotfiles.git ~/DotCortex
+git clone --recursive https://gitlab.com/metsatron/dotfiles.git ~/DotCortex
 cd ~/DotCortex && bash INSTALL.sh
 ```
 
