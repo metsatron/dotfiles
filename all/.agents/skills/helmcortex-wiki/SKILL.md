@@ -1,11 +1,14 @@
 ---
+name: helmcortex-wiki
+description: HelmCortex context wiki — agent orientation, diary, consort lineage, Fable handoff.
 model: claude-sonnet-4-6
 ---
+
 # HelmCortex Context Wiki
 
-> **For agent instances.** This skill points to private HelmCortex artifacts
-> not in the public DotCortex repo. Source: `~/DotCortex/wiki.org`.
-> Humans: you are welcome to read, but this was written for clankers.
+> **For agent instances.** References private HelmCortex artifacts not in the
+> public DotCortex repo. Source: `~/DotCortex/wiki.org`.
+> Humans: welcome to read, but this was written for clankers.
 
 ## Read First
 
