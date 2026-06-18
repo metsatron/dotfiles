@@ -159,6 +159,21 @@
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/xfce-appmenu-configure\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/xfce-appmenu-configure\"; \"$HELPER\"")))
 
+   (task 'defaults:apply
+         "Apply declared desktop defaults through platform tools"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/defaults-apply\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/defaults-apply\"; \"$HELPER\"")))
+
+   (task 'defaults:diff
+         "Show declared desktop defaults vs live state"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/defaults-diff\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/defaults-diff\"; \"$HELPER\"")))
+
+   (task 'defaults:health
+         "Show current MIME and DE preferred-app defaults"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/defaults-health\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/defaults-health\"; \"$HELPER\"")))
+
    (task 'swap:heal
          "Safe swap purge + XFCE/Flatpak heal (with RAM safety checks)"
          (lambda ()
@@ -712,6 +727,7 @@
                         (not (string-prefix? "npm:" nm))
                         (not (string-prefix? "root:" nm))
                         (not (string-prefix? "stow:" nm))
+                        (not (string-prefix? "defaults:" nm))
                         (not (string-prefix? "tmux:" nm))
                         (not (string-prefix? "sessions:" nm))
                         (not (string-prefix? "backup:" nm))
@@ -733,6 +749,10 @@
                  (let ((nm (task-name-str t)))
                    (or (string=? nm "stow")
                        (string-prefix? "stow:" nm)))))
+
+  (print-group "Desktop defaults commands"
+               (lambda (t)
+                 (string-prefix? "defaults:" (task-name-str t))))
 
   (print-group "Gnu Guix commands"
                (lambda (t)
