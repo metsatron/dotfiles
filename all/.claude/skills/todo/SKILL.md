@@ -13,3 +13,6 @@ Use this to route and update DotCortex TODO items.
 - Use Obsidian Tasks format.
 - Keep TODO files action-oriented, not research-shaped.
 - Route concrete tasks to the right HelmCortex TODO page when the work belongs there.
+- Mark individual completed tasks in place with `[x] ... ✅ YYYY-MM-DD`.
+- Move content to `LOGS/TODO/closed/` only when an entire task block is complete; never move isolated done items out of an otherwise-active block.
+- Never delete completed task history; when a full block is closed, move the block intact to the matching closed ledger.
