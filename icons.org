@@ -296,6 +296,10 @@ Pixel art defaults to nearest-neighbor scaling so crisp source pixels do not get
 blurred. Use =--resample lanczos= for painterly or antialiased source art.
 Use =--magic-pink= when an icon generator gives you a PNG with a fake
 =#ff00ff= transparency matte instead of an alpha channel.
+Use =--trim-transparent= after color-keying to crop away transparent borders
+while preserving the icon's aspect ratio on a square transparent canvas.
+The first =--names= entry is written as the real PNG. Additional aliases are
+relative symlinks by default to avoid duplicate binary payloads.
 
 #+BEGIN_SRC python :tangle all/.local/bin/icon-theme-inject :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 from __future__ import annotations
@@ -307,9 +311,9 @@ from PIL import Image
 
 
 THEME_SIZES = {
-    "Irixium": (16, 22, 24, 32, 48),
+    "Irixium": (16, 22, 24, 32, 48, 64, 128, 256),
     "BeOS-r5-Icons": (16, 22, 24, 32, 48, 64, 128, 256),
-    "indigo-reality": (16, 22, 32, 48, 256),
+    "indigo-reality": (16, 22, 32, 48, 64, 128, 256),
 }
 
 
@@ -323,6 +327,23 @@ def theme_app_dir(theme: str, size: int) -> Path:
 
 def parse_csv(value: str) -> list[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def replace_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        raise SystemExit(f"refusing to replace non-file path: {path}")
+
+
+def write_icon_alias(alias: Path, target_name: str, copy_aliases: bool) -> None:
+    if alias.exists() or alias.is_symlink():
+        replace_path(alias)
+    if copy_aliases:
+        source = alias.with_name(target_name)
+        alias.write_bytes(source.read_bytes())
+    else:
+        alias.symlink_to(target_name)
 
 
 def parse_hex_color(value: str) -> tuple[int, int, int]:
@@ -356,6 +377,26 @@ def remove_color_key(image: Image.Image, color: tuple[int, int, int], tolerance:
     return keyed
 
 
+def trim_transparent(image: Image.Image, padding: int) -> Image.Image:
+    alpha = image.getchannel("A")
+    bbox = alpha.getbbox()
+    if bbox is None:
+        return image
+
+    left, top, right, bottom = bbox
+    if padding > 0:
+        left = max(0, left - padding)
+        top = max(0, top - padding)
+        right = min(image.width, right + padding)
+        bottom = min(image.height, bottom + padding)
+
+    cropped = image.crop((left, top, right, bottom))
+    side = max(cropped.width, cropped.height)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(cropped, ((side - cropped.width) // 2, (side - cropped.height) // 2))
+    return square
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Inject scaled app icons into repo-managed DotCortex icon themes."
@@ -364,6 +405,11 @@ def main() -> int:
     parser.add_argument("--themes", default="Irixium,BeOS-r5-Icons", help="comma-separated theme names")
     parser.add_argument("--names", required=True, help="comma-separated icon names without .png")
     parser.add_argument("--sizes", default="", help="comma-separated sizes; default follows each theme")
+    parser.add_argument(
+        "--copy-aliases",
+        action="store_true",
+        help="write every --names entry as a physical PNG instead of symlinking aliases",
+    )
     parser.add_argument(
         "--resample",
         choices=("nearest", "lanczos"),
@@ -387,6 +433,17 @@ def main() -> int:
         action="store_true",
         help="shortcut for --transparent-color #ff00ff",
     )
+    parser.add_argument(
+        "--trim-transparent",
+        action="store_true",
+        help="crop transparent borders after color-keying and pad back to square before resizing",
+    )
+    parser.add_argument(
+        "--trim-padding",
+        type=int,
+        default=0,
+        help="source-pixel padding to preserve around --trim-transparent crops",
+    )
     parser.add_argument("--repo-root", default=".", help="DotCortex repository root")
     args = parser.parse_args()
 
@@ -408,6 +465,10 @@ def main() -> int:
         if args.transparent_tolerance < 0:
             raise SystemExit("--transparent-tolerance must be zero or greater")
         image = remove_color_key(image, transparent_color, args.transparent_tolerance)
+    if args.trim_padding < 0:
+        raise SystemExit("--trim-padding must be zero or greater")
+    if args.trim_transparent:
+        image = trim_transparent(image, args.trim_padding)
 
     written = 0
     for theme in themes:
@@ -418,10 +479,17 @@ def main() -> int:
             app_dir = repo_root / theme_app_dir(theme, size)
             app_dir.mkdir(parents=True, exist_ok=True)
             scaled = image.resize((size, size), resample)
-            for name in names:
-                dst = app_dir / f"{name}.png"
-                scaled.save(dst)
-                print(f"{dst.relative_to(repo_root)} {size}x{size}")
+            primary = app_dir / f"{names[0]}.png"
+            if primary.exists() or primary.is_symlink():
+                replace_path(primary)
+            scaled.save(primary)
+            print(f"{primary.relative_to(repo_root)} {size}x{size}")
+            written += 1
+            for name in names[1:]:
+                alias = app_dir / f"{name}.png"
+                write_icon_alias(alias, primary.name, args.copy_aliases)
+                mode = "copy" if args.copy_aliases else "symlink"
+                print(f"{alias.relative_to(repo_root)} -> {primary.name} ({mode})")
                 written += 1
 
     print(f"icon-theme-inject: wrote {written} icon files")
@@ -448,14 +516,22 @@ if __name__ == "__main__":
 - Add app-id aliases when launchers or Flatpaks may resolve those instead
   (example: =firedragon=, =org.garudalinux.firedragon=,
   =garudalinux-firedragon=).
+- Put the preferred real icon name first in =--names=. Additional names become
+  relative symlinks by default; use =--copy-aliases= only when a consumer cannot
+  resolve aliases.
 - Keep icons in the =apps= context unless the desktop file points elsewhere.
 
 ** Pixel art handling
 - For pixel-art source, scale with nearest-neighbor and inspect small sizes.
 - For fake-alpha PNGs, run with =--magic-pink= or
   =--transparent-color '#ff00ff'= before resizing.
+- For source art with too much matte space, add =--trim-transparent= after
+  color-keying. It crops transparent borders, then pads back to square so icons
+  do not distort.
 - For antialiased/painterly source, use =--resample lanczos=.
 - Generate real size-specific PNGs; do not place a 1024px image in 16px slots.
+- For Plasma/SonicDE, include high-resolution app sizes such as 64, 128, and
+  256px so panels and switchers do not bilinear-upscale a 48px icon.
 - Good future tools to declare in package manifests: =imagemagick= for format
   conversion/sprite sheets, =oxipng= for lossless PNG optimization,
   =pngquant= for lossy palette compression when file size matters, and
