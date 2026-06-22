@@ -13,7 +13,7 @@ BENCH_DIR := $(GUIX_HOME)/.bench
 PULL_CACHE := $(BENCH_DIR)/pull-url
 FALLBACK_PULL_URLS ?= https://git.cbaines.net/guix/guix https://codeberg.org/guix/guix.git https://git.savannah.gnu.org/git/guix.git
 
-.PHONY: guix-dirs guix-pull-bench guix-pull guix-core guix-dev guix-gc guix-nonguix
+.PHONY: guix-dirs guix-pull-bench guix-pull guix-core guix-dev guix-gc guix-nonguix guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde
 
 guix-dirs:
 | @chmod +x $(HOME)/.local/bin/guix-mkdirs 2>/dev/null || true
@@ -77,6 +77,23 @@ guix-dev: guix-core
 guix-nonguix: guix-dirs
 | mkdir -p $(EXTRA)/nonguix
 | $(GUIX) package -m $(GUIX_HOME)/manifests/nonguix.scm -p $(EXTRA)/nonguix/nonguix
+
+# Virtual Habitat — sanctuary substrate profiles (Phase 0B stubs; apply in Phase 1A)
+guix-desktop-common: guix-dirs
+| mkdir -p $(EXTRA)/desktop-common
+| $(GUIX) package -m $(GUIX_HOME)/manifests/desktop-common.scm -p $(EXTRA)/desktop-common/desktop-common
+
+guix-sanctuary-qtile: guix-desktop-common
+| mkdir -p $(EXTRA)/sanctuary-qtile
+| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-qtile.scm -p $(EXTRA)/sanctuary-qtile/sanctuary-qtile
+
+guix-sanctuary-gnustep: guix-desktop-common
+| mkdir -p $(EXTRA)/sanctuary-gnustep
+| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-gnustep.scm -p $(EXTRA)/sanctuary-gnustep/sanctuary-gnustep
+
+guix-sanctuary-cde: guix-desktop-common
+| mkdir -p $(EXTRA)/sanctuary-cde
+| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-cde.scm -p $(EXTRA)/sanctuary-cde/sanctuary-cde
 
 guix-gc:
 | $(GUIX) gc

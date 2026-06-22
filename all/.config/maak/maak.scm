@@ -191,6 +191,10 @@
    (task 'guix:apply "Build core+dev profiles"
          (lambda () (mk-guix "guix-core guix-dev guix-nonguix")))
 
+   ;; Virtual Habitat sanctuary substrate profiles (Phase 0B declared; apply in Phase 1A)
+   (task 'guix:sanctuary-apply "Build desktop-common + sanctuary Guix profiles (Phase 1A)"
+         (lambda () (mk-guix "guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde")))
+
    (task 'guix:git-bench
          "Probe guix channel mirrors and print the fastest URL (writes cache)"
          (lambda () (sh "make -f ~/DotCortex/all/.mk/guix.mk guix-pull-bench")))
