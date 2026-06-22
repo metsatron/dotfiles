@@ -35,6 +35,7 @@
    "linux-pam" "libtirpc" "rpcsvc-proto" "rpcbind"
    "openssl" "tcl" "lmdb" "opensp" "ncompress"
    "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
+   "perl" "mkfontdir" "bdftopcf"
    ;; Media
    "freetype" "libjpeg-turbo"
    ;; Fallback terminal inside the sanctuary
