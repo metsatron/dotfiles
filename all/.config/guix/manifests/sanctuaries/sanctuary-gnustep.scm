@@ -1,18 +1,17 @@
 ;; sanctuary-gnustep
 
-;; Window Maker and GNUstep are installed from apt inside the Debian-based Distrobox
-;; container. This Guix manifest holds only Guix-managed complements (if any).
-;; Validate which GNUstep/Window Maker packages exist in Guix before filling this in.
+;; Window Maker is available in Guix (=windowmaker= 0.96.0). Full GNUstep runtime
+;; (gnustep-base, gnustep-gui, gnustep-back) is not in Guix channels — those can be
+;; added via source build inside the container in a later phase.
 
 
 ;; [[file:../../../../../guix.org::*sanctuary-gnustep][sanctuary-gnustep:1]]
 ;; Virtual Habitat — sanctuary-gnustep Guix profile
-;; Window Maker + GNUstep come from apt inside the Distrobox container.
-;; Only Guix-managed complements go here.
-;; TODO (Phase 1A): audit Guix package availability with `guix search windowmaker gnustep`
+;; Window Maker from Guix. GNUstep runtime (base/gui/back) not in Guix channels;
+;; compile from source inside the container in a later phase.
 (specifications->manifest
  '(
-   ;; "windowmaker"   ; likely not in Guix — use apt inside container
-   ;; "gnustep-make"  ; likely not in Guix — use apt inside container
+   "windowmaker"    ; classic NeXT-style WM — in Guix 0.96.0
+   "xterm"          ; fallback terminal inside the sanctuary
    ))
 ;; sanctuary-gnustep:1 ends here
