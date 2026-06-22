@@ -36,6 +36,8 @@
    "openssl" "tcl" "lmdb" "opensp" "ncompress"
    "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
    "perl" "mkfontdir" "bdftopcf"
+   ;; X11 extensions
+   "libxscrnsaver"
    ;; Media
    "freetype" "libjpeg-turbo" "bzip2"
    ;; Fallback terminal inside the sanctuary
