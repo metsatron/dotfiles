@@ -18,10 +18,11 @@
 ;; Install target: ~/.local/share/cde (user-writable, persists in sanctuary home).
 (specifications->manifest
  '(
-   ;; Build toolchain
+   ;; Build toolchain + download/unpack tools
    "autoconf" "automake" "libtool"
    "gcc-toolchain" "make" "m4"
    "bison" "flex" "patch" "git"
+   "tar" "curl" "gzip"
    ;; OpenMotif — the required Motif implementation (verified in Guix)
    "motif"
    ;; X11 libraries
