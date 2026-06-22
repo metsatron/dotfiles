@@ -32,7 +32,7 @@
    ;; X11 tools (needed by CDE at build and runtime)
    "sessreg" "xrdb" "xset" "xbitmaps"
    ;; System libraries
-   "linux-pam" "libtirpc" "rpcsvc-proto" "rpcbind"
+   "linux-pam" "libxcrypt" "libtirpc" "rpcsvc-proto" "rpcbind"
    "openssl" "tcl" "lmdb" "opensp" "ncompress"
    "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
    "perl" "mkfontdir" "bdftopcf"
