@@ -22,7 +22,7 @@
    "autoconf" "automake" "libtool"
    "gcc-toolchain" "make" "m4"
    "bison" "flex" "patch" "git"
-   "tar" "curl" "gzip"
+   "tar" "curl" "gzip" "pkg-config"
    ;; OpenMotif — the required Motif implementation (verified in Guix)
    "motif"
    ;; X11 libraries
