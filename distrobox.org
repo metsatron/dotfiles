@@ -59,8 +59,12 @@ No package content: packages come from the host store bind-mount.
 # Uses sanctuary-base.scm — minimal Guix rootfs for Distrobox compatibility only.
 # Actual packages (qtile, emacs, etc.) come from host /gnu/store bind-mount.
 #
+# guix pack produces a functional environment image with no /etc/passwd.
+# This script injects a second OCI layer adding the system files that
+# the OCI runtime (crun) and Distrobox need before they can start a container.
+#
 # Run once, and re-run if sanctuary-base.scm changes.
-# Requires: guix (channel-pinned), podman
+# Requires: guix (channel-pinned), podman, python3
 set -euo pipefail
 
 GUIX="${HOME}/.config/guix/current/bin/guix"
@@ -74,13 +78,92 @@ fi
 echo "==> Packing Guix base image from ${BASE_MANIFEST}…"
 tarball="$( "${GUIX}" pack -f docker \
   --entry-point=/bin/sh \
-  -S /bin=bin -S /usr/bin=usr/bin -S /lib=lib \
+  -S /bin=bin \
   -m "${BASE_MANIFEST}" 2>&1 | tail -1 )"
 
 echo "    tarball: ${tarball}"
-echo "==> Loading into Podman as sanctuary-base:guix…"
-podman load < "${tarball}"
-image_id="$( podman images --format '{{.ID}}' | head -1 )"
+
+# ---- Inject system files layer ----
+# guix pack creates a functional environment with no /etc/passwd.
+# crun (OCI runtime) and Distrobox both require it before the container can start.
+# We add a second OCI layer with the minimal system files.
+
+echo "==> Injecting system files layer (/etc/passwd, /etc/shadow, /etc/group, /root, /tmp)…"
+WORK_DIR="$(mktemp -d)"
+trap "rm -rf '${WORK_DIR}'" EXIT
+
+tar xzf "${tarball}" -C "${WORK_DIR}"
+
+LAYER_STAGE="${WORK_DIR}/etc-layer-stage"
+mkdir -p "${LAYER_STAGE}/etc" "${LAYER_STAGE}/root" "${LAYER_STAGE}/tmp" "${LAYER_STAGE}/var/tmp"
+
+cat > "${LAYER_STAGE}/etc/passwd" <<'PASSWDEOF'
+root:x:0:0:root:/root:/bin/sh
+nobody:x:65534:65534:nobody:/nonexistent:/bin/false
+PASSWDEOF
+
+cat > "${LAYER_STAGE}/etc/group" <<'GROUPEOF'
+root:x:0:
+nogroup:x:65534:
+GROUPEOF
+
+printf 'root:!:19000:0:99999:7:::\n' > "${LAYER_STAGE}/etc/shadow"
+chmod 640 "${LAYER_STAGE}/etc/shadow"
+chmod 1777 "${LAYER_STAGE}/tmp"
+chmod 1777 "${LAYER_STAGE}/var/tmp"
+
+# Distrobox-init calls `command -v <shell>` (from $SHELL on the host) before the
+# guix profile bind-mounts are added to PATH.  /bin is symlinked to the guix
+# profile/bin, but zsh is not in sanctuary-base.scm.  /usr/bin IS in the default
+# PATH, so we add a symlink there pointing into the desktop-common profile
+# (which is bind-mounted before any process runs in the container).
+mkdir -p "${LAYER_STAGE}/usr/bin" "${LAYER_STAGE}/usr/sbin"
+ln -s /home/metsatron/.guix-extra-profiles/desktop-common/desktop-common/bin/zsh \
+  "${LAYER_STAGE}/usr/bin/zsh"
+
+# Pre-seed /.containersetupdone so Distrobox skips the package manager block.
+# Without a supported pkg manager (apt/pacman/dnf/etc), Distrobox's init exits 127.
+# Guix containers get packages via /gnu/store bind-mount, not a pkg manager.
+touch "${LAYER_STAGE}/.containersetupdone"
+
+LAYER_TAR_RAW="${WORK_DIR}/sys-layer.tar"
+tar -C "${LAYER_STAGE}" -cf "${LAYER_TAR_RAW}" .
+
+DIFF_ID="sha256:$(sha256sum < "${LAYER_TAR_RAW}" | cut -d' ' -f1)"
+LAYER_DIR_NAME="${DIFF_ID#sha256:}"
+mkdir -p "${WORK_DIR}/${LAYER_DIR_NAME}"
+cp "${LAYER_TAR_RAW}" "${WORK_DIR}/${LAYER_DIR_NAME}/layer.tar"
+echo "1.0" > "${WORK_DIR}/${LAYER_DIR_NAME}/VERSION"
+
+python3 - <<PYEOF
+import json, os
+d = '${WORK_DIR}'
+with open(os.path.join(d, 'manifest.json')) as f:
+    m = json.load(f)
+m[0]['Layers'].append('${LAYER_DIR_NAME}/layer.tar')
+with open(os.path.join(d, 'manifest.json'), 'w') as f:
+    json.dump(m, f)
+with open(os.path.join(d, 'config.json')) as f:
+    c = json.load(f)
+c['rootfs']['diff_ids'].append('${DIFF_ID}')
+c['history'].append({
+    'created': '1970-01-01T00:00:01Z',
+    'created_by': 'sanctuary-base-build: inject system files',
+    'comment': '/etc/passwd /etc/group /etc/shadow /root /tmp'
+})
+with open(os.path.join(d, 'config.json'), 'w') as f:
+    json.dump(c, f)
+PYEOF
+
+echo "    diff_id: ${DIFF_ID}"
+
+echo "==> Loading patched image into Podman as sanctuary-base:guix…"
+# Capture the loaded image reference from `podman load` output (e.g. "Loaded image: repo:tag")
+loaded_ref="$( tar -C "${WORK_DIR}" --exclude='etc-layer-stage' --exclude='sys-layer.tar' -cf - . \
+  | podman load 2>&1 | grep 'Loaded image' | sed 's/Loaded image: //' )"
+echo "    loaded: ${loaded_ref}"
+image_id="$( podman images --format '{{.ID}}' --filter "reference=${loaded_ref}" | head -1 )"
+[[ -z "${image_id}" ]] && image_id="$( podman images --format '{{.ID}}' | head -1 )"
 podman tag "${image_id}" "sanctuary-base:guix"
 echo "    tagged: sanctuary-base:guix"
 echo "Done. Run distrobox-sanctuaries-create to create the sanctuaries."

@@ -18,6 +18,8 @@
  '(
    "bash"
    "coreutils"
+   "glibc"         ; getent — Distrobox init uses getent passwd heavily; without it the
+                   ; elif branch runs with empty current_user_entry and hits exit 1
    "shadow"        ; useradd / passwd / group management — Distrobox requires this
    "util-linux"    ; basic system utilities (mount, login, etc.)
    "findutils"     ; find, xargs
