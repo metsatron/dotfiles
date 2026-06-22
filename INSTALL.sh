@@ -788,6 +788,38 @@ for shell_file in "$HOME/.zshenv" "$HOME/.zshrc" "$HOME/.bashrc"; do
 done
 
 # ══════════════════════════════════════════════════════════════
+# Phase 10.5: TTY Colemak keymap
+# ══════════════════════════════════════════════════════════════
+info "Phase 10.5: TTY Colemak keymap"
+
+# Apply Colemak to all virtual consoles immediately.
+# ckbcomp (from console-setup) converts the X11 layout to console format
+# without needing console-data installed. /etc/default/keyboard already has
+# XKBLAYOUT=us / XKBVARIANT=colemak; this makes it take effect now and at boot.
+if command -v ckbcomp >/dev/null 2>&1; then
+  ckbcomp us colemak | $SUDO loadkeys 2>/dev/null \
+    && ok "Colemak applied to TTY" \
+    || warn "loadkeys failed — TTY may still be QWERTY"
+
+  # Wire into rc.local for boot persistence (idempotent)
+  RC_LOCAL=/etc/rc.local
+  KEYMAP_LINE="ckbcomp us colemak | loadkeys 2>/dev/null || true"
+  if ! grep -qF "$KEYMAP_LINE" "$RC_LOCAL" 2>/dev/null; then
+    # Insert before exit 0 if present, otherwise append
+    if grep -q "^exit 0" "$RC_LOCAL" 2>/dev/null; then
+      $SUDO sed -i "s|^exit 0|${KEYMAP_LINE}\nexit 0|" "$RC_LOCAL"
+    else
+      printf '\n%s\n' "$KEYMAP_LINE" | $SUDO tee -a "$RC_LOCAL" >/dev/null
+    fi
+    ok "Colemak keymap wired into $RC_LOCAL"
+  else
+    ok "Colemak already in $RC_LOCAL"
+  fi
+else
+  warn "ckbcomp not found — install console-setup to enable TTY Colemak"
+fi
+
+# ══════════════════════════════════════════════════════════════
 # Done
 # ══════════════════════════════════════════════════════════════
 echo ""
