@@ -37,7 +37,7 @@
    "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
    "perl" "mkfontdir" "bdftopcf"
    ;; Media
-   "freetype" "libjpeg-turbo"
+   "freetype" "libjpeg-turbo" "bzip2"
    ;; Fallback terminal inside the sanctuary
    "xterm"
    ))
