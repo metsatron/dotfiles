@@ -38,7 +38,6 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
    - bullet point details of what changed
    - focus on WHY not just WHAT
 
-   Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
    ```
 
 5. **Refresh visibility before staging:**
