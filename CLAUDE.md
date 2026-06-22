@@ -395,6 +395,32 @@ pkill firedragon   # or whichever app
 # then reopen from launcher
 ```
 
+### XFCE Screenshot Region Tool Leaves Ghost InputOnly Window (T480s)
+
+Taking a screenshot with the region-select tool (xfce4-screenshooter or similar) creates a
+fullscreen `InputOnly` + `Override Redirect` X window for the selection overlay. If the tool
+crashes or is killed mid-selection, this ghost window is left mapped over the entire screen.
+It is completely invisible but swallows all mouse clicks and keyboard input. Symptoms: cursor
+only appears briefly during Alt+Tab, can't click or type anywhere in the desktop.
+
+Diagnosis and fix (run from a TTY or any terminal with DISPLAY access):
+
+```bash
+export DISPLAY=:0 XAUTHORITY=~/.Xauthority
+
+# Find the ghost window — look for InputOnly + Override Redirect + 1920x1080+0+0
+xwininfo -root -children | grep "1920x1080+0+0"
+# Note the window ID (e.g. 0x5000004), then confirm:
+xwininfo -id 0x5000004 | grep -E "Class|Override|Map State"
+# Should show: Class: InputOnly, Override Redirect State: yes, Map State: IsViewable
+
+# Kill it
+xdotool windowkill 0x5000004
+
+# Also reset the root cursor in case it was hidden
+xsetroot -cursor_name left_ptr
+```
+
 ## HelmCortex Integration
 
 DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow files into HelmCortex -- HelmCortex owns all its own configs (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs) directly.
