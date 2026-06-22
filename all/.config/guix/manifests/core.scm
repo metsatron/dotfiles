@@ -40,6 +40,8 @@
 
    "smem"
 
+   "distrobox"              ; Virtual Habitat container management (wraps Podman)
+
    ;; rust/cargo managed via dotcortex-rust-env (rustup) — not Guix
    ;; cargo crates managed via cargo.org
    ;; "starship"
