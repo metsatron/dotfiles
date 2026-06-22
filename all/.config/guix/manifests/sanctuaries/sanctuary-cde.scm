@@ -1,18 +1,42 @@
 ;; sanctuary-cde
 
-;; Open CDE (=cdesktopenv= / =arcfide/CDesktopEnv=) is compiled from source inside
-;; the container. This profile holds Guix-managed build toolchain supplements if
-;; needed alongside apt-provided Motif/X11 dependencies.
+;; Official CDE 2.5.3 (=cdesktopenv= on SourceForge, released 2025-11-25) is compiled
+;; from source inside the container. Source: =cde-2.5.3.tar.gz= — NOT the stale 2012
+;; =arcfide/CDesktopEnv= clone. Build with =./autogen.sh && ./configure && make && make install=.
+;; Session entrypoint: =<prefix>/bin/Xsession= (NOT =dtlogin=, NOT =startx=).
+;; Do NOT use: imake, make World, installCDE, LessTif, libXp.
+
+;; This profile provides the full build toolchain and all CDE library dependencies
+;; available in Guix. Missing from Guix: =libutempter= (use =--disable-utmpx= if
+;; configure supports it), libXScrnSaver. These are non-critical for a basic CDE
+;; desktop in Xephyr; address if configure fails.
 
 
 ;; [[file:../../../../../guix.org::*sanctuary-cde][sanctuary-cde:1]]
 ;; Virtual Habitat — sanctuary-cde Guix profile
-;; Open CDE is built from source — Motif/X11/imake deps come from apt.
-;; Only Guix-managed build toolchain supplements go here.
-;; TODO (Phase 1B): audit which CDE build deps (if any) are better sourced from Guix
+;; CDE 2.5.3 build toolchain and library deps — all sourced from Guix.
+;; Install target: ~/.local/share/cde (user-writable, persists in sanctuary home).
 (specifications->manifest
  '(
-   ;; "motif"    ; OpenMotif — check if available in Guix or use apt libmotif-dev
-   ;; "imake"    ; X11 build tool — TODO validate
+   ;; Build toolchain
+   "autoconf" "automake" "libtool"
+   "gcc-toolchain" "make" "m4"
+   "bison" "flex" "patch" "git"
+   ;; OpenMotif — the required Motif implementation (verified in Guix)
+   "motif"
+   ;; X11 libraries
+   "libx11" "libxt" "libxmu" "libxft"
+   "libxinerama" "libxpm" "libxaw"
+   "libxdmcp" "libxrender"
+   ;; X11 tools (needed by CDE at build and runtime)
+   "sessreg" "xrdb" "xset" "xbitmaps"
+   ;; System libraries
+   "linux-pam" "libtirpc" "rpcsvc-proto" "rpcbind"
+   "openssl" "tcl" "lmdb" "opensp" "ncompress"
+   "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
+   ;; Media
+   "freetype" "libjpeg-turbo"
+   ;; Fallback terminal inside the sanctuary
+   "xterm"
    ))
 ;; sanctuary-cde:1 ends here
