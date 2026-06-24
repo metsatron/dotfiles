@@ -14,7 +14,8 @@
 (specifications->manifest
  '(
    "icewm"    ; Win9x/XP-era WM — confirmed in Guix; first slice uses Windows-95 theme
-   "pcmanfm"  ; GTK file manager — period-appropriate for the Win9x desktop aesthetic
+   "pcmanfm"  ; GTK file manager — requires dbus session (provided by dbus-run-session below)
+   "dbus"     ; dbus-run-session wraps the icewm-session so GLib/GIO apps (pcmanfm) can launch
    "xterm"    ; fallback terminal inside gaming sanctuaries
    ))
 ;; room-gaming:1 ends here
