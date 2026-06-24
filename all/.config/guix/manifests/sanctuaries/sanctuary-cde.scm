@@ -33,6 +33,7 @@
    "sessreg" "xrdb" "xset" "xbitmaps"
    ;; System libraries
    "linux-pam" "libxcrypt" "libtirpc" "rpcsvc-proto" "rpcbind"
+   "net-base" "inetutils" "gawk" "cups"
    "openssl" "tcl" "lmdb" "opensp" "ncompress"
    "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
    "perl" "mkfontdir" "bdftopcf"
