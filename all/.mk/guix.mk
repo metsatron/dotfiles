@@ -13,7 +13,7 @@ BENCH_DIR := $(GUIX_HOME)/.bench
 PULL_CACHE := $(BENCH_DIR)/pull-url
 FALLBACK_PULL_URLS ?= https://git.cbaines.net/guix/guix https://codeberg.org/guix/guix.git https://git.savannah.gnu.org/git/guix.git
 
-.PHONY: guix-dirs guix-pull-bench guix-pull guix-core guix-dev guix-gc guix-nonguix guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde
+.PHONY: guix-dirs guix-pull-bench guix-pull guix-core guix-dev guix-gc guix-nonguix guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-room-gaming
 
 guix-dirs:
 | @chmod +x $(HOME)/.local/bin/guix-mkdirs 2>/dev/null || true
@@ -94,6 +94,10 @@ guix-sanctuary-gnustep: guix-desktop-common
 guix-sanctuary-cde: guix-desktop-common
 | mkdir -p $(EXTRA)/sanctuary-cde
 | $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-cde.scm -p $(EXTRA)/sanctuary-cde/sanctuary-cde
+
+guix-room-gaming: guix-desktop-common
+| mkdir -p $(EXTRA)/room-gaming
+| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/room-gaming.scm -p $(EXTRA)/room-gaming/room-gaming
 
 guix-gc:
 | $(GUIX) gc
