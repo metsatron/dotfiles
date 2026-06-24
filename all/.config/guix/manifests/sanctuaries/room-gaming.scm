@@ -13,7 +13,8 @@
 ;; Apply: make guix-room-gaming   OR   loom guix:sanctuary-apply
 (specifications->manifest
  '(
-   "icewm"   ; Win9x/XP-era WM — confirmed in Guix; first slice uses Windows-95 theme
-   "xterm"   ; fallback terminal inside gaming sanctuaries
+   "icewm"    ; Win9x/XP-era WM — confirmed in Guix; first slice uses Windows-95 theme
+   "pcmanfm"  ; GTK file manager — period-appropriate for the Win9x desktop aesthetic
+   "xterm"    ; fallback terminal inside gaming sanctuaries
    ))
 ;; room-gaming:1 ends here
