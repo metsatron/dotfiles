@@ -20,13 +20,14 @@
   #:use-module (guix download)
   #:use-module (guix build-system gnu)
   #:use-module ((guix licenses) #:prefix license:)
-  #:use-module (gnu packages audio)
-  #:use-module (gnu packages autotools)
-  #:use-module (gnu packages compression)
-  #:use-module (gnu packages fontutils)
-  #:use-module (gnu packages gl)
-  #:use-module (gnu packages pkg-config)
-  #:use-module (gnu packages sdl))
+  #:use-module (gnu packages audio)       ; fluidsynth
+  #:use-module (gnu packages autotools)   ; autoconf automake libtool
+  #:use-module (gnu packages compression) ; zlib
+  #:use-module (gnu packages gl)          ; mesa
+  #:use-module (gnu packages image)       ; libpng
+  #:use-module (gnu packages linux)       ; alsa-lib
+  #:use-module (gnu packages pkg-config)  ; pkg-config
+  #:use-module (gnu packages sdl))        ; sdl2 sdl2-net
 
 (define-public dosbox-x
   (package
@@ -48,6 +49,15 @@
          "--enable-silent-rules")
        #:phases
        (modify-phases %standard-phases
+         (add-after 'unpack 'force-sdl2
+           (lambda _
+             ;; Guix builds this package on SDL2. Upstream 2026.06.02 still
+             ;; trips the configure logic into SDL3 even when --disable-sdl3 is
+             ;; present, so force the local configure default back to SDL2.
+             (substitute* "configure.ac"
+               (("dnl LIBRARY USE: SDL selection")
+                "enable_sdl3=no\n\ndnl LIBRARY USE: SDL selection"))
+             #t))
          (add-before 'configure 'bootstrap
            (lambda _
              (invoke "sh" "autogen.sh"))))))
