@@ -23,6 +23,7 @@
    "borg"            ; helmcortex-borg multi-endpoint backup
    "inotify-tools"   ; helmcortex-borg watch verb (inotifywait)
    "flatpak"
+   "distrobox"             ; Virtual Habitat control plane — sanctuary-exec and launchers require it
    "fastfetch" "wfetch" "uwufetch" "macchina"
    "rofi"
    ;; "kitty"
