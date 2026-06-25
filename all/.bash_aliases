@@ -50,6 +50,8 @@ alias gc='git commit'
 alias gp='git push'
 alias gr='git rm'
 alias clone='git clone'
+# Fleet multiplexer picker (tmux + Zellij)
+alias mux='mux-session'
 alias ..='cd ..'
 alias ...='cd ../..'
 alias update='sudo apt update && sudo apt upgrade'

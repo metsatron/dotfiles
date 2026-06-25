@@ -118,3 +118,9 @@ Related red herring: a session-stale `GUIX_PYTHONPATH` (e.g. `python3.11` site-p
 ## /model and /config write into the stowed settings.json
 
 `~/.claude/settings.json` is a stow symlink into `all/.claude/settings.json`, so harness commands that persist defaults (`/model`, `/config`, theme changes) dirty the tracked DotCortex worktree directly. Don't commit the tangled file alone — backport the new keys into the settings block in `hooks.org`, re-tangle, and commit both together (T480, 2026-06-10).
+
+## ssh ConnectTimeout does NOT bound a hung remote command (mux-session picker hang)
+
+`ssh -o ConnectTimeout=N -o ConnectionAttempts=1` only bounds the TCP/auth handshake. Once the connection succeeds, a remote command that hangs blocks the local `ssh` forever — `ConnectTimeout` never fires. This bit `mux-session`: `build_menu` probes every fleet host sequentially (`tmux`/`zellij`/`wsl.exe ... tmux list-sessions`) before drawing the fzf picker, so one wedged probe meant the picker never rendered. Intermittent because it only bit when a Windows host (gillean/judith) was powered on but its WSL was cold/unresponsive — the `wsl.exe ... tmux list-sessions` command connected, then hung. Symptom looked like "stuck waiting to attach" even though it never got past the listing stage.
+
+Fix pattern: wrap probe SSH in `timeout` — `timeout -k 1 N ssh ...` bounds the whole command no matter where it stalls. Apply to listing/probe SSH only, never the interactive `ssh -t` attach/create path. See `mux.org`'s `ssh_probe` helper (T480s, 2026-06-25).
