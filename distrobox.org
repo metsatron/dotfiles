@@ -290,18 +290,29 @@ distrobox create \
   --no-entry
 
 # --- sanctuary-redstone-9x: Redstone 9X IceWM (gaming wing, first slice) ---
+REDSTONE_EXTRA_VOLUMES=()
+for resource in \
+  /usr/share/themes/Windows-95 \
+  /usr/share/icons/Windows-95 \
+  /usr/share/icons/Win95
+do
+  if [[ -d "${resource}" ]]; then
+    REDSTONE_EXTRA_VOLUMES+=(--volume "${resource}:${resource}:ro")
+  fi
+done
 distrobox create \
   --name sanctuary-redstone-9x \
   --image "${BASE_IMAGE}" \
   --home "${GUESTS_DIR}/sanctuary-redstone-9x/home" \
   --volume /gnu/store:/gnu/store:ro \
   --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
+  "${REDSTONE_EXTRA_VOLUMES[@]}" \
   --no-entry
 
 echo "distrobox-sanctuaries-create: all four sanctuaries created"
 echo "Next: run 'sanctuary-cde-build' to compile CDE 2.5.3 inside the sanctuary"
-echo "Then: sanctuary-cde-launch (switch to Desktop 4 first, Super+4)"
-echo "      sanctuary-redstone-9x-launch (switch to Desktop 5 first, Super+5)"
+echo "Then: sanctuary-cde-launch"
+echo "      sanctuary-redstone-9x-launch"
 #+END_SRC
 
 * Sanctuary Launcher Scripts
@@ -474,26 +485,51 @@ kill "${XEPHYR_PID}" 2>/dev/null || true
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-cde-launch :shebang "#!/usr/bin/env bash"
 # Launch sanctuary-cde: Xephyr :92 + CDE inside the Guix container.
-# Switch to Desktop 4 (Super+4) first.
+# Launch from the host desktop; Xephyr does not need a workspace hop.
+# Escape: Super+1 / Ctrl+F1 works while Xephyr has focus (-no-host-grab).
+# Host-side exit: sanctuary-cde-stop (from any terminal, tmux, or SSH).
+# Clipboard: cde-copy-to-host exports CDE selection to host; bridge auto-runs.
 # Prerequisite: run sanctuary-cde-build to compile CDE 2.5.3 first.
 set -euo pipefail
 
 DISPLAY_NUM=":92"
 SANCTUARY="sanctuary-cde"
 GUIX_PROFILES="${HOME}/.guix-extra-profiles"
+DOTCORTEX_RUN="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dotcortex"
+STATE_FILE="${DOTCORTEX_RUN}/sanctuary-cde.pid"
+HOST_DISPLAY="${DISPLAY}"   # capture before DISPLAY is changed by exec chains
 
-Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac &
+XEPHYR_PID=0
+BRIDGE_PID=0
+
+_cde_cleanup() {
+    [[ "${XEPHYR_PID}" -gt 0 ]] && kill "${XEPHYR_PID}" 2>/dev/null || true
+    [[ "${BRIDGE_PID}" -gt 0 ]]  && kill "${BRIDGE_PID}"  2>/dev/null || true
+    rm -f "${STATE_FILE}"
+}
+trap _cde_cleanup EXIT
+
+mkdir -p "${DOTCORTEX_RUN}"
+
+# -no-host-grab: Xephyr does not grab host keyboard/mouse, so host workspace
+# shortcuts (Super+1/Ctrl+F1) reach XFWM4 even when the nested display has focus.
+Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -no-host-grab &
 XEPHYR_PID=$!
-trap "kill ${XEPHYR_PID} 2>/dev/null || true" EXIT
+printf 'PID=%s\nDISPLAY=%s\n' "${XEPHYR_PID}" "${DISPLAY_NUM}" > "${STATE_FILE}"
 
 timeout 10 sh -c "until DISPLAY=${DISPLAY_NUM} xdpyinfo >/dev/null 2>&1; do sleep 0.1; done" \
-  || { echo "Xephyr ${DISPLAY_NUM} did not become ready"; kill "${XEPHYR_PID}"; exit 1; }
+  || { echo "Xephyr ${DISPLAY_NUM} did not become ready"; exit 1; }
 
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — adding CDE fonts and starting CDE…"
 CDE_HOME="${HOME}/.local/share/dotcortex/guests/sanctuary-cde/home/.local/share/cde"
 DISPLAY="${DISPLAY_NUM}" xset fp+ "${CDE_HOME}/etc/cde/fontaliases"
 DISPLAY="${DISPLAY_NUM}" xset fp+ "${CDE_HOME}/share/cde/fontaliases"
 DISPLAY="${DISPLAY_NUM}" xset fp rehash
+
+# Clipboard bridge: forward CDE :92 PRIMARY to host CLIPBOARD (one-way).
+# Requires xclip in desktop-common profile.
+cde-clipboard-bridge "${HOST_DISPLAY}" "${DISPLAY_NUM}" &
+BRIDGE_PID=$!
 
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   GUIX_PROFILE=${GUIX_PROFILES}/desktop-common/desktop-common
@@ -503,10 +539,194 @@ DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   export PATH=\${PATH}:/usr/bin:/bin
   export DTSPSYSAPPHOSTS=\${HOME}/.local/share/cde/appconfig
   export TTPATH=\${HOME}/.local/share/cde/appconfig/tttypes
+  export DTINFOLIB=\${HOME}/.local/share/cde/infolib
   exec \${HOME}/.local/share/cde/bin/Xsession
 "
+#+END_SRC
 
-kill "${XEPHYR_PID}" 2>/dev/null || true
+#+BEGIN_SRC bash :tangle linux/.local/bin/cde-clipboard-bridge :shebang "#!/usr/bin/env bash"
+# Forward CDE Xephyr PRIMARY selection → host CLIPBOARD and PRIMARY (one-way).
+# Polls every 300 ms; exits cleanly when the CDE display becomes unavailable.
+# Usage (called by sanctuary-cde-launch):
+#   cde-clipboard-bridge <host-display> <cde-display>
+# Requires: xclip in the host-side desktop-common Guix profile.
+set -euo pipefail
+HOST_DISPLAY="${1:-:0}"
+CDE_DISPLAY="${2:-:92}"
+prev_hash=""
+while DISPLAY="${CDE_DISPLAY}" xdpyinfo >/dev/null 2>&1; do
+    content=$(DISPLAY="${CDE_DISPLAY}" xclip -selection primary -o 2>/dev/null) || true
+    if [[ -n "${content}" ]]; then
+        curr_hash=$(printf '%s' "${content}" | md5sum | cut -d' ' -f1)
+        if [[ "${curr_hash}" != "${prev_hash}" ]]; then
+            printf '%s' "${content}" | DISPLAY="${HOST_DISPLAY}" xclip -selection clipboard -i 2>/dev/null || true
+            printf '%s' "${content}" | DISPLAY="${HOST_DISPLAY}" xclip -selection primary   -i 2>/dev/null || true
+            prev_hash="${curr_hash}"
+        fi
+    fi
+    sleep 0.3
+done
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/cde-copy-to-host :shebang "#!/usr/bin/env bash"
+# One-shot: export CDE :92 PRIMARY selection to the host CLIPBOARD and PRIMARY.
+# Run from any host terminal, tmux, or SSH while the CDE session is live.
+# Usage: cde-copy-to-host [<cde-display>]
+set -euo pipefail
+CDE_DISPLAY="${1:-:92}"
+HOST_DISPLAY="${DISPLAY:-:0}"
+content=$(DISPLAY="${CDE_DISPLAY}" xclip -selection primary -o 2>/dev/null) \
+    || { echo "cde-copy-to-host: nothing in CDE PRIMARY selection on ${CDE_DISPLAY}" >&2; exit 1; }
+printf '%s' "${content}" | DISPLAY="${HOST_DISPLAY}" xclip -selection clipboard -i
+printf '%s' "${content}" | DISPLAY="${HOST_DISPLAY}" xclip -selection primary   -i
+printf 'Copied %d bytes from CDE:%s to host:%s clipboard.\n' \
+    "${#content}" "${CDE_DISPLAY}" "${HOST_DISPLAY}"
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-cde-stop :shebang "#!/usr/bin/env bash"
+# Terminate the running sanctuary-cde Xephyr session from any host terminal.
+# Reads PID from $XDG_RUNTIME_DIR/dotcortex/sanctuary-cde.pid written by
+# sanctuary-cde-launch. Validates ownership and process identity before
+# sending SIGTERM. Never uses pkill or broad process-name matching.
+set -euo pipefail
+
+DOTCORTEX_RUN="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dotcortex"
+STATE_FILE="${DOTCORTEX_RUN}/sanctuary-cde.pid"
+
+if [[ ! -f "${STATE_FILE}" ]]; then
+  echo "sanctuary-cde-stop: no active session (${STATE_FILE} not found)" >&2
+  exit 1
+fi
+
+PID="$(grep '^PID=' "${STATE_FILE}" | cut -d= -f2)"
+DISP="$(grep '^DISPLAY=' "${STATE_FILE}" | cut -d= -f2)"
+
+if [[ -z "${PID}" ]]; then
+  echo "sanctuary-cde-stop: malformed state file — no PID entry" >&2
+  exit 1
+fi
+
+PROC_UID="$(ps -p "${PID}" -o uid= 2>/dev/null | tr -d ' ' || true)"
+PROC_COMM="$(ps -p "${PID}" -o comm= 2>/dev/null | tr -d ' ' || true)"
+
+if [[ -z "${PROC_UID}" ]]; then
+  echo "sanctuary-cde-stop: PID ${PID} not found — session already gone"
+  rm -f "${STATE_FILE}"
+  exit 0
+fi
+
+if [[ "${PROC_UID}" != "$(id -u)" ]]; then
+  echo "sanctuary-cde-stop: PID ${PID} is owned by UID ${PROC_UID}, not $(id -u) — refusing" >&2
+  exit 1
+fi
+
+if [[ "${PROC_COMM}" != "Xephyr" ]]; then
+  echo "sanctuary-cde-stop: PID ${PID} is '${PROC_COMM}', not Xephyr — refusing" >&2
+  exit 1
+fi
+
+echo "Stopping sanctuary-cde (Xephyr ${DISP:-:92}, PID ${PID})…"
+kill -TERM "${PID}"
+rm -f "${STATE_FILE}"
+echo "Done."
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle all/.local/bin/vi :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# vi compatibility wrapper: opens Neovim.
+# Placed in ~/.local/bin/ (ahead of /usr/bin in PATH) so CDE's Vi action,
+# dtterm sessions, and all scripts that call 'vi' get Neovim instead.
+exec nvim "$@"
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/xclipboard :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# xclipboard replacement for sanctuary-cde.
+# xclipboard is not available in Guix; this stub shows clipboard contents
+# in a dtterm window using xclip (which IS in the desktop-common profile).
+exec dtterm -title "Clipboard Contents" -e sh -c '
+echo "=== PRIMARY (last X selection) ==="
+DISPLAY=:92 xclip -selection primary -o 2>/dev/null || echo "(empty)"
+echo ""
+echo "=== CLIPBOARD (Ctrl+C / cde-copy-to-host) ==="
+DISPLAY=:92 xclip -selection clipboard -o 2>/dev/null || echo "(empty)"
+echo ""
+echo "Press Enter to close..."
+read _dummy
+'
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/xload :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# xload replacement for sanctuary-cde.
+# xload is not available in Guix; this stub opens btop (system monitor)
+# in a dtterm window. btop is available in the desktop-common profile.
+exec dtterm -title "System Load" -e btop
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/libreoffice :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# LibreOffice placeholder for sanctuary-cde.
+# LibreOffice is not installed in this sanctuary; this stub informs the user.
+exec dtterm -title "LibreOffice Not Available" -e sh -c '
+echo "LibreOffice is not installed in the sanctuary-cde environment."
+echo ""
+echo "To use LibreOffice, open it on the host system (outside the sanctuary)"
+echo "or add it to the sanctuary Guix profile and rebuild."
+echo ""
+echo "Press Enter to close..."
+read _dummy
+'
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/firefox :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# Firefox placeholder for sanctuary-cde.
+exec dtterm -title "Firefox Not Available" -e sh -c '
+echo "Firefox is not installed in the sanctuary-cde environment."
+echo "For web browsing, use Firefox on the host system outside the sanctuary."
+echo ""
+echo "Press Enter to close..."
+read _dummy
+'
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/gcompris :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# GCompris placeholder — not available in Guix channels.
+exec dtterm -title "GCompris Not Available" -e sh -c '
+echo "GCompris is not available in the Guix channel."
+echo "It is not installed in the sanctuary-cde environment."
+echo ""
+echo "Press Enter to close..."
+read _dummy
+'
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/geogebra :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# GeoGebra placeholder — not available in Guix channels.
+exec dtterm -title "GeoGebra Not Available" -e sh -c '
+echo "GeoGebra is not available in the Guix channel."
+echo "It is not installed in the sanctuary-cde environment."
+echo ""
+echo "Press Enter to close..."
+read _dummy
+'
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/bitmap :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# bitmap replacement: the X11 bitmap editor is not in Guix; redirect to dticon.
+exec dtterm -title "Bitmap Editor" -e sh -c '
+echo "The X11 bitmap editor is not available in Guix."
+echo "Use the CDE Icon Editor (dticon) instead:"
+echo "  - FrontPanel → Icon Editor"
+echo "  - Or run: dticon"
+echo ""
+echo "Press Enter to close..."
+read _dummy
+'
 #+END_SRC
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-cde-build :shebang "#!/usr/bin/env bash"
@@ -548,6 +768,15 @@ if [ -d "\${CDE_PREFIX}/bin" ]; then
     sed -i "s|/usr/dt/bin/|\${CDE_PREFIX}/bin/|g" \
       "\${CDE_PREFIX}"/appconfig/types/C/*.dt 2>/dev/null || true
   fi
+  # Relabel the Vi text editor action to surface Neovim.
+  if [ -f "\${CDE_PREFIX}/appconfig/types/C/uxstd.dt" ]; then
+    sed -i 's/LABEL\s\+Vi$/LABEL           Neovim (vi)/g' \
+        "\${CDE_PREFIX}/appconfig/types/C/uxstd.dt" 2>/dev/null || true
+  fi
+  # Write ~/.dtprofile to set DTINFOLIB for the CDE Information Manager.
+  mkdir -p "\${HOME}/.dt"
+  printf 'export DTINFOLIB=%s/.local/share/cde/infolib\n' "\${HOME}" \
+      > "\${HOME}/.dtprofile"
   # Rebuild types.xdr with corrected dtinfo process-type start paths.
   PTYPE_DIR="\${CDE_SRC}/cde-${CDE_VERSION}/programs/tttypes"
   if [ -d "\${PTYPE_DIR}" ]; then
@@ -621,7 +850,7 @@ make install
 touch "\${CDE_PREFIX}/.dotcortex-cde-${CDE_VERSION}-complete"
 
 echo "CDE ${CDE_VERSION} installed to \${CDE_PREFIX}"
-echo "Launch with: sanctuary-cde-launch (Super+4 to reach Desktop 4 first)"
+echo "Launch with: sanctuary-cde-launch"
 INNER_EOF
 )
 sanctuary-exec sanctuary-cde sh -c "${INNER_SCRIPT}"
@@ -629,8 +858,8 @@ sanctuary-exec sanctuary-cde sh -c "${INNER_SCRIPT}"
 
 * Sanctuary: sanctuary-redstone-9x — Redstone 9X IceWM
 
-First gaming-wing sanctuary.  IceWM with the Windows-95 theme.
-Host virtual desktop: *Desktop 5*, =Super+5=. Xephyr display: =:93=.
+First gaming-wing sanctuary.  IceWM with the Windows NT theme.
+Launch from the current host desktop. Xephyr display: =:93=.
 Guix profiles: =desktop-common= + =room-gaming= (icewm, pcmanfm, xterm) + =room-windows-compat= (wine64, winetricks, fontconfig, powershell, dosbox-x).
 
 The launcher projects =DotCortex/linux/.icewm/= directly into the isolated guest
@@ -640,7 +869,7 @@ icons (My Computer, My Documents, Recycle Bin) from =linux/.icewm/desktop/=.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-redstone-9x-launch :shebang "#!/usr/bin/env bash"
 # Launch sanctuary-redstone-9x: Xephyr :93 + IceWM inside the Guix container.
-# Switch to Desktop 5 (Super+5) first.
+# Launch from the host desktop; no workspace hop is required.
 # Prerequisites:
 #   loom guix:sanctuary-apply   ← builds desktop-common + room-gaming + room-windows-compat
 #   distrobox-sanctuaries-create
@@ -678,10 +907,35 @@ ln -sfnT "${HOME}/DotCortex/linux/.icewm/preferences" "${GUEST_HOME}/.icewm/pref
 ln -sfnT "${HOME}/DotCortex/linux/.icewm/menu" "${GUEST_HOME}/.icewm/menu"
 ln -sfnT "${HOME}/DotCortex/linux/.icewm/startup" "${GUEST_HOME}/.icewm/startup"
 
+# Project the DotCortex GTK theme into the guest so GTK uses the repo-owned theme
+# instead of whichever host theme happens to be installed.
+mkdir -p "${GUEST_HOME}/.themes"
+ln -sfnT "${HOME}/DotCortex/linux/.themes/Windows-95" "${GUEST_HOME}/.themes/Windows-95"
+
+# Project the repo icon theme too; GTK and pcmanfm need it inside the guest home
+# for desktop shortcuts and panel icons to resolve correctly.
+mkdir -p "${GUEST_HOME}/.local/share/icons"
+ln -sfnT "${HOME}/DotCortex/linux/.local/share/icons/Chicago95" \
+  "${GUEST_HOME}/.local/share/icons/Chicago95"
+
 # Project DotCortex-managed PowerShell profile into guest home.
 mkdir -p "${GUEST_HOME}/.config/powershell"
 ln -sfnT "${HOME}/DotCortex/linux/.config/powershell/Microsoft.PowerShell_profile.ps1" \
   "${GUEST_HOME}/.config/powershell/Microsoft.PowerShell_profile.ps1"
+
+# Project the Redstone launcher wrapper into the guest so menu items can source
+# the correct Guix profiles before running PowerShell/CMD/DOS tools.
+mkdir -p "${GUEST_HOME}/.local/bin"
+ln -sfnT "${HOME}/DotCortex/linux/.local/bin/redstone-9x-run" \
+  "${GUEST_HOME}/.local/bin/redstone-9x-run"
+
+mkdir -p "${GUEST_HOME}/.config/gtk-3.0"
+ln -sfnT "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/settings.ini" \
+  "${GUEST_HOME}/.config/gtk-3.0/settings.ini"
+ln -sfnT "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/gtk.css" \
+  "${GUEST_HOME}/.config/gtk-3.0/gtk.css"
+ln -sfnT "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-2.0/gtkrc" \
+  "${GUEST_HOME}/.gtkrc-2.0"
 
 # Project staged fonts into guest home (idempotent; absent if not yet provisioned).
 if [[ -d "${FONT_STAGE}" ]]; then
@@ -715,10 +969,14 @@ DISPLAY="${DISPLAY_NUM}" xrdb -merge "${HOME}/DotCortex/linux/.config/redstone-9
 
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — sourcing Guix profiles and starting IceWM…"
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
+  REDSTONE_GUEST_BIN=${GUEST_HOME}/.local/bin
   GUIX_PROFILE=${GUIX_PROFILES}/desktop-common/desktop-common
   . \${GUIX_PROFILE}/etc/profile
   GUIX_PROFILE=${GUIX_PROFILES}/room-gaming/room-gaming
   . \${GUIX_PROFILE}/etc/profile
+  export GTK_THEME=Windows-95
+  export XCURSOR_THEME=Win95
+  export XCURSOR_SIZE=32
   export GDK_PIXBUF_MODULE_FILE=\${GUIX_PROFILE}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
   GUIX_PROFILE=${GUIX_PROFILES}/room-windows-compat/room-windows-compat
   . \${GUIX_PROFILE}/etc/profile
@@ -726,21 +984,22 @@ DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   export WINEARCH=win64
   export WINEDEBUG=-all
   export DOTCORTEX_DIR=${HOME}/DotCortex
-  ${HOME}/DotCortex/linux/.local/bin/sanctuary-redstone-9x-wineprefix-init
+  export PATH=\${REDSTONE_GUEST_BIN}:\${PATH}
+  bash ${HOME}/DotCortex/linux/.local/bin/sanctuary-redstone-9x-wineprefix-init
   exec dbus-run-session icewm-session
 "
 
 kill "${XEPHYR_PID}" 2>/dev/null || true
 #+END_SRC
 
-IceWM preferences tangle block.  Selects the Windows-95 theme and incorporates
+IceWM preferences tangle block.  Selects the Windows NT theme and incorporates
 the theme-supplied =extras/prefoverride= settings.  Stows to =~/.icewm/preferences=
 on the host; the launcher above projects this file directly into the guest home.
 
 #+BEGIN_SRC conf :tangle linux/.icewm/preferences
-Theme="Windows-95/default.theme"
+Theme="WindowsNT/default.theme"
 
-# Taskbar and icon sizing required by Windows-95 theme pixmaps
+# Taskbar and icon sizing required by the Windows NT theme pixmaps
 TaskBarGraphHeight=27
 TrayIconMaxHeight=16
 MenuIconSize=16
@@ -751,13 +1010,128 @@ MenuMouseTracking=1
 # Time format matches Windows 95 clock appearance; hover for full date
 TimeFormat="%d.%m %R"
 
-# Suppress taskbar elements absent from Windows 95 stock layout
+# Suppress taskbar elements absent from the stock layout
 TaskBarShowWindowListMenu=0
 TaskBarShowWorkspaces=0
 TaskBarShowCollapseButton=0
 
-# Win95 teal desktop — icewmbg fallback when pcmanfm --desktop is not running
-DesktopBackgroundColor="#008080"
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.icewm/themes/WindowsNT/default.theme :mkdirp yes
+####################################################
+# "Windows NT" IceWM theme
+# By Azuma Hazuki (azumahazuki at gee-mail dot calm)
+# 1 Jan 2010
+####################################################
+
+Look=pixmap
+Gradients="titleAT.xpm titleAB.xpm titleIB.xpm titleIT.xpm taskbarbg.xpm taskbuttonbg.xpm taskbuttonminimized.xpm taskbuttonactive.xpm toolbuttonbg.xpm menubg.xpm dialogbg.xpm"
+
+BorderSizeX=3
+BorderSizeY=3
+CornerSizeX=21
+CornerSizeY=21
+
+TitleBarHeight=18
+TitleButtonsLeft="s"
+TitleButtonsRight="xmi"
+
+TitleBarJoinLeft=0
+TitleBarJoinRight=1
+
+ColorNormalButton="rgb:d6/d3/ce"
+ColorNormalButtonText="rgb:00/00/00"
+ColorActiveButton="rgb:d6/d3/ce"
+ColorActiveButtonText="rgb:00/00/00"
+
+ColorNormalTitleBarText="rgb:c0/c0/c0"
+ColorActiveTitleBarText="rgb:ff/ff/ff"
+ColorActiveTitleBarShadow="rgb:00/00/00"
+
+ColorActiveBorder="rgb:d6/d3/ce"
+ColorNormalBorder="rgb:d6/d3/ce"
+
+ColorDialog="rgb:00/00/00"
+ColorListBox="rgb:00/00/00"
+ColorListBoxText="rgb:ff/ff/ff"
+ColorListBoxSelection="rgb:00/7f/df"
+ColorListBoxSelectionText="rgb:ff/ff/ff"
+ColorScrollBar="rgb:00/00/00"
+ColorScrollBarSlider="rgb:00/00/00"
+ColorScrollBarButton="rgb:00/00/00"
+ColorScrollBarButtonArrow="rgb:00/00/00"
+ColorLabel="rgb:00/00/00"
+ColorLabelText="rgb:ff/ff/ff"
+
+ColorNormalMenu="rgb:d6/d3/ce"
+ColorActiveMenuItem="rgb:00/00/80"
+ColorNormalMenuItemText="rgb:00/00/00"
+ColorActiveMenuItemText="rgb:ff/ff/ff"
+ColorDisabledMenuItemText="rgb:80/80/80"
+
+ColorDefaultTaskBar="rgb:d6/d3/ce"
+ColorNormalTaskBarApp="rgb:d6/d3/ce"
+ColorNormalTaskBarAppText="rgb:00/00/00"
+ColorInvisibleTaskBarApp="rgb:00/00/00"
+ColorInvisibleTaskBarAppText="rgb:ff/ff/ff"
+ColorActiveTaskBarApp="rgb:d6/d3/ce"
+ColorActiveTaskBarAppText="rgb:00/00/00"
+ColorMinimizedTaskBarApp="rgb:00/00/00"
+ColorMinimizedTaskBarAppText="rgb:00/00/00"
+ColorNormalWorkspaceButton="rgb:00/00/00"
+ColorActiveWorkspaceButton="rgb:30/30/30"
+
+ColorInput="rgb:00/00/00"
+ColorInputText="rgb:ff/ff/ff"
+
+ColorClock=""
+ColorClockText="rgb:00/00/00"
+
+ColorCPUStatusUser="rgb:00/8f/ff"
+ColorCPUStatusSystem="rgb:00/cf/ff"
+ColorCPUStatusNice="rgb:9d/a1/bc"
+ColorCPUStatusIdle="rgb:00/00/00"
+
+ColorNetSend="rgb:4c/59/a6"
+ColorNetReceive="rgb:9d/a1/bc"
+ColorNetIdle="00/00/00"
+
+ColorToolTip="rgb:00/00/00"
+ColorToolTipText="rgb:FF/FF/FF"
+
+ColorMoveSizeStatus="rgb:0f/0f/10"
+ColorMoveSizeStatusText="rgb:00/8f/ff"
+
+ColorQuickSwitch="rgb:00/00/00"
+ColorQuickSwitchText="rgb:ff/ff/ff"
+
+# Font Specification
+TitleFontNameXft		=	tahoma:size=8:bold
+MenuFontNameXft			=	tahoma:size=8
+MinimizedWindowFontNameXft	=	tahoma:size=8
+ActiveButtonFontNameXft		=	tahoma:size=8
+NormalButtonFontNameXft		=	tahoma:size=8
+ToolButtonFontNameXft		=	tahoma:size=8
+NormalWorkspaceFontNameXft	=	tahoma:size=8
+ActiveWorkspaceFontNameXft	=	tahoma:size=8
+QuickSwitchFontNameXft		=	tahoma:size=8
+ListBoxFontNameXft		=	tahoma:size=8
+StatusFontNameXft		=	tahoma:size=8
+ToolTipFontNameXft		=	tahoma:size=8
+ActiveTaskBarFontNameXft	=	tahoma:size=8
+NormalTaskBarFontNameXft	=	tahoma:size=8
+ClockFontNameXft		=	tahoma:size=8
+ApmFontNameXft			=	tahoma:size=8
+LabelFontNameXft		=	tahoma:size=8
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.icewm/themes/WindowsNT/prefoverride :mkdirp yes
+TimeFormat="%R"
+MenuMouseTracking=1
+ToolTipDelay=200
+
+TaskBarShowCollapseButton=0
+ShowWindowList=0 # 0 / 1
 #+END_SRC
 
 IceWM right-click desktop menu.  Projected into the guest home by the launcher.
@@ -770,10 +1144,10 @@ prog "File Manager"   folder   pcmanfm
 separator
 
 menu "Terminals" utilities-terminal {
-  prog "Windows PowerShell"  utilities-terminal  urxvt -name redstone-powershell -title "Windows PowerShell" -e pwsh
-  prog "PowerShell (Bash)"   utilities-terminal  urxvt -name redstone-bash-powershell -title "Bash"
-  prog "Command Prompt"      utilities-terminal  wineconsole --backend=user cmd.exe
-  prog "Bash (CMD frame)"    utilities-terminal  urxvt -name redstone-bash-cmd -title "Bash"
+  prog "Windows PowerShell"  utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-powershell -title "Windows PowerShell" -e pwsh
+  prog "PowerShell (Bash)"   utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-powershell -title "Windows PowerShell" -e bash
+  prog "Command Prompt"      utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run wineconsole --backend=user cmd.exe
+  prog "Bash (CMD frame)"    utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-cmd -title "Command Prompt" -e bash
   prog "Terminal (fallback)" utilities-terminal  xterm
 }
 
@@ -825,7 +1199,7 @@ Type=Application
 Name=My Documents
 Comment=Open personal folder
 Exec=pcmanfm
-Icon=folder-home
+Icon=user-home
 Terminal=false
 #+END_SRC
 
@@ -869,7 +1243,7 @@ Type=Application
 Name=DOSBox-X
 Comment=DOS and Win9x emulator
 Exec=dosbox-x
-Icon=terminal
+Icon=utilities-terminal
 Terminal=false
 #+END_SRC
 
@@ -961,6 +1335,8 @@ to Courier New when not installed yet — see =redstone-9x-font-provision=).
 ! Redstone 9X — URxvt terminal profiles
 ! Loaded into Xephyr display by sanctuary-redstone-9x-launch via xrdb -merge.
 ! Each launcher uses: urxvt -name <instance> ...
+
+Xft.dpi: 96
 
 ! ── Common defaults ──────────────────────────────────────────────────────────
 URxvt.scrollBar:       false
@@ -1137,6 +1513,100 @@ function bash { /usr/bin/env bash @args }
 Set-PSReadLineOption -EditMode Windows
 #+END_SRC
 
+** GTK theme
+
+Redstone uses the Windows-95 GTK theme and a repo-backed Chicago95 icon theme.
+
+#+BEGIN_SRC conf :tangle linux/.config/redstone-9x/gtk-3.0/settings.ini :mkdirp yes
+[Settings]
+gtk-theme-name=Windows-95
+gtk-icon-theme-name=Chicago95
+gtk-application-prefer-dark-theme=0
+gtk-font-name=Sans 9
+gtk-button-images=1
+gtk-menu-images=1
+gtk-toolbar-style=GTK_TOOLBAR_BOTH
+gtk-toolbar-icon-size=GTK_ICON_SIZE_LARGE_TOOLBAR
+gtk-cursor-theme-name=Win95
+gtk-cursor-theme-size=32
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.config/redstone-9x/gtk-2.0/gtkrc :mkdirp yes
+gtk-theme-name="Windows-95"
+gtk-icon-theme-name="Chicago95"
+gtk-font-name="Sans 9"
+gtk-cursor-theme-name="Win95"
+gtk-cursor-theme-size=32
+gtk-toolbar-style=GTK_TOOLBAR_BOTH
+gtk-toolbar-icon-size=GTK_ICON_SIZE_LARGE_TOOLBAR
+gtk-button-images=1
+gtk-menu-images=1
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.config/redstone-9x/gtk-3.0/gtk.css :mkdirp yes
+/* Redstone 9X GTK user overrides.
+ * Keep the Win95 theme visually static: no fade, no hide, no animated sidebar.
+ */
+
+* {
+  transition: none;
+  animation: none;
+}
+
+.sidebar,
+.sidebar *,
+places-sidebar,
+places-sidebar * {
+  transition: none;
+  animation: none;
+  opacity: 1;
+}
+
+button,
+button:hover,
+button:active,
+button:checked,
+entry,
+entry:hover,
+entry:focus {
+  transition: none;
+}
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-run :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+GUIX_PROFILES="${HOME}/.guix-extra-profiles"
+
+source_guix_profile() {
+  local profile="$1"
+  local status=0
+  local had_nounset=0
+
+  case $- in
+    *u*) had_nounset=1; set +u ;;
+  esac
+
+  GUIX_PROFILE="$profile"
+  export GUIX_PROFILE
+
+  if . "$profile/etc/profile"; then
+    status=0
+  else
+    status=$?
+  fi
+
+  (( had_nounset )) && set -u
+  return "$status"
+}
+
+for _prof in desktop-common room-gaming room-windows-compat; do
+  source_guix_profile "${GUIX_PROFILES}/${_prof}/${_prof}"
+done
+
+exec "$@"
+#+END_SRC
+
 ** Additional desktop entries — terminals and portals
 
 #+BEGIN_SRC conf :tangle linux/.icewm/desktop/bash-ps.desktop
@@ -1146,7 +1616,7 @@ Type=Application
 Name=Bash (PowerShell frame)
 Comment=Bash shell in PowerShell colours
 Exec=urxvt -name redstone-bash-powershell -title "Bash"
-Icon=bash
+Icon=utilities-terminal
 Terminal=false
 #+END_SRC
 
@@ -1157,7 +1627,7 @@ Type=Application
 Name=Bash (CMD frame)
 Comment=Bash shell in CMD colours
 Exec=urxvt -name redstone-bash-cmd -title "Bash"
-Icon=bash
+Icon=utilities-terminal
 Terminal=false
 #+END_SRC
 
@@ -1168,7 +1638,7 @@ Type=Application
 Name=My Briefcase
 Comment=Open personal briefcase folder
 Exec=pcmanfm ~/Briefcase
-Icon=folder
+Icon=my_briefcase
 Terminal=false
 #+END_SRC
 

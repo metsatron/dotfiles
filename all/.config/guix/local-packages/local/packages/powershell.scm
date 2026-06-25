@@ -38,20 +38,16 @@
     (build-system binary-build-system)
     (arguments
      `(#:install-plan
-       '(("." "lib/powershell/" #:include-regexp (".*")))
-       #:patchelf-plan
-       '(("lib/powershell/pwsh"
-          ("glibc" "gcc:lib")
-          ("lib/powershell")))
+       '(("." "lib/powershell" #:include-regexp (".*")))
        #:phases
        (modify-phases %standard-phases
-         (add-before 'patchelf 'make-writable
+         (add-after 'binary-unpack 'stage-layout
            (lambda* (#:key outputs #:allow-other-keys)
-             (for-each make-file-writable
-                       (find-files (string-append (assoc-ref outputs "out") "/lib/powershell")
-                                   "\\.so$"))
-             (make-file-writable
-              (string-append (assoc-ref outputs "out") "/lib/powershell/pwsh"))))
+             (let* ((out (assoc-ref outputs "out"))
+                    (lib (string-append out "/lib/powershell")))
+               (mkdir-p lib)
+               (invoke "cp" "-a" "." lib)
+               #t)))
          (add-after 'install 'create-launcher
            (lambda* (#:key outputs #:allow-other-keys)
              (let* ((out (assoc-ref outputs "out"))
