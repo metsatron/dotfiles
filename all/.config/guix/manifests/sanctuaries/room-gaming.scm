@@ -1,9 +1,9 @@
 ;; room-gaming
 
-;; Shared profile for gaming-wing sanctuaries.  IceWM is the only confirmed Guix
-;; package for the first slice (=sanctuary-redstone-9x=).  Gaming tool stacks (Steam,
-;; Lutris, Wine, Proton, DOSBox-X, emulators) are not yet audited for Guix availability
-;; — add them here once each is confirmed, never as foreign-distro workarounds.
+;; Shared profile for gaming-wing sanctuaries.  Confirmed Guix packages:
+;; - =icewm=, =pcmanfm=, =dbus=, =xterm= — desktop stack (first slice)
+;; - =wine64= — WoW64 Wine (runs 32- and 64-bit Windows apps); =winetricks= — helper scripts
+;; - Not in Guix or nonguix: =lutris= (→ Flatpak =net.lutris.Lutris= on host), =powershell=
 
 
 ;; [[file:../../../../../guix.org::*room-gaming][room-gaming:1]]
@@ -13,9 +13,11 @@
 ;; Apply: make guix-room-gaming   OR   loom guix:sanctuary-apply
 (specifications->manifest
  '(
-   "icewm"    ; Win9x/XP-era WM — confirmed in Guix; first slice uses Windows-95 theme
-   "pcmanfm"  ; GTK file manager — requires dbus session (provided by dbus-run-session below)
-   "dbus"     ; dbus-run-session wraps the icewm-session so GLib/GIO apps (pcmanfm) can launch
-   "xterm"    ; fallback terminal inside gaming sanctuaries
+   "icewm"       ; Win9x/XP-era WM — Windows-95 theme
+   "pcmanfm"     ; GTK file manager (needs dbus session)
+   "dbus"        ; dbus-run-session wraps icewm-session for GLib/GIO apps
+   "xterm"       ; fallback terminal
+   "wine64"      ; WoW64 Wine — runs 32- and 64-bit Windows executables
+   "winetricks"  ; Wine helper: installs DLLs, runtimes, vcredist etc.
    ))
 ;; room-gaming:1 ends here
