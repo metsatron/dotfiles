@@ -31,6 +31,18 @@
    "libxdmcp" "libxrender"
    ;; X11 tools (needed by CDE at build and runtime)
    "sessreg" "xrdb" "xset" "xbitmaps"
+   ;; X11 standard utilities (for CDE action database and user tools)
+   "xclock"     ; XclockDig action
+   "xrefresh"   ; Xrefresh action
+   "xdpyinfo"   ; Xdpyinfo action
+   "xwininfo"   ; Xwininfo action
+   "xlsfonts"   ; Xlsfonts action
+   "xprop"      ; Xprop/Window Properties action
+   "xwd"        ; Xwd Capture / Xwud Display actions
+   "xfd"        ; Font Preview (Xfd) action
+   "xfontsel"   ; font browser
+   ;; X11 fonts — misc-fixed family for CDE interface font aliases
+   "font-misc-misc"
    ;; System libraries
    "linux-pam" "libxcrypt" "libtirpc" "rpcsvc-proto" "rpcbind"
    "net-base" "inetutils" "gawk" "cups"
@@ -41,6 +53,9 @@
    "libxscrnsaver"
    ;; Media
    "freetype" "libjpeg-turbo" "bzip2"
+   ;; Graphical applications accessible from the CDE Application Manager
+   "stellarium"  ; planetarium/sky simulation
+   "tuxpaint"    ; kids paint program
    ;; Fallback terminal inside the sanctuary
    "xterm"
    ))
