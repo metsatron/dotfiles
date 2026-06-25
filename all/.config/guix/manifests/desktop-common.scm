@@ -26,11 +26,17 @@
    "zsh-vi-mode" "zsh-autosuggestions" "zsh-history-substring-search"
    "tmux"
 
+   ;; --- Shell prompt ---
+   "starship"
+
    ;; --- Core utilities ---
    "git" "git-extras"
    "jq" "direnv"
    "htop" "btop" "ranger" "chafa"
    "moreutils"
+
+   ;; --- Clipboard (host-side bridge for sanctuary X selections) ---
+   "xclip"
 
    ;; --- Runtime & certs ---
    "python"
