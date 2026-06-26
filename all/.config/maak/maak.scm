@@ -206,7 +206,7 @@
 
    ;; Virtual Habitat sanctuary substrate profiles (Phase 0B declared; apply in Phase 1A)
    (task 'guix:sanctuary-apply "Build desktop-common + sanctuary + gaming + windows-compat Guix profiles"
-         (lambda () (mk-guix "guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-room-gaming guix-room-windows-compat")))
+         (lambda () (mk-guix "guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-sanctuary-sx guix-room-gaming guix-room-windows-compat")))
 
    (task 'guix:git-bench
          "Probe guix channel mirrors and print the fastest URL (writes cache)"
