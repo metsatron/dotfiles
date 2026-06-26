@@ -51,6 +51,35 @@ stow:
 safe-stow:
 | set -euo pipefail; \
 | cd $(HOME)/DotCortex; \
+| repair_mutable_agent_dir() { \
+|   local rel="$$1" target="$(HOME)/$$1" resolved entry name rel_entry ts backup; \
+|   [ -L "$$target" ] || return 0; \
+|   resolved=$$(readlink -f "$$target" 2>/dev/null || true); \
+|   echo ">> repair mutable agent dir $$target"; \
+|   rm -f "$$target"; \
+|   mkdir -p "$$target"; \
+|   [ -n "$$resolved" ] && [ -d "$$resolved" ] || return 0; \
+|   for entry in "$$resolved"/* "$$resolved"/.[!.]* "$$resolved"/..?*; do \
+|     [ -e "$$entry" ] || [ -L "$$entry" ] || continue; \
+|     name=$$(basename "$$entry"); \
+|     rel_entry=$${entry#$(HOME)/DotCortex/}; \
+|     if git ls-files --error-unmatch "$$rel_entry" >/dev/null 2>&1 || git ls-files "$$rel_entry/" | grep -q .; then \
+|       continue; \
+|     fi; \
+|     if [ -e "$$target/$$name" ] || [ -L "$$target/$$name" ]; then \
+|       ts=$$(date +%Y%m%d-%H%M%S); \
+|       backup="$$target/$$name.bak.$$ts"; \
+|       echo "   backup existing $$target/$$name -> $$backup"; \
+|       mv "$$target/$$name" "$$backup"; \
+|     fi; \
+|     echo "   move runtime $$entry -> $$target/$$name"; \
+|     mv "$$entry" "$$target/$$name"; \
+|   done; \
+| }; \
+| repair_mutable_agent_dir .claude; \
+| repair_mutable_agent_dir .agents; \
+| repair_mutable_agent_dir .opencode; \
+| repair_mutable_agent_dir .codex; \
 | for pkg in $(STOW_PKGS); do \
 |   preview_file=$$(mktemp); \
 |   echo ">> preview $$pkg"; \
