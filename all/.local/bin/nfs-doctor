@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# nfs-doctor — role-aware self-heal watchdog
+# Stow-global. Idempotent and safe to run repeatedly. Scheduled as root (systemd
+# timer or =/etc/cron.d=); also runnable by hand (escalates via =sudo -n=). Uses
+# =NFS_DOCTOR_HOME= (set by the scheduler) so it targets the human's mounts even
+# when run as root.
+
+
+# [[file:../../../nfs.org::*nfs-doctor — role-aware self-heal watchdog][nfs-doctor — role-aware self-heal watchdog:1]]
+# Heal logic must continue past individual failures — no set -e.
+set -uo pipefail
+
+TAG="nfs-doctor"
+HOME_DIR="${NFS_DOCTOR_HOME:-${HOME:-/home/metsatron}}"
+MNT_BASE="${HOME_DIR}/mnt"
+
+log() { logger -t "$TAG" -- "$*" 2>/dev/null || true; printf '%s: %s\n' "$TAG" "$*"; }
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+have() { command -v "$1" >/dev/null 2>&1; }
+is_systemd() { [ -d /run/systemd/system ]; }
+
+ts_ip() { ip -4 -o addr show tailscale0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1; }
+nfsd_answering() { timeout 5 rpcinfo -t 127.0.0.1 nfs >/dev/null 2>&1; }
+is_nfs_server() { have exportfs && grep -q "DOTCORTEX-NFS" /etc/exports 2>/dev/null; }
+
+heal_firewall() {
+  have nft || return 0
+  if run_priv nft list table inet dotcortex_nfs >/dev/null 2>&1; then return 0; fi
+  log "firewall: dotcortex_nfs table missing — re-applying"
+  [ -x "${HOME_DIR}/.local/bin/nfs-firewall" ] && \
+    "${HOME_DIR}/.local/bin/nfs-firewall" >/dev/null 2>&1 || true
+}
+
+heal_server() {
+  is_nfs_server || return 0
+  local ip; ip="$(ts_ip)"
+  if [ -z "$ip" ]; then
+    log "server: tailscale0 has no IP yet — deferring nfsd start"
+    return 0
+  fi
+  nfsd_answering && return 0
+  log "server: nfsd down but tailscale0 up ($ip) — restarting nfs-kernel-server"
+  if is_systemd; then
+    run_priv systemctl restart nfs-kernel-server 2>/dev/null \
+      || run_priv systemctl restart nfs-server 2>/dev/null || true
+  else
+    run_priv service nfs-kernel-server restart 2>/dev/null || true
+  fi
+  run_priv exportfs -ra 2>/dev/null || true
+  if nfsd_answering; then log "server: nfsd restored"; else log "server: WARN nfsd still down"; fi
+}
+
+reload_autofs() {
+  if is_systemd; then
+    run_priv systemctl reload autofs 2>/dev/null \
+      || run_priv systemctl restart autofs 2>/dev/null || true
+  else
+    run_priv service autofs reload 2>/dev/null \
+      || run_priv service autofs restart 2>/dev/null || true
+  fi
+}
+
+mount_is_stale() {
+  local mp="$1"
+  grep -q " $mp " /proc/mounts 2>/dev/null || return 1   # not mounted -> not stale
+  timeout 5 stat "$mp" >/dev/null 2>&1 && return 1
+  return 0
+}
+
+heal_client() {
+  [ -d "$MNT_BASE" ] || return 0
+  local mp host
+  for mp in "$MNT_BASE"/*; do
+    [ -d "$mp" ] || continue
+    host="$(basename "$mp")"
+    if mount_is_stale "$mp"; then
+      log "client: $mp is stale — force/lazy unmount + autofs reload"
+      run_priv umount -f "$mp" 2>/dev/null || run_priv umount -l "$mp" 2>/dev/null || true
+      reload_autofs
+    fi
+    # If the server is reachable but the share is not mounted, trigger automount.
+    if ! grep -q " $mp " /proc/mounts 2>/dev/null; then
+      if timeout 5 rpcinfo -t "$host" nfs >/dev/null 2>&1; then
+        timeout 8 ls "$mp" >/dev/null 2>&1 || true
+      fi
+    fi
+  done
+}
+
+log "run start (uid=$(id -u) home=$HOME_DIR)"
+heal_firewall
+heal_server
+heal_client
+log "run done"
+# nfs-doctor — role-aware self-heal watchdog:1 ends here

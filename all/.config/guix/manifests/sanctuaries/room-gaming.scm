@@ -1,19 +1,20 @@
 ;; room-gaming
 
-;; Shared profile for gaming-wing sanctuaries.  IceWM is the only confirmed Guix
-;; package for the first slice (=sanctuary-redstone-9x=).  Gaming tool stacks (Steam,
-;; Lutris, Wine, Proton, DOSBox-X, emulators) are not yet audited for Guix availability
-;; — add them here once each is confirmed, never as foreign-distro workarounds.
+;; Shared IceWM desktop stack for gaming-wing sanctuaries.  Pure desktop — no Windows
+;; compatibility tools (those live in =room-windows-compat=, sourced separately by
+;; Windows-themed rooms like =sanctuary-redstone-9x=).
 
 
 ;; [[file:../../../../../guix.org::*room-gaming][room-gaming:1]]
 ;; Virtual Habitat — room-gaming Guix profile
-;; Shared across gaming-wing sanctuaries (redstone-9x, lunestone-b2, commodore, retropie).
-;; desktop-common is sourced separately by each launcher.
-;; Apply: make guix-room-gaming   OR   loom guix:sanctuary-apply
+;; Desktop stack shared across all gaming-wing sanctuaries.
+;; Windows compat tools live in room-windows-compat (sourced separately).
+;; Apply: make guix-room-gaming
 (specifications->manifest
  '(
-   "icewm"   ; Win9x/XP-era WM — confirmed in Guix; first slice uses Windows-95 theme
-   "xterm"   ; fallback terminal inside gaming sanctuaries
+   "icewm"    ; Win9x/XP-era WM — Windows-95 theme
+   "pcmanfm"  ; GTK file manager (needs dbus session)
+   "dbus"     ; dbus-run-session wraps icewm-session for GLib/GIO apps
+   "xterm"    ; fallback terminal
    ))
 ;; room-gaming:1 ends here

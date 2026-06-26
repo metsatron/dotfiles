@@ -23,10 +23,13 @@ _emit_norm() {
     }
     $0 ~ /^[[:space:]]*#/ || NF==0 { next }
     {
-      n1=$1; n2=$2; n3=$3; n4=$4; n5=$5; n6=$6; n7=$7; n8=$8;
+      n1=$1; n2=$2; n3=$3; n4=$4; n5=$5; n6=$6; extra="";
+      for (i=7; i<=NF; i++) {
+        extra = extra (extra ? " " : "") $i
+      }
       printf "%s|%s|%s|%s|%s|%s|%s|%s\n",
         dequote(n1),dequote(n2),dequote(n3),dequote(n4),
-        dequote(n5),dequote(n6),dequote(n7),dequote(n8)
+        dequote(n5),dequote(n6),dequote(extra),""
     }
   ' "$MAN"
 }
@@ -49,12 +52,15 @@ meta_value() {
 
   local field
   for field in "$@"; do
-    case "$field" in
-      "$key"=*)
-        printf '%s\n' "${field#*=}"
-        return 0
-        ;;
-    esac
+    [ -n "$field" ] || continue
+    for field in $field; do
+      case "$field" in
+        "$key"=*)
+          printf '%s\n' "${field#*=}"
+          return 0
+          ;;
+      esac
+    done
   done
 
   return 1
@@ -107,9 +113,19 @@ sha256_file() {
   fi
 }
 
+sha512_file() {
+  local path="$1"
+
+  if command -v sha512sum >/dev/null 2>&1; then
+    sha512sum "$path" | awk '{print $1}'
+  else
+    shasum -a 512 "$path" | awk '{print $1}'
+  fi
+}
+
 install_tar_gz() {
   local name="$1" url="$2" root="$3" note="$4" r1="$5"
-  local tmpdir archive expected_sha actual_sha
+  local tmpdir archive expected_sha actual_sha hash_alg strip_components copy_spec copy_src copy_dst
 
   root="$(expand_root "$name" "$root")"
   tmpdir="$(mktemp -d)"
@@ -118,18 +134,139 @@ install_tar_gz() {
   echo ">> [$name] install via tar.gz: $url"
   curl -fL "$url" -o "$archive"
 
-  expected_sha="$(meta_value sha256 "$note" "$r1" || true)"
+  expected_sha="$(meta_value sha512 "$note" "$r1" || true)"
+  hash_alg="sha512"
+  if [ -z "$expected_sha" ]; then
+    expected_sha="$(meta_value sha256 "$note" "$r1" || true)"
+    hash_alg="sha256"
+  fi
   if [ -n "$expected_sha" ]; then
-    actual_sha="$(sha256_file "$archive")"
+    if [ "$hash_alg" = "sha512" ]; then
+      actual_sha="$(sha512_file "$archive")"
+    else
+      actual_sha="$(sha256_file "$archive")"
+    fi
     if [ "$actual_sha" != "$expected_sha" ]; then
-      echo "!! [$name] sha256 mismatch: expected $expected_sha, got $actual_sha" >&2
+      echo "!! [$name] $hash_alg mismatch: expected $expected_sha, got $actual_sha" >&2
       rm -rf "$tmpdir"
       return 1
     fi
   fi
 
   mkdir -p "$root"
-  tar -xzf "$archive" -C "$root"
+  strip_components="$(meta_value strip "$note" "$r1" || true)"
+  if [ -z "$strip_components" ]; then
+    strip_components="$(meta_value strip_components "$note" "$r1" || true)"
+  fi
+  if [ -n "$strip_components" ] && [ "$strip_components" != "0" ]; then
+    tar -xzf "$archive" -C "$root" --strip-components="$strip_components"
+  else
+    tar -xzf "$archive" -C "$root"
+  fi
+
+  copy_spec="$(meta_value copy_bin "$note" "$r1" || true)"
+  if [ -n "$copy_spec" ]; then
+    copy_src="${copy_spec%%:*}"
+    copy_dst="${copy_spec#*:}"
+
+    if [ -z "$copy_src" ] || [ -z "$copy_dst" ] || [ "$copy_src" = "$copy_spec" ]; then
+      echo "!! [$name] malformed copy_bin '$copy_spec' (expected source:dest)" >&2
+      rm -rf "$tmpdir"
+      return 1
+    fi
+
+    if [ ! -f "$root/$copy_src" ]; then
+      echo "!! [$name] copy source '$root/$copy_src' not found" >&2
+      rm -rf "$tmpdir"
+      return 1
+    fi
+
+    mkdir -p "$HOME/.local/bin"
+    cat > "$HOME/.local/bin/$copy_dst" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+    app_root="$root"
+    binary="$root/$copy_dst"
+    hub_config_home="\${XDG_CONFIG_HOME:-\$HOME/.config}/antigravity-hub"
+    hub_data_home="\${XDG_DATA_HOME:-\$HOME/.local/share}/antigravity-hub"
+    hub_cache_home="\${XDG_CACHE_HOME:-\$HOME/.cache}/antigravity-hub"
+    hub_state_home="\${XDG_STATE_HOME:-\$HOME/.local/state}/antigravity-hub"
+    hub_user_data="\$hub_state_home/user-data"
+
+    unset BROWSER
+    export LD_LIBRARY_PATH="$root\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+    mkdir -p "\$hub_config_home" "\$hub_data_home" "\$hub_cache_home" "\$hub_user_data"
+    export XDG_CONFIG_HOME="\$hub_config_home"
+    export XDG_DATA_HOME="\$hub_data_home"
+    export XDG_CACHE_HOME="\$hub_cache_home"
+    cd "\$app_root"
+    exec "\$binary" "\$@" --user-data-dir="\$hub_user_data"
+EOF
+    chmod +x "$HOME/.local/bin/$copy_dst" 2>/dev/null || true
+  fi
+
+  if [ "$name" = "antigravity-hub" ]; then
+    mkdir -p "$root"
+    ln -sf "$root/antigravity" "$root/antigravity-hub"
+  fi
+
+  if [ "$name" = "agy" ]; then
+    mkdir -p "$root"
+    ln -sf "$root/antigravity" "$root/agy"
+  fi
+
+  if [ "$name" = "antigravity-hub" ] || [ "$name" = "antigravity-ide" ]; then
+    mkdir -p "$root/share/applications"
+    case "$name" in
+      antigravity-hub)
+        cat > "$root/share/applications/antigravity-hub.desktop" <<'EOF'
+[Desktop Entry]
+Name=Antigravity Hub
+Comment=Antigravity command center
+GenericName=Agent Manager
+Exec=/home/metsatron/.local/bin/antigravity-hub %F
+TryExec=/home/metsatron/.local/bin/antigravity-hub
+Icon=/home/metsatron/.local/share/antigravity-ide/2.1.1-6123990880747520/resources/app/out/vs/platform/browserOnboarding/static/antigravity.svg
+Type=Application
+StartupNotify=false
+StartupWMClass=Antigravity Hub
+Categories=Development;IDE;
+Keywords=vscode;
+EOF
+        ;;
+      antigravity-ide)
+        cat > "$root/share/applications/antigravity-ide.desktop" <<'EOF'
+[Desktop Entry]
+Name=Antigravity IDE
+Comment=Antigravity editor surface
+GenericName=Text Editor
+Exec=/home/metsatron/.local/bin/antigravity-ide %F
+TryExec=/home/metsatron/.local/bin/antigravity-ide
+Icon=antigravity-ide
+Type=Application
+StartupNotify=false
+StartupWMClass=Antigravity IDE
+Categories=Development;IDE;
+MimeType=application/x-antigravity-workspace;
+Actions=new-empty-window;
+Keywords=vscode;
+
+[Desktop Action new-empty-window]
+Name=New Empty Window
+Exec=/home/metsatron/.local/bin/antigravity-ide --new-window %F
+Icon=antigravity-ide
+EOF
+        ;;
+    esac
+  fi
+
+  if [ "$name" = "antigravity-ide" ]; then
+    mkdir -p "$root/share/icons/hicolor/scalable/apps"
+    ln -sf "$root/resources/app/out/vs/platform/browserOnboarding/static/antigravity.svg" \
+      "$root/share/icons/hicolor/scalable/apps/antigravity-ide.svg"
+  fi
+
   rm -rf "$tmpdir"
 }
 
@@ -209,9 +346,16 @@ sync_links_for_app() {
 sync_share_for_app() {
   local name="$1" root="$2" bindir="${3:-bin}"
   local share_src share_dst="$HOME/.local/share"
+  local preserve_exec=0
 
   root="$(expand_root "$name" "$root")"
   share_src="${root%/}/share"
+
+  case "$name" in
+    antigravity-hub)
+      preserve_exec=1
+      ;;
+  esac
 
   [ -d "$share_src" ] || return 0
 
@@ -230,7 +374,7 @@ sync_share_for_app() {
       local base dst
       base="$(basename "$f")"
       dst="$share_dst/applications/$base"
-      if [ -n "$bin_exe" ]; then
+      if [ "$preserve_exec" -eq 0 ] && [ -n "$bin_exe" ]; then
         # Write a corrected copy with absolute Exec/TryExec so the launcher
         # appears even when the DE session PATH does not include ~/.local/bin.
         # Write to a tempfile first — $dst may be a symlink pointing back to
@@ -257,7 +401,7 @@ sync_share_for_app() {
       dst="$share_dst/icons/$rel"
       mkdir -p "$(dirname "$dst")"
       ln -sf "$f" "$dst"
-    done < <(find "$icons_src" -type f \( -name '*.png' -o -name '*.svg' \))
+    done < <(find "$icons_src" \( -type f -o -type l \) \( -name '*.png' -o -name '*.svg' \))
     echo ">> [$name] wrote XDG share entries from $share_src"
   fi
 }
