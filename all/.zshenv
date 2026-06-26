@@ -47,7 +47,10 @@ if [ -r "$HOME/.guix-extra-profiles/core/core/etc/profile" ]; then
 fi
 
 # HelmCortex FORGE bin (auryn, pipelines, sapphire-server)
-if [ -d "$HOME/HelmCortex/FORGE/bin" ] && ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
+# On client machines HelmCortex is an NFS mount; a dead mount makes bare -d/ls
+# block in uninterruptible I/O and hangs every shell start + command lookup.
+# timeout caps the probe (this runs before path_dir_healthy is defined).
+if timeout 2 test -d "$HOME/HelmCortex/FORGE/bin" 2>/dev/null && timeout 2 ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
   export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
 fi
 
