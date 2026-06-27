@@ -16,47 +16,56 @@
 ;; Virtual Habitat — sanctuary-cde Guix profile
 ;; CDE 2.5.3 build toolchain and library deps — all sourced from Guix.
 ;; Install target: ~/.local/share/cde (user-writable, persists in sanctuary home).
-(specifications->manifest
- '(
-   ;; Build toolchain + download/unpack tools
-   "autoconf" "automake" "libtool"
-   "gcc-toolchain" "make" "m4"
-   "bison" "flex" "patch" "git"
-   "tar" "curl" "gzip" "pkg-config"
-   ;; OpenMotif — the required Motif implementation (verified in Guix)
-   "motif"
-   ;; X11 libraries
-   "libx11" "libxt" "libxmu" "libxft"
-   "libxinerama" "libxpm" "libxaw"
-   "libxdmcp" "libxrender"
-   ;; X11 tools (needed by CDE at build and runtime)
-   "sessreg" "xrdb" "xset" "xbitmaps"
-   ;; X11 standard utilities (for CDE action database and user tools)
-   "xclock"     ; XclockDig action
-   "xrefresh"   ; Xrefresh action
-   "xdpyinfo"   ; Xdpyinfo action
-   "xwininfo"   ; Xwininfo action
-   "xlsfonts"   ; Xlsfonts action
-   "xprop"      ; Xprop/Window Properties action
-   "xwd"        ; Xwd Capture / Xwud Display actions
-   "xfd"        ; Font Preview (Xfd) action
-   "xfontsel"   ; font browser
-   ;; X11 fonts — misc-fixed family for CDE interface font aliases
-   "font-misc-misc"
-   ;; System libraries
-   "linux-pam" "libxcrypt" "libtirpc" "rpcsvc-proto" "rpcbind"
-   "net-base" "inetutils" "gawk" "cups"
-   "openssl" "tcl" "lmdb" "opensp" "ncompress"
-   "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
-   "perl" "mkfontdir" "bdftopcf"
-   ;; X11 extensions
-   "libxscrnsaver"
-   ;; Media
-   "freetype" "libjpeg-turbo" "bzip2"
-   ;; Graphical applications accessible from the CDE Application Manager
-   "stellarium"  ; planetarium/sky simulation
-   "tuxpaint"    ; kids paint program
-   ;; Fallback terminal inside the sanctuary
-   "xterm"
-   ))
+;; geogebra-classic is a local package (local/packages/geogebra.scm); the make
+;; target passes -L $(LOCAL_PKGS) so the module is visible.
+(use-modules (local packages geogebra))
+
+(manifest
+ (cons
+  (package->manifest-entry geogebra-classic)
+  (manifest-entries
+   (specifications->manifest
+    '(
+      ;; Build toolchain + download/unpack tools
+      "autoconf" "automake" "libtool"
+      "gcc-toolchain" "make" "m4"
+      "bison" "flex" "patch" "git"
+      "tar" "curl" "gzip" "pkg-config"
+      ;; OpenMotif — the required Motif implementation (verified in Guix)
+      "motif"
+      ;; X11 libraries
+      "libx11" "libxt" "libxmu" "libxft"
+      "libxinerama" "libxpm" "libxaw"
+      "libxdmcp" "libxrender"
+      ;; X11 tools (needed by CDE at build and runtime)
+      "sessreg" "xrdb" "xset" "xbitmaps"
+      ;; X11 standard utilities (for CDE action database and user tools)
+      "xclock"     ; XclockDig action
+      "xrefresh"   ; Xrefresh action
+      "xdpyinfo"   ; Xdpyinfo action
+      "xwininfo"   ; Xwininfo action
+      "xlsfonts"   ; Xlsfonts action
+      "xprop"      ; Xprop/Window Properties action
+      "xwd"        ; Xwd Capture / Xwud Display actions
+      "xfd"        ; Font Preview (Xfd) action
+      "xfontsel"   ; font browser
+      ;; X11 fonts — misc-fixed family for CDE interface font aliases
+      "font-misc-misc"
+      ;; System libraries
+      "linux-pam" "libxcrypt" "libtirpc" "rpcsvc-proto" "rpcbind"
+      "net-base" "inetutils" "gawk" "cups"
+      "openssl" "tcl" "lmdb" "opensp" "ncompress"
+      "oksh"           ; ksh substitute — OpenBSD Korn Shell (ksh not in Guix)
+      "perl" "mkfontdir" "bdftopcf"
+      ;; X11 extensions
+      "libxscrnsaver"
+      ;; Media
+      "freetype" "libjpeg-turbo" "bzip2"
+      ;; Graphical applications accessible from the CDE Application Manager
+      "gcompris-qt"  ; educational games for children
+      "stellarium"   ; planetarium/sky simulation
+      "tuxpaint"     ; kids paint program
+      ;; Fallback terminal inside the sanctuary
+      "xterm"
+      )))))
 ;; sanctuary-cde:1 ends here
