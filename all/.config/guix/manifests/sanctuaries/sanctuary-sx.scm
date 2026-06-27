@@ -32,10 +32,12 @@
    "ristretto"
    ;; Text editor
    "mousepad"
-   ;; Archive manager
-   "engrampa"
-   ;; Session bus (required for dbus-run-session launcher)
-   "dbus"
+;; Archive manager
+    "engrampa"
+    ;; Exo — helper library providing exo-desktop-item-edit for launcher editing
+    "exo"
+    ;; Session bus (required for dbus-run-session launcher)
+    "dbus"
    ;; Standard X11 debug and display utilities
    "xterm"       ; fallback terminal
    "xdpyinfo"    ; display info
