@@ -327,9 +327,9 @@ echo "      sanctuary-sx-launch"
 
 * Sanctuary Launcher Scripts
 
-Each launcher: starts Xephyr full-screen on the current host desktop, waits for the
-display, then sources the Guix profiles inside the container and starts the WM.
-Switch to the correct virtual desktop (Super+N) before running.
+Each launcher starts Xephyr full-screen on the current host desktop, waits for
+the display, then sources the Guix profiles inside the container and starts the
+selected WM/session.
 
 All entries go through =sanctuary-enter=. Distrobox 1.8.2.4 copies almost every host
 environment variable into =podman exec --env= arguments; the helper starts Distrobox
@@ -337,8 +337,8 @@ under =env -i= and restores only the variables required for identity, locale, di
 session D-Bus, and audio. API keys and agent sockets must never cross this boundary.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-enter :shebang "#!/usr/bin/env bash"
-# Select and launch a sanctuary's graphical Xephyr environment.
-# Usage: sanctuary-enter [sanctuary-name]
+# Select and launch a tested graphical habitat profile.
+# Usage: sanctuary-enter [profile-id]
 set -euo pipefail
 
 if (( $# > 1 )); then
@@ -348,32 +348,44 @@ if (( $# > 1 )); then
 fi
 
 if (( $# == 1 )); then
-  SANCTUARY="$1"
+  PROFILE="$1"
 else
   DISTROBOX_BIN="$(command -v distrobox)" \
     || { echo "sanctuary-enter: distrobox not found" >&2; exit 127; }
   FZF_BIN="$(command -v fzf)" \
     || { echo "sanctuary-enter: fzf not found" >&2; exit 127; }
 
-  SANCTUARIES="$(
+  AVAILABLE_SANCTUARIES="$(
     "${DISTROBOX_BIN}" list --no-color | awk -F '|' '
       NR > 1 {
         name = $2
         gsub(/^[[:space:]]+|[[:space:]]+$/, "", name)
-        if (name ~ /^sanctuary-/) print name
+        print name
       }
     '
   )"
 
-  if [[ -z "${SANCTUARIES}" ]]; then
+  PROFILES=""
+  case "${AVAILABLE_SANCTUARIES}" in
+    *sanctuary-redstone-9x*) PROFILES="${PROFILES}"$'\n'"redstone-9x:icewm" ;;
+  esac
+  case "${AVAILABLE_SANCTUARIES}" in
+    *sanctuary-cde*) PROFILES="${PROFILES}"$'\n'"sanctuary-cde:cde" ;;
+  esac
+  case "${AVAILABLE_SANCTUARIES}" in
+    *sanctuary-sx*) PROFILES="${PROFILES}"$'\n'"sx-window:xfce4" ;;
+  esac
+  PROFILES="$(printf '%s\n' "${PROFILES}" | sed '/^$/d')"
+
+  if [[ -z "${PROFILES}" ]]; then
     echo "sanctuary-enter: no available sanctuaries" >&2
     exit 1
   fi
 
-  SANCTUARY="$(
-    printf '%s\n' "${SANCTUARIES}" \
+  PROFILE="$(
+    printf '%s\n' "${PROFILES}" \
       | "${FZF_BIN}" \
-          --prompt='sanctuary> ' \
+          --prompt='habitat> ' \
           --height=40% \
           --layout=reverse \
           --border \
@@ -382,7 +394,22 @@ else
   )" || exit 130
 fi
 
-LAUNCHER="${SANCTUARY}-launch"
+case "${PROFILE}" in
+  redstone-9x:icewm|sanctuary-redstone-9x)
+    LAUNCHER="sanctuary-redstone-9x-launch"
+    ;;
+  sanctuary-cde:cde|sanctuary-cde)
+    LAUNCHER="sanctuary-cde-launch"
+    ;;
+  sx-window:xfce4|sanctuary-sx)
+    LAUNCHER="sanctuary-sx-launch"
+    ;;
+  *)
+    echo "sanctuary-enter: unsupported or untested profile: ${PROFILE}" >&2
+    exit 2
+    ;;
+esac
+
 LAUNCHER_BIN="$(command -v "${LAUNCHER}")" \
   || { echo "sanctuary-enter: launcher not found: ${LAUNCHER}" >&2; exit 127; }
 exec "${LAUNCHER_BIN}"
@@ -540,6 +567,20 @@ DISPLAY="${DISPLAY_NUM}" xset fp rehash
 # Requires xclip in desktop-common profile.
 cde-clipboard-bridge "${HOST_DISPLAY}" "${DISPLAY_NUM}" &
 BRIDGE_PID=$!
+
+# Start Calendar RPC daemon as UID 0 inside the running container (uid 0 = host
+# metsatron in rootless Podman user namespace).  rpc.cmsd requires geteuid()==0;
+# the container root check is satisfied here with no host privilege escalation.
+# Idempotent: skips the start if rpc.cmsd is already running.
+podman start "${SANCTUARY}" 2>/dev/null || true
+
+# Calendar RPC daemon — UID 0 in container (= host metsatron in rootless Podman user ns).
+# rpc.cmsd requires geteuid()==0; no host privilege escalation.  Idempotent.
+if ! podman exec "${SANCTUARY}" pgrep -x rpc.cmsd >/dev/null 2>&1; then
+    podman exec --user 0 "${SANCTUARY}" mkdir -p /var/spool/calendar
+    podman exec --user 0 "${SANCTUARY}" "${CDE_HOME}/bin/rpc.cmsd" &
+    sleep 0.5
+fi
 
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   GUIX_PROFILE=${GUIX_PROFILES}/desktop-common/desktop-common
@@ -902,6 +943,16 @@ ACTION MailerServerStatus
         EXEC_STRING     sh -c 'echo "UNRESOLVED: Mail server (MTA) not configured"; echo; echo "dtmail shows local mbox files. Sending or receiving mail requires"; echo "Sendmail, Postfix, or another MTA -- not present in this container."; echo; echo "Press Enter to close..."; read _'
         DESCRIPTION     Mailer -- dtmail works but no MTA configured in this container.
 }
+ACTION Dtmail
+{
+        LABEL           Mailer
+        ICON            DtMail
+        ARG_COUNT       0
+        TYPE            COMMAND
+        WINDOW_TYPE     NO_STDIO
+        EXEC_STRING     /home/metsatron/.local/share/dotcortex/guests/sanctuary-cde/home/.local/share/cde/bin/dtmail -t
+        DESCRIPTION     The Mailer action opens the CDE mail client (dtmail).
+}
 SANCTUARY_DT
 fi
 
@@ -1008,41 +1059,59 @@ if [[ "${_missing}" -eq 1 ]]; then
 fi
 
 # Project DotCortex-managed IceWM config into isolated guest home.
-# Reads directly from the org-tangled overlay — stow on the host is not required.
+# Copy, do not symlink: the host repo path is not visible inside the container.
+project_file() {
+  local src="$1" dst="$2"
+  mkdir -p "$(dirname "${dst}")"
+  rm -f "${dst}"
+  cp -f "${src}" "${dst}"
+}
+
+project_dir() {
+  local src="$1" dst="$2" tmp="${2}.tmp"
+  mkdir -p "$(dirname "${dst}")"
+  rm -rf "${tmp}"
+  cp -a "${src}" "${tmp}"
+  rm -rf "${dst}"
+  mv "${tmp}" "${dst}"
+}
+
 mkdir -p "${GUEST_HOME}/.icewm"
-ln -sfnT "${HOME}/DotCortex/linux/.icewm/themes" "${GUEST_HOME}/.icewm/themes"
-ln -sfnT "${HOME}/DotCortex/linux/.icewm/preferences" "${GUEST_HOME}/.icewm/preferences"
-ln -sfnT "${HOME}/DotCortex/linux/.icewm/menu" "${GUEST_HOME}/.icewm/menu"
-ln -sfnT "${HOME}/DotCortex/linux/.icewm/startup" "${GUEST_HOME}/.icewm/startup"
+project_dir "${HOME}/DotCortex/linux/.icewm/themes" "${GUEST_HOME}/.icewm/themes"
+project_file "${HOME}/DotCortex/linux/.icewm/preferences" "${GUEST_HOME}/.icewm/preferences"
+project_file "${HOME}/DotCortex/linux/.icewm/menu" "${GUEST_HOME}/.icewm/menu"
+project_file "${HOME}/DotCortex/linux/.icewm/startup" "${GUEST_HOME}/.icewm/startup"
+chmod +x "${GUEST_HOME}/.icewm/startup"
 
 # Project the DotCortex GTK theme into the guest so GTK uses the repo-owned theme
 # instead of whichever host theme happens to be installed.
 mkdir -p "${GUEST_HOME}/.themes"
-ln -sfnT "${HOME}/DotCortex/linux/.themes/Windows-95" "${GUEST_HOME}/.themes/Windows-95"
+project_dir "${HOME}/DotCortex/linux/.themes/Windows-95" "${GUEST_HOME}/.themes/Windows-95"
 
 # Project the repo icon theme too; GTK and pcmanfm need it inside the guest home
 # for desktop shortcuts and panel icons to resolve correctly.
 mkdir -p "${GUEST_HOME}/.local/share/icons"
-ln -sfnT "${HOME}/DotCortex/linux/.local/share/icons/Chicago95" \
+project_dir "${HOME}/DotCortex/linux/.local/share/icons/Chicago95" \
   "${GUEST_HOME}/.local/share/icons/Chicago95"
 
 # Project DotCortex-managed PowerShell profile into guest home.
 mkdir -p "${GUEST_HOME}/.config/powershell"
-ln -sfnT "${HOME}/DotCortex/linux/.config/powershell/Microsoft.PowerShell_profile.ps1" \
+project_file "${HOME}/DotCortex/linux/.config/powershell/Microsoft.PowerShell_profile.ps1" \
   "${GUEST_HOME}/.config/powershell/Microsoft.PowerShell_profile.ps1"
 
 # Project the Redstone launcher wrapper into the guest so menu items can source
 # the correct Guix profiles before running PowerShell/CMD/DOS tools.
 mkdir -p "${GUEST_HOME}/.local/bin"
-ln -sfnT "${HOME}/DotCortex/linux/.local/bin/redstone-9x-run" \
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-run" \
   "${GUEST_HOME}/.local/bin/redstone-9x-run"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-run"
 
 mkdir -p "${GUEST_HOME}/.config/gtk-3.0"
-ln -sfnT "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/settings.ini" \
+project_file "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/settings.ini" \
   "${GUEST_HOME}/.config/gtk-3.0/settings.ini"
-ln -sfnT "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/gtk.css" \
+project_file "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/gtk.css" \
   "${GUEST_HOME}/.config/gtk-3.0/gtk.css"
-ln -sfnT "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-2.0/gtkrc" \
+project_file "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-2.0/gtkrc" \
   "${GUEST_HOME}/.gtkrc-2.0"
 
 # Project staged fonts into guest home (idempotent; absent if not yet provisioned).
@@ -1051,20 +1120,33 @@ if [[ -d "${FONT_STAGE}" ]]; then
   ln -sfnT "${FONT_STAGE}" "${GUEST_HOME}/.local/share/fonts/redstone-9x"
 fi
 
+# Project managed Audacious Winamp skins into the guest.  The player keeps its
+# mutable runtime config in the guest home; only the reusable skin assets come
+# from DotCortex.
+if [[ -d "${HOME}/DotCortex/linux/.local/share/audacious/Skins" ]]; then
+  project_dir "${HOME}/DotCortex/linux/.local/share/audacious/Skins" \
+    "${GUEST_HOME}/.local/share/audacious/Skins"
+fi
+
 # Win95 desktop icons — symlink declared .desktop files; Desktop itself stays writable
 mkdir -p "${GUEST_HOME}/Desktop"
 for f in "${HOME}/DotCortex/linux/.icewm/desktop/"*.desktop; do
-  [[ -e "$f" ]] && ln -sfnT "$f" "${GUEST_HOME}/Desktop/$(basename "$f")"
+  [[ -e "$f" ]] && project_file "$f" "${GUEST_HOME}/Desktop/$(basename "$f")"
 done
 
-# pcmanfm desktop background — written once on first launch; user can override via preferences
+# pcmanfm desktop background — written once on first launch; user can override via preferences.
+# Use the default profile so desktop preferences talk to the active desktop manager.
 mkdir -p "${GUEST_HOME}/.config/pcmanfm/default"
 if [[ ! -f "${GUEST_HOME}/.config/pcmanfm/default/desktop-items-0.conf" ]]; then
   printf '[*]\nwallpaper_mode=color\nwallpaper_bg_color=#008080\n' \
     > "${GUEST_HOME}/.config/pcmanfm/default/desktop-items-0.conf"
 fi
+if [[ ! -f "${GUEST_HOME}/.config/pcmanfm/default/pcmanfm.conf" ]]; then
+  printf '[config]\nbm_open_method=0\n\n[ui]\nshow_hidden=1\nview_mode=icon\n' \
+    > "${GUEST_HOME}/.config/pcmanfm/default/pcmanfm.conf"
+fi
 
-Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac &
+Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -dpi 96 &
 XEPHYR_PID=$!
 trap "kill ${XEPHYR_PID} 2>/dev/null || true" EXIT
 
@@ -1074,6 +1156,7 @@ timeout 10 sh -c "until DISPLAY=${DISPLAY_NUM} xdpyinfo >/dev/null 2>&1; do slee
 # Load Redstone terminal profiles (URxvt named instances) into the Xephyr display.
 DISPLAY="${DISPLAY_NUM}" xrdb -merge "${HOME}/DotCortex/linux/.config/redstone-9x/Xresources" \
   2>/dev/null || echo "${SANCTUARY}: warning — Xresources not found, terminals will use defaults"
+DISPLAY="${DISPLAY_NUM}" xrandr --dpi 96 2>/dev/null || true
 
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — sourcing Guix profiles and starting IceWM…"
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
@@ -1084,10 +1167,13 @@ DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   . \${GUIX_PROFILE}/etc/profile
   export GTK_THEME=Windows-95
   export XCURSOR_THEME=Win95
-  export XCURSOR_SIZE=32
+  export XCURSOR_SIZE=24
   export GDK_PIXBUF_MODULE_FILE=\${GUIX_PROFILE}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
   GUIX_PROFILE=${GUIX_PROFILES}/room-windows-compat/room-windows-compat
   . \${GUIX_PROFILE}/etc/profile
+  export XDG_DATA_DIRS=${GUIX_PROFILES}/room-windows-compat/room-windows-compat/share:${GUIX_PROFILES}/room-gaming/room-gaming/share:${GUIX_PROFILES}/desktop-common/desktop-common/share:/usr/local/share:/usr/share
+  export XDG_CONFIG_DIRS=${GUIX_PROFILES}/room-windows-compat/room-windows-compat/etc/xdg:${GUIX_PROFILES}/room-gaming/room-gaming/etc/xdg:${GUIX_PROFILES}/desktop-common/desktop-common/etc/xdg:/etc/xdg
+  export GSETTINGS_SCHEMA_DIR=${GUIX_PROFILES}/room-gaming/room-gaming/share/glib-2.0/schemas
   export WINEPREFIX=${GUEST_HOME}/.wine-redstone
   export WINEARCH=win64
   export WINEDEBUG=-all
@@ -1095,6 +1181,7 @@ DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   export PATH=\${REDSTONE_GUEST_BIN}:\${PATH}
   xrdb -merge ${HOME}/DotCortex/linux/.config/redstone-9x/Xresources \
     2>/dev/null || echo ${SANCTUARY}: warning — Redstone Xresources not loaded
+  xrandr --dpi 96 2>/dev/null || true
   bash ${HOME}/DotCortex/linux/.local/bin/sanctuary-redstone-9x-wineprefix-init
   exec dbus-run-session icewm-session
 "
@@ -1109,6 +1196,34 @@ on the host; the launcher above projects this file directly into the guest home.
 #+BEGIN_SRC conf :tangle linux/.icewm/preferences
 Theme="WindowsNT/default.theme"
 
+# Taskbar, tray, status widgets, and icon sizing for the Redstone profile.
+ShowTaskBar=1
+TaskBarAtTop=0
+TaskBarShowClock=1
+TaskBarShowWorkspaces=1
+TaskBarShowWindows=1
+TaskBarShowShowDesktopButton=1
+TaskBarShowTray=1
+TaskBarEnableSystemTray=1
+TrayShowAllWindows=1
+TaskBarShowCPUStatus=1
+CPUStatusShowRamUsage=1
+CPUStatusShowSwapUsage=1
+CPUStatusShowAcpiTemp=1
+CPUStatusShowCpuFreq=1
+TaskBarShowMEMStatus=1
+TaskBarShowNetStatus=1
+NetStatusShowOnlyRunning=1
+NetworkStatusDevice="eth0"
+TaskBarShowAPMAuto=1
+TaskBarShowAPMTime=1
+TaskBarShowAPMGraph=1
+TaskBarDoubleHeight=0
+TaskBarCPUSamples=20
+TaskBarMEMSamples=20
+TaskBarNetSamples=20
+TaskbarButtonWidthDivisor=3
+
 # Taskbar and icon sizing required by the Windows NT theme pixmaps
 TaskBarGraphHeight=27
 TrayIconMaxHeight=16
@@ -1120,9 +1235,8 @@ MenuMouseTracking=1
 # Time format matches Windows 95 clock appearance; hover for full date
 TimeFormat="%d.%m %R"
 
-# Suppress taskbar elements absent from the stock layout
+# Suppress only the taskbar controls that clash with the Win95 layout.
 TaskBarShowWindowListMenu=0
-TaskBarShowWorkspaces=0
 TaskBarShowCollapseButton=0
 
 #+END_SRC
@@ -1216,23 +1330,23 @@ ColorQuickSwitch="rgb:00/00/00"
 ColorQuickSwitchText="rgb:ff/ff/ff"
 
 # Font Specification
-TitleFontNameXft		=	tahoma:size=8:bold
-MenuFontNameXft			=	tahoma:size=8
-MinimizedWindowFontNameXft	=	tahoma:size=8
-ActiveButtonFontNameXft		=	tahoma:size=8
-NormalButtonFontNameXft		=	tahoma:size=8
-ToolButtonFontNameXft		=	tahoma:size=8
-NormalWorkspaceFontNameXft	=	tahoma:size=8
-ActiveWorkspaceFontNameXft	=	tahoma:size=8
-QuickSwitchFontNameXft		=	tahoma:size=8
-ListBoxFontNameXft		=	tahoma:size=8
-StatusFontNameXft		=	tahoma:size=8
-ToolTipFontNameXft		=	tahoma:size=8
-ActiveTaskBarFontNameXft	=	tahoma:size=8
-NormalTaskBarFontNameXft	=	tahoma:size=8
-ClockFontNameXft		=	tahoma:size=8
-ApmFontNameXft			=	tahoma:size=8
-LabelFontNameXft		=	tahoma:size=8
+TitleFontNameXft		=	tahoma:size=7:bold
+MenuFontNameXft			=	tahoma:size=7
+MinimizedWindowFontNameXft	=	tahoma:size=7
+ActiveButtonFontNameXft		=	tahoma:size=7
+NormalButtonFontNameXft		=	tahoma:size=7
+ToolButtonFontNameXft		=	tahoma:size=7
+NormalWorkspaceFontNameXft	=	tahoma:size=7
+ActiveWorkspaceFontNameXft	=	tahoma:size=7
+QuickSwitchFontNameXft		=	tahoma:size=7
+ListBoxFontNameXft		=	tahoma:size=7
+StatusFontNameXft		=	tahoma:size=7
+ToolTipFontNameXft		=	tahoma:size=7
+ActiveTaskBarFontNameXft	=	tahoma:size=7
+NormalTaskBarFontNameXft	=	tahoma:size=7
+ClockFontNameXft		=	tahoma:size=7
+ApmFontNameXft			=	tahoma:size=7
+LabelFontNameXft		=	tahoma:size=7
 #+END_SRC
 
 #+BEGIN_SRC conf :tangle linux/.icewm/themes/WindowsNT/prefoverride :mkdirp yes
@@ -1250,15 +1364,19 @@ IceWM right-click desktop menu.  Projected into the guest home by the launcher.
 # Redstone 9X — IceWM desktop right-click menu
 
 prog "File Manager"   folder   pcmanfm
+prog "Text Editor"    text-editor pluma
+prog "Music Player"   multimedia audacious
+prog "Appearance"     preferences-desktop-theme lxappearance
 
 separator
 
 menu "Terminals" utilities-terminal {
-  prog "Windows PowerShell"  utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-powershell -title "Windows PowerShell" -e pwsh
-  prog "PowerShell (Bash)"   utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-powershell -title "Windows PowerShell" -e bash
-  prog "Command Prompt"      utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run wineconsole --backend=user cmd.exe
-  prog "Bash (CMD frame)"    utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-cmd -title "Command Prompt" -e bash
-  prog "URxVT"               utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-plain-urxvt -title "URxVT"
+  prog "Windows PowerShell"  utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run xterm -class redstone-powershell -title "Windows PowerShell" -geometry 80x25 -fa "Consolas" -fs 11 -bg "#012456" -fg "#EEEDF0" -cr "#EEEDF0" -e pwsh -NoLogo
+  prog "PowerShell (Bash)"   utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-powershell -title "Windows PowerShell" -geometry 80x25 +sb -bg rgb:01/24/56 -fg rgb:ee/ed/f0 -cr rgb:ee/ed/f0 -fn "xft:Cascadia Mono:size=11:antialias=true,xft:Consolas:size=11:antialias=true" -e bash
+  prog "Command Prompt"      utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -hold -name redstone-bash-cmd -title "Command Prompt" -geometry 80x25 +sb -bg rgb:0c/0c/0c -fg rgb:cc/cc/cc -cr rgb:cc/cc/cc -fn "xft:Lucida Console:pixelsize=14:antialias=true" -e bash -lc 'exec wine cmd.exe'
+  prog "Bash (CMD frame)"    utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-cmd -title "Command Prompt" -geometry 80x25 +sb -bg rgb:0c/0c/0c -fg rgb:cc/cc/cc -cr rgb:cc/cc/cc -fn "xft:Lucida Console:pixelsize=14:antialias=true" -e bash
+  prog "URxVT"               utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-plain-urxvt -title "URxVT" -geometry 80x25 +sb -bg rgb:00/00/00 -fg rgb:d6/d3/ce -cr rgb:d6/d3/ce -fn "xft:Courier New:size=11:antialias=true,xft:monospace:size=11:antialias=true"
+  prog "XTerm"               utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run xterm -title "XTerm" -geometry 80x25
 }
 
 menu "Wine Tools" wine {
@@ -1268,7 +1386,7 @@ menu "Wine Tools" wine {
   prog "Notepad"             wine   wine64 notepad
 }
 
-prog "DOSBox-X"  terminal  dosbox-x
+prog "DOSBox-X"  terminal  bash /home/metsatron/.local/bin/redstone-9x-run dosbox-x
 
 separator
 
@@ -1281,9 +1399,29 @@ menu "System" folder {
 IceWM startup hook.  Runs after =icewm-session= initialises the WM.  Starts
 =pcmanfm= in desktop mode which draws Win95-style desktop icons from =~/Desktop/=.
 
-#+BEGIN_SRC bash :tangle linux/.icewm/startup :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+#+BEGIN_SRC bash :tangle linux/.icewm/startup :shebang "#!/bin/sh" :tangle-mode (identity #o755)
 # Redstone 9X — Win95 desktop manager
-pcmanfm --desktop &
+if command -v xrdb >/dev/null 2>&1; then
+  xrdb -merge /home/metsatron/DotCortex/linux/.config/redstone-9x/Xresources \
+    2>/dev/null || true
+fi
+mkdir -p "${HOME}/Desktop" "${HOME}/.cache/redstone-9x"
+export XDG_CURRENT_DESKTOP="${XDG_CURRENT_DESKTOP:-LXDE}"
+export GDK_BACKEND="${GDK_BACKEND:-x11}"
+pcmanfm --desktop >"${HOME}/.cache/redstone-9x/pcmanfm-desktop.log" 2>&1 &
+
+# Tray inhabitants: start only when available and not already running.
+# PCManFM remains the desktop/background owner; these only occupy IceWM's tray.
+if command -v nm-applet >/dev/null 2>&1 \
+  && pgrep -x NetworkManager >/dev/null 2>&1 \
+  && ! pgrep -xu "$(id -u)" nm-applet >/dev/null 2>&1; then
+  nm-applet >"${HOME}/.cache/redstone-9x/nm-applet.log" 2>&1 &
+fi
+
+if command -v pnmixer >/dev/null 2>&1 \
+  && ! pgrep -xu "$(id -u)" pnmixer >/dev/null 2>&1; then
+  pnmixer >"${HOME}/.cache/redstone-9x/pnmixer.log" 2>&1 &
+fi
 #+END_SRC
 
 Win95 desktop icon declarations.  The launcher symlinks each file individually
@@ -1330,7 +1468,7 @@ Version=1.0
 Type=Application
 Name=Command Prompt
 Comment=Windows Command Prompt via Wine
-Exec=/home/metsatron/.local/bin/redstone-9x-run wineconsole --backend=user cmd.exe
+Exec=bash /home/metsatron/.local/bin/redstone-9x-run urxvt -hold -name redstone-bash-cmd -title "Command Prompt" -geometry 80x25 +sb -bg rgb:0c/0c/0c -fg rgb:cc/cc/cc -cr rgb:cc/cc/cc -fn "xft:Lucida Console:pixelsize=14:antialias=true" -e bash -lc 'exec wine cmd.exe'
 Icon=utilities-terminal
 Terminal=false
 #+END_SRC
@@ -1341,7 +1479,7 @@ Version=1.0
 Type=Application
 Name=Windows PowerShell
 Comment=PowerShell 7 for Linux
-Exec=/home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-powershell -title "Windows PowerShell" -e pwsh
+Exec=bash /home/metsatron/.local/bin/redstone-9x-run xterm -class redstone-powershell -title "Windows PowerShell" -geometry 80x25 -fa "Consolas" -fs 11 -bg "#012456" -fg "#EEEDF0" -cr "#EEEDF0" -e pwsh -NoLogo
 Icon=utilities-terminal
 Terminal=false
 #+END_SRC
@@ -1363,7 +1501,7 @@ Idempotent script run by the launch script before IceWM starts.  Creates
 the Wine prefix in the isolated guest home, installs Wine package fonts into
 the Windows =Fonts= directory, and imports the CMD console registry template.
 
-Requires environment: =WINEPREFIX=, =DOTCORTEX_DIR=, =wine64= in PATH.
+Requires environment: =WINEPREFIX=, =DOTCORTEX_DIR=, =wine= in PATH.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-redstone-9x-wineprefix-init :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 set -euo pipefail
@@ -1376,7 +1514,7 @@ echo "redstone-9x: initialising Wine prefix at ${WINEPREFIX}…"
 WINEDEBUG=-all wineboot -u
 
 # 1. Copy Wine package fonts (from Guix profile)
-WINE_FONTS_SRC="$(dirname "$(dirname "$(command -v wine64)")")/share/wine/fonts"
+WINE_FONTS_SRC="$(dirname "$(dirname "$(command -v wine)")")/share/wine/fonts"
 WINE_FONTS_DST="${WINEPREFIX}/drive_c/windows/Fonts"
 if [[ -d "${WINE_FONTS_SRC}" && -d "${WINE_FONTS_DST}" ]]; then
   cp -n "${WINE_FONTS_SRC}"/*.ttf "${WINE_FONTS_DST}/" 2>/dev/null || true
@@ -1392,7 +1530,7 @@ fi
 # 3. Import CMD console appearance registry template
 REG="${DOTCORTEX_DIR}/linux/.config/redstone-9x/wine-cmd-console.reg"
 if [[ -f "${REG}" ]]; then
-  WINEDEBUG=-all wine64 regedit "${REG}"
+  WINEDEBUG=-all wine regedit "${REG}"
 fi
 
 # 4. bash.cmd bridge: typing 'bash' in Wine CMD opens a Bash-CMD frame.
@@ -1449,78 +1587,78 @@ to Courier New when not installed yet — see =redstone-9x-font-provision=).
 Xft.dpi: 96
 
 ! ── Common defaults ──────────────────────────────────────────────────────────
-URxvt.scrollBar:       false
-URxvt.geometry:        80x25
-URxvt.letterSpace:     0
-URxvt.lineSpace:       1
-URxvt.borderLess:      false
-URxvt.internalBorder:  2
+URxvt*scrollBar:       false
+URxvt*geometry:        80x25
+URxvt*letterSpace:     0
+URxvt*lineSpace:       1
+URxvt*borderLess:      false
+URxvt*internalBorder:  2
 
 ! ── redstone-powershell — Windows PowerShell (deep blue / white) ─────────────
-redstone-powershell.background:  #012456
-redstone-powershell.foreground:  #EEEDF0
-redstone-powershell.cursorColor: #EEEDF0
-redstone-powershell.color0:      #0C0C0C
-redstone-powershell.color1:      #C50F1F
-redstone-powershell.color2:      #13A10E
-redstone-powershell.color3:      #C19C00
-redstone-powershell.color4:      #0037DA
-redstone-powershell.color5:      #881798
-redstone-powershell.color6:      #3A96DD
-redstone-powershell.color7:      #CCCCCC
-redstone-powershell.color8:      #767676
-redstone-powershell.color9:      #E74856
-redstone-powershell.color10:     #16C60C
-redstone-powershell.color11:     #F9F1A5
-redstone-powershell.color12:     #3B78FF
-redstone-powershell.color13:     #B4009E
-redstone-powershell.color14:     #61D6D6
-redstone-powershell.color15:     #F2F2F2
-redstone-powershell.font:        xft:Consolas:size=11:antialias=true
+redstone-powershell*background:  #012456
+redstone-powershell*foreground:  #EEEDF0
+redstone-powershell*cursorColor: #EEEDF0
+redstone-powershell*color0:      #0C0C0C
+redstone-powershell*color1:      #C50F1F
+redstone-powershell*color2:      #13A10E
+redstone-powershell*color3:      #C19C00
+redstone-powershell*color4:      #0037DA
+redstone-powershell*color5:      #881798
+redstone-powershell*color6:      #3A96DD
+redstone-powershell*color7:      #CCCCCC
+redstone-powershell*color8:      #767676
+redstone-powershell*color9:      #E74856
+redstone-powershell*color10:     #16C60C
+redstone-powershell*color11:     #F9F1A5
+redstone-powershell*color12:     #3B78FF
+redstone-powershell*color13:     #B4009E
+redstone-powershell*color14:     #61D6D6
+redstone-powershell*color15:     #F2F2F2
+redstone-powershell*font:        xft:Consolas:size=11:antialias=true
 
 ! ── redstone-bash-powershell — Bash in PowerShell frame ─────────────────────
-redstone-bash-powershell.background:  #012456
-redstone-bash-powershell.foreground:  #EEEDF0
-redstone-bash-powershell.cursorColor: #EEEDF0
-redstone-bash-powershell.color0:      #0C0C0C
-redstone-bash-powershell.color1:      #C50F1F
-redstone-bash-powershell.color2:      #13A10E
-redstone-bash-powershell.color3:      #C19C00
-redstone-bash-powershell.color4:      #0037DA
-redstone-bash-powershell.color5:      #881798
-redstone-bash-powershell.color6:      #3A96DD
-redstone-bash-powershell.color7:      #CCCCCC
-redstone-bash-powershell.color8:      #767676
-redstone-bash-powershell.color9:      #E74856
-redstone-bash-powershell.color10:     #16C60C
-redstone-bash-powershell.color11:     #F9F1A5
-redstone-bash-powershell.color12:     #3B78FF
-redstone-bash-powershell.color13:     #B4009E
-redstone-bash-powershell.color14:     #61D6D6
-redstone-bash-powershell.color15:     #F2F2F2
-redstone-bash-powershell.font:        xft:Cascadia Mono:size=11:antialias=true,xft:Consolas:size=11:antialias=true
+redstone-bash-powershell*background:  #012456
+redstone-bash-powershell*foreground:  #EEEDF0
+redstone-bash-powershell*cursorColor: #EEEDF0
+redstone-bash-powershell*color0:      #0C0C0C
+redstone-bash-powershell*color1:      #C50F1F
+redstone-bash-powershell*color2:      #13A10E
+redstone-bash-powershell*color3:      #C19C00
+redstone-bash-powershell*color4:      #0037DA
+redstone-bash-powershell*color5:      #881798
+redstone-bash-powershell*color6:      #3A96DD
+redstone-bash-powershell*color7:      #CCCCCC
+redstone-bash-powershell*color8:      #767676
+redstone-bash-powershell*color9:      #E74856
+redstone-bash-powershell*color10:     #16C60C
+redstone-bash-powershell*color11:     #F9F1A5
+redstone-bash-powershell*color12:     #3B78FF
+redstone-bash-powershell*color13:     #B4009E
+redstone-bash-powershell*color14:     #61D6D6
+redstone-bash-powershell*color15:     #F2F2F2
+redstone-bash-powershell*font:        xft:Cascadia Mono:size=11:antialias=true,xft:Consolas:size=11:antialias=true
 
 ! ── redstone-bash-cmd — Bash in CMD frame (classic black / pale grey) ────────
-redstone-bash-cmd.background:  #0C0C0C
-redstone-bash-cmd.foreground:  #CCCCCC
-redstone-bash-cmd.cursorColor: #CCCCCC
-redstone-bash-cmd.color0:      #0C0C0C
-redstone-bash-cmd.color1:      #C50F1F
-redstone-bash-cmd.color2:      #13A10E
-redstone-bash-cmd.color3:      #C19C00
-redstone-bash-cmd.color4:      #0037DA
-redstone-bash-cmd.color5:      #881798
-redstone-bash-cmd.color6:      #3A96DD
-redstone-bash-cmd.color7:      #CCCCCC
-redstone-bash-cmd.color8:      #767676
-redstone-bash-cmd.color9:      #E74856
-redstone-bash-cmd.color10:     #16C60C
-redstone-bash-cmd.color11:     #F9F1A5
-redstone-bash-cmd.color12:     #3B78FF
-redstone-bash-cmd.color13:     #B4009E
-redstone-bash-cmd.color14:     #61D6D6
-redstone-bash-cmd.color15:     #F2F2F2
-redstone-bash-cmd.font:        xft:Lucida Console:size=11:antialias=true,xft:Courier New:size=11:antialias=true
+redstone-bash-cmd*background:  #0C0C0C
+redstone-bash-cmd*foreground:  #CCCCCC
+redstone-bash-cmd*cursorColor: #CCCCCC
+redstone-bash-cmd*color0:      #0C0C0C
+redstone-bash-cmd*color1:      #C50F1F
+redstone-bash-cmd*color2:      #13A10E
+redstone-bash-cmd*color3:      #C19C00
+redstone-bash-cmd*color4:      #0037DA
+redstone-bash-cmd*color5:      #881798
+redstone-bash-cmd*color6:      #3A96DD
+redstone-bash-cmd*color7:      #CCCCCC
+redstone-bash-cmd*color8:      #767676
+redstone-bash-cmd*color9:      #E74856
+redstone-bash-cmd*color10:     #16C60C
+redstone-bash-cmd*color11:     #F9F1A5
+redstone-bash-cmd*color12:     #3B78FF
+redstone-bash-cmd*color13:     #B4009E
+redstone-bash-cmd*color14:     #61D6D6
+redstone-bash-cmd*color15:     #F2F2F2
+redstone-bash-cmd*font:        xft:Lucida Console:size=11:antialias=true,xft:Courier New:size=11:antialias=true
 #+END_SRC
 
 ** Font provision script
@@ -1534,15 +1672,16 @@ Provenance table:
 
 | Font          | Source                       | Licence          | Status           |
 |---------------|------------------------------|------------------|------------------|
-| Arial         | GE-Proton Wine fonts (X230)  | Microsoft TT CUF | Auto-copy if NFS |
-| Tahoma        | GE-Proton Wine fonts (X230)  | Microsoft TT CUF | Auto-copy if NFS |
-| Times New Roman | GE-Proton Wine fonts (X230)| Microsoft TT CUF | Auto-copy if NFS |
-| Courier New   | GE-Proton Wine fonts (X230)  | Microsoft TT CUF | Auto-copy if NFS |
+| Arial         | Winetricks =corefonts=       | Microsoft EULA   | Auto-install into Redstone prefix |
+| Tahoma        | Winetricks =tahoma=          | Microsoft EULA   | Auto-install into Redstone prefix |
+| Times New Roman | Winetricks =corefonts=     | Microsoft EULA   | Auto-install into Redstone prefix |
+| Courier New   | Winetricks =corefonts=       | Microsoft EULA   | Auto-install into Redstone prefix |
 | Cascadia Mono | github.com/microsoft/cascadia-code | MIT       | Auto-download    |
-| Lucida Console | MS Windows install          | Proprietary      | Manual provision |
-| Consolas      | MS Office/Windows            | Proprietary      | Manual provision |
-| Verdana       | MS core web fonts            | Microsoft CUF    | Manual provision |
-| MS Sans Serif | Windows system (bitmap)      | Proprietary      | Manual provision |
+| Lucida Console | Winetricks =lucida=          | Microsoft EULA   | Auto-install into Redstone prefix |
+| Consolas      | Winetricks =consolas=        | Microsoft EULA   | Auto-install into Redstone prefix |
+| Verdana       | Winetricks =corefonts=       | Microsoft EULA   | Auto-install into Redstone prefix |
+| Webdings      | Winetricks =webdings=        | Microsoft EULA   | Auto-install into Redstone prefix |
+| MS Sans Serif | Windows system (bitmap)      | Proprietary      | Manual fallback only |
 
 Run: =redstone-9x-font-provision= (once; idempotent).
 
@@ -1552,11 +1691,42 @@ set -euo pipefail
 SANCTUARY="sanctuary-redstone-9x"
 GUESTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/guests"
 FONT_STAGE="${GUESTS_DIR}/${SANCTUARY}/fonts"
+FONT_WINEPREFIX="${GUESTS_DIR}/${SANCTUARY}/font-provision-prefix"
 mkdir -p "${FONT_STAGE}"
 
 STAGED=0
 
-# Source 1: GE-Proton Wine fonts from X230 NFS (when mounted)
+# Source 1: Winetricks Microsoft font verbs.
+# Use a managed font-provisioning prefix so active Redstone Wine sessions do not
+# block font installation. Never use the default ~/.wine.
+WINE_PROFILE="${HOME}/.guix-extra-profiles/room-windows-compat/room-windows-compat"
+if [[ -x "${WINE_PROFILE}/bin/winetricks" ]]; then
+  echo "redstone-9x-fonts: installing Microsoft fonts via Winetricks…"
+  WINEPREFIX="${FONT_WINEPREFIX}" \
+  WINEARCH=win32 \
+  WINEDEBUG=-all \
+  PATH="${WINE_PROFILE}/bin:${PATH}" \
+    "${WINE_PROFILE}/bin/winetricks" -q corefonts tahoma webdings lucida consolas
+
+  PREFIX_FONTS="${FONT_WINEPREFIX}/drive_c/windows/Fonts"
+  if [[ -d "${PREFIX_FONTS}" ]]; then
+    for font in \
+      andale32.exe arial.ttf arialbd.ttf arialbi.ttf ariali.ttf ariblk.ttf \
+      comic.ttf comicbd.ttf cour.ttf courbd.ttf courbi.ttf couri.ttf \
+      georgia.ttf georgiab.ttf georgiai.ttf georgiaz.ttf impact.ttf \
+      lucon.ttf consola.ttf consolab.ttf consolai.ttf consolaz.ttf \
+      tahoma.ttf tahomabd.ttf times.ttf timesbd.ttf timesbi.ttf timesi.ttf \
+      trebuc.ttf trebucbd.ttf trebucbi.ttf trebucit.ttf verdana.ttf \
+      verdanab.ttf verdanai.ttf verdanaz.ttf webdings.ttf; do
+      [[ -f "${PREFIX_FONTS}/${font}" ]] && cp -n "${PREFIX_FONTS}/${font}" "${FONT_STAGE}/"
+    done
+    find "${FONT_STAGE}" -maxdepth 1 -type f \( -iname "lucon.ttf" -o -iname "consola.ttf" -o -iname "cour.ttf" \) | grep -q . && STAGED=1
+  fi
+else
+  echo "redstone-9x-fonts: winetricks not available — build room-windows-compat first"
+fi
+
+# Source 2: GE-Proton Wine fonts from X230 NFS (fallback/cache when mounted)
 GEPROTON_FONTS="/home/metsatron/mnt/x230/.steam/compatibilitytools.d/GE-Proton7-45/files/share/wine/fonts"
 if [[ -d "${GEPROTON_FONTS}" ]]; then
   echo "redstone-9x-fonts: copying from GE-Proton7 (X230 NFS)…"
@@ -1566,8 +1736,7 @@ else
   echo "redstone-9x-fonts: X230 NFS not mounted — skipping GE-Proton fonts"
 fi
 
-# Source 2: Guix wine64 profile fonts (available once room-windows-compat is built)
-WINE_PROFILE="${HOME}/.guix-extra-profiles/room-windows-compat/room-windows-compat"
+# Source 3: Guix wine64 profile fonts (fallback; available once room-windows-compat is built)
 GUIX_WINE_FONTS="${WINE_PROFILE}/share/wine/fonts"
 if [[ -d "${GUIX_WINE_FONTS}" ]]; then
   echo "redstone-9x-fonts: copying from Guix wine64 profile…"
@@ -1575,7 +1744,7 @@ if [[ -d "${GUIX_WINE_FONTS}" ]]; then
   STAGED=1
 fi
 
-# Source 3: Cascadia Mono (MIT licence — auto-download)
+# Source 4: Cascadia Mono (MIT licence — auto-download)
 CASCADIA_TTF="${FONT_STAGE}/CascadiaMono.ttf"
 if [[ ! -f "${CASCADIA_TTF}" ]]; then
   echo "redstone-9x-fonts: downloading Cascadia Mono (MIT)…"
@@ -1597,9 +1766,7 @@ if [[ "${STAGED}" -eq 0 ]]; then
 fi
 echo ""
 echo "Fonts requiring manual provisioning (proprietary):"
-echo "  Lucida Console  — extract from Windows install to ${FONT_STAGE}/lucon.ttf"
-echo "  Consolas        — extract from Windows install to ${FONT_STAGE}/consola.ttf"
-echo "  Verdana         — extract from core web fonts to ${FONT_STAGE}/verdana.ttf"
+echo "  MS Sans Serif   — extract from Windows install if exact bitmap UI fallback is needed"
 #+END_SRC
 
 ** PowerShell $PROFILE
@@ -1619,8 +1786,6 @@ function Prompt {
 
 # Make bash easily reachable from pwsh
 function bash { /usr/bin/env bash @args }
-
-Set-PSReadLineOption -EditMode Windows
 #+END_SRC
 
 ** GTK theme
@@ -1632,21 +1797,23 @@ Redstone uses the Windows-95 GTK theme and a repo-backed Chicago95 icon theme.
 gtk-theme-name=Windows-95
 gtk-icon-theme-name=Chicago95
 gtk-application-prefer-dark-theme=0
-gtk-font-name=Sans 9
+gtk-font-name=Sans 8
+gtk-xft-dpi=98304
 gtk-button-images=1
 gtk-menu-images=1
 gtk-toolbar-style=GTK_TOOLBAR_BOTH
 gtk-toolbar-icon-size=GTK_ICON_SIZE_LARGE_TOOLBAR
 gtk-cursor-theme-name=Win95
-gtk-cursor-theme-size=32
+gtk-cursor-theme-size=24
 #+END_SRC
 
 #+BEGIN_SRC conf :tangle linux/.config/redstone-9x/gtk-2.0/gtkrc :mkdirp yes
 gtk-theme-name="Windows-95"
 gtk-icon-theme-name="Chicago95"
-gtk-font-name="Sans 9"
+gtk-font-name="Sans 8"
+gtk-xft-dpi=98304
 gtk-cursor-theme-name="Win95"
-gtk-cursor-theme-size=32
+gtk-cursor-theme-size=24
 gtk-toolbar-style=GTK_TOOLBAR_BOTH
 gtk-toolbar-icon-size=GTK_ICON_SIZE_LARGE_TOOLBAR
 gtk-button-images=1
@@ -1714,6 +1881,12 @@ for _prof in desktop-common room-gaming room-windows-compat; do
   source_guix_profile "${GUIX_PROFILES}/${_prof}/${_prof}"
 done
 
+export DISPLAY="${DISPLAY:-:93}"
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+export WINEPREFIX="${WINEPREFIX:-${HOME}/.wine-redstone}"
+export WINEDEBUG="${WINEDEBUG:--all}"
+export DOTCORTEX_DIR="${DOTCORTEX_DIR:-${HOME}/DotCortex}"
+
 exec "$@"
 #+END_SRC
 
@@ -1725,7 +1898,7 @@ Version=1.0
 Type=Application
 Name=Bash (PowerShell frame)
 Comment=Bash shell in PowerShell colours
-Exec=/home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-powershell -title "Bash" -e bash
+Exec=bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-powershell -title "Bash" -geometry 80x25 +sb -bg rgb:01/24/56 -fg rgb:ee/ed/f0 -cr rgb:ee/ed/f0 -fn "xft:Cascadia Mono:size=11:antialias=true,xft:Consolas:size=11:antialias=true" -e bash
 Icon=utilities-terminal
 Terminal=false
 #+END_SRC
@@ -1736,7 +1909,7 @@ Version=1.0
 Type=Application
 Name=Bash (CMD frame)
 Comment=Bash shell in CMD colours
-Exec=/home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-cmd -title "Bash" -e bash
+Exec=bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-cmd -title "Bash" -geometry 80x25 +sb -bg rgb:0c/0c/0c -fg rgb:cc/cc/cc -cr rgb:cc/cc/cc -fn "xft:Lucida Console:pixelsize=14:antialias=true" -e bash
 Icon=utilities-terminal
 Terminal=false
 #+END_SRC
