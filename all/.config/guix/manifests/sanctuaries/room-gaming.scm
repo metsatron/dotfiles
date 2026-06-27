@@ -14,7 +14,19 @@
  '(
    "icewm"    ; Win9x/XP-era WM — Windows-95 theme
    "pcmanfm"  ; GTK file manager (needs dbus session)
+   "gtk+"     ; GTK schemas, including org.gtk.Settings.FileChooser
+   "pluma"    ; MATE text editor for Redstone native apps
+   "audacious" ; Winamp-skin-capable audio player
+   "pnmixer"  ; lightweight system tray volume applet
+   "network-manager-applet" ; tray applet; launched only when NetworkManager is active
+   "lxappearance" ; GTK theme/icon settings UI
    "dbus"     ; dbus-run-session wraps icewm-session for GLib/GIO apps
+   "gsettings-desktop-schemas" ; schemas required by PCManFM desktop preferences
+   "xrdb"     ; load Redstone URxVT Xresources into Xephyr
    "xterm"    ; fallback terminal
+   "xdpyinfo"  ; display info
+   "xwininfo"  ; window inspection
+   "xprop"     ; window/root properties
+   "xrandr"    ; display DPI configuration
    ))
 ;; room-gaming:1 ends here
