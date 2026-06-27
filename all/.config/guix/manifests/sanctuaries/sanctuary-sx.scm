@@ -25,6 +25,15 @@
    "thunar"
    ;; Terminal emulator
    "xfce4-terminal"
+   ;; Garcon — XFCE application/settings menu library; exposes share/desktop-directories/
+   ;; needed by xfce4-settings-manager to populate its category grid via Garcon menus.
+   "garcon"
+   ;; Image viewer
+   "ristretto"
+   ;; Text editor
+   "mousepad"
+   ;; Archive manager
+   "engrampa"
    ;; Session bus (required for dbus-run-session launcher)
    "dbus"
    ;; Standard X11 debug and display utilities
