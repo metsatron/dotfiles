@@ -9,5 +9,3 @@ function Prompt {
 
 # Make bash easily reachable from pwsh
 function bash { /usr/bin/env bash @args }
-
-Set-PSReadLineOption -EditMode Windows
