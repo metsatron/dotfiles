@@ -94,7 +94,7 @@ guix-sanctuary-gnustep: guix-desktop-common
 
 guix-sanctuary-cde: guix-desktop-common
 | mkdir -p $(EXTRA)/sanctuary-cde
-| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-cde.scm -p $(EXTRA)/sanctuary-cde/sanctuary-cde
+| $(GUIX) package -L $(LOCAL_PKGS) -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-cde.scm -p $(EXTRA)/sanctuary-cde/sanctuary-cde
 
 guix-sanctuary-sx: guix-desktop-common
 | mkdir -p $(EXTRA)/sanctuary-sx
