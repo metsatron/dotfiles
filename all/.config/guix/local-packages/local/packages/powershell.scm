@@ -20,7 +20,11 @@
   #:use-module (guix download)
   #:use-module (nonguix build-system binary)
   #:use-module ((guix licenses) #:prefix license:)
+  #:use-module (gnu packages compression)
   #:use-module (gnu packages gcc)
+  #:use-module (gnu packages icu4c)
+  #:use-module (gnu packages instrumentation)
+  #:use-module (gnu packages tls)
   #:use-module (gnu packages base))
 
 (define-public powershell
@@ -39,15 +43,48 @@
     (arguments
      `(#:install-plan
        '(("." "lib/powershell" #:include-regexp (".*")))
+       #:patchelf-plan
+       '(("pwsh" ("glibc" "gcc:lib")))
        #:phases
        (modify-phases %standard-phases
-         (add-after 'binary-unpack 'stage-layout
+         (add-after 'unpack 'enter-archive-root
+           (lambda _
+             ;; The upstream tarball has several top-level directories. Guix's
+             ;; unpack phase can leave cwd in Modules/, which drops pwsh from
+             ;; the later install-plan.
+             (when (and (string=? (basename (getcwd)) "Modules")
+                        (file-exists? "../pwsh"))
+               (chdir ".."))))
+         (add-after 'enter-archive-root 'make-payload-writable
            (lambda* (#:key outputs #:allow-other-keys)
+             (for-each make-file-writable (find-files "." "\\.so$"))
+             (make-file-writable "pwsh")
+             (chmod "pwsh" #o755)))
+         (add-after 'install 'patch-native-runpaths
+           (lambda* (#:key inputs outputs #:allow-other-keys)
              (let* ((out (assoc-ref outputs "out"))
-                    (lib (string-append out "/lib/powershell")))
-               (mkdir-p lib)
-               (invoke "cp" "-a" "." lib)
-               #t)))
+                    (lib (string-append out "/lib/powershell"))
+                    (rpath (string-append
+                            lib ":"
+                            (assoc-ref inputs "gcc:lib") "/lib:"
+                            (assoc-ref inputs "glibc") "/lib:"
+                            (assoc-ref inputs "icu4c") "/lib:"
+                            (assoc-ref inputs "openssl") "/lib:"
+                            (assoc-ref inputs "zlib") "/lib:"
+                            (assoc-ref inputs "lttng-ust") "/lib")))
+               (for-each
+                (lambda (file)
+                  (make-file-writable file)
+                  (invoke "patchelf" "--set-rpath" rpath file))
+                (append (find-files lib "\\.so$")
+                        (find-files lib "createdump$")))
+               ;; The .NET tracepoint provider depends on liblttng-ust.so.0,
+               ;; but current Guix ships liblttng-ust.so.1. PowerShell runs
+               ;; without this optional tracing provider.
+               (let ((trace-provider
+                      (string-append lib "/libcoreclrtraceptprovider.so")))
+                 (when (file-exists? trace-provider)
+                   (delete-file trace-provider))))))
          (add-after 'install 'create-launcher
            (lambda* (#:key outputs #:allow-other-keys)
              (let* ((out (assoc-ref outputs "out"))
@@ -60,7 +97,11 @@
                (chmod (string-append bin "/pwsh") #o755)))))))
     (inputs
      `(("glibc" ,glibc)
-       ("gcc:lib" ,gcc "lib")))
+       ("gcc:lib" ,gcc "lib")
+       ("icu4c" ,icu4c)
+       ("lttng-ust" ,lttng-ust)
+       ("openssl" ,openssl)
+       ("zlib" ,zlib)))
     (supported-systems '("x86_64-linux"))
     (synopsis "PowerShell — cross-platform shell and scripting language")
     (description
