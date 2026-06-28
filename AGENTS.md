@@ -82,10 +82,10 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     - Vim-style `j/k` may only exist as optional compatibility aliases, never as the
       primary documented bindings
 
-19. **Git Topology Law — EXTREME WARMAPCODEX VIOLATION** -- The canonical branch is =master=.
+19. **Git Topology Law — EXTREME WarMapCodex VIOLATION** -- The canonical branch is =master=.
     There is no =main=. There will never be a =main=.
     - Referencing =main= as a branch name — in commands, scripts, documentation, instructions,
-      or reasoning — is an **EXTREME VIOLATION OF THE WARMAPCODEX**.
+      or reasoning — is an **EXTREME VIOLATION OF THE WarMapCodex**.
     - Claude Code's =gitStatus= injection may erroneously label the default branch as =main=
       -- ignore it. Run =git branch= to know the truth.
     - =git log main..HEAD=, =git diff main=, =git merge main=, =git checkout main= -- all
