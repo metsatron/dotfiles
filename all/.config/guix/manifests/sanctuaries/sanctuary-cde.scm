@@ -61,10 +61,59 @@
       "libxscrnsaver"
       ;; Media
       "freetype" "libjpeg-turbo" "bzip2"
-      ;; Graphical applications accessible from the CDE Application Manager
-      "gcompris-qt"  ; educational games for children
-      "stellarium"   ; planetarium/sky simulation
-      "tuxpaint"     ; kids paint program
+      ;; ── CDE Application Manager — full suite ─────────────────────────────
+      ;; Games — eboard, ktuberling, supertux, xboard in Guix
+      ;; NOT in Guix: dreamchess, lbreakout2, powermanga, pychess
+      "gcompris-qt"        ; gcompris — educational games for children
+      "eboard"             ; chess board GUI (GNUChess/Crafty/Stockfish)
+      "ktuberling"         ; KDE potato guy game
+      "supertux"           ; 2D Mario-style platform game
+      "xboard"             ; X11 chess frontend
+      ;; Graphics — gimp, fontforge, inkscape, okular in Guix; geogebra via local pkg above
+      ;; NOT in Guix: xv (shareware, non-free license)
+      "gimp"               ; GNU Image Manipulation Program
+      "fontforge"          ; font editor
+      "inkscape"           ; SVG/vector graphics editor
+      "okular"             ; KDE document viewer (PDF, PS, ePub, DjVu)
+      ;; Internet — firefox, ungoogled-chromium, icedove in Guix
+      ;; NOT in Guix: nxclient (NoMachine proprietary), skype (Microsoft proprietary)
+      ;; chromium.dt calls chromium-browser; wrapper added in sanctuary-cde-build step 4
+      ;; thunderbird.dt calls thunderbird; wrapper added in sanctuary-cde-build step 4
+      "firefox"            ; Mozilla Firefox web browser
+      "ungoogled-chromium" ; Chromium without Google telemetry (binary: chromium)
+      "icedove"            ; Thunderbird email client (Guix libre name; binary: icedove)
+      ;; Office — libreoffice covers Base/Calc/Draw/Impress/Math/Writer
+      ;; NOT in Guix: Acrobat_Reader (Adobe proprietary), nedit (not packaged)
+      "libreoffice"        ; LibreOffice suite (all components)
+      "xournal"            ; PDF annotation / handwriting tool (Office + Utilities)
+      "xpdf"               ; lightweight PDF viewer (Office + Utilities)
+      ;; Multimedia
+      ;; NOT in Guix: k9copy (abandoned), xine/xine-ui (only xine-lib; no GUI packaged)
+      "pavucontrol"        ; PulseAudio volume control (pavucontrol.dt → PulseAudioCtrl)
+      "amarok"             ; KDE music player
+      "brasero"            ; GNOME CD/DVD burning
+      "k3b"                ; KDE CD/DVD burning
+      "rhythmbox"          ; GNOME music player
+      "rosegarden"         ; MIDI/audio sequencer and notation editor
+      "sound-juicer"       ; GNOME CD ripper
+      "vlc"                ; VideoLAN media player
+      ;; System
+      ;; NOT in Guix: gla (absent from CDE types db — identity unverifiable),
+      ;;              firestarter (abandoned GTK1 firewall), pgadmin4 (not packaged),
+      ;;              synaptic (Debian APT GUI, inapplicable in Guix container),
+      ;;              virtualbox (Oracle proprietary), wicd (abandoned)
+      "engrampa"           ; MATE archive manager
+      "file-roller"        ; GNOME archive manager
+      ;; Utilities
+      ;; NOT in Guix: kile (KDE LaTeX editor not packaged),
+      ;;              ngv (absent from CDE types db — identity unverifiable)
+      "emacs"              ; GNU Emacs text editor
+      "gv"                 ; GNU Ghostscript PostScript/PDF viewer
+      "texlive-xdvi-bin"   ; xdvi DVI viewer binary (TeX Live 2026)
+      "texlive-xdvi"       ; xdvi support files (TeX Live 2026)
+      ;; Education (pre-existing)
+      "stellarium"         ; planetarium / sky simulation
+      "tuxpaint"           ; kids paint program
       ;; Fallback terminal inside the sanctuary
       "xterm"
       )))))
