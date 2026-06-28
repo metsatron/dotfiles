@@ -305,11 +305,23 @@ else
     $SUDO ln -sf /var/guix/profiles/per-user/root/current-guix \
       ~root/.config/guix/current 2>/dev/null || true
 
-    # Authorize the official CI substitute server
-    # This lets Guix download pre-built binaries instead of compiling
-    $SUDO /usr/local/bin/guix archive --authorize \
-      < /var/guix/profiles/per-user/root/current-guix/share/guix/ci.guix.gnu.org.pub \
-      2>/dev/null || true
+    # Authorize substitute servers (ci + bordeaux + nonguix).
+    # Without all three keys, bordeaux substitutes are silently rejected and
+    # nonguix packages (ZFS, winetricks, etc.) always build from source — this
+    # can add hours to the first guix:apply after a fresh install or guix pull.
+    _guix_share=/var/guix/profiles/per-user/root/current-guix/share/guix
+    for _pub in ci.guix.gnu.org.pub bordeaux.guix.gnu.org.pub; do
+      [ -r "$_guix_share/$_pub" ] && \
+        $SUDO /usr/local/bin/guix archive --authorize < "$_guix_share/$_pub" 2>/dev/null || true
+    done
+    # Nonguix key: try bundled copy first, fall back to network fetch
+    _nonguix_pub="$(cd "$(dirname "$0")" && pwd)/all/.config/guix/nonguix-signing-key.pub"
+    if [ -r "$_nonguix_pub" ]; then
+      $SUDO /usr/local/bin/guix archive --authorize < "$_nonguix_pub" 2>/dev/null || true
+    elif command -v curl >/dev/null 2>&1; then
+      curl -fsSL 'https://substitutes.nonguix.org/signing-key.pub' \
+        | $SUDO /usr/local/bin/guix archive --authorize 2>/dev/null || true
+    fi
 
     # Start the daemon
     if [ "$INIT_SYSTEM" = "sysv-init" ]; then
@@ -326,7 +338,7 @@ else
 ### END INIT INFO
 
 DAEMON=/usr/local/bin/guix-daemon
-DAEMON_ARGS="--build-users-group=guixbuild"
+DAEMON_ARGS="--build-users-group=guixbuild --substitute-urls='https://bordeaux.guix.gnu.org https://ci.guix.gnu.org https://substitutes.nonguix.org'"
 PIDFILE=/var/run/guix-daemon.pid
 
 case "$1" in
