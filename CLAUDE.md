@@ -335,143 +335,53 @@ export PATH="$HOME/.guix-extra-profiles/core/core/bin:$PATH"
 
 ## Known Gotchas
 
-### Stow Conflicts
+Situational gotchas live in on-demand skills — load the relevant one rather than reading this section. See `dotcortex-gotchas` (stow, tangle, Guix), `sanctuary-gotchas` (XFCE, Xephyr, Flatpak audio, X11 ghost windows), `pi-agent-gotchas` (pi-coding-agent provider config).
 
-`safe-stow` handles three conflict message formats across stow versions. It filters HelmCortex (user-managed symlink), backs up real files, removes them, then stows. On failure, auto-retries with `--ignore=HelmCortex`.
+## HelmCortex Integration
 
-After repo rename (`.dotfiles` -> `DotCortex`), remove dangling symlinks first:
+DotCortex (foundation) and HelmCortex (temple) are fully decoupled. DotCortex does **not** stow files into HelmCortex -- HelmCortex owns all its own configs (`.obsidian/`, `.vscode/`, FORGE/bin scripts, conda configs) directly.
 
-```bash
-find ~ -maxdepth 5 -lname "*/.dotfiles/*" -not -path "*/.git/*" -delete
-```
+DotCortex's only HelmCortex touchpoint: the shell PATH entry in `.zshenv` adding `$HOME/HelmCortex/FORGE/bin` to `$PATH` for tools like `auryn`, `helmcortex-anaconda`, and `claude-code-md-pipeline`.
 
-### /tmp Permissions Break Tangle and Guix Pull
+HelmCortex lives at `~/HelmCortex` (may be a symlink to a mount point like `~/mnt/x230/HelmCortex`).
 
-If `/tmp` has restrictive permissions (`755` instead of `1777`), both fail:
+**Historical note**: HelmCortex configs were previously managed via `helmcortex.org` and stowed from `all/HelmCortex/`. This was decoupled in March 2026. The `style.org` laincore.css tangles directly to `~/HelmCortex/.obsidian/snippets/` (not through stow).
 
-- Tangle: emacs `org-persist` can't create temp directories
-- Guix pull/build: sandbox can't bind-mount
+## Multi-Machine Setup (Star Fleet)
 
-Fix: `sudo chmod 1777 /tmp`. Tangle-only workaround: `TMPDIR=~/.cache/tmp make tangle`
+**System provenance for each machine lives in SystemCodex:**
+=HelmCortex/CORTEX/GoldenAge_Loom/SteinerCortex/SystemCodex/Machines/=
+Check there first when working on a specific machine — init system, service management, Tailscale, storage, and known quirks are documented per-machine. Update it whenever the system state changes.
 
-### pipefail + grep -v
+- **X230** (ThinkPad, Debian/systemd): HelmCortex native, overlays: `all linux debian x230`, verb: `loom stow:x230`
+- The x230 checkout of this repo lives at `/home/metsatron/DotCortex` on host `x230` (`git remote x230`).
+- **T480s** (ThinkPad, Devuan/sysv-init): HelmCortex mounted + symlinked, overlays: `all linux debian devuan t480s`, verb: `loom stow:t480s`
+- **T480** (ThinkPad, Vendefoul Wolf/Devuan/sysv-init): SSH alias `t480`, overlays: `all linux debian t480`, verb: `STOW_PKGS="all linux debian t480" make safe-stow`; ISO says "OpenRC" but installed system is Devuan sysv-init — use `service`, not `rc-service`
+- **S24** (Samsung Galaxy S24 Ultra, Android/Termux): SSH alias `s24`, overlays: `all termux s24`, verb: `loom stow:s24`; no Guix, use `STOW_PKGS='all termux s24' make safe-stow` if loom unavailable
+- Future machines: clone DotCortex, run `INSTALL.sh`, done
 
-Under `set -euo pipefail`, `grep -v PATTERN` exits 1 when all lines are filtered. Wrap: `{ grep -v PATTERN || true; }`
+### Overlay Scoping
 
-### LD_PRELOAD Warning
+- `all/` -- cross-platform (works on Linux, macOS, etc)
+- `linux/` -- Linux-only (Guix is Linux-only, so `host-wrap` lives here)
+- `debian/` -- Debian-family shared (apt/nala packages)
+- `devuan/` -- sysv-init shared (non-systemd daemons, desktop launchers for XFCE panel scripts)
+- `x230/` -- X230-specific (earlyoom, neofetch/fastfetch configs, GTK settings, wezterm, systemd services)
+- `t480s/` -- T480s-specific (future machine-specific configs)
 
-Systems with `libgtk3-nocsd` in `LD_PRELOAD` emit a harmless warning on Guix commands. Ignore it or `unset LD_PRELOAD`.
+### .zshenv for SSH PATH
 
-### Guix Substituter Display Bug
+The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh invocations (login, interactive, scripts, SSH). This ensures `emacs`, `nvim`, `guile`, and other Guix tools are available over SSH without manual PATH setup.
 
-`guix package` occasionally crashes with `Wrong type argument in position 1: #f` during substitute progress display. Cosmetic only -- retry the command.
+## When Working on DotCortex
 
-### Absolute Symlinks in Overlay Dirs Abort Stow
-
-If an org file tangles an absolute symlink (e.g. `.config/guix/current`), stow refuses to manage it. Remove it from the overlay dir -- they're machine-specific. `INSTALL.sh` auto-cleans these.
-
-### Flatpak Audio Dead After PulseAudio Restart (T480s)
-
-Killing PulseAudio (`pulseaudio -k`) destroys `/run/flatpak/pulse/` which `flatpak-session-helper`
-created at login. The helper does not recreate it automatically when PA restarts. Flatpak apps
-(FireDragon, etc.) have `PULSE_SERVER=unix:/run/flatpak/pulse/native` baked into their sandbox
-env, but the socket is gone. Menu restart reuses the existing sandbox with a stale dead tmpfs
-bind-mount -- it does not help.
-
-Fix:
-
-
-```bash
-# 1. Recreate the socket directory
-sudo mkdir -p /run/flatpak/pulse
-sudo chown $USER:$USER /run/flatpak /run/flatpak/pulse
-ln -s /run/user/1000/pulse/native /run/flatpak/pulse/native
-touch /run/flatpak/pulse/config
-
-# 2. Verify it's connectable
-PULSE_SERVER=unix:/run/flatpak/pulse/native pactl info
-
-# 3. Full kill + relaunch the Flatpak app (NOT menu restart)
-pkill firedragon   # or whichever app
-# then reopen from launcher
-```
-
-### XFCE Screenshot Region Tool Leaves Ghost InputOnly Window (T480s)
-
-Taking a screenshot with the region-select tool (xfce4-screenshooter or similar) creates a
-fullscreen `InputOnly` + `Override Redirect` X window for the selection overlay. If the tool
-crashes or is killed mid-selection, this ghost window is left mapped over the entire screen.
-It is completely invisible but swallows all mouse clicks and keyboard input. Symptoms: cursor
-only appears briefly during Alt+Tab, can't click or type anywhere in the desktop.
-
-Diagnosis and fix (run from a TTY or any terminal with DISPLAY access):
-
-```bash
-export DISPLAY=:0 XAUTHORITY=~/.Xauthority
-
-# Find the ghost window — look for InputOnly + Override Redirect + 1920x1080+0+0
-xwininfo -root -children | grep "1920x1080+0+0"
-# Note the window ID (e.g. 0x5000004), then confirm:
-xwininfo -id 0x5000004 | grep -E "Class|Override|Map State"
-# Should show: Class: InputOnly, Override Redirect State: yes, Map State: IsViewable
-
-# Kill it
-xdotool windowkill 0x5000004
-
-# Also reset the root cursor in case it was hidden
-xsetroot -cursor_name left_ptr
-```
-
-### Xephyr Exit Leaves Ghost InputOnly Window Without =-no-host-grab=
-
-Xephyr launched without =-no-host-grab= grabs the host keyboard and pointer when active. If Xephyr exits abnormally (guest WM crash, SIGKILL, display error), the input grab is not released and an invisible fullscreen =InputOnly= + =Override Redirect= X window remains on the host display, swallowing all mouse clicks and keyboard input. Symptoms: can't click anything on the host desktop, cursor may disappear.
-
-Prevention: always pass =-no-host-grab= to every Xephyr invocation. All sanctuary launch scripts in =distrobox.org= include it.
-
-Emergency recovery (SSH in from another machine or switch to a TTY):
-
-```bash
-export DISPLAY=:0 XAUTHORITY=~/.Xauthority
-
-# Find the ghost window — look for the fullscreen InputOnly override-redirect entry
-xwininfo -root -children | grep "1920x1080+0+0"
-# Note the window ID, confirm it:
-xwininfo -id 0x4e00004 | grep -E "Class|Override|Map State"
-# Should show: InputOnly, Override Redirect State: yes, IsViewable
-
-xdotool windowkill 0x4e00004
-xsetroot -cursor_name left_ptr   # restore cursor if hidden
-```
-
-### xfconf Symlink Means xfconfd Writes Directly to DotCortex
-
-The sanctuary-sx launch script symlinks the guest home's =xfce-perchannel-xml= directory to =linux/.config/sanctuary-sx/xfconf/= in the DotCortex tree. This means xfconfd writes new channel XML files directly into the repo whenever an XFCE app first accesses xfconf. Any new app installed in the sanctuary will silently create a channel file in DotCortex source.
-
-Before every =git add= involving xfconf: run =git status linux/.config/sanctuary-sx/xfconf/= and review new files. If a new channel is ephemeral or machine-specific, add it to =linux/.config/sanctuary-sx/xfconf/.gitignore= *before* staging anything. Never run =git add -A= or broad-pathspec adds that sweep up new xfconf channel files without review.
-
-### Host X Utilities Not in Guix Container PATH
-
-Tools from the host Debian system (=setxkbmap=, =xrandr=, =xdpyinfo=, etc.) are not in the PATH inside a Guix-backed Distrobox sanctuary. The Guix container's =/usr/bin= belongs to the container image; the host filesystem is mounted read-only at =/run/host/=. Any =.desktop= file, shell script, or XDG autostart entry that needs host X utilities must use the full path:
-
-```
-/run/host/usr/bin/setxkbmap -layout us -variant colemak
-/run/host/usr/bin/xrandr --query
-```
-
-Bare command names fail silently in XDG autostart context (the session manager does not propagate the error) and visibly in shell scripts (command not found).
-
-### XFCE 4.20 xfsettingsd Silently Drops XkbVariant
-
-xfsettingsd in the XFCE 4.20 Guix build applies =XkbLayout= from =keyboard-layout.xml= but silently discards =XkbVariant= on session startup, reverting to the base layout (e.g., QWERTY for =us=) even when the channel file has the correct variant. The setting appears correct in the XFCE Keyboard GUI but does not take effect.
-
-Fix: add an XDG autostart =.desktop= entry that runs =setxkbmap= explicitly after session initialization. The autostart entry runs after xfsettingsd, so it wins. In Guix containers, use the full host path:
-
-#+BEGIN_SRC conf
-[Desktop Entry]
-Type=Application
-Name=Colemak keyboard layout
-Exec=/run/host/usr/bin/setxkbmap -layout us -variant colemak -option terminate:ctrl_alt_bksp
-NoDisplay=true
+- Always edit `.org` source, never tangled output
+- The Makefile is tangled from `loom.org` -- edit `loom.org`, not Makefile
+- New skills, hooks, plugins, and agent instructions are authored in `.org` files, never in emitted harness directories
+- Use `make preview-stow` for a dry-run before applying
+- After adding a new package manager, add loom verbs AND make targets
+- When searching for a tool, check Guix profiles (`~/.guix-extra-profiles/core/core/bin/`) before assuming it's not installed
+- When uncertain about external tools or APIs, issue a Perplexity research prompt rather than exploring speculatively
 
 ## Claude Code Rules
 
