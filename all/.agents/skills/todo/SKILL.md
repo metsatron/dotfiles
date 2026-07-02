@@ -16,3 +16,4 @@ Use this to route and update DotCortex TODO items.
 - Mark individual completed tasks in place with `[x] ... ✅ YYYY-MM-DD`.
 - Move content to `LOGS/TODO/closed/` only when an entire task block is complete; never move isolated done items out of an otherwise-active block.
 - Never delete completed task history; when a full block is closed, move the block intact to the matching closed ledger.
+- Do not create timestamped backup files inside Obsidian/HelmCortex TODO trees. They pollute the vault. Use the TODO repo's Git state for rollback safety: check status, stage the exact dirty TODO file before editing when needed, and inspect the diff afterward.
