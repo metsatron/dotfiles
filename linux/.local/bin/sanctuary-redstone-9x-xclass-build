@@ -1,0 +1,653 @@
+#!/usr/bin/env bash
+# Xclass + Explorer + Desktop build
+
+# Builds the rn10950 [[https://github.com/rn10950/FVWM95-Updated][FVWM95-Updated]] xclass library, the =Explorer= file
+# manager, and the =Desktop= manager, inside the sanctuary using the
+# =room-fvwm95= Guix profile. All source patches are applied reproducibly via
+# python3 string replacement (never hand-edited under =$HOME=), so this script is
+# the single source of truth for the xclass toolchain.
+
+# Patches applied:
+
+# 1. *GCC 16 =min=/=max= templates* (utils.h): replace the broken two-argument
+#    =auto ... decltype= template with single-argument =template<T> T max(T,T)=
+#    plus mixed-type overloads (int/unsigned/short pairs) and =abs(unsigned)=
+#    overloads. The two-arg =max(0,1)= silently returned 0 on GCC 16, breaking
+#    xclass =max(w,1)= window-dimension clamps (all X window creation failed
+#    with =BadValue=).
+# 2. *ORectangle.h*: remove the duplicate =#define min/max= macros (collide
+#    with the utils.h templates); =#include "utils.h"= instead.
+# 3. *OXMainFrame =SetMWMHints=*: write the Motif hints via a =long[4]= array
+#    (not the =MWMHintsProperty= struct) — =XChangeProperty= format=32 expects
+#    =long=-sized elements on 64-bit, and the struct's =CARD32= packing produced
+#    garbage in the decorations/inputMode fields.
+# 4. *Explorer =SetMWMHints= removal* (OXExplorer.cc:443): delete the
+#    =SetMWMHints(MWM_DECOR_ALL, MWM_FUNC_ALL, MWM_INPUT_MODELESS)= call so the
+#    Explorer top-level window has *no* =_MOTIF_WM_HINTS= property — exactly like
+#    PCManFM. fvwm95's MWM-hint path leaves Explorer with no min/max/close caption
+#    buttons even when =MWM_DECOR_ALL= is requested; removing the redundant hint
+#    makes Explorer inherit the WM's native caption-button layout under both
+#    fvwm95 and IceWM.
+# 5. *Desktop cursor* (OXDesktopContainer.cc): =XDefineCursor(XC_top_left_arrow)=
+#    on the desktop container window.
+# 6. *Desktop =Line up Icons=* (OXDesktopContainer::LineUpIcons): snap every icon's
+#    current position to an 80x80 grid and persist via =Save()=. Wired to
+#    =M_VIEW_LINEUP= in main.cc.
+# 7. *Desktop =Properties=* (main.cc): wire =M_ROOT_PROPS= to open the xclass-native
+#    =OXPropertiesDialog= on the desktop directory.
+# 8. *Explorer =Copy/Cut/Paste=* (OXExplorer.cc): real copy buffer
+#    (=g_copyBuffer= + =g_cutMode=) with fork+exec =cp -r= / =mv=. Wired to
+#    =M_EDIT_COPY/CUT/PASTE=; refreshes the file view after paste.
+
+
+# [[file:../../../distrobox.org::*Xclass + Explorer + Desktop build][Xclass + Explorer + Desktop build:1]]
+#!/usr/bin/env bash
+set -euo pipefail
+
+SANCTUARY="sanctuary-redstone-9x"
+GUIX_PROFILES="${HOME}/.guix-extra-profiles"
+REPO="https://github.com/rn10950/FVWM95-Updated.git"
+# Build inside the guest home so the host-side clone/python and the
+# container-side compile (where HOME = guest home) see the same files.
+GUEST_HOME="$(eval echo "~metsatron/.local/share/dotcortex/guests/${SANCTUARY}/home")"
+BUILD_DIR="${GUEST_HOME}/.cache/xclass-build"
+INSTALL_DIR="${GUEST_HOME}/.local/xclass"
+
+if [[ ! -f "${GUIX_PROFILES}/room-fvwm95/room-fvwm95/etc/profile" ]]; then
+  echo "xclass-build: ERROR — room-fvwm95 profile not built" >&2
+  echo "  Run: make guix-room-fvwm95" >&2
+  exit 1
+fi
+
+echo "xclass-build: cloning rn10950/FVWM95-Updated into ${BUILD_DIR}…"
+rm -rf "${BUILD_DIR}"
+git clone --depth 1 "${REPO}" "${BUILD_DIR}"
+
+echo "xclass-build: applying source patches…"
+export BUILD_DIR
+python3 <<'PYEOF'
+import re, os
+
+def rd(p):
+    with open(p,'rb') as f: return f.read()
+def wr(p,b):
+    with open(p,'wb') as f: f.write(b)
+
+B = os.environ['BUILD_DIR']
+
+# --- Patch 1: utils.h min/max templates + abs(unsigned) overloads ---
+p = B + '/xclass/include/xclass/utils.h'
+c = rd(p)
+# remove the broken two-arg max/min templates if present
+c = c.replace(b'template <class T, class U> inline auto max(T a, U b) -> decltype(a > b ? a : b) { return a > b ? a : b; }', b'')
+c = c.replace(b'template <class T, class U> inline auto min(T a, U b) -> decltype(a < b ? a : b) { return a < b ? a : b; }', b'')
+# remove ANY #define min(...) / #define max(...) macros (whatever their format)
+c = re.sub(rb'(?m)^\s*#define\s+min\b.*\n', b'', c)
+c = re.sub(rb'(?m)^\s*#define\s+max\b.*\n', b'', c)
+tmpl = (b'\n// GCC16-safe min/max (single-arg templates + mixed-type overloads)\n'
+        b'template <class T> inline T max(T a, T b) { return a > b ? a : b; }\n'
+        b'template <class T> inline T min(T a, T b) { return a < b ? a : b; }\n'
+        b'inline int max(int a, unsigned int b) { return (unsigned)a > b ? a : (int)b; }\n'
+        b'inline int max(unsigned int a, int b) { return a > (unsigned)b ? (int)a : b; }\n'
+        b'inline int max(int a, short b) { return a > (int)b ? a : (int)b; }\n'
+        b'inline int max(short a, int b) { return (int)a > b ? (int)a : b; }\n'
+        b'inline int max(int a, unsigned short b) { return a > (int)b ? a : (int)b; }\n'
+        b'inline int max(unsigned short a, int b) { return (int)a > b ? (int)a : b; }\n'
+        b'inline int min(int a, unsigned int b) { return (unsigned)a < b ? a : (int)b; }\n'
+        b'inline int min(unsigned int a, int b) { return a < (unsigned)b ? (int)a : b; }\n'
+        b'inline int min(int a, short b) { return a < (int)b ? a : (int)b; }\n'
+        b'inline int min(short a, int b) { return (int)a < b ? (int)a : b; }\n'
+        b'inline int min(int a, unsigned short b) { return a < (int)b ? a : (int)b; }\n'
+        b'inline int min(unsigned short a, int b) { return (int)a < b ? (int)a : b; }\n'
+        b'inline unsigned int abs(unsigned int v) { return v; }\n'
+        b'inline unsigned long abs(unsigned long v) { return v; }\n')
+if b'GCC16-safe min/max' not in c:
+    # insert BEFORE the include guard #endif so the templates are inside it
+    c = re.sub(rb'(?m)^(#endif\s*//\s*__UTILS_H\s*)$',
+               tmpl + b'\n\\1', c, count=1)
+wr(p, c)
+
+# --- Patch 2: ORectangle.h — drop duplicate min/max defines ---
+p = B + '/xclass/include/xclass/ORectangle.h'
+c = rd(p)
+c = re.sub(rb'\s*#define\s+min\b.*\n', b'\n', c)
+c = re.sub(rb'\s*#define\s+max\b.*\n', b'\n', c)
+if b'utils.h' not in c:
+    c = b'#include "utils.h"\n' + c
+wr(p, c)
+
+# --- Patch 3: OXMainFrame.cc — SetMWMHints using long[4] array ---
+p = B + '/xclass/lib/libxclass/OXMainFrame.cc'
+c = rd(p)
+old = (b'void OXMainFrame::SetMWMHints(unsigned int value, unsigned int funcs, unsigned int input) {\n'
+       b'  MWMHintsProperty prop;\n\n'
+       b'  prop.decorations = value;\n'
+       b'  prop.functions   = funcs;\n'
+       b'  prop.inputMode   = input;\n'
+       b'  prop.flags       = MWM_HINTS_DECORATIONS | \n'
+       b'                     MWM_HINTS_FUNCTIONS   |\n'
+       b'                     MWM_HINTS_INPUT_MODE;\n\n'
+       b'  XChangeProperty(GetDisplay(), _id, _MOTIF_WM_HINTS, _MOTIF_WM_HINTS, 32,\n'
+       b'                  PropModeReplace, (unsigned char *)&prop, PROP_MWM_HINTS_ELEMENTS);\n'
+       b'}')
+new = (b'void OXMainFrame::SetMWMHints(unsigned int value, unsigned int funcs, unsigned int input) {\n'
+       b'  long hints[4];\n'
+       b'  hints[0] = MWM_HINTS_DECORATIONS | MWM_HINTS_FUNCTIONS | MWM_HINTS_INPUT_MODE;\n'
+       b'  hints[1] = funcs;\n'
+       b'  hints[2] = value;\n'
+       b'  hints[3] = input;\n'
+       b'  XChangeProperty(GetDisplay(), _id, _MOTIF_WM_HINTS, _MOTIF_WM_HINTS, 32,\n'
+       b'                  PropModeReplace, (unsigned char *)hints, PROP_MWM_HINTS_ELEMENTS);\n'
+       b'}')
+if old in c:
+    c = c.replace(old, new, 1)
+else:
+    # already patched or different layout — skip gracefully
+    pass
+wr(p, c)
+
+# --- Patch 3b: OXMainFrame.h — MWMHintsProperty fields -> long ---
+p = B + '/xclass/include/xclass/OXMainFrame.h'
+c = rd(p)
+c = c.replace(b'    CARD32 flags;', b'    long flags;')
+c = c.replace(b'    CARD32 decorations;', b'    long decorations;')
+c = c.replace(b'    CARD32 functions;', b'    long functions;')
+c = c.replace(b'    CARD32 inputMode;', b'    long inputMode;')
+wr(p, c)
+
+# --- Patch 4: Explorer OXExplorer.cc — remove SetMWMHints call ---
+p = B + '/all-applications/system/explorer-0.6.8/OXExplorer.cc'
+c = rd(p)
+c = c.replace(b'  SetMWMHints(MWM_DECOR_ALL, MWM_FUNC_ALL, MWM_INPUT_MODELESS);',
+              b'  // MWM hints intentionally NOT set - inherit WM default decoration\n'
+              b'  // like PCManFM so fvwm95/IceWM render native caption buttons.', 1)
+# Patch 8: Explorer Copy/Cut/Paste — inject copy buffer + handlers (idempotent).
+if b'g_copyBuffer' not in c:
+    c = c.replace(b'#include <dirent.h>',
+                  b'#include <dirent.h>\n#include <vector>\n#include <sys/wait.h>\n#include <signal.h>', 1)
+    decl = (b'// File copy/cut/paste buffer (shared across Explorer windows).\n'
+            b'static std::vector<OString*> g_copyBuffer;\n'
+            b'static bool g_cutMode = false;\n\n')
+    c = c.replace(b'static void remove_suffix', decl + b'static void remove_suffix', 1)
+    sw_old = (b'            case M_HELP_ABOUT:\n              About();\n              break;\n\n'
+              b'            case 99:\n')
+    sw_new = (b'            case M_HELP_ABOUT:\n              About();\n              break;\n\n'
+              b'            case M_EDIT_COPY:\n              DoCopyCut(false);\n              break;\n\n'
+              b'            case M_EDIT_CUT:\n              DoCopyCut(true);\n              break;\n\n'
+              b'            case M_EDIT_PASTE:\n              DoPaste();\n              break;\n\n'
+              b'            case 99:\n')
+    c = c.replace(sw_old, sw_new, 1)
+    helper = (b'\nvoid OXExplorer::DoCopyCut(bool cut) {\n'
+              b'  for (size_t i = 0; i < g_copyBuffer.size(); ++i) delete g_copyBuffer[i];\n'
+              b'  g_copyBuffer.clear(); g_cutMode = cut;\n'
+              b'  std::vector<OItem *> items = _fileWindow->GetSelectedItems();\n'
+              b'  char cwd[PATH_MAX]; if (!getcwd(cwd, sizeof(cwd))) return;\n'
+              b'  for (size_t i = 0; i < items.size(); ++i) {\n'
+              b'    OFileItem *f = (OFileItem *) items[i];\n'
+              b'    char full[PATH_MAX]; snprintf(full, sizeof(full), "%s/%s", cwd, f->GetName()->GetString());\n'
+              b'    g_copyBuffer.push_back(new OString(full));\n  }\n}\n\n'
+              b'void OXExplorer::DoPaste() {\n'
+              b'  if (g_copyBuffer.empty()) { XBell(GetDisplay(), 0); return; }\n'
+              b'  char cwd[PATH_MAX]; if (!getcwd(cwd, sizeof(cwd))) return;\n'
+              b'  for (size_t i = 0; i < g_copyBuffer.size(); ++i) {\n'
+              b'    const char *src = g_copyBuffer[i]->GetString();\n'
+              b'    const char *slash = strrchr(src, \'/\'); const char *base = slash ? slash+1 : src;\n'
+              b'    char dst[PATH_MAX]; snprintf(dst, sizeof(dst), "%s/%s", cwd, base);\n'
+              b'    if (strcmp(src, dst) == 0) continue;\n'
+              b'    struct stat st; if (lstat(dst, &st) == 0) continue;\n'
+              b'    pid_t pid = fork();\n'
+              b'    if (pid == 0) {\n'
+              b'      if (g_cutMode) execlp("mv", "mv", "--", src, dst, (char*)NULL);\n'
+              b'      else          execlp("cp", "cp", "-r", "--", src, dst, (char*)NULL);\n'
+              b'      _exit(127);\n'
+              b'    } else if (pid > 0) { int s; waitpid(pid, &s, 0); }\n  }\n'
+              b'  if (g_cutMode) {\n'
+              b'    for (size_t i = 0; i < g_copyBuffer.size(); ++i) delete g_copyBuffer[i];\n'
+              b'    g_copyBuffer.clear(); g_cutMode = false;\n  }\n'
+              b'  _fileWindow->DisplayDirectory(); UpdateListBox(); UpdateTree();\n}\n\n')
+    c = c.replace(b'void OXExplorer::DeleteFiles()', helper + b'void OXExplorer::DeleteFiles()', 1)
+wr(p, c)
+# Patch 8 header declarations
+p = B + '/all-applications/system/explorer-0.6.8/OXExplorer.h'
+h = rd(p)
+if b'DoCopyCut' not in h:
+    h = h.replace(b'  void DoOpen(const OFileItem *f);',
+                  b'  void DoOpen(const OFileItem *f);\n  void DoCopyCut(bool cut);\n  void DoPaste();', 1)
+    wr(p, h)
+
+# --- Patch 5+6: Desktop OXDesktopContainer — cursor + LineUpIcons ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'#include <X11/cursorfont.h>' not in c:
+    c = c.replace(b'#include <limits.h>', b'#include <limits.h>\n#include <X11/cursorfont.h>', 1)
+# cursor in ctor
+cur_old = b'      _lineGC = new OXGC(GetDisplay(), _id, gmask, &gval);\n      XSetDashes(GetDisplay(), _lineGC->GetGC(), 0, "\\x1\\x1", 2); \n    }'
+cur_new = (b'      _lineGC = new OXGC(GetDisplay(), _id, gmask, &gval);\n'
+           b'      XSetDashes(GetDisplay(), _lineGC->GetGC(), 0, "\\x1\\x1", 2); \n'
+           b'    }\n\n'
+           b'    Cursor _dc = XCreateFontCursor(GetDisplay(), XC_top_left_arrow);\n'
+           b'    XDefineCursor(GetDisplay(), _id, _dc);')
+c = c.replace(cur_old, cur_new, 1)
+# LineUpIcons method after ArrangeIcons
+arr = (b'void OXDesktopContainer::ArrangeIcons() {\n'
+      b'  SListFrameElt *ptr;\n'
+      b'  OXDesktopIcon *f;\n\n'
+      b'  for (ptr = _flist; ptr != NULL; ptr = ptr->next) {\n'
+      b'    f = (OXDesktopIcon *) ptr->frame;\n'
+      b'    f->InitPos();\n'
+      b'  }\n}\n')
+lineup = arr + (b'\nvoid OXDesktopContainer::LineUpIcons() {\n'
+                b'  SListFrameElt *ptr;\n'
+                b'  const int gridX = 80, gridY = 80;\n'
+                b'  for (ptr = _flist; ptr != NULL; ptr = ptr->next) {\n'
+                b'    OXDesktopIcon *f = (OXDesktopIcon *) ptr->frame;\n'
+                b'    int nx = ((f->GetX() + gridX/2) / gridX) * gridX;\n'
+                b'    int ny = ((f->GetY() + gridY/2) / gridY) * gridY;\n'
+                b'    if (nx < 4) nx = 4;\n'
+                b'    if (ny < 4) ny = 4;\n'
+                b'    f->Move(nx, ny);\n'
+                b'  }\n'
+                b'  Save();\n}\n')
+if b'LineUpIcons' not in c:
+    c = c.replace(arr, lineup, 1)
+wr(p, c)
+# header decl
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.h'
+h = rd(p)
+if b'LineUpIcons' not in h:
+    h = h.replace(b'  void ArrangeIcons();', b'  void ArrangeIcons();\n  void LineUpIcons();', 1)
+    wr(p, h)
+
+# --- Patch 7: Desktop main.cc — M_VIEW_LINEUP + M_ROOT_PROPS handlers ---
+p = B + '/all-applications/system/desktop-0.3.4/main.cc'
+c = rd(p)
+old = (b'            case M_FILE_NEWBRIEFCASE:\n'
+       b'              _container->CreateObject(dmsg->x_root, dmsg->y_root, choice);\n'
+       b'              break;\n\n'
+       b'            default:\n'
+       b'              break;\n\n'
+       b'          }')
+new = (b'            case M_FILE_NEWBRIEFCASE:\n'
+       b'              _container->CreateObject(dmsg->x_root, dmsg->y_root, choice);\n'
+       b'              break;\n\n'
+       b'            case M_VIEW_LINEUP:\n'
+       b'              _container->LineUpIcons();\n'
+       b'              break;\n\n'
+       b'            case M_ROOT_PROPS: {\n'
+       b'              char cwd[PATH_MAX];\n'
+       b'              if (getcwd(cwd, sizeof(cwd)))\n'
+       b'                new OXPropertiesDialog(_client->GetRoot(), NULL, new OString(cwd));\n'
+       b'              break;\n'
+       b'            }\n\n'
+       b'            default:\n'
+       b'              break;\n\n'
+       b'          }')
+if b'case M_VIEW_LINEUP:' not in c:
+    c = c.replace(old, new, 1)
+wr(p, c)
+
+# --- Patch 9: OXDesktopIcon.h — add SetPicture (so desktoprc 'icon=' can override) ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopIcon.h'
+h = rd(p)
+if b'void SetPicture' not in h:
+    h = h.replace(b'  const OPicture *GetPicture() const { return _pic; }',
+                  b'  const OPicture *GetPicture() const { return _pic; }\n'
+                  b'  // Redstone: allow desktoprc "icon=" override to replace the\n'
+                  b'  // type-resolved picture at load time. Triggers a redraw.\n'
+                  b'  void SetPicture(const OPicture *p) { _pic = p; NeedRedraw(); }', 1)
+    wr(p, h)
+
+# --- Patch 10: OXDesktopContainer::Init — apply saved desktoprc 'icon=' override ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'_deskrc_icon_override' not in c:
+    c = c.replace(
+        b'        ini.GetItem("icon", arg);\n'
+        b'        ini.GetItem("position", arg);\n'
+        b'        if (sscanf(arg, "%d,%d", &x, &y) == 2) f->Move(x, y);',
+        b'        ini.GetItem("icon", arg);\n'
+        b'        // Redstone _deskrc_icon_override: actually apply the saved\n'
+        b'        // picture name (upstream writes it on Save but never reads\n'
+        b'        // it back). This unlocks per-object custom desktop icons.\n'
+        b'        if (arg[0]) { const OPicture *_ip = _client->GetPicture(arg);\n'
+        b'                     if (_ip) f->SetPicture(_ip); }\n'
+        b'        ini.GetItem("position", arg);\n'
+        b'        if (sscanf(arg, "%d,%d", &x, &y) == 2) f->Move(x, y);', 1)
+wr(p, c)
+
+# --- Patch 11: suppress shortcut-arrow overlay for the Recycle Bin only ---
+#     (scoped: native trash object, no global overlay disable)
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+# GetIconPics fallback (var = fname; *lpic) — recycle dirs are caught earlier
+# in the S_ISDIR branch, but guard here too for correctness.
+c = c.replace(b'  *lpic = is_link ? _slink : NULL;',
+              b'  *lpic = (is_link && !_isRecycleBin(fname)) ? _slink : NULL;', 1)
+# CreateIcons dir-branch (var = filename; lpic)
+c = c.replace(b'        lpic  = is_link ? _slink : NULL;',
+              b'        lpic  = (is_link && !_isRecycleBin(filename)) ? _slink : NULL;', 1)
+# NewIcon dir-branch (var = filename; lpic)
+c = c.replace(b'    lpic  = is_link ? _slink : NULL;',
+              b'    lpic  = (is_link && !_isRecycleBin(filename)) ? _slink : NULL;', 1)
+wr(p, c)
+
+# --- Patch 12: CreateObject — real New Text Document + New Briefcase ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'M_FILE_NEWTEXTDOC:' not in c:
+    c = c.replace(
+        b'      if (NewIcon(x, y, &url, S_IFDIR, ACTION_CREATE)) retc = True;\n'
+        b'      break;\n\n'
+        b'    default:\n'
+        b'      break;',
+        b'      if (NewIcon(x, y, &url, S_IFDIR, ACTION_CREATE)) retc = True;\n'
+        b'      break;\n\n'
+        b'    case M_FILE_NEWTEXTDOC:\n'
+        b'      // Create an empty text document (unique name), refresh, openable\n'
+        b'      // through the configured editor via MIME action for .txt.\n'
+        b'      strcpy(name, "New Text Document.txt");\n'
+        b'      i = 1;\n'
+        b'      while (access(name, F_OK) == 0) sprintf(name, "New Text Document (%d).txt", i++);\n'
+        b'      if (url.filename) delete[] url.filename;\n'
+        b'      url.filename = StrDup(name);\n'
+        b'      if (NewIcon(x, y, &url, S_IFREG, ACTION_CREATE)) retc = True;\n'
+        b'      break;\n\n'
+        b'    case M_FILE_NEWBRIEFCASE:\n'
+        b'      // Honest working folder/container. xclass desktop cannot model\n'
+        b'      // true Win95 Briefcase sync; this is a real persistent folder.\n'
+        b'      // We assign the briefcase icon immediately via SetPicture so it\n'
+        b'      // is visually distinct, and Save() persists it to desktoprc.\n'
+        b'      strcpy(name, "New Briefcase");\n'
+        b'      i = 1;\n'
+        b'      while (access(name, F_OK) == 0) sprintf(name, "New Briefcase (%d)", i++);\n'
+        b'      if (url.filename) delete[] url.filename;\n'
+        b'      url.filename = StrDup(name);\n'
+        b'      {\n'
+        b'        OXDesktopIcon *_bi = NewIcon(x, y, &url, S_IFDIR, ACTION_CREATE);\n'
+        b'        if (_bi) {\n'
+        b'          const OPicture *_bp = _client->GetPicture("briefcase.xpm");\n'
+        b'          if (_bp) _bi->SetPicture(_bp);\n'
+        b'          retc = True;\n'
+        b'        }\n'
+        b'      }\n'
+        b'      break;\n\n'
+        b'    case M_FILE_NEWIMAGE:\n'
+        b'      // Create a real, uniquely-named blank 16x16 24-bit BMP image in\n'
+        b'      // the desktop dir. Writes a valid BMP header + white pixels so\n'
+        b'      // the file is a loadable bitmap (not a zero-byte stub).\n'
+        b'      strcpy(name, "New Bitmap Image.bmp");\n'
+        b'      i = 1;\n'
+        b'      while (access(name, F_OK) == 0) sprintf(name, "New Bitmap Image (%d).bmp", i++);\n'
+        b'      if (url.filename) delete[] url.filename;\n'
+        b'      url.filename = StrDup(name);\n'
+        b'      {\n'
+        b'        FILE *_bf = fopen(name, "wb");\n'
+        b'        if (_bf) {\n'
+        b'          unsigned char _hdr[54] = {0};\n'
+        b'          int _bw = 16, _bh = 16, _rowz = ((_bw*3+3)&~3);\n'
+        b'          int _fsize = 54 + _rowz*_bh;\n'
+        b'          _hdr[0]=\'B\'; _hdr[1]=\'M\';\n'
+        b'          _hdr[2]=_fsize&0xFF; _hdr[3]=(_fsize>>8)&0xFF; _hdr[4]=(_fsize>>16)&0xFF; _hdr[5]=(_fsize>>24)&0xFF;\n'
+        b'          _hdr[10]=54;\n'
+        b'          _hdr[14]=40;\n'
+        b'          _hdr[18]=_bw&0xFF; _hdr[19]=(_bw>>8)&0xFF;\n'
+        b'          _hdr[22]=_bh&0xFF; _hdr[23]=(_bh>>8)&0xFF;\n'
+        b'          _hdr[26]=1; _hdr[28]=24;\n'
+        b'          _hdr[34]=(_fsize-54)&0xFF; _hdr[35]=((_fsize-54)>>8)&0xFF; _hdr[36]=((_fsize-54)>>16)&0xFF; _hdr[37]=((_fsize-54)>>24)&0xFF;\n'
+        b'          fwrite(_hdr,1,54,_bf);\n'
+        b'          for (int _r=0;_r<_bh;_r++){ for (int _c=0;_c<_rowz;_c++) { unsigned char _px=0xFF; fwrite(&_px,1,1,_bf);} }\n'
+        b'          fclose(_bf);\n'
+        b'          if (NewIcon(x, y, &url, S_IFREG, ACTION_CREATE)) retc = True;\n'
+        b'        }\n'
+        b'      }\n'
+        b'      break;\n\n'
+        b'    default:\n'
+        b'      break;', 1)
+wr(p, c)
+
+# --- Patch 13: _CreateDesktop — do NOT auto-create the 'Home' symlink; ---
+#     Redstone projects My Computer / My Documents / Firefox as native objects.
+p = B + '/all-applications/system/desktop-0.3.4/main.cc'
+c = rd(p)
+c = c.replace(b'    symlink(home, "Home");',
+               b'    // (Redstone) Home desktop object is projected by the launch script\n'
+               b'    // as native objects (My Computer / My Documents / Firefox) instead.', 1)
+wr(p, c)
+
+# --- Patch 14: _compare SORT_BY_DATE (stat mtime, newest first) ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'SORT_BY_DATE' not in c:
+    c = c.replace(
+        b"  case SORT_BY_SIZE:\n"
+        b"    if (f1->GetSize() != f2->GetSize()) return (f1->GetSize() <= f2->GetSize());\n"
+        b"    break;\n"
+        b"\n"
+        b"  }\n"
+        b"  return (strcmp(f1->GetName()->GetString(), f2->GetName()->GetString()) <= 0);\n",
+        b"  case SORT_BY_SIZE:\n"
+        b"    if (f1->GetSize() != f2->GetSize()) return (f1->GetSize() <= f2->GetSize());\n"
+        b"    break;\n"
+        b"\n"
+        b"  case SORT_BY_DATE: {\n"
+        b"    struct stat _s1, _s2; time_t _t1 = 0, _t2 = 0;\n"
+        b"    if (stat(f1->GetName()->GetString(), &_s1) == 0) _t1 = _s1.st_mtime;\n"
+        b"    if (stat(f2->GetName()->GetString(), &_s2) == 0) _t2 = _s2.st_mtime;\n"
+        b"    if (_t1 != _t2) return (_t1 >= _t2);\n"
+        b"    break;\n"
+        b"  }\n"
+        b"\n"
+        b"  }\n"
+        b"  return (strcmp(f1->GetName()->GetString(), f2->GetName()->GetString()) <= 0);\n", 1)
+    wr(p, c)
+
+# --- Patch 15: Auto Arrange + ArrangeBy (grid in sorted order) ---
+# header: method decls + member
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.h'
+h = rd(p)
+if b'ArrangeBy' not in h:
+    h = h.replace(b'  void ArrangeIcons();\n  void LineUpIcons();',
+                  b'  void ArrangeIcons();\n  void LineUpIcons();\n'
+                  b'  void ArrangeBy(int sortType);\n'
+                  b'  int  ToggleAutoArrange();\n'
+                  b'  void NextFreeSlot(int &x, int &y);', 1)
+    h = h.replace(b'  int _total, _selected, _dragging, _sortType;',
+                  b'  int _total, _selected, _dragging, _sortType;\n  int _autoArrange;', 1)
+    wr(p, h)
+# cc: ctor init + methods + NewIcon auto-arrange
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'_autoArrange = True;' not in c:
+    c = c.replace(b'    _sortType = SORT_BY_NAME;\n',
+                  b'    _sortType = SORT_BY_NAME;\n    _autoArrange = True;\n', 1)
+if b'OXDesktopContainer::ArrangeBy' not in c:
+    c = c.replace(
+        b"    f->Move(nx, ny);\n"
+        b"  }\n"
+        b"  Save();\n"
+        b"}\n",
+        b"    f->Move(nx, ny);\n"
+        b"  }\n"
+        b"  Save();\n"
+        b"}\n\n"
+        b"void OXDesktopContainer::ArrangeBy(int sortType) {\n"
+        b"  Sort(sortType);\n"
+        b"  const int gridX = 80, gridY = 80, ox = 8, oy = 8;\n"
+        b"  int dh = _client->GetDisplayHeight();\n"
+        b"  int x = ox, y = oy;\n"
+        b"  SListFrameElt *ptr;\n"
+        b"  for (ptr = _flist; ptr != NULL; ptr = ptr->next) {\n"
+        b"    OXDesktopIcon *f = (OXDesktopIcon *) ptr->frame;\n"
+        b"    f->Move(x, y);\n"
+        b"    y += gridY;\n"
+        b"    if (y + gridY > dh) { y = oy; x += gridX; }\n"
+        b"  }\n"
+        b"  Save();\n"
+        b"}\n\n"
+        b"int OXDesktopContainer::ToggleAutoArrange() {\n"
+        b"  _autoArrange = !_autoArrange;\n"
+        b"  if (_autoArrange) ArrangeBy(_sortType);\n"
+        b"  return _autoArrange;\n"
+        b"}\n\n"
+        b"void OXDesktopContainer::NextFreeSlot(int &x, int &y) {\n"
+        b"  const int gridX = 80, gridY = 80, ox = 8, oy = 8;\n"
+        b"  int dh = _client->GetDisplayHeight();\n"
+        b"  for (int cx = ox; ; cx += gridX) {\n"
+        b"    for (int cy = oy; cy + gridY <= dh; cy += gridY) {\n"
+        b"      int taken = 0;\n"
+        b"      SListFrameElt *ptr;\n"
+        b"      for (ptr = _flist; ptr != NULL; ptr = ptr->next) {\n"
+        b"        OXDesktopIcon *f = (OXDesktopIcon *) ptr->frame;\n"
+        b"        if (f->GetX() >= cx-gridX/2 && f->GetX() <= cx+gridX/2 &&\n"
+        b"            f->GetY() >= cy-gridY/2 && f->GetY() <= cy+gridY/2) { taken = 1; break; }\n"
+        b"      }\n"
+        b"      if (!taken) { x = cx; y = cy; return; }\n"
+        b"    }\n"
+        b"  }\n"
+        b"}\n", 1)
+if b'if (_autoArrange) NextFreeSlot' not in c:
+    c = c.replace(
+        b"OXDesktopIcon *OXDesktopContainer::NewIcon(int x, int y, URL *url,\n"
+        b"                                           int ftype, int action) {\n"
+        b"  struct stat sbuf, lbuf;\n",
+        b"OXDesktopIcon *OXDesktopContainer::NewIcon(int x, int y, URL *url,\n"
+        b"                                           int ftype, int action) {\n"
+        b"  struct stat sbuf, lbuf;\n"
+        b"  if (_autoArrange) NextFreeSlot(x, y);\n", 1)
+wr(p, c)
+
+# --- Patch 15e: main.cc — menu handlers call ArrangeBy + Auto Arrange toggle ---
+p = B + '/all-applications/system/desktop-0.3.4/main.cc'
+c = rd(p)
+if b'ArrangeBy(SORT_BY_NAME)' not in c:
+    c = c.replace(b'_container->Sort(SORT_BY_NAME);',  b'_container->ArrangeBy(SORT_BY_NAME);', 1)
+    c = c.replace(b'_container->Sort(SORT_BY_TYPE);',  b'_container->ArrangeBy(SORT_BY_TYPE);', 1)
+    c = c.replace(b'_container->Sort(SORT_BY_SIZE);',  b'_container->ArrangeBy(SORT_BY_SIZE);', 1)
+    c = c.replace(b'_container->Sort(SORT_BY_DATE);',  b'_container->ArrangeBy(SORT_BY_DATE);', 1)
+if b'ToggleAutoArrange' not in c:
+    c = c.replace(
+        b"            case M_VIEW_REFRESH:\n"
+        b"              _container->DisplayDirectory();\n"
+        b"              break;\n",
+        b"            case M_VIEW_ARRANGE_AUTO:\n"
+        b"              _sortMenu->CheckEntry(M_VIEW_ARRANGE_AUTO,\n"
+        b"                                    _container->ToggleAutoArrange());\n"
+        b"              break;\n\n"
+        b"            case M_VIEW_REFRESH:\n"
+        b"              _container->DisplayDirectory();\n"
+        b"              break;\n", 1)
+wr(p, c)
+
+# --- Patch 16: GetIconPics — explicit textdoc/bitmap icons for .txt/.bmp ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'#include <strings.h>' not in c:
+    c = c.replace(b'#include <sys/stat.h>',
+                  b'#include <sys/stat.h>\n#include <strings.h>', 1) if b'#include <sys/stat.h>' in c else c.replace(b'#include <dirent.h>', b'#include <dirent.h>\n#include <strings.h>', 1)
+if b'_ext = strrchr(fname' not in c:
+    c = c.replace(
+        b'  *pic = MimeTypesList->GetIcon(fname, False);\n'
+        b'  if (*pic == NULL) {\n'
+        b'    *pic = _doc;\n',
+        b'  *pic = MimeTypesList->GetIcon(fname, False);\n'
+        b'  if (*pic == NULL) {\n'
+        b'    // Redstone P16: explicit period-appropriate icons for New Text\n'
+        b'    // Document and New Bitmap Image. Survives refresh because Init()\n'
+        b'    // applies the desktoprc icon= override AFTER CreateIcons runs.\n'
+        b'    const char *_ext = strrchr(fname, \'.\');\n'
+        b'    if (_ext) {\n'
+        b'      if (strcasecmp(_ext, \".txt\") == 0) {\n'
+        b'        const OPicture *_tp = _client->GetPicture(\"textdoc.xpm\");\n'
+        b'        if (_tp) { *pic = _tp; *lpic = (is_link && !_isRecycleBin(fname)) ? _slink : NULL; return; }\n'
+        b'      } else if (strcasecmp(_ext, \".bmp\") == 0) {\n'
+        b'        const OPicture *_ip = _client->GetPicture(\"bitmap.xpm\");\n'
+        b'        if (_ip) { *pic = _ip; *lpic = (is_link && !_isRecycleBin(fname)) ? _slink : NULL; return; }\n'
+        b'      }\n'
+        b'    }\n'
+        b'    *pic = _doc;\n', 1)
+wr(p, c)
+
+# --- Patch 17: CreateObject — persist new-object icons immediately via Save() ---
+p = B + '/all-applications/system/desktop-0.3.4/OXDesktopContainer.cc'
+c = rd(p)
+if b'if (retc) Save();' not in c:
+    c = c.replace(
+        b"    default:\n"
+        b"      break;\n"
+        b"  }\n\n"
+        b"  return retc;\n"
+        b"}\n",
+        b"    default:\n"
+        b"      break;\n"
+        b"  }\n\n"
+        b"  if (retc) Save();\n"
+        b"  return retc;\n"
+        b"}\n", 1)
+wr(p, c)
+
+print('All xclass patches applied')
+PYEOF
+
+echo "xclass-build: compiling inside ${SANCTUARY}…"
+sanctuary-exec "${SANCTUARY}" bash -c '
+set -e
+GUIX_PROFILE=${HOME}/.guix-extra-profiles/room-fvwm95/room-fvwm95
+. ${GUIX_PROFILE}/etc/profile
+ID=${HOME}/.local/xclass
+export PATH=${ID}/bin:${PATH}
+export LIBRARY_PATH=${ID}/lib:${LIBRARY_PATH:-}
+LIBS=$(${ID}/bin/xc-config --libs 2>/dev/null || echo "-lxclass -lXpm -lXext -lX11")
+
+# Build xclass library
+X=${HOME}/.cache/xclass-build/xclass
+mkdir -p ${ID}/lib ${ID}/include ${ID}/bin ${ID}/share
+cp -a ${X}/include/xclass ${ID}/include/
+cd ${X}/lib/libxclass
+rm -f *.o libxclass.a
+rm -f OXGL*.cc   # Explorer/Desktop do not use OpenGL; avoids GL/glx.h dependency
+# Generate the compile-time default paths as a header (avoids -D quote hell).
+cat > ${ID}/include/xclass/oxbuild-defaults.h <<EOF
+#ifndef OXBUILD_DEFAULTS_H
+#define OXBUILD_DEFAULTS_H
+#define OX_DEFAULT_POOL "${ID}/share/xclass-icons"
+#define OX_DEFAULT_ROOT "${ID}"
+#endif
+EOF
+g++ -O2 -w -fpermissive -Wno-narrowing -I${ID}/include \
+   -include xclass/oxbuild-defaults.h \
+   -c *.cc
+ar rcs libxclass.a *.o
+cp libxclass.a ${ID}/lib/
+cp -a ../../lib/xclass ${ID}/lib/ 2>/dev/null || true
+cp ${X}/lib/xclassrc ${ID}/etc/xclassrc 2>/dev/null || mkdir -p ${ID}/etc && cp ${X}/lib/xclassrc ${ID}/etc/xclassrc 2>/dev/null || true
+cp -a ${X}/share/xclass-icons ${ID}/share/ 2>/dev/null || true
+cp ${X}/utils/xc-config ${ID}/bin/ 2>/dev/null || true
+LIBS=$(${ID}/bin/xc-config --libs)
+
+# Build Explorer
+cd ${HOME}/.cache/xclass-build/all-applications/system/explorer-0.6.8
+rm -f *.o explorer
+for f in main URL OXExplorer OXDirectoryTree OXCopyBox OXOptions OXEditMime OXIconSelDialog OXOpenWith ORecycledFiles; do
+  g++ -O2 -w -I${ID}/include -c ${f}.cc -o ${f}.o
+done
+g++ -o explorer *.o ${LIBS}
+strip explorer
+cp -f explorer ${HOME}/.local/bin/explorer
+
+# Build Desktop
+cd ${HOME}/.cache/xclass-build/all-applications/system/desktop-0.3.4
+rm -f *.o desktop
+for f in main URL ORecycledFiles ODesktopLayout OXDesktopIcon OXDesktopContainer OXDesktopRoot OXEditLabel; do
+  g++ -O2 -w -I${ID}/include -c ${f}.cc -o ${f}.o
+done
+g++ -o desktop *.o ${LIBS}
+strip desktop
+cp -f desktop ${HOME}/.local/bin/desktop
+
+# xclass runtime config
+mkdir -p ${HOME}/.xclass/etc ${HOME}/.xclass/desktop ${HOME}/.local/xclass/share/xclass-icons
+sed -e "s|/usr/local/xclass|${ID}|g" -e "s|/usr/local/xclass-icons|${ID}/share/xclass-icons|g" ${ID}/etc/xclassrc > ${HOME}/.xclass/etc/xclassrc 2>/dev/null || true
+'
+
+echo "xclass-build: done. Explorer + Desktop installed to ~/.local/bin/"
+# Xclass + Explorer + Desktop build:1 ends here
