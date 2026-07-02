@@ -1,5 +1,5 @@
 ---
-title: "The Chapel — Medicine"
+title: "The Temple — Medicine"
 description: "A lineage record. Two decades in the medicine, a decade of it in the Amazon."
 ---
 
