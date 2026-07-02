@@ -13,7 +13,7 @@ Read it yourself: [GitHub](https://github.com/metsatron/dotfiles) / [GitLab](htt
 
 ## The base
 
-Devuan underneath — Debian without systemd — with GNU Guix on top for reproducible, declarative packages. Emacs is the workshop: the dotfiles are literate Org-mode, so the configuration is a document and the document is the configuration. The fleet is mostly old ThinkPads, deliberately: machines with open documentation, replaceable parts, and no management engine of consequence, running a stack light enough that "obsolete" hardware outperforms most people's new laptops. Even my phone is in the loom, through Termux.
+Devuan underneath — Debian without systemd — with GNU Guix on top for reproducible, declarative packages. Emacs is the workshop: the dotfiles are literate Org-mode, so the configuration is a document and the document is the configuration. The fleet is mostly old ThinkPads, deliberately: machines with open documentation, replaceable parts, and Coreboot-compatible firmware — every machine in the fleet can run free boot firmware — on a stack light enough that "obsolete" hardware outperforms most people's new laptops. Even my phone is in the loom, through Termux.
 
 ## The server side
 
