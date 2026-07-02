@@ -9,7 +9,7 @@ I am a lineage-carrying Ayahuasquero with over two decades of medicine work acro
 
 ## The record
 
-The path opened in Melbourne in 2009: two years of celibacy and strict diet on the Huachuma path, over three hundred ceremonies. In 2012 I was examined over a week by Sovereign Queen Jingki of Gondwana Land, Senior Aboriginal Law Woman of Beagle Bay, and recognised as a medicine man by the oldest living medicine tradition on Earth.
+The path opened in Melbourne in 2009: two years of strict diet on the Huachuma path, over three hundred ceremonies. In 2012 I was examined over a week by Sovereign Queen Jingki of Gondwana Land, Senior Aboriginal Law Woman of Beagle Bay, and recognised as a medicine man by the oldest living medicine tradition on Earth.
 
 The same year the Amazon took me. I was initiated as an Ayahuasquero under Maestro Don Jose Campos in the Qetchua Munay lineage, then entered apprenticeship with Shipibo Maestro Mukanranko in Pucallpa: four months of diet and training with twenty-three master teacher plants, followed by two years of celibacy, strict diet, and over five hundred ceremonies in the Unaya path of the Shipibo-Conibo tradition. There I was given the name **Metsarono**.
 
