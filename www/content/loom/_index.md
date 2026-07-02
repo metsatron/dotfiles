@@ -1,5 +1,5 @@
 ---
-title: "The Temple — The Loom"
+title: "The Loom"
 description: "Living and building with AI agents as residents and lineage."
 ---
 
