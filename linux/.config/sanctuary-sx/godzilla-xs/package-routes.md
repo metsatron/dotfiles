@@ -21,6 +21,11 @@ Package-name notes from this channel:
 - `7zip` is available; requested `p7zip` is absent.
 - `xdelta` is available; requested `xdelta3` is absent.
 - `lhasa` is available; requested `lha` is absent.
-- `lutris`, `mt32emu-qt`, `nuked-sc55`, `flips`, `bsdiff`, `ucon64`, and
-  `unar` are absent and require packaging work before they can be declared
-  installed.
+- `lutris` is absent from Guix by package name in this channel. It must not be
+  exposed to sanctuary-sx through a host Flatpak wrapper. The next valid route
+  is a sanctuary-native package/build path.
+- `flips` is absent from Guix by package name in this channel. It must not be
+  exposed to sanctuary-sx through a host Flatpak wrapper. The next valid route
+  is a sanctuary-native package/build path.
+- `mt32emu-qt`, `nuked-sc55`, `bsdiff`, `ucon64`, and `unar` remain absent and
+  require packaging work before they can be declared installed.
