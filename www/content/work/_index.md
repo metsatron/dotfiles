@@ -9,6 +9,8 @@ I have been building for the web since 2007, and building computers since long b
 
 I came up through the Melbourne agency circuit: web producer at bwired, webmaster for the ANZCA College of Anaesthetists, front-end contractor at CPM Australia and Arkade building responsive WordPress builds with full social integration back when that was hard, new media artist with Western Edge Youth Arts. From 2012 to 2016 I worked with Inspiral in London, heading up WooCommerce PHP front-end development and building world-standard eCommerce for UK and Australian clients — including the transition to a full WooCommerce-based online organic supermarket.
 
+Somewhere in those years a childhood dream came true: I worked on Nintendo of Australia's website, back in the Wii era. The dream arrived and then it came apart in my hands — a flatness I had no name for yet. One day I couldn't finish the day. Before lunch I walked into the CEO's office: "Sam, I'm sorry, I have to go now. I just can't stay any longer." He asked if I had somewhere else to go. I said no. He said okay then. We said our goodbyes and I was dismissed. That emptiness is what made the Amazon possible — when I finally flew, it was with no reservations, in either sense.
+
 ## The luminaries — 2008 to 2024
 
 Alongside all of that, for fifteen years I ran my own practice building and running the digital presence of people whose work I believed in: spiritual teachers, Amazonian maestros, visionary artists, scientists. Not as a vendor. As lineage service, from inside the relationships.
