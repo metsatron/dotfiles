@@ -38,8 +38,17 @@
    ;; --- Clipboard (host-side bridge for sanctuary X selections) ---
    "xclip"
 
+   ;; --- X cursor theming (Win95 cursors via Chicago95 Xcursor theme) ---
+   ;; libX11 dlopens libXcursor.so.1 to render themed cursors when
+   ;; XCURSOR_THEME is set. Without this, all X apps fall back to the
+   ;; built-in X cursor font (basic black arrows).
+   "libxcursor"
+   "libxrender"    ; libXcursor runtime dep
+   "libxfixes"     ; libXcursor runtime dep
+
    ;; --- Runtime & certs ---
    "python"
+   "gamemode"
    "glibc-locales"
    "nss-certs"
    ))

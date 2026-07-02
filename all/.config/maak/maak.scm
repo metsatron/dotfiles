@@ -683,12 +683,13 @@
          "Render live agent process cockpit"
          (lambda () (sh "make -f ~/DotCortex/all/.mk/sessions.mk sessions-top")))
 
-   ;; --- Pip (pipx) ---
-   (task 'pip:health "Show DotCortex Python/pip env and versions"
-         (lambda () (sh "~/.local/bin/pip-health")))
-
    ;; --- Pipx ---
-   ;; (task 'pipx:apply ...)
+   (task 'pipx:apply
+         "Install missing pipx-isolated packages from manifest"
+         (lambda () (sh "~/.local/bin/pipx-apply")))
+
+   (task 'pipx:health "Show DotCortex pipx env and installed venvs"
+         (lambda () (sh "~/.local/bin/pipx-health")))
 
    ;; --- Agent schema ---
    (task 'agents:apply "Tangle agent docs, skills, commands, and hooks"

@@ -154,6 +154,7 @@ include $(HOME)/DotCortex/all/.mk/bun.mk
 include $(HOME)/DotCortex/all/.mk/bunx.mk
 include $(HOME)/DotCortex/all/.mk/npm.mk
 include $(HOME)/DotCortex/all/.mk/pip.mk
+include $(HOME)/DotCortex/all/.mk/pipx.mk
 include $(HOME)/DotCortex/all/.mk/nala.mk
 include $(HOME)/DotCortex/all/.mk/dnf.mk
 include $(HOME)/DotCortex/all/.mk/bots.mk
