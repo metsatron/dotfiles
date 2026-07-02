@@ -1,5 +1,5 @@
 ---
-title: "Tiago Pires"
+title: "Tiago Pires — ExoCortex"
 description: "Web architect, systems builder, sovereign technology practitioner."
 ---
 
