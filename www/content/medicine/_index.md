@@ -5,7 +5,7 @@ description: "A lineage record. Two decades in the medicine, a decade of it in t
 
 This room is deliberately quiet. What follows is a factual record, not an advertisement — the depth it points at does not live on a website.
 
-I am a lineage-carrying Ayahuasquero with over two decades of medicine work across Shipibo-Conibo, Shipibo-Shetebo, Qetchua and Indigenous Australian traditions. The medicine and the technology on this site are not two careers. They are one life: I built the websites of my maestros while dieting under them, and the same discipline that holds a dieta holds a production server.
+I am a lineage-carrying Ayahuasquero of the Shipibo-Conibo and Shipibo-Shetebo traditions, with over two decades in the medicine. The path has also been recognised and blessed beyond them — by Qetchua, Qero and Aymara maestros, and by Australian Aboriginal law. Those initiations and blessings I hold with gratitude; I do not claim to carry those cultures. The medicine and the technology on this site are not two careers. They are one life: I built the websites of my maestros while dieting under them, and the same discipline that holds a dieta holds a production server.
 
 ## The record
 
@@ -15,7 +15,7 @@ The same year the Amazon took me. I was initiated as an Ayahuasquero under Maest
 
 In 2014 came the deep-jungle Mariri diet and then five months of Banco de la Medicina under Mukanranko — sequential plant diets culminating in twelve hundred master teacher plants, and the qualification of **Unaya Honi**: Doctor of Shipibo Traditional Plant Medicine.
 
-From 2015 to 2017 I trained in Europe under Maestro Inkanima in the Muraya path of the Shipibo-Shetebo tradition — including a forty-plant diet I co-supervised as the accompanying maestro — and was named **Metsaronin**. Alongside this: Kambo initiation under Yawanawa Maestro Mauro (2011), a seven-day Peyote vision quest with Inca Chief Don Valario in the Blue Mountains (2013), and the Eagle and Condor ceremony at Christmas Hills with the Whale Dreaming Grandmother of Australia.
+From 2015 to 2017 I trained in Europe under Maestro Inkanima in the Muraya path of the Shipibo-Shetebo tradition — including a forty-plant diet I co-supervised as the accompanying maestro — and was named **Metsaronin**.
 
 Since 2018, through Mother Sri Sucharita Saraswati, the thread continues in the [Academy](/academy/).
 
