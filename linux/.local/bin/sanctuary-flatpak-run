@@ -1,0 +1,252 @@
+#!/bin/bash
+# Sanctuary Flatpak runner
+
+# Run a host-installed Flatpak payload from inside a sanctuary.  The app/runtime
+# objects are read from the host Flatpak installations, but process environment,
+# theme lookup, and default config/cache paths come from the sanctuary guest home.
+
+
+# [[file:../../../flatpak.org::*Sanctuary Flatpak runner][Sanctuary Flatpak runner:1]]
+set -euo pipefail
+
+usage() {
+  echo "Usage: sanctuary-flatpak-run <app-id> [flatpak-run-args...]" >&2
+}
+
+if [[ "$#" -lt 1 ]]; then
+  usage
+  exit 2
+fi
+
+case "${HOME}" in
+  */.local/share/dotcortex/guests/*/home) ;;
+  *)
+    echo "sanctuary-flatpak-run: refusing outside a DotCortex guest home: HOME=${HOME}" >&2
+    exit 2
+    ;;
+esac
+
+app_id="$1"
+shift
+
+host_home="${SANCTUARY_HOST_HOME:-/home/metsatron}"
+if [[ -n "${SANCTUARY_FLATPAK_BIN:-}" ]]; then
+  flatpak_bin="${SANCTUARY_FLATPAK_BIN}"
+elif command -v flatpak >/dev/null 2>&1; then
+  flatpak_bin="$(command -v flatpak)"
+else
+  flatpak_bin="${host_home}/.guix-extra-profiles/core/core/bin/flatpak"
+fi
+export FLATPAK_USER_DIR="${SANCTUARY_FLATPAK_USER_DIR:-${host_home}/.local/share/flatpak}"
+export FLATPAK_SYSTEM_DIR="${SANCTUARY_FLATPAK_SYSTEM_DIR:-/run/host/var/lib/flatpak}"
+
+if [[ ! -x "${flatpak_bin}" ]]; then
+  echo "sanctuary-flatpak-run: missing Flatpak binary: ${flatpak_bin}" >&2
+  exit 1
+fi
+
+if [[ ! -d "${FLATPAK_USER_DIR}/app" ]]; then
+  echo "sanctuary-flatpak-run: missing host user Flatpak app store: ${FLATPAK_USER_DIR}" >&2
+  exit 1
+fi
+
+if [[ ! -d "${FLATPAK_SYSTEM_DIR}/runtime" ]]; then
+  echo "sanctuary-flatpak-run: missing host system Flatpak runtime store: ${FLATPAK_SYSTEM_DIR}" >&2
+  exit 1
+fi
+
+if [[ ! -e /var/lib/dbus/machine-id && -r /run/host/var/lib/dbus/machine-id ]]; then
+  mkdir -p /var/lib/dbus
+  ln -sfnT /run/host/var/lib/dbus/machine-id /var/lib/dbus/machine-id
+fi
+
+export XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-${HOME}/.config}"
+export XDG_DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+export XDG_CACHE_HOME="${XDG_CACHE_HOME:-${HOME}/.cache}"
+
+prepend_xdg_data() {
+  local dir="$1"
+  [[ -d "$dir" ]] || return 0
+  case ":${XDG_DATA_DIRS:-}:" in
+    *":${dir}:"*) ;;
+    *) XDG_DATA_DIRS="${dir}${XDG_DATA_DIRS:+:${XDG_DATA_DIRS}}" ;;
+  esac
+}
+
+prepend_xdg_data "${FLATPAK_USER_DIR}/exports/share"
+prepend_xdg_data "${FLATPAK_SYSTEM_DIR}/exports/share"
+export XDG_DATA_DIRS
+
+safe_link() {
+  local target="$1"
+  local link="$2"
+  mkdir -p "$(dirname "$link")"
+  if [[ -e "$link" && ! -L "$link" ]]; then
+    echo "sanctuary-flatpak-run: preserving existing real path $link" >&2
+    return 0
+  fi
+  ln -sfnT "$target" "$link"
+}
+
+shared_link() {
+  local target="$1"
+  local link="$2"
+  local saved="${link}.local-before-shared"
+  mkdir -p "$(dirname "$link")"
+  if [[ -L "$link" ]]; then
+    ln -sfnT "$target" "$link"
+    return 0
+  fi
+  if [[ -e "$link" ]]; then
+    if [[ "$(readlink -f "$link" 2>/dev/null || true)" = "$(readlink -f "$target" 2>/dev/null || true)" ]]; then
+      return 0
+    fi
+    if [[ -e "$saved" ]]; then
+      echo "sanctuary-flatpak-run: preserving existing real path $link because $saved already exists" >&2
+      return 0
+    fi
+    mv "$link" "$saved"
+  fi
+  ln -sfnT "$target" "$link"
+}
+
+resolve_shared_root() {
+  local name="$1"
+  local candidate resolved
+  for candidate in \
+    "${host_home}/${name}" \
+    "${host_home}/mnt/x230/${name}" \
+    "/run/host/home/metsatron/${name}"
+  do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+    [[ -n "${resolved}" ]] || continue
+    case "${resolved}" in
+      /run/host/*) continue ;;
+    esac
+    printf '%s\n' "${resolved}"
+    return 0
+  done
+  return 1
+}
+
+add_shared_root_args() {
+  local name="$1"
+  local candidate resolved seen=" "
+  for candidate in \
+    "${host_home}/${name}" \
+    "${host_home}/mnt/x230/${name}" \
+    "/run/host/home/metsatron/${name}"
+  do
+    [[ -e "$candidate" || -L "$candidate" ]] || continue
+    case "${candidate}" in
+      /run/host/*) continue ;;
+    esac
+    case "${seen}" in
+      *" ${candidate} "*) ;;
+      *)
+        run_args+=("--filesystem=${candidate}")
+        seen="${seen}${candidate} "
+        ;;
+    esac
+    resolved="$(readlink -f "$candidate" 2>/dev/null || true)"
+    [[ -n "${resolved}" ]] || continue
+    case "${resolved}" in
+      /run/host/*) continue ;;
+    esac
+    case "${seen}" in
+      *" ${resolved} "*) ;;
+      *)
+        run_args+=("--filesystem=${resolved}")
+        seen="${seen}${resolved} "
+        ;;
+    esac
+  done
+}
+
+run_args=()
+# Forward the sanctuary's X display into the flatpak sandbox so the app
+# renders inside the sanctuary (e.g. Xephyr :93) rather than on the host
+# display (:0). --socket=x11 shares the X socket for $DISPLAY, and the
+# explicitly-set DISPLAY env points the app at it. Without this flatpak
+# inherits the host DISPLAY and the window never reaches the sanctuary.
+if [[ -n "${DISPLAY:-}" ]]; then
+  run_args+=("--socket=x11" "--env=DISPLAY=${DISPLAY}")
+fi
+for root_name in Games RetroPie Applications; do
+  add_shared_root_args "$root_name"
+done
+
+if [[ "${app_id}" = "net.lutris.Lutris" ]]; then
+  lutris_app_home="${HOME}/.var/app/net.lutris.Lutris"
+  mkdir -p \
+    "${host_home}/RetroPie/stow/.config/lutris" \
+    "${host_home}/RetroPie/stow/.local/share/lutris" \
+    "${lutris_app_home}/config" \
+    "${lutris_app_home}/data" \
+    "${lutris_app_home}/cache"
+  shared_link "${host_home}/RetroPie/stow/.config/lutris" "${lutris_app_home}/config/lutris"
+  shared_link "${host_home}/RetroPie/stow/.local/share/lutris" "${lutris_app_home}/data/lutris"
+  if [[ -f "${HOME}/.config/gtk-3.0/settings.ini" ]]; then
+    mkdir -p "${lutris_app_home}/config/gtk-3.0"
+    [[ -L "${lutris_app_home}/config/gtk-3.0/settings.ini" ]] && unlink "${lutris_app_home}/config/gtk-3.0/settings.ini"
+    cp -f "${HOME}/.config/gtk-3.0/settings.ini" "${lutris_app_home}/config/gtk-3.0/settings.ini"
+  fi
+  if [[ -f "${HOME}/.config/gtk-4.0/settings.ini" ]]; then
+    mkdir -p "${lutris_app_home}/config/gtk-4.0"
+    [[ -L "${lutris_app_home}/config/gtk-4.0/settings.ini" ]] && unlink "${lutris_app_home}/config/gtk-4.0/settings.ini"
+    cp -f "${HOME}/.config/gtk-4.0/settings.ini" "${lutris_app_home}/config/gtk-4.0/settings.ini"
+  fi
+  run_args+=(
+    "--filesystem=${host_home}/RetroPie/stow/.config/lutris"
+    "--filesystem=${host_home}/RetroPie/stow/.local/share/lutris"
+    "--filesystem=${HOME}/.config/gtk-3.0:ro"
+    "--filesystem=${HOME}/.config/gtk-4.0:ro"
+    "--env=GTK_THEME=Default"
+    "--env=GTK_CSD=0"
+    "--env=GTK_OVERLAY_SCROLLING=0"
+    "--unset-env=FONTCONFIG_FILE"
+    "--unset-env=FONTCONFIG_PATH"
+    "--env=WINEESYNC=0"
+    "--env=WINEFSYNC=0"
+    "--env=XDG_CACHE_HOME=${lutris_app_home}/cache"
+  )
+fi
+
+flatpak_args=()
+app_args=()
+before_separator=1
+for arg in "$@"; do
+  if [[ "$arg" = "--" && "$before_separator" -eq 1 ]]; then
+    before_separator=0
+    continue
+  fi
+  if [[ "$before_separator" -eq 1 ]]; then
+    flatpak_args+=("$arg")
+  else
+    app_args+=("$arg")
+  fi
+done
+
+if [[ "${app_id}" = "org.garudalinux.firedragon" ]]; then
+  firedragon_profile="${HOME}/.firedragon/flatpak-migrate"
+  if [[ ! -d "${firedragon_profile}" ]]; then
+    echo "sanctuary-flatpak-run: missing FireDragon profile: ${firedragon_profile}" >&2
+    exit 1
+  fi
+  run_args+=("--filesystem=${firedragon_profile}")
+  firedragon_profile_real="$(readlink -f "${firedragon_profile}" 2>/dev/null || true)"
+  if [[ -n "${firedragon_profile_real}" && "${firedragon_profile_real}" != "${firedragon_profile}" ]]; then
+    run_args+=("--filesystem=${firedragon_profile_real}")
+  fi
+  has_profile_arg=0
+  for arg in "${app_args[@]}"; do
+    [[ "${arg}" = "--profile" || "${arg}" = --profile=* ]] && has_profile_arg=1
+  done
+  if [[ "${has_profile_arg}" -eq 0 ]]; then
+    app_args=("--profile" "${firedragon_profile}" "${app_args[@]}")
+  fi
+fi
+
+exec "${flatpak_bin}" run "${run_args[@]}" "${flatpak_args[@]}" "${app_id}" "${app_args[@]}"
+# Sanctuary Flatpak runner:1 ends here
