@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+FLEET_HOSTS=(x230 t480s t480)
+REMOTE_TIMEOUT="${RG_SESSIONS_REMOTE_TIMEOUT:-8}"
+SSH_CONNECT_TIMEOUT="${RG_SESSIONS_SSH_CONNECT_TIMEOUT:-3}"
+
+usage() {
+  cat >&2 <<'EOF'
+Usage: rg-sessions PATTERN [PATH ...] [rg options]
+
+With only PATTERN, searches known local agent session stores, then reachable
+fleet hosts. With explicit PATH arguments, uses those paths locally and remotely.
+EOF
+}
+
+if [ "$#" -eq 0 ]; then
+  usage
+  exit 2
+fi
+
+if ! command -v rg >/dev/null 2>&1; then
+  echo "rg-sessions: rg not found" >&2
+  exit 127
+fi
+
+local_hostname="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf '')"
+
+default_session_roots() {
+  local candidates=(
+    "$HOME/.codex"
+    "$HOME/.claude"
+    "$HOME/.pi/agent/sessions"
+    "$HOME/.pi-agent"
+  )
+  local path
+  for path in "${candidates[@]}"; do
+    [ -e "$path" ] && printf '%s\n' "$path"
+  done
+}
+
+has_explicit_path=0
+for arg in "$@"; do
+  case "$arg" in
+    -*)
+      ;;
+    *)
+      if [ "$arg" != "$1" ]; then
+        has_explicit_path=1
+        break
+      fi
+      ;;
+  esac
+done
+
+rg_args=("$@")
+if [ "$has_explicit_path" -eq 0 ]; then
+  mapfile -t roots < <(default_session_roots)
+  if [ "${#roots[@]}" -eq 0 ]; then
+    echo "rg-sessions: no local session roots found" >&2
+  else
+    rg_args+=("${roots[@]}")
+  fi
+fi
+
+run_rg() {
+  rg -n --color=auto --hidden --no-ignore --glob '!**/.git/**' "${rg_args[@]}"
+}
+
+printf '== local:%s ==\n' "${local_hostname:-unknown}" >&2
+local_status=0
+run_rg || local_status=$?
+
+remote_script='
+set -eu
+if ! command -v rg >/dev/null 2>&1; then
+  echo "rg-sessions: remote rg not found" >&2
+  exit 127
+fi
+if [ "$#" -eq 1 ]; then
+  set -- "$1" "$HOME/.codex" "$HOME/.claude" "$HOME/.pi/agent/sessions" "$HOME/.pi-agent"
+fi
+existing=
+pattern="$1"
+shift
+for path in "$@"; do
+  [ -e "$path" ] && existing="${existing}${existing:+
+}$path"
+done
+if [ -z "$existing" ]; then
+  exit 0
+fi
+set -- "$pattern"
+while IFS= read -r path; do
+  [ -n "$path" ] && set -- "$@" "$path"
+done <<EOF_PATHS
+$existing
+EOF_PATHS
+exec rg -n --color=auto --hidden --no-ignore --glob "!**/.git/**" "$@"
+'
+
+remote_status=0
+pids=()
+tmpfiles=()
+
+for host in "${FLEET_HOSTS[@]}"; do
+  [ -n "$host" ] || continue
+  case "$local_hostname" in
+    "$host"|"$host".*) continue ;;
+  esac
+
+  tmp="$(mktemp "${TMPDIR:-/tmp}/rg-sessions.${host}.XXXXXX")"
+  tmpfiles+=("$tmp")
+  (
+    if ! timeout "$SSH_CONNECT_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$host" true >/dev/null 2>&1; then
+      printf '== %s: offline ==\n' "$host" >"$tmp"
+      exit 0
+    fi
+    {
+      printf '== %s ==\n' "$host"
+      timeout "$REMOTE_TIMEOUT" ssh -o BatchMode=yes -o ConnectTimeout="$SSH_CONNECT_TIMEOUT" -o ConnectionAttempts=1 "$host" sh -s -- "${rg_args[@]}" <<EOF_REMOTE
+$remote_script
+EOF_REMOTE
+      status=$?
+      if [ "$status" -eq 124 ]; then
+        printf 'rg-sessions: %s timed out after %ss\n' "$host" "$REMOTE_TIMEOUT" >&2
+      elif [ "$status" -ne 0 ] && [ "$status" -ne 1 ]; then
+        printf 'rg-sessions: %s failed with status %s\n' "$host" "$status" >&2
+      fi
+      exit 0
+    } >"$tmp" 2>&1
+  ) &
+  pids+=("$!")
+done
+
+for pid in "${pids[@]}"; do
+  wait "$pid" || remote_status=1
+done
+
+for tmp in "${tmpfiles[@]}"; do
+  [ -s "$tmp" ] && cat "$tmp"
+  rm -f "$tmp"
+done
+
+if [ "$local_status" -eq 0 ] || [ "$local_status" -eq 1 ]; then
+  exit "$remote_status"
+fi
+exit "$local_status"
