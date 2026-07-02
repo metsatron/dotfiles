@@ -99,6 +99,9 @@ if command -v rg >/dev/null 2>&1; then
   alias rga='rg -n --color=auto'         # nice default for humans
   alias rgi='rg -n --color=auto -i'      # case-insensitive default
   alias rg0='rg -0 -n --color=never -l'  # NUL-delimited file list (for piping)
+  alias rg-x='rg-x'
+  alias rg-logs='rg-logs'
+  alias rg-sessions='rg-sessions'
 fi
 if [[ -x "$HOME/.cargo/bin/bat" ]]; then
   alias bat='$HOME/.cargo/bin/bat --theme "Solarized (dark)" --style full'

@@ -60,6 +60,9 @@ if [ -d "$FNM_PATH" ]; then
   export PATH="$FNM_PATH:$PATH"
 fi
 
+# n (Node version manager) — installs to ~/.local so it beats Guix node in PATH
+export N_PREFIX="$HOME/.local"
+
 # npm global
 if [ -d "$HOME/.npm-global/bin" ]; then
   export PATH="$HOME/.npm-global/bin:$PATH"
