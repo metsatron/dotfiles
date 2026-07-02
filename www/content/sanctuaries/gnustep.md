@@ -2,7 +2,7 @@
 title: "The GNUstep Sanctuary"
 description: "Window Maker + GNUstep — the NeXT lineage, kept alive by GNU."
 skin: gnustep
-weight: 4
+weight: 5
 ---
 
 Window Maker and GNUstep: the NeXT lineage as a living free-software environment rather than an archaeology project. Black title bars, tiles and dockapps, Objective-C where Objective-C belongs — with modern package management underneath, because the whole sanctuary is declared in Guix and tangled from DotCortex like everything else.
