@@ -30,6 +30,7 @@
    "deskflow"
    "gimp" "inkscape" "birdtray" "icedove" "gnome-boxes"
    "vlc"
+   "whisper-cpp"     ; CPU speech-to-text (whisper-transcribe, telegram voice pipeline)
    ;; "audacity"
    "appmenu-gtk-module"
    "cdemu-client" "cdemu-daemon"
