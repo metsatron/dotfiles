@@ -733,4 +733,73 @@
             (lambda ()
               (when (and (buffer-file-name)
                          (locate-dominating-file (buffer-file-name) "Eask"))
-                (eglot-ensure)))))
+                (eglot-ensure))))
+  ;; Loom verb runner — adapted with gratitude from Josep Bigorra's heks-emacs
+  ;; maak runner: https://codeberg.org/jjba23/heks-emacs — jjba23
+  (defgroup loom nil
+    "Customizations for the DotCortex loom task runner."
+    :group 'tools)
+  
+  (defface loom-task-documentation-face
+    '((t (:inherit font-lock-comment-face)))
+    "Face for loom verb descriptions in completion annotations."
+    :group 'loom)
+  
+  (defcustom loom-annotation-padding 4
+    "Columns between the longest verb name and its description."
+    :type 'integer
+    :group 'loom)
+  
+  (defun loom--binary ()
+    "Return the loom executable, or signal a `user-error' when absent."
+    (or (executable-find "loom")
+        (let ((fallback (expand-file-name "~/.local/bin/loom")))
+          (and (file-executable-p fallback) fallback))
+        (user-error "No `loom' executable found; is this a stowed DotCortex machine?")))
+  
+  (defun loom--get-tasks ()
+    "Return an alist of (VERB . DESCRIPTION) from the live `loom' listing.
+  Verb lines are two-space-indented lowercase names; option lines like
+  `-h' and section headers do not match."
+    (let (tasks)
+      (with-temp-buffer
+        (call-process (loom--binary) nil t nil)
+        (goto-char (point-min))
+        (while (re-search-forward
+                "^  \\([a-z][a-zA-Z0-9:!_-]*\\)[ \t]+\\(.+\\)$" nil t)
+          (push (cons (match-string 1) (match-string 2)) tasks)))
+      (nreverse tasks)))
+  
+  (defun loom--make-annotation-function (tasks)
+    "Return an annotation function aligning TASKS descriptions in one column."
+    (let* ((max-len (seq-max (mapcar (lambda (cell) (length (car cell))) tasks)))
+           (doc-align (+ max-len loom-annotation-padding)))
+      (lambda (cand)
+        (let ((desc (cdr (assoc cand tasks))))
+          (if desc
+              (concat (propertize " " 'display `(space :align-to ,doc-align))
+                      (propertize desc 'face 'loom-task-documentation-face))
+            "")))))
+  
+  (defun loom-run-task (verb)
+    "Select a loom VERB with completion and run it in a compilation buffer.
+  Verbs ending in `!' are destructive by DotCortex convention and ask
+  for confirmation first. Runs from ~/DotCortex so relative paths in
+  loom recipes resolve as they do in a shell."
+    (interactive
+     (let ((tasks (loom--get-tasks)))
+       (unless tasks
+         (user-error "No loom verbs found; check that `loom' runs"))
+       (let ((completion-extra-properties
+              `(:annotation-function ,(loom--make-annotation-function tasks))))
+         (list (completing-read "Run loom verb: " tasks nil t)))))
+    (when (and (string-suffix-p "!" verb)
+               (not (yes-or-no-p (format "`%s' is destructive — run it? " verb))))
+      (user-error "Aborted"))
+    (let ((default-directory (expand-file-name "~/DotCortex/")))
+      (compile (concat (shell-quote-argument (loom--binary)) " "
+                       (shell-quote-argument verb)))))
+  
+  (global-set-key (kbd "C-c m l") #'loom-run-task)
+  (when (fboundp 'spacemacs/set-leader-keys)
+    (spacemacs/set-leader-keys "ol" #'loom-run-task)))
