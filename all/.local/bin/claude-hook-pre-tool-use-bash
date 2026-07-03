@@ -3,14 +3,14 @@
 # Intercepts Bash tool calls that attempt remote git operations without proper precautions.
 # Blocks =ssh -A= (agent forwarding) and raw remote =git pull= without dirty-state checks.
 # Also blocks raw =git pull --ff-only= on remote machines when =dotcortex-pull= should be used instead.
-# Blocks DotCortex stow/apply mistakes unless the agent has made a recent explicit
-# machine-identity check and the requested stow target matches the live host.
+# Blocks DotCortex stow verbs whose machine target does not match the machine they would run on — the live host for local commands, or the ssh destination for ssh-wrapped commands. Block reasons go to stderr, which is what Claude Code shows the agent on a PreToolUse exit-2.
 
 
 # [[file:../../../hooks.org::*Remote git safety guard][Remote git safety guard:1]]
 # ~/DotCortex/all/.local/bin/claude-hook-pre-tool-use-bash
 # PreToolUse hook for Bash — blocks unsafe remote git/stow operations.
-# Exit 2 = block the tool call; stdout is shown to Claude as the reason.
+# Exit 2 = block the tool call; the reason MUST go to stderr — stdout is
+# not shown to the agent on a PreToolUse block.
 # No set -euo pipefail: hooks must not abort on grep non-match (exit 1).
 
 input=$(cat)
@@ -28,13 +28,10 @@ if [ -z "$cmd" ]; then
 fi
 
 python3 - "$cmd" <<'PYEOF'
-import json
-import os
 import re
 import shlex
 import socket
 import sys
-import time
 
 cmd = sys.argv[1]
 
@@ -54,71 +51,15 @@ EXPECTED_HOSTS = {
     "s24": {"s24"},
 }
 
-CHECK_RE = re.compile(r"^\s*(hostname\s+-s|uname\s+-n|hostnamectl\s+hostname)\s*$")
+# Optional leading env assignments (STOW_PKGS="..." make safe-stow) must not hide the verb
+ENV_PREFIX = r"(?:[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|\S*)\s+)*"
 STOW_RE = re.compile(
-    r"(^|[;&|]\s*)("
+    r"(^|[;&|]\s*)" + ENV_PREFIX + r"("
     r"(?:\S*/)?loom\s+stow(?::[A-Za-z0-9_-]+)?"
     r"|(?:\S*/)?make(?:\s+-f\s+\S+)?\s+(?:safe-stow|stow|x11-apply)"
     r"|(?:\S*/)?stow\s+(?:all|linux|debian|devuan|x230|t480s|t480|s24|openmandriva)\b"
     r")"
 )
-
-
-def state_path():
-    user = os.environ.get("USER") or str(os.getuid())
-    filename = f"dotcortex-agent-host-check-{user}.json"
-    for base in (os.environ.get("XDG_RUNTIME_DIR"), os.environ.get("TMPDIR"), "/tmp"):
-        if not base:
-            continue
-        try:
-            os.makedirs(base, exist_ok=True)
-            if os.access(base, os.W_OK):
-                return os.path.join(base, filename)
-        except OSError:
-            continue
-    return os.path.join("/tmp", filename)
-
-
-def current_host():
-    raw = socket.gethostname().split(".", 1)[0]
-    return raw, HOST_ALIASES.get(raw, raw)
-
-
-def write_check_marker(raw, short):
-    path = state_path()
-    payload = {
-        "host": raw,
-        "short": short,
-        "cwd": os.getcwd(),
-        "checked_at": int(time.time()),
-    }
-    try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-            handle.write("\n")
-    except OSError:
-        pass
-
-
-def fresh_check(raw, short, max_age=300):
-    if CHECK_RE.search(cmd):
-        write_check_marker(raw, short)
-        return True, "same command"
-
-    path = state_path()
-    try:
-        with open(path, encoding="utf-8") as handle:
-            payload = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return False, "missing"
-
-    if payload.get("host") != raw or payload.get("short") != short:
-        return False, "host changed"
-    age = int(time.time()) - int(payload.get("checked_at", 0))
-    if age > max_age:
-        return False, f"stale ({age}s)"
-    return True, f"fresh ({age}s)"
 
 
 def shell_words(text):
@@ -137,7 +78,7 @@ def stow_targets(text):
     for match in re.finditer(r"(?:^|[;&|]\s*)(?:\S*/)?stow\s+([A-Za-z0-9_-]+)", text):
         targets.append(match.group(1))
 
-    if re.search(r"(?:^|[;&|]\s*)(?:\S*/)?make(?:\s+-f\s+\S+)?\s+safe-stow\b", text):
+    if re.search(r"(?:^|[;&|]\s*)" + ENV_PREFIX + r"(?:\S*/)?make(?:\s+-f\s+\S+)?\s+safe-stow\b", text):
         words = shell_words(text)
         pkgs = []
         for word in words:
@@ -152,43 +93,47 @@ def stow_targets(text):
     return targets
 
 
-SSH_WRAP_RE = re.compile(r"^\s*ssh\s+")
+# ssh flags that consume a following argument (so we can find the destination word)
+SSH_ARG_FLAGS = {"-p", "-i", "-o", "-l", "-F", "-J", "-b", "-e", "-c", "-L", "-R", "-D", "-W", "-S"}
+
+
+def ssh_destination(text):
+    words = shell_words(text)
+    if not words or words[0] != "ssh":
+        return None
+    i = 1
+    while i < len(words):
+        word = words[i]
+        if word in SSH_ARG_FLAGS:
+            i += 2
+            continue
+        if word.startswith("-"):
+            i += 1
+            continue
+        return word.rsplit("@", 1)[-1]
+    return None
+
 
 if not STOW_RE.search(cmd):
-    if CHECK_RE.search(cmd):
-        raw_host, short_host = current_host()
-        write_check_marker(raw_host, short_host)
     sys.exit(0)
 
-if SSH_WRAP_RE.match(cmd):
-    sys.exit(0)
+ssh_dest = ssh_destination(cmd)
+if ssh_dest:
+    raw_host = ssh_dest
+    short_host = HOST_ALIASES.get(ssh_dest, ssh_dest)
+    where = f"ssh destination '{ssh_dest}'"
+else:
+    raw_host = socket.gethostname().split(".", 1)[0]
+    short_host = HOST_ALIASES.get(raw_host, raw_host)
+    where = f"local host '{raw_host}'"
 
-raw_host, short_host = current_host()
-checked, check_reason = fresh_check(raw_host, short_host)
-targets = stow_targets(cmd)
-
-if not checked:
-    print("BLOCKED: DotCortex stow command without a fresh machine check.")
-    print()
-    print(f"Hook-detected machine: {raw_host} ({short_host})")
-    print(f"Check state: {check_reason}")
-    print()
-    print("Required before stow:")
-    print("  1. Run `hostname -s` or `uname -n` as its own tool call.")
-    print("  2. Only then run the stow verb matching that machine.")
-    print()
-    print("This prevents an agent from stowing x230/t480s/s24 overlays on the wrong host.")
-    sys.exit(2)
-
-for target in targets:
+for target in stow_targets(cmd):
     expected = EXPECTED_HOSTS.get(target)
     if expected and short_host not in expected and raw_host not in expected:
-        print("BLOCKED: DotCortex stow target does not match the current machine.")
-        print()
-        print(f"Hook-detected machine: {raw_host} ({short_host})")
-        print(f"Requested stow target: {target}")
-        print()
-        print("Run `hostname -s` again, then use the stow verb for the detected machine.")
+        print("BLOCKED: DotCortex stow target does not match the machine it would run on.", file=sys.stderr)
+        print(f"Requested stow target: {target}", file=sys.stderr)
+        print(f"Would run on: {where} (alias: {short_host})", file=sys.stderr)
+        print(f"Use the stow verb for '{short_host}', or run this on the matching machine.", file=sys.stderr)
         sys.exit(2)
 
 sys.exit(0)
@@ -206,10 +151,12 @@ esac
 
 # Block ssh -A (agent forwarding): match ssh immediately followed by -A flag
 # anywhere a ssh command would actually start (line start, after &&, after ;)
-if printf '%s' "$cmd" | grep -qE '(^|&&|;)[[:space:]]*(ssh)[[:space:]]+-A([[:space:]]|$)'; then
-  printf 'BLOCKED: ssh -A (agent forwarding) exposes your local SSH keys to the remote machine.\n'
-  printf 'Confirm with the user that agent forwarding is acceptable before proceeding.\n'
-  printf 'Consider whether the remote machine has its own key instead.\n'
+if printf '%s' "$cmd" | grep -qE '(^|&&|;)[[:space:]]*(ssh)[[:space:]]+(-[^A[:space:]][[:space:]]+|[^-][^[:space:]]*[[:space:]]+)?-A([[:space:]]|$)'; then
+  {
+    printf 'BLOCKED: ssh -A (agent forwarding) exposes your local SSH keys to the remote machine.\n'
+    printf 'Confirm with the user that agent forwarding is acceptable before proceeding.\n'
+    printf 'Consider whether the remote machine has its own key instead.\n'
+  } >&2
   exit 2
 fi
 
@@ -218,13 +165,15 @@ fi
 # The double-negative (no dotcortex-pull) is a guard for legitimate syncs.
 if printf '%s' "$cmd" | grep -qP '(^|&&|;)\s*ssh\s+\S+.*git pull' 2>/dev/null && \
    ! printf '%s' "$cmd" | grep -qF 'dotcortex-pull'; then
-  printf 'BLOCKED: remote git pull without dirty-state guard.\n\n'
-  printf 'Required steps before pulling on a remote machine:\n'
-  printf '  1. ssh <host> "cd ~/DotCortex && git status --short"\n'
-  printf '  2. Confirm no dirty tracked files (or get explicit user approval)\n'
-  printf '  3. Use dotcortex-pull instead of git pull --ff-only\n\n'
-  printf 'Correct pattern:\n'
-  printf '  ssh <host> "cd ~/DotCortex && dotcortex-pull && loom stow:<machine>"\n'
+  {
+    printf 'BLOCKED: remote git pull without dirty-state guard.\n\n'
+    printf 'Required steps before pulling on a remote machine:\n'
+    printf '  1. ssh <host> "cd ~/DotCortex && git status --short"\n'
+    printf '  2. Confirm no dirty tracked files (or get explicit user approval)\n'
+    printf '  3. Use dotcortex-pull instead of git pull --ff-only\n\n'
+    printf 'Correct pattern:\n'
+    printf '  ssh <host> "cd ~/DotCortex && dotcortex-pull && loom stow:<machine>"\n'
+  } >&2
   exit 2
 fi
 
