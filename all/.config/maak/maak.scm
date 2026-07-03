@@ -399,6 +399,35 @@
   "Check forge reachability for all conf-managed AppImages"
   (lambda () (sh "for a in $(~/.local/bin/apprelease list); do ~/.local/bin/apprelease health \"$a\" 2>&1 || true; done")))
 
+;; --- AM / AppMan (ivan-hc/AM, user mode) ---
+(task 'am:bootstrap
+  "Install ~/.local/bin/appman and seed appman-config (idempotent)"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-bootstrap")))
+
+(task 'am:apply
+  "Install manifest apps via appman, no removals"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-apply")))
+
+(task 'am:apply!
+  "Install from manifest AND remove extras not listed"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-enforce")))
+
+(task 'am:diff "Plan: manifest vs installed AppMan apps"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-diff")))
+
+(task 'am:capture
+  "Capture installed apps -> all/.am/manifest/apps.ssv"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-capture")))
+
+(task 'am:update "Update all AppMan apps and appman itself (appman -u)"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-update")))
+
+(task 'am:clean "Remove orphaned launchers/symlinks (appman -c)"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-clean")))
+
+(task 'am:health "Show appman binary, config, apps dir, manifest state"
+  (lambda () (sh "make -f ~/DotCortex/all/.mk/am.mk am-health")))
+
 ;; --- Plasmoid (pinned Plasma 6 panel applets) ---
 (task 'plasmoid:apply
       "Install/upgrade pinned Plasma applets from manifest (verifies commit lock)"
