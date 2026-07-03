@@ -20,7 +20,7 @@ From that premise, eight articles:
 7. **Licensing prevails.** No governance document, including this one, may restrict the freedoms a free software license grants. Downstream forks govern however they choose — by design.
 8. **Amendments** are the maintainer's alone, version-controlled and documented in commit history.
 
-The lineage is stated in the document itself: the GNU Manifesto and the Free Software Definition, Roberto Rosario's [Code of Merit](https://codeofmerit.org), and the **Seven Freedoms of Free Software** proposed by [attribution withdrawn] which extend Stallman's four freedoms into seven principles — [proposed publicly on Telegram, 2026-06-21]([withdrawn]), and included in the Code with his consent since version 1.1.0.
+The lineage is stated in the document itself: the GNU Manifesto and the Free Software Definition, Roberto Rosario's [Code of Merit](https://codeofmerit.org), the principle that software freedom includes freedom of conscience, and the hacker tradition of meritocracy, sovereignty, and refusal.
 
 The full document is offered under CC-BY-SA 4.0 — adopt it, adapt it, fork it for your own projects. Read the canonical source: [GitHub](https://github.com/metsatron/dotfiles/blob/master/CODE_OF_SOVEREIGNTY.org) · [GitLab](https://gitlab.com/metsatron/dotfiles/-/blob/master/CODE_OF_SOVEREIGNTY.org).
 
