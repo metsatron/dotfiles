@@ -24,6 +24,7 @@
    ;; File manager
    "thunar"
    "gvfs"        ; GIO volume/trash backends for thunar trash:///
+   "tumbler"     ; thumbnail service consumed by thunar
    ;; Terminal emulator
    "xfce4-terminal"
    ;; Garcon — XFCE application/settings menu library; exposes share/desktop-directories/
