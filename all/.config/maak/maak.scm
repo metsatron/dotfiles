@@ -208,6 +208,31 @@
    (task 'guix:sanctuary-apply "Build desktop-common + sanctuary + gaming + windows-compat + retropie Guix profiles"
          (lambda () (mk-guix "guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-sanctuary-sx guix-room-gaming guix-room-windows-compat guix-room-retropie")))
 
+   ;; Per-sanctuary / per-room apply verbs. The combined guix:sanctuary-apply is one
+   ;; fail-fast make chain, so a single broken profile (e.g. an upstream test failure
+   ;; in a CDE app dependency) aborts every later profile. These land one profile at a
+   ;; time — each make target already declares its own prereqs (desktop-common or
+   ;; guix-dirs), so they are self-sufficient — keeping fail-fast semantics per verb
+   ;; (no -k, no muted failures) while letting one wing be applied independently.
+   (task 'guix:desktop-common "Build the shared desktop-common Guix profile"
+         (lambda () (mk-guix "guix-desktop-common")))
+   (task 'guix:qtile-apply "Build sanctuary-qtile profile (+ desktop-common)"
+         (lambda () (mk-guix "guix-sanctuary-qtile")))
+   (task 'guix:gnustep-apply "Build sanctuary-gnustep profile (+ desktop-common)"
+         (lambda () (mk-guix "guix-sanctuary-gnustep")))
+   (task 'guix:cde-apply "Build sanctuary-cde profile (+ desktop-common)"
+         (lambda () (mk-guix "guix-sanctuary-cde")))
+   (task 'guix:sx-apply "Build sanctuary-sx profile (+ desktop-common)"
+         (lambda () (mk-guix "guix-sanctuary-sx")))
+   (task 'guix:gaming-apply "Build room-gaming profile (+ desktop-common)"
+         (lambda () (mk-guix "guix-room-gaming")))
+   (task 'guix:windows-compat-apply "Build room-windows-compat profile (+ desktop-common)"
+         (lambda () (mk-guix "guix-room-windows-compat")))
+   (task 'guix:fvwm95-apply "Build room-fvwm95 profile"
+         (lambda () (mk-guix "guix-room-fvwm95")))
+   (task 'guix:retropie-apply "Build room-retropie profile (retroarch, mame, ES fork, cores, X68000/PC-98/FM-TOWNS)"
+         (lambda () (mk-guix "guix-room-retropie")))
+
    (task 'guix:git-bench
          "Probe guix channel mirrors and print the fastest URL (writes cache)"
          (lambda () (sh "make -f ~/DotCortex/all/.mk/guix.mk guix-pull-bench")))
