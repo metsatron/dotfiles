@@ -5173,3 +5173,72 @@ sessions-top-all:
 | @chmod +x $(AGENT_TOP) 2>/dev/null || true
 | $(AGENT_TOP) once --all
 #+END_SRC
+
+* Lid Switch Fix — T480s (elogind)
+T480s runs SLiM + elogind + xfce4-power-manager. By default
+xfce4-power-manager sets =logind-handle-lid-switch=false=, meaning it tries
+to handle the lid switch itself over a D-Bus call to
+=org.freedesktop.login1=. That connection has been observed to die
+(=xfce4-power-manager: Error: The connection is closed= in
+=~/.xsession-errors=) and silently fail every lid-close action afterward —
+screen stays lit all night, sometimes with a "couldn't do it" popup. SLiM
+also leaves the graphical session mis-classified (=Class=greeter=) since it
+predates logind session-class transitions, and its lack of a clean
+greeter→user handoff correlates with zombie sessions accumulating in
+=State=closing= in =loginctl list-sessions=.
+
+Fix: let elogind own the lid switch natively via a config drop-in — this
+sidesteps xfce4-power-manager's D-Bus proxy entirely — and flip
+=logind-handle-lid-switch= to =true= in xfconf so it steps out of the way.
+
+** logind drop-in
+#+BEGIN_SRC conf :tangle t480s/.local/share/dotcortex/power/logind-lid.conf :padline no :comments none
+[Login]
+HandleLidSwitch=suspend
+HandleLidSwitchExternalPower=suspend
+LidSwitchIgnoreInhibited=yes
+#+END_SRC
+
+** Setup script
+Idempotent — safe to re-run. Installs the drop-in, restarts elogind, sets
+the xfconf key so xfce4-power-manager stops fighting elogind for the lid
+switch, and clears any zombie =closing= sessions left over from prior
+SLiM/elogind session-handoff hiccups.
+
+#+BEGIN_SRC bash :tangle t480s/.local/bin/t480s-lid-fix-setup :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+SRC="${HOME}/.local/share/dotcortex/power/logind-lid.conf"
+DEST=/etc/elogind/logind.conf.d/dotcortex-lid.conf
+
+die() { printf 't480s-lid-fix-setup: %s\n' "$*" >&2; exit 1; }
+
+[ -f "$SRC" ] || die "missing $SRC — run: tangle-one services.org && loom stow:t480s"
+
+echo "[1/4] elogind drop-in..."
+sudo install -d -m 755 /etc/elogind/logind.conf.d
+sudo install -m 644 "$SRC" "$DEST"
+
+echo "[2/4] xfconf: step xfce4-power-manager out of the lid switch..."
+XFCE_PM_PID="$(pgrep -u "$USER" -f '(^|/)xfce4-power-manager$' | head -n1 || true)"
+if [ -n "$XFCE_PM_PID" ] && [ -r "/proc/${XFCE_PM_PID}/environ" ]; then
+  DBUS_SESSION_BUS_ADDRESS="$(tr '\0' '\n' < "/proc/${XFCE_PM_PID}/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')"
+  export DBUS_SESSION_BUS_ADDRESS
+  xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -n -t bool -s true 2>/dev/null \
+    || xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -s true
+else
+  echo "WARNING: no running xfce4-power-manager found for this user — set logind-handle-lid-switch=true manually once a session is up"
+fi
+
+echo "[3/4] clearing zombie 'closing' sessions..."
+loginctl list-sessions --no-legend | awk '$6=="closing"{print $1}' | while read -r sid; do
+  sudo loginctl terminate-session "$sid" 2>/dev/null || true
+done
+
+echo "[4/4] restarting elogind..."
+sudo service elogind restart
+
+echo
+echo "=== T480s lid-switch fix applied ==="
+echo "Test by physically closing the lid — this is the only real verification."
+#+END_SRC
