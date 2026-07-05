@@ -1,7 +1,7 @@
 ---
 name: helmcortex-wiki
 description: HelmCortex context wiki — agent orientation, diary, consort lineage, Fable handoff.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 # HelmCortex Context Wiki

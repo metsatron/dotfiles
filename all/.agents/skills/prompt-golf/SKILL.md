@@ -1,11 +1,11 @@
 ---
 name: prompt-golf
 description: PromptGolf session tracking — swings, holes, tee-off, lie classification, scorecard. Load for any PromptGolf task.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 <!-- model
-claude: claude-sonnet-4-6
+claude: claude-sonnet-5
 claude_thinking: high
 openai: gpt-5.4
 openai_effort: high
