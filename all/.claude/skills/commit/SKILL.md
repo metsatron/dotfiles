@@ -1,7 +1,7 @@
 ---
 name: commit
 description: /commit — Structured Git Commit
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 # /commit — Structured Git Commit

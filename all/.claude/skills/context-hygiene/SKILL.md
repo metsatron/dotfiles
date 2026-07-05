@@ -1,7 +1,7 @@
 ---
 name: context-hygiene
 description: Context window hygiene — when to compact, clear, and delegate to subagents
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 # Context Window Hygiene

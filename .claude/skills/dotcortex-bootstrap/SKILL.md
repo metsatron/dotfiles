@@ -1,7 +1,7 @@
 ---
 name: dotcortex-bootstrap
 description: Fresh machine and recovery bootstrap skill.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 # DotCortex Bootstrap
