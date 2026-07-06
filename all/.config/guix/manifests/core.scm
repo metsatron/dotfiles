@@ -35,6 +35,7 @@
    "appmenu-gtk-module"
    "cdemu-client" "cdemu-daemon"
    "node"
+   "llama-cpp"
 
    "python"
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly"
