@@ -207,14 +207,18 @@ executing here is cheaper than burning tokens in circles.
 ## Model Guidance
 
 - Main session model cannot be changed autonomously -- use `/model sonnet|haiku` yourself.
-- **Opus is currently not viable.** Use `claude-sonnet-4-6` with thinking `high` or `max`
-  for architecture, debugging, and novel problems.
+- **Opus 4.8 is viable current top tier** (1M context; architecture, debugging, novel
+  work). The earlier "Opus is not viable, use Sonnet" directive was an April 2026
+  artifact from a period of severe Opus degradation; that regime is over (corrected
+  2026-07-05). Sonnet 5 is the standard workhorse; Haiku is mechanical-only.
 - Subagents (via the Agent tool):
   - **Haiku (`claude-haiku-4-5-20251001`)** -- mechanical execution: file ops, grep,
     glob, reading files, git log/status, quick lookups. Zero ambiguity only.
-  - **Sonnet (`claude-sonnet-4-6`)** -- standard coding, debugging, most tasks.
+  - **Sonnet (`claude-sonnet-5`)** -- standard coding, debugging, most tasks.
   - **Sonnet + thinking high/max** -- architecture, deep multi-file analysis, complex
     refactors. Never default all subagents to this tier.
+  - **Opus 4.8 (`claude-opus-4-8`)** -- hardest architecture, multi-file reasoning,
+    long-context work; use deliberately, not as a blanket default.
 - When spawning subagents via the Agent tool, always set the `model` parameter
   explicitly. Never let it default to the current session model for all subagents.
 - Never silently switch model -- state which model and why, one line.
