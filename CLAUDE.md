@@ -162,12 +162,37 @@ HelmCortex and its workspaces (FORGE, bridge) maintain their own skill harnesses
 
 Before investigating unknown tool APIs, agent conventions, external system behavior,
 or any problem where you would otherwise spend more than 3 tool calls speculating --
-surface a Perplexity prompt for Mètsàtron to run, then stop and wait.
+surface a research prompt for Mètsàtron to run, naming the lane best suited to the
+question, then stop and wait.
+
+**Lanes -- pick by what the question actually needs:**
+
+- **Perplexity** (Pro until Dec 2026 -- free sub ends then; model-selectable) --
+  default lane. Multi-source synthesis with citations: library versions, API
+  behavior, benchmark landscapes, architecture surveys, anything needing breadth
+  plus sources. Current model map (2026-07, changes regularly -- thinking-capable
+  unless noted): Sonar 2 (no thinking), GPT-5.4, Gemini 3.1 Pro, Claude Sonnet 5.0,
+  GLM 5.2, Kimi K2.6, Nemotron 3 Ultra. A prompt may name its preferred model when
+  the question benefits.
+- **ChatGPT** -- second synthesis opinion. Sometimes better than Perplexity when
+  the question is more "reason about this" than "find this"; also the retry lane
+  when a Perplexity answer comes back thin.
+- **Brave Leo** (free) -- sticks closest to the actual search results. Faithful
+  what-do-the-pages-actually-say checks and quick factual lookups that should not
+  burn Pro quota.
+- **Reddit vibes check** (Reddit Answers or direct subreddit reading) --
+  practitioner ground truth that fenced, hedged official statements will never
+  give: real-world model behavior, effort tiers, quota economics, "is X actually
+  good", tool reliability in the wild. Prefer this lane whenever vendor docs are
+  the only official source and the question is about lived behavior.
+
+For decision-grade questions, request **two lanes** (typically Perplexity + Reddit)
+and reconcile the returns before acting.
 
 **Format -- output this verbatim, then stop:**
 
 ```
-META-AGENT RESEARCH PROMPT:
+META-AGENT RESEARCH PROMPT [lane]:
 [single-focus question -- include tool names, version numbers, and exactly what you need to determine]
 ```
 
@@ -176,7 +201,7 @@ This applies to: architecture decisions, model capability questions, library ver
 edge-cases, and any situation where a 30-second web search collapses a multi-step rabbit hole.
 
 This also applies when genuinely unsure of the best approach and synthesising from
-the internet would improve the solution quality. Planning in Perplexity before
+the internet would improve the solution quality. Planning in a research lane before
 executing here is cheaper than burning tokens in circles.
 
 ## Model Guidance
