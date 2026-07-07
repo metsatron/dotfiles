@@ -32,11 +32,11 @@ This is not paranoia and it is not even distrust, exactly. The strider does not 
 
 It matters that this is not diversification in the financial sense, because the posture is different at the root.
 
-Hedging is fear wearing a spreadsheet: hold many positions because you cannot tell which will betray you. The strider's distribution is the opposite of fear — it is *skillfulness so complete that betrayal stops being an event*. When any surface fails, nothing happens. A tenant is changed. A route fails over. A community's door closes and the works continue in the open where they always were, and other doors — this is the strange grace of it — open on their own, because nothing pulls people toward you like weight held lightly.
+Hedging is fear wearing a spreadsheet: hold many positions because you cannot tell which will betray you. The strider's distribution is the opposite of fear — it is *skillfulness so complete that betrayal stops being an event*. When any surface fails, nothing happens. A tenant is changed. A route fails over. A community's door closes and the works continue in the open where they always were, and other doors — open on their own, because nothing pulls people toward you like weight held lightly.
 
 There is an old story about walking on water, and the detail everyone remembers is the wrong one. The miracle is not the buoyancy. The instructive moment is Peter — who walks, briefly, and then looks down, considers what he is doing, feels the full concentrated weight of himself doing it, and goes under immediately. Read as engineering rather than as spectacle, that is the exact failure mode: the surface holds precisely until the ego gathers itself into a single point of self-regard and presses. Mastery through technique sinks. What walks is whatever has dissolved the thing that concentrates.
 
-I am not claiming that attainment. I am saying I have watched the mechanics from both sides — sunk enough times, walked enough mornings — to know which way the physics point.
+I have watched the mechanics from both sides — sunk enough times, walked enough mornings — to know which way the physics point.
 
 ## The doctrine, compressed
 
@@ -44,4 +44,4 @@ Stand on everything. Depend on nothing. Calibrate the pressure at every point of
 
 The lake is large, the tension is real, and it was always walkable.
 
-Ride on top. Stride the lake.
+Ride on top.
