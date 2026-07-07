@@ -6,9 +6,9 @@ draft: true
 weight: 10
 ---
 
-My digital life has died more than once. Moving back to Australia from Berlin, a bag of SSDs corrupted in transit. Another time, index corruption in my ZFS pool put thirty-two gigabytes of the only data that can never be re-derived in mortal danger: recordings of almost every ceremony I have run or sat in, icaros sung by my maestros, mantras from my Guru, the first websites I built in high school, videos of me as a baby in Portugal and the Canary Islands. I lost the firmware maps of my custom keyboard and not much else, and I pulled the rest back off dead drives like a Phoenix — more than once, with no backups and no right to succeed. Everything about how my machines are built now follows from those nights.
+My digital life has died more than once. Moving back to Australia from Berlin, a bag of SSDs corrupted in transit. Another time, index corruption in my ZFS pool put thirty-two gigabytes of the only data that can never be re-derived in mortal danger: recordings of almost every ceremony I have run or sat in, icaros sung by my maestros, mantras from my Guru, the first websites I built in high school, videos of me as a baby in Portugal and the Canary Islands. I lost the firmware maps of my custom keyboard and not much else, and I pulled the rest back off dead drives — more than once, with no backups and no right to succeed. Everything about how my machines are built now follows from those nights.
 
-So when a screenshot of one of my desktops makes the rounds and the first question is *what distro is that?* — it is the wrong question, and the wrongness is the whole point.
+So when a screenshot of one of my desktops makes the rounds and the first question is *what distro is that?* — it is the wrong question.
 
 The distro under any of my machines is boring on purpose. A stable Debian-family base here, a Guix profile layer there — pick one, it barely matters. Everything you are actually looking at — the desktop that reads like a lost SGI workstation, the BeOS grammar, the terminal that behaves identically on a ThinkPad from 2012 and a phone from 2024 — none of that lives in the distribution. It lives in a single version-controlled repository that rides on top of whatever operating system happens to be underneath. I call the layer a **super system**, and the name is not a coinage for this essay: the repository turns a decade old this year, and the name assembled itself in bits and pieces across most of that decade before settling, this last year, as RMS-GSS — *Generative Super System*. The repo has outlived every substrate that tried to be permanent underneath it. It assumes nothing about its host except a POSIX shell and a package manager it can drive.
 
@@ -46,8 +46,6 @@ This is a practiced position, not a posted one, so the claims come with receipts
 
 Every machine I operate is produced from the one public repository — the same literate sources, the same manifests, the same overlay tooling, differing only in a per-machine layer as thin as the machines' differences really are. A fresh ThinkPad becomes one of my machines in an afternoon, unattended for most of it. The desktops that have made the front page of r/unixporn were not screenshots of a lucky arrangement; they were checkouts. When the repository's history needed rewriting this month, I rewrote it, re-synced the fleet against the new history, and every machine agreed about reality again by lunch — because agreement about reality is what the layer *is*.
 
-Nobody else's dotfiles could produce my machines. Mine provably do.
-
 ## The quiet part
 
 There is a sovereignty argument under all of this, and it is not an afterthought. It is the founding reason the layer exists — I wrote it into the repository itself, under the Code of Sovereignty. This essay is the architecture that makes it enforceable.
@@ -66,4 +64,4 @@ This is the oldest problem there is, and the durable answer was found long ago b
 
 A super system is that shape, in git. It does not ask the base to be virtuous — no base will be, and the ones that advertise virtue loudest are the ones furthest into capture. It asks the base to be *replaceable*, and keeps everything that matters — the law, the memory, the twenty years — where no one can vote on it but me.
 
-The stop light gets stolen by whatever rides on top. Ride on top.
+Ride on top.
