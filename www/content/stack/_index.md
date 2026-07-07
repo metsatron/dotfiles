@@ -11,9 +11,9 @@ DotCortex rides on top of any OS as a super system — that is its point. It is 
 
 The centre of the armory is **DotCortex**, my literate dotfiles grimoire: Org-mode source that tangles into host-scoped overlays, which a Guile-powered control plane called the Loom weaves onto living machines with GNU Stow. One repo declares the packages (Guix, apt, Flatpak, pip, npm, cargo and more, each as a manifest), the shell, the editor, the desktop styling, the backup rituals, and the machine-specific state for every host I run — without ever making private state public.
 
-Read it yourself: [GitHub](https://github.com/metsatron/dotfiles) / [GitLab](https://gitlab.com/metsatron/dotfiles). This site's source lives in the same repo. That is not a gimmick — it is the point. A stack you cannot read is a stack you have to trust, and I do not extend trust to software.
+Read the source: [GitHub](https://github.com/metsatron/dotfiles) / [GitLab](https://gitlab.com/metsatron/dotfiles). This site's source lives in the same repo. A stack you cannot read is a stack you have to trust, and I do not extend trust to software.
 
-Reproducibility is worth the most to the least standard user. Someone whose taste fits the defaults does not need any of this — their whole computing life ships preinstalled. Mine does not fit any defaults, which is exactly why it is declared: the bitmap fonts, the retro desktop grammars, the emulation curation, the agent harness — none of it exists in anyone's distro, and all of it rebuilds from one clone. Nobody else's dotfiles could produce my machines. Mine provably do.
+Reproducibility is worth the most to the least standard user. Someone whose taste fits the defaults does not need any of this — their whole computing life ships preinstalled. Mine does not, which is exactly why it is declared.
 
 ## The base
 
