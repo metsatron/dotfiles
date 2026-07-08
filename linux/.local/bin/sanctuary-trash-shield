@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+
+
+# # sanctuary-trash-shield helper.
+# # Isolate a sanctuary's =trash:///= from the host's fleet NFS mounts.
+
+# Root cause (confirmed live 2026-07-08): Distrobox bind-mounts the host home at
+# =/home/<user>= *and* passes the host root recursively at =/run/host=, so the
+# host's autofs fleet NFS mounts (=~/mnt/x230=, =~/mnt/t480=, …) surface *inside*
+# the container's own mount namespace as real mount points — via *both* paths.
+# GVFS's trash aggregator (=gvfsd-trash=) walks every visible mount point looking
+# for =$topdir/.Trash-$uid=, so it merged those remote machines' trash into the
+# sandboxed room's =trash:///= (measured historically: 392 entries = 68 local +
+# 324 leaked from the host's real =~/mnt/x230/.Trash-1000=).
+
+# The fix runs at launch *inside* the container's mount namespace, which is
+# isolated from the host — verified live: every op below leaves the host mount
+# table untouched. It makes the two passthrough parents =rprivate= (a
+# propagation-*type* change, which by Linux mount semantics sends no events to
+# peers, so it cannot affect the host) then tmpfs-masks the whole =~/mnt= tree via
+# both reachable paths. A tmpfs over =~/mnt= makes every fleet mount underneath
+# unreachable (=ENOENT= on path resolution), so =gvfsd-trash= finds only the
+# guest-home trash — exactly what a sandbox should have. It is *re-trigger-proof*
+# against autofs (masks *over* the mounts rather than unmounting them, which a
+# live desktop session instantly re-triggers) and *future-proof* (masks the
+# parent, so a new fleet machine is covered with no code change). The rooms do not
+# need =~/mnt= — the only reader is the GE-Proton font fallback, which degrades
+# gracefully when the NFS is absent (see =redstone-9x-font-provision=).
+
+# This never removes or recreates the container; it only adds mounts inside the
+# running container's namespace, and it is idempotent (re-masking an already-masked
+# path is skipped).
+
+
+# [[file:../../../distrobox.org::*Sanctuary Launcher Scripts][Sanctuary Launcher Scripts:4]]
+# Shield a sanctuary's trash:/// from the host fleet NFS mounts. See the org
+# prose above for the full mechanism.
+#
+# IMPORTANT — why podman exec and NOT distrobox enter / sanctuary-exec:
+# both join the SAME container mount namespace (verified), so masks applied
+# by either are seen by the desktop session a later distrobox enter starts.
+# BUT distrobox enter drops ALL effective capabilities (it runs as the plain
+# login user: CapEff=0), so mount(2) fails with EPERM. podman exec keeps the
+# container's CAP_SYS_ADMIN (CapEff=all), so it can mount. We therefore apply
+# the shield via podman exec, and it still persists for the enter-started
+# session because the namespace is shared.
+#
+# Usage: sanctuary-trash-shield <sanctuary-name> <host-home-dir>
+#   <host-home-dir> is the LAUNCHER's $HOME (the host home path at which
+#   distrobox bind-mounts the real home inside the container, e.g. /home/user).
+set -uo pipefail
+
+SANCTUARY="${1:?sanctuary name required}"
+HOST_HOME="${2:?host home dir required (the launcher HOME dir)}"
+
+PODMAN_BIN="$(command -v podman 2>/dev/null || true)"
+if [[ -z "${PODMAN_BIN}" ]]; then
+  echo "sanctuary-trash-shield: podman not found — cannot shield ${SANCTUARY}" >&2
+  exit 0
+fi
+
+# The container's home bind and /run/host passthrough (and the fleet mounts
+# propagated through them) exist only once it is running. Ensure it is up;
+# idempotent no-op if already running.
+"${PODMAN_BIN}" start "${SANCTUARY}" >/dev/null 2>&1 || true
+
+# The inner script receives HOST_HOME as $1 (avoids quoting it into the body).
+"${PODMAN_BIN}" exec "${SANCTUARY}" sh -c '
+  set -u
+  host_home="$1"
+  # 1. Detach the two passthrough parents from the host peer group so no mask
+  #    below can propagate back to the host. Type change only — non-propagating.
+  mount --make-rprivate "$host_home"  2>/dev/null || true
+  mount --make-rprivate /run/host     2>/dev/null || true
+  # 2. tmpfs-mask the fleet mount tree via both reachable paths. Every fleet
+  #    mount underneath becomes unreachable, so gvfsd-trash sees no foreign
+  #    trash — only the guest home trash ($XDG_DATA_HOME/Trash).
+  for d in "$host_home/mnt" "/run/host$host_home/mnt"; do
+    [ -d "$d" ] || continue
+    # Idempotent: skip if already masked with a tmpfs.
+    [ "$(stat -f -c %T "$d" 2>/dev/null)" = tmpfs ] && continue
+    if mount -t tmpfs tmpfs "$d" 2>/dev/null; then
+      echo "sanctuary-trash-shield: masked $d"
+    else
+      echo "sanctuary-trash-shield: WARNING could not mask $d (continuing)" >&2
+    fi
+  done
+' sanctuary-trash-shield "${HOST_HOME}" 2>&1 || true
+exit 0
+# Sanctuary Launcher Scripts:4 ends here

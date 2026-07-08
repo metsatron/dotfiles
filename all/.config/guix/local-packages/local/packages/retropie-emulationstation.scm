@@ -80,6 +80,25 @@
              (substitute* "es-core/src/utils/TimeUtil.h"
                (("#include <string>")
                 "#include <ctime>\n#include <string>"))
+             #t))
+         (add-after 'install 'install-resources
+           (lambda* (#:key source outputs #:allow-other-keys)
+             ;; Real runtime crash 2026-07-06: ES's CMakeLists installs only
+             ;; the binary — never the resources/ tree (fonts, frame.png,
+             ;; splash.svg, help icons). ES resolves those at runtime via
+             ;; getExePath()/resources (i.e. beside the binary) and
+             ;; getHomePath()/.emulationstation/resources — both confirmed
+             ;; from the binary's own strings. With resources absent the very
+             ;; first font/splash texture load fails ("Error - File type
+             ;; unknown!") and ES segfaults on the null texture the instant it
+             ;; launches (SIGSEGV, exit 139, observed in sanctuary-retropie).
+             ;; Copy the source resources/ tree next to the installed binary
+             ;; so getExePath()/resources finds it. The git checkout is passed
+             ;; to every build phase as #:source.
+             (let ((out (assoc-ref outputs "out")))
+               (copy-recursively
+                (string-append source "/resources")
+                (string-append out "/bin/resources")))
              #t)))))
     (native-inputs (list pkg-config))
     (inputs

@@ -138,6 +138,40 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
       Docker env-files take values literally — strip =export= prefixes and surrounding quotes
       when deriving from shell-sourced env files.
 
+23. **Sanctuary/Distrobox container removal requires fresh, per-container verification and
+    confirmation, every single time — permanent law (sealed 2026-07-07 after a near-miss on
+    all six sanctuary containers, and after a prior session actually deleted one and forced
+    a manual recreate)** -- The architecture is real and worth stating precisely, not
+    overstating: guest homes (=--home=) and Guix profiles live outside the container and
+    normally hold the real data, so a container's own writable layer is often genuinely
+    disposable. But "often" and "by design" are not "verified" — the 2026-07-07 incident
+    happened precisely because that architectural principle was treated as settled fact and
+    acted on without checking it, in the same breath as asking for permission. The rule is
+    not "containers are precious," it's "disposability is a claim that must be proven fresh
+    every time, never assumed from the design or from an earlier check in the same session."
+    Never run =distrobox rm=, =podman rm=, or any equivalent destructive removal against a
+    sanctuary container (=sanctuary-qtile=, =sanctuary-gnustep=, =sanctuary-cde=,
+    =sanctuary-redstone-9x=, =sanctuary-sx=, =sanctuary-retropie=, or any future sanctuary)
+    without, every single time, with no grandfathering from a prior approval or a prior
+    check in the same conversation:
+    - A =podman diff= (or equivalent) review of the container's own writable layer,
+      shown to the user BEFORE asking permission, not after — and actually READ the
+      contents of anything non-obvious found (file sizes, not just filenames; a
+      plausible-looking config path can still be empty boilerplate, or can still be real
+      user data — check, don't guess either way).
+    - Explicit, freshly-worded confirmation from the user for that specific removal,
+      naming the exact container(s) — a general "yes, recreate now" answer to a
+      hypothetical does not carry forward to the actual destructive tool call moments
+      later; ask again, immediately before the irreversible step, in its own turn.
+    - Never batch multiple sanctuary containers into one removal action. One at a time,
+      confirmed each time.
+    - Prefer non-destructive alternatives first: stopping/restarting a container,
+      killing stray processes inside it, or leaving a mount-config change staged and
+      undeployed until the user chooses to act, is always preferable to removal.
+    Restarting or killing a container's processes (=podman kill=, =podman restart=,
+    =sanctuary-teardown-stale-session=) is NOT covered by this law and remains fine —
+    this law is specifically about destroying and recreating the container itself.
+
 ## Agent Config Scoping
 
 Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
@@ -192,6 +226,19 @@ question, then stop and wait.
 
 For decision-grade questions, request **two lanes** (typically Perplexity + Reddit)
 and reconcile the returns before acting.
+
+**Known lane degradations (update the date when status changes):**
+
+- *2026-07-06:* Perplexity is intermittently forcing **Sonar 2 (no thinking)** regardless
+  of the requested model — the model-selectable claim above is not currently reliable.
+  Sonar 2 answers have shown thinner sourcing and less precise technical claims than
+  ChatGPT on the same question in side-by-side comparison (e.g. it asserted a same-filesystem/
+  execute-bit trust rule for a libfm question that ChatGPT 5.5-high, citing the actual libfm
+  source, showed was wrong). While this persists: treat a Perplexity return as provisional
+  if it does not show a non-Sonar-2 model was actually used, and prefer running the same
+  question through **ChatGPT** as well before acting on a technical/code-level claim. Do not
+  silently drop Perplexity as a lane -- flag degraded returns back to Mètsàtron rather than
+  quietly discounting them.
 
 **Format -- output this verbatim, then stop:**
 
