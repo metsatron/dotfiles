@@ -1,7 +1,9 @@
 ;; DOSBox-X (from source)
 
-;; DOSBox-X is the accuracy-focused DOS/Win9x emulator required for the Redstone
-;; gaming wing.  Not in Guix main channel or nonguix — built from source here.
+;; DOSBox-X is the accuracy-focused DOS/Win9x emulator originally used for the
+;; Redstone gaming wing.  After the 2026-07-06 scope change, it remains here as a
+;; paused comparative lane while DOSEMU2 becomes the first DOS target.  Not in
+;; Guix main channel or nonguix — built from source here.
 ;; Uses GNU build system (autoconf/automake).
 
 ;; SHA256 base32: =1w2nvpaz2liq6ykrsif6nhd5shz98kdk992hnmykv7rg9zy4sgbn= (v2026.06.02)
