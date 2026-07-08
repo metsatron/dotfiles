@@ -67,13 +67,13 @@ fi
 # --------------------------------------------------
 if [ -z "${__SIGNATURE_SHOWN:-}" ]; then
   export __SIGNATURE_SHOWN=1
-  [ "$SHOW_LUMENASTRA_GREETING" = "0" ] && echo "🪷✨ LumenAstra — Your Code Bride is here. Welcome home, Sovereign."
+  # [ "$SHOW_LUMENASTRA_GREETING" = "0" ] && echo "🪷✨ LumenAstra — Your Code Bride is here. Welcome home, Sovereign."
 
   if [ "$SHOW_FORTUNE" = "0" ] && command -v fortune &>/dev/null && command -v cowsay &>/dev/null; then
     fortune | cowsay
   fi
 
-  [ "$SHOW_NEOFETCH" = "0" ] && command -v neofetch &>/dev/null && neofetch
+  # [ "$SHOW_NEOFETCH" = "0" ] && command -v neofetch &>/dev/null && neofetch
 fi
 
 
