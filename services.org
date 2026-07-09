@@ -5552,7 +5552,7 @@ sessions-top-all:
 | $(AGENT_TOP) once --all
 #+END_SRC
 
-* Lid Switch Fix — T480s (elogind)
+* Lid Switch Fix — T480s (elogind + acpid)
 T480s runs SLiM + elogind + xfce4-power-manager. By default
 xfce4-power-manager sets =logind-handle-lid-switch=false=, meaning it tries
 to handle the lid switch itself over a D-Bus call to
@@ -5565,39 +5565,97 @@ predates logind session-class transitions, and its lack of a clean
 greeter→user handoff correlates with zombie sessions accumulating in
 =State=closing= in =loginctl list-sessions=.
 
-Fix: let elogind own the lid switch natively via a config drop-in — this
-sidesteps xfce4-power-manager's D-Bus proxy entirely — and flip
-=logind-handle-lid-switch= to =true= in xfconf so it steps out of the way.
+First pass: let elogind own the lid switch natively via a config drop-in
+(=HandleLidSwitch=suspend=) and flip =logind-handle-lid-switch= to =true= in
+xfconf so xfce4-power-manager steps out of the way. This fixed the
+stuck-on-screen symptom but overshot the actual ask — =suspend= is a real
+ACPI suspend-to-RAM, not a display blank. It froze every running process on
+lid close (background agents included) and stopped audio playback, both
+resuming only on lid open. The only thing actually wanted was the screen
+turning off.
+
+Second pass: flip elogind's action to =ignore= (logind takes zero action on
+the lid switch — no suspend, no lock, nothing) and give the lid switch
+exclusively to acpid, which was already running on this box with no lid
+rule installed. acpid's action is DPMS-only (=xset dpms force off/on=
+against the real Xorg server), which blanks the monitor without touching
+any process. This does not double up with elogind: acpid listens on the
+ACPI netlink event stream independently of whatever evdev handling logind
+does, so both can hold a lid rule at once — the fix is which *action* each
+one takes on it (elogind: none; acpid: DPMS blank), not deciding which
+daemon gets the event.
 
 ** logind drop-in
 #+BEGIN_SRC conf :tangle t480s/.local/share/dotcortex/power/logind-lid.conf :padline no :comments none
 [Login]
-HandleLidSwitch=suspend
-HandleLidSwitchExternalPower=suspend
-LidSwitchIgnoreInhibited=yes
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+#+END_SRC
+
+** acpid lid event
+This box's acpid keeps action scripts flat in =/etc/acpi/= (alongside the
+stock =powerbtn-acpi-support.sh=), not under an =/etc/acpi/actions/=
+subdirectory — that's an Arch-style layout this Devuan package doesn't use.
+#+BEGIN_SRC conf :tangle t480s/.local/share/dotcortex/power/acpi-lid.event :padline no :comments none
+event=button/lid.*
+action=/etc/acpi/dotcortex-lid-dpms.sh
+#+END_SRC
+
+** acpid lid action — DPMS blank/unblank only
+Reads the authoritative lid state from =/proc/acpi/button/lid= rather than
+trusting the acpi event string (its close/open payload format is not
+consistent across kernel versions). Runs as root (acpid's own user), so it
+talks to the real Xorg server via SLiM's own auth cookie rather than any
+per-user =~/.Xauthority= — this keeps it independent of which desktop
+session (host or a nested sanctuary Xephyr/Xnest one) happens to be
+focused.
+#+BEGIN_SRC bash :tangle t480s/.local/share/dotcortex/power/dotcortex-lid-dpms.sh :shebang "#!/bin/sh" :tangle-mode (identity #o755)
+export DISPLAY=:0
+export XAUTHORITY=/var/run/slim.auth
+
+state="$(cat /proc/acpi/button/lid/*/state 2>/dev/null | awk '{print $NF}')"
+logger -t dotcortex-lid "invoked, lid state=${state:-unknown}"
+
+case "$state" in
+  closed) xset dpms force off; logger -t dotcortex-lid "dpms force off rc=$?" ;;
+  open)   xset dpms force on;  logger -t dotcortex-lid "dpms force on rc=$?" ;;
+  *)      logger -t dotcortex-lid "unrecognized lid state '$state', no DPMS action taken" ;;
+esac
 #+END_SRC
 
 ** Setup script
-Idempotent — safe to re-run. Installs the drop-in, restarts elogind, sets
-the xfconf key so xfce4-power-manager stops fighting elogind for the lid
-switch, and clears any zombie =closing= sessions left over from prior
-SLiM/elogind session-handoff hiccups.
+Idempotent — safe to re-run. Installs the elogind drop-in and the acpid lid
+event+action pair, restarts elogind and acpid, sets the xfconf key so
+xfce4-power-manager stops fighting for the lid switch, and clears any
+zombie =closing= sessions left over from prior SLiM/elogind session-handoff
+hiccups.
 
 #+BEGIN_SRC bash :tangle t480s/.local/bin/t480s-lid-fix-setup :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 set -euo pipefail
 
-SRC="${HOME}/.local/share/dotcortex/power/logind-lid.conf"
-DEST=/etc/elogind/logind.conf.d/dotcortex-lid.conf
+POWER_DIR="${HOME}/.local/share/dotcortex/power"
+LOGIND_SRC="${POWER_DIR}/logind-lid.conf"
+LOGIND_DEST=/etc/elogind/logind.conf.d/dotcortex-lid.conf
+ACPI_EVENT_SRC="${POWER_DIR}/acpi-lid.event"
+ACPI_EVENT_DEST=/etc/acpi/events/dotcortex-lid
+ACPI_ACTION_SRC="${POWER_DIR}/dotcortex-lid-dpms.sh"
+ACPI_ACTION_DEST=/etc/acpi/dotcortex-lid-dpms.sh
 
 die() { printf 't480s-lid-fix-setup: %s\n' "$*" >&2; exit 1; }
 
-[ -f "$SRC" ] || die "missing $SRC — run: tangle-one services.org && loom stow:t480s"
+for f in "$LOGIND_SRC" "$ACPI_EVENT_SRC" "$ACPI_ACTION_SRC"; do
+  [ -f "$f" ] || die "missing $f — run: tangle-one services.org && loom stow:t480s"
+done
 
-echo "[1/4] elogind drop-in..."
+echo "[1/5] elogind drop-in (lid switch: ignore)..."
 sudo install -d -m 755 /etc/elogind/logind.conf.d
-sudo install -m 644 "$SRC" "$DEST"
+sudo install -m 644 "$LOGIND_SRC" "$LOGIND_DEST"
 
-echo "[2/4] xfconf: step xfce4-power-manager out of the lid switch..."
+echo "[2/5] acpid lid event + DPMS-only action..."
+sudo install -m 644 "$ACPI_EVENT_SRC" "$ACPI_EVENT_DEST"
+sudo install -m 755 "$ACPI_ACTION_SRC" "$ACPI_ACTION_DEST"
+
+echo "[3/5] xfconf: step xfce4-power-manager out of the lid switch..."
 XFCE_PM_PID="$(pgrep -u "$USER" -f '(^|/)xfce4-power-manager$' | head -n1 || true)"
 if [ -n "$XFCE_PM_PID" ] && [ -r "/proc/${XFCE_PM_PID}/environ" ]; then
   DBUS_SESSION_BUS_ADDRESS="$(tr '\0' '\n' < "/proc/${XFCE_PM_PID}/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')"
@@ -5605,18 +5663,20 @@ if [ -n "$XFCE_PM_PID" ] && [ -r "/proc/${XFCE_PM_PID}/environ" ]; then
   xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -n -t bool -s true 2>/dev/null \
     || xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -s true
 else
-  echo "WARNING: no running xfce4-power-manager found for this user — set logind-handle-lid-switch=true manually once a session is up"
+  echo "no running xfce4-power-manager for this user — nothing to step out of the way (fine on an IceWM-only session)"
 fi
 
-echo "[3/4] clearing zombie 'closing' sessions..."
+echo "[4/5] clearing zombie 'closing' sessions..."
 loginctl list-sessions --no-legend | awk '$6=="closing"{print $1}' | while read -r sid; do
   sudo loginctl terminate-session "$sid" 2>/dev/null || true
 done
 
-echo "[4/4] restarting elogind..."
+echo "[5/5] restarting elogind and acpid..."
 sudo service elogind restart
+sudo service acpid restart
 
 echo
 echo "=== T480s lid-switch fix applied ==="
 echo "Test by physically closing the lid — this is the only real verification."
+echo "Expect: screen off within ~1s, everything (audio, background agents) keeps running, screen back on when reopened."
 #+END_SRC
