@@ -14,6 +14,9 @@ PlasmoidItem {
     id: root
 
     readonly property string appName: Plasmoid.configuration.appName
+    property string machineName: ""
+    // Brand shows the configured name, or the machine hostname when left blank.
+    readonly property string brandText: appName !== "" ? appName : machineName
     readonly property int maxRecentItems: Plasmoid.configuration.maxRecentItems
     readonly property bool menuTakeover: appMenuModel.menuAvailable && Plasmoid.configuration.hideWhenMenuAvailable
 
@@ -21,7 +24,7 @@ PlasmoidItem {
     Plasmoid.constraintHints: Plasmoid.CanFillArea
     Plasmoid.status: menuTakeover ? PlasmaCore.Types.HiddenStatus : PlasmaCore.Types.ActiveStatus
 
-    toolTipMainText: appName
+    toolTipMainText: brandText
     toolTipSubText: i18n("Desktop menu — shown when no application menu is active")
 
     function quoteArg(s) {
@@ -42,6 +45,16 @@ PlasmoidItem {
         connectedSources: []
         onNewData: function (sourceName, data) {
             disconnectSource(sourceName);
+        }
+    }
+
+    P5Support.DataSource {
+        id: hostnameReader
+        engine: "executable"
+        connectedSources: []
+        onNewData: function (sourceName, data) {
+            disconnectSource(sourceName);
+            root.machineName = String(data.stdout || "").trim();
         }
     }
 
@@ -289,7 +302,10 @@ PlasmoidItem {
         writeDesktopKey("alignment", value);
     }
 
-    Component.onCompleted: reloadPlaces()
+    Component.onCompleted: {
+        reloadPlaces();
+        hostnameReader.connectSource("uname -n");
+    }
 
     fullRepresentation: RowLayout {
         id: bar
@@ -299,7 +315,7 @@ PlasmoidItem {
         Layout.minimumHeight: implicitHeight
 
         PC3.ToolButton {
-            text: root.appName
+            text: root.brandText
             font.bold: true
             Layout.fillHeight: true
             onClicked: {
