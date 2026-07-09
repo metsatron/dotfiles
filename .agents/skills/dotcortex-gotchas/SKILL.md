@@ -124,3 +124,21 @@ Related red herring: a session-stale `GUIX_PYTHONPATH` (e.g. `python3.11` site-p
 `ssh -o ConnectTimeout=N -o ConnectionAttempts=1` only bounds the TCP/auth handshake. Once the connection succeeds, a remote command that hangs blocks the local `ssh` forever — `ConnectTimeout` never fires. This bit `mux-session`: `build_menu` probes every fleet host sequentially (`tmux`/`zellij`/`wsl.exe ... tmux list-sessions`) before drawing the fzf picker, so one wedged probe meant the picker never rendered. Intermittent because it only bit when a Windows host (gillean/judith) was powered on but its WSL was cold/unresponsive — the `wsl.exe ... tmux list-sessions` command connected, then hung. Symptom looked like "stuck waiting to attach" even though it never got past the listing stage.
 
 Fix pattern: wrap probe SSH in `timeout` — `timeout -k 1 N ssh ...` bounds the whole command no matter where it stalls. Apply to listing/probe SSH only, never the interactive `ssh -t` attach/create path. See `mux.org`'s `ssh_probe` helper (T480s, 2026-06-25).
+
+## `ethtool -t <iface> offline` is destructive — never run it as a diagnostic
+
+`ethtool -t` is a hardware self-test, not a query. It resets the adapter, and on an e1000e whose TX ring is already hung it NULL-derefs in `e1000_flush_desc_rings()`; the `ethtool` process then exits with IRQs disabled, wedging userspace and forcing a power cycle. Read-only ethtool verbs: `-S` (stats), `-a` (pause), `-k` (offloads), `-i` (driver), `-g` (rings), `--show-eee`, and bare `ethtool <iface>`. Everything else — `-t`, `-A`, `-K`, `-G`, `-r`, `--set-eee` — mutates adapter state. Ask before running any of them (T480s, 2026-07-09).
+
+## Link up at full speed but zero packets sent: read the pause-frame counters first
+
+Carrier at 1000/full, `tx_errors=0`, `rx_crc_errors=0`, no PCIe AER, yet `tx_packets` never increments — check `ethtool -S <iface> | grep flow_control` before blaming the NIC, the driver, or the kernel. A link partner jamming PAUSE stops the MAC transmitting exactly this way: thousands of `rx_flow_control_xoff` against almost no `xon`, ~30/s (the 33.5ms max pause quanta at 1 Gbps, refreshed just before expiry). Fix the switch, not the host — power-cycling a wedged unmanaged switch clears it.
+
+The discriminator against a real driver bug is the **absence** of `Detected Hardware Unit Hang`: a genuine e1000e TX-ring stall always prints it with TDH/TDT register dumps, whereas a pause deadlock only trips the generic `NETDEV WATCHDOG: transmit queue 0 timed out`. Ignore the internet's universal `ethtool -K <iface> tso off` advice for I219 — the driver already disables TSO at probe, so it is always already in effect. A pause storm also **masks** any genuine TX hang underneath it; re-check once the link is quiet (T480s + T480, 2026-07-09).
+
+## An I219 MAC can stay wedged across `modprobe -r e1000e`
+
+Reloading the driver does not reset I219 MAC/PHY state — it is shared with the Intel ME. If a freshly loaded e1000e still hangs on the very first packet (`TDH <0>` / `TDT <1>`, one descriptor queued, head never advances) on an idle link, cold-power-off the machine before suspecting dead silicon. A warm reboot may not clear it; a full power-off does (T480s, 2026-07-09).
+
+## `err -30` (EROFS) after a forced shutdown is not evidence of a failing disk
+
+`EXT4-fs (dm-0): ext4_do_writepages: jbd2_start: ... err -30` only means writes hit a read-only filesystem. An operator SysRq remount-read-only (the `U` in REISUB) produces it *byte-identically* to a journal abort. Two discriminators settle it: ext4 records `FS Error count` / `First error time` permanently in the superblock (`dumpe2fs -h <dev>`) on any real filesystem error, and a genuine abort *always* logs `Aborting journal`. If both are absent, no abort occurred. Grep the log for `sysrq: Emergency Remount R/O` before raising a failing-drive alarm, and confirm with `smartctl -H -A`. A `jbd2` token inside a kernel oops backtrace's `Modules linked in:` line is not an error message (T480s, 2026-07-09).
