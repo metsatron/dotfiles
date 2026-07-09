@@ -45,6 +45,16 @@
    "thunar"
    "gvfs"        ; GIO volume/trash backends for thunar trash:/// — safe behind sanctuary-trash-shield
    "tumbler"     ; thumbnail service consumed by thunar
+   ;; MIME/content-type database + icon-theme fallback for GIO content-type and
+   ;; GIcon resolution (g_content_type_guess, icon lookups) used by xfdesktop and
+   ;; tumbler. Verified absent from this manifest's package closure 2026-07-10
+   ;; (guix show on tumbler/gvfs/glib/xfce4-panel/xfdesktop — none declare them;
+   ;; Guix's gtk+ does not propagate them). Candidate fix for the 2026-07-07
+   ;; GLib-GObject null-instance warnings (session dotcortex/2026-07/07-15-47)
+   ;; — confirm via the live SX test checklist before closing that defect.
+   "shared-mime-info"
+   "desktop-file-utils"
+   "hicolor-icon-theme"
    ;; Terminal emulator
    "xfce4-terminal"
    ;; Garcon — XFCE application/settings menu library; exposes share/desktop-directories/
