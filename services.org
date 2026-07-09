@@ -1510,6 +1510,23 @@ fi
 log "swap-heal ritual complete."
 #+END_SRC
 
+* Recall embedder — T480s (Devuan / XDG autostart)
+The Recall RAG embedder is a =llama-server= process from the Guix =core= profile, serving =qwen3-embedding-0.6b-q8_0.gguf= on =127.0.0.1:3003=.  It is started by =FORGE/bin/recall embedder start=, which is idempotent (it exits 0 if the PID file names a live process) and detaches via =start_new_session=, so it survives the autostart shell exiting.
+
+T480s is Devuan/sysvinit with no systemd user units, so the session-scoped mechanism is XDG autostart — the same lane as =nfs-premount.desktop=.  Both =FORGE/bin/recall= and the model file live under =$HOME/mnt/x230=, which is an NFS mount from the X230, so the entry cannot assume the tree is present at login.  The loop below polls for the =recall= entrypoint (the test itself triggers the automount) and only then execs it, giving up quietly after two minutes rather than hanging the session.
+
+This starts the embedder only.  Ingest is deliberately not autostarted: =recall ingest= is a long CPU-bound job and running it unattended at login on a laptop would fight the user for cores on every boot.
+
+#+BEGIN_SRC conf :tangle t480s/.config/autostart/recall-embedder.desktop :tangle-mode (identity #o644) :mkdirp yes :comments no
+[Desktop Entry]
+Type=Application
+Name=Recall embedder
+Exec=bash -c 'for _ in $(seq 1 60); do if [ -x "$HOME/mnt/x230/HelmCortex/FORGE/bin/recall" ]; then exec "$HOME/mnt/x230/HelmCortex/FORGE/bin/recall" embedder start >/dev/null 2>&1; fi; sleep 2; done'
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+#+END_SRC
+
 * Agent Session Daemon
 Phase-2 telemetry foundation for agent sessions.
 
@@ -1519,6 +1536,417 @@ is the human-facing CLI after entering or creating a tmux session.
 =HelmCortex/ROOTS/DotRoot/agent-session/=. LOGS are notes/TODO storage, not a session
 source. The =HelmCortex/ROOTS/AgentRoot/session-index.json= (written by FORGE/bin/agent-session)
 is the cross-agent session truth; agent-sessiond reads it for summary counts only.
+
+** thread-triage
+Phase-0 Thread-Ledger evidence packet extractor. This is a read-only offline
+archaeology lane over normalized =.MASTER= markdown exports; it never writes
+under HelmCortex.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/thread-triage :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: thread-triage [OPTIONS]
+
+Emit Thread-Ledger Phase-0 evidence packets as JSONL on stdout.
+
+Options:
+  --month YYYY-MM      restrict to export paths containing /YYYY-MM/
+  --root PATH          HelmCortex root (default: ~/HelmCortex)
+  --ledger PATH        skip-list ledger path
+                       (default: ~/HelmCortex/ROOTS/AgentRoot/thread-ledger.json)
+  --include-skipped    emit packets even when the ledger says to skip
+  --limit N            stop after N discovered sessions
+  -h, --help           show this help
+EOF
+}
+
+need_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "thread-triage: python3 is required for JSONL emission" >&2
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+need_python
+python3 - "$@" <<'PY'
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+from datetime import datetime, timezone
+
+HEAD_SCAN_MAX_BYTES = 65536
+TAIL_SCAN_MAX_BYTES = 65536
+TURN_TRUNCATE_CHARS = 1500
+TERMINAL_SIGNAL_RE = re.compile(r"\b(commit|handoff|exit|done|shipped)\b", re.I)
+TURN_HEADER_RE = re.compile(r"^##(?: \[(\d+)\])? ([^\n]+?)\s*$", re.M)
+MID_LIST_RE = re.compile(r"(^|\n)\s*(?:[-*+]|\d+[.)])\s+\S[^\n]*\s*$")
+
+HARNESS_DIRS = {
+    "Claude": "claude",
+    "Codex": "codex",
+    "OpenCode": "opencode",
+    "Hermes": "hermes",
+    "Antigravity": "antigravity",
+}
+AGENT_LABELS = {
+    "CLAUDE", "CODEX", "OPENCODE", "HERMES", "ANTIGRAVITY", "ASSISTANT",
+    "AGENT", "SYSTEM",
+}
+FRONTMATTER_KEYS = {
+    "provider", "model", "session_id", "date", "source_utc", "end_date",
+    "cwd", "session_cwd", "workspace_path", "git_branch", "branch", "machine", "host",
+}
+
+
+def warn(msg):
+    print(f"thread-triage: WARN: {msg}", file=sys.stderr)
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--month")
+    ap.add_argument("--root", default=str(pathlib.Path.home() / "HelmCortex"))
+    ap.add_argument(
+        "--ledger",
+        default=str(pathlib.Path.home() / "HelmCortex/ROOTS/AgentRoot/thread-ledger.json"),
+    )
+    ap.add_argument("--include-skipped", action="store_true")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("-h", "--help", action="store_true")
+    ns, rest = ap.parse_known_args(argv)
+    if ns.help:
+        print("thread-triage: internal help dispatch error", file=sys.stderr)
+        sys.exit(0)
+    if rest:
+        warn(f"ignoring unknown arguments: {' '.join(rest)}")
+    if ns.month and not re.fullmatch(r"\d{4}-\d{2}", ns.month):
+        print("thread-triage: --month must be YYYY-MM", file=sys.stderr)
+        sys.exit(2)
+    return ns
+
+
+def read_head_bytes(path, max_bytes=HEAD_SCAN_MAX_BYTES):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(max_bytes)
+    except Exception as exc:
+        warn(f"{path}: head read failed: {exc}")
+        return b""
+
+
+def read_tail_bytes(path, max_bytes=TAIL_SCAN_MAX_BYTES):
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+        if size > max_bytes:
+            cut = data.find(b"\n")
+            if cut >= 0:
+                data = data[cut + 1:]
+        return data
+    except Exception as exc:
+        warn(f"{path}: tail read failed: {exc}")
+        return b""
+
+
+def decode(data):
+    return data.decode("utf-8", errors="replace")
+
+
+def iso_from_mtime(path):
+    try:
+        return (datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    except Exception:
+        return None
+
+
+def trunc(text, n=TURN_TRUNCATE_CHARS):
+    if text is None:
+        return None
+    text = re.sub(r"[ \t]+\n", "\n", text).strip()
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def machine_from_path(path):
+    parts = path.parts
+    if ".MASTER" in parts:
+        idx = parts.index(".MASTER")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
+def harness_from_path(path):
+    parts = path.parts
+    for raw, canonical in HARNESS_DIRS.items():
+        if raw in parts:
+            return canonical
+    return None
+
+
+def parse_frontmatter(head_text, path):
+    warnings = []
+    fm = {}
+    if not head_text.startswith("---\n"):
+        warnings.append("frontmatter missing from bounded head scan")
+        return fm, warnings
+    end = head_text.find("\n---", 4)
+    if end < 0:
+        warnings.append("frontmatter terminator missing from bounded head scan")
+        return fm, warnings
+    body = head_text[4:end]
+    current_key = None
+    for line in body.splitlines():
+        if not line.strip() or line.startswith("  - "):
+            continue
+        if line.startswith((" ", "\t")) and current_key:
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip()
+        if key not in FRONTMATTER_KEYS:
+            current_key = key
+            continue
+        val = val.strip()
+        if ((val.startswith('"') and val.endswith('"')) or
+                (val.startswith("'") and val.endswith("'"))):
+            val = val[1:-1]
+        fm[key] = val if val != "" else None
+        current_key = key
+    if "session_id" not in fm:
+        warnings.append("session_id missing from frontmatter")
+    if not (fm.get("cwd") or fm.get("session_cwd") or fm.get("workspace_path")):
+        warnings.append("cwd missing from frontmatter")
+    return fm, warnings
+
+
+def parse_turns(tail_text):
+    raw_matches = list(TURN_HEADER_RE.finditer(tail_text))
+    matches = []
+    for m in raw_matches:
+        probe = tail_text[m.end():].lstrip().splitlines()
+        first = probe[0].strip() if probe else ""
+        if first.startswith("<time ") or re.fullmatch(r"\*[^*]+\*", first):
+            matches.append(m)
+    turns = []
+    for idx, m in enumerate(matches):
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(tail_text)
+        label = m.group(2).strip()
+        body = tail_text[start:end].strip()
+        lines = body.splitlines()
+        if lines and (re.fullmatch(r"\*[^*]+\*", lines[0].strip()) or
+                      lines[0].strip().startswith("<time ")):
+            body = "\n".join(lines[1:]).strip()
+        role = "user" if label.upper() in ("USER", "METSATRON", "MÈTSÀTRON") else "agent"
+        turns.append({
+            "n": int(m.group(1) or (len(turns) + 1)),
+            "label": label,
+            "role": role,
+            "text": body,
+        })
+    return turns
+
+
+def abrupt_heuristics(turns, paths_by_cwd, path, date_text):
+    last = turns[-1] if turns else None
+    last_agent = next((t for t in reversed(turns) if t["role"] == "agent"), None)
+    last_agent_text = last_agent["text"].rstrip() if last_agent else ""
+    ends_mid_tool = False
+    if last_agent_text:
+        ends_mid_tool = (
+            last_agent_text.endswith(("**Bash**", "**Tool**", "**Skill**", "```")) or
+            last_agent_text.count("```") % 2 == 1
+        )
+    ends_mid_list = bool(last_agent_text and MID_LIST_RE.search(last_agent_text))
+    successor = None
+    cwd_key = str(path.parent)
+    siblings = paths_by_cwd.get(cwd_key, [])
+    try:
+        mtime = path.stat().st_mtime
+        for other in siblings:
+            if other == path:
+                continue
+            omt = other.stat().st_mtime
+            if 0 < omt - mtime <= 48 * 3600:
+                successor = str(other)
+                break
+    except Exception:
+        pass
+    return {
+        "last_turn_role": last["role"] if last else None,
+        "last_turn_is_agent": bool(last and last["role"] == "agent"),
+        "last_agent_ends_mid_tool_call": ends_mid_tool,
+        "last_agent_ends_mid_list": ends_mid_list,
+        "successor_same_cwd_within_48h": bool(successor),
+        "successor_path": successor,
+        "source_date": date_text,
+    }
+
+
+def bounded_hash(path, head_bytes, tail_bytes):
+    h = hashlib.sha256()
+    try:
+        size = path.stat().st_size
+    except Exception:
+        size = None
+    h.update(b"thread-triage.bounded.v1\0")
+    h.update(str(size).encode())
+    h.update(b"\0")
+    h.update(head_bytes)
+    h.update(b"\0")
+    h.update(tail_bytes)
+    return h.hexdigest()
+
+
+def ledger_skip_keys(path):
+    keys = set()
+    if not path.exists():
+        return keys
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warn(f"ledger read failed; treating as empty skip-list: {exc}")
+        return keys
+    entries = payload.get("sessions") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        warn("ledger has no list/sessions array; treating as empty skip-list")
+        return keys
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        verdict = item.get("verdict") or item.get("status") or item.get("human_verdict")
+        if not verdict or verdict == "unknown":
+            continue
+        h = item.get("hash") or item.get("source_hash") or item.get("bounded_hash")
+        mt = item.get("mtime") or item.get("source_mtime")
+        if h and mt:
+            keys.add((str(h), str(mt)))
+    return keys
+
+
+def discover(root, month):
+    logs = root / "LOGS"
+    for raw in HARNESS_DIRS:
+        base = logs / raw
+        if not base.exists():
+            warn(f"missing export corpus: {base}")
+            continue
+        for path in base.rglob("*.md"):
+            s = path.as_posix()
+            if "/.MASTER/" not in s:
+                continue
+            if "/.CHUNKED/" in s or "/.ROLLED/" in s:
+                continue
+            if month and f"/{month}/" not in s:
+                continue
+            yield path
+
+
+def packet_for(path, paths_by_cwd, skip_keys):
+    warnings = []
+    head_bytes = read_head_bytes(path)
+    tail_bytes = read_tail_bytes(path)
+    head_text = decode(head_bytes)
+    tail_text = decode(tail_bytes)
+    fm, fm_warnings = parse_frontmatter(head_text, path)
+    warnings.extend(fm_warnings)
+    turns = parse_turns(tail_text)
+    if not turns:
+        warnings.append("no turn headers found in bounded tail scan")
+    users = [t for t in turns if t["role"] == "user"]
+    agents = [t for t in turns if t["role"] == "agent"]
+    last_user = users[-1]["text"] if users else ""
+    stat = None
+    try:
+        stat = path.stat()
+    except Exception as exc:
+        warnings.append(f"stat failed: {exc}")
+    content_hash = bounded_hash(path, head_bytes, tail_bytes)
+    mtime = str(stat.st_mtime) if stat else ""
+    skipped = (content_hash, mtime) in skip_keys
+    machine = fm.get("machine") or fm.get("host") or machine_from_path(path)
+    cwd = fm.get("cwd") or fm.get("session_cwd") or fm.get("workspace_path")
+    git_branch = fm.get("git_branch") or fm.get("branch")
+    packet = {
+        "schema": "thread-triage.packet.v1",
+        "harness": harness_from_path(path),
+        "model": fm.get("model"),
+        "session_id": fm.get("session_id") or path.stem,
+        "date": fm.get("datetime") or fm.get("date") or fm.get("source_utc") or iso_from_mtime(path),
+        "cwd": cwd,
+        "machine": machine,
+        "git_branch": git_branch,
+        "source_path": str(path),
+        "source_mtime": mtime or None,
+        "source_size_bytes": stat.st_size if stat else None,
+        "source_hash": content_hash,
+        "source_hash_scheme": "sha256(head64k+tail64k+size)",
+        "skip_list": {
+            "ledger_match": skipped,
+            "matched_by": "source_hash+source_mtime" if skipped else None,
+        },
+        "last_user_turns": [
+            {"n": t["n"], "label": t["label"], "text": trunc(t["text"])}
+            for t in users[-3:]
+        ],
+        "last_agent_turn": (
+            {"n": agents[-1]["n"], "label": agents[-1]["label"], "text": trunc(agents[-1]["text"])}
+            if agents else None
+        ),
+        "terminal_signal": {
+            "regex": r"\b(commit|handoff|exit|done|shipped)\b",
+            "matched": bool(TERMINAL_SIGNAL_RE.search(last_user or "")),
+            "matches": sorted({m.group(1).lower() for m in TERMINAL_SIGNAL_RE.finditer(last_user or "")}),
+        },
+        "abrupt_end": abrupt_heuristics(turns, paths_by_cwd, path, fm.get("date")),
+        "warnings": warnings,
+    }
+    return packet
+
+
+def main(argv):
+    ns = parse_args(argv)
+    root = pathlib.Path(ns.root).expanduser()
+    ledger = pathlib.Path(ns.ledger).expanduser()
+    skip_keys = ledger_skip_keys(ledger)
+    paths = sorted(discover(root, ns.month))
+    if ns.limit:
+        paths = paths[: max(0, ns.limit)]
+    paths_by_cwd = {}
+    for p in paths:
+        paths_by_cwd.setdefault(str(p.parent), []).append(p)
+    for path in paths:
+        try:
+            packet = packet_for(path, paths_by_cwd, skip_keys)
+            if packet["skip_list"]["ledger_match"] and not ns.include_skipped:
+                continue
+            json.dump(packet, sys.stdout, ensure_ascii=False, sort_keys=True)
+            sys.stdout.write("\n")
+        except Exception as exc:
+            warn(f"{path}: packet extraction failed: {exc}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY
+#+END_SRC
 
 ** agent-sessiond
 #+BEGIN_SRC bash :tangle all/.local/bin/agent-sessiond :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
