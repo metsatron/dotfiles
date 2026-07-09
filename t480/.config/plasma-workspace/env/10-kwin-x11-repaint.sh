@@ -1,6 +1,8 @@
 # Plasma/SonicDE sources ~/.config/plasma-workspace/env/*.sh before KWin starts.
-# XLibre compositing is RESTORED on this box: the panel/menu smear was the modesetting
-# DDX (X11Libre/xserver#1924 family; xlibre-artix/xlibre-video-intel#2), fixed by forcing
-# the xf86-video-intel/SNA DDX in /etc/X11/xorg.conf.d (machine-local — see T480 SystemCodex).
-# So we no longer disable compositing here. Retained light mitigation: force full repaints.
-export KWIN_USE_BUFFER_AGE=0
+# The xf86-video-intel DDX was reverted 2026-07-09: it "cured" the modesetting smear
+# (X11Libre/xserver#1924 family) only by disabling hardware GL -- AIGLX cannot load the
+# i965 driver Mesa 25 removed, dropping the whole session onto llvmpipe (kitty ~400% CPU).
+# We are back on the builtin modesetting DDX with hardware iris, and attack the smear at
+# KWin's GL interface instead: EGL bypasses the GLX/Present path implicated upstream.
+# KWIN_USE_BUFFER_AGE=0 is gone -- it forced full repaints at ~1.9 cores (192.8% -> 0.4%).
+export KWIN_OPENGL_INTERFACE=egl
