@@ -1,7 +1,7 @@
 ---
 name: sandcastle
 description: Orchestrate AFK coding agents in isolated Podman/Docker sandboxes with sandcastle.run(). Covers API patterns, branch strategies, Podman preference, session resume/fork, and super system integration.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 # Sandcastle
@@ -17,7 +17,7 @@ import { run, claudeCode } from "@ai-hero/sandcastle";
 import { podman } from "@ai-hero/sandcastle/sandboxes/podman";
 
 await run({
-  agent: claudeCode("claude-sonnet-4-6"),
+  agent: claudeCode("claude-sonnet-5"),
   sandbox: podman(),
   promptFile: ".sandcastle/prompt.md",
   maxIterations: 5,
@@ -62,7 +62,7 @@ sandbox: podman({
 ### One-shot run
 ```typescript
 const result = await run({
-  agent: claudeCode("claude-sonnet-4-6"), // example — choose per task
+  agent: claudeCode("claude-sonnet-5"), // example — choose per task
   sandbox: podman(),
   promptFile: ".sandcastle/prompt.md",
   branchStrategy: { type: "branch", branch: "agent/task" },
@@ -79,15 +79,15 @@ await using sandbox = await createSandbox({
   sandbox: podman(),
   hooks: { sandbox: { onSandboxReady: [{ command: "npm install" }] } },
 });
-await sandbox.run({ agent: claudeCode("claude-sonnet-4-6"), promptFile: ".sandcastle/implement.md", maxIterations: 5 });
+await sandbox.run({ agent: claudeCode("claude-sonnet-5"), promptFile: ".sandcastle/implement.md", maxIterations: 5 });
 const tests = await sandbox.exec("npm test");
 if (tests.exitCode !== 0) throw new Error(tests.stdout);
-await sandbox.run({ agent: claudeCode("claude-sonnet-4-6"), prompt: "Review and fix." });
+await sandbox.run({ agent: claudeCode("claude-sonnet-5"), prompt: "Review and fix." });
 ```
 
 ### Session resume / fork
 ```typescript
-const first = await run({ agent: claudeCode("claude-sonnet-4-6"), sandbox: podman(), prompt: "Draft a plan" });
+const first = await run({ agent: claudeCode("claude-sonnet-5"), sandbox: podman(), prompt: "Draft a plan" });
 const second = await first.resume?.("Now implement");
 
 // Fan-out fork (each child gets its own branch)
@@ -102,7 +102,7 @@ const [a, b] = await Promise.all([
 import { interactive } from "@ai-hero/sandcastle";
 import { noSandbox } from "@ai-hero/sandcastle/sandboxes/no-sandbox";
 
-await interactive({ agent: claudeCode("claude-sonnet-4-6"), sandbox: noSandbox() });
+await interactive({ agent: claudeCode("claude-sonnet-5"), sandbox: noSandbox() });
 ```
 
 ## Dynamic Prompt Context

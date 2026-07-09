@@ -10,6 +10,7 @@ Kirigami.FormLayout {
     QQC2.TextField {
         id: appNameField
         Kirigami.FormData.label: i18n("Menu title:")
+        placeholderText: i18n("Machine hostname")
     }
 
     QQC2.CheckBox {

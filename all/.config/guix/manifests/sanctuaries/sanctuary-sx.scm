@@ -9,6 +9,26 @@
 ;; Virtual Habitat — sanctuary-sx Guix profile
 ;; XFCE desktop stack for the SX-Window / Ko-Window continuation habitat.
 ;; desktop-common is sourced separately by the launcher.
+;; gvfs is present (GIO volume/trash backends for thunar trash:///) and is
+;; now SAFE because the launcher runs sanctuary-trash-shield before starting
+;; the desktop. Background: distrobox bind-mounts the host home at /home/<user>
+;; AND passes the host root recursively at /run/host, so the host's autofs
+;; fleet NFS mounts (~/mnt/x230, ~/mnt/t480, …) surface INSIDE the container's
+;; own mount namespace as real mount points via BOTH paths. gvfs's trash
+;; aggregator (gvfsd-trash) walks every visible mount point looking for
+;; $topdir/.Trash-$uid, so without the shield it merged those remote machines'
+;; trash into this sandboxed room's trash:/// (measured historically: 392
+;; entries = 68 local + 324 leaked from the host's real ~/mnt/x230/.Trash-1000).
+;; sanctuary-trash-shield (see distrobox.org) closes this at launch, inside the
+;; container's isolated mount namespace: it makes the two passthrough parents
+;; rprivate (so nothing below can propagate to the host) then tmpfs-masks the
+;; whole ~/mnt tree via both reachable paths, leaving every fleet mount
+;; unreachable (ENOENT). gvfs then finds only the guest-home trash, which is
+;; exactly what a sandbox should have. Re-trigger-proof against autofs (masks
+;; OVER the mounts, never unmounts them) and future-proof (masks the parent, so
+;; a new fleet machine is covered with no change). If you ever run gvfs in a
+;; room WITHOUT the shield wired into its launcher, the leak returns — keep the
+;; two together. See redstone-9x-state-digest.md.
 ;; Apply: make guix-sanctuary-sx
 (specifications->manifest
  '(
@@ -23,7 +43,7 @@
    "xfce4-appfinder"
    ;; File manager
    "thunar"
-   "gvfs"        ; GIO volume/trash backends for thunar trash:///
+   "gvfs"        ; GIO volume/trash backends for thunar trash:/// — safe behind sanctuary-trash-shield
    "tumbler"     ; thumbnail service consumed by thunar
    ;; Terminal emulator
    "xfce4-terminal"
