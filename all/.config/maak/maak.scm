@@ -321,6 +321,10 @@
     (task 'icons:sync "Copy icon/theme trees into home and rebuild caches"
           (lambda () (sh "make icons-sync")))
 
+    (task 'desktop:icon-cache
+          "Rebuild missing icon-theme.cache files system-wide (user + root-owned packs; sudo batched once)"
+          (lambda () (sh "make icon-cache-rebuild")))
+
      (task 'flatpak:remotes
            "Ensure remotes (user+system) with clean env"
            (lambda () (mk "flatpak-remotes")))
@@ -477,6 +481,36 @@
 (task 'kwin:borderless-off
       "Restore titlebars on maximized windows"
       (lambda () (mk "kwin-borderless-off")))
+
+;; --- XFCE Desktop Menu (SonicDE shape on XFCE) ---
+(task 'desktop:xfce-menu-build
+      "Build+install the native xfce-desktop-menubar panel plugin (user-scope)"
+      (lambda ()
+        (sh "H=\"$HOME/.local/bin/xfce-desktop-menubar-build\"; [ -x \"$H\" ] || H=\"$HOME/DotCortex/linux/.local/bin/xfce-desktop-menubar-build\"; \"$H\"")))
+
+(task 'desktop:xfce-menu-configure
+      "Add appmenu + windowck + desktop-menubar plugins to the top panel (additive)"
+      (lambda ()
+        (sh "H=\"$HOME/.local/bin/xfce-desktopmenu-configure\"; [ -x \"$H\" ] || H=\"$HOME/DotCortex/linux/.local/bin/xfce-desktopmenu-configure\"; \"$H\"")))
+
+(task 'desktop:xfce-menu
+      "Build the desktop menubar plugin then place all panel plugins"
+      (lambda ()
+        (sh "B=\"$HOME/.local/bin/xfce-desktop-menubar-build\"; [ -x \"$B\" ] || B=\"$HOME/DotCortex/linux/.local/bin/xfce-desktop-menubar-build\"; C=\"$HOME/.local/bin/xfce-desktopmenu-configure\"; [ -x \"$C\" ] || C=\"$HOME/DotCortex/linux/.local/bin/xfce-desktopmenu-configure\"; \"$B\" && \"$C\"")))
+
+(task 'xfwm:titleless-status "Show xfwm4 titleless/borderless maximize state"
+      (lambda ()
+        (sh "H=\"$HOME/.local/bin/xfwm-titleless-maximized\"; [ -x \"$H\" ] || H=\"$HOME/DotCortex/linux/.local/bin/xfwm-titleless-maximized\"; \"$H\" status")))
+
+(task 'xfwm:titleless-on
+      "Hide titlebars/borders on maximized windows (panel carries the chrome)"
+      (lambda ()
+        (sh "H=\"$HOME/.local/bin/xfwm-titleless-maximized\"; [ -x \"$H\" ] || H=\"$HOME/DotCortex/linux/.local/bin/xfwm-titleless-maximized\"; \"$H\" enable")))
+
+(task 'xfwm:titleless-off
+      "Restore normal decorations on maximized windows"
+      (lambda ()
+        (sh "H=\"$HOME/.local/bin/xfwm-titleless-maximized\"; [ -x \"$H\" ] || H=\"$HOME/DotCortex/linux/.local/bin/xfwm-titleless-maximized\"; \"$H\" disable")))
 
 ;; --- Logseq ---
 (task 'logseq:launch "Launch Logseq DB (starts ttyd if needed)"
