@@ -81,3 +81,33 @@ export NVM_DIR="$HOME/.config/nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
 [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+
+# --- kitty shell integration (no-op outside kitty) ---
+if [ -n "${KITTY_INSTALLATION_DIR:-}" ] && [ -n "${KITTY_SHELL_INTEGRATION:-}" ]; then
+  if [ -n "${ZSH_VERSION:-}" ]; then
+    # Upstream discourages sourcing kitty.zsh (global aliases can break it) and
+    # recommends invoking the kitty-integration autoload function directly.
+    if [ -r "$KITTY_INSTALLATION_DIR/shell-integration/zsh/kitty-integration" ]; then
+      autoload -Uz -- "$KITTY_INSTALLATION_DIR/shell-integration/zsh/kitty-integration"
+      kitty-integration
+      unfunction kitty-integration 2>/dev/null
+    fi
+  elif [ -n "${BASH_VERSION:-}" ]; then
+    # kitty.bash consumes KITTY_SHELL_INTEGRATION and unsets it, so a second
+    # sourcing is a documented no-op.
+    [ -r "$KITTY_INSTALLATION_DIR/shell-integration/bash/kitty.bash" ] &&
+      . "$KITTY_INSTALLATION_DIR/shell-integration/bash/kitty.bash"
+  fi
+
+  # kitten ssh ships kitty's terminfo AND shell integration to the remote, fixing
+  # `TERM=xterm-kitty` breaking tput/clear/vim colours on hosts that lack kitty's
+  # terminfo (x230, t480, s24). Deliberately an interactive ALIAS, so:
+  #   - scripts and non-interactive shells keep plain ssh (aliases do not expand there)
+  #   - shell functions defined earlier in the rc chain already bound plain ssh
+  #   - outside kitty this whole block never runs, so xfce-terminal/TTY are unaffected
+  # Escape hatch when a host misbehaves with the kitten: `command ssh host`.
+  command -v kitten >/dev/null 2>&1 && alias ssh='kitten ssh'
+fi
+
+# --- zoxide init (must be last — after everything that touches PROMPT_COMMAND) ---
+command -v zoxide >/dev/null 2>&1 && eval "$(zoxide init bash)"
