@@ -4,6 +4,7 @@ GUIX_MK_INCLUDED := 1
 
 .RECIPEPREFIX := |
 SHELL := /bin/bash
+.SHELLFLAGS := -Eeuo pipefail -c
 .ONESHELL:
 
 GUIX ?= guix
