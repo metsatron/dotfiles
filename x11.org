@@ -101,12 +101,38 @@ if ! registrar_has_owner; then
   fi
 
   if [ -n "${APPMENU_REGISTRAR}" ]; then
-    # Keep the registrar alive after the helper shell exits.
-    nohup "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 &
+    # `-r` only references an existing primary instance; it cannot start one.
+    # Start the primary as the D-Bus service file does, then hold it with `-r`
+    # so it does not auto-quit after ~10 s idle.
+    nohup "$APPMENU_REGISTRAR" --gapplication-service >/dev/null 2>&1 &
+    for _i in 1 2 3 4 5 6; do
+      sleep 0.5
+      registrar_has_owner && break
+    done
+    # Foreground, bounded: `-r` returns in milliseconds once a primary owns the
+    # name, and its hold is what stops the registrar idle-quitting after ~10 s.
+    if registrar_has_owner; then
+      timeout 5 "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 || true
+    fi
   fi
 fi
 
 unset APPMENU_REGISTRAR
+#+END_SRC
+
+* Session PATH: ~/.local/bin
+=xfce4-session= launches XDG autostart entries with the PATH it inherits from Xsession. That PATH never contained =~/.local/bin=, so every autostart entry naming a stowed helper by bare command name died at login with =Failed to execute child process ... (No such file or directory)= -- =appmenu-boot-setup= (the global-menu registrar bootstrap), =clipmenud-start=, =xfce-sanctuary-shortcuts=, =plank=, =twistpatch=. The failure is silent unless you read =~/.xsession-errors=, and the usual symptom is "the fix works when I run it by hand but never survives a reboot" -- because an interactive shell *does* have =~/.local/bin= on PATH.
+
+Numbered =40= so it runs *after* =20-guix-core-profile.sh=. Guix prepends its profile, so prepending here afterwards leaves =~/.local/bin= ahead of Guix -- the ordering =guix.org= already relies on for the =python3= shim that keeps =#!/usr/bin/env python3= off Guix's tkinter-less interpreter. Nine names now resolve to =~/.local/bin= for GUI-launched processes (=python3=, =pip3=, =node=, =npm=, =npx=, =corepack=, =f2py=, =isympy=, =numpy-config=); all nine already resolved that way in interactive shells, so this makes the session agree with the shell rather than diverge from it.
+
+#+BEGIN_SRC sh :tangle linux/.xsessionrc.d/40-local-bin.sh :shebang "#!/usr/bin/env sh"
+# Put ~/.local/bin on the session PATH so XDG autostart entries can name stowed
+# helpers by bare command name. Idempotent: re-sourcing must not duplicate.
+case ":${PATH}:" in
+  *":$HOME/.local/bin:"*) ;;
+  *) PATH="$HOME/.local/bin:$PATH" ;;
+esac
+export PATH
 #+END_SRC
 
 * Plasma/SonicDE Guix menu environment
@@ -590,8 +616,17 @@ else
   exit 0
 fi
 
+# `pkill -x` matches against /proc/<pid>/comm, which the kernel truncates to 15
+# characters -- "appmenu-registrar" is 17, so the full name NEVER matches and the
+# stale-registrar sweep silently no-ops. Match the truncated comm as well.
+pkill -x appmenu-registr >/dev/null 2>&1 || true
 pkill -x appmenu-registrar >/dev/null 2>&1 || true
-nohup "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 &
+
+# `-r` alone can NEVER start a registrar. Per `--help` it means "Reference a
+# registrar", i.e. bump the hold count of an already-running primary instance.
+# With no primary it blocks without ever claiming the bus name. Start the
+# primary the same way the D-Bus service file does, with --gapplication-service.
+nohup "$APPMENU_REGISTRAR" --gapplication-service >/dev/null 2>&1 &
 
 # Wait up to 3 s for the registrar to claim its D-Bus name.
 for _i in 1 2 3 4 5 6; do
@@ -604,9 +639,40 @@ if command -v xfce-appmenu-configure >/dev/null 2>&1; then
   xfce-appmenu-configure >/dev/null 2>&1 || true
 fi
 
-# Restart the panel so its appmenu plugin reconnects to the now-live registrar.
-# xfce4-session auto-restarts the panel; the new instance finds the registrar.
-pkill -x xfce4-panel >/dev/null 2>&1 || true
+# Reconnect the panel's appmenu plugin to the now-live registrar. Use the
+# panel's own --restart: `pkill` relies on xfce4-session respawning the panel,
+# which it does not reliably do, and a killed panel simply stays dead.
+xfce4-panel --restart >/dev/null 2>&1 || true
+sleep 2
+
+# ORDER MATTERS. A registrar with no references auto-quits ~10 s after its last
+# activity, taking every exported menu with it. `-r` adds a hold that prevents
+# that: it increments a persistent count and returns in ~15 ms.
+#
+# It must run *after* the panel restart. Measured on T480s: holding first, then
+# restarting the panel, leaves the registrar dead ~10 s later -- the outgoing
+# panel's appmenu plugin unreferences the registrar as it exits, cancelling the
+# hold. Holding last survives indefinitely.
+#
+# Foreground, because backgrounding means the reference never lands if this
+# script exits first. Bounded by `timeout` because with no primary instance
+# running, `-r` blocks forever instead of failing.
+hold_registrar() {
+  registrar_has_owner || return 1
+  timeout 5 "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 || true
+  sleep 11
+  registrar_has_owner
+}
+
+if ! hold_registrar; then
+  # Registrar lost its name anyway; bring it back and hold it once more.
+  nohup "$APPMENU_REGISTRAR" --gapplication-service >/dev/null 2>&1 &
+  for _i in 1 2 3 4 5 6; do
+    sleep 0.5
+    registrar_has_owner && break
+  done
+  registrar_has_owner && timeout 5 "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 || true
+fi
 #+END_SRC
 
 #+BEGIN_SRC conf :tangle linux/.config/autostart/appmenu-boot.desktop :tangle-mode (identity #o644) :comments no
@@ -614,7 +680,7 @@ pkill -x xfce4-panel >/dev/null 2>&1 || true
 Type=Application
 Name=AppMenu Boot Setup
 Comment=Start appmenu-registrar on first login and restart panel if needed
-Exec=appmenu-boot-setup
+Exec=sh -c 'exec "$HOME/.local/bin/appmenu-boot-setup"'
 NoDisplay=true
 X-XFCE-Autostart-Override=true
 #+END_SRC
