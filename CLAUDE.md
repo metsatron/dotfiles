@@ -168,6 +168,13 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     =sanctuary-teardown-stale-session=) is NOT covered by this law and remains fine —
     this law is specifically about destroying and recreating the container itself.
 
+24. **Environment claims must come from the user's shell, never the agent's own subprocess (sealed 2026-07-09 after a two-day misdiagnosis)** -- an agent's tool subprocess does not share the user's interactive session environment. Claude Code scrubs `NO_COLOR` from its subprocesses, so an agent running `env | grep NO_COLOR` in its own Bash tool reads a *different process's* environment and will confidently report the opposite of the truth. A live `NO_COLOR=1` was misreported as unset, producing a false "confirmed upstream bug" against innocent third-party software that was one approval away from being filed.
+    - Never answer "is X set in the environment?" from the agent's own subprocess. Have the user run the check in the affected shell, or read it from the specific live PID -- filtered to the exact variable names needed, never a broad `/proc/<pid>/environ` dump.
+    - If the agent's reading of a basic variable (`TERM`, `SHELL`, `COLORTERM`) disagrees with the user's, **that disagreement is the finding**. Stop and reconcile it; never note it and reason past it.
+    - Distinguish where a variable is *declared* from where it is *observed*. Grepping `*.org`, `/etc`, or any config tree proves nothing about the live environment -- a variable injected at runtime is declared nowhere on disk.
+    - `bash --norc` / `--noprofile` isolate **rc files, not the environment**. An "isolated" shell still inherits every exported variable from its parent, so an environmental hypothesis tested that way has no control at all. Use `env -i`, or explicitly unset the suspect variable.
+    - Never assert an environment fact in an outbound bug report, issue, or message to a third party unless it was observed in the user's actual shell.
+
 ## Agent Config Scoping
 
 Harness-exclusive config lives in its own directory. Nothing crosses these boundaries uninvited:
