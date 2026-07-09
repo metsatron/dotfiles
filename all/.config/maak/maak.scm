@@ -34,8 +34,12 @@
 (define (mk-guix-root cmd)
   (sh (string-append "make -f " HOME "/DotCortex/all/.mk/guix-root.mk " cmd)))
 
+;; Generic target runner. The root Makefile includes every all/.mk/*.mk fragment,
+;; so this resolves flatpak-*, plasmoid-*, kwin-borderless-* and icons-* alike.
+;; It previously hardcoded "-f flatpak.mk", which silently broke all 7 non-flatpak
+;; verbs routed through mk (plasmoid:{apply,diff,health,reload}, kwin-borderless:*).
 (define (mk cmd)
-  (sh (string-append "make -f " HOME "/DotCortex/all/.mk/flatpak.mk " cmd)))
+  (sh (string-append "make -C " HOME "/DotCortex " cmd)))
 
 (define (mk-appimage cmd)
   (let* ((HOME (or (getenv "HOME") ""))
