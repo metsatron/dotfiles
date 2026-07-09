@@ -1510,6 +1510,23 @@ fi
 log "swap-heal ritual complete."
 #+END_SRC
 
+* Recall embedder — T480s (Devuan / XDG autostart)
+The Recall RAG embedder is a =llama-server= process from the Guix =core= profile, serving =qwen3-embedding-0.6b-q8_0.gguf= on =127.0.0.1:3003=.  It is started by =FORGE/bin/recall embedder start=, which is idempotent (it exits 0 if the PID file names a live process) and detaches via =start_new_session=, so it survives the autostart shell exiting.
+
+T480s is Devuan/sysvinit with no systemd user units, so the session-scoped mechanism is XDG autostart — the same lane as =nfs-premount.desktop=.  Both =FORGE/bin/recall= and the model file live under =$HOME/mnt/x230=, which is an NFS mount from the X230, so the entry cannot assume the tree is present at login.  The loop below polls for the =recall= entrypoint (the test itself triggers the automount) and only then execs it, giving up quietly after two minutes rather than hanging the session.
+
+This starts the embedder only.  Ingest is deliberately not autostarted: =recall ingest= is a long CPU-bound job and running it unattended at login on a laptop would fight the user for cores on every boot.
+
+#+BEGIN_SRC conf :tangle t480s/.config/autostart/recall-embedder.desktop :tangle-mode (identity #o644) :mkdirp yes :comments no
+[Desktop Entry]
+Type=Application
+Name=Recall embedder
+Exec=bash -c 'for _ in $(seq 1 60); do if [ -x "$HOME/mnt/x230/HelmCortex/FORGE/bin/recall" ]; then exec "$HOME/mnt/x230/HelmCortex/FORGE/bin/recall" embedder start >/dev/null 2>&1; fi; sleep 2; done'
+Hidden=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true
+#+END_SRC
+
 * Agent Session Daemon
 Phase-2 telemetry foundation for agent sessions.
 
@@ -1519,6 +1536,417 @@ is the human-facing CLI after entering or creating a tmux session.
 =HelmCortex/ROOTS/DotRoot/agent-session/=. LOGS are notes/TODO storage, not a session
 source. The =HelmCortex/ROOTS/AgentRoot/session-index.json= (written by FORGE/bin/agent-session)
 is the cross-agent session truth; agent-sessiond reads it for summary counts only.
+
+** thread-triage
+Phase-0 Thread-Ledger evidence packet extractor. This is a read-only offline
+archaeology lane over normalized =.MASTER= markdown exports; it never writes
+under HelmCortex.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/thread-triage :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: thread-triage [OPTIONS]
+
+Emit Thread-Ledger Phase-0 evidence packets as JSONL on stdout.
+
+Options:
+  --month YYYY-MM      restrict to export paths containing /YYYY-MM/
+  --root PATH          HelmCortex root (default: ~/HelmCortex)
+  --ledger PATH        skip-list ledger path
+                       (default: ~/HelmCortex/ROOTS/AgentRoot/thread-ledger.json)
+  --include-skipped    emit packets even when the ledger says to skip
+  --limit N            stop after N discovered sessions
+  -h, --help           show this help
+EOF
+}
+
+need_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "thread-triage: python3 is required for JSONL emission" >&2
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+need_python
+python3 - "$@" <<'PY'
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+from datetime import datetime, timezone
+
+HEAD_SCAN_MAX_BYTES = 65536
+TAIL_SCAN_MAX_BYTES = 65536
+TURN_TRUNCATE_CHARS = 1500
+TERMINAL_SIGNAL_RE = re.compile(r"\b(commit|handoff|exit|done|shipped)\b", re.I)
+TURN_HEADER_RE = re.compile(r"^##(?: \[(\d+)\])? ([^\n]+?)\s*$", re.M)
+MID_LIST_RE = re.compile(r"(^|\n)\s*(?:[-*+]|\d+[.)])\s+\S[^\n]*\s*$")
+
+HARNESS_DIRS = {
+    "Claude": "claude",
+    "Codex": "codex",
+    "OpenCode": "opencode",
+    "Hermes": "hermes",
+    "Antigravity": "antigravity",
+}
+AGENT_LABELS = {
+    "CLAUDE", "CODEX", "OPENCODE", "HERMES", "ANTIGRAVITY", "ASSISTANT",
+    "AGENT", "SYSTEM",
+}
+FRONTMATTER_KEYS = {
+    "provider", "model", "session_id", "date", "source_utc", "end_date",
+    "cwd", "session_cwd", "workspace_path", "git_branch", "branch", "machine", "host",
+}
+
+
+def warn(msg):
+    print(f"thread-triage: WARN: {msg}", file=sys.stderr)
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--month")
+    ap.add_argument("--root", default=str(pathlib.Path.home() / "HelmCortex"))
+    ap.add_argument(
+        "--ledger",
+        default=str(pathlib.Path.home() / "HelmCortex/ROOTS/AgentRoot/thread-ledger.json"),
+    )
+    ap.add_argument("--include-skipped", action="store_true")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("-h", "--help", action="store_true")
+    ns, rest = ap.parse_known_args(argv)
+    if ns.help:
+        print("thread-triage: internal help dispatch error", file=sys.stderr)
+        sys.exit(0)
+    if rest:
+        warn(f"ignoring unknown arguments: {' '.join(rest)}")
+    if ns.month and not re.fullmatch(r"\d{4}-\d{2}", ns.month):
+        print("thread-triage: --month must be YYYY-MM", file=sys.stderr)
+        sys.exit(2)
+    return ns
+
+
+def read_head_bytes(path, max_bytes=HEAD_SCAN_MAX_BYTES):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(max_bytes)
+    except Exception as exc:
+        warn(f"{path}: head read failed: {exc}")
+        return b""
+
+
+def read_tail_bytes(path, max_bytes=TAIL_SCAN_MAX_BYTES):
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+        if size > max_bytes:
+            cut = data.find(b"\n")
+            if cut >= 0:
+                data = data[cut + 1:]
+        return data
+    except Exception as exc:
+        warn(f"{path}: tail read failed: {exc}")
+        return b""
+
+
+def decode(data):
+    return data.decode("utf-8", errors="replace")
+
+
+def iso_from_mtime(path):
+    try:
+        return (datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    except Exception:
+        return None
+
+
+def trunc(text, n=TURN_TRUNCATE_CHARS):
+    if text is None:
+        return None
+    text = re.sub(r"[ \t]+\n", "\n", text).strip()
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def machine_from_path(path):
+    parts = path.parts
+    if ".MASTER" in parts:
+        idx = parts.index(".MASTER")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
+def harness_from_path(path):
+    parts = path.parts
+    for raw, canonical in HARNESS_DIRS.items():
+        if raw in parts:
+            return canonical
+    return None
+
+
+def parse_frontmatter(head_text, path):
+    warnings = []
+    fm = {}
+    if not head_text.startswith("---\n"):
+        warnings.append("frontmatter missing from bounded head scan")
+        return fm, warnings
+    end = head_text.find("\n---", 4)
+    if end < 0:
+        warnings.append("frontmatter terminator missing from bounded head scan")
+        return fm, warnings
+    body = head_text[4:end]
+    current_key = None
+    for line in body.splitlines():
+        if not line.strip() or line.startswith("  - "):
+            continue
+        if line.startswith((" ", "\t")) and current_key:
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip()
+        if key not in FRONTMATTER_KEYS:
+            current_key = key
+            continue
+        val = val.strip()
+        if ((val.startswith('"') and val.endswith('"')) or
+                (val.startswith("'") and val.endswith("'"))):
+            val = val[1:-1]
+        fm[key] = val if val != "" else None
+        current_key = key
+    if "session_id" not in fm:
+        warnings.append("session_id missing from frontmatter")
+    if not (fm.get("cwd") or fm.get("session_cwd") or fm.get("workspace_path")):
+        warnings.append("cwd missing from frontmatter")
+    return fm, warnings
+
+
+def parse_turns(tail_text):
+    raw_matches = list(TURN_HEADER_RE.finditer(tail_text))
+    matches = []
+    for m in raw_matches:
+        probe = tail_text[m.end():].lstrip().splitlines()
+        first = probe[0].strip() if probe else ""
+        if first.startswith("<time ") or re.fullmatch(r"\*[^*]+\*", first):
+            matches.append(m)
+    turns = []
+    for idx, m in enumerate(matches):
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(tail_text)
+        label = m.group(2).strip()
+        body = tail_text[start:end].strip()
+        lines = body.splitlines()
+        if lines and (re.fullmatch(r"\*[^*]+\*", lines[0].strip()) or
+                      lines[0].strip().startswith("<time ")):
+            body = "\n".join(lines[1:]).strip()
+        role = "user" if label.upper() in ("USER", "METSATRON", "MÈTSÀTRON") else "agent"
+        turns.append({
+            "n": int(m.group(1) or (len(turns) + 1)),
+            "label": label,
+            "role": role,
+            "text": body,
+        })
+    return turns
+
+
+def abrupt_heuristics(turns, paths_by_cwd, path, date_text):
+    last = turns[-1] if turns else None
+    last_agent = next((t for t in reversed(turns) if t["role"] == "agent"), None)
+    last_agent_text = last_agent["text"].rstrip() if last_agent else ""
+    ends_mid_tool = False
+    if last_agent_text:
+        ends_mid_tool = (
+            last_agent_text.endswith(("**Bash**", "**Tool**", "**Skill**", "```")) or
+            last_agent_text.count("```") % 2 == 1
+        )
+    ends_mid_list = bool(last_agent_text and MID_LIST_RE.search(last_agent_text))
+    successor = None
+    cwd_key = str(path.parent)
+    siblings = paths_by_cwd.get(cwd_key, [])
+    try:
+        mtime = path.stat().st_mtime
+        for other in siblings:
+            if other == path:
+                continue
+            omt = other.stat().st_mtime
+            if 0 < omt - mtime <= 48 * 3600:
+                successor = str(other)
+                break
+    except Exception:
+        pass
+    return {
+        "last_turn_role": last["role"] if last else None,
+        "last_turn_is_agent": bool(last and last["role"] == "agent"),
+        "last_agent_ends_mid_tool_call": ends_mid_tool,
+        "last_agent_ends_mid_list": ends_mid_list,
+        "successor_same_cwd_within_48h": bool(successor),
+        "successor_path": successor,
+        "source_date": date_text,
+    }
+
+
+def bounded_hash(path, head_bytes, tail_bytes):
+    h = hashlib.sha256()
+    try:
+        size = path.stat().st_size
+    except Exception:
+        size = None
+    h.update(b"thread-triage.bounded.v1\0")
+    h.update(str(size).encode())
+    h.update(b"\0")
+    h.update(head_bytes)
+    h.update(b"\0")
+    h.update(tail_bytes)
+    return h.hexdigest()
+
+
+def ledger_skip_keys(path):
+    keys = set()
+    if not path.exists():
+        return keys
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warn(f"ledger read failed; treating as empty skip-list: {exc}")
+        return keys
+    entries = payload.get("sessions") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        warn("ledger has no list/sessions array; treating as empty skip-list")
+        return keys
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        verdict = item.get("verdict") or item.get("status") or item.get("human_verdict")
+        if not verdict or verdict == "unknown":
+            continue
+        h = item.get("hash") or item.get("source_hash") or item.get("bounded_hash")
+        mt = item.get("mtime") or item.get("source_mtime")
+        if h and mt:
+            keys.add((str(h), str(mt)))
+    return keys
+
+
+def discover(root, month):
+    logs = root / "LOGS"
+    for raw in HARNESS_DIRS:
+        base = logs / raw
+        if not base.exists():
+            warn(f"missing export corpus: {base}")
+            continue
+        for path in base.rglob("*.md"):
+            s = path.as_posix()
+            if "/.MASTER/" not in s:
+                continue
+            if "/.CHUNKED/" in s or "/.ROLLED/" in s:
+                continue
+            if month and f"/{month}/" not in s:
+                continue
+            yield path
+
+
+def packet_for(path, paths_by_cwd, skip_keys):
+    warnings = []
+    head_bytes = read_head_bytes(path)
+    tail_bytes = read_tail_bytes(path)
+    head_text = decode(head_bytes)
+    tail_text = decode(tail_bytes)
+    fm, fm_warnings = parse_frontmatter(head_text, path)
+    warnings.extend(fm_warnings)
+    turns = parse_turns(tail_text)
+    if not turns:
+        warnings.append("no turn headers found in bounded tail scan")
+    users = [t for t in turns if t["role"] == "user"]
+    agents = [t for t in turns if t["role"] == "agent"]
+    last_user = users[-1]["text"] if users else ""
+    stat = None
+    try:
+        stat = path.stat()
+    except Exception as exc:
+        warnings.append(f"stat failed: {exc}")
+    content_hash = bounded_hash(path, head_bytes, tail_bytes)
+    mtime = str(stat.st_mtime) if stat else ""
+    skipped = (content_hash, mtime) in skip_keys
+    machine = fm.get("machine") or fm.get("host") or machine_from_path(path)
+    cwd = fm.get("cwd") or fm.get("session_cwd") or fm.get("workspace_path")
+    git_branch = fm.get("git_branch") or fm.get("branch")
+    packet = {
+        "schema": "thread-triage.packet.v1",
+        "harness": harness_from_path(path),
+        "model": fm.get("model"),
+        "session_id": fm.get("session_id") or path.stem,
+        "date": fm.get("datetime") or fm.get("date") or fm.get("source_utc") or iso_from_mtime(path),
+        "cwd": cwd,
+        "machine": machine,
+        "git_branch": git_branch,
+        "source_path": str(path),
+        "source_mtime": mtime or None,
+        "source_size_bytes": stat.st_size if stat else None,
+        "source_hash": content_hash,
+        "source_hash_scheme": "sha256(head64k+tail64k+size)",
+        "skip_list": {
+            "ledger_match": skipped,
+            "matched_by": "source_hash+source_mtime" if skipped else None,
+        },
+        "last_user_turns": [
+            {"n": t["n"], "label": t["label"], "text": trunc(t["text"])}
+            for t in users[-3:]
+        ],
+        "last_agent_turn": (
+            {"n": agents[-1]["n"], "label": agents[-1]["label"], "text": trunc(agents[-1]["text"])}
+            if agents else None
+        ),
+        "terminal_signal": {
+            "regex": r"\b(commit|handoff|exit|done|shipped)\b",
+            "matched": bool(TERMINAL_SIGNAL_RE.search(last_user or "")),
+            "matches": sorted({m.group(1).lower() for m in TERMINAL_SIGNAL_RE.finditer(last_user or "")}),
+        },
+        "abrupt_end": abrupt_heuristics(turns, paths_by_cwd, path, fm.get("date")),
+        "warnings": warnings,
+    }
+    return packet
+
+
+def main(argv):
+    ns = parse_args(argv)
+    root = pathlib.Path(ns.root).expanduser()
+    ledger = pathlib.Path(ns.ledger).expanduser()
+    skip_keys = ledger_skip_keys(ledger)
+    paths = sorted(discover(root, ns.month))
+    if ns.limit:
+        paths = paths[: max(0, ns.limit)]
+    paths_by_cwd = {}
+    for p in paths:
+        paths_by_cwd.setdefault(str(p.parent), []).append(p)
+    for path in paths:
+        try:
+            packet = packet_for(path, paths_by_cwd, skip_keys)
+            if packet["skip_list"]["ledger_match"] and not ns.include_skipped:
+                continue
+            json.dump(packet, sys.stdout, ensure_ascii=False, sort_keys=True)
+            sys.stdout.write("\n")
+        except Exception as exc:
+            warn(f"{path}: packet extraction failed: {exc}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY
+#+END_SRC
 
 ** agent-sessiond
 #+BEGIN_SRC bash :tangle all/.local/bin/agent-sessiond :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
@@ -1530,12 +1958,15 @@ PROC_PATTERNS=(opencode opencode-telegram claude codex hermes pi-agent sapphire)
 
 usage() {
   cat <<'EOF'
-Usage: agent-sessiond <once|watch|status>
+Usage: agent-sessiond <once|watch|status|native-sample>
 
 Commands:
   once    collect one snapshot and write JSON atomically
   watch   collect repeatedly every AGENT_SESSIOND_INTERVAL seconds, default 10
   status  print a summary of the latest local state snapshot
+  native-sample <claude|codex> [N] [--json]
+          print the N most-recently-modified native sessions
+          for the given agent (default N=5)
 EOF
 }
 
@@ -1885,28 +2316,55 @@ def _claude_model_probe(pid_str, session_id):
 
 
 # ── codex model probe (read logs_2.sqlite) ───────────────────────────────────
-_CODEX_LOG_DB   = home / ".codex/logs_2.sqlite"
-_CODEX_MODEL_RE = re.compile(r'\bmodel=([A-Za-z0-9._:/-]+)')
+# NOTE: logs_2.sqlite can be multi-GB / tens of millions of rows. A per-PID
+# query (WHERE process_uuid LIKE 'pid:<pid>:%') forces SQLite to walk the
+# ts index across the whole table looking for LIKE matches, which can take
+# minutes per PID with several live codex processes. Instead we run ONE
+# bounded query per collection cycle (ts >= now - horizon, LIMIT N), cache
+# the most-recent match per pid in a module-level dict, and turn
+# _codex_model_probe() into a plain dict lookup. The ts lower bound lets
+# the descending index scan terminate at the horizon regardless of how
+# many rows match feedback_log_body LIKE '%model=%'.
+_CODEX_LOG_DB       = home / ".codex/logs_2.sqlite"
+_CODEX_MODEL_RE     = re.compile(r'\bmodel=([A-Za-z0-9._:/-]+)')
+_CODEX_PID_RE       = re.compile(r'^pid:(\d+):')
+_CODEX_PROBE_HORIZON_S = 48 * 3600
+_CODEX_PROBE_LIMIT     = 2000
+_codex_model_by_pid    = None  # populated on first probe of this cycle
 
-def _codex_model_probe(pid_str):
-    """Extract most-recent model for this PID from Codex logs_2.sqlite."""
+def _codex_model_probe_scan():
+    """One bounded pass over logs_2.sqlite, cached per collection cycle.
+
+    Returns {pid_str: extra_dict} built from the most-recent (ts DESC)
+    matching row per pid within the horizon window."""
+    result = {}
     if not _CODEX_LOG_DB.exists():
-        return {}
+        return result
     try:
-        conn = sqlite3.connect(f"file:{_CODEX_LOG_DB}?mode=ro", uri=True)
-        rows = conn.execute(
-            "SELECT feedback_log_body, ts FROM logs "
-            "WHERE process_uuid LIKE ? AND feedback_log_body LIKE '%model=%' "
-            "ORDER BY ts DESC, ts_nanos DESC LIMIT 50",
-            (f"pid:{pid_str}:%",)
-        ).fetchall()
-        conn.close()
-        for (body, ts) in rows:
-            if not body:
+        conn = sqlite3.connect(f"file:{_CODEX_LOG_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            horizon = time.time() - _CODEX_PROBE_HORIZON_S
+            rows = conn.execute(
+                "SELECT process_uuid, feedback_log_body, ts FROM logs "
+                "WHERE ts >= ? AND feedback_log_body LIKE '%model=%' "
+                "ORDER BY ts DESC, ts_nanos DESC LIMIT ?",
+                (horizon, _CODEX_PROBE_LIMIT)
+            ).fetchall()
+        finally:
+            conn.close()
+        for (process_uuid, body, ts) in rows:
+            if not body or not process_uuid:
                 continue
+            pm = _CODEX_PID_RE.match(process_uuid)
+            if not pm:
+                continue
+            pid_str = pm.group(1)
+            if pid_str in result:
+                continue  # already have the most-recent (rows are ts DESC)
             mm = _CODEX_MODEL_RE.search(body)
             if mm:
-                return {
+                result[pid_str] = {
                     "provider":              "openai",
                     "provider_source":       "codex_log",
                     "model":                 mm.group(1),
@@ -1920,8 +2378,18 @@ def _codex_model_probe(pid_str):
                     "metadata_ts":           float(ts) if ts else None,
                 }
     except Exception:
-        pass
-    return {}
+        return {}
+    return result
+
+def _codex_model_probe(pid_str):
+    """Extract most-recent model for this PID from Codex logs_2.sqlite.
+
+    Backed by a single bounded scan per collection cycle (see
+    _codex_model_probe_scan) instead of a per-PID query."""
+    global _codex_model_by_pid
+    if _codex_model_by_pid is None:
+        _codex_model_by_pid = _codex_model_probe_scan()
+    return _codex_model_by_pid.get(str(pid_str), {})
 
 
 # ── capabilities (binary presence) ───────────────────────────────────────────
@@ -2483,6 +2951,340 @@ for w in warns:
 PY
 }
 
+cmd_native_sample() {
+  need_python
+  local agent="" n=5 json_flag=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json_flag=1 ;;
+      claude|codex) agent="$arg" ;;
+      ''|*[!0-9]*) ;;
+      *) n="$arg" ;;
+    esac
+  done
+  if [ -z "$agent" ]; then
+    echo "agent-sessiond: native-sample requires an agent: claude|codex" >&2
+    usage >&2
+    exit 2
+  fi
+
+  python3 - "$agent" "$n" "$json_flag" <<'PY'
+import json
+import pathlib
+import re
+import sys
+from datetime import datetime, timezone
+
+agent, n_arg, json_flag = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+try:
+    N = max(1, int(n_arg))
+except ValueError:
+    N = 5
+
+home = pathlib.Path.home()
+warnings_global = []
+
+HEAD_SCAN_MAX_BYTES = 65536      # bounded head read -- never full-file parse
+TAIL_SCAN_MAX_BYTES = 65536      # bounded tail read
+EXACT_COUNT_MAX_BYTES = 300_000  # below this, count lines exactly; above, estimate
+
+
+def iso_from_epoch(ts):
+    try:
+        return (datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                 .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    except Exception:
+        return None
+
+
+def iso_from_mtime(path):
+    try:
+        return iso_from_epoch(path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def read_head(path, max_bytes=HEAD_SCAN_MAX_BYTES):
+    """Read a bounded prefix; never seeks past max_bytes."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes)
+        return data.decode(errors="replace")
+    except Exception as exc:
+        warnings_global.append(f"{path.name}: head read failed: {exc}")
+        return ""
+
+
+def read_tail(path, max_bytes=TAIL_SCAN_MAX_BYTES):
+    """Read a bounded suffix; drops a possibly-truncated first partial line."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+        text = data.decode(errors="replace")
+        lines = text.split("\n")
+        if size > max_bytes and lines:
+            lines = lines[1:]
+        return lines
+    except Exception as exc:
+        warnings_global.append(f"{path.name}: tail read failed: {exc}")
+        return []
+
+
+def iter_json_lines(lines):
+    """Yield parsed dicts, skipping unparseable or empty lines silently."""
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def estimate_message_count(path, tail_lines):
+    """Exact line count for small files; tail-density estimate for large ones."""
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return None, "unknown"
+    if size <= EXACT_COUNT_MAX_BYTES:
+        try:
+            with open(path, "rb") as fh:
+                count = sum(1 for _ in fh)
+            return count, "exact"
+        except Exception:
+            return None, "unknown"
+    sample = [l for l in tail_lines if l.strip()]
+    if not sample:
+        return None, "unknown"
+    tail_bytes = sum(len(l.encode(errors="replace")) + 1 for l in sample)
+    if tail_bytes <= 0:
+        return None, "unknown"
+    avg_len = tail_bytes / len(sample)
+    if avg_len <= 0:
+        return None, "unknown"
+    return round(size / avg_len), "estimated_from_tail_sample"
+
+
+def truncate(s, n=140):
+    if not s:
+        return s
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# -- claude sample -------------------------------------------------------------
+def sample_claude(path):
+    warnings = []
+    session_id = path.stem
+
+    cwd = None
+    title = None
+    git_branch = None
+    for obj in iter_json_lines(read_head(path).splitlines()):
+        if cwd is None and isinstance(obj.get("cwd"), str):
+            cwd = obj["cwd"]
+        if git_branch is None and isinstance(obj.get("gitBranch"), str):
+            git_branch = obj["gitBranch"]
+        if title is None and obj.get("type") == "user":
+            msg = obj.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                title = content
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        title = block.get("text")
+                        break
+        if cwd and title and git_branch:
+            break
+    if cwd is None:
+        warnings.append("no cwd found in bounded head scan")
+    if title is None:
+        warnings.append("no first user message found in bounded head scan")
+
+    tail_lines = read_tail(path)
+    model = None
+    updated_at = None
+    for obj in reversed(list(iter_json_lines(tail_lines))):
+        if updated_at is None and isinstance(obj.get("timestamp"), str):
+            updated_at = obj["timestamp"]
+        if git_branch is None and isinstance(obj.get("gitBranch"), str):
+            git_branch = obj["gitBranch"]
+        if model is None:
+            msg = obj.get("message") or {}
+            if msg.get("role") == "assistant" and msg.get("model") and msg.get("usage"):
+                model = msg["model"]
+        if model and updated_at:
+            break
+    if model is None:
+        warnings.append("no assistant model found in bounded tail scan")
+    if updated_at is None:
+        updated_at = iso_from_mtime(path)
+        warnings.append("no timestamp in tail scan; fell back to file mtime")
+
+    msg_count, msg_count_source = estimate_message_count(path, tail_lines)
+
+    return {
+        "agent": "claude",
+        "session_id": session_id,
+        "cwd": cwd,
+        "model": model,
+        "git_branch": git_branch,
+        "title": truncate(title),
+        "updated_at": updated_at,
+        "message_count": msg_count,
+        "message_count_source": msg_count_source,
+        "resume_cmd": f"claude --resume {session_id}",
+        "source_path": str(path),
+        "size_bytes": path.stat().st_size if path.exists() else None,
+        "warnings": warnings,
+    }
+
+
+# -- codex sample ----------------------------------------------------------------
+_CODEX_ID_FROM_NAME = re.compile(r"([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$")
+
+def sample_codex(path):
+    warnings = []
+    session_id = None
+    cwd = None
+    git_branch = None
+    cli_version = None
+
+    head_text = read_head(path)
+    head_lines = head_text.splitlines()
+    if head_lines:
+        try:
+            first = json.loads(head_lines[0])
+            if first.get("type") == "session_meta":
+                payload = first.get("payload") or {}
+                session_id = payload.get("session_id") or payload.get("id")
+                cwd = payload.get("cwd")
+                cli_version = payload.get("cli_version")
+                git_branch = (payload.get("git") or {}).get("branch")
+        except Exception as exc:
+            warnings.append(f"session_meta parse failed: {exc}")
+    if session_id is None:
+        m = _CODEX_ID_FROM_NAME.search(path.name)
+        session_id = m.group(1) if m else path.stem
+        warnings.append("session_id fell back to filename parse")
+    if cwd is None:
+        warnings.append("no cwd found in session_meta head line")
+
+    tail_lines = read_tail(path)
+    model = None
+    title = None
+    updated_at = None
+    for obj in reversed(list(iter_json_lines(tail_lines))):
+        if updated_at is None and isinstance(obj.get("timestamp"), str):
+            updated_at = obj["timestamp"]
+        if model is None and obj.get("type") == "turn_context":
+            payload = obj.get("payload") or {}
+            if isinstance(payload.get("model"), str):
+                model = payload["model"]
+        if title is None and obj.get("type") == "event_msg":
+            payload = obj.get("payload") or {}
+            if payload.get("type") == "task_complete" and payload.get("last_agent_message"):
+                title = payload["last_agent_message"]
+        if model and title and updated_at:
+            break
+    if model is None:
+        warnings.append("no model found in bounded tail scan (turn_context)")
+    if title is None:
+        warnings.append("no task_complete message found in bounded tail scan")
+    if updated_at is None:
+        updated_at = iso_from_mtime(path)
+        warnings.append("no timestamp in tail scan; fell back to file mtime")
+
+    msg_count, msg_count_source = estimate_message_count(path, tail_lines)
+
+    return {
+        "agent": "codex",
+        "session_id": session_id,
+        "cwd": cwd,
+        "model": model,
+        "git_branch": git_branch,
+        "cli_version": cli_version,
+        "title": truncate(title),
+        "updated_at": updated_at,
+        "message_count": msg_count,
+        "message_count_source": msg_count_source,
+        "resume_cmd": f"codex resume {session_id}",
+        "source_path": str(path),
+        "size_bytes": path.stat().st_size if path.exists() else None,
+        "warnings": warnings,
+    }
+
+
+# -- file discovery --------------------------------------------------------------
+def newest_files(root, pattern, n, exclude_substr=None):
+    if not root.exists():
+        return []
+    files = []
+    for f in root.rglob(pattern):
+        if exclude_substr and exclude_substr in f.as_posix():
+            continue
+        try:
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    files.sort(key=lambda t: t[0], reverse=True)
+    return [f for _, f in files[:n]]
+
+
+samples = []
+if agent == "claude":
+    root = home / ".claude/projects"
+    for f in newest_files(root, "*.jsonl", N, exclude_substr="/subagents/"):
+        try:
+            samples.append(sample_claude(f))
+        except Exception as exc:
+            warnings_global.append(f"{f}: sample_claude failed: {exc}")
+elif agent == "codex":
+    root = home / ".codex/sessions"
+    for f in newest_files(root, "*.jsonl", N):
+        try:
+            samples.append(sample_codex(f))
+        except Exception as exc:
+            warnings_global.append(f"{f}: sample_codex failed: {exc}")
+else:
+    print(f"agent-sessiond: unknown agent '{agent}' (expected claude|codex)", file=sys.stderr)
+    sys.exit(2)
+
+if json_flag:
+    out = {
+        "schema": "agent-sessiond.native-sample.v1",
+        "agent": agent,
+        "samples": samples,
+        "warnings": warnings_global,
+    }
+    json.dump(out, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+else:
+    print(f"native-sample: {agent}  ({len(samples)} of requested {N})")
+    for s in samples:
+        sid = s["session_id"][:12] if s.get("session_id") else "?"
+        model = s.get("model") or "?"
+        cwd = s.get("cwd") or "?"
+        updated = s.get("updated_at") or "?"
+        title = s.get("title") or ""
+        print(f"  {sid}  {updated}  {model:<16}  {cwd}")
+        if title:
+            print(f"      {title}")
+        print(f"      resume: {s['resume_cmd']}")
+        for w in s.get("warnings", []):
+            print(f"      WARN: {w}")
+    for w in warnings_global:
+        print(f"WARN: {w}")
+PY
+}
+
 cmd="${1:-status}"
 case "$cmd" in
   once)
@@ -2496,6 +3298,10 @@ case "$cmd" in
     ;;
   status)
     print_status
+    ;;
+  native-sample)
+    shift
+    cmd_native_sample "$@"
     ;;
   -h|--help|help)
     usage
@@ -2622,7 +3428,7 @@ Implementation phases: 2M non-destructive actions · 2N curses TUI · 2O destruc
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
-_DEFAULT_STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/DotCortex/ROOTS/DotRoot/agent-session}"
+_DEFAULT_STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/HelmCortex/ROOTS/DotRoot/agent-session}"
 if [ -n "${AGENT_TOP_STATE+x}" ]; then
   AGENT_TOP_STATE_EXPLICIT=1
 else
@@ -2634,7 +3440,7 @@ else
   export AGENT_TOP_STATE="${AGENT_SESSIOND_STATE:-${_DEFAULT_STATE_DIR}/state.latest.json}"
 fi
 export AGENT_TOP_STATE_DIR="${AGENT_TOP_STATE_DIR:-${_DEFAULT_STATE_DIR}}"
-export AGENT_TOP_EXTRA_DIRS="${AGENT_TOP_EXTRA_DIRS:-${HOME}/mnt/x230/DotCortex/ROOTS/DotRoot/agent-session}"
+export AGENT_TOP_EXTRA_DIRS="${AGENT_TOP_EXTRA_DIRS:-${HOME}/mnt/x230/HelmCortex/ROOTS/DotRoot/agent-session}"
 REFRESH_SECS="${AGENT_TOP_REFRESH:-5}"
 AGENT_TOP_RELOAD_INTERVAL="${AGENT_TOP_RELOAD_INTERVAL:-2}"
 AGENT_TOP_LOCAL_REFRESH_INTERVAL="${AGENT_TOP_LOCAL_REFRESH_INTERVAL:-15}"
@@ -2724,7 +3530,7 @@ INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", os.path.expanduser("~/HelmCortex/
 SHOW_ALL   = "$show_all" == "true"
 ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
 STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
-    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
 EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 
 BOLD = "\033[1m"
@@ -3087,7 +3893,7 @@ run_refresh() {
       _remote_host="$(timeout 8 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 'hostname 2>/dev/null || echo unknown')"
       local _remote_state_json
       _remote_state_json="$(timeout 45 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 "sh -c 'agent-sessiond once >/dev/null 2>&1; \
-        cat ~/DotCortex/ROOTS/DotRoot/agent-session/state.${_remote_host}.json' 2>/dev/null")"
+        cat ~/HelmCortex/ROOTS/DotRoot/agent-session/state.${_remote_host}.json' 2>/dev/null")"
       if [ -n "$_remote_state_json" ]; then
         printf '%s' "$_remote_state_json" \
           > "${AGENT_TOP_STATE_DIR}/state.${_remote_host}.json"
@@ -3106,7 +3912,7 @@ run_hosts() {
 import datetime, json, os, socket
 
 STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
-    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
 EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 
 BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"; YLW = "\033[33m"; RED = "\033[31m"; RST = "\033[0m"
@@ -3250,7 +4056,7 @@ run_watch() {
       return
     fi
     (
-      _json="$(timeout 45 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 "sh -c 'agent-sessiond once >/dev/null 2>&1; cat ~/DotCortex/ROOTS/DotRoot/agent-session/state.\$(hostname).json'" 2>/dev/null || true)"
+      _json="$(timeout 45 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 "sh -c 'agent-sessiond once >/dev/null 2>&1; cat ~/HelmCortex/ROOTS/DotRoot/agent-session/state.\$(hostname).json'" 2>/dev/null || true)"
       [ -n "$_json" ] || exit 1
       if [ -n "$_json" ]; then
         _host="$(printf '%s' "$_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("host",""))' 2>/dev/null || true)"
@@ -3300,7 +4106,7 @@ import json, os, re, shlex, socket, subprocess, sys
 TARGET     = sys.argv[1]
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
-    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
 EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
@@ -3500,7 +4306,7 @@ TARGET     = sys.argv[1]
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
 STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
-    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
 EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
 
@@ -3690,7 +4496,7 @@ TARGET     = sys.argv[1]
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
 STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
-    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
 EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
 
@@ -3955,7 +4761,7 @@ NO_REFRESH     = (sys.argv[4] if len(sys.argv) > 4 else "false") == "true"
 STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
 INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
 STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
-    "~/DotCortex/ROOTS/DotRoot/agent-session"))
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
 EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
 RELOAD_INTERVAL = float(os.environ.get("AGENT_TOP_RELOAD_INTERVAL", "2") or "2")
 LOCAL_REFRESH_INTERVAL = float(os.environ.get("AGENT_TOP_LOCAL_REFRESH_INTERVAL", "15") or "15")
@@ -4417,7 +5223,7 @@ class TUI:
                 ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
                  "x230", "sh", "-c",
                  "agent-sessiond once >/dev/null 2>&1; "
-                 "cat ~/DotCortex/ROOTS/DotRoot/agent-session/state.$(hostname).json"],
+                 "cat ~/HelmCortex/ROOTS/DotRoot/agent-session/state.$(hostname).json"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
             )
@@ -5172,4 +5978,133 @@ sessions-top:
 sessions-top-all:
 | @chmod +x $(AGENT_TOP) 2>/dev/null || true
 | $(AGENT_TOP) once --all
+#+END_SRC
+
+* Lid Switch Fix — T480s (elogind + acpid)
+T480s runs SLiM + elogind + xfce4-power-manager. By default
+xfce4-power-manager sets =logind-handle-lid-switch=false=, meaning it tries
+to handle the lid switch itself over a D-Bus call to
+=org.freedesktop.login1=. That connection has been observed to die
+(=xfce4-power-manager: Error: The connection is closed= in
+=~/.xsession-errors=) and silently fail every lid-close action afterward —
+screen stays lit all night, sometimes with a "couldn't do it" popup. SLiM
+also leaves the graphical session mis-classified (=Class=greeter=) since it
+predates logind session-class transitions, and its lack of a clean
+greeter→user handoff correlates with zombie sessions accumulating in
+=State=closing= in =loginctl list-sessions=.
+
+First pass: let elogind own the lid switch natively via a config drop-in
+(=HandleLidSwitch=suspend=) and flip =logind-handle-lid-switch= to =true= in
+xfconf so xfce4-power-manager steps out of the way. This fixed the
+stuck-on-screen symptom but overshot the actual ask — =suspend= is a real
+ACPI suspend-to-RAM, not a display blank. It froze every running process on
+lid close (background agents included) and stopped audio playback, both
+resuming only on lid open. The only thing actually wanted was the screen
+turning off.
+
+Second pass: flip elogind's action to =ignore= (logind takes zero action on
+the lid switch — no suspend, no lock, nothing) and give the lid switch
+exclusively to acpid, which was already running on this box with no lid
+rule installed. acpid's action is DPMS-only (=xset dpms force off/on=
+against the real Xorg server), which blanks the monitor without touching
+any process. This does not double up with elogind: acpid listens on the
+ACPI netlink event stream independently of whatever evdev handling logind
+does, so both can hold a lid rule at once — the fix is which *action* each
+one takes on it (elogind: none; acpid: DPMS blank), not deciding which
+daemon gets the event.
+
+** logind drop-in
+#+BEGIN_SRC conf :tangle t480s/.local/share/dotcortex/power/logind-lid.conf :padline no :comments none
+[Login]
+HandleLidSwitch=ignore
+HandleLidSwitchExternalPower=ignore
+#+END_SRC
+
+** acpid lid event
+This box's acpid keeps action scripts flat in =/etc/acpi/= (alongside the
+stock =powerbtn-acpi-support.sh=), not under an =/etc/acpi/actions/=
+subdirectory — that's an Arch-style layout this Devuan package doesn't use.
+#+BEGIN_SRC conf :tangle t480s/.local/share/dotcortex/power/acpi-lid.event :padline no :comments none
+event=button/lid.*
+action=/etc/acpi/dotcortex-lid-dpms.sh
+#+END_SRC
+
+** acpid lid action — DPMS blank/unblank only
+Reads the authoritative lid state from =/proc/acpi/button/lid= rather than
+trusting the acpi event string (its close/open payload format is not
+consistent across kernel versions). Runs as root (acpid's own user), so it
+talks to the real Xorg server via SLiM's own auth cookie rather than any
+per-user =~/.Xauthority= — this keeps it independent of which desktop
+session (host or a nested sanctuary Xephyr/Xnest one) happens to be
+focused.
+#+BEGIN_SRC bash :tangle t480s/.local/share/dotcortex/power/dotcortex-lid-dpms.sh :shebang "#!/bin/sh" :tangle-mode (identity #o755)
+export DISPLAY=:0
+export XAUTHORITY=/var/run/slim.auth
+
+state="$(cat /proc/acpi/button/lid/*/state 2>/dev/null | awk '{print $NF}')"
+logger -t dotcortex-lid "invoked, lid state=${state:-unknown}"
+
+case "$state" in
+  closed) xset dpms force off; logger -t dotcortex-lid "dpms force off rc=$?" ;;
+  open)   xset dpms force on;  logger -t dotcortex-lid "dpms force on rc=$?" ;;
+  *)      logger -t dotcortex-lid "unrecognized lid state '$state', no DPMS action taken" ;;
+esac
+#+END_SRC
+
+** Setup script
+Idempotent — safe to re-run. Installs the elogind drop-in and the acpid lid
+event+action pair, restarts elogind and acpid, sets the xfconf key so
+xfce4-power-manager stops fighting for the lid switch, and clears any
+zombie =closing= sessions left over from prior SLiM/elogind session-handoff
+hiccups.
+
+#+BEGIN_SRC bash :tangle t480s/.local/bin/t480s-lid-fix-setup :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+POWER_DIR="${HOME}/.local/share/dotcortex/power"
+LOGIND_SRC="${POWER_DIR}/logind-lid.conf"
+LOGIND_DEST=/etc/elogind/logind.conf.d/dotcortex-lid.conf
+ACPI_EVENT_SRC="${POWER_DIR}/acpi-lid.event"
+ACPI_EVENT_DEST=/etc/acpi/events/dotcortex-lid
+ACPI_ACTION_SRC="${POWER_DIR}/dotcortex-lid-dpms.sh"
+ACPI_ACTION_DEST=/etc/acpi/dotcortex-lid-dpms.sh
+
+die() { printf 't480s-lid-fix-setup: %s\n' "$*" >&2; exit 1; }
+
+for f in "$LOGIND_SRC" "$ACPI_EVENT_SRC" "$ACPI_ACTION_SRC"; do
+  [ -f "$f" ] || die "missing $f — run: tangle-one services.org && loom stow:t480s"
+done
+
+echo "[1/5] elogind drop-in (lid switch: ignore)..."
+sudo install -d -m 755 /etc/elogind/logind.conf.d
+sudo install -m 644 "$LOGIND_SRC" "$LOGIND_DEST"
+
+echo "[2/5] acpid lid event + DPMS-only action..."
+sudo install -m 644 "$ACPI_EVENT_SRC" "$ACPI_EVENT_DEST"
+sudo install -m 755 "$ACPI_ACTION_SRC" "$ACPI_ACTION_DEST"
+
+echo "[3/5] xfconf: step xfce4-power-manager out of the lid switch..."
+XFCE_PM_PID="$(pgrep -u "$USER" -f '(^|/)xfce4-power-manager$' | head -n1 || true)"
+if [ -n "$XFCE_PM_PID" ] && [ -r "/proc/${XFCE_PM_PID}/environ" ]; then
+  DBUS_SESSION_BUS_ADDRESS="$(tr '\0' '\n' < "/proc/${XFCE_PM_PID}/environ" | sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p')"
+  export DBUS_SESSION_BUS_ADDRESS
+  xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -n -t bool -s true 2>/dev/null \
+    || xfconf-query -c xfce4-power-manager -p /xfce4-power-manager/logind-handle-lid-switch -s true
+else
+  echo "no running xfce4-power-manager for this user — nothing to step out of the way (fine on an IceWM-only session)"
+fi
+
+echo "[4/5] clearing zombie 'closing' sessions..."
+loginctl list-sessions --no-legend | awk '$6=="closing"{print $1}' | while read -r sid; do
+  sudo loginctl terminate-session "$sid" 2>/dev/null || true
+done
+
+echo "[5/5] restarting elogind and acpid..."
+sudo service elogind restart
+sudo service acpid restart
+
+echo
+echo "=== T480s lid-switch fix applied ==="
+echo "Test by physically closing the lid — this is the only real verification."
+echo "Expect: screen off within ~1s, everything (audio, background agents) keeps running, screen back on when reopened."
 #+END_SRC

@@ -162,3 +162,4 @@ include $(HOME)/DotCortex/all/.mk/bots.mk
 include $(HOME)/DotCortex/all/.mk/sessions.mk
 include $(HOME)/DotCortex/all/.mk/termux.mk
 include $(HOME)/DotCortex/all/.mk/plasmoid.mk
+include $(HOME)/DotCortex/all/.mk/xfce-desktopmenu.mk

@@ -26,6 +26,8 @@
    "distrobox"             ; Virtual Habitat control plane — sanctuary-exec and launchers require it
    "fastfetch" "wfetch" "uwufetch" "macchina"
    "rofi"
+   "clipmenu" "clipnotify" "xsel"   ; rofi clipboard-history mode (Super+z): clipmenud daemon + xsel backend
+   "darkman"         ; portal Settings backend for org.freedesktop.appearance color-scheme -- workaround for a xdg-desktop-portal-gtk 1.15.3 bug that always answers color-scheme=0 regardless of dconf state
    ;; "kitty"
    "deskflow"
    "gimp" "inkscape" "birdtray" "icedove" "gnome-boxes"
@@ -35,6 +37,7 @@
    "appmenu-gtk-module"
    "cdemu-client" "cdemu-daemon"
    "node"
+   "llama-cpp"
 
    "python"
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly"

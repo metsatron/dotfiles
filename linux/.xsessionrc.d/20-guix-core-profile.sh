@@ -9,6 +9,21 @@ if [ -r "$GUIX_PROFILE/etc/profile" ]; then
   . "$GUIX_PROFILE/etc/profile"
 fi
 
+# Guix's glibc finds locale data only via GUIX_LOCPATH. The profile's own
+# etc/profile does NOT export it, and the X session never sets it, so a
+# Guix binary launched from a keyboard shortcut or autostart entry sees
+# LANG=en_US.UTF-8 with no locale data behind it. Two failure modes follow,
+# and both were observed: rofi calls setlocale(), fails, and exits 1 (every
+# rofi shortcut silently dead); or, with LANG also unset, it starts in the C
+# locale, where fontconfig scores Noto Color Emoji below Symbola and colour
+# emoji degrade into outline glyphs and tofu. An interactive zsh escapes both
+# because .zshenv sets GUIX_LOCPATH -- which is why `rofi -dmenu` from a
+# terminal always worked while the identical shortcut did not.
+if [ -d "$GUIX_PROFILE/lib/locale" ]; then
+  GUIX_LOCPATH="$GUIX_PROFILE/lib/locale"
+  export GUIX_LOCPATH
+fi
+
 add_xdg_data_dir() {
   dir="$1"
   [ -d "$dir" ] || return 0
@@ -34,6 +49,16 @@ for profile in "$HOME/.guix-profile" "$HOME"/.guix-extra-profiles/*/*; do
   [ -d "$profile" ] || continue
   case "$profile" in
     *-link) continue ;;
+    # Room and sanctuary profiles belong to their own rooms/containers, which
+    # source them explicitly. Adding their share/ to the HOST session's
+    # XDG_DATA_DIRS ranks their .desktop files ABOVE /usr/share, so a Guix build
+    # silently shadows the Debian app -- its Exec= is an absolute /gnu/store path,
+    # so PATH never even comes into it. A Guix GTK app resolves modules and themes
+    # from the Guix store, so it cannot load Debian's appmenu-gtk-module and loses
+    # the global menu, and falls back to Adwaita/CSD instead of the host GTK theme.
+    # This is exactly what broke pluma's global menu (room-gaming ships pluma).
+    # Rooms stay out of the host session.
+    "$HOME"/.guix-extra-profiles/room-*|"$HOME"/.guix-extra-profiles/sanctuary-*) continue ;;
   esac
   add_xdg_data_dir "$profile/share"
 done
