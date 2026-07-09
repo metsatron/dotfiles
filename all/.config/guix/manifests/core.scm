@@ -42,6 +42,7 @@
    "python"
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly"
    "python-send2trash" "python-websockets" "python-unidecode" "python-wheel"
+   "python-pillow"   ; ranger's kitty image-preview method imports PIL under ranger's own guix python — not propagated by the ranger package (verified: guix show ranger has no pillow dependency, and testing ranger's actual interpreter with its own GUIX_PYTHONPATH raised ModuleNotFoundError)
 
    "smem"
 
