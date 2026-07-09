@@ -1,0 +1,244 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CANARY_VERSION="1.0.0"
+
+# ---- defaults ----
+MODEL="claude-sonnet-5"
+LANE="claude"
+MODE="both"
+LEDGER_OVERRIDE=""
+TIMEOUT_SECS=120
+
+usage() {
+  cat <<'EOF'
+canary - model-degradation probe
+
+Runs a fixed set of reasoning probes against an LLM CLI and grades the answers
+deterministically (grep/string-match in code, no LLM judging an LLM). Detects
+day-to-day serving degradation at session start so work is routed accordingly.
+
+Usage:
+  canary [--model MODEL] [--lane LANE] [--mode bare|harnessed|both] [--ledger PATH]
+  canary -h | --help
+
+Options:
+  --model MODEL   Model id to probe (default: claude-sonnet-5)
+  --lane LANE     CLI lane to drive (default: claude; codex/opencode reserved)
+  --mode MODE     bare (no project context), harnessed (repo cwd), or both (default)
+  --ledger PATH   JSONL ledger path (default: $CANARY_LEDGER, else
+                  ${XDG_STATE_HOME:-$HOME/.local/state}/canary/ledger.jsonl)
+
+Verdict / exit code:
+  GREEN (0)  all probes pass  - normal judgment work
+  AMBER (1)  one probe fails  - mechanical, tightly-briefed tasks only
+  RED   (2)  two or more fail - no judgment work on this model today
+EOF
+}
+
+# ---- arg parse (no side effects before this point) ----
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --model)   MODEL="${2:?--model needs a value}"; shift 2 ;;
+    --lane)    LANE="${2:?--lane needs a value}"; shift 2 ;;
+    --mode)    MODE="${2:?--mode needs a value}"; shift 2 ;;
+    --ledger)  LEDGER_OVERRIDE="${2:?--ledger needs a value}"; shift 2 ;;
+    *) echo "canary: unknown argument: $1" >&2; exit 64 ;;
+  esac
+done
+
+case "$MODE" in bare|harnessed|both) ;; *) echo "canary: invalid --mode: $MODE" >&2; exit 64 ;; esac
+
+# ---- dependency check ----
+for dep in jq timeout; do
+  command -v "$dep" >/dev/null 2>&1 || { echo "canary: required tool '$dep' not found on PATH" >&2; exit 70; }
+done
+
+# ---- lane resolution (extensible; claude only for now) ----
+case "$LANE" in
+  claude)
+    LANE_BIN="$(command -v claude 2>/dev/null || true)"
+    [ -n "$LANE_BIN" ] || { echo "canary: lane 'claude' binary not found on PATH" >&2; exit 70; }
+    BIN_VERSION="$("$LANE_BIN" --version 2>/dev/null | head -n1 || true)"
+    ;;
+  *) echo "canary: unsupported --lane: $LANE (supported: claude)" >&2; exit 64 ;;
+esac
+
+# ---- ledger path ----
+if [ -n "$LEDGER_OVERRIDE" ]; then
+  LEDGER="$LEDGER_OVERRIDE"
+else
+  LEDGER="${CANARY_LEDGER:-${XDG_STATE_HOME:-$HOME/.local/state}/canary/ledger.jsonl}"
+fi
+mkdir -p "$(dirname "$LEDGER")"
+
+HOSTNAME_VAL="$(hostname 2>/dev/null || echo unknown)"
+
+# ---- probe data ----
+# Grading semantics per probe:
+#   REQUIRED_<id> : newline-separated regexes; ALL must match (case-insensitive).
+#   FORBIDDEN_<id>: newline-separated regexes; NONE may match.
+#   EXACT_<id>    : if set, strict full-string match after whitespace trim
+#                   (overrides required/forbidden).
+#   FIRSTN_<id>   : if set, required regexes are matched only against the first
+#                   N chars of the (newline-flattened) answer.
+PROBE_IDS="repo-shape checkpoint-law format-fidelity boundary-law"
+
+PROMPT_repo_shape="In a literate dotfiles repo where org files tangle to stow overlays, a newly adopted app's config file in ~/.config needs a setting changed. What is the correct procedure? Answer in two or three sentences."
+REQUIRED_repo_shape='\borg\b
+tangle
+stow'
+FORBIDDEN_repo_shape='(you|just|simply|should) (directly )?(edit|modify|change) (the )?(live |config |target )?file (directly|in[- ]?place)'
+
+PROMPT_checkpoint_law="You are about to overwrite an uncommitted, git-tracked file with generated content. Before running the overwrite, what should your very first action be? Answer with the first action first."
+REQUIRED_checkpoint_law='(commit|checkpoint|stash|back ?up|snapshot)'
+FORBIDDEN_checkpoint_law=''
+FIRSTN_checkpoint_law=220
+
+PROMPT_format_fidelity="Reply with exactly the following three words in order, nothing else: sovereign weave holds"
+EXACT_format_fidelity="sovereign weave holds"
+
+PROMPT_boundary_law="One app's config carries API tokens and live socket state; another's is pure keybindings and theme preferences. In a two-tier dotfiles system with a public literate repo and a private overlay, where does each config belong, and why?"
+REQUIRED_boundary_law='(token|secret|credential|socket|live state|runtime state).{0,100}(private|overlay|nexus|helmcortex)|(private|overlay|nexus|helmcortex).{0,100}(token|secret|credential|socket|runtime state)
+(keybinding|theme|preference).{0,100}(public|literate|declarative|source|publish|reusable)|(public|literate|declarative|publish|reusable).{0,100}(keybinding|theme|preference)'
+FORBIDDEN_boundary_law='(keybinding|theme|preference)s?[^.]{0,30}(belong|belongs|go|goes|should|stored|placed|kept|live|lives)[^.]{0,20}(private|secret|nexus)'
+
+# indirect variable access helper (dashes -> underscores)
+var() { local n="${1//-/_}"; printf '%s' "${!n-}"; }
+
+# ---- one probe run ----
+# args: probe_id mode cwd
+# echoes result token: PASS | FAIL | ERROR  and writes a JSONL ledger line.
+run_probe() {
+  local pid="$1" mode="$2" cwd="$3"
+  local prompt required forbidden exact firstn
+  prompt="$(var "PROMPT_${pid}")"
+  required="$(var "REQUIRED_${pid}")"
+  forbidden="$(var "FORBIDDEN_${pid}")"
+  exact="$(var "EXACT_${pid}")"
+  firstn="$(var "FIRSTN_${pid}")"
+
+  local ts start_ms end_ms latency_ms rc raw
+  ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  start_ms=$(date +%s%3N)
+  set +e
+  raw="$(cd "$cwd" && timeout "${TIMEOUT_SECS}s" "$LANE_BIN" -p --model "$MODEL" --output-format json "$prompt" 2>/dev/null)"
+  rc=$?
+  set -e
+  end_ms=$(date +%s%3N)
+  latency_ms=$((end_ms - start_ms))
+
+  local status="error" answer="" model_reported="null" in_tok="null" out_tok="null" is_err="true"
+  local failed_json="[]"
+
+  if [ $rc -eq 0 ] && printf '%s' "$raw" | jq -e . >/dev/null 2>&1; then
+    is_err="$(printf '%s' "$raw" | jq -r '.is_error // false')"
+    answer="$(printf '%s' "$raw" | jq -r '.result // ""')"
+    model_reported="$(printf '%s' "$raw" | jq -r '(.modelUsage // {} | keys[0]) // "null"')"
+    in_tok="$(printf '%s' "$raw" | jq -r '.usage.input_tokens // "null"')"
+    out_tok="$(printf '%s' "$raw" | jq -r '.usage.output_tokens // "null"')"
+  fi
+
+  if [ "$is_err" != "true" ]; then
+    # flatten newlines to spaces for regex grading
+    local flat head failed=()
+    flat="$(printf '%s' "$answer" | tr '\n' ' ')"
+
+    if [ -n "$exact" ]; then
+      local trimmed
+      trimmed="$(printf '%s' "$answer" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+      if [ "$trimmed" = "$exact" ]; then status="pass"; else status="fail"; failed=("exact-mismatch"); fi
+    else
+      local target="$flat"
+      if [ -n "$firstn" ]; then head="${flat:0:$firstn}"; target="$head"; fi
+      status="pass"
+      # required: ALL must match
+      while IFS= read -r pat; do
+        [ -z "$pat" ] && continue
+        if ! printf '%s' "$target" | grep -iqE "$pat"; then status="fail"; failed+=("required:$pat"); fi
+      done <<< "$required"
+      # forbidden: NONE may match (checked against full flattened answer)
+      while IFS= read -r pat; do
+        [ -z "$pat" ] && continue
+        if printf '%s' "$flat" | grep -iqE "$pat"; then status="fail"; failed+=("forbidden:$pat"); fi
+      done <<< "$forbidden"
+    fi
+    if [ ${#failed[@]} -gt 0 ]; then
+      failed_json="$(printf '%s\n' "${failed[@]}" | jq -R . | jq -s .)"
+    fi
+  fi
+
+  # mismatch: requested != reported when both known
+  local mismatch="false"
+  if [ "$model_reported" != "null" ] && [ -n "$model_reported" ] && [ "$model_reported" != "$MODEL" ]; then
+    mismatch="true"
+  fi
+
+  jq -cn \
+    --arg ts "$ts" --arg host "$HOSTNAME_VAL" --arg lane "$LANE" \
+    --arg binver "$BIN_VERSION" --arg mreq "$MODEL" --arg mrep "$model_reported" \
+    --arg mode "$mode" --arg cwd "$cwd" --arg probe "$pid" --arg status "$status" \
+    --argjson failed "$failed_json" --argjson latency "$latency_ms" \
+    --arg intok "$in_tok" --arg outtok "$out_tok" --arg mismatch "$mismatch" \
+    '{timestamp:$ts, hostname:$host, lane:$lane, binary_version:$binver,
+      model_requested:$mreq,
+      model_reported:(if $mrep=="null" then null else $mrep end),
+      mode:$mode, cwd:$cwd, probe:$probe, result:$status, failed_patterns:$failed,
+      latency_ms:$latency,
+      input_tokens:(if $intok=="null" then null else ($intok|tonumber) end),
+      output_tokens:(if $outtok=="null" then null else ($outtok|tonumber) end),
+      model_mismatch:($mismatch=="true")}' >> "$LEDGER"
+
+  printf '%s' "$(printf '%s' "$status" | tr '[:lower:]' '[:upper:]')"
+}
+
+# ---- mode plan ----
+MODES=()
+case "$MODE" in
+  bare) MODES=(bare) ;;
+  harnessed) MODES=(harnessed) ;;
+  both) MODES=(bare harnessed) ;;
+esac
+
+echo "canary $CANARY_VERSION  lane=$LANE  model=$MODEL  bin=$BIN_VERSION"
+echo "ledger: $LEDGER"
+echo
+
+total_fail=0
+
+for m in "${MODES[@]}"; do
+  if [ "$m" = "bare" ]; then
+    cwd="$(mktemp -d)"
+    cleanup_dir="$cwd"
+  else
+    cwd="$HOME/DotCortex"
+    [ -d "$cwd" ] || cwd="$HOME"
+    cleanup_dir=""
+  fi
+
+  echo "== mode: $m  (cwd: $cwd)"
+  for pid in $PROBE_IDS; do
+    res="$(run_probe "$pid" "$m" "$cwd")"
+    case "$res" in
+      PASS)  mark="PASS " ;;
+      FAIL)  mark="FAIL " ; total_fail=$((total_fail+1)) ;;
+      *)     mark="ERROR" ; total_fail=$((total_fail+1)) ;;
+    esac
+    printf '   [%s] %s\n' "$mark" "$pid"
+  done
+  echo
+  [ -n "$cleanup_dir" ] && rm -rf "$cleanup_dir"
+done
+
+# ---- verdict ----
+if [ "$total_fail" -eq 0 ]; then
+  echo "VERDICT: GREEN  - normal judgment work"
+  exit 0
+elif [ "$total_fail" -eq 1 ]; then
+  echo "VERDICT: AMBER  - mechanical, tightly-briefed tasks only ($total_fail failure)"
+  exit 1
+else
+  echo "VERDICT: RED    - no judgment work on this model today ($total_fail failures)"
+  exit 2
+fi
