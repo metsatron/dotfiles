@@ -65,7 +65,8 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
 ## Rules
 
 - If there are no changes, say so and stop.
-- Refuse to commit from a dirty tracked worktree. If tracked unstaged changes exist outside the intended commit, stop and ask the user whether to split, stage, or stash them first.
+- Refuse to commit from a dirty tracked worktree. If tracked unstaged changes exist outside the intended commit, stop and ask the user whether to split, stage, or stash them first. Exception — multi-writer repos with live concurrent sessions (HelmCortex, DotCortex on the fleet): pre-existing dirt from other lanes is expected; commit surgically instead of stopping, per the multi-writer rules below.
+- Multi-writer repos (sealed 2026-07-10): check the staged index for other lanes' work BEFORE committing (`git diff --cached --quiet`) — a pre-loaded index rides into a bare `git commit` silently; prefer pathspec commits (`git commit -m … -- <paths>`), which leave other lanes' staged entries untouched (untracked files need `git add` first); never delete a live `.git/index.lock` — identify the holder (`pgrep -af git`), wait for no-lock AND empty index, then commit; if a swept commit already happened, repair with `git reset --soft HEAD~1` + pathspec recommit, which restores the other lane's staged state exactly.
 - If changes span multiple unrelated scopes, suggest splitting into multiple commits.
 - If the user's hint conflicts with what the diff shows, trust the diff.
 - Never commit generated/tangled output without the canonical `.org` source in the same commit.
