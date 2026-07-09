@@ -1,7 +1,7 @@
 ---
 name: elisp-craft
 description: Write and adapt Emacs Lisp for DotCortex — emacs.org block conventions, elisp best practices (defgroup/defcustom/defface, user-error, shell-quote-argument, compile), respectful upstream adaptation with credit, and batch testing with the lexical-binding gotcha.
-model: claude-sonnet-4-6
+model: claude-sonnet-5
 ---
 
 # Elisp Craft — Writing and Adapting Emacs Lisp for DotCortex
