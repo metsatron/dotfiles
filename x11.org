@@ -120,6 +120,72 @@ fi
 unset APPMENU_REGISTRAR
 #+END_SRC
 
+* GTK4/libadwaita color-scheme (portal Settings)
+GTK4 apps built on libadwaita (GNOME Calculator, and similarly-modernized GNOME apps) no longer read XFCE's XSettings theme name at all -- they hardcode Adwaita and only switch light/dark by asking =xdg-desktop-portal='s Settings interface for =org.freedesktop.appearance color-scheme=. =xdg-desktop-portal-gtk= answers that query straight from the GNOME gsettings key =org.gnome.desktop.interface color-scheme=, which nothing on an XFCE session ever sets. Confirmed live via =dbus-monitor= (2026-07-10): the portal call returned =uint32 0= (no-preference), so libadwaita apps rendered light Adwaita regardless of the dark XFCE theme.
+
+This tracks the XFCE XSettings theme name so libadwaita apps follow whatever =/Net/ThemeName= is currently set to, rather than hardcoding a value independent of theme switches.
+
+#+BEGIN_SRC sh :tangle linux/.xsessionrc.d/35-gtk-color-scheme.sh :shebang "#!/usr/bin/env sh"
+command -v gsettings >/dev/null 2>&1 || return 0
+
+THEME_NAME=""
+if command -v xfconf-query >/dev/null 2>&1; then
+  THEME_NAME="$(xfconf-query -c xsettings -p /Net/ThemeName 2>/dev/null)"
+fi
+
+case "${THEME_NAME}" in
+  *[Dd]ark*) SCHEME=prefer-dark ;;
+  *)         SCHEME=default ;;
+esac
+
+gsettings set org.gnome.desktop.interface color-scheme "${SCHEME}" 2>/dev/null || true
+#+END_SRC
+
+* darkman — color-scheme portal backend (works around xdg-desktop-portal-gtk 1.15.3)
+Live investigation (2026-07-10) confirmed the dconf/gsettings side of the previous fix is entirely correct -- =gsettings get org.gnome.desktop.interface color-scheme= reports =prefer-dark=, no gschema override or dconf lock exists, and =gsettings-desktop-schemas= is current (48.0-1). Yet =gdbus call --session --dest org.freedesktop.impl.portal.desktop.gtk ... Settings.Read org.freedesktop.appearance color-scheme= kept returning =uint32 0= even across a full daemon restart. Devuan excalibur only carries =xdg-desktop-portal-gtk 1.15.3-1=, sitting in a known regression window (other users reported needing to pin/downgrade for reliable color-scheme reads). No newer/older version is available without adding another apt suite.
+
+=darkman= (packaged in Guix, no Debian/Devuan apt package exists) runs its own =org.freedesktop.impl.portal.desktop.darkman= D-Bus service implementing the Settings portal interface directly from its own internal light/dark state -- it does not depend on =xdg-desktop-portal-gtk= at all, sidestepping the bug entirely. =portals.conf= tells the frontend dispatcher to route the =Settings= interface specifically to darkman; every other portal interface (file chooser, screenshot, etc.) is untouched and still served by =xdg-desktop-portal-gtk= as before.
+
+Automatic sunrise/sunset transitions require a configured location (=lat=/=lng= or geoclue); leaving both unset (the default, no =config.yaml= needed) disables automatic transitions entirely, and darkman just holds whatever mode was last set -- it persists the mode to a cache file and restores it on restart, so =darkman set dark= only needs to be run once, ever, after first install.
+
+#+BEGIN_SRC conf :tangle linux/.config/xdg-desktop-portal/portals.conf :tangle-mode (identity #o644)
+[preferred]
+org.freedesktop.impl.portal.Settings=darkman
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle all/.local/share/xdg-desktop-portal/portals/darkman.portal :tangle-mode (identity #o644)
+[portal]
+DBusName=org.freedesktop.impl.portal.desktop.darkman
+Interfaces=org.freedesktop.impl.portal.Settings
+UseIn=XFCE;
+#+END_SRC
+
+#+BEGIN_SRC sh :tangle all/.local/bin/darkman-start :shebang "#!/usr/bin/env bash"
+P="$HOME/.guix-extra-profiles/core/core"; [ -r "$P/etc/profile" ] && . "$P/etc/profile"
+set -euo pipefail
+exec darkman run
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.config/autostart/darkman.desktop :tangle-mode (identity #o644) :comments no
+[Desktop Entry]
+Type=Application
+Name=darkman
+Comment=Dark/light mode portal Settings backend (xdg-desktop-portal-gtk color-scheme bug workaround)
+Exec=sh -c 'exec "$HOME/.local/bin/darkman-start"'
+Terminal=false
+X-GNOME-Autostart-enabled=true
+#+END_SRC
+
+Deliberately narrow: this only keeps the =org.gnome.desktop.interface color-scheme= gsettings key in sync for apps that read it directly instead of via the portal. It does not touch the actual XFCE theme name -- darkman's mode is a one-time-set static value here (no automatic transitions), not something that should ever drive a real desktop theme switch.
+
+#+BEGIN_SRC sh :tangle all/.local/share/darkman/gsettings-color-scheme.sh :tangle-mode (identity #o755) :shebang "#!/bin/sh"
+case "$1" in
+  dark)  SCHEME=prefer-dark ;;
+  light) SCHEME=default ;;
+esac
+gsettings set org.gnome.desktop.interface color-scheme "${SCHEME}" 2>/dev/null || true
+#+END_SRC
+
 * Session PATH: ~/.local/bin
 =xfce4-session= launches XDG autostart entries with the PATH it inherits from Xsession. That PATH never contained =~/.local/bin=, so every autostart entry naming a stowed helper by bare command name died at login with =Failed to execute child process ... (No such file or directory)= -- =appmenu-boot-setup= (the global-menu registrar bootstrap), =clipmenud-start=, =xfce-sanctuary-shortcuts=, =plank=, =twistpatch=. The failure is silent unless you read =~/.xsession-errors=, and the usual symptom is "the fix works when I run it by hand but never survives a reboot" -- because an interactive shell *does* have =~/.local/bin= on PATH.
 
@@ -567,13 +633,35 @@ case ":${gtk_modules}:" in
 esac
 set_string /Gtk/Modules "$gtk_modules"
 
+registrar_alive() {
+  if command -v gdbus >/dev/null 2>&1; then
+    gdbus call --session \
+      --dest com.canonical.AppMenu.Registrar \
+      --object-path /com/canonical/AppMenu/Registrar \
+      --method org.freedesktop.DBus.Peer.Ping >/dev/null 2>&1
+  else
+    # pgrep/pkill -x match only the first 15 chars of comm; "appmenu-registrar"
+    # is 17, so -x never matches. Match the full cmdline instead.
+    pgrep -f '[a]ppmenu-registrar' >/dev/null 2>&1
+  fi
+}
+
 registrar_bin="$(resolve_registrar || true)"
 
 if [[ -n "$registrar_bin" ]]; then
-  pkill -x appmenu-registr >/dev/null 2>&1 || true
-  pkill -x appmenu-registrar >/dev/null 2>&1 || true
-  # Keep exactly one registrar alive after this configuration helper exits.
-  nohup "$registrar_bin" -r >/dev/null 2>&1 &
+  if registrar_alive; then
+    # NEVER bounce a healthy registrar. It holds the menu export of every window
+    # currently open. Apps register their menu exactly once, at window creation,
+    # so killing/replacing (-r) the registrar silently orphans every open window:
+    # the global menu goes permanently empty until each app is restarted. This ran
+    # unconditionally on every xfce4-heal, which is precisely why healing the panel
+    # destroyed the global menu after each reboot.
+    :
+  else
+    pkill -x appmenu-registr >/dev/null 2>&1 || true
+    pkill -x appmenu-registrar >/dev/null 2>&1 || true
+    nohup "$registrar_bin" -r >/dev/null 2>&1 &
+  fi
 fi
 
 printf 'Gtk/ShellShowsMenubar=%s\n' "$(xfconf-query -c xsettings -p /Gtk/ShellShowsMenubar 2>/dev/null || echo unset)"
@@ -804,6 +892,9 @@ set_cmd '<Super>x'     "$HOME/.local/bin/rofi-actions"    "$HOME/.local/bin/rofi
 set_cmd '<Super>b'     "$HOME/.local/bin/rofi-emoji-menu" "$HOME/.local/bin/rofi-emoji-menu"
 set_cmd '<Super>z'     "$HOME/.local/bin/clipmenu-rofi"   "$HOME/.local/bin/clipmenu-rofi"
 set_cmd '<Super>w'     "$HOME/.local/bin/rofi-window"     "$HOME/.local/bin/rofi-window"
+# <Super>r ships as an XFCE *default* (/commands/default/<Super>r → `xfce4-appfinder -c`).
+# A /commands/custom/ entry at the same key takes precedence, so no removal is needed.
+set_cmd '<Super>r'     "$HOME/.local/bin/rofi-run"        "$HOME/.local/bin/rofi-run"
 # Drop the xfwm4 popup_menu_key on <Alt>space so it stops shadowing the new
 # /commands/custom/<Alt>space appfinder launcher (the two-channel conflict).
 xfconf-query -c xfce4-keyboard-shortcuts -p '/xfwm4/custom/<Alt>space' -r 2>/dev/null || true
@@ -1019,12 +1110,16 @@ The =sleep= lets xfwm4/xfsettingsd fully settle first so the run wins the race. 
 this entry the script never ran on its own — which is why Super+4 "had to be fixed so
 many times" by hand.
 
+The =Exec== line names the script by *absolute path*, never by bare command name. This is not stylistic. From its creation until 2026-07-09 this entry read =Exec=bash -c "sleep 12; xfce-sanctuary-shortcuts"=, and =xfce4-session= launches autostart entries with the PATH inherited from Xsession, which did not contain =~/.local/bin=. So =bash= started, then failed with =bash: line 1: xfce-sanctuary-shortcuts: command not found= (visible only in =~/.xsession-errors=), and the script never ran at login even once. The user-visible symptom was =Super+4= silently losing its workspace grab after *every single reboot* while =Super+1/2/3= kept working — because xfconf faithfully persists all four bindings, and it is only the *regrab* that this script performs. Running the script by hand always "fixed" it, which made the config look flaky when it was the launcher that was broken.
+
+=.xsessionrc.d/40-local-bin.sh= now also puts =~/.local/bin= on the session PATH, which would make a bare name resolve. Both fixes stay: the PATH snippet only helps if =~/.xsessionrc= is sourced at all, and a display manager that skips it must not take the workspace grabs down with it. An autostart entry should not depend on PATH to find a file whose location it already knows.
+
 #+BEGIN_SRC conf :tangle t480s/.config/autostart/xfce-sanctuary-shortcuts.desktop :tangle-mode (identity #o644) :comments no
 [Desktop Entry]
 Type=Application
 Name=Virtual Habitat Workspace Shortcuts
 Comment=Re-assert Super+1/2/3/4 workspace grabs after session settles (xfwm4 drops Super+4 on startup regrab races)
-Exec=bash -c "sleep 12; xfce-sanctuary-shortcuts"
+Exec=sh -c 'sleep 12; exec "$HOME/.local/bin/xfce-sanctuary-shortcuts"'
 NoDisplay=true
 X-XFCE-Autostart-Override=true
 OnlyShowIn=XFCE;
