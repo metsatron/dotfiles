@@ -1,0 +1,160 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CH=xfce4-panel
+DRY=0
+[ "${1:-}" = "--dry-run" ] && { DRY=1; shift; }
+
+# Plugins to ensure, in panel order (name = .desktop stem = xfconf plugin value).
+# windowck-plugin (the standalone window-title applet) is intentionally NOT here
+# — the appmenu/menubar already carry identity, and the title is redundant beside
+# them. Add "windowck-plugin" to WANT (or WANT_EXTRA) if you want it back.
+WANT=(appmenu wckbuttons xfce-desktop-menubar)
+[ -n "${WANT_EXTRA:-}" ] && WANT+=($WANT_EXTRA)
+
+# Bold, always-visible caption-button theme for windowck (see the caption-button
+# theme section in xfce-desktopmenu.org). Overridable with WCK_THEME=…; set it to
+# the empty string to leave the windowck rc untouched.
+WCK_THEME="${WCK_THEME-BigSur-Bold-Dark}"
+
+command -v xfconf-query >/dev/null 2>&1 || { echo "xfconf-query not found" >&2; exit 1; }
+xfconf-query -c "$CH" -l >/dev/null 2>&1 || {
+  echo "no xfce4-panel xfconf channel (run inside a live XFCE session)" >&2; exit 1; }
+
+backup() {
+  local xml="$HOME/.config/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml"
+  [ -f "$xml" ] || return 0
+  cp "$xml" "$xml.backup-$(date +%Y%m%d-%H%M%S)"
+  echo "backed up $xml"
+}
+
+# All currently-configured plugin names.
+existing_names() {
+  xfconf-query -c "$CH" -l 2>/dev/null | grep -E '^/plugins/plugin-[0-9]+$' \
+    | while read -r p; do xfconf-query -c "$CH" -p "$p" 2>/dev/null; done
+}
+
+plugin_present() { existing_names | grep -qx "$1"; }
+
+next_id() {
+  local max=0 n
+  for p in $(xfconf-query -c "$CH" -l 2>/dev/null | grep -oE '/plugins/plugin-[0-9]+' | sort -u); do
+    n=${p##*plugin-}
+    [ "$n" -gt "$max" ] && max="$n"
+  done
+  echo $((max + 1))
+}
+
+list_panels() {
+  xfconf-query -c "$CH" -l 2>/dev/null | grep -oE '/panels/panel-[0-9]+' \
+    | sort -u | sed 's#.*panel-##' | sort -n
+}
+
+panel_ids() {
+  xfconf-query -c "$CH" -p "/panels/panel-$1/plugin-ids" 2>/dev/null \
+    | grep -E '^[0-9]+$'
+}
+
+target_panel() {
+  [ -n "${PANEL:-}" ] && { echo "$PANEL"; return; }
+  # Prefer the panel already holding appmenu.
+  local p appid
+  for p in $(list_panels); do
+    for appid in $(panel_ids "$p"); do
+      [ "$(xfconf-query -c "$CH" -p "/plugins/plugin-$appid" 2>/dev/null)" = appmenu ] \
+        && { echo "$p"; return; }
+    done
+  done
+  list_panels | head -1
+}
+
+# Recover the live session bus from the running panel — a detached tmux/ssh
+# shell may carry a stale DBUS_SESSION_BUS_ADDRESS.
+panel_dbus() {
+  local pid; pid=$(pgrep -x xfce4-panel | head -1 || true)
+  [ -n "$pid" ] && grep -z DBUS_SESSION_BUS_ADDRESS "/proc/$pid/environ" 2>/dev/null | tr '\0' '\n'
+}
+
+# Update-or-append a key in an xfce_rc file.
+set_rc_key() {
+  local file="$1" key="$2" val="$3"
+  if grep -q "^${key}=" "$file" 2>/dev/null; then
+    sed -i "s|^${key}=.*|${key}=${val}|" "$file"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$file"
+  fi
+}
+
+# Pin the windowck caption-button theme. windowck re-saves its in-memory config
+# on panel teardown, so editing the rc under a live panel gets clobbered by the
+# next restart — the only reliable path is quit → write rc → relaunch. The rc is
+# created only once the panel has instantiated the wckbuttons plugin, so this
+# runs AFTER the first restart below.
+apply_wck_theme() {
+  local theme="$1"
+  [ -n "$theme" ] || { echo "WCK_THEME empty — leaving windowck rc untouched"; return 0; }
+  if [ ! -d "$HOME/.themes/$theme" ] && [ ! -d "$HOME/.local/share/themes/$theme" ] \
+     && [ ! -d "/usr/share/themes/$theme" ]; then
+    echo "warn: windowck theme '$theme' not found (run loom stow first) — skipping" >&2
+    return 0
+  fi
+  local rc="" i
+  for i in $(seq 1 15); do
+    rc=$(ls "$HOME"/.config/xfce4/panel/wckbuttons-*.rc 2>/dev/null | head -1 || true)
+    [ -n "$rc" ] && break
+    sleep 0.2
+  done
+  [ -n "$rc" ] || { echo "warn: no wckbuttons rc yet — is wckbuttons on the panel? skipping" >&2; return 0; }
+
+  local dbus; dbus=$(panel_dbus)
+  [ -n "$dbus" ] && export "$dbus"
+  xfce4-panel -q >/dev/null 2>&1 || true
+  for i in $(seq 1 20); do pgrep -x xfce4-panel >/dev/null || break; sleep 0.2; done
+  for rc in "$HOME"/.config/xfce4/panel/wckbuttons-*.rc; do
+    [ -f "$rc" ] || continue
+    set_rc_key "$rc" sync_wm_theme false
+    set_rc_key "$rc" theme "$theme"
+    echo "wck theme -> $theme  ($rc)"
+  done
+  setsid xfce4-panel >/dev/null 2>&1 < /dev/null &
+  disown 2>/dev/null || true
+  echo "panel relaunched with the '$theme' caption buttons"
+}
+
+P="$(target_panel)"
+[ -n "$P" ] || { echo "no panel found" >&2; exit 1; }
+echo "target panel: panel-$P"
+
+[ "$DRY" = "1" ] || backup
+
+base="$(next_id)"
+offset=0
+for name in "${WANT[@]}"; do
+  if plugin_present "$name"; then
+    echo "present : $name"
+    continue
+  fi
+  id=$((base + offset))
+  offset=$((offset + 1))
+  if [ "$DRY" = "1" ]; then
+    echo "would add: $name  (plugin-$id -> panel-$P)"
+    continue
+  fi
+  xfconf-query -c "$CH" -p "/plugins/plugin-$id" -n -t string -s "$name"
+  # Rebuild the panel's plugin-ids array with the new id appended.
+  args=()
+  for v in $(panel_ids "$P"); do args+=(-t int -s "$v"); done
+  args+=(-t int -s "$id")
+  xfconf-query -c "$CH" -p "/panels/panel-$P/plugin-ids" "${args[@]}"
+  echo "added   : $name  (plugin-$id -> panel-$P)"
+done
+
+if [ "$DRY" = "1" ]; then
+  [ -n "$WCK_THEME" ] && echo "would set windowck theme -> $WCK_THEME (sync_wm_theme=false)"
+  exit 0
+fi
+echo "restarting panel to instantiate plugins…"
+xfce4-panel -r >/dev/null 2>&1 || { echo "run 'xfce4-panel -r' to apply"; exit 0; }
+
+# Pin the bold caption-button theme once the panel has created the wckbuttons rc.
+apply_wck_theme "$WCK_THEME"

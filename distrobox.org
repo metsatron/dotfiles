@@ -232,6 +232,20 @@ GUIX_PROFILES="${HOME}/.guix-extra-profiles"
 CDE_PROFILE="${GUIX_PROFILES}/sanctuary-cde/sanctuary-cde"
 CDE_RUNTIME="${HOME}/.config/virtualisation/sanctuary-cde"
 
+# NOTE 2026-07-08: the GVFS host-trash leak (R9X-URGENT) is now fixed at
+# LAUNCH by sanctuary-trash-shield, not at create time. The former
+# create-time FLEET_TRASH_SHADOW flags were both mis-targeted (they shadowed
+# each mount's .local/share/Trash, but gvfs reads a foreign mount's topdir
+# trash $topdir/.Trash-$uid — a different path it never touched) and
+# structurally too weak (you cannot pre-shadow a child of an autofs mount
+# that is not mounted yet, and the flags only take effect on a full
+# container recreate). sanctuary-trash-shield instead runs inside the
+# already-running container's isolated mount namespace at each launch:
+# make-rprivate the passthrough parents, then tmpfs-mask the whole ~/mnt
+# tree via both reachable paths. It needs no recreation, is re-trigger-proof
+# against autofs, and covers new fleet machines automatically. See the
+# sanctuary-trash-shield block above and redstone-9x-state-digest.md.
+
 if ! podman image exists "${BASE_IMAGE}" 2>/dev/null; then
   echo "Base image ${BASE_IMAGE} not found — run sanctuary-base-build first" >&2
   exit 1
@@ -490,6 +504,129 @@ else
 fi
 #+END_SRC
 
+#+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-teardown-stale-session :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# Kill any surviving session from a prior launch of a sanctuary before
+# starting a fresh one. `podman kill`/`podman restart` on the container
+# alone is NOT sufficient — confirmed 2026-07-07: a full prior XFCE desktop
+# session (distrobox enter, podman exec, thunar, xfdesktop, gvfsd-trash,
+# xfce4-session) survived a full container restart and kept running
+# alongside a freshly launched session, invisibly, until killed by exact
+# PID. Distrobox's `podman exec` desktop sessions are apparently not torn
+# down by cycling the container's own main process. This also matters for
+# correctness beyond hygiene: two live sessions can share D-Bus/gvfs state
+# in ways that make later diagnosis (or even normal use) unreliable.
+# Usage: sanctuary-teardown-stale-session <sanctuary-name> <display-num>
+set -uo pipefail
+
+SANCTUARY="${1:?sanctuary name required}"
+DISPLAY_NUM="${2:?display num required, e.g. :93}"
+
+# Kill any leftover distrobox-enter wrapper and podman-exec session tied to
+# this sanctuary from a prior launch. pgrep/pkill exclude their own PID by
+# default, so this is safe to run even though the pattern text below also
+# appears later in this same script's own distrobox/podman invocations.
+pkill -f "distrobox enter ${SANCTUARY} --" 2>/dev/null || true
+pkill -f "podman exec .*${SANCTUARY} sh -c" 2>/dev/null || true
+
+# Kill any stale Xephyr still bound to this display from a prior launch.
+stale_xephyr="$(pgrep -f "^Xephyr ${DISPLAY_NUM} " | head -1 || true)"
+if [[ -n "${stale_xephyr}" ]]; then
+  echo "${SANCTUARY}: killing stale Xephyr ${DISPLAY_NUM} (pid ${stale_xephyr})"
+  kill "${stale_xephyr}" 2>/dev/null || true
+fi
+
+sleep 1
+rm -f "/tmp/.X${DISPLAY_NUM#:}-lock"
+exit 0
+#+END_SRC
+
+# sanctuary-trash-shield helper.
+# Isolate a sanctuary's =trash:///= from the host's fleet NFS mounts.
+
+Root cause (confirmed live 2026-07-08): Distrobox bind-mounts the host home at
+=/home/<user>= *and* passes the host root recursively at =/run/host=, so the
+host's autofs fleet NFS mounts (=~/mnt/x230=, =~/mnt/t480=, …) surface *inside*
+the container's own mount namespace as real mount points — via *both* paths.
+GVFS's trash aggregator (=gvfsd-trash=) walks every visible mount point looking
+for =$topdir/.Trash-$uid=, so it merged those remote machines' trash into the
+sandboxed room's =trash:///= (measured historically: 392 entries = 68 local +
+324 leaked from the host's real =~/mnt/x230/.Trash-1000=).
+
+The fix runs at launch *inside* the container's mount namespace, which is
+isolated from the host — verified live: every op below leaves the host mount
+table untouched. It makes the two passthrough parents =rprivate= (a
+propagation-*type* change, which by Linux mount semantics sends no events to
+peers, so it cannot affect the host) then tmpfs-masks the whole =~/mnt= tree via
+both reachable paths. A tmpfs over =~/mnt= makes every fleet mount underneath
+unreachable (=ENOENT= on path resolution), so =gvfsd-trash= finds only the
+guest-home trash — exactly what a sandbox should have. It is *re-trigger-proof*
+against autofs (masks *over* the mounts rather than unmounting them, which a
+live desktop session instantly re-triggers) and *future-proof* (masks the
+parent, so a new fleet machine is covered with no code change). The rooms do not
+need =~/mnt= — the only reader is the GE-Proton font fallback, which degrades
+gracefully when the NFS is absent (see =redstone-9x-font-provision=).
+
+This never removes or recreates the container; it only adds mounts inside the
+running container's namespace, and it is idempotent (re-masking an already-masked
+path is skipped).
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-trash-shield :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# Shield a sanctuary's trash:/// from the host fleet NFS mounts. See the org
+# prose above for the full mechanism.
+#
+# IMPORTANT — why podman exec and NOT distrobox enter / sanctuary-exec:
+# both join the SAME container mount namespace (verified), so masks applied
+# by either are seen by the desktop session a later distrobox enter starts.
+# BUT distrobox enter drops ALL effective capabilities (it runs as the plain
+# login user: CapEff=0), so mount(2) fails with EPERM. podman exec keeps the
+# container's CAP_SYS_ADMIN (CapEff=all), so it can mount. We therefore apply
+# the shield via podman exec, and it still persists for the enter-started
+# session because the namespace is shared.
+#
+# Usage: sanctuary-trash-shield <sanctuary-name> <host-home-dir>
+#   <host-home-dir> is the LAUNCHER's $HOME (the host home path at which
+#   distrobox bind-mounts the real home inside the container, e.g. /home/user).
+set -uo pipefail
+
+SANCTUARY="${1:?sanctuary name required}"
+HOST_HOME="${2:?host home dir required (the launcher HOME dir)}"
+
+PODMAN_BIN="$(command -v podman 2>/dev/null || true)"
+if [[ -z "${PODMAN_BIN}" ]]; then
+  echo "sanctuary-trash-shield: podman not found — cannot shield ${SANCTUARY}" >&2
+  exit 0
+fi
+
+# The container's home bind and /run/host passthrough (and the fleet mounts
+# propagated through them) exist only once it is running. Ensure it is up;
+# idempotent no-op if already running.
+"${PODMAN_BIN}" start "${SANCTUARY}" >/dev/null 2>&1 || true
+
+# The inner script receives HOST_HOME as $1 (avoids quoting it into the body).
+"${PODMAN_BIN}" exec "${SANCTUARY}" sh -c '
+  set -u
+  host_home="$1"
+  # 1. Detach the two passthrough parents from the host peer group so no mask
+  #    below can propagate back to the host. Type change only — non-propagating.
+  mount --make-rprivate "$host_home"  2>/dev/null || true
+  mount --make-rprivate /run/host     2>/dev/null || true
+  # 2. tmpfs-mask the fleet mount tree via both reachable paths. Every fleet
+  #    mount underneath becomes unreachable, so gvfsd-trash sees no foreign
+  #    trash — only the guest home trash ($XDG_DATA_HOME/Trash).
+  for d in "$host_home/mnt" "/run/host$host_home/mnt"; do
+    [ -d "$d" ] || continue
+    # Idempotent: skip if already masked with a tmpfs.
+    [ "$(stat -f -c %T "$d" 2>/dev/null)" = tmpfs ] && continue
+    if mount -t tmpfs tmpfs "$d" 2>/dev/null; then
+      echo "sanctuary-trash-shield: masked $d"
+    else
+      echo "sanctuary-trash-shield: WARNING could not mask $d (continuing)" >&2
+    fi
+  done
+' sanctuary-trash-shield "${HOST_HOME}" 2>&1 || true
+exit 0
+#+END_SRC
+
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-clip-bridge :shebang "#!/usr/bin/env bash"
 # Bidirectional CLIPBOARD bridge between host and a Xephyr guest display.
 # Usage: sanctuary-clip-bridge <host-display> <guest-display>
@@ -524,6 +661,8 @@ HOST_DISPLAY="${DISPLAY}"
 SANCTUARY="sanctuary-qtile"
 GUIX_PROFILES="${HOME}/.guix-extra-profiles"
 
+sanctuary-teardown-stale-session "${SANCTUARY}" "${DISPLAY_NUM}"
+
 Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -no-host-grab &
 XEPHYR_PID=$!
 trap "kill ${XEPHYR_PID} 2>/dev/null || true" EXIT
@@ -534,6 +673,9 @@ timeout 10 sh -c "until DISPLAY=${DISPLAY_NUM} xdpyinfo >/dev/null 2>&1; do slee
 sanctuary-clip-bridge "${HOST_DISPLAY}" "${DISPLAY_NUM}" &
 CLIP_BRIDGE_PID=$!
 trap "kill ${XEPHYR_PID} ${CLIP_BRIDGE_PID} 2>/dev/null || true" EXIT
+
+# ── Shield trash:/// from host fleet NFS mounts (see sanctuary-trash-shield) ──
+sanctuary-trash-shield "${SANCTUARY}" "${HOME}"
 
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — sourcing Guix profiles and starting Qtile…"
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
@@ -557,6 +699,8 @@ HOST_DISPLAY="${DISPLAY}"
 SANCTUARY="sanctuary-gnustep"
 GUIX_PROFILES="${HOME}/.guix-extra-profiles"
 
+sanctuary-teardown-stale-session "${SANCTUARY}" "${DISPLAY_NUM}"
+
 Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -no-host-grab &
 XEPHYR_PID=$!
 trap "kill ${XEPHYR_PID} 2>/dev/null || true" EXIT
@@ -567,6 +711,9 @@ timeout 10 sh -c "until DISPLAY=${DISPLAY_NUM} xdpyinfo >/dev/null 2>&1; do slee
 sanctuary-clip-bridge "${HOST_DISPLAY}" "${DISPLAY_NUM}" &
 CLIP_BRIDGE_PID=$!
 trap "kill ${XEPHYR_PID} ${CLIP_BRIDGE_PID} 2>/dev/null || true" EXIT
+
+# ── Shield trash:/// from host fleet NFS mounts (see sanctuary-trash-shield) ──
+sanctuary-trash-shield "${SANCTUARY}" "${HOME}"
 
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — sourcing Guix profiles and starting Window Maker…"
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
@@ -608,6 +755,8 @@ trap _cde_cleanup EXIT
 
 mkdir -p "${DOTCORTEX_RUN}"
 
+sanctuary-teardown-stale-session "${SANCTUARY}" "${DISPLAY_NUM}"
+
 # -no-host-grab: Xephyr does not grab host keyboard/mouse, so host workspace
 # shortcuts (Super+1/Ctrl+F1) reach XFWM4 even when the nested display has focus.
 Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -no-host-grab &
@@ -616,6 +765,9 @@ printf 'PID=%s\nDISPLAY=%s\n' "${XEPHYR_PID}" "${DISPLAY_NUM}" > "${STATE_FILE}"
 
 timeout 10 sh -c "until DISPLAY=${DISPLAY_NUM} xdpyinfo >/dev/null 2>&1; do sleep 0.1; done" \
   || { echo "Xephyr ${DISPLAY_NUM} did not become ready"; exit 1; }
+
+# ── Shield trash:/// from host fleet NFS mounts (see sanctuary-trash-shield) ──
+sanctuary-trash-shield "${SANCTUARY}" "${HOME}"
 
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — adding CDE fonts and starting CDE…"
 CDE_HOME="${HOME}/.local/share/dotcortex/guests/sanctuary-cde/home/.local/share/cde"
@@ -1348,12 +1500,24 @@ podman exec --user 0 "${SANCTUARY}" sh -c "
 
 First gaming-wing sanctuary.  IceWM with the Windows NT theme.
 Launch from the current host desktop. Xephyr display: =:93=.
-Guix profiles: =desktop-common= + =room-gaming= (icewm, pcmanfm, xterm) + =room-windows-compat= (wine64, winetricks, fontconfig, powershell, dosbox-x).
+Guix profiles: =desktop-common= + =room-gaming= (icewm, pcmanfm, xterm) + =room-windows-compat= (wine64, winetricks, fontconfig, powershell, DOS emulation tooling).
+
+Current DOS direction (2026-07-07): =DOSEMU2= is the terminal-clean DOS lane.
+=DOSBox-X= remains packaged in =room-windows-compat= as an integrated
+compatibility lane for mouse-heavy DOS software, Windows 3.x, and booted
+Win9x machine profiles. New Redstone DOS work uses the host-visible =.compat/=
+runtime spine and =.dosemu/= bridge declared below.
 
 The launcher projects =DotCortex/linux/.icewm/= directly into the isolated guest
 home before launching Xephyr — IceWM reads config, theme, and menu from org-managed
 source. =pcmanfm --desktop= (via =~/.icewm/startup=) manages Win95-style desktop
 icons (My Computer, My Documents, Recycle Bin) from =linux/.icewm/desktop/=.
+Recycle Bin opens the real on-disk Trash folder directly (no GVFS =trash://=
+URI — room-gaming deliberately has no =gvfs=; a 2026-07-07 retry leaked the
+HOST's real Trash contents into the sandboxed room via distrobox's /run/host
+bind mount, on top of the earlier libfm crash risk — see
+redstone-9x-state-digest.md) and a small poller (=redstone-9x-recycle-bin-watch=,
+launched from =~/.icewm/startup=) keeps its icon in sync with full/empty state.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-redstone-9x-launch :shebang "#!/usr/bin/env bash"
 # Launch sanctuary-redstone-9x: Xephyr :93 + selected desktop inside the Guix container.
@@ -1447,6 +1611,23 @@ bm_open_method=0
 show_hidden=1
 view_mode=icon
 '       > "${GUEST_HOME}/.config/pcmanfm/default/pcmanfm.conf"
+  fi
+  # libfm shows an "execute this file?" confirm dialog before launching any
+  # desktop-icon .desktop entry (UI policy, not a per-file trust/exec-bit
+  # check). quick_exec=1 suppresses it. Upsert rather than write-once so an
+  # existing guest whose libfm.conf predates this key self-heals too.
+  mkdir -p "${GUEST_HOME}/.config/libfm"
+  if [[ ! -f "${GUEST_HOME}/.config/libfm/libfm.conf" ]]; then
+    printf '[config]
+quick_exec=1
+'       > "${GUEST_HOME}/.config/libfm/libfm.conf"
+  elif grep -q '^quick_exec=' "${GUEST_HOME}/.config/libfm/libfm.conf"; then
+    sed -i 's/^quick_exec=.*/quick_exec=1/' "${GUEST_HOME}/.config/libfm/libfm.conf"
+  elif grep -q '^\[config\]$' "${GUEST_HOME}/.config/libfm/libfm.conf"; then
+    sed -i '/^\[config\]$/a quick_exec=1' "${GUEST_HOME}/.config/libfm/libfm.conf"
+  else
+    printf '[config]\nquick_exec=1\n\n' | cat - "${GUEST_HOME}/.config/libfm/libfm.conf" > "${GUEST_HOME}/.config/libfm/libfm.conf.tmp"
+    mv "${GUEST_HOME}/.config/libfm/libfm.conf.tmp" "${GUEST_HOME}/.config/libfm/libfm.conf"
   fi
 elif [[ "${DESKTOP}" == "fvwm95" ]]; then
   # Project FVWM95 config
@@ -1582,8 +1763,20 @@ project_file "${HOME}/DotCortex/linux/.config/powershell/Microsoft.PowerShell_pr
 mkdir -p "${GUEST_HOME}/.local/bin"
 project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-run"   "${GUEST_HOME}/.local/bin/redstone-9x-run"
 chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-run"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-compat-init"   "${GUEST_HOME}/.local/bin/redstone-9x-compat-init"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-compat-init"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-import-manifest"   "${GUEST_HOME}/.local/bin/redstone-9x-import-manifest"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-import-manifest"
 project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-pwsh"   "${GUEST_HOME}/.local/bin/redstone-9x-pwsh"
 chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-pwsh"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-dosemu2-init"   "${GUEST_HOME}/.local/bin/redstone-9x-dosemu2-init"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-dosemu2-init"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-dos"   "${GUEST_HOME}/.local/bin/redstone-9x-dos"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-dos"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-dosemu2-shell"   "${GUEST_HOME}/.local/bin/redstone-9x-dosemu2-shell"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-dosemu2-shell"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-dosbox-x"   "${GUEST_HOME}/.local/bin/redstone-9x-dosbox-x"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-dosbox-x"
 project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-explorer"   "${GUEST_HOME}/.local/bin/redstone-9x-explorer"
 chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-explorer"
 project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-vlc"        "${GUEST_HOME}/.local/bin/redstone-9x-vlc"
@@ -1596,6 +1789,8 @@ project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-pinball"    "${GUES
 chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-pinball"
 project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-dsdmine"    "${GUEST_HOME}/.local/bin/redstone-9x-dsdmine"
 chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-dsdmine"
+project_file "${HOME}/DotCortex/linux/.local/bin/redstone-9x-recycle-bin-watch"    "${GUEST_HOME}/.local/bin/redstone-9x-recycle-bin-watch"
+chmod +x "${GUEST_HOME}/.local/bin/redstone-9x-recycle-bin-watch"
 # sanctuary-flatpak-run is the runner the flatpak game wrappers exec; project a
 # COPY (the host repo path is not visible inside the container, so the
 # stowed symlink would be broken there).
@@ -1625,6 +1820,14 @@ project_file "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-3.0/gtk.css"   "${
 project_file "${HOME}/DotCortex/linux/.config/redstone-9x/gtk-2.0/gtkrc"   "${GUEST_HOME}/.gtkrc-2.0"
 
 # Fonts
+# Redstone keeps its sanctuary-local Microsoft/period fonts in FONT_STAGE, but
+# it also needs the host's merged ~/.local/share/fonts tree so families moved
+# to helmstow or local font triage remain visible inside the room.
+HOST_FONT_ROOT="${HOME}/.local/share/fonts"
+if [[ -d "${HOST_FONT_ROOT}" ]]; then
+  mkdir -p "${GUEST_HOME}/.local/share/fonts"
+  ln -sfnT "${HOST_FONT_ROOT}" "${GUEST_HOME}/.local/share/fonts/host-user"
+fi
 if [[ -d "${FONT_STAGE}" ]]; then
   mkdir -p "${GUEST_HOME}/.local/share/fonts"
   ln -sfnT "${FONT_STAGE}" "${GUEST_HOME}/.local/share/fonts/redstone-9x"
@@ -1645,6 +1848,13 @@ mkdir -p "${GUEST_HOME}/.config/audacious"
 if [[ ! -f "${GUEST_HOME}/.config/audacious/config" ]]; then
   project_file "${HOME}/DotCortex/linux/.config/redstone-9x/audacious/config"     "${GUEST_HOME}/.config/audacious/config"
 fi
+
+# Redstone runtime spine and DOS bridge.
+"${GUEST_HOME}/.local/bin/redstone-9x-compat-init" --quiet
+"${GUEST_HOME}/.local/bin/redstone-9x-dosemu2-init"
+
+# ── Tear down any surviving prior session before launching fresh ──
+sanctuary-teardown-stale-session "${SANCTUARY}" "${DISPLAY_NUM}"
 
 # ── Xephyr ──
 Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -dpi 96 -no-host-grab &
@@ -1669,6 +1879,9 @@ DISPLAY="${DISPLAY_NUM}" xrandr --dpi 96 2>/dev/null || true
 # X font cursor (the plain Unix arrow).
 DISPLAY="${DISPLAY_NUM}" XCURSOR_THEME=Chicago95_Cursor_White XCURSOR_SIZE=24 XCURSOR_PATH="${HOME}/.icons:/usr/share/icons" xsetroot -cursor_name top_left_arrow -solid "#008080" 2>/dev/null || true
 
+# ── Shield trash:/// from host fleet NFS mounts (see sanctuary-trash-shield) ──
+sanctuary-trash-shield "${SANCTUARY}" "${HOME}"
+
 # ── Launch selected desktop ──
 if [[ "${DESKTOP}" == "fvwm95" ]]; then
   echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — starting FVWM95…"
@@ -1686,7 +1899,7 @@ if [[ "${DESKTOP}" == "fvwm95" ]]; then
     export LIBRARY_PATH=${GUEST_HOME}/.local/xclass/lib:\${LIBRARY_PATH:-}
     export LD_LIBRARY_PATH=${GUEST_HOME}/.local/xclass/lib:${GUIX_PROFILES}/desktop-common/desktop-common/lib:\${LD_LIBRARY_PATH:-}
     export OX_POOL=${GUEST_HOME}/.local/xclass/share/xclass-icons
-    export XDG_DATA_DIRS=${GUIX_PROFILES}/sanctuary-sx/sanctuary-sx/share:${GUIX_PROFILES}/room-windows-compat/room-windows-compat/share:${GUIX_PROFILES}/room-gaming/room-gaming/share:${GUIX_PROFILES}/desktop-common/desktop-common/share:/home/metsatron/.local/share/flatpak/exports/share:/usr/local/share:/usr/share
+    export XDG_DATA_DIRS=${GUIX_PROFILES}/room-windows-compat/room-windows-compat/share:${GUIX_PROFILES}/room-gaming/room-gaming/share:${GUIX_PROFILES}/desktop-common/desktop-common/share:/home/metsatron/.local/share/flatpak/exports/share:/usr/local/share:/usr/share
     bash ${HOME}/DotCortex/linux/.local/bin/sanctuary-redstone-9x-wineprefix-init
     export GTK_THEME=Windows-95
     # GTK3 overlay (auto-hide fading) scrollbars — disable for classic reserved-gutter
@@ -1748,7 +1961,7 @@ else
     export GDK_PIXBUF_MODULE_FILE=\${GUIX_PROFILE}/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache
     GUIX_PROFILE=${GUIX_PROFILES}/room-windows-compat/room-windows-compat
     . \${GUIX_PROFILE}/etc/profile
-    export XDG_DATA_DIRS=${GUIX_PROFILES}/sanctuary-sx/sanctuary-sx/share:${GUIX_PROFILES}/room-windows-compat/room-windows-compat/share:${GUIX_PROFILES}/room-gaming/room-gaming/share:${GUIX_PROFILES}/desktop-common/desktop-common/share:/home/metsatron/.local/share/flatpak/exports/share:/usr/local/share:/usr/share
+    export XDG_DATA_DIRS=${GUIX_PROFILES}/room-windows-compat/room-windows-compat/share:${GUIX_PROFILES}/room-gaming/room-gaming/share:${GUIX_PROFILES}/desktop-common/desktop-common/share:/home/metsatron/.local/share/flatpak/exports/share:/usr/local/share:/usr/share
     export XDG_CONFIG_DIRS=${GUIX_PROFILES}/room-windows-compat/room-windows-compat/etc/xdg:${GUIX_PROFILES}/room-gaming/room-gaming/etc/xdg:${GUIX_PROFILES}/desktop-common/desktop-common/etc/xdg:/etc/xdg
     export GSETTINGS_SCHEMA_DIR=${GUIX_PROFILES}/room-gaming/room-gaming/share/glib-2.0/schemas
     export WINEPREFIX=${GUEST_HOME}/.wine-redstone
@@ -3029,8 +3242,8 @@ AddToMenu "StartMenu@fvwm-menu.xpm@^#808080^"
 + "Games              %mini-solitaire.xpm%"      Popup Games
 + "Multimedia         %mini-cd.xpm%"            Popup Multimedia
 + "Terminals          %mini-term.xpm%"          Popup Terminals
++ "DOS / Windows      %mini-bomb.xpm%"          Popup DosWindows
 + "Wine Tools         %mini-x2.xpm%"            Popup WineTools
-+ "DOSBox-X           %mini-bomb.xpm%"          Exec dosbox-x &
 + ""                   Nop
 + "Restart FVWM95     %mini-turn.xpm%"          Restart
 + "Quit FVWM95        %mini-stop.xpm%"          Quit
@@ -3070,6 +3283,11 @@ AddToMenu "Terminals" "Terminals" Title
 + "Bash (CMD frame)"        Exec bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-bash-cmd -title "Command Prompt" -geometry 80x25 +sb -bg rgb:0c/0c/0c -fg rgb:cc/cc/cc -cr rgb:cc/cc/cc -fn "xft:Lucida Console:pixelsize=14:antialias=true" -e bash
 + "URxVT"                   Exec bash /home/metsatron/.local/bin/redstone-9x-run urxvt -name redstone-plain-urxvt -title "URxVT" -geometry 80x25 +sb -bg rgb:00/00/00 -fg rgb:d6/d3/ce -cr rgb:d6/d3/ce -fn "xft:Courier New:size=11:antialias=true,xft:monospace:size:11:antialias=true" -e bash
 + "XTerm"                   Exec bash /home/metsatron/.local/bin/redstone-9x-run xterm -title "XTerm" -geometry 80x25
+
+DestroyMenu "DosWindows"
+AddToMenu "DosWindows" "DOS / Windows" Title
++ "MS-DOS Prompt      %mini-bomb.xpm%"          Exec bash /home/metsatron/.local/bin/redstone-9x-run xterm -title "MS-DOS Prompt" -geometry 80x25 -fa "Perfect DOS VGA 437 Win" -fs 11 -bg black -fg "#c0c0c0" -e /home/metsatron/.local/bin/redstone-9x-dosemu2-shell &
++ "DOSBox-X           %mini-bomb.xpm%"          Exec /home/metsatron/.local/bin/redstone-9x-dosbox-x &
 
 DestroyMenu "WineTools"
 AddToMenu "WineTools" "Wine Tools" Title
@@ -3600,14 +3818,17 @@ menu "Terminals" utilities-terminal {
   prog "XTerm"               utilities-terminal  bash /home/metsatron/.local/bin/redstone-9x-run xterm -title "XTerm" -geometry 80x25
 }
 
+menu "DOS Compatibility" terminal {
+  prog "MS-DOS Prompt"  terminal  bash /home/metsatron/.local/bin/redstone-9x-run xterm -title "MS-DOS Prompt" -geometry 80x25 -fa "Perfect DOS VGA 437 Win" -fs 11 -bg black -fg "#c0c0c0" -e /home/metsatron/.local/bin/redstone-9x-dosemu2-shell
+  prog "DOSBox-X"       terminal  /home/metsatron/.local/bin/redstone-9x-dosbox-x
+}
+
 menu "Wine Tools" wine {
   prog "Wine Configurator"   wine   wine64 winecfg
   prog "Registry Editor"     wine   wine64 regedit
   prog "Windows Explorer"    wine   wine64 explorer
   prog "Notepad"             wine   wine64 notepad
 }
-
-prog "DOSBox-X"  terminal  bash /home/metsatron/.local/bin/redstone-9x-run dosbox-x
 
 separator
 
@@ -3657,6 +3878,57 @@ if command -v pnmixer >/dev/null 2>&1 \
   && ! pgrep -xu "$(id -u)" pnmixer >/dev/null 2>&1; then
   pnmixer >"${HOME}/.cache/redstone-9x/pnmixer.log" 2>&1 &
 fi
+
+# Recycle Bin icon state watcher: the static ~/Desktop/recycle-bin.desktop
+# launcher has no dynamic full/empty state on its own (GVFS's native trash
+# object would give us that for free, but room-gaming has no gvfs — a
+# 2026-07-07 retry of plain gvfs leaked the HOST's real Trash contents into
+# the sandboxed room via distrobox's /run/host bind mount — see
+# redstone-9x-state-digest.md). Poll the on-disk Trash folder instead and
+# rewrite Icon= directly; no new package required.
+if [ -x "${HOME}/.local/bin/redstone-9x-recycle-bin-watch" ] \
+  && ! pgrep -fu "$(id -u)" "redstone-9x-recycle-bin-watch" >/dev/null 2>&1; then
+  "${HOME}/.local/bin/redstone-9x-recycle-bin-watch" \
+    >"${HOME}/.cache/redstone-9x/recycle-bin-watch.log" 2>&1 &
+fi
+#+END_SRC
+
+Recycle Bin icon-state watcher.  PCManFM's own native trash desktop object
+would track full/empty state for free, but room-gaming deliberately has no
+=gvfs= (it crashes =pcmanfm --desktop= — see the running registry). This
+polls the plain on-disk Trash folder instead — no GVFS, no new package,
+just =ls=/=sed= against a path that already exists — and rewrites the
+static launcher's =Icon== key directly. =pcmanfm --desktop= already
+monitors =~/Desktop/= for content changes (that's how manual icon
+repositioning/renaming persists), so an in-place edit to the =.desktop=
+file's icon is picked up the same way.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-recycle-bin-watch :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+# Redstone 9X — Recycle Bin icon state watcher.
+# Toggles ~/Desktop/recycle-bin.desktop's Icon= between user-trash and
+# user-trash-full to match the real on-disk Trash folder, since the static
+# launcher has no dynamic state of its own (no gvfs in this room — see
+# redstone-9x-state-digest.md). Plain poll loop; no inotify dependency.
+set -euo pipefail
+
+TRASH_FILES="${XDG_DATA_HOME:-${HOME}/.local/share}/Trash/files"
+DESKTOP_ICON="${HOME}/Desktop/recycle-bin.desktop"
+
+while true; do
+  if [[ -d "${TRASH_FILES}" ]] && [[ -n "$(ls -A "${TRASH_FILES}" 2>/dev/null)" ]]; then
+    icon="user-trash-full"
+  else
+    icon="user-trash"
+  fi
+  # Compare against the file's ACTUAL current Icon= line, not a remembered
+  # in-process variable — a relaunch reprojects a fresh copy of this file
+  # over top of a still-running watcher, and an in-memory "last state" would
+  # never notice the reset, silently going stale (found 2026-07-07).
+  if [[ -f "${DESKTOP_ICON}" ]] && ! grep -qx "Icon=${icon}" "${DESKTOP_ICON}"; then
+    sed -i "s/^Icon=.*/Icon=${icon}/" "${DESKTOP_ICON}"
+  fi
+  sleep 3
+done
 #+END_SRC
 
 Win95 desktop icon declarations.  The launcher symlinks each file individually
@@ -3692,7 +3964,7 @@ Version=1.0
 Type=Application
 Name=Recycle Bin
 Comment=Browse the Recycle Bin
-Exec=pcmanfm trash:///
+Exec=sh -c 'pcmanfm "$HOME/.local/share/Trash/files"'
 Icon=user-trash
 Terminal=false
 #+END_SRC
@@ -3719,13 +3991,24 @@ Icon=utilities-terminal
 Terminal=false
 #+END_SRC
 
+#+BEGIN_SRC conf :tangle linux/.icewm/desktop/dosemu2.desktop
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=MS-DOS Prompt
+Comment=DOSEMU2 interactive DOS session
+Exec=bash /home/metsatron/.local/bin/redstone-9x-run xterm -title "MS-DOS Prompt" -geometry 80x25 -fa "Perfect DOS VGA 437 Win" -fs 11 -bg black -fg "#c0c0c0" -e /home/metsatron/.local/bin/redstone-9x-dosemu2-shell
+Icon=utilities-terminal
+Terminal=false
+#+END_SRC
+
 #+BEGIN_SRC conf :tangle linux/.icewm/desktop/dosbox-x.desktop
 [Desktop Entry]
 Version=1.0
 Type=Application
 Name=DOSBox-X
-Comment=DOS and Win9x emulator
-Exec=/home/metsatron/.local/bin/redstone-9x-run dosbox-x
+Comment=DOSBox-X compatibility lane
+Exec=/home/metsatron/.local/bin/redstone-9x-dosbox-x
 Icon=utilities-terminal
 Terminal=false
 #+END_SRC
@@ -4046,6 +4329,21 @@ export TERM="${TERM:-xterm-256color}"
 export POWERSHELL_UPDATECHECK=Off
 export DOTNET_CLI_TELEMETRY_OPTOUT=1
 
+# .NET 8 System.Console locates the terminfo database via $TERMINFO, ~/.terminfo,
+# then fixed roots (/usr/share/terminfo, ...) -- it NEVER consults $TERMINFO_DIRS.
+# Inside this rootless Distrobox container /usr/share/terminfo has no 'xterm'
+# entry (only /run/host/usr/share/terminfo/x/xterm does), so .NET loads no
+# terminfo, CursorAddress (cup) is null, Console.SetCursorPosition silently
+# emits nothing while still caching the move, and PSReadLine's full-buffer
+# redraw never repositions to the prompt origin -> the interactive "smear".
+# CPR (ESC[6n) is unaffected because .NET hard-codes it.  Point .NET at the
+# host terminfo tree so cup is emitted and the redraw is correct.  (Root cause
+# confirmed 2026-07-06 via strace: openat of the host xterm entry + 26 CUP
+# writes appear, smear gone.)
+if [ -d /run/host/usr/share/terminfo ]; then
+  export TERMINFO=/run/host/usr/share/terminfo
+fi
+
 # Let pwsh handle the TTY directly.  PSReadLine (PowerShell 7's readline
 # engine) sets raw terminal mode itself and handles all echoing; running
 # stty -echo before launch creates a double-echo conflict with PSReadLine.
@@ -4070,6 +4368,377 @@ while ($true) {
         Write-Error $_
     }
 }
+#+END_SRC
+
+** Redstone runtime spine
+
+Redstone's shared compatibility substrate lives under =~/.compat/=.  The
+runtime root is intentionally Unix-centric and host-visible, while DOS-visible
+layout is a generated projection layered over it.
+
+Current spine:
+
+- =~/.compat/imports/retropie-dosbox-pure/= — DOSBox Pure collection manifests
+- =~/.compat/imports/retropie-ports/= — symlink-aware ports manifests
+- =~/.compat/library/= — future canonical content roots
+- =~/.compat/generated/dos/c/REDSTONE/= — DOS-visible projection for DOSEMU2
+- =~/.compat/state/= — lane-private mutable state
+- =~/.compat/machines/dosbox-x/= — Windows 3.1 / Win9x machine folders
+
+The current live RetroPie topology is recorded exactly, not inferred:
+
+- EmulationStation =ports= logical path: =~/RetroPie/roms/ports=
+- Physical backing directory: =~/RetroPie/isos/ports=
+- The logical path is currently a symlink to the backing directory
+- DOSBox Pure PC/DOS collection: =~/RetroPie/isos/pc= (separate import surface)
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-compat-init :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+QUIET=0
+if [[ "${1:-}" == "--quiet" ]]; then
+  QUIET=1
+  shift
+fi
+
+COMPAT_ROOT="${REDSTONE_COMPAT_ROOT:-${HOME}/.compat}"
+
+mkdir -p \
+  "${COMPAT_ROOT}/imports/retropie-dosbox-pure" \
+  "${COMPAT_ROOT}/imports/retropie-ports" \
+  "${COMPAT_ROOT}/library/media/floppy" \
+  "${COMPAT_ROOT}/library/media/cdrom" \
+  "${COMPAT_ROOT}/library/media/iso" \
+  "${COMPAT_ROOT}/library/dos/apps" \
+  "${COMPAT_ROOT}/library/dos/toolchains" \
+  "${COMPAT_ROOT}/library/games" \
+  "${COMPAT_ROOT}/library/ports/engines" \
+  "${COMPAT_ROOT}/library/ports/families" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/USR/BIN" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/ETC" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/OPT" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/SHARE" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/HOME" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/TMP" \
+  "${COMPAT_ROOT}/generated/dos/c/REDSTONE/VAR" \
+  "${COMPAT_ROOT}/generated/dosemu2" \
+  "${COMPAT_ROOT}/generated/dosbox-x" \
+  "${COMPAT_ROOT}/generated/dosbox-staging" \
+  "${COMPAT_ROOT}/generated/retroarch" \
+  "${COMPAT_ROOT}/generated/desktop" \
+  "${COMPAT_ROOT}/state/shared" \
+  "${COMPAT_ROOT}/state/apps" \
+  "${COMPAT_ROOT}/state/dosemu2" \
+  "${COMPAT_ROOT}/state/dosbox-x" \
+  "${COMPAT_ROOT}/state/dosbox-staging" \
+  "${COMPAT_ROOT}/state/retroarch" \
+  "${COMPAT_ROOT}/state/86box" \
+  "${COMPAT_ROOT}/state/wine" \
+  "${COMPAT_ROOT}/state/proton" \
+  "${COMPAT_ROOT}/state/lutris" \
+  "${COMPAT_ROOT}/machines/dosbox-x/win31-standard" \
+  "${COMPAT_ROOT}/machines/dosbox-x/win31-upgraded" \
+  "${COMPAT_ROOT}/machines/dosbox-x/win95" \
+  "${COMPAT_ROOT}/machines/dosbox-x/win98se" \
+  "${COMPAT_ROOT}/machines/86box"
+
+if (( ! QUIET )); then
+  echo "redstone-9x-compat-init: initialised ${COMPAT_ROOT}"
+fi
+#+END_SRC
+
+** RetroPie import manifests
+
+Inventory is manifest-first.  The ports tree is treated as one corpus with a
+stable frontend alias and a physical backing directory; the script records both
+without pretending they are separate permanent imports.
+
+#+BEGIN_SRC python :tangle linux/.local/bin/redstone-9x-import-manifest :shebang "#!/usr/bin/env python3"
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+from datetime import datetime, timezone
+
+
+HOME = Path.home()
+COMPAT_ROOT = Path(os.environ.get("REDSTONE_COMPAT_ROOT", HOME / ".compat"))
+RETROPIE = HOME / "RetroPie"
+LAUNCHER_SUFFIXES = {".sh", ".desktop", ".cfg", ".bat"}
+
+
+def stamp():
+    return datetime.now(timezone.utc).strftime("manifest-%Y%m%dT%H%M%SZ")
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def iter_entries(root: Path, compute_sha256: bool):
+    """Stream (rel_path, kind, size, mtime, sha256, target) top-down.
+    Never descends into symlinked directories (os.walk followlinks=False).
+    Prints one progress line per top-level directory entered, so a long
+    corpus never runs silent."""
+    last_top = None
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+        dirnames.sort()
+        filenames.sort()
+        rel_dir = Path(dirpath).relative_to(root)
+        top = rel_dir.parts[0] if rel_dir.parts else "."
+        if top != last_top:
+            print(f"[redstone-9x-import-manifest] scanning {top}/", file=sys.stderr)
+            last_top = top
+        for name in dirnames:
+            entry = Path(dirpath) / name
+            if entry.is_symlink():
+                rel = entry.relative_to(root)
+                st = entry.lstat()
+                yield rel, "symlink", st.st_size, int(st.st_mtime), "", os.readlink(entry)
+        for name in filenames:
+            entry = Path(dirpath) / name
+            rel = entry.relative_to(root)
+            st = entry.lstat()
+            if entry.is_symlink():
+                yield rel, "symlink", st.st_size, int(st.st_mtime), "", os.readlink(entry)
+            elif stat.S_ISREG(st.st_mode):
+                digest = sha256_file(entry) if compute_sha256 else ""
+                yield rel, "file", st.st_size, int(st.st_mtime), digest, ""
+            else:
+                yield rel, "other", st.st_size, int(st.st_mtime), "", ""
+
+
+def write_manifest(root: Path, outdir: Path, compute_sha256: bool):
+    """Write inventory.tsv incrementally (one flush per row, never held
+    in memory as a full list) and return per-top-level-directory
+    aggregates plus launcher/config filenames for the summary manifest."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    top_stats = {}
+    launchers = []
+    total_rows = 0
+    with (outdir / "inventory.tsv").open("w", encoding="utf-8") as fh:
+        fh.write("path\tkind\tsize\tmtime\tsha256\ttarget\n")
+        for rel, kind, size, mtime, digest, target in iter_entries(root, compute_sha256):
+            fh.write(f"{rel}\t{kind}\t{size}\t{mtime}\t{digest}\t{target}\n")
+            fh.flush()
+            total_rows += 1
+            if kind == "file":
+                top = rel.parts[0] if rel.parts else str(rel)
+                bucket = top_stats.setdefault(top, {"files": 0, "size": 0})
+                bucket["files"] += 1
+                bucket["size"] += size
+                if rel.suffix.lower() in LAUNCHER_SUFFIXES:
+                    launchers.append(str(rel))
+    print(f"[redstone-9x-import-manifest] {total_rows} entries recorded", file=sys.stderr)
+    return top_stats, launchers
+
+
+def write_json(path: Path, payload):
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+
+
+def write_reference_scan(path: Path, root: Path):
+    needles = ("RetroPie/roms/ports", "RetroPie/isos/ports", "RetroPie/isos/pc")
+    suffixes = {".sh", ".cfg", ".xml", ".desktop", ".txt", ".org"}
+    hits = []
+    for candidate in sorted(root.rglob("*")):
+        if candidate.is_dir() or candidate.suffix.lower() not in suffixes:
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if any(needle in line for needle in needles):
+                hits.append((str(candidate.relative_to(root)), lineno, line))
+    with path.open("w", encoding="utf-8") as fh:
+        for rel, lineno, line in hits:
+            fh.write(f"{rel}:{lineno}:{line}\n")
+
+
+def manifest_ports(compute_sha256: bool):
+    logical = RETROPIE / "roms" / "ports"
+    physical = logical.resolve()
+    outdir = COMPAT_ROOT / "imports" / "retropie-ports" / stamp()
+    print(f"[redstone-9x-import-manifest] ports: {logical} -> {physical}", file=sys.stderr)
+    top_stats, launchers = write_manifest(logical, outdir, compute_sha256)
+    write_json(outdir / "manifest.json", {
+        "kind": "ports",
+        "logical_root": str(logical),
+        "physical_root": str(physical),
+        "logical_is_symlink": logical.is_symlink(),
+        "logical_symlink_target": os.readlink(logical) if logical.is_symlink() else "",
+        "hashed": compute_sha256,
+        "top_level": top_stats,
+        "launcher_files": launchers,
+        "notes": "EmulationStation-facing logical path with physical backing directory recorded separately. roms/ports and isos/ports are one corpus (symlink), not two imports to reconcile.",
+    })
+    (outdir / "logical-root.txt").write_text(str(logical) + "\n")
+    (outdir / "physical-root.txt").write_text(str(physical) + "\n")
+    (outdir / "symlink-topology.txt").write_text(
+        f"{logical} -> {os.readlink(logical) if logical.is_symlink() else '(not a symlink)'}\n"
+        f"resolved: {physical}\n"
+    )
+    write_reference_scan(outdir / "path-references.txt", physical)
+    print(outdir)
+
+
+def manifest_dosbox_pure(compute_sha256: bool):
+    root = RETROPIE / "isos" / "pc"
+    outdir = COMPAT_ROOT / "imports" / "retropie-dosbox-pure" / stamp()
+    print(f"[redstone-9x-import-manifest] dosbox-pure: {root}", file=sys.stderr)
+    top_stats, launchers = write_manifest(root, outdir, compute_sha256)
+    write_json(outdir / "manifest.json", {
+        "kind": "dosbox-pure",
+        "source_root": str(root),
+        "hashed": compute_sha256,
+        "top_level": top_stats,
+        "launcher_files": launchers,
+        "notes": "Independent DOSBox Pure PC/DOS collection. Separate from ports topology.",
+    })
+    write_reference_scan(outdir / "path-references.txt", root)
+    print(outdir)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="redstone-9x-import-manifest",
+        description="Inventory a single Redstone 9X RetroPie import target. "
+                     "Shallow metadata by default; no recursive SHA-256 unless --sha256 is passed.",
+    )
+    parser.add_argument(
+        "target", choices=["ports", "dosbox-pure"],
+        help="which corpus to inventory — always explicit, there is no 'all'",
+    )
+    parser.add_argument(
+        "--sha256", action="store_true",
+        help="compute a SHA-256 digest per file (slow, recursive; off by default)",
+    )
+    args = parser.parse_args()
+
+    if args.target == "ports":
+        manifest_ports(args.sha256)
+    else:
+        manifest_dosbox_pure(args.sha256)
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
+
+** DOSEMU2 bridge scaffold
+
+DOSEMU2 uses the Redstone runtime spine's generated DOS projection.  The mutable
+guest DOS bridge remains under =~/.dosemu/=, but =C:\REDSTONE= is backed by the
+host-visible =~/.compat/generated/dos/c/REDSTONE= tree.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-dosemu2-init :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+COMPAT_BIN="${HOME}/.local/bin/redstone-9x-compat-init"
+[[ -x "${COMPAT_BIN}" ]] && "${COMPAT_BIN}" --quiet
+
+DOSEMU_HOME="${HOME}/.dosemu"
+DRIVE_C="${DOSEMU_HOME}/drive_c"
+GENERATED_ROOT="${REDSTONE_COMPAT_ROOT:-${HOME}/.compat}/generated/dos/c/REDSTONE"
+REDSTONE_LINK="${DRIVE_C}/redstone"
+BIN_DIR="${GENERATED_ROOT}/USR/BIN"
+ETC_DIR="${GENERATED_ROOT}/ETC"
+OPT_DIR="${GENERATED_ROOT}/OPT"
+SHARE_DIR="${GENERATED_ROOT}/SHARE"
+HOME_DIR="${GENERATED_ROOT}/HOME"
+TMP_DIR="${GENERATED_ROOT}/TMP"
+VAR_DIR="${GENERATED_ROOT}/VAR"
+HOOK_BAT="${DRIVE_C}/userhook.bat"
+HOOK_SYS="${DRIVE_C}/userhook.sys"
+
+mkdir -p "${DRIVE_C}" "${BIN_DIR}" "${ETC_DIR}" "${OPT_DIR}" "${SHARE_DIR}" "${HOME_DIR}" "${TMP_DIR}" "${VAR_DIR}"
+if [[ ! -e "${REDSTONE_LINK}" || -L "${REDSTONE_LINK}" ]]; then
+  ln -sfnT "${GENERATED_ROOT}" "${REDSTONE_LINK}"
+fi
+
+cat > "${HOOK_BAT}" <<'EOF'
+@ECHO OFF
+SET REDSTONE_HOME=C:\REDSTONE
+SET PATH=C:\REDSTONE\USR\BIN;%PATH%
+SET TEMP=C:\REDSTONE\TMP
+SET TMP=C:\REDSTONE\TMP
+IF EXIST C:\REDSTONE\ETC\AUTOEXEC.BAT CALL C:\REDSTONE\ETC\AUTOEXEC.BAT
+EOF
+
+if [[ ! -f "${HOOK_SYS}" ]]; then
+  cat > "${HOOK_SYS}" <<'EOF'
+REM Redstone 9X DOSEMU2 hook placeholder.
+REM Add CONFIG.SYS-style directives here only when a DOS program needs them.
+EOF
+fi
+
+if [[ ! -f "${BIN_DIR}/README.BAT" ]]; then
+  cat > "${BIN_DIR}/README.BAT" <<'EOF'
+@ECHO OFF
+ECHO Redstone 9X DOS launchers live in C:\REDSTONE\USR\BIN
+ECHO Unix-side wrappers live at ~/.local/bin/redstone-9x-dos-*
+EOF
+fi
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-dos :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+DOTCORTEX_BIN="${HOME}/.local/bin"
+BIN_DIR="${REDSTONE_COMPAT_ROOT:-${HOME}/.compat}/generated/dos/c/REDSTONE/USR/BIN"
+
+"${DOTCORTEX_BIN}/redstone-9x-dosemu2-init"
+
+if ! command -v dosemu >/dev/null 2>&1; then
+  echo "redstone-9x-dos: dosemu not found in room-windows-compat" >&2
+  echo "  Current state: wrapper scaffold is ready, package provisioning is still pending." >&2
+  exit 127
+fi
+
+if (( $# == 0 )); then
+  exec dosemu -K "${BIN_DIR}" -T
+fi
+
+launcher="$1"
+match="$(
+  find "${BIN_DIR}" -maxdepth 1 -type f \
+    \( -iname "${launcher}" -o -iname "${launcher}.bat" \) \
+    | sort \
+    | head -n 1
+)"
+
+if [[ -z "${match}" ]]; then
+  echo "redstone-9x-dos: launcher not found: ${launcher}" >&2
+  echo "  Expected a .bat file under ${BIN_DIR}" >&2
+  exit 1
+fi
+
+exec dosemu -K "${BIN_DIR}" -E "$(basename "${match}")"
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-dosemu2-shell :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+exec "${HOME}/.local/bin/redstone-9x-dos"
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-dosbox-x :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+if ! command -v dosbox-x >/dev/null 2>&1; then
+  echo "redstone-9x-dosbox-x: dosbox-x not found in room-windows-compat" >&2
+  exit 127
+fi
+
+exec dosbox-x "$@"
 #+END_SRC
 
 ** Audacious profile
@@ -4280,7 +4949,8 @@ Guix package availability queried against current channel (2026-06-25).
 | VLC                   | =vlc=                 | native            | room-windows-compat*   | guest home              |
 | Audacity              | =audacity=            | native            | room-windows-compat*   | guest home              |
 | mGBA                  | =mgba=                | native            | room-windows-compat*   | guest home              |
-| DOSBox-X              | local package         | native            | room-windows-compat    | guest home              |
+| DOSEMU2               | bridge + wrapper scaffold | native        | room-windows-compat    | =~/.dosemu/= plus =~/.compat/= |
+| DOSBox-X              | local package (compat lane) | native    | room-windows-compat    | guest home              |
 | Firefox ESR           | =firefox-esr= (nongnu)| native            | room-windows-compat*   | guest home              |
 | IceCat                | =icecat=              | native            | room-windows-compat*   | guest home              |
 | PowerShell            | local binary pkg      | native            | room-windows-compat    | guest home              |
@@ -4709,8 +5379,26 @@ gtk-decoration-layout=:
 [Desktop Entry]
 Type=Application
 Name=Colemak keyboard layout
-Exec=/run/host/usr/bin/setxkbmap -layout us -variant colemak -option terminate:ctrl_alt_bksp
+Exec=sanctuary-sx-colemak-apply
 NoDisplay=true
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-sx-colemak-apply :shebang "#!/usr/bin/env bash" :mkdirp yes
+set -euo pipefail
+
+if [[ -x /run/host/usr/bin/setxkbmap ]]; then
+  exec /run/host/usr/bin/setxkbmap -layout us -variant colemak -option terminate:ctrl_alt_bksp
+fi
+
+if command -v setxkbmap >/dev/null 2>&1; then
+  exec "$(command -v setxkbmap)" -layout us -variant colemak -option terminate:ctrl_alt_bksp
+fi
+
+if [[ -x /usr/bin/setxkbmap ]]; then
+  exec /usr/bin/setxkbmap -layout us -variant colemak -option terminate:ctrl_alt_bksp
+fi
+
+exit 0
 #+END_SRC
 
 #+BEGIN_SRC conf :tangle linux/.config/sanctuary-sx/xfconf/.gitignore :mkdirp yes
@@ -4915,6 +5603,10 @@ if [[ -f "${HOME}/DotCortex/linux/.local/bin/sanctuary-sx-fastfetch-grid" ]]; th
   mkdir -p "${GUEST_HOME}/.local/bin"
   ln -sfnT "${HOME}/DotCortex/linux/.local/bin/sanctuary-sx-fastfetch-grid" "${GUEST_HOME}/.local/bin/sanctuary-sx-fastfetch-grid"
 fi
+if [[ -f "${HOME}/DotCortex/linux/.local/bin/sanctuary-sx-colemak-apply" ]]; then
+  mkdir -p "${GUEST_HOME}/.local/bin"
+  ln -sfnT "${HOME}/DotCortex/linux/.local/bin/sanctuary-sx-colemak-apply" "${GUEST_HOME}/.local/bin/sanctuary-sx-colemak-apply"
+fi
 if [[ -f "${HOME}/DotCortex/linux/.local/bin/firefox" ]]; then
   mkdir -p "${GUEST_HOME}/.local/bin"
   ln -sfnT "${HOME}/DotCortex/linux/.local/bin/firefox" "${GUEST_HOME}/.local/bin/firefox"
@@ -4953,6 +5645,9 @@ if [[ -f "${DOTCORTEX_SX}/audacious/config" ]] && [[ ! -e "${GUEST_HOME}/.config
   cp -f "${DOTCORTEX_SX}/audacious/config" "${GUEST_HOME}/.config/audacious/config"
 fi
 
+# ── Tear down any surviving prior session before launching fresh ──
+sanctuary-teardown-stale-session "${SANCTUARY}" "${DISPLAY_NUM}"
+
 Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -no-host-grab &
 XEPHYR_PID=$!
 trap "kill ${XEPHYR_PID} 2>/dev/null || true" EXIT
@@ -4980,6 +5675,9 @@ sanctuary-clip-bridge "${HOST_DISPLAY}" "${DISPLAY_NUM}" &
 CLIP_BRIDGE_PID=$!
 trap "kill ${XEPHYR_PID} ${CLIP_BRIDGE_PID} ${KEYMAP_GUARD_PID} 2>/dev/null || true" EXIT
 
+# ── Shield trash:/// from host fleet NFS mounts (see sanctuary-trash-shield) ──
+sanctuary-trash-shield "${SANCTUARY}" "${HOME}"
+
 echo "${SANCTUARY}: Xephyr ${DISPLAY_NUM} ready — sourcing Guix profiles and starting XFCE…"
 DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   GUIX_PROFILE=${GUIX_PROFILES}/desktop-common/desktop-common
@@ -4992,6 +5690,21 @@ DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   export GTK_CSD=0
   export GTK_OVERLAY_SCROLLING=0
   export LIBOVERLAY_SCROLLBAR=0
+  # The SX room does not use portal file pickers, and fcitx5/tumbler can
+  # otherwise drag xdg-desktop-portal + document portal activation into the
+  # session, producing long startup stalls and FUSE timeout noise.
+  export GTK_USE_PORTAL=0
+  export GIO_USE_PORTAL=0
+  # gvfs tries to spawn gvfsd-fuse via fusermount3 inside the sanctuary. That
+  # binary is not present in the room contract, and the failed FUSE mount path
+  # is just noise/risk here: SX needs gvfs' D-Bus backends for thunar trash:///
+  # and volume metadata, not the ~/.gvfs FUSE mirror.
+  export GVFS_DISABLE_FUSE=1
+  # Suppress the at-spi2 accessibility bridge: each GTK app launched inside
+  # dbus-run-session otherwise spawns its own at-spi2 bus daemon (1 inotify
+  # instance each, never reaped) and can saturate max_user_instances=128.
+  # sanctuary-sx does not need accessibility services for the default room.
+  export NO_AT_BRIDGE=1
   exec dbus-run-session sh -c 'gamemoded -d >/dev/null 2>&1 || true; exec startxfce4'
 "
 
@@ -5541,4 +6254,140 @@ export NO_AT_BRIDGE=1
 DSDMINE_DIR="${HOME}/.local/share/dsdmine"
 cd "${DSDMINE_DIR}"
 exec "${DSDMINE_DIR}/dsdmine" "$@"
+#+END_SRC
+
+* Host-facing sanctuary menu launchers
+
+Freedesktop =.desktop= entries that surface each sanctuary — and each spin — in the host application menu, so a sanctuary can be started from the launcher instead of a terminal. They live in the =linux/= overlay (sanctuaries are Guix/Distrobox/Xephyr, i.e. Linux-only) and stow to =~/.local/share/applications/=. Each =Exec= is an absolute path to the sanctuary's launch script; each =Icon= is an absolute path into the themed icon pack that matches that sanctuary's own identity — Chicago95 (Windows 9x) for Redstone 9X, Irixium for Godzilla XS-86000, and the SGI-family Iris / indigo-reality packs for the CDE (Motif/Sun) and GNUstep (NeXT) workstations — so each tile reads correctly regardless of the host icon theme. Only =sanctuary-redstone-9x= has multiple spins (IceWM by default, FVWM95), selected through the =SANCTUARY_DESKTOP= environment variable the launcher already reads; every other sanctuary is single-desktop. The RetroPie launcher and its host entry live in =retropie.org= alongside that sanctuary's own launch script.
+
+Every entry's =Exec= goes through the shim =sanctuary-menu-launch= rather than calling the launch script directly. A desktop-menu launch inherits the graphical session's environment, which lacks both the Guix core profile (where =distrobox= lives) and =~/.local/bin= (the =sanctuary-*= helpers); the launch scripts run =set -e= and call those bare, so the first one hits command-not-found and the launch dies silently (=Terminal=false= means no visible error). The shim rebuilds a login-like environment — sourcing the Guix profiles exactly as =.zshenv= does for a terminal, then prepending =~/.local/bin= — before exec'ing the real launcher. It is invoked by absolute path so it resolves without any pre-existing =PATH=.
+
+** sanctuary-menu-launch shim
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-menu-launch :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# sanctuary-menu-launch — host-menu shim for the sanctuary .desktop launchers.
+# Rebuild the login-like environment a terminal would have (Guix profiles +
+# ~/.local/bin) so the launch scripts' bare host commands (distrobox,
+# sanctuary-exec, sanctuary-teardown-stale-session, …) resolve, then exec the
+# real launcher. See the org prose above for why this indirection is needed.
+set -eo pipefail
+
+for _prof in "${HOME}/.config/guix/current" "${HOME}/.guix-extra-profiles/core/core"; do
+  [ -r "${_prof}/etc/profile" ] && . "${_prof}/etc/profile"
+done
+export PATH="${HOME}/.local/bin:${PATH}"
+
+sanctuary="${1:?usage: sanctuary-menu-launch <qtile|gnustep|cde|redstone-9x|sx|retropie> [spin]}"
+case "${sanctuary}" in
+  qtile|gnustep|cde|sx|retropie)
+    exec "sanctuary-${sanctuary}-launch" ;;
+  redstone-9x)
+    export SANCTUARY_DESKTOP="${2:-icewm}"
+    exec sanctuary-redstone-9x-launch ;;
+  *)
+    echo "sanctuary-menu-launch: unknown sanctuary '${sanctuary}'" >&2
+    exit 2 ;;
+esac
+#+END_SRC
+
+** Emacs Sanctuary (sanctuary-qtile)
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/sanctuary-qtile.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Emacs Sanctuary
+GenericName=Distrobox Sanctuary
+Comment=Qtile window manager + multi-Emacs sanctuary (Distrobox/Xephyr)
+Exec=/home/metsatron/.local/bin/sanctuary-menu-launch qtile
+Icon=/home/metsatron/.local/share/icons/BeOS-r5-Icons/apps/48/emacs.png
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=sanctuary;distrobox;qtile;emacs;
+#+END_SRC
+
+** GNU/NeXT Sanctuary (sanctuary-gnustep)
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/sanctuary-gnustep.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=GNU/NeXT Sanctuary
+GenericName=Distrobox Sanctuary
+Comment=Window Maker + GNUstep NeXTSTEP-lineage sanctuary (Distrobox/Xephyr)
+Exec=/home/metsatron/.local/bin/sanctuary-menu-launch gnustep
+Icon=/home/metsatron/.local/share/icons/indigo-reality/devices/48/computer.svg
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=sanctuary;distrobox;gnustep;windowmaker;nextstep;
+#+END_SRC
+
+** CDE — Motif/Sun Sanctuary (sanctuary-cde)
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/sanctuary-cde.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=CDE — Motif/Sun Sanctuary
+GenericName=Distrobox Sanctuary
+Comment=Common Desktop Environment 2.5.3 (Motif/Sun) sanctuary (Distrobox/Xephyr)
+Exec=/home/metsatron/.local/bin/sanctuary-menu-launch cde
+Icon=/home/metsatron/.local/share/icons/Iris/scalable/devices/computer.svg
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=sanctuary;distrobox;cde;motif;solaris;
+#+END_SRC
+
+** Redstone 9X — IceWM spin (sanctuary-redstone-9x)
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/sanctuary-redstone-9x-icewm.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Redstone 9X (IceWM)
+GenericName=Distrobox Sanctuary
+Comment=Windows 9x-themed IceWM sanctuary (Distrobox/Xephyr)
+Exec=/home/metsatron/.local/bin/sanctuary-menu-launch redstone-9x icewm
+Icon=/home/metsatron/.local/share/icons/Chicago95/devices/48/computer.png
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=sanctuary;distrobox;redstone;windows;icewm;
+#+END_SRC
+
+** Redstone 9X — FVWM95 spin (sanctuary-redstone-9x)
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/sanctuary-redstone-9x-fvwm95.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Redstone 9X (FVWM95)
+GenericName=Distrobox Sanctuary
+Comment=Windows 9x-themed FVWM95 sanctuary (Distrobox/Xephyr)
+Exec=/home/metsatron/.local/bin/sanctuary-menu-launch redstone-9x fvwm95
+Icon=/home/metsatron/.local/share/icons/Chicago95/devices/48/monitor.png
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=sanctuary;distrobox;redstone;windows;fvwm95;
+#+END_SRC
+
+** Godzilla XS-86000 (sanctuary-sx)
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/sanctuary-sx.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Godzilla XS-86000
+GenericName=Sharp X68000 Habitat
+Comment=Godzilla XS-86000 — Sharp X68000 / SX-Window XFCE sanctuary (Distrobox/Xephyr)
+Exec=/home/metsatron/.local/bin/sanctuary-menu-launch sx
+Icon=/home/metsatron/.local/share/icons/Irixium/48x48/devices/computer.png
+Terminal=false
+StartupNotify=false
+Categories=System;
+Keywords=sanctuary;distrobox;godzilla;x68000;sx;
 #+END_SRC

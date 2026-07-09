@@ -7,6 +7,6 @@ weight: 2
 
 Full name: **Mineshaft Whistler Redstone 9X First Edition™ Plus**. If you know, you know.
 
-Redstone 9X is the gaming wing's first sanctuary: a container wearing the full desktop grammar of a late-1990s PC — teal desktop, battleship-grey chrome, and window furniture that behaves the way window furniture used to behave. Under the period costume it is a modern, declared system: IceWM shaped to the era, DOSBox-X for the DOS strata, source ports for the classics, and every launcher declared in DotCortex source rather than hand-installed — the whole thing rebuildable from the repo.
+Redstone 9X is the gaming wing's first sanctuary: a container wearing the full desktop grammar of a late-1990s PC — teal desktop, battleship-grey chrome, and window furniture that behaves the way window furniture used to behave. Under the period costume it is a modern, declared system: IceWM shaped to the era, a DOSEMU2 terminal lane, a DOSBox-X compatibility lane, source ports for the classics, and a host-visible `.compat/` runtime spine that records how RetroPie collections, DOS projections, and per-lane state relate without flattening them into one folder. Every launcher is declared in DotCortex source rather than hand-installed — the whole thing rebuildable from the repo.
 
 The point is not nostalgia for its own sake. The point is that the era's software is still excellent, still runs, and deserves a home that treats it as a living catalogue rather than a zip file in a downloads folder. Screenshots when the drywall is up.

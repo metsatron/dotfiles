@@ -7,12 +7,15 @@
 ;; Categories:
 ;; - *Guix standard*: =wine64=, =fontconfig=
 ;; - *nonguix channel*: =winetricks=
-;; - *Local package defs* (=all/.config/guix/local-packages/=): =powershell=, =dosbox-x=
+;; - *Local package defs* (=all/.config/guix/local-packages/=): =powershell=, =dosbox-x= (integrated Redstone compatibility lane while the =DOSEMU2= package recipe catches up)
 
 
 ;; [[file:../../../../../guix.org::*room-windows-compat][room-windows-compat:1]]
 ;; Virtual Habitat — room-windows-compat Guix profile
 ;; Windows compatibility layer: Wine, fonts, terminal runtimes, DOS emulation.
+;; Redstone's active DOS direction is DOSEMU2 for terminal-clean DOS work, while
+;; DOSBox-X remains an integrated compatibility lane for mouse-heavy DOS,
+;; Windows 3.x, and booted Win9x profiles until the DOSEMU2 package recipe is declared.
 ;; Apply: make guix-room-windows-compat   (uses -L for local package defs)
 (use-modules (gnu packages wine)          ; wine64
              (nongnu packages wine)       ; winetricks
