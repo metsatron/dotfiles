@@ -30,8 +30,19 @@ if ! registrar_has_owner; then
   fi
 
   if [ -n "${APPMENU_REGISTRAR}" ]; then
-    # Keep the registrar alive after the helper shell exits.
-    nohup "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 &
+    # `-r` only references an existing primary instance; it cannot start one.
+    # Start the primary as the D-Bus service file does, then hold it with `-r`
+    # so it does not auto-quit after ~10 s idle.
+    nohup "$APPMENU_REGISTRAR" --gapplication-service >/dev/null 2>&1 &
+    for _i in 1 2 3 4 5 6; do
+      sleep 0.5
+      registrar_has_owner && break
+    done
+    # Foreground, bounded: `-r` returns in milliseconds once a primary owns the
+    # name, and its hold is what stops the registrar idle-quitting after ~10 s.
+    if registrar_has_owner; then
+      timeout 5 "$APPMENU_REGISTRAR" -r >/dev/null 2>&1 || true
+    fi
   fi
 fi
 
