@@ -14,10 +14,22 @@ MIMETYPE="$(file --dereference --brief --mime-type -- "${FILE_PATH}")"
 
 preview_text() {
   if command -v /home/metsatron/.cargo/bin/bat >/dev/null 2>&1; then
+    # --theme=base16: bat's "base16" theme maps syntax roles onto the 16 base
+    # ANSI color slots (0-15) rather than hardcoding hex, and those exact 16
+    # slots are already wired to the LainCore/DreamWeave base16 palette in
+    # kitty.conf/WezTerm (color0-15, see style.org emit-kitty). That makes the
+    # preview pane inherit LainCore automatically and stay correct if the
+    # palette is ever retuned in style.org, with no duplicated hex here.
+    # base16-256 was rejected: its non-syntax roles fall back to the fixed
+    # xterm 256-cube, which our terminal configs do not remap, so it would
+    # drift from the theme. Plain "ansi" was rejected too: it drops down to
+    # bare SGR with far fewer distinguished syntax roles than base16 offers
+    # while inheriting the same terminal palette.
     /home/metsatron/.cargo/bin/bat \
       --color=always \
       --style=plain \
       --paging=never \
+      --theme=base16 \
       --terminal-width="${PV_WIDTH:-80}" \
       -- "${FILE_PATH}" && exit 5
   fi
