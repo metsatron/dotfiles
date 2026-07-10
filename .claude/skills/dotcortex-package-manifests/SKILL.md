@@ -14,3 +14,4 @@ Use this for package-manifest edits in DotCortex: pip, npm, guix, flatpak, snap,
 - Re-tangle before applying.
 - Prefer manager-specific Loom verbs when available.
 - Do not invent a new manifest layout for an existing manager.
+- **Category-manifest law (Mètsàtron, sealed 2026-07-10): NEVER create a new per-package .org file.** Package installs go in the manager's manifest org (cargo.org, guix.org, ...); package CONFIG goes in the existing category org that owns its domain (terminal tools → term.org, X desktop userland → x11.org, multiplexers → mux.org, theming → style.org, ...). Offenders already absorbed: yazi.org → term.org, rofi.org → x11.org. If no category org fits, ask Mètsàtron — do not mint one per package.
