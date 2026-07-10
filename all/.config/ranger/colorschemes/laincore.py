@@ -48,7 +48,7 @@ WARN     = 136  # base0A
 ACTIVE   = 71   # base0B
 ACCENT   = 38   # base0C
 DIR_BLUE = 32   # base0D — kept for vcsinfo/titlebar roles
-DIR_YELLOW = 178  # folders: unmistakable gold-yellow per Mètsàtron's call 2026-07-10 (brighter than base0A's 136 so directories never read as brown; 220 is the neon step up if wanted)
+DIR_YELLOW = 221  # folders: canonical #ffcb63 per Mètsàtron's ruling 2026-07-10 (already live in nvim); 221=#ffd75f is the nearest cell ranger's 256-color curses palette can reach
 VIOLET   = 140  # base0E
 LIGHT_BG = 238  # base02 -- inactive tab background
 LIGHT_FG = 252  # base05 -- inactive tab foreground
