@@ -86,6 +86,8 @@
 		 ((tab-line-tab-inactive &override) :background base2
 		  :foreground base4 :box nil)
 		 ((tab-line-highlight &override) :background selection)
+		 (treemacs-directory-face :foreground "#ffcb63")
+		 (dired-directory :foreground "#ffcb63")
 		 (tooltip :background base1 :foreground fg))
 		nil)
 
