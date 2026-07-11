@@ -1,7 +1,6 @@
 ---
 name: antigravity-config
 description: Manage Antigravity from DotCortex source files.
-model: claude-sonnet-5
 ---
 
 # Antigravity Configuration

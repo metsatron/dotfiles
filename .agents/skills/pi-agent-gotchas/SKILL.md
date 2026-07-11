@@ -1,7 +1,6 @@
 ---
 name: pi-agent-gotchas
 description: Troubleshooting pi-coding-agent config — DeepInfra provider, openai-completions api type, models.json, auth.json, DEEPINFRA_TOKEN, deepseek provider
-model: claude-haiku-4-5-20251001
 ---
 
 # Pi Agent (pi-coding-agent) Gotchas

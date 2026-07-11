@@ -1,7 +1,6 @@
 ---
 name: virtual-habitat
 description: Orient to the Virtual Habitat project — VM/container habitat extending DotCortex. Guest registry (sanctuaries/enclaves/emulation), vocabulary, current phase, project note locations, guest schema.
-model: claude-haiku-4-5-20251001
 ---
 
 # Virtual Habitat

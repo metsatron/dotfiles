@@ -1,7 +1,6 @@
 ---
 name: verify
 description: Tool Presence And Help
-model: claude-haiku-4-5-20251001
 ---
 
 # Tool Presence And Help

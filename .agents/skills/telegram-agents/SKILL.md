@@ -1,7 +1,6 @@
 ---
 name: telegram-agents
 description: Manage Telegram-connected AI agents across machines — enable/disable, switch hosts.
-model: claude-haiku-4-5-20251001
 ---
 
 # Telegram Agents Manager
