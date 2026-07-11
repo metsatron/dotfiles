@@ -12,7 +12,7 @@ Drive delegated agents as a supervising meta-agent: decompose work, write handof
 - **Haiku (`claude-haiku-4-5`) / GPT-5.4-mini** — mechanical, high-volume, zero-ambiguity: enumeration, file ops, per-item classification against a fixed taxonomy. Spawn via the Agent tool with `model: haiku`.
 - **Sonnet subagents (background, parallel)** — sweep/verify/diagnose lanes: triage reports, corpus inventories, regression checks, reconciliation analyses, network/device identification. Proven pattern 2026-07-10: fan several out simultaneously at session start, keep the main thread for decisions and commit gates.
 - **Opus subagents** — client-production passes and anything multi-machine with rebuild/deploy consequences; give them the client profile, the ordered plan, hard rules (never `down -v`, adapt-and-report on discrepancy, stop on genuine risk), and demand a per-step evidence report.
-- **Codex gpt-5.5 medium** — building: generators, reconstructors, real tooling from written specs. Proven across five builds 2026-07-10. gpt-5.6 does not exist on ChatGPT-account Codex (API-confirmed 2026-07-10); re-probe after quota resets. See Codex-on-X230 and Local Codex.
+- **Codex gpt-5.6-luna** — building: generators, reconstructors, real tooling from written specs (lineage: five clean gpt-5.5 builds 2026-07-10). GPT-5.6 shipped on ChatGPT-account Codex 2026-07-11 (live-probed: luna at high and xhigh both accepted). Ruling 2026-07-11: default `gpt-5.6-luna` cranked high/xhigh — Luna at max effort is still cheaper than `gpt-5.6-terra`, so Terra is cost/perf-dominated and skipped; `gpt-5.6-sol` for the hardest passes (top tier, cheaper than Opus even at max); `gpt-5.5` remains the known-good fallback if 5.6 misbehaves. See Codex-on-X230 and Local Codex.
 - **You (Opus/Sonnet/Fable)** — design, TaskHandoff authoring, verification against spec, commit gating.
 
 ## Fan-out playbook (sealed from the 2026-07-10 relay)
@@ -31,7 +31,7 @@ Learned 2026-07-08 through three failures: **Codex cannot write the NFS-mounted 
    `Write ~/mnt/x230/HelmCortex/ROOTS/PromptGolf/_recon/<task>.md`
 2. Dispatch over SSH, in the background:
    ```
-   /usr/bin/ssh x230 'cd ~/HelmCortex && codex exec --model gpt-5.5 -c model_reasoning_effort=medium \
+   /usr/bin/ssh x230 'cd ~/HelmCortex && codex exec --model gpt-5.6-luna -c model_reasoning_effort=xhigh \
      --dangerously-bypass-approvals-and-sandbox --skip-git-repo-check \
      "$(cat ROOTS/PromptGolf/_recon/<task>.md)" > ROOTS/PromptGolf/_recon/<task>-codex.log 2>&1'
    ```
@@ -62,7 +62,7 @@ These repos routinely have LIVE concurrent sessions staging and committing. Seal
 
 ## Local Codex on T480s — sandboxed lane for local-disk repos (DotCortex)
 
-- DotCortex is local ext4, and T480s bwrap works: `cd ~/DotCortex && codex exec --model gpt-5.5 -c model_reasoning_effort=medium --sandbox workspace-write --skip-git-repo-check "$(cat <prompt>)"` builds safely with NO bypass flag and no per-session authorization. It reads NFS HelmCortex fine (corpus reads); it just can't write it.
+- DotCortex is local ext4, and T480s bwrap works: `cd ~/DotCortex && codex exec --model gpt-5.6-luna -c model_reasoning_effort=xhigh --sandbox workspace-write --skip-git-repo-check "$(cat <prompt>)"` builds safely with NO bypass flag and no per-session authorization. It reads NFS HelmCortex fine (corpus reads); it just can't write it.
 - **Plugin trap 1 — false "not installed":** the codex-rescue companion may claim "Codex CLI is not installed"; the binary lives at `~/.npm-global/bin/codex` (npm lane, `npm.org`). That is a PATH bug in the companion's environment — drive codex directly via Bash with `PATH=~/.npm-global/bin:$PATH`.
 - **Plugin trap 2 — workspace pinning:** the companion pins `--sandbox workspace-write` cwd to the CLAUDE SESSION's workspace, so a DotCortex-targeted job dispatched from a HelmCortex session gets a read-only DotCortex and fails at apply time (it will still produce a good diagnosis). Direct `codex exec` from the target repo's directory is the reliable path.
 - The companion also leaves dead jobs flagged `running`, blocking later dispatches. Reap in `~/.claude/plugins/data/codex-openai-codex/state/<ws>/jobs/`: set the stale `running` job (pid dead) to `failed` in both `state.json` and the job JSON, with backups. (Pid-liveness fix is ledgered in TODO DotCortex.)
