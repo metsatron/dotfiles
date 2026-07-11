@@ -31,6 +31,8 @@
 ;; cores + MAME + Mednafen, plus the X68000/PC-98/FM-TOWNS marrow.
 ;; Apply: make guix-room-retropie   (uses -L for local package defs)
 (use-modules (gnu packages emulators)      ; retroarch, mame, mednafen, most cores
+             (gnu packages games)          ; yamagi-quake2, sdlpop, supertux, openttd (ports engines, 2026-07-12)
+             (gnu packages game-development) ; ioquake3
              (nongnu packages emulators)   ; libretro-genesis-plus-gx
              (local packages retropie-emulationstation)  ; local: RetroPie ES fork
              (local packages px68k-libretro)             ; local: X68000 libretro core
@@ -41,6 +43,12 @@
  (list retroarch
        mame
        mednafen
+       ;; ports engines — sourcing matrix 2026-07-12 (Guix-proper lane)
+       yamagi-quake2
+       ioquake3
+       sdlpop
+       supertux
+       openttd
        retropie-emulationstation
        libretro-genesis-plus-gx
        libretro-nestopia
