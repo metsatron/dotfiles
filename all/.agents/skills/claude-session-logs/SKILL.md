@@ -1,7 +1,6 @@
 ---
 name: claude-session-logs
 description: Locate and resume exported Claude Code session logs in the canonical HelmCortex .MASTER corpus. Use when asked to find the newest Claude session, recover a continuation point, or search an exported Claude transcript.
-model: claude-haiku-4-5-20251001
 ---
 
 # Claude Session Log Retrieval

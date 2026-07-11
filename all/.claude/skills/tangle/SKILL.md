@@ -1,7 +1,6 @@
 ---
 name: tangle
 description: Tangle Org files (like the current skills.org) into their final destinations (e.g., all/.agents/skills/).
-model: claude-haiku-4-5-20251001
 ---
 
 # Tangle Org Sources

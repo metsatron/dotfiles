@@ -1,7 +1,6 @@
 ---
 name: meta-agent
 description: Drive delegated agents (Codex on X230, Haiku subagents, local builds); scope, dispatch, verify, gate commits so the human never has to touch the burning tools.
-model: claude-sonnet-5
 ---
 
 # Meta-Agent Orchestration
