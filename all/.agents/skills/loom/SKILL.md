@@ -1,7 +1,6 @@
 ---
 name: loom
 description: Operate DotCortex with loom verbs (e.g., pip:apply, npm:sync, guix:apply, or stow verbs) via full explicit paths for Hermes workflow.
-model: claude-haiku-4-5-20251001
 ---
 
 # Loom Verbs for DotCortex Operations

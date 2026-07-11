@@ -1,7 +1,6 @@
 ---
 name: helmcortex-brain
 description: DotCortex cloud brain — membrane between local DotCortex agents and cloud meta-agents. Source law, memory protocol, SteinerCortex orientation.
-model: claude-sonnet-5
 ---
 
 # DotCortex Brain — Cloud Membrane

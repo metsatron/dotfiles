@@ -1,7 +1,6 @@
 ---
 name: helmcortex-pvox
 description: Use HelmCortex VoxForge `pvox` to speak text, stream transcripts, inspect voice mappings, and work against Flatpak-managed Pied models.
-model: claude-haiku-4-5-20251001
 ---
 
 # HelmCortex PVOX Operations
