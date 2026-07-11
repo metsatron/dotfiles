@@ -32,9 +32,10 @@ Use this skill when the task involves speaking text through VoxForge, checking P
 
 ## Speaking Convention
 
-- Full answer or selected prose -> `Claude` / Amy Medium
-- Short completion, attention cue, or brief spoken summary -> `ClaudeMX`
-- Default cue text when useful: `Tudo pronto, meu comandante!`
+- **Match the voice to the LANGUAGE of the text — this rule overrides length and everything below.** English content (the default for ALL communication with the operator) -> `Claude` (Amy Medium, en_US).
+- `ClaudeMX` (`es_MX-claude-high`) is a NON-English (Spanish) model. Use it ONLY for text actually written in Spanish. NEVER speak English through it — the es_MX phonemes render English words garbled and unintelligible (sealed 2026-07-11, after an English status message spoken via ClaudeMX could not be understood at all).
+- Length does not choose the voice; language does. A one-line English summary is still `Claude`, not `ClaudeMX`.
+- Non-English flourish text, only when a Spanish/Portuguese cue is genuinely wanted: `Tudo pronto, meu comandante!`
 
 ## Preferred Speaking Path
 
@@ -50,16 +51,16 @@ Low-latency streaming:
 printf '%s' "your text here" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say Claude --stdin --stream
 ```
 
-Short attention cues use the Spanish Claude model:
+English summaries and cues — the normal case — use `Claude` (Amy Medium, en_US):
+
+```bash
+printf '%s' "short english summary here" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say Claude --stdin --stream
+```
+
+`ClaudeMX` is ONLY for genuinely Spanish/Portuguese text — never English:
 
 ```bash
 ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stream "Tudo pronto, meu comandante!"
-```
-
-Brief spoken summaries also use `ClaudeMX`:
-
-```bash
-printf '%s' "resumo curto aqui" | PVOX_PLAYER_RAW=aplay ~/HelmCortex/FORGE/VoxForge/bin/pvox say ClaudeMX --stdin --stream
 ```
 
 Speech Dispatcher path (useful for `pclip default` and system voice routing):
