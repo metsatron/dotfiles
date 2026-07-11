@@ -1,7 +1,6 @@
 ---
 name: dotcortex-icons
 description: Manage DotCortex icon themes, app icon aliases, pixel-art scaling, icon cache sync, and repo-backed icon payloads.
-model: claude-haiku-4-5-20251001
 ---
 
 # DotCortex Icon Theme Workflows

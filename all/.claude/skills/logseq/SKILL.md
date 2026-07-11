@@ -1,7 +1,6 @@
 ---
 name: logseq
 description: Interact with Logseq DB via native logseq CLI (auto-installed at ~/.local/bin/logseq) or HTTP API (port 12315). CLI requires Logseq GUI running. Use for querying pages, blocks, tasks, tags; running queries; appending content.
-model: claude-haiku-4-5-20251001
 ---
 
 # Logseq DB

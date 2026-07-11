@@ -1,7 +1,6 @@
 ---
 name: sandcastle
 description: Orchestrate AFK coding agents in isolated Podman/Docker sandboxes with sandcastle.run(). Covers API patterns, branch strategies, Podman preference, session resume/fork, and super system integration.
-model: claude-sonnet-5
 ---
 
 # Sandcastle

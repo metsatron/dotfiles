@@ -1,7 +1,6 @@
 ---
 name: defuddle
 description: Extract clean markdown from web pages using Defuddle CLI, removing clutter, navigation, and ads. Prefer over WebFetch for standard articles, docs, and blog posts to reduce token usage.
-model: claude-haiku-4-5-20251001
 ---
 
 # Defuddle

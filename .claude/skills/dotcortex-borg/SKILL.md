@@ -1,7 +1,6 @@
 ---
 name: dotcortex-borg
 description: Operate the dotcortex-borg versioned encrypted backup — endpoints, verbs, secret provisioning, and the legacy-backup preservation law.
-model: claude-sonnet-5
 ---
 
 # dotcortex-borg — Versioned Encrypted DotCortex Backup

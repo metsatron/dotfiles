@@ -1,7 +1,6 @@
 ---
 name: metacortex-projects
 description: Navigate and manage MetaCortex project plans — structure, frontmatter, build sequences, README index, and project vs evaluation scope.
-model: claude-haiku-4-5-20251001
 ---
 
 # MetaCortex Projects

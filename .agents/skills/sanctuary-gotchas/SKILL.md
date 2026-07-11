@@ -1,7 +1,6 @@
 ---
 name: sanctuary-gotchas
 description: Sanctuary and XFCE gotchas — Xephyr ghost InputOnly window, XFCE screenshot ghost, Flatpak PulseAudio audio dead, xfconf symlink DotCortex, setxkbmap XkbVariant xfsettingsd, host X utilities Guix container PATH, wallpaper xfdesktop
-model: claude-haiku-4-5-20251001
 ---
 
 # Sanctuary Gotchas
