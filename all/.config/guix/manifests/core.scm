@@ -35,6 +35,7 @@
    "deskflow"
    "gimp" "inkscape" "birdtray" "icedove" "gnome-boxes"
    "vlc"
+   "mpd" "mpd-mpc"   ; music daemon + CLI — fleet DJ lane (music.org: config/autostart; menu.org: rofi-mpd Super+m; library: HelmCortex/NADA)
    "whisper-cpp"     ; CPU speech-to-text (whisper-transcribe, telegram voice pipeline)
    ;; "audacity"
    "appmenu-gtk-module"
