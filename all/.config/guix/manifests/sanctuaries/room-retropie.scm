@@ -36,6 +36,8 @@
              (nongnu packages emulators)   ; libretro-genesis-plus-gx
              (nongnu packages game-development) ; eduke32, fury (nonguix ruling 2026-07-12)
              (local packages retropie-emulationstation)  ; local: RetroPie ES fork
+             (local packages prboom-libretro)             ; local source build: Doom core
+             (local packages tyrquake-libretro)           ; local source build: Quake 1 core
              (local packages px68k-libretro)             ; local: X68000 libretro core
              (local packages np2kai)                     ; local: PC-98 (NP2kai/sdlnp21kai)
              (local packages tsugaru))                   ; local: FM-TOWNS (Tsugaru_CUI)
@@ -61,6 +63,9 @@
        libretro-beetle-psx-hw
        libretro-flycast
        libretro-beetle-gba
+       ;; local source builds — Doom and Quake 1 are absent from Guix/nonguix
+       libretro-prboom
+       libretro-tyrquake
        libretro-px68k
        retropie-np2kai
        retropie-tsugaru))

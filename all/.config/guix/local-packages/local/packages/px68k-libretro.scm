@@ -49,7 +49,7 @@
              (invoke "make" "-f" "Makefile.libretro" "CC=gcc")
              #t)))
        #:install-plan
-       '(("px68k_libretro.so" "lib/retroarch/cores/"))))
+       '(("px68k_libretro.so" "lib/libretro/"))))
     (native-inputs (list gcc-toolchain))
     (supported-systems '("x86_64-linux"))
     (synopsis "Libretro core — Sharp X68000 emulator (Keropi/PX68k lineage)")
