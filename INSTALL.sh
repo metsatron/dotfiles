@@ -337,14 +337,18 @@ else
 # Short-Description: GNU Guix daemon
 ### END INIT INFO
 
+# --substitute-urls must be ONE argv element. Do NOT store the args in a variable with
+# embedded single quotes and expand it unquoted -- the URL list word-splits into garbage
+# and guix-daemon dies silently on start (this exact bug left guix dead on a T480 for two
+# weeks). Keep the URLs in a double-quoted variable passed directly to daemonize.
 DAEMON=/usr/local/bin/guix-daemon
-DAEMON_ARGS="--build-users-group=guixbuild --substitute-urls='https://bordeaux.guix.gnu.org https://ci.guix.gnu.org https://substitutes.nonguix.org'"
 PIDFILE=/var/run/guix-daemon.pid
+SUBSTITUTE_URLS="https://bordeaux.guix.gnu.org https://ci.guix.gnu.org https://substitutes.nonguix.org"
 
 case "$1" in
   start)
     echo "Starting guix-daemon..."
-    daemonize -p "$PIDFILE" "$DAEMON" $DAEMON_ARGS
+    daemonize -p "$PIDFILE" "$DAEMON" --build-users-group=guixbuild --substitute-urls="$SUBSTITUTE_URLS"
     ;;
   stop)
     echo "Stopping guix-daemon..."
