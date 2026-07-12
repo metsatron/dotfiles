@@ -5,6 +5,10 @@ description: Troubleshooting DotCortex issues — stow conflicts, tangle failure
 
 # DotCortex Known Gotchas
 
+## A stray `all/.hermes` (or any private app-config dir) in the repo hijacks the `~/.hermes` symlink via stow
+
+If a mutable app-config directory that HelmCortex owns — `.hermes` is the canonical case — ever ends up inside a DotCortex overlay (`all/.hermes/`, even untracked), the next `stow all` folds it and repoints `~/.hermes` from its helmstow deployment (`~/HelmCortex/NEXUS/stow/linux/.hermes`) to the empty repo dir, displacing the real symlink into a `~/.hermes.bak.<timestamp>`. The repo copy has no `config.yaml` and no `.env`, so the Hermes gateway reads empty config + zero API keys and silently falls through its default provider catalog to whatever it can find — in the incident that surfaced this (2026-07-12) it misrouted Telegram inference to an *unauthorized* OpenRouter fallback (401) and a dead NVIDIA model id (404), while Telegram itself stayed connected so the only symptom was error replies. Diagnosis: `ls -la ~/.hermes` (is it a symlink, and to where?), then compare `readlink -f ~/.hermes/config.yaml` against the HelmCortex tree. Fix: `ln -sfn HelmCortex/NEXUS/stow/linux/.hermes ~/.hermes`, remove the stray `all/.hermes` from the repo, restart the gateway. Prevention (now in place): `^/\.hermes(/|$)` is in `all/.stow-local-ignore` and `linux/.stow-local-ignore` (sourced from `icons.org`) so stow can never fold it again. Root law: CLAUDE.md rule 20 — DotCortex must never own a secret-bearing mutable app-config tree; those live in HelmCortex NEXUS and deploy via `helmstow`.
+
 ## Makefile is tangled output — never edit it directly
 
 The Makefile is tangled from `loom.org`. Any direct edits will be overwritten by the next `make tangle`. Always edit the Makefile template block in `loom.org` instead, then re-tangle.
