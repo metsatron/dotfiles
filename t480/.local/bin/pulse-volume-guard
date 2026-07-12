@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# SonicDE volume guard: undo the USB-device-add volume reset (default sink → ~18%).
+# Does NOT try to stop the glitch (root cause is above the PulseAudio module layer,
+# six candidates ruled out by test 2026-07-12); it snaps the volume back the instant
+# the sink collapses into the glitch range on a device/card/server event. It only
+# ever acts on that signature, so it never fights a real volume change you make.
+set -u
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+PACTL="$(command -v pactl)" || exit 0
+
+# Single instance — a manual start and the autostart entry must not both run.
+LOCK="$XDG_RUNTIME_DIR/pulse-volume-guard.pid"
+if [ -f "$LOCK" ] && kill -0 "$(cat "$LOCK" 2>/dev/null)" 2>/dev/null; then exit 0; fi
+echo "$$" > "$LOCK"
+trap 'rm -f "$LOCK"' EXIT
+
+GLITCH_MAX=25    # the glitch lands at ~18%; treat <=25% as its signature
+GOOD=90          # sane default until the real volume is observed
+
+vol() { "$PACTL" get-sink-volume @DEFAULT_SINK@ 2>/dev/null | grep -oE '[0-9]+%' | head -1 | tr -d '%'; }
+
+# Autostart may fire before the sound server; wait for it.
+for _ in $(seq 1 30); do "$PACTL" get-default-sink >/dev/null 2>&1 && break; sleep 2; done
+
+# Seed GOOD from the current volume if it is already in the normal range.
+v="$(vol)"; [ -n "${v:-}" ] && [ "$v" -gt "$GLITCH_MAX" ] && [ "$v" -le 100 ] && GOOD="$v"
+
+# A device add/unplug fires a card/server event and ~1s of turbulence (the glitch
+# to ~18% plus a +5% key-injection wobble). We must NOT learn GOOD from that noise,
+# or GOOD drifts upward toward 100% every plug. So: card/server events open a 3s
+# "turbulence window"; only sink changes OUTSIDE that window are treated as real
+# volume adjustments the user made and remembered as GOOD. The glitch restore itself
+# is unconditional. Process substitution (not a pipe) keeps GOOD/last_dev live in
+# this shell; the outer loop reconnects if PulseAudio restarts.
+last_dev=0
+while :; do
+  while read -r line; do
+    case "$line" in
+      *"on card"*|*"on server"*)
+        last_dev="$(date +%s)"
+        ;;
+      *"'change' on sink #"*)
+        v="$(vol)"; [ -n "${v:-}" ] || continue
+        if [ "$v" -le "$GLITCH_MAX" ]; then
+          "$PACTL" set-sink-volume @DEFAULT_SINK@ "${GOOD}%"           # glitch: snap back to your level
+        elif [ "$v" -le 100 ] && [ "$(( $(date +%s) - last_dev ))" -ge 3 ]; then
+          GOOD="$v"                                                    # quiet-period change = a real adjustment → remember it
+        fi
+        ;;
+    esac
+  done < <("$PACTL" subscribe 2>/dev/null)
+  sleep 3
+done
