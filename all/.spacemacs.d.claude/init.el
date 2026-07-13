@@ -323,12 +323,12 @@
   ;; box-drawing range (U+2500–U+257F) to IosevkaTerm globally, so a proportional
   ;; slip in the text font cannot break Claude's / any TUI's box rendering.
   ;;
-  ;; NOTE: "FiraPro Nerd Font" is named in fonts.org but Nerd Fonts ships no such
-  ;; family (it ships FiraCode and FiraMono). It is kept here verbatim to match
-  ;; the declared list; it will simply never match until fonts.org resolves it.
+  ;; The second entry read "FiraPro Nerd Font" until 2026-07-13. Nerd Fonts ships
+  ;; no such family, so it had always been a silent no-op. Resolved to FiraCode,
+  ;; which is what was meant and what is installed.
   (defvar metsatron/terminal-font-preference
     '("MesloLGS Nerd Font Mono"
-      "FiraPro Nerd Font Mono"
+      "FiraCode Nerd Font Mono"
       "Mononoki Nerd Font Mono"
       "IosevkaTerm Nerd Font Mono")
     "Monospace families for terminal buffers, most-preferred first.
