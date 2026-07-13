@@ -3,8 +3,8 @@
 
 
 # [[file:../../../distrobox.org::*Sanctuary Create Script][Sanctuary Create Script:1]]
-# Create the three Phase 1 Distrobox sanctuaries.
-# Run once per machine, or after `distrobox rm <name>` to recreate.
+# Create missing Phase 1 Distrobox sanctuaries, optionally by exact name.
+# This helper NEVER removes or replaces an existing container.
 #
 # Prerequisites:
 #   sanctuary-base-build        ← build + load the Guix base image
@@ -16,11 +16,23 @@ usage() {
   cat <<EOF
 distrobox-sanctuaries-create - create the six Phase 1 Distrobox sanctuaries
 
-Usage: distrobox-sanctuaries-create
+Usage: distrobox-sanctuaries-create [SANCTUARY...]
        distrobox-sanctuaries-create -h | --help
 
-No arguments. Requires sanctuary-base:guix, the Guix profiles, and guest homes
-to have been prepared first.
+With no names, creates all missing sanctuaries. With names, creates only those
+missing sanctuaries. Existing containers are always skipped and are never
+removed or replaced.
+
+Known names:
+  sanctuary-qtile
+  sanctuary-gnustep
+  sanctuary-cde
+  sanctuary-redstone-9x
+  sanctuary-sx
+  sanctuary-retropie
+
+Requires sanctuary-base:guix, the relevant Guix profiles, and guest homes to
+have been prepared first.
 EOF
 }
 
@@ -29,16 +41,23 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   exit 0
 fi
 
-if (( $# > 0 )); then
-  usage >&2
-  exit 1
-fi
-
 GUESTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/guests"
 BASE_IMAGE="sanctuary-base:guix"
 GUIX_PROFILES="${HOME}/.guix-extra-profiles"
 CDE_PROFILE="${GUIX_PROFILES}/sanctuary-cde/sanctuary-cde"
 CDE_RUNTIME="${HOME}/.config/virtualisation/sanctuary-cde"
+DISTROBOX_BIN="/usr/bin/distrobox"
+RETROPIE_CONTAINER_ROOT="/run/dotcortex/retropie"
+RETROPIE_SOURCE=""
+
+ALL_SANCTUARIES=(
+  sanctuary-qtile
+  sanctuary-gnustep
+  sanctuary-cde
+  sanctuary-redstone-9x
+  sanctuary-sx
+  sanctuary-retropie
+)
 
 # NOTE 2026-07-08: the GVFS host-trash leak (R9X-URGENT) is now fixed at
 # LAUNCH by sanctuary-trash-shield, not at create time. The former
@@ -54,97 +73,183 @@ CDE_RUNTIME="${HOME}/.config/virtualisation/sanctuary-cde"
 # against autofs, and covers new fleet machines automatically. See the
 # sanctuary-trash-shield block above and redstone-9x-state-digest.md.
 
+for helper in \
+  "${DISTROBOX_BIN}" \
+  /usr/bin/distrobox-create \
+  /usr/bin/distrobox-init \
+  /usr/bin/distrobox-export \
+  /usr/bin/distrobox-host-exec
+do
+  if [[ ! -x "${helper}" ]]; then
+    echo "Required system Distrobox helper missing: ${helper}" >&2
+    exit 1
+  fi
+done
+
 if ! podman image exists "${BASE_IMAGE}" 2>/dev/null; then
   echo "Base image ${BASE_IMAGE} not found — run sanctuary-base-build first" >&2
   exit 1
 fi
 
-# --- sanctuary-qtile: Emacs Sanctuary (Phase 1A) ---
-distrobox create \
-  --name sanctuary-qtile \
-  --image "${BASE_IMAGE}" \
-  --home "${GUESTS_DIR}/sanctuary-qtile/home" \
-  --volume /gnu/store:/gnu/store:ro \
-  --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
-  --no-entry
+EXISTING_CONTAINERS="$(podman ps -a --format '{{.Names}}')" || {
+  echo "Could not list existing Podman containers; refusing to create anything" >&2
+  exit 1
+}
 
-# --- sanctuary-gnustep: GNU/NeXT Lineage Sanctuary (Phase 1A) ---
-distrobox create \
-  --name sanctuary-gnustep \
-  --image "${BASE_IMAGE}" \
-  --home "${GUESTS_DIR}/sanctuary-gnustep/home" \
-  --volume /gnu/store:/gnu/store:ro \
-  --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
-  --no-entry
+container_exists() {
+  grep -Fxq -- "$1" <<<"${EXISTING_CONTAINERS}"
+}
 
-# --- sanctuary-cde: Motif/Sun Sanctuary (Phase 1B) ---
-for resource in \
-  "${CDE_PROFILE}/etc/netconfig" \
-  "${CDE_PROFILE}/etc/rpc" \
-  "${CDE_PROFILE}/etc/services" \
-  "${CDE_PROFILE}/bin/hostname" \
-  "${CDE_PROFILE}/bin/awk" \
-  "${CDE_RUNTIME}/nawk" \
-  "${CDE_PROFILE}/bin/xset" \
-  "${CDE_RUNTIME}/nsswitch.conf"
-do
-  if [[ ! -e "${resource}" ]]; then
-    echo "sanctuary-cde runtime resource missing: ${resource}" >&2
-    echo "Run 'loom guix:sanctuary-apply' and 'loom stow:t480s' first" >&2
+validate_name() {
+  case "$1" in
+    sanctuary-qtile|sanctuary-gnustep|sanctuary-cde|sanctuary-redstone-9x|sanctuary-sx|sanctuary-retropie)
+      return 0 ;;
+    *)
+      echo "Unknown sanctuary name: $1" >&2
+      usage >&2
+      return 2 ;;
+  esac
+}
+
+resolve_retropie_source() {
+  [[ -n "${RETROPIE_SOURCE}" ]] && return 0
+
+  local logical_root="${HOME}/RetroPie"
+  local ports_dir="${logical_root}/roms/ports"
+
+  # stat -L both follows ~/RetroPie and triggers the direct autofs mount before
+  # readlink resolves it. The active NFS and autofs mounts are private on this
+  # host, so rslave/rshared cannot propagate a later submount into a container.
+  # Binding the resolved, already-mounted NFS subtree directly avoids depending
+  # on propagation and pins that mounted subtree for the container lifetime.
+  if ! stat -L -- "${ports_dir}" >/dev/null 2>&1; then
+    echo "RetroPie tree unavailable: ${ports_dir}" >&2
+    echo "The automount did not produce a readable ports directory; refusing to create a gaming sanctuary" >&2
     exit 1
   fi
+
+  RETROPIE_SOURCE="$(readlink -f -- "${logical_root}")" || {
+    echo "Could not resolve RetroPie source: ${logical_root}" >&2
+    exit 1
+  }
+  if [[ ! -d "${RETROPIE_SOURCE}/roms/ports" ]]; then
+    echo "Resolved RetroPie source has no ports directory: ${RETROPIE_SOURCE}" >&2
+    exit 1
+  fi
+  echo "RetroPie bind source: ${RETROPIE_SOURCE} -> ${RETROPIE_CONTAINER_ROOT} (read-only)"
+}
+
+check_cde_resources() {
+  local resource
+  for resource in \
+    "${CDE_PROFILE}/etc/netconfig" \
+    "${CDE_PROFILE}/etc/rpc" \
+    "${CDE_PROFILE}/etc/services" \
+    "${CDE_PROFILE}/bin/hostname" \
+    "${CDE_PROFILE}/bin/awk" \
+    "${CDE_RUNTIME}/nawk" \
+    "${CDE_PROFILE}/bin/xset" \
+    "${CDE_RUNTIME}/nsswitch.conf"
+  do
+    if [[ ! -e "${resource}" ]]; then
+      echo "sanctuary-cde runtime resource missing: ${resource}" >&2
+      echo "Run 'loom guix:sanctuary-apply' and 'loom stow:t480s' first" >&2
+      exit 1
+    fi
+  done
+}
+
+create_common() {
+  local name="$1"
+  shift
+  "${DISTROBOX_BIN}" create \
+    --name "${name}" \
+    --image "${BASE_IMAGE}" \
+    --home "${GUESTS_DIR}/${name}/home" \
+    --volume /gnu/store:/gnu/store:ro \
+    --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
+    "$@" \
+    --no-entry
+}
+
+preflight_one() {
+  case "$1" in
+    sanctuary-cde)
+      check_cde_resources
+      ;;
+    sanctuary-redstone-9x|sanctuary-retropie)
+      resolve_retropie_source
+      ;;
+  esac
+}
+
+create_one() {
+  local name="$1"
+
+  case "${name}" in
+    sanctuary-qtile|sanctuary-gnustep|sanctuary-sx)
+      create_common "${name}"
+      ;;
+    sanctuary-cde)
+      create_common "${name}" \
+        --volume "${CDE_PROFILE}/etc/netconfig:/etc/netconfig:ro" \
+        --volume "${CDE_PROFILE}/etc/rpc:/etc/rpc:ro" \
+        --volume "${CDE_PROFILE}/etc/services:/etc/services:ro" \
+        --volume "${CDE_RUNTIME}/nsswitch.conf:/etc/nsswitch.conf:ro" \
+        --volume "${CDE_PROFILE}/bin/hostname:/usr/bin/hostname:ro" \
+        --volume "${CDE_PROFILE}/bin/awk:/usr/bin/awk:ro" \
+        --volume "${CDE_RUNTIME}/nawk:/usr/bin/nawk:ro" \
+        --volume "${CDE_PROFILE}/bin/xset:/usr/bin/xset:ro"
+      ;;
+    sanctuary-redstone-9x)
+      create_common "${name}" \
+        --volume "${RETROPIE_SOURCE}:${RETROPIE_CONTAINER_ROOT}:ro" \
+        --init-hooks 'mkdir -p /opt/retropie/supplementary/runcommand && ln -sfn /home/metsatron/.local/bin/runcommand-shim /opt/retropie/supplementary/runcommand/runcommand.sh'
+      ;;
+    sanctuary-retropie)
+      create_common "${name}" \
+        --volume "${RETROPIE_SOURCE}:${RETROPIE_CONTAINER_ROOT}:ro"
+      ;;
+  esac
+}
+
+if (( $# == 0 )); then
+  REQUESTED=("${ALL_SANCTUARIES[@]}")
+else
+  REQUESTED=("$@")
+fi
+
+declare -A SEEN=()
+TO_CREATE=()
+for sanctuary in "${REQUESTED[@]}"; do
+  validate_name "${sanctuary}" || exit $?
+  if [[ -n "${SEEN[${sanctuary}]+present}" ]]; then
+    continue
+  fi
+  SEEN["${sanctuary}"]=1
+
+  if container_exists "${sanctuary}"; then
+    echo "distrobox-sanctuaries-create: ${sanctuary} already exists — skipping"
+    continue
+  fi
+
+  TO_CREATE+=("${sanctuary}")
 done
 
-distrobox create \
-  --name sanctuary-cde \
-  --image "${BASE_IMAGE}" \
-  --home "${GUESTS_DIR}/sanctuary-cde/home" \
-  --volume /gnu/store:/gnu/store:ro \
-  --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
-  --volume "${CDE_PROFILE}/etc/netconfig:/etc/netconfig:ro" \
-  --volume "${CDE_PROFILE}/etc/rpc:/etc/rpc:ro" \
-  --volume "${CDE_PROFILE}/etc/services:/etc/services:ro" \
-  --volume "${CDE_RUNTIME}/nsswitch.conf:/etc/nsswitch.conf:ro" \
-  --volume "${CDE_PROFILE}/bin/hostname:/usr/bin/hostname:ro" \
-  --volume "${CDE_PROFILE}/bin/awk:/usr/bin/awk:ro" \
-  --volume "${CDE_RUNTIME}/nawk:/usr/bin/nawk:ro" \
-  --volume "${CDE_PROFILE}/bin/xset:/usr/bin/xset:ro" \
-  --no-entry
+for sanctuary in "${TO_CREATE[@]}"; do
+  preflight_one "${sanctuary}"
+done
 
-# --- sanctuary-redstone-9x: Redstone 9X IceWM (gaming wing, first slice) ---
-# Theme and icon assets are projected from DotCortex by the launcher.  Do not
-# bind host /usr/share theme/icon trees into the public Redstone contract.
-distrobox create \
-  --name sanctuary-redstone-9x \
-  --image "${BASE_IMAGE}" \
-  --home "${GUESTS_DIR}/sanctuary-redstone-9x/home" \
-  --volume /gnu/store:/gnu/store:ro \
-  --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
-  --init-hooks 'mkdir -p /opt/retropie/supplementary/runcommand && ln -sfn /home/metsatron/.local/bin/runcommand-shim /opt/retropie/supplementary/runcommand/runcommand.sh' \
-  --no-entry
+CREATED=()
+for sanctuary in "${TO_CREATE[@]}"; do
+  echo "distrobox-sanctuaries-create: creating ${sanctuary}"
+  create_one "${sanctuary}"
+  CREATED+=("${sanctuary}")
+done
 
-# --- sanctuary-sx: SX-Window XLibre/X11 XFCE Habitat ---
-distrobox create \
-  --name sanctuary-sx \
-  --image "${BASE_IMAGE}" \
-  --home "${GUESTS_DIR}/sanctuary-sx/home" \
-  --volume /gnu/store:/gnu/store:ro \
-  --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
-  --no-entry
-
-# --- sanctuary-retropie: gamepad-first EmulationStation room (retropie.org) ---
-distrobox create \
-  --name sanctuary-retropie \
-  --image "${BASE_IMAGE}" \
-  --home "${GUESTS_DIR}/sanctuary-retropie/home" \
-  --volume /gnu/store:/gnu/store:ro \
-  --volume "${GUIX_PROFILES}:${GUIX_PROFILES}:ro" \
-  --no-entry
-
-echo "distrobox-sanctuaries-create: all six sanctuaries created"
-echo "Next: run 'sanctuary-cde-build' to compile CDE 2.5.3 inside the sanctuary"
-echo "Then: sanctuary-cde-launch"
-echo "      sanctuary-redstone-9x-launch"
-echo "      sanctuary-sx-launch"
-echo "      sanctuary-retropie-launch  (after: make guix-room-retropie)"
+if (( ${#CREATED[@]} == 0 )); then
+  echo "distrobox-sanctuaries-create: nothing created"
+else
+  printf 'distrobox-sanctuaries-create: created %s\n' "${CREATED[*]}"
+fi
 # Sanctuary Create Script:1 ends here
