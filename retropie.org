@@ -9,8 +9,9 @@
 * Purpose
 
 X230 already runs RetroPie bare-metal against =~/RetroPie= (ROMs, BIOS, and Lutris/EmulationStation
-state) — that directory is already declared a shared host resource and projected into every
-Distrobox sanctuary's guest home by =guests.org='s =vm-homes-init=. This file adds
+state) — that directory is already declared a shared host resource. =vm-homes-init= provides the
+generic guest-home projection; the Redstone and RetroPie launchers replace that guest link with a
+direct container bind of the resolved NFS subtree so it remains valid across autofs restarts. This file adds
 =sanctuary-retropie=: a portable Distrobox sanctuary so the same ROM/BIOS library and
 EmulationStation/RetroArch stack can run from any machine, not just X230's bare-metal install,
 without duplicating a single ROM or BIOS file.
@@ -43,7 +44,8 @@ libretro cores, + the X68000/PC-98/FM-TOWNS marrow — see guix.org for the full
 make guix-room-retropie   → ~/.guix-extra-profiles/room-retropie/room-retropie
   ↓
 distrobox-sanctuaries-create (distrobox.org) — sanctuary-retropie joins the other five,
-same sanctuary-base:guix image, same /gnu/store + GUIX_PROFILES read-only bind mounts
+same sanctuary-base:guix image, same /gnu/store + GUIX_PROFILES read-only bind mounts,
+plus the resolved RetroPie NFS subtree at /run/dotcortex/retropie
   ↓
 sanctuary-retropie-launch (plugs into sanctuary-enter, same fzf picker as every other sanctuary):
   project the es-theme-metsatron submodule's built/ into the guest's EmulationStation config
@@ -59,9 +61,9 @@ sanctuary-retropie-launch (plugs into sanctuary-enter, same fzf picker as every 
 1. =loom guix:sanctuary-apply= (or =make guix-room-retropie= directly) — builds the
    =room-retropie= Guix profile declared in =guix.org=.
 2. =sanctuary-retropie= uncommented in =linux/.config/virtualisation/guests.conf= (done).
-3. =vm-homes-init= (guests.org) — projects =~/RetroPie=, =~/DotCortex=, etc. into the guest home.
-4. =distrobox-sanctuaries-create= (distrobox.org) — creates the =sanctuary-retropie= container
-   alongside the other five.
+3. =vm-homes-init= (guests.org) — creates the guest home and projects the shared profiles/resources.
+4. =distrobox-sanctuaries-create sanctuary-retropie= (distrobox.org) — creates only the missing
+   =sanctuary-retropie= container; existing containers are always skipped.
 
 * Health
 
@@ -140,6 +142,8 @@ GUEST_HOME="${GUESTS_DIR}/${SANCTUARY}/home"
 GUIX_PROFILES="${HOME}/.guix-extra-profiles"
 THEME_SRC="${HOME}/DotCortex/linux/.emulationstation-themes/metsatron/built"
 CFG_SRC="${HOME}/DotCortex/linux/.emulationstation-config/es_systems.cfg"
+RETROPIE_HOST_ROOT="${HOME}/RetroPie"
+RETROPIE_CONTAINER_ROOT="/run/dotcortex/retropie"
 
 # Preflight: verify the room-retropie profile is built before launching.
 if [[ ! -f "${GUIX_PROFILES}/room-retropie/room-retropie/etc/profile" ]]; then
@@ -153,13 +157,48 @@ if ! distrobox list --no-color 2>/dev/null | awk -F '|' '{gsub(/^[ \t]+|[ \t]+$/
   exit 1
 fi
 
-# Ensure the guest home has the RetroPie library and Guix profiles projected.
-# vm-homes-init is idempotent (ln -sfnT); it links ~/RetroPie -> the shared
-# host library and ~/.guix-extra-profiles -> the host Guix profiles. Without
-# these the RetroPie-convention paths inside es_systems.cfg (~/RetroPie/roms/*,
-# ~-relative cores) resolve to nothing inside the container.
-if [[ ! -e "${GUEST_HOME}/RetroPie" || ! -e "${GUEST_HOME}/.guix-extra-profiles" ]]; then
-  vm-homes-init >/dev/null 2>&1 || true
+# Follow the host ~/RetroPie link before Podman starts. This stat triggers the
+# direct autofs mount and fails before Xephyr opens if the NFS-backed library is
+# unavailable. The container declaration binds the resolved subtree directly
+# at RETROPIE_CONTAINER_ROOT; no nested-mount propagation is required.
+HOST_PORTS_DIR="${RETROPIE_HOST_ROOT}/roms/ports"
+if ! stat -L -- "${HOST_PORTS_DIR}" >/dev/null 2>&1; then
+  echo "${SANCTUARY}: ERROR — RetroPie tree unavailable on the host" >&2
+  echo "  Expected a readable ports directory at: ${HOST_PORTS_DIR}" >&2
+  echo "  The automount did not become available; container start was not attempted." >&2
+  exit 1
+fi
+
+# Ensure the guest home and Guix profile projection exist. vm-homes-init may
+# restore its generic ~/RetroPie host link, so install the sanctuary-specific
+# link to the direct container bind immediately afterwards on every launch.
+if [[ ! -d "${GUEST_HOME}" || ! -e "${GUEST_HOME}/.guix-extra-profiles" ]]; then
+  if ! vm-homes-init >/dev/null; then
+    echo "${SANCTUARY}: ERROR — vm-homes-init failed" >&2
+    exit 1
+  fi
+fi
+if [[ ! -e "${GUEST_HOME}/.guix-extra-profiles" ]]; then
+  echo "${SANCTUARY}: ERROR — Guix profile projection missing from guest home" >&2
+  exit 1
+fi
+if [[ -e "${GUEST_HOME}/RetroPie" && ! -L "${GUEST_HOME}/RetroPie" ]]; then
+  echo "${SANCTUARY}: ERROR — refusing to replace non-symlink guest path: ${GUEST_HOME}/RetroPie" >&2
+  exit 1
+fi
+ln -sfnT "${RETROPIE_CONTAINER_ROOT}" "${GUEST_HOME}/RetroPie"
+
+if ! podman start "${SANCTUARY}" >/dev/null; then
+  echo "${SANCTUARY}: ERROR — container failed to start" >&2
+  echo "  After the human-gated recreation, run:" >&2
+  echo "    distrobox-sanctuaries-create ${SANCTUARY}" >&2
+  exit 1
+fi
+if ! podman exec "${SANCTUARY}" test -d "${RETROPIE_CONTAINER_ROOT}/roms/ports"; then
+  echo "${SANCTUARY}: ERROR — RetroPie bind is absent inside the running container" >&2
+  echo "  Expected: ${RETROPIE_CONTAINER_ROOT}/roms/ports" >&2
+  echo "  This container must be recreated from the updated declaration." >&2
+  exit 1
 fi
 
 # Project the theme (copy, not symlink: the host repo path isn't visible inside the container).
@@ -182,9 +221,9 @@ fi
 
 # Seed a minimal RetroArch config pointing the system (BIOS) directory at the
 # RetroPie-convention ~/RetroPie/BIOS so BIOS-dependent cores (PSX, X68000,
-# Dreamcast, FDS) find firmware the RetroPie way. The guest-home absolute path
-# is identical inside and outside the container, so it resolves in both. Seeded
-# only when absent, so RetroArch's own written-back settings survive across runs.
+# Dreamcast, FDS) find firmware the RetroPie way. Inside the container the
+# guest-home RetroPie link resolves to the dedicated direct bind. Seeded only
+# when absent, so RetroArch's own written-back settings survive across runs.
 RA_CFG="${GUEST_HOME}/.config/retroarch/retroarch.cfg"
 if [[ ! -f "${RA_CFG}" ]]; then
   mkdir -p "${GUEST_HOME}/.config/retroarch"
@@ -220,11 +259,11 @@ profile *is* the emulator inventory, ruled 2026-07-03).
 
 Fully RetroPie-convention: every =<path>= is =~/RetroPie/roms/<system>= and
 BIOS resolves from =~/RetroPie/BIOS=, exactly as X230's bare-metal RetroPie
-reads this same shared library.  Inside the sanctuary =~= expands to the guest
-home, where =vm-homes-init= projects =~/RetroPie= → the shared host library and
-=~/.guix-extra-profiles= → the host Guix profiles; so both the ROM paths and
-the =~=-relative core paths resolve with zero machine-specific absolute paths
-baked into this file.
+reads this same shared library. Inside the sanctuary =~= expands to the guest
+home, where the launcher points =~/RetroPie= at the direct container bind and
+=vm-homes-init= projects =~/.guix-extra-profiles= from the host; so both the ROM
+paths and the =~=-relative core paths resolve with zero machine-specific
+absolute paths baked into this file.
 
 This is the *libretro first cut*: the systems that have both a core in
 =room-retropie= and populated ROMs.  Launch is =retroarch -L <core> %ROM%=
@@ -691,8 +730,9 @@ Usage:
   ports-menu-gen fvwm
   ports-menu-gen -h | --help
 
-The default root is ~/RetroPie/roms/ports. Set RETROPIE_PORTS_DIR to use
-another ports root for a bounded test. Only *.sh at depth one and two match.
+Set RETROPIE_PORTS_DIR to force one root for a bounded test. Otherwise the
+guest ~/RetroPie/roms/ports root is tried first, then the real host-home path
+/home/metsatron/RetroPie/roms/ports. Only *.sh at depth one and two match.
 EOF
 }
 
@@ -707,22 +747,89 @@ if (( $# != 1 )) || [[ "$1" != "icewm" && "$1" != "fvwm" ]]; then
 fi
 
 MODE="$1"
-ROOT="${RETROPIE_PORTS_DIR:-${HOME}/RetroPie/roms/ports}"
+
+emit_unavailable() {
+  if [[ "${MODE}" == "icewm" ]]; then
+    printf '  prog "Ports unavailable — RetroPie tree not mounted" dialog-warning true\n'
+  else
+    printf 'DestroyMenu "Ports"\n'
+    printf 'AddToMenu "Ports" "Ports" Title\n'
+    printf '+ "Ports unavailable — RetroPie tree not mounted" Nop\n'
+  fi
+}
+
+# All normal-operation output is staged first. If any runtime error occurs
+# after argument validation, the EXIT trap discards partial output, emits one
+# valid unavailable menu, and forces status 0 so a menuprog/PipeRead caller can
+# never be killed by missing media or an incidental generator failure.
+OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/ports-menu-gen.XXXXXX")" || {
+  emit_unavailable
+  exit 0
+}
+PUBLISHED=0
+runtime_cleanup() {
+  local status=$?
+  trap - EXIT
+  rm -f -- "${OUTPUT_FILE}"
+  if (( status != 0 )); then
+    printf 'ports-menu-gen: runtime failure; emitting unavailable menu\n' >&2
+    if (( PUBLISHED == 0 )); then
+      emit_unavailable || true
+    fi
+  fi
+  exit 0
+}
+trap runtime_cleanup EXIT
 
 shopt -s nullglob
-top_level=("$ROOT"/*.sh)
-nested_level=("$ROOT"/*/*.sh)
-
 top_scripts=()
-for script in "${top_level[@]}"; do
-  [[ -f "$script" ]] || continue
-  top_scripts+=("$script")
+nested_level=()
+ROOT=""
+
+load_scripts() {
+  local candidate="$1"
+  local script
+  local top_level=("${candidate}"/*.sh)
+  local nested_candidates=("${candidate}"/*/*.sh)
+
+  top_scripts=()
+  nested_level=()
+  for script in "${top_level[@]}"; do
+    [[ -f "${script}" ]] || continue
+    top_scripts+=("${script}")
+  done
+  for script in "${nested_candidates[@]}"; do
+    [[ -f "${script}" ]] || continue
+    nested_level+=("${script}")
+  done
+
+  if (( ${#top_scripts[@]} + ${#nested_level[@]} > 0 )); then
+    ROOT="${candidate}"
+    return 0
+  fi
+  return 1
+}
+
+if [[ -v RETROPIE_PORTS_DIR ]]; then
+  candidate_roots=("${RETROPIE_PORTS_DIR}")
+else
+  candidate_roots=(
+    "${HOME}/RetroPie/roms/ports"
+    "/home/metsatron/RetroPie/roms/ports"
+  )
+fi
+
+for candidate in "${candidate_roots[@]}"; do
+  [[ -n "${candidate}" && -d "${candidate}" ]] || continue
+  resolved_candidate="$(readlink -f -- "${candidate}" 2>/dev/null)" || continue
+  if load_scripts "${resolved_candidate}"; then
+    break
+  fi
 done
 
 declare -A seen_dirs=()
 nested_dirs=()
 for script in "${nested_level[@]}"; do
-  [[ -f "$script" ]] || continue
   dir="${script%/*}"
   if [[ -z "${seen_dirs[${dir}]+present}" ]]; then
     seen_dirs["$dir"]=1
@@ -730,9 +837,17 @@ for script in "${nested_level[@]}"; do
   fi
 done
 
-if (( ${#top_scripts[@]} + ${#nested_level[@]} == 0 )); then
-  printf 'ports-menu-gen: no .sh launchers found at depth 1 or 2 below %s\n' "$ROOT" >&2
-  exit 1
+if [[ -z "${ROOT}" ]]; then
+  if [[ -v RETROPIE_PORTS_DIR ]]; then
+    printf 'ports-menu-gen: no .sh launchers found at depth 1 or 2 below explicit root: %s\n' \
+      "${RETROPIE_PORTS_DIR:-<empty>}" >&2
+  else
+    printf 'ports-menu-gen: no .sh launchers found in guest or host RetroPie roots\n' >&2
+  fi
+  emit_unavailable > "${OUTPUT_FILE}"
+  cat -- "${OUTPUT_FILE}"
+  PUBLISHED=1
+  exit 0
 fi
 
 classify_script() {
@@ -876,8 +991,12 @@ emit_fvwm() {
 }
 
 if [[ "$MODE" == "icewm" ]]; then
-  emit_icewm
+  emit_icewm > "${OUTPUT_FILE}"
 else
-  emit_fvwm
+  emit_fvwm > "${OUTPUT_FILE}"
 fi
+
+cat -- "${OUTPUT_FILE}"
+PUBLISHED=1
+exit 0
 #+END_SRC
