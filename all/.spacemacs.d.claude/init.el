@@ -702,7 +702,7 @@
   (spacemacs/set-leader-keys
     "os" #'claude-code)
   (defvar metsatron/claude-workspace-width 80
-    "Columns for the Claude side window in `metsatron/setup-claude-workspace'.
+    "Columns for the Claude window in the @Claude layout.
   80 because this window is a TERMINAL, not a pane of prose — it hosts vterm and
   the Claude CLI's TUI, both of which are written against the traditional 80-column
   terminal. Wider does not buy more content, it just stretches the same wrapped
@@ -710,7 +710,7 @@
   squeezed to 89 of 211 columns).")
   
   (defvar metsatron/claude-workspace-treemacs-width 20
-    "Columns for the Treemacs side window in `metsatron/setup-claude-workspace'.")
+    "Columns for the Treemacs side window in the @Claude layout.")
   
   (defun metsatron/claude--editor-buffer ()
     "A sensible buffer for the editor pane: the most recent file-visiting one.
@@ -722,14 +722,14 @@
                   (buffer-list))
         (get-buffer-create "*scratch*")))
   
-  (defun metsatron/setup-claude-workspace ()
-    "Treemacs (left) | editor | Claude (right), Claude at a real width.
-  Rebuilds the frame from a known state rather than accreting side windows on
-  repeat invocation."
-    (interactive)
+  (defun metsatron/claude-workspace-build ()
+    "Build the Claude arrangement in the CURRENT perspective.
+  Not bound to a key on purpose — reach this through the @Claude layout below.
+  See the prose above for why."
     ;; `ignore-window-parameters' is what lets `delete-other-windows' clear
-    ;; EXISTING side windows (Treemacs, a stale Claude window) — without it they
-    ;; are explicitly exempt, and each call would stack another one.
+    ;; EXISTING side windows — Treemacs, and the Claude window, which
+    ;; claude-code-ide stamps with `no-delete-other-windows'. Without the binding
+    ;; both are exempt and survive, so each call would stack another one.
     (let ((ignore-window-parameters t))
       (delete-other-windows))
     (switch-to-buffer (metsatron/claude--editor-buffer))
@@ -749,14 +749,43 @@
                         (claude-code-ide--get-buffer-name)))
              (buf  (and name (get-buffer name))))
         (if buf
-            (claude-code-ide--display-buffer-in-side-window buf)
+            (progn
+              ;; Drop any window ALREADY showing the Claude buffer first. Under
+              ;; Spacemacs' `display-buffer-alist', `display-buffer' opens a NEW
+              ;; window rather than reusing the existing one, so without this a
+              ;; repeat call accretes another Claude window every time. Observed
+              ;; 2026-07-13: three windows onto one buffer, plus a 15-column
+              ;; vterm sliver. Idempotence here is not a nicety.
+              (dolist (w (window-list))
+                (when (eq (window-buffer w) buf)
+                  (let ((ignore-window-parameters t))
+                    (ignore-errors (delete-window w)))))
+              (claude-code-ide--display-buffer-in-side-window buf))
           ;; No session for this project yet — start one; it displays itself
           ;; through the same path, under the bindings above.
-          (call-interactively #'claude-code-ide)))))
+          (call-interactively #'claude-code-ide))))
+    ;; vterm only learns its size from the window. After the resizes above the
+    ;; Claude TUI can be left painted at the old width ("cursed" stale cells), so
+    ;; make it resync rather than waiting for the next keystroke.
+    (when (fboundp 'claude-code-ide--sync-terminal-dimensions)
+      (ignore-errors (claude-code-ide--sync-terminal-dimensions))))
   
-  (spacemacs/declare-prefix "oW" "claude workspace")
-  (spacemacs/set-leader-keys "oW" #'metsatron/setup-claude-workspace)
-  (global-set-key (kbd "C-c W") #'metsatron/setup-claude-workspace)
+  ;; Exposed as a LAYOUT (`SPC l c'), never as a window command.
+  ;;
+  ;; The body runs inside a NEW persp-mode perspective, so the layout you are
+  ;; currently in is untouched — that is the whole point, and it is what makes
+  ;; this "a new workspace" rather than "a frame rebuilder".
+  ;;
+  ;; An earlier version was an `interactive' command that called
+  ;; `delete-other-windows' on the CURRENT frame. It was selected by accident from
+  ;; `M-x' autocompletion and duly demolished the live workbench. `(interactive)'
+  ;; is a capability grant, not a convenience — it publishes a command to M-x and
+  ;; every completion frontend, where a destructive one gets picked eventually.
+  ;; `metsatron/claude-workspace-build' is deliberately NOT interactive. Do not add
+  ;; an `(interactive)' form to it, and do not give it a global key.
+  (spacemacs|define-custom-layout "@Claude"
+    :binding "c"
+    :body (metsatron/claude-workspace-build))
   (defun metsatron/setup-workbench ()
     "Right: two editor panes. Left: Treemacs side window. Bottom-left vterm."
     (interactive)
