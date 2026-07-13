@@ -14,7 +14,11 @@ Leave VERSION empty when using git pins.
 #+BEGIN_SRC text :tangle all/.local/share/dotcortex/manifests/cargo/crates.ssv
 # CRATE VERSION FEATURES BINS SOURCE GIT_URL GIT_REF TARGET LANE
 czkawka_cli  10.0.0 "" "" crates.io "" "" "" host
-neovide      "" "" "" git       https://github.com/neovide/neovide          "" "" host
+# neovide dropped 2026-07-14, deliberately — not a silent prune. It is redundant
+# with kitty+nvim, its git build had already been failing on X230 (cargo 1.90 dies
+# parsing neovide's own Cargo.toml — see the failure-collection note in cargo-apply),
+# and as a Skia/OpenGL GUI it was the one crate that could not be built in the
+# glibc-matched build container, which would have forced a second build mechanism.
 starship     "" "" "" crates.io "" "" "" host
 tpfancontrol "" "" "" git       https://github.com/Arnavion/tpfancontrol-rs "" "" host
 
@@ -160,6 +164,25 @@ DEFAULT_LANE="${DEFAULT_LANE:-host}"
 ENFORCE="${ENFORCE:-1}"
 UNINSTALL="${UNINSTALL:-1}"
 
+# Thermal guard. A host that cannot survive a rustc storm does not run one.
+#
+# The X230 died this way on 2026-07-13: cargo:apply pinned all four cores, the
+# ACPI zone hit its 100C critical trip, and the kernel hardware-protection-killed
+# the machine -- taking the fleet's NFS/Samba/ZFS down with it, unattended, at
+# 23:11. The lesson is not "be careful when running sweeps": an automated sweep
+# has no one to be careful. The refusal has to live in the tool.
+#
+# The marker is stowed from the x230/ overlay, so it exists only on hosts that
+# have actually been declared thermally constrained. Clear it after the teardown.
+if [[ -e "$HOME/.config/dotcortex/no-local-builds" && "${ALLOW_LOCAL_BUILD:-0}" != 1 ]]; then
+  echo "REFUSING: $(hostname) is marked thermally constrained (no-local-builds)."
+  echo "  Reason: $(head -1 "$HOME/.config/dotcortex/no-local-builds" 2>/dev/null)"
+  echo
+  echo "  Build on the fleet build host instead:  cargo-remote-apply"
+  echo "  To override once (you had better mean it):  ALLOW_LOCAL_BUILD=1 cargo-apply"
+  exit 1
+fi
+
 echo "== cargo apply =="
 
 # Check for host libraries required by crates that link against C libs
@@ -257,6 +280,255 @@ fi
 # sweep must surface, not bury under a cheerful "Done."
 if [[ "${#failed[@]}" -gt 0 ]]; then
   echo "FAILED (${#failed[@]}): ${failed[*]}"
+  exit 1
+fi
+
+echo "Done."
+#+END_SRC
+
+* Thermal constraint marker (X230 only)
+Stowed only on the X230. Its presence makes =cargo-apply= refuse to compile
+locally and redirect to =cargo-remote-apply=. Delete this block (and re-stow)
+once the heatsink teardown is done and the machine can cool itself again.
+
+#+BEGIN_SRC text :tangle x230/.config/dotcortex/no-local-builds
+Heatsink degraded (dust + worn thermal interface); no local Rust/Guix compiles.
+Thermal-critical shutdown 2026-07-13 23:11 during a cargo:apply sweep: acpitz hit
+its 100C trip and the kernel hardware-protection-killed the machine, taking the
+fleet's NFS/Samba/ZFS exports down with it. This host idles near 76C at its
+MINIMUM clock, so it has no headroom for a compile. Build on t480s via
+cargo-remote-apply. Clear this marker after the teardown (fins + thermal pad).
+#+END_SRC
+
+* Remote build (thermally-constrained hosts)
+Build the manifest on a build host, inside a container whose userland ABI matches
+*this* machine, then verify and ship the binaries back. See =cargo-remote-apply=
+for why each guard exists.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/cargo-remote-apply :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Build this machine's cargo manifest somewhere else, because building it here
+# would destroy the machine.
+#
+# On 2026-07-13 a cargo:apply sweep on the X230 pinned all four cores in rustc.
+# The ACPI thermal zone hit its 100C critical trip and the kernel executed a
+# HARDWARE PROTECTION shutdown -- which took NFS, Samba, ZFS and Jellyfin down
+# with it, because that laptop is the fleet's fileserver. The heat path on a
+# 13-year-old chassis is degraded (dust, worn thermal interface); the compile
+# storm is what exposed it. Until the teardown, this host does not compile Rust.
+#
+# Three constraints shape the design, and all three are load-bearing:
+#
+# 1. glibc is forward-compatible ONLY. Every build host in the fleet is newer
+#    than the X230 (T480s 2.41 vs X230 2.39). A binary built natively on the
+#    build host links symbols this machine does not have and will not start.
+#    So the build runs in a container pinned to THIS machine's os-release.
+#
+# 2. The X230 is Ivy Bridge and has NO AVX2; every other machine in the fleet
+#    has it. A -C target-cpu=native build would emit AVX2 and SIGILL on arrival.
+#    RUSTFLAGS is deliberately scrubbed, never forwarded.
+#
+# 3. "It will run over there" is a claim, so it gets machine-checked, not
+#    assumed: every built binary is verified against this host's glibc floor
+#    and then actually executed here before anything is installed.
+
+MAN="$HOME/DotCortex/all/.local/share/dotcortex/manifests/cargo/crates.ssv"
+
+BUILD_HOST="${CARGO_BUILD_HOST:-t480s}"
+DEST="$HOME/.cargo/bin"
+
+# The container must match THIS machine's userland, not the build host's.
+. /etc/os-release
+BUILD_IMAGE="${CARGO_BUILD_IMAGE:-docker.io/library/${ID}:${VERSION_ID}}"
+TAG="dotcortex-cargo-build:${ID}-${VERSION_ID}"
+
+# This host's glibc -- the ABI ceiling every returned binary must respect.
+# NB: awk without exit, deliberately. `ldd --version | head -1` looks equivalent
+# but head closes the pipe early, ldd dies of SIGPIPE, and under `set -o pipefail`
+# that kills this script with 141 before it prints a single line.
+HOST_GLIBC="$(ldd --version | awk 'NR==1 {print $NF}')"
+
+REMOTE_WORK=".cache/dotcortex/cargo-remote/${ID}-${VERSION_ID}"
+STAGE="$(mktemp -d)"
+trap 'rm -rf "$STAGE"' EXIT
+
+echo "== cargo remote apply =="
+echo "   build host : $BUILD_HOST"
+echo "   image      : $BUILD_IMAGE  (matches this host: ${ID} ${VERSION_ID}, glibc ${HOST_GLIBC})"
+echo "   dest       : $DEST"
+
+[[ -r "$MAN" ]] || { echo "ERROR: manifest not found: $MAN"; exit 1; }
+ssh -o BatchMode=yes -o ConnectTimeout=10 "$BUILD_HOST" true 2>/dev/null \
+  || { echo "ERROR: build host '$BUILD_HOST' unreachable over ssh"; exit 1; }
+ssh -o BatchMode=yes "$BUILD_HOST" 'command -v podman >/dev/null' \
+  || { echo "ERROR: podman not present on $BUILD_HOST"; exit 1; }
+
+# --- ship the manifest ------------------------------------------------------
+ssh -o BatchMode=yes "$BUILD_HOST" "mkdir -p '$REMOTE_WORK'/{out,cargo-home,rustup-home}"
+scp -q "$MAN" "$BUILD_HOST:$REMOTE_WORK/crates.ssv"
+
+# --- build the toolchain image once, reuse thereafter -----------------------
+ssh -o BatchMode=yes "$BUILD_HOST" bash -s -- "$REMOTE_WORK" "$BUILD_IMAGE" "$TAG" <<'REMOTE_IMAGE'
+set -euo pipefail
+work="$1"; image="$2"; tag="$3"
+if podman image exists "$tag"; then
+  echo ">> reusing build image $tag"
+  exit 0
+fi
+echo ">> building build image $tag from $image"
+cat >"$work/Containerfile" <<EOF
+FROM $image
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl git pkg-config build-essential \
+      libssl-dev libfreetype-dev libfontconfig-dev \
+ && rm -rf /var/lib/apt/lists/*
+EOF
+podman build -t "$tag" -f "$work/Containerfile" "$work"
+REMOTE_IMAGE
+
+# --- build the manifest inside the ABI-matched container --------------------
+# CARGO_HOME/RUSTUP_HOME are bind-mounted and persist between runs, so the
+# registry cache survives and repeat sweeps are cheap.
+ssh -o BatchMode=yes "$BUILD_HOST" bash -s -- "$REMOTE_WORK" "$TAG" <<'REMOTE_BUILD'
+set -euo pipefail
+work="$1"; tag="$2"
+abs="$HOME/$work"
+
+podman run --rm \
+  -v "$abs:/work:Z" \
+  -w /work \
+  "$tag" \
+  bash -euo pipefail -c '
+    export CARGO_HOME=/work/cargo-home
+    export RUSTUP_HOME=/work/rustup-home
+    export PATH="$CARGO_HOME/bin:$PATH"
+
+    # Never tune for the build host CPU: the target has no AVX2.
+    unset RUSTFLAGS CARGO_BUILD_RUSTFLAGS
+
+    if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
+      curl -fsSL https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --default-toolchain stable
+    fi
+
+    failed=()
+    while read -r crate version features bins source git_url git_ref target lane; do
+      case "$crate" in ""|\#*) continue ;; esac
+      dq() { [ "$1" = "\"\"" ] && echo "" || echo "$1"; }
+      version="$(dq "$version")"; features="$(dq "$features")"; bins="$(dq "$bins")"
+      source="$(dq "$source")";   git_url="$(dq "$git_url")"; git_ref="$(dq "$git_ref")"
+
+      args=(install "$crate" --root /work/out)
+      [ -n "$version" ] && args+=(--version "$version" --locked)
+      [ -n "$features" ] && args+=(--features "$features")
+      if [ -n "$bins" ]; then
+        IFS="," read -ra BB <<<"$bins"
+        for b in "${BB[@]}"; do [ -n "$b" ] && args+=(--bin "$b"); done
+      fi
+      if [ "${source:-crates.io}" = "git" ] && [ -n "$git_url" ]; then
+        args+=(--git "$git_url")
+        [ -n "$git_ref" ] && args+=(--rev "$git_ref")
+      fi
+
+      echo ">> building $crate"
+      # One bad crate must not silently skip the rest of the manifest.
+      cargo "${args[@]}" || failed+=("$crate")
+    done < /work/crates.ssv
+
+    if [ "${#failed[@]}" -gt 0 ]; then
+      echo "BUILD FAILED (${#failed[@]}): ${failed[*]}"
+      exit 1
+    fi
+  '
+REMOTE_BUILD
+
+# --- bring the binaries back into a staging area, NOT straight into PATH -----
+echo "== fetching build output =="
+rsync -a --info=stats1 "$BUILD_HOST:$REMOTE_WORK/out/bin/" "$STAGE/"
+
+shopt -s nullglob
+built=( "$STAGE"/* )
+if (( ${#built[@]} == 0 )); then
+  echo "ERROR: build host returned no binaries"
+  exit 1
+fi
+
+# --- VERIFY before installing -----------------------------------------------
+# The whole point of the container is an ABI claim. Check the claim.
+echo "== verifying ${#built[@]} binaries against this host (glibc ${HOST_GLIBC}, $(uname -m)) =="
+
+_max_glibc_req() {
+  # Highest GLIBC_x.y.z this binary demands. Empty if statically linked.
+  # The `|| true` is load-bearing: on a static binary objdump exits non-zero and
+  # grep matches nothing, and under `set -o pipefail` that would abort the whole
+  # verification on a binary that is in fact perfectly fine.
+  { objdump -T "$1" 2>/dev/null || true; } \
+    | { grep -o 'GLIBC_[0-9.]*' || true; } \
+    | sed 's/GLIBC_//' \
+    | sort -V \
+    | tail -1
+}
+
+bad=()
+good=()
+for bin in "${built[@]}"; do
+  name="$(basename "$bin")"
+
+  # (a) glibc floor.
+  req="$(_max_glibc_req "$bin")"
+  if [[ -n "$req" ]] && [[ "$(printf '%s\n%s\n' "$req" "$HOST_GLIBC" | sort -V | tail -1)" != "$HOST_GLIBC" ]]; then
+    echo "   FAIL $name: needs glibc $req, this host has $HOST_GLIBC"
+    bad+=("$name"); continue
+  fi
+
+  # (b) Every library and symbol resolves against THIS host's loader. Catches
+  # missing sonames and undefined symbols without executing anything.
+  if ldd_out="$(ldd -r "$bin" 2>&1)"; then
+    if grep -qE 'not found|undefined symbol' <<<"$ldd_out"; then
+      echo "   FAIL $name: unresolved at load time:"
+      grep -E 'not found|undefined symbol' <<<"$ldd_out" | sed 's/^/          /'
+      bad+=("$name"); continue
+    fi
+  fi
+
+  # (c) It starts. NOT "it exits 0" -- that was a bug: tpfancontrol is a daemon
+  # with no --help handler, exits 1 complaining about its config file, and got
+  # branded an ABI failure for it. A non-zero exit means the binary LOADED and
+  # RAN and then made its own decision, which is exactly what we are testing for.
+  # Only a loader failure (126/127) or death by signal (>=128 -- SIGILL=132 is
+  # the AVX2-on-Ivy-Bridge case) means it cannot execute on this host.
+  set +e
+  "$bin" --version >/dev/null 2>&1
+  rc=$?
+  set -e
+  if (( rc == 126 || rc == 127 || rc >= 128 )); then
+    echo "   FAIL $name: will not execute here (exit $rc$( ((rc>=128)) && echo ", signal $((rc-128))"))"
+    bad+=("$name"); continue
+  fi
+
+  printf '   ok   %-16s glibc<=%-6s loads, runs\n' "$name" "${req:-static}"
+  good+=("$bin")
+done
+
+# --- install the verified ones ----------------------------------------------
+# One bad binary must not block the other twelve. That is the same law as
+# b4b2c1aa9 ("one bad package must not silently skip the rest of the manifest"),
+# just from the other end -- and the failure is loud and the exit is non-zero,
+# so nothing is buried.
+if (( ${#good[@]} )); then
+  mkdir -p "$DEST"
+  install -m 0755 "${good[@]}" "$DEST/"
+  echo
+  echo "Installed ${#good[@]} verified binaries into $DEST"
+fi
+
+if (( ${#bad[@]} )); then
+  echo
+  echo "NOT INSTALLED (${#bad[@]} failed verification): ${bad[*]}"
+  echo "These built on $BUILD_HOST but will not run here. Nothing was overwritten for them."
   exit 1
 fi
 
@@ -368,7 +640,7 @@ if __name__ == "__main__":
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: cargo-capture cargo-diff cargo-sync cargo-apply cargo-health
+.PHONY: cargo-capture cargo-diff cargo-sync cargo-apply cargo-health cargo-remote-apply
 
 cargo-capture:
 | @chmod +x $(HOME)/.local/bin/cargo-capture 2>/dev/null || true
@@ -391,6 +663,12 @@ cargo-apply:
 cargo-health:
 | @chmod +x $(HOME)/.local/bin/cargo-health 2>/dev/null || true
 | $(HOME)/.local/bin/cargo-health
+
+# Build the manifest on CARGO_BUILD_HOST inside an ABI-matched container, verify
+# the binaries against this host, then install. For hosts that cannot compile.
+cargo-remote-apply:
+| @chmod +x $(HOME)/.local/bin/cargo-remote-apply 2>/dev/null || true
+| $(HOME)/.local/bin/cargo-remote-apply
 #+END_SRC
 
 ** Dedicated wrapper: cargo-wrap
