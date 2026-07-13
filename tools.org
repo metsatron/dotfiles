@@ -3148,3 +3148,154 @@ exec carbonyl "$url"
 #+BEGIN_SRC sh
 chmod +x ~/DotCortex/linux/.local/bin/obsidian-tab
 #+END_SRC
+
+* Whisper Hotkey
+=Super+c= toggles mic capture (XFCE custom command binding above, mirroring
+=Super+v='s live pclip binding — a direct =/commands/custom/<Super>X=
+xfconf command, no =.desktop= launcher involved; that's a KDE/kglobalaccel
+convention and doesn't apply on this XFCE machine). First press starts
+recording via =parecord=, second press stops it, transcribes via
+=whisper-transcribe --model small= (low-latency tier, not the default
+=large=), copies the transcript to the clipboard, and pastes it into
+whatever window currently has focus via =xdotool key ctrl+v=. State
+(recording PID + the in-progress wav) lives under
+=~/.local/state/whisper-hotkey/= so a crashed/killed recording never
+leaves a stale lock — the toggle always checks the PID is actually alive
+before trusting it.
+
+Speech is never destroyed (hardened 2026-07-13, after a failed run
+deleted a dictation unrecoverably): transcription retries in place —
+=small=, =small= again, then =large= — and if every attempt fails the
+wav is archived to =failed-<epoch>.wav= (last 5 kept) with the recovery
+command in the notification. Successful runs keep =last.wav= and
+=last-transcript.txt= too, so a misfired paste loses nothing. Every run
+appends its branch and whisper's real stderr to =run.log= in the state
+dir — the old script silenced both, which is why the failure was
+undiagnosable.
+
+Known limitation: =ctrl+v= is the paste binding for GUI apps generally;
+some terminal emulators require =ctrl+shift+v= instead. Not handled
+per-app — retarget the =xdotool key= line if this bites in a specific app.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/whisper-hotkey :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+# xfwm4 key-binding execution context doesn't reliably inherit XDG_RUNTIME_DIR
+# (same gotcha already worked around in pclip's own <Super>v binding) — without
+# it, parecord/pactl can't find the PulseAudio socket and fail silently.
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/whisper-hotkey"
+PID_FILE="$STATE_DIR/record.pid"
+WAV_FILE="$STATE_DIR/capture.wav"
+OUT_FILE="$STATE_DIR/transcript.md"
+LOG_FILE="$STATE_DIR/run.log"
+WHISPER_TRANSCRIBE="$HOME/HelmCortex/FORGE/bin/whisper-transcribe"
+
+mkdir -p "$STATE_DIR"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG_FILE"; }
+
+# A failed capture is evidence and recoverable speech — NEVER rm it.
+# Archive it, keep the last 5, and hand back the archived path.
+archive_failed_wav() {
+  saved="$STATE_DIR/failed-$(date +%s).wav"
+  mv -f "$WAV_FILE" "$saved" 2>/dev/null || { echo ""; return 0; }
+  ls -1t "$STATE_DIR"/failed-*.wav 2>/dev/null | tail -n +6 | xargs -r rm -f --
+  echo "$saved"
+}
+
+is_recording() {
+  [ -f "$PID_FILE" ] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
+}
+
+if is_recording; then
+  # Stop: signal parecord to finalize the wav, then transcribe and paste.
+  pid="$(cat "$PID_FILE")"
+  kill -INT "$pid" 2>/dev/null || true
+  for _ in $(seq 1 20); do
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  rm -f "$PID_FILE"
+
+  if [ ! -s "$WAV_FILE" ]; then
+    log "stop: wav missing or empty — parecord captured nothing"
+    notify-send "Whisper Hotkey" "No audio captured — nothing to transcribe (see run.log)." || true
+    exit 0
+  fi
+
+  wav_bytes="$(stat -c %s "$WAV_FILE")"
+  log "stop: captured ${wav_bytes} bytes"
+  notify-send "Whisper Hotkey" "Transcribing…" || true
+
+  if [ ! -x "$WHISPER_TRANSCRIBE" ]; then
+    saved="$(archive_failed_wav)"
+    log "FAIL: whisper-transcribe not executable at $WHISPER_TRANSCRIBE — audio kept: $saved"
+    notify-send "Whisper Hotkey" "whisper-transcribe missing — audio KEPT: $saved" || true
+    exit 1
+  fi
+
+  # Write to a file rather than parsing stdout: whisper-cli echoes the
+  # transcript to its own inherited stdout with no trailing newline right
+  # before whisper-transcribe's own "---" frontmatter delimiter, producing
+  # a glued line like " Thank you.---" that line-based parsing can't see
+  # as a delimiter — the frontmatter file path never touches that stream,
+  # since it's built straight from the already-read transcript text in
+  # Python (found 2026-07-07, "transcription came back empty" bug).
+  #
+  # Retry ladder: the recording is held and re-attempted until a
+  # transcript lands — small twice (fast tier), then large (strong tier).
+  # stderr goes to run.log, never /dev/null: a silent failure here once
+  # cost a whole dictation (2026-07-13).
+  transcript=""
+  for model in small small large; do
+    rm -f "$OUT_FILE"
+    log "attempt model=$model"
+    if [ "$model" = "large" ]; then
+      notify-send "Whisper Hotkey" "Retrying with large model (slower, stronger)…" || true
+    fi
+    "$WHISPER_TRANSCRIBE" --model "$model" --out "$OUT_FILE" "$WAV_FILE" >>"$LOG_FILE" 2>&1 \
+      || { log "attempt model=$model: nonzero exit"; continue; }
+    if [ ! -s "$OUT_FILE" ]; then
+      log "attempt model=$model: no output file"
+      continue
+    fi
+    # Strip the YAML frontmatter (everything up to and including the
+    # second "---" line plus the blank line after it) — transcript only.
+    transcript="$(awk 'BEGIN{d=0} /^---$/{d++; next} d>=2' "$OUT_FILE")"
+    transcript="$(printf '%s' "$transcript" | sed -e '1{/^$/d}')"
+    if [ -n "$transcript" ]; then
+      log "attempt model=$model: OK ($(printf '%s' "$transcript" | wc -c) chars)"
+      break
+    fi
+    log "attempt model=$model: transcript empty"
+  done
+  rm -f "$OUT_FILE"
+
+  if [ -z "$transcript" ]; then
+    saved="$(archive_failed_wav)"
+    log "FAIL: all attempts empty — audio kept: $saved"
+    notify-send -u critical "Whisper Hotkey" "Transcription failed after 3 attempts. Audio KEPT: $saved — recover with: whisper-transcribe --model large $saved" || true
+    exit 0
+  fi
+
+  # Belt and braces: transcript survives on disk and in the clipboard
+  # even if the paste keystroke lands in the wrong window (terminals
+  # want ctrl+shift+v — see prose above).
+  printf '%s' "$transcript" > "$STATE_DIR/last-transcript.txt"
+  printf '%s' "$transcript" | xclip -selection clipboard
+  xdotool key --clearmodifiers ctrl+v
+  preview="$(printf '%s' "$transcript" | head -c 120)"
+  notify-send "Whisper Hotkey" "Pasted: ${preview}" || true
+  mv -f "$WAV_FILE" "$STATE_DIR/last.wav"
+else
+  # Start: background parecord, remember its PID.
+  rm -f "$WAV_FILE"
+  parecord --channels=1 "$WAV_FILE" >/dev/null 2>&1 &
+  echo $! > "$PID_FILE"
+  disown
+  notify-send "Whisper Hotkey" "Recording… press Super+c again to stop and paste." || true
+fi
+#+END_SRC
+
