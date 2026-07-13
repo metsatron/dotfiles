@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: nala-repos nala-capture nala-diff nala-release-diff nala-release-sync nala-sync nala-apply nala-health
+.PHONY: nala-repos nala-capture nala-diff nala-release-diff nala-release-sync nala-sync nala-apply nala-apply-auto nala-health
 
 nala-repos:
 | @chmod +x $(HOME)/.local/bin/nala-repos-setup 2>/dev/null || true
@@ -30,6 +30,15 @@ nala-sync: nala-repos
 
 nala-apply: nala-repos
 | sudo nala upgrade
+| @chmod +x $(HOME)/.local/bin/nala-apply 2>/dev/null || true
+| ENFORCE=1 UNINSTALL=0 $(HOME)/.local/bin/nala-apply
+
+# Same as nala-apply, but never asks. nala refuses to run without a terminal
+# unless --assume-yes is passed, so an agent session (no TTY) cannot use
+# nala-apply at all. Held-back packages stay held: this is `upgrade`, not
+# `full-upgrade`, so kernel/ABI transitions still need a human.
+nala-apply-auto: nala-repos
+| sudo nala upgrade --assume-yes
 | @chmod +x $(HOME)/.local/bin/nala-apply 2>/dev/null || true
 | ENFORCE=1 UNINSTALL=0 $(HOME)/.local/bin/nala-apply
 
