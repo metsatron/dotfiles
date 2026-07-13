@@ -1699,7 +1699,119 @@ def fetch_deepinfra(timeout_seconds: float) -> dict[str, Any]:
     }
 
 
+# --- Shared result cache + rate-limit backoff -------------------------------
+#
+# Every provider probe funnels through fetch_provider, so the cache lives here
+# rather than in each fetcher.
+#
+# Why this exists (2026-07-13): Claude's OAuth usage endpoint tolerates only a
+# trickle of requests. Five `ai-usage --watch` panes, each polling on the 30s
+# default, hit it roughly every 6 seconds for three days and earned a permanent
+# HTTP 429 — while /api/oauth/profile kept returning 200, so the token was never
+# the problem. Nothing here cached, nothing backed off, and each watcher fetched
+# independently, so the throttle could never lift. The fix is twofold: concurrent
+# watchers share ONE fetch through an on-disk cache, and a 429 is respected with
+# escalating backoff instead of being retried into the ground.
+
+CACHE_DIR = os.path.expanduser("~/.cache/ai-usage")
+CACHE_TTL_SECONDS = float(os.environ.get("AI_USAGE_CACHE_TTL", "180"))
+BACKOFF_STEPS = (60, 120, 300, 600, 900)
+
+
+def _cache_path(key: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", key)
+    return os.path.join(CACHE_DIR, f"{safe}.json")
+
+
+def _cache_read(key: str) -> dict[str, Any]:
+    try:
+        with open(_cache_path(key), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+def _cache_write(key: str, entry: dict[str, Any]) -> None:
+    # Atomic: concurrent watchers must never read a half-written file.
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        path = _cache_path(key)
+        tmp = f"{path}.{os.getpid()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(entry, handle)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _is_rate_limited(result: dict[str, Any]) -> bool:
+    if result.get("state") != "error":
+        return False
+    return "429" in str(result.get("detail") or result.get("error") or result)
+
+
+def _cacheable(result: dict[str, Any]) -> dict[str, Any]:
+    """Drop the ProviderSpec — it is a dataclass, not JSON, and the caller has it."""
+    return {k: v for k, v in result.items() if k != "spec"}
+
+
+def _revive(cached: dict[str, Any], spec: ProviderSpec) -> dict[str, Any]:
+    return {**cached, "spec": spec}
+
+
 def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
+    now = time.time()
+    entry = _cache_read(spec.key)
+    cached = entry.get("result")
+
+    # Serve a fresh cache without touching the network. This is what makes N
+    # concurrent watchers cost one fetch instead of N.
+    if cached and (now - float(entry.get("ts", 0))) < CACHE_TTL_SECONDS:
+        return _revive(cached, spec)
+
+    # Still inside a backoff window from a previous 429: do not make it worse.
+    # Serve the last good result if we have one, marked stale.
+    backoff_until = float(entry.get("backoff_until", 0))
+    if now < backoff_until:
+        if cached:
+            return _revive({**cached, "stale": True}, spec)
+        wait = int(backoff_until - now)
+        return {
+            "spec": spec,
+            "state": "error",
+            "detail": f"rate limited (HTTP 429) — backing off, retrying in {wait}s",
+        }
+
+    result = _fetch_provider_uncached(spec, timeout_seconds)
+
+    if _is_rate_limited(result):
+        # Escalate the backoff each consecutive time we are throttled.
+        step = int(entry.get("backoff_step", 0))
+        delay = BACKOFF_STEPS[min(step, len(BACKOFF_STEPS) - 1)]
+        _cache_write(
+            spec.key,
+            {
+                "ts": float(entry.get("ts", 0)),
+                "result": cached,
+                "backoff_until": now + delay,
+                "backoff_step": step + 1,
+            },
+        )
+        if cached:
+            return _revive({**cached, "stale": True}, spec)
+        return result
+
+    # Success: reset the backoff ladder. Only good results are cached — caching
+    # an error would serve the error back for the whole TTL.
+    if result.get("state") != "error":
+        _cache_write(
+            spec.key,
+            {"ts": now, "result": _cacheable(result), "backoff_until": 0, "backoff_step": 0},
+        )
+    return result
+
+
+def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
     if spec.key == "gemini":
         result = fetch_gemini_cli_usage(spec, timeout_seconds)
         if result["state"] == "missing" and spec.fuelcheck_provider:
@@ -1975,7 +2087,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--interval",
         type=float,
-        default=30.0,
+        default=120.0,
         help="Refresh interval in seconds when --watch is enabled.",
     )
     return parser.parse_args()
