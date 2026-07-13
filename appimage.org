@@ -44,7 +44,7 @@ azahar.AppImage azahar no conf:conf-available conf:azahar
 claude-desktop-1.1.5749-1.3.17-amd64.AppImage claude-desktop-1.1.5749-1.3.17-amd64 no conf:conf-available conf:claude-desktop
 claude-devtools-0.4.9.AppImage claude-devtools-0.4.9 no conf:conf-available conf:claude-devtools
 cursor-2.6.20-x86_64.AppImage cursor-2.6.20-x86_64 no conf:conf-available conf:cursor
-opencode-electron-linux-x86_64.AppImage opencode-electron-linux-x86_64 no conf:conf-available conf:opencode
+opencode-desktop-linux-x86_64.AppImage opencode-desktop-linux-x86_64 no conf:conf-available conf:opencode
 #+END_SRC
 
 #+name: appimage-inventory-manual
@@ -172,8 +172,10 @@ NAME="OpenCode"
 FORGE="github"
 REPO="anomalyco/opencode"
 TYPE="appimage"
-APPIMG_NAME="opencode-electron"
-ASSET_RE='opencode-electron-linux-x86_64\.AppImage$'
+APPIMG_NAME="opencode-desktop"
+ASSET_RE='opencode-desktop-linux-x86_64\.AppImage$'
+# Upstream renamed the asset opencode-electron-* → opencode-desktop-* (seen at
+# v1.17.x); the old regex matched nothing and the app silently stopped updating.
 # anomalyco/opencode is the working mirror; sst/opencode is private/defunct
 # Alternative with broader libc compatibility (musl/older glibc):
 # REPO="pkgforge-dev/opencode-AppImage-Enhanced"
@@ -315,14 +317,32 @@ normalize_release_json() {
 }
 
 forge_release_json() {
-    local forge="$1" repo="$2" base_url="${3:-}" token="${4:-}"
+    local forge="$1" repo="$2" base_url="${3:-}" token="${4:-}" prerelease="${5:-0}"
     case "$forge" in
         github)
-            local url="https://api.github.com/repos/$repo/releases/latest"
-            if [[ -n "$token" ]]; then
-                curl -fsSL -H "Authorization: Bearer $token" "$url"
+            # /releases/latest never returns pre-releases, so a conf that sets
+            # PRERELEASE=1 has to walk the release list instead and take the
+            # newest pre-release. Picking "newest overall" would be wrong: the
+            # confs that want a pre-release want it *specifically* (Logseq's DB
+            # build lives on the nightly track while stable still ships the old
+            # file-based app), so a fresh stable must not silently win.
+            local url body
+            if [[ "$prerelease" == "1" ]]; then
+                url="https://api.github.com/repos/$repo/releases?per_page=30"
             else
-                curl -fsSL "$url"
+                url="https://api.github.com/repos/$repo/releases/latest"
+            fi
+            if [[ -n "$token" ]]; then
+                body="$(curl -fsSL -H "Authorization: Bearer $token" "$url")" || return 1
+            else
+                body="$(curl -fsSL "$url")" || return 1
+            fi
+            if [[ "$prerelease" == "1" ]]; then
+                jq -e '[.[] | select(.draft | not) | select(.prerelease)] | .[0] // empty' <<<"$body" || {
+                    echo "ERROR: no pre-release found for $repo" >&2; return 1
+                }
+            else
+                printf '%s' "$body"
             fi
             ;;
         gitlab)
@@ -396,6 +416,14 @@ appimage_current_ver() {
         sort -V | tail -n1 || true
 }
 
+# Confs are sourced into the shell's globals, and every app is processed in the
+# same shell. Required keys are overwritten by each conf, but optional ones are
+# not: without this, PRERELEASE=1 from one conf would leak into every app after
+# it, and a FORGE_TOKEN would leak across repos it was never meant for.
+clear_conf_vars() {
+    unset PRERELEASE FORGE_BASE_URL FORGE_TOKEN DIRECT_URL DIRECT_VERSION_CMD
+}
+
 find_conf() {
     local app="$1"
     if [[ -r "$CONF_DIR/$app.conf" ]]; then
@@ -448,6 +476,7 @@ show_cache() {
 health_check() {
     local app="$1" conf forge repo base_url
     conf="$(find_conf "$app")" || { echo "No conf for $app"; return 1; }
+    clear_conf_vars
     source "$conf"
     : "${FORGE?}" "${NAME?}"
     if [[ "$FORGE" == "dead" ]]; then
@@ -461,7 +490,7 @@ health_check() {
         fi
     fi
     local json
-    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" 2>&1)" || {
+    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" "${PRERELEASE:-0}" 2>&1)" || {
         echo "[fail] $NAME forge API unreachable: $json"; return 1
     }
     json="$(normalize_release_json "$json")"
@@ -476,6 +505,7 @@ update_one() {
     local app="$1" conf json latest_tag latest_ver asset_url asset_name
     local cached_asset have installed_ver dest
     conf="$(find_conf "$app")" || { echo "[skip] $app: no conf"; return 0; }
+    clear_conf_vars
     source "$conf"
     : "${FORGE?}" "${NAME?}" "${APPIMG_NAME?}" "${ASSET_RE?}"
 
@@ -514,7 +544,7 @@ update_one() {
     fi
 
     require jq curl
-    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" 2>&1)" || {
+    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" "${PRERELEASE:-0}" 2>&1)" || {
         echo "[fail] $NAME: forge API unreachable"; return 1
     }
     json="$(normalize_release_json "$json")"
@@ -555,6 +585,18 @@ update_one() {
     [[ -z "$asset_name" ]] && { echo "[warn] $NAME: matched URL but no asset name"; asset_name="unknown"; }
 
     latest_ver="$(normalize_ver "$latest_tag")"
+
+    # A pre-release track is often tagged by channel ("nightly"), not by version.
+    # That tag carries no version, so it would name the installed file
+    # Foo-nightly.AppImage and defeat the up-to-date check below forever. The
+    # asset name does carry it (Logseq-linux-x86_64-2.0.1.AppImage), so fall
+    # back to that whenever the tag has no digits in it at all.
+    if [[ ! "$latest_ver" =~ [0-9] ]]; then
+        local ver_from_asset
+        ver_from_asset="$(grep -oE '[0-9]+(\.[0-9]+)+' <<<"$asset_name" | head -n1 || true)"
+        [[ -n "$ver_from_asset" ]] && latest_ver="$ver_from_asset"
+    fi
+
     installed_ver="$(appimage_current_ver "$APPIMG_NAME")"
 
     echo "[conf] $NAME installed: ${installed_ver:-none}  latest: $latest_ver"
@@ -897,9 +939,17 @@ for f in "$APPS_DIR"/*.zs-old; do
 done
 echo "cleanup: removed $zs_old_count .zs-old files" | tee -a "$LOG"
 
-# Make sure everything we touch is executable
+# Make sure everything we touch is executable.
+#
+# The .desktop chmod must skip symlinks. Most entries in this directory are stow
+# symlinks into ~/DotCortex, so chmod follows the link and flips the mode of the
+# tracked source file — the sweep silently dirties its own repo (six rofi
+# launchers went 644 → 755 that way, and the next tangle would have reverted
+# them right back). -type f is false for symlinks, so this only touches the real
+# files appimaged actually writes here.
 chmod -f +x "$APPS_DIR"/*.AppImage 2>/dev/null || true
-chmod -f +x "$HOME/.local/share/applications/"*.desktop 2>/dev/null || true
+find "$HOME/.local/share/applications" -maxdepth 1 -type f -name '*.desktop' \
+     -exec chmod +x {} + 2>/dev/null || true
 
 # Scrub broken .desktop entries (integrated)
 APPS="$APPS_DIR" ~/.local/bin/appimage-scrub-desktops 2>&1 | tee -a "$LOG"
@@ -924,7 +974,9 @@ DESK_DIR="$HOME/.local/share/applications"
 echo "== scrubbing $DESK_DIR/*.desktop =="
 
 chmod -f +x "$APPS"/*.AppImage 2>/dev/null || true
-chmod -f +x "$DESK_DIR"/*.desktop 2>/dev/null || true
+# Skip symlinks: they are stow links into ~/DotCortex, and chmod would follow
+# them and dirty the tracked source. See the same guard in appimage-update.
+find "$DESK_DIR" -maxdepth 1 -type f -name '*.desktop' -exec chmod +x {} + 2>/dev/null || true
 
 shopt -s nullglob
 for f in "$DESK_DIR"/*.desktop; do
@@ -1260,6 +1312,11 @@ APPIMG_NAME="AppName"    # prefix used for version detection in ~/Applications
 ASSET_RE='AppName-.*\.AppImage$'  # regex to match the asset name
 
 # Optional:
+PRERELEASE=1            # github only: track the newest *pre-release* instead of
+                        # /releases/latest, which never returns pre-releases.
+                        # Picks the newest release with prerelease=true — not
+                        # merely the newest release — so a fresh stable cannot
+                        # quietly displace the pre-release build you asked for.
 FORGE_BASE_URL="https://git.selfhosted.example"  # for forgejo
 FORGE_TOKEN="ghp_xxx"   # for higher rate limits or private repos
 DIRECT_URL="https://..."  # for FORGE=direct
