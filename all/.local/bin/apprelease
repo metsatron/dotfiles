@@ -69,14 +69,32 @@ normalize_release_json() {
 }
 
 forge_release_json() {
-    local forge="$1" repo="$2" base_url="${3:-}" token="${4:-}"
+    local forge="$1" repo="$2" base_url="${3:-}" token="${4:-}" prerelease="${5:-0}"
     case "$forge" in
         github)
-            local url="https://api.github.com/repos/$repo/releases/latest"
-            if [[ -n "$token" ]]; then
-                curl -fsSL -H "Authorization: Bearer $token" "$url"
+            # /releases/latest never returns pre-releases, so a conf that sets
+            # PRERELEASE=1 has to walk the release list instead and take the
+            # newest pre-release. Picking "newest overall" would be wrong: the
+            # confs that want a pre-release want it *specifically* (Logseq's DB
+            # build lives on the nightly track while stable still ships the old
+            # file-based app), so a fresh stable must not silently win.
+            local url body
+            if [[ "$prerelease" == "1" ]]; then
+                url="https://api.github.com/repos/$repo/releases?per_page=30"
             else
-                curl -fsSL "$url"
+                url="https://api.github.com/repos/$repo/releases/latest"
+            fi
+            if [[ -n "$token" ]]; then
+                body="$(curl -fsSL -H "Authorization: Bearer $token" "$url")" || return 1
+            else
+                body="$(curl -fsSL "$url")" || return 1
+            fi
+            if [[ "$prerelease" == "1" ]]; then
+                jq -e '[.[] | select(.draft | not) | select(.prerelease)] | .[0] // empty' <<<"$body" || {
+                    echo "ERROR: no pre-release found for $repo" >&2; return 1
+                }
+            else
+                printf '%s' "$body"
             fi
             ;;
         gitlab)
@@ -150,6 +168,14 @@ appimage_current_ver() {
         sort -V | tail -n1 || true
 }
 
+# Confs are sourced into the shell's globals, and every app is processed in the
+# same shell. Required keys are overwritten by each conf, but optional ones are
+# not: without this, PRERELEASE=1 from one conf would leak into every app after
+# it, and a FORGE_TOKEN would leak across repos it was never meant for.
+clear_conf_vars() {
+    unset PRERELEASE FORGE_BASE_URL FORGE_TOKEN DIRECT_URL DIRECT_VERSION_CMD
+}
+
 find_conf() {
     local app="$1"
     if [[ -r "$CONF_DIR/$app.conf" ]]; then
@@ -202,6 +228,7 @@ show_cache() {
 health_check() {
     local app="$1" conf forge repo base_url
     conf="$(find_conf "$app")" || { echo "No conf for $app"; return 1; }
+    clear_conf_vars
     source "$conf"
     : "${FORGE?}" "${NAME?}"
     if [[ "$FORGE" == "dead" ]]; then
@@ -215,7 +242,7 @@ health_check() {
         fi
     fi
     local json
-    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" 2>&1)" || {
+    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" "${PRERELEASE:-0}" 2>&1)" || {
         echo "[fail] $NAME forge API unreachable: $json"; return 1
     }
     json="$(normalize_release_json "$json")"
@@ -230,6 +257,7 @@ update_one() {
     local app="$1" conf json latest_tag latest_ver asset_url asset_name
     local cached_asset have installed_ver dest
     conf="$(find_conf "$app")" || { echo "[skip] $app: no conf"; return 0; }
+    clear_conf_vars
     source "$conf"
     : "${FORGE?}" "${NAME?}" "${APPIMG_NAME?}" "${ASSET_RE?}"
 
@@ -268,7 +296,7 @@ update_one() {
     fi
 
     require jq curl
-    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" 2>&1)" || {
+    json="$(forge_release_json "$FORGE" "$REPO" "${FORGE_BASE_URL:-}" "${FORGE_TOKEN:-}" "${PRERELEASE:-0}" 2>&1)" || {
         echo "[fail] $NAME: forge API unreachable"; return 1
     }
     json="$(normalize_release_json "$json")"
@@ -309,6 +337,18 @@ update_one() {
     [[ -z "$asset_name" ]] && { echo "[warn] $NAME: matched URL but no asset name"; asset_name="unknown"; }
 
     latest_ver="$(normalize_ver "$latest_tag")"
+
+    # A pre-release track is often tagged by channel ("nightly"), not by version.
+    # That tag carries no version, so it would name the installed file
+    # Foo-nightly.AppImage and defeat the up-to-date check below forever. The
+    # asset name does carry it (Logseq-linux-x86_64-2.0.1.AppImage), so fall
+    # back to that whenever the tag has no digits in it at all.
+    if [[ ! "$latest_ver" =~ [0-9] ]]; then
+        local ver_from_asset
+        ver_from_asset="$(grep -oE '[0-9]+(\.[0-9]+)+' <<<"$asset_name" | head -n1 || true)"
+        [[ -n "$ver_from_asset" ]] && latest_ver="$ver_from_asset"
+    fi
+
     installed_ver="$(appimage_current_ver "$APPIMG_NAME")"
 
     echo "[conf] $NAME installed: ${installed_ver:-none}  latest: $latest_ver"
