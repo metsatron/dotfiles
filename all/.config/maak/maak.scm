@@ -562,6 +562,12 @@
    (task 'cargo:health "Show DotCortex Rust env and versions"
          (lambda () (sh "~/.local/bin/cargo-health")))
 
+   ;; Build on a remote host in an ABI-matched container, verify, then install.
+   ;; For hosts that cannot survive a local rustc storm -- see cargo.org.
+   (task 'cargo:remote-apply
+         "Build manifest on CARGO_BUILD_HOST, verify ABI, install here"
+         (lambda () (sh "~/.local/bin/cargo-remote-apply")))
+
    ;; --- Homebrew ---
    (task 'brew:apply
          "Enforce Homebrew state from DotCortex manifest"
