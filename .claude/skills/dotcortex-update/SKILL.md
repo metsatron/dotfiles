@@ -18,7 +18,7 @@ Not every manager applies to every machine — `brew` is macOS-only, `dnf` is T4
 ```bash
 cd ~/DotCortex
 
-loom nala:diff && loom nala:apply       # Debian/apt
+loom nala:diff && loom nala:apply-auto  # Debian/apt — see TTY note below
 loom guix:apply                         # core profile (fast, idempotent)
 loom flatpak:diff && loom flatpak:apply
 loom snap:diff && loom snap:apply
@@ -38,9 +38,15 @@ loom am:diff && loom am:apply           # opt-in AppMan
 
 `loom guix:pull` (channel updates) is deliberately NOT part of the default sweep — it's slow (minutes) and network-heavy. Only run it if the user asks for it explicitly.
 
+## nala needs a TTY — use `nala:apply-auto` from an agent session
+
+`nala:apply` runs a bare `sudo nala upgrade`, and nala refuses to proceed without a terminal ("It can be dangerous to continue without a terminal"). An agent's Bash tool has no TTY, and neither does Claude Code's `!` prefix, so `nala:apply` simply cannot complete from a session — it dies after printing the upgrade plan. `nala:apply-auto` is the same recipe with `--assume-yes`; use it whenever running the sweep as an agent. `nala:apply` stays the human verb, for when Mètsàtron wants to eyeball the package list in a real terminal before confirming.
+
+Both verbs run `upgrade`, never `full-upgrade` — held-back packages (kernel/ABI transitions) stay held either way and remain a deliberate human decision.
+
 ## Rules
 
-- One machine at a time, and only with the user's go-ahead for that machine — this is not a background fleet-wide cron job. A manager's apply can prompt interactively (nala held-package prompts, sudo) or hit a real conflict needing judgment; don't force through a prompt or retry blindly.
+- One machine at a time, and only with the user's go-ahead for that machine — this is not a background fleet-wide cron job. A manager's apply can hit a real conflict needing judgment; don't force through a prompt or retry blindly. `nala:apply-auto` is the one sanctioned non-interactive escape hatch, and only because nala's own prompt is a TTY check rather than a judgment call — never invent an `--assume-yes`/`--force` for any other manager to get past something it is asking about.
 - Report what actually changed per manager (from the diff, or from apply's own summary) — "ran the sweep" without saying what moved defeats the purpose.
 - Never invoke Haiku for this — package manager applies aren't zero-ambiguity mechanical work. Use the main session or a Sonnet-tier subagent.
 - This sweep never touches `.org` source or manifests. Adding, removing, or version-pinning a package is a separate, deliberate manifest edit — not something this skill does on its own initiative.
