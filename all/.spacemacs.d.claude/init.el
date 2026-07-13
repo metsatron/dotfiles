@@ -306,6 +306,37 @@
                 (setq-local display-line-numbers t)
                 (display-line-numbers-mode 1))))
   ;; --- VTERM: clean monospace, no extra spacing, no prettify-symbols ---
+  
+  ;; Terminal font preference, in the order fonts.org declares under "Preferred
+  ;; SF Mono fallback candidates". The first family actually installed wins, so
+  ;; the declared order is load-bearing rather than decorative. IosevkaTerm is
+  ;; the tail guarantee, not the choice.
+  ;;
+  ;; TUI column alignment does NOT depend on this family: blk-glyphs pins the
+  ;; box-drawing range (U+2500–U+257F) to IosevkaTerm globally, so a proportional
+  ;; slip in the text font cannot break Claude's / any TUI's box rendering.
+  ;;
+  ;; NOTE: "FiraPro Nerd Font" is named in fonts.org but Nerd Fonts ships no such
+  ;; family (it ships FiraCode and FiraMono). It is kept here verbatim to match
+  ;; the declared list; it will simply never match until fonts.org resolves it.
+  (defvar metsatron/terminal-font-preference
+    '("MesloLGS Nerd Font Mono"
+      "FiraPro Nerd Font Mono"
+      "Mononoki Nerd Font Mono"
+      "IosevkaTerm Nerd Font Mono")
+    "Monospace families for terminal buffers, most-preferred first.
+  Order is declared in `fonts.org'. `metsatron/terminal-font' picks the first
+  family that is actually installed.")
+  
+  (defvar metsatron/terminal-font-height 100
+    "Face height for terminal buffers.")
+  
+  (defun metsatron/terminal-font ()
+    "First installed family from `metsatron/terminal-font-preference'.
+  Returns nil if none are installed, in which case the frame default stands."
+    (seq-find (lambda (family) (member family (font-family-list)))
+              metsatron/terminal-font-preference))
+  
   (with-eval-after-load 'vterm
     (defun metsatron/vterm-fonts ()
       (variable-pitch-mode 0)
@@ -313,9 +344,10 @@
       (setq-local prettify-symbols-alist nil)
       (when (boundp 'prettify-symbols-mode)
         (prettify-symbols-mode -1))
-      ;; IosevkaTerm enforces strict monospace on ALL glyphs incl Nerd Font extras
-      (face-remap-add-relative 'default     '(:family "IosevkaTerm Nerd Font Mono" :height 100))
-      (face-remap-add-relative 'fixed-pitch '(:family "IosevkaTerm Nerd Font Mono" :height 100))
+      (when-let ((family (metsatron/terminal-font)))
+        (let ((spec `(:family ,family :height ,metsatron/terminal-font-height)))
+          (face-remap-add-relative 'default     spec)
+          (face-remap-add-relative 'fixed-pitch spec)))
       ;; no extra line padding
       (setq-local line-spacing 0))
     (add-hook 'vterm-mode-hook #'metsatron/vterm-fonts))
