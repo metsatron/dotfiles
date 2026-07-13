@@ -35,10 +35,28 @@ guix-sub-apply:
 | \
 | DAEMON_BIN="$$(systemctl show -p ExecStart guix-daemon 2>/dev/null | sed -E 's/^ExecStart=..([^ ]*guix-daemon).*/\1/')"; \
 | [[ -x "$$DAEMON_BIN" ]] || DAEMON_BIN="/var/guix/profiles/per-user/root/current-guix/bin/guix-daemon"; \
+| \
+| # Thermal guard, same marker the cargo lane honours. A host that cannot survive \
+| # a compile does not get to run one, and the refusal belongs in the tool, not in \
+| # an agent's good intentions. --max-jobs=0 forbids LOCAL build jobs outright: \
+| # every derivation must arrive as a substitute or be offloaded to a build machine \
+| # (/etc/guix/machines.scm). Without it the daemon cheerfully compiles locally the \
+| # moment a substitute misses -- and the custom packages defined in this very file \
+| # (patched gvfs, emulationstation, ...) NEVER have an upstream substitute, so the \
+| # miss is guaranteed, not hypothetical. That is how the X230 hardware-thermal-killed \
+| # itself on 2026-07-13, taking the fleet's NFS/Samba/ZFS with it. \
+| # This must live HERE rather than as a hand-edit of override.conf, because this \
+| # recipe REGENERATES override.conf -- a hand-edit would be silently wiped on the \
+| # next guix-sub-apply, which is precisely the silent-drift class we keep paying for. \
+| EXTRA=""; \
+| if [[ -e "$$HOME/.config/dotcortex/no-local-builds" ]]; then \
+|   EXTRA=" --max-jobs=0"; \
+|   echo ">> $$(hostname): marked no-local-builds — daemon gets --max-jobs=0 (substitute or offload only)"; \
+| fi; \
 | sudo mkdir -p /etc/systemd/system/guix-daemon.service.d; \
 | tmp="$$(mktemp)"; \
-| printf '%s\n[Service]\nEnvironment=GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale\nExecStart=\nExecStart=%s --build-users-group=guixbuild --substitute-urls=\"%s\"\n' \
-|   "" "$$DAEMON_BIN" "$$SUB_URLS" >"$$tmp"; \
+| printf '%s\n[Service]\nEnvironment=GUIX_LOCPATH=/var/guix/profiles/per-user/root/guix-profile/lib/locale\nExecStart=\nExecStart=%s --build-users-group=guixbuild%s --substitute-urls=\"%s\"\n' \
+|   "" "$$DAEMON_BIN" "$$EXTRA" "$$SUB_URLS" >"$$tmp"; \
 | sudo install -m 0644 "$$tmp" /etc/systemd/system/guix-daemon.service.d/override.conf; rm -f "$$tmp"; \
 | sudo systemctl daemon-reload; sudo systemctl restart guix-daemon; \
 | systemctl --no-pager status guix-daemon || true
