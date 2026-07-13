@@ -1618,6 +1618,120 @@ def deepinfra_token(timeout_seconds: float) -> tuple[str | None, str]:
     return None, "deepctl"
 
 
+CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
+CLAUDE_CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
+
+
+def claude_oauth_token() -> str | None:
+    try:
+        with open(CLAUDE_CREDENTIALS, encoding="utf-8") as handle:
+            oauth = json.load(handle).get("claudeAiOauth") or {}
+    except (OSError, ValueError):
+        return None
+
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
+        return None
+
+    # expiresAt is epoch milliseconds. An expired token is not our job to
+    # refresh — say so and let the fuelcheck fallback try.
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and time.time() >= (float(expires_at) / 1000.0):
+        return None
+
+    return token
+
+
+def _claude_quota(percent: Any, resets_at: Any, label: str) -> dict[str, Any]:
+    return {
+        "label": label,
+        "usedPercent": float(percent) if isinstance(percent, (int, float)) else None,
+        "resetsAt": resets_at if isinstance(resets_at, str) else None,
+    }
+
+
+def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
+    """Read Claude usage straight from the OAuth endpoint.
+
+    fuelcheck-cli only reports the top-level five_hour/seven_day figures and drops
+    the `limits` array entirely — which is where the per-model scoped limits now
+    live (the legacy seven_day_opus / seven_day_sonnet fields are always null).
+    That array is the only place a Fable limit is visible, and it can sit at 99%
+    while the headline weekly reads a comfortable 70%. So fetch it ourselves and
+    render every limit the account actually has, whatever models Anthropic adds
+    later. Falls back to fuelcheck when there is no usable token.
+    """
+    token = claude_oauth_token()
+    if not token:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "missing",
+            "source": "oauth",
+            "summary": "No usable Claude OAuth token in ~/.claude/.credentials.json.",
+            "raw": None,
+        }
+
+    request = urllib.request.Request(
+        CLAUDE_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "anthropic-beta": CLAUDE_OAUTH_BETA,
+            "Accept": "application/json",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        # Say 429 in words the backoff layer recognises.
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "error",
+            "source": "oauth",
+            "summary": f"Claude OAuth usage fetch failed (HTTP {error.code})",
+            "raw": None,
+        }
+    except (urllib.error.URLError, TimeoutError, ValueError) as error:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "error",
+            "source": "oauth",
+            "summary": f"Claude OAuth usage fetch failed: {error}",
+            "raw": None,
+        }
+
+    five = data.get("five_hour") or {}
+    seven = data.get("seven_day") or {}
+
+    primary = _claude_quota(five.get("utilization"), five.get("resets_at"), "5h")
+    secondary = _claude_quota(seven.get("utilization"), seven.get("resets_at"), "wk")
+
+    # Every scoped limit the account carries — one line each, named by the model.
+    scoped: list[dict[str, Any]] = []
+    for limit in data.get("limits") or []:
+        if not isinstance(limit, dict) or limit.get("kind") != "weekly_scoped":
+            continue
+        model = ((limit.get("scope") or {}).get("model") or {})
+        name = model.get("display_name") or model.get("id") or "scoped"
+        quota = _claude_quota(limit.get("percent"), limit.get("resets_at"), str(name))
+        quota["severity"] = limit.get("severity")
+        scoped.append(quota)
+
+    return {
+        "provider": spec.key,
+        "label": spec.label,
+        "state": "ok",
+        "source": "oauth",
+        "summary": f"{spec.label} usage",
+        "raw": {"usage": {"primary": primary, "secondary": secondary}, "scoped": scoped},
+    }
+
+
 def fetch_deepinfra(timeout_seconds: float) -> dict[str, Any]:
     token, token_source = deepinfra_token(timeout_seconds)
     if not token:
@@ -1819,7 +1933,14 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
         return result
 
     if spec.key == "claude":
-        return fetch_fuelcheck(spec, timeout_seconds)
+        # Native OAuth first: it is the only source that carries the per-model
+        # scoped limits (Fable). fuelcheck stays as the fallback for when there
+        # is no usable token.
+        result = fetch_claude_oauth(spec, timeout_seconds)
+        if result["state"] == "ok":
+            return result
+        fallback = fetch_fuelcheck(spec, timeout_seconds)
+        return fallback if fallback["state"] == "ok" else result
 
     if spec.kind == "deepinfra":
         return fetch_deepinfra(timeout_seconds)
@@ -2008,6 +2129,17 @@ def render_text(results: list[dict[str, Any]]) -> None:
                 print(current)
             if weekly:
                 print(weekly)
+
+            # Per-model scoped limits (Fable, and whatever Anthropic scopes next).
+            # These are invisible in the headline weekly figure: Fable can sit at
+            # 99% while the weekly reads 70%, so it earns its own line.
+            for quota in raw.get("scoped") or []:
+                if not isinstance(quota, dict):
+                    continue
+                line = format_compact_quota_line(str(quota.get("label") or "scoped"), quota)
+                if line:
+                    print(line)
+
             weekly_reset_at = None
             if isinstance(secondary, dict):
                 weekly_reset_at = secondary.get("resetTime") or secondary.get("resetsAt")
