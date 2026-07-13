@@ -13,7 +13,9 @@ Most managers have a `:diff` verb — run it first and look at the output before
 
 ## Sweep list
 
-Not every manager applies to every machine — `brew` is macOS-only, `dnf` is T480 (OpenMandriva)-only, `termux-pkg` is s24/Termux-only, `am` is opt-in. Skip a manager if its manifest doesn't exist on this host's overlay (see `dotcortex-packages` for manifest paths) rather than erroring.
+Not every manager applies to every machine — `brew` is macOS-only, `termux-pkg` is s24/Termux-only, `am` is opt-in. Skip a manager if its manifest doesn't exist on this host's overlay (see `dotcortex-packages` for manifest paths) rather than erroring.
+
+`dnf` is not on this fleet. This skill used to say "dnf is T480 (OpenMandriva)-only"; T480 was verified on 2026-07-13 to run **Vendefoul 6 with nala/apt and no dnf binary at all**, so T480 sweeps exactly like the other Debian-family machines. The `dnf` verbs are kept for a future RPM host, not for T480.
 
 ```bash
 cd ~/DotCortex
@@ -31,7 +33,7 @@ loom cargo:diff && loom cargo:apply
 loom appimage:update
 loom app:apply
 loom brew:apply                         # macOS only
-loom dnf:diff && loom dnf:apply         # T480 only
+loom dnf:diff && loom dnf:apply         # RPM hosts only — NOT T480 (it is apt/nala)
 loom termux-pkg:apply                   # s24/Termux only
 loom am:diff && loom am:apply           # opt-in AppMan
 ```
