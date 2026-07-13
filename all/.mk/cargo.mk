@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: cargo-capture cargo-diff cargo-sync cargo-apply cargo-health
+.PHONY: cargo-capture cargo-diff cargo-sync cargo-apply cargo-health cargo-remote-apply
 
 cargo-capture:
 | @chmod +x $(HOME)/.local/bin/cargo-capture 2>/dev/null || true
@@ -25,3 +25,9 @@ cargo-apply:
 cargo-health:
 | @chmod +x $(HOME)/.local/bin/cargo-health 2>/dev/null || true
 | $(HOME)/.local/bin/cargo-health
+
+# Build the manifest on CARGO_BUILD_HOST inside an ABI-matched container, verify
+# the binaries against this host, then install. For hosts that cannot compile.
+cargo-remote-apply:
+| @chmod +x $(HOME)/.local/bin/cargo-remote-apply 2>/dev/null || true
+| $(HOME)/.local/bin/cargo-remote-apply
