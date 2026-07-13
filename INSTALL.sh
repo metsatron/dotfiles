@@ -56,20 +56,32 @@ esac
 info "Platform lane: $PLATFORM"
 
 # ── Detect init system ────────────────────────────────────────
+# What we need to know is WHICH PROGRAM MANAGES SERVICES — not who is PID 1.
+# On Devuan those can be different: sysvinit is PID 1 *and* OpenRC is the rc
+# system. The old order tested `/sbin/init --version | grep sysv` BEFORE OpenRC,
+# so an OpenRC box matched "sysv-init" first and the openrc branch below was
+# unreachable on exactly the machines that needed it. T480 was misclassified that
+# way: bootstrap wrote an LSB script and an /etc/rc2.d link, OpenRC reads neither,
+# and guix-daemon therefore never started at boot — for months, "fixed" by hand
+# each time and dead again after the next reboot.
+#
+# So: check OpenRC BEFORE sysv, and check it by evidence (a running /run/openrc,
+# or the openrc package owning /etc/init.d/rc), not by `command -v openrc` — the
+# binary can be absent from PATH on a box where OpenRC is nonetheless in charge.
 INIT_SYSTEM="unknown"
 if [ -d /run/systemd/system ]; then
   INIT_SYSTEM="systemd"
+elif [ -d /run/openrc ] \
+  || dpkg -S /etc/init.d/rc 2>/dev/null | grep -q '^openrc:' \
+  || [ -x /sbin/rc-update ] && [ -d /etc/runlevels ]; then
+  INIT_SYSTEM="openrc"
 elif [ -f /sbin/init ] && /sbin/init --version 2>&1 | grep -qi sysv; then
   INIT_SYSTEM="sysv-init"
-elif command -v openrc &>/dev/null; then
-  INIT_SYSTEM="openrc"
-else
+elif [ -f /etc/devuan_version ]; then
   # Devuan uses sysv-init but init --version may not report it
-  if [ -f /etc/devuan_version ]; then
-    INIT_SYSTEM="sysv-init"
-  fi
+  INIT_SYSTEM="sysv-init"
 fi
-info "Init system: $INIT_SYSTEM"
+info "Service manager: $INIT_SYSTEM"
 
 # ── Root check ────────────────────────────────────────────────
 SUDO=""
@@ -374,6 +386,41 @@ INITSCRIPT
       $SUDO update-rc.d guix-daemon defaults 2>/dev/null || true
       $SUDO daemonize /usr/local/bin/guix-daemon --build-users-group=guixbuild
       ok "Guix daemon started (sysv-init)"
+
+    elif [ "$INIT_SYSTEM" = "openrc" ]; then
+      # OpenRC reads /etc/runlevels/, NEVER /etc/rc*.d/. An LSB script + an
+      # update-rc.d link — the sysv branch above — is a dead letter here: it
+      # looks installed, starts fine by hand, and never runs at boot. Write a
+      # native openrc-run service instead.
+      #
+      # depend(): `after`, never `need`. Devuan's OpenRC has no `localmount`
+      # (Gentoo name; here it is mountall.sh), and `need` on a service that does
+      # not exist makes OpenRC refuse to start this one outright.
+      $SUDO tee /etc/init.d/guix-daemon > /dev/null << 'OPENRCSCRIPT'
+#!/sbin/openrc-run
+name="guix-daemon"
+description="GNU Guix build daemon"
+
+command="/usr/local/bin/guix-daemon"
+command_args="--build-users-group=guixbuild --substitute-urls=\"https://bordeaux.guix.gnu.org https://ci.guix.gnu.org https://substitutes.nonguix.org\""
+command_background="yes"
+pidfile="/run/guix-daemon.pid"
+
+depend() {
+    after mountall.sh
+}
+OPENRCSCRIPT
+      $SUDO chmod +x /etc/init.d/guix-daemon
+      # Purge any sysv links a previous (misdetecting) run left behind — OpenRC
+      # ignores them, so they only mislead the next person reading the machine.
+      $SUDO rm -f /etc/rc*.d/*guix-daemon 2>/dev/null || true
+      $SUDO rc-update add guix-daemon default 2>/dev/null || true
+      $SUDO rc-service guix-daemon start 2>/dev/null || true
+      if [ -e /run/openrc/started/guix-daemon ]; then
+        ok "Guix daemon started (OpenRC, registered in default runlevel)"
+      else
+        warn "OpenRC did not register guix-daemon — check: rc-service guix-daemon start"
+      fi
 
     elif [ "$INIT_SYSTEM" = "systemd" ]; then
       # Systemd unit should already exist from the tarball
