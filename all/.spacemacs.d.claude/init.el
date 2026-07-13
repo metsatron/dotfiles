@@ -11,7 +11,35 @@
    dotspacemacs-excluded-packages '(vterm org-superstar)
 
    ;; You had two dotspacemacs-additional-packages; merged to keep all
-   dotspacemacs-additional-packages '(mixed-pitch org-appear org-modern valign vterm doom-themes centaur-tabs kurecolor ellsp)
+   ;; Claude Code inside Emacs — three clients, deliberately kept side by side
+   ;; because they trade off against each other and none dominates:
+   ;;
+   ;;   claude-code-ide  runs the REAL `claude' CLI in a terminal buffer AND
+   ;;                    bridges Emacs to it over MCP (buffer/xref/imenu/flycheck
+   ;;                    exposed as tools). Hooks, skills and plugins all fire —
+   ;;                    the DotCortex harness stays in force. THE DEFAULT for
+   ;;                    real work. Most maintained of the three.
+   ;;   claude-code      thin wrapper, real CLI in a terminal, no MCP bridge.
+   ;;                    The minimal comparison point. Requires Emacs 30+ (have
+   ;;                    30.2). Also carries a `ghostel' (libghostty) backend.
+   ;;   agent-shell      NOT the CLI: a comint buffer speaking ACP to an adapter.
+   ;;                    Native Emacs buffer, so Evil behaves — but hooks are NOT
+   ;;                    supported and skills only partially surface. The harness
+   ;;                    is INERT here. Fine for exploration, wrong for governed
+   ;;                    DotCortex work. Depends on acp.el + shell-maker.
+   ;;
+   ;; ghostel: libghostty-backed terminal, an upgrade path from vterm (SIMD VT
+   ;; parsing, grapheme clusters, reflow-on-resize, kitty graphics). Preferred
+   ;; over rwc9u/emacs-libgterm, which is a self-described prototype tested only
+   ;; on macOS; ghostel is a supported claude-code.el backend.
+   dotspacemacs-additional-packages
+   '(mixed-pitch org-appear org-modern valign vterm doom-themes centaur-tabs kurecolor ellsp
+     inheritenv
+     (claude-code-ide :location (recipe :fetcher github :repo "manzaltu/claude-code-ide.el"))
+     (claude-code     :location (recipe :fetcher github :repo "stevemolitor/claude-code.el"))
+     (acp             :location (recipe :fetcher github :repo "xenodium/acp.el"))
+     (agent-shell     :location (recipe :fetcher github :repo "xenodium/agent-shell"))
+     (ghostel         :location (recipe :fetcher github :repo "dakra/ghostel")))
 
    dotspacemacs-configuration-layers
    '(helm
@@ -69,7 +97,9 @@
    dotspacemacs-smooth-scrolling t
    dotspacemacs-line-numbers '(:relative nil :visual nil)
    dotspacemacs-folding-method 'evil
-   dotspacemacs-search-tools '("rg" "ag" "pt" "ack" "grep")
+   ;; `pt' (the Platinum Searcher) was dropped from Spacemacs' allowed set — leaving
+   ;; it here fails dotfile validation on every SPC f e R with a type-mismatch error.
+   dotspacemacs-search-tools '("rg" "ag" "ack" "grep")
    dotspacemacs-show-trailing-whitespace t
    dotspacemacs-whitespace-cleanup nil))
 (defun dotspacemacs/user-env ()
@@ -591,6 +621,36 @@
     (define-key vterm-mode-map (kbd "C-y") #'vterm-yank)
     (define-key vterm-mode-map (kbd "S-<return>") (lambda () (interactive) (vterm-send-string "\n")))
     (setq vterm-max-scrollback 10000))
+  (spacemacs/declare-prefix "oc" "claude-code-ide")
+  (spacemacs/declare-prefix "oa" "agent-shell")
+  (spacemacs/declare-prefix "os" "claude-code (thin)")
+  
+  ;; claude-code-ide — the harness-preserving default.
+  (with-eval-after-load 'claude-code-ide
+    ;; Expose Emacs to Claude over MCP: xref, imenu, project info, flycheck.
+    (when (fboundp 'claude-code-ide-emacs-tools-setup)
+      (claude-code-ide-emacs-tools-setup)))
+  (spacemacs/set-leader-keys
+    "oc" #'claude-code-ide-menu
+    "oo" #'claude-code-ide-toggle)
+  
+  ;; agent-shell — ACP. Harness is inert here; see the prose above.
+  ;; Auth: login-based (subscription) rather than API key. Anthropic's stance on
+  ;; subscription use over ACP has moved around; if this starts failing, that is
+  ;; the first thing to re-check, not a config bug.
+  (with-eval-after-load 'agent-shell
+    (when (fboundp 'agent-shell-anthropic-make-authentication)
+      (setq agent-shell-anthropic-authentication
+            (agent-shell-anthropic-make-authentication :login t))))
+  (spacemacs/set-leader-keys
+    "oa" #'agent-shell-anthropic-start-claude-code)
+  
+  ;; claude-code — thin CLI wrapper. vterm backend to match the rest of the
+  ;; config; `ghostel' (libghostty) is the experimental upgrade path from vterm.
+  (with-eval-after-load 'claude-code
+    (setq claude-code-terminal-backend 'vterm))
+  (spacemacs/set-leader-keys
+    "os" #'claude-code)
   (defun metsatron/setup-workbench ()
     "Right: two editor panes. Left: Treemacs side window. Bottom-left vterm."
     (interactive)
