@@ -4,7 +4,7 @@
 ;; gets packed into a Docker image via =guix pack=. It contains nothing sanctuary-specific —
 ;; just the system utilities Distrobox needs to function inside a Guix rootfs.
 
-;; Actual packages (qtile, emacs, zsh, etc.) are NOT bundled here. They come from
+;; Actual desktop packages (qtile, emacs, etc.) are NOT bundled here. They come from
 ;; the host =/gnu/store= bind-mounted read-only into the container, accessed via
 ;; =~/.guix-extra-profiles/= profile symlinks.
 
@@ -12,7 +12,7 @@
 ;; [[file:../../../../../guix.org::*sanctuary-base][sanctuary-base:1]]
 ;; Virtual Habitat — sanctuary base layer (container compat only)
 ;; Packed into a Docker image via `guix pack -f docker`.
-;; All actual packages come from the host /gnu/store bind-mount.
+;; All desktop packages come from the host /gnu/store bind-mount.
 ;; Keep this manifest minimal — only what Distrobox needs to enter the container.
 (specifications->manifest
  '(
@@ -27,6 +27,16 @@
    "diffutils"
    "procps"        ; ps, kill — Distrobox uses these internally
    "which"
+   ;; Upstream distrobox-init dependency contract.  Guix images have no
+   ;; fallback package manager, so every command it checks must be present.
+   "bc" "bzip2" "curl"
+   "gnupg"         ; gpg
+   "inetutils"     ; hostname, ping
+   "less" "lsof" "man-db"
+   "pigz" "pinentry-tty" ; pinentry
+   "rsync" "openssh" "sudo"
+   "tree" "unzip" "wget"
+   "xauth" "zip" "zsh"
    "glibc-locales"
    "nss-certs"
    ))
