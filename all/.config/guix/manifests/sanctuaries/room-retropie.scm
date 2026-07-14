@@ -33,6 +33,7 @@
 (use-modules (gnu packages emulators)      ; retroarch, mame, mednafen, most cores
              (gnu packages games)          ; yamagi-quake2, sdlpop, supertux, openttd (ports engines, 2026-07-12)
              (gnu packages game-development) ; ioquake3
+             (gnu packages audio)          ; fluid-3 (FluidR3 GM soundfont for dsda-doom MIDI)
              (nongnu packages emulators)   ; libretro-genesis-plus-gx
              (nongnu packages game-development) ; eduke32, fury (nonguix ruling 2026-07-12)
              (local packages retropie-emulationstation)  ; local: RetroPie ES fork
@@ -64,6 +65,11 @@
        ;;                 those collections lose their soundtracks silently.
        dsda-doom
        crispy-doom
+       ;; FluidR3 GM soundfont (share/soundfonts/FluidR3Mono_GM.sf3).  dsda-doom links
+       ;; fluidsynth, but ships no soundfont — without one its MIDI is silent or awful.
+       ;; The shim points snd_soundfont at the PROFILE path, which is stable across
+       ;; rebuilds; never hardcode a /gnu/store path, it changes on every update.
+       fluid-3
        ;; nonguix lane — Mètsàtron's ruling 2026-07-12: guix+nonguix top priority
        eduke32
        fury
