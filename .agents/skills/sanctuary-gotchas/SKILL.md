@@ -139,3 +139,19 @@ fi
 ```
 
 Confirm with strace: `openat(".../terminfo/x/xterm")` succeeds and `write(1, "\33[1;40H")` cursor-address (CUP) writes reappear before each redraw (0 → many). Terminal-agnostic (any `$TERM` whose entry exists in the tree) and PSReadLine-version-independent (bundled 2.3.6 is fine — no module vendoring needed). On a full VM it self-neutralizes: no `/run/host`, and the VM's own `/usr/share/terminfo` satisfies .NET (just ensure terminfo is installed). Applied in `distrobox.org` → the `redstone-9x-pwsh` wrapper.
+
+## IceWM ignores the XDG icon theme, and DROPS toolbar buttons whose icon it cannot find
+
+The same `Icon=` name renders on the Redstone desktop and comes up blank in the Start menu and quick-launch strip. That is not a caching bug, a size bug, or a bad PNG: **pcmanfm (GTK) resolves names out of the Chicago95 XDG theme; IceWM does not.** Every menu icon that appears to work (`firefox_2`, `multimedia`, `system-file-manager`) also exists in some other theme IceWM does read — nothing that lives *only* in Chicago95 ever resolves.
+
+The trap is the symptom. IceWM does not draw a placeholder for an unresolvable icon — it **omits the whole `prog` entry from the toolbar**. So the failure presents as a *missing button*, which reads as "the launcher is broken / the program isn't installed", and sends you debugging PATH instead of icons.
+
+Fix: graft the icons into IceWM's own directory, `~/.icewm/icons/NAME_16x16.png` (and `_32x32`, `_48x48`), which always resolves. `sanctuary-redstone-9x-launch` does this after projecting Chicago95. An absolute path in the `prog` line also works; a bare theme name does not.
+
+Diagnose it with known-good separator icons between the icons under test (`prog "M" firefox_2 …`), so you are counting gaps between markers rather than trying to identify 16px buttons by eye — misreading a low-res crop will send you down a false trail faster than any bad hypothesis.
+
+## `.desktop` `Exec=` splits on whitespace — quote paths with spaces
+
+`Exec=` is not a shell command line; the launcher parses it with `g_shell_parse_argv`, which splits on whitespace exactly like a POSIX shell. RetroPie ports launchers are named like `Ultimate Doom (MP3) (crispy).sh`, so an unquoted `Exec=` resolves `argv[0]` to `.../ports/doom/Ultimate` — and the icon does **nothing at all**: no error, no window, no log line. A desktop icon that silently does nothing is indistinguishable from one nobody has clicked yet, so this can ship and sit there for days.
+
+Quote the path: `Exec="/run/dotcortex/retropie/isos/ports/doom/Ultimate Doom (MP3) (crispy).sh"`. Space *and* parenthesis are reserved characters in the freedesktop spec. Verify by parsing the emitted file the way GLib would (`shlex.split`) and stat-ing `argv[0]` — never by assuming it launches.

@@ -14,6 +14,22 @@ Use this when adding, replacing, or debugging app icons in DotCortex-managed ico
 - `icons.org` owns helper scripts and process notes; edit it for workflow changes.
 - Do not commit `icon-theme.cache` or `.icon-theme.cache`.
 
+## THE THEMES ARE GIT SUBMODULES — a plain `git add` will not capture your icons
+
+`Chicago95`, `BeOS-r5-Icons`, `Irixium`, `Iris`, `indigo-reality`, `Platinum9`, `irix-icons-linux` and `Throbbers` are each a **separate git repository** (mostly Mètsàtron's own GitLab forks). `icon-theme-inject` writes *inside* a submodule working tree. DotCortex only tracks the submodule's commit pointer, so from the DotCortex root your new PNGs appear as a single ` m <theme>` line and `git add <path/to/icon.png>` fails with *"Pathspec is in submodule"*. Commit them and they are silently absent.
+
+Committing icon work is therefore always two steps:
+
+```bash
+SUB=~/DotCortex/linux/.local/share/icons/Chicago95
+git -C "$SUB" add apps && git -C "$SUB" commit -m "feat(apps): ..."   # 1. inside the theme repo
+git -C ~/DotCortex add linux/.local/share/icons/Chicago95             # 2. bump the pointer
+```
+
+Both need pushing for the icons to reach another machine — a DotCortex push alone carries a pointer to a commit that does not exist upstream.
+
+**Keep injections additive.** `icon-theme-inject --names a,b,c` writes `a.png` and makes `b`/`c` symlinks to it — so an alias that collides with art the theme already ships will *overwrite upstream work* (it shows as `T` typechange, easily missed among a hundred `??` lines). Before committing, check `git -C "$SUB" status --short | grep -E '^ ?[MT]'` — that list should be empty. Restore anything on it.
+
 ## Workflow
 
 1. Check current state:
@@ -63,6 +79,9 @@ If a new theme has a different app-directory grammar, add it to `THEME_SIZES` an
 
 ## Pixel Art Rules
 
+- **Non-square sources must use `--square`.** The default resize is `image.resize((size, size))`, which *stretches*. Game sprites are rarely square (Doom's `STFST01` is 24x29) and come out visibly squashed with no warning.
+- **Choose by legibility at the smallest size actually used, not by what looks good at 128.** IceWM's `MenuIconSize=16`, so a Start-menu icon lives or dies at 16px. Render every candidate at 16/22/24/32/48, look at them side by side, and pick from that. Quake's Ranger HUD face is the perfect counterpart to the Doomguy's — and it is dark, low-contrast art that collapses into brown mush below 32px, so the Q logo won the slot. Photographic console art (the SNES/N64 renders in the BeOS pack) is gorgeous at 128 and an unreadable grey smear at 32.
+- **Game art is already in the tree — extract, don't draw.** `game-art-extract` (retropie.org) pulls lumps from Doom IWADs and Quake PAKs at native size, in the original palette. Reach for it before inventing or downloading art.
 - Pixel art: use `--resample nearest`; inspect 16/22/24 px outputs because readability can fail at panel size.
 - ChatGPT-style magic-pink mattes: use `--magic-pink` or `--transparent-color '#ff00ff'`.
 - Use `--transparent-tolerance` when the matte is slightly off-pink, and
