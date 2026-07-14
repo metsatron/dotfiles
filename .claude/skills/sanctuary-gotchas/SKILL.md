@@ -7,6 +7,36 @@ description: Sanctuary and XFCE gotchas — Xephyr ghost InputOnly window, XFCE 
 
 Covers XFCE, Xephyr, Flatpak, X11, and Distrobox sanctuary issues.
 
+## `podman exec` enters as ROOT and poisons the guest home — use `distrobox enter` (sealed 2026-07-14)
+
+`podman exec <sanctuary> …` runs as **container-root**. Anything it writes into the shared guest home lands root-owned, and the desktop user (`metsatron`, uid 1000) can then neither read nor write it. `distrobox enter <sanctuary> -- …` runs as **metsatron** — the user the desktop actually runs as.
+
+This is not theoretical: verifying the Ports menu with `podman exec` created `~/.cache/dotcortex/` root-owned, IceWM could no longer read its own cache, and the menu reported **"Ports unavailable — RetroPie tree not mounted"** while the tree was mounted and fully readable. A cache fault was surfaced to the user as a mount fault, and sent everyone hunting the wrong bug.
+
+- Writing anything into the guest home: **always `distrobox enter`**. `podman exec` is for read-only inspection only.
+- After any container work, check your footprint: `find ~/.local/share/dotcortex/guests/<name>/home -not -user metsatron` must return nothing.
+- Corollary for tool design: a cache failure must never change what the user sees. If the data source is readable, serve the real content — cached or not. Reserve "unavailable" for the source genuinely being absent, and never write a placeholder INTO a cache (a bad run then poisons every later good one).
+
+## A running container never picks up host mounts made after it started (sealed 2026-07-14)
+
+Podman establishes bind mounts **when the container starts**. If the mount source is behind an **autofs** automount (e.g. an NFS tree under `~/mnt/`), and the container starts while that automount is not live, it captures an **empty** bind for the entire life of that run. Nested autofs mounts do **not** propagate into a container's mount namespace — `/home/metsatron/mnt` is simply empty inside the guest.
+
+- `podman start` on an **already-running** container is a **no-op**, so a stale empty bind survives every subsequent launch. It works only by luck — when the container happened to start after the automount was triggered.
+- **The remedy is a RESTART, never a recreation.** Trigger the automount host-side first (`stat -L` the path), then stop/start the container. `sanctuary-retropie-bind-ensure` does this, and also recovers a container wedged in `Stopping` (bounded stop → escalate to `podman kill` → confirm `Exited` → start).
+- Never tell the user to recreate a sanctuary to fix a stale mount. Recreation is heavyweight, human-gated, and touches the only thing holding their data.
+
+## Distrobox bakes its helper paths into the container at CREATE time (sealed 2026-07-14)
+
+`distrobox create` records the **host paths** of `distrobox-init`, `distrobox-export` and `distrobox-host-exec` as bind mounts inside the container. Move or remove distrobox and every existing container that referenced the old path becomes **unstartable** — `crun: cannot stat …/distrobox-export`.
+
+Removing distrobox from the Guix core manifest (it was destroying rootless podman storage) orphaned three sanctuaries this way. Recreation is the only fix; the bind sources are immutable container config.
+
+It also changed the *contract*: system distrobox (1.8.x) requires ~30 base commands inside the container and shells out to a **package manager** when any are missing — and a Guix image has none. `sanctuary-base` must therefore satisfy that dependency list natively (see `guix.org`), and pre-seed `/etc/passwd.done` so `distrobox-init` skips its root-password step (Guix's `passwd` is PAM-linked, the image has no PAM service, and the `chpasswd -e` fallback runs unprivileged and cannot open `/etc/passwd`).
+
+## RetroArch ships an `.info` stub for every core that ever existed — only the `.so` is real (sealed 2026-07-14)
+
+`ls lib/libretro/ | grep prboom` "finds" a core that is not installed: `prboom_libretro.info` is metadata, present for hundreds of cores that are absent. **Only `*_libretro.so` proves a core exists.** This produced a false positive that nearly closed a bug that was still open.
+
 ## Flatpak audio dead after PulseAudio restart
 
 Killing PulseAudio (`pulseaudio -k`) destroys `/run/flatpak/pulse/` which `flatpak-session-helper` created at login. The helper does not recreate it on PA restart. Flatpak apps have `PULSE_SERVER=unix:/run/flatpak/pulse/native` baked into their sandbox env but the socket is gone. Menu restart reuses the existing sandbox with a stale bind-mount — it does not help.
