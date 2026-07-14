@@ -32,7 +32,9 @@ resolving only engines declared in the Guix rooms; an unprovisioned engine fails
 X230 command instead of trying =/opt/retropie= or pretending that a launch succeeded.
 
 The menu generator reads only =*.sh= matches at depth one and depth two below the ports root. It
-does not index game content, inspect assets, hash files, or walk any other path. IceWM calls it on
+does not index game content, inspect assets, hash files, or walk any other path. It classifies each
+launcher once, caches the rendered menu under the guest's XDG cache directory, and uses only the
+ports root plus its immediate directory mtimes for cheap staleness detection. IceWM calls it on
 menu expansion; FVWM95 reads its generated menu definitions at startup.
 
 * Design
@@ -652,6 +654,7 @@ exec "${command[@]}"
 # Generate IceWM or FVWM95 menu entries for the ports launcher scripts.
 # Deliberately glob only ROOT/*.sh and ROOT/*/*.sh; do not crawl game content.
 set -euo pipefail
+shopt -s nullglob
 
 # Ordered first-match classification table. Patterns match the launcher path
 # relative to ROOT, in lowercase. Keep engine-specific paths before the broad
@@ -736,6 +739,12 @@ guest ~/RetroPie/roms/ports root is tried first, then the real host-home path
 EOF
 }
 
+BUILD_ONLY=0
+if [[ "${1:-}" == '--build' ]]; then
+  BUILD_ONLY=1
+  shift
+fi
+
 if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
   usage
   exit 0
@@ -747,6 +756,20 @@ if (( $# != 1 )) || [[ "$1" != "icewm" && "$1" != "fvwm" ]]; then
 fi
 
 MODE="$1"
+SELF="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+TIMEOUT_BIN="$(command -v timeout 2>/dev/null || true)"
+if [[ -z "${TIMEOUT_BIN}" && -x /bin/timeout ]]; then
+  TIMEOUT_BIN='/bin/timeout'
+fi
+CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/dotcortex/ports-menu"
+CACHE_FILE="${CACHE_DIR}/${MODE}.menu"
+STAMP_FILE="${CACHE_DIR}/${MODE}.stamp"
+LOCK_DIR="${CACHE_DIR}/${MODE}.lock"
+BUILD_TMP_MENU=''
+BUILD_TMP_STAMP=''
+LOCK_HELD=0
+ROOT=''
+CURRENT_SIGNATURE=''
 
 emit_unavailable() {
   if [[ "${MODE}" == "icewm" ]]; then
@@ -758,245 +781,355 @@ emit_unavailable() {
   fi
 }
 
-# All normal-operation output is staged first. If any runtime error occurs
-# after argument validation, the EXIT trap discards partial output, emits one
-# valid unavailable menu, and forces status 0 so a menuprog/PipeRead caller can
-# never be killed by missing media or an incidental generator failure.
-OUTPUT_FILE="$(mktemp "${TMPDIR:-/tmp}/ports-menu-gen.XXXXXX")" || {
-  emit_unavailable
-  exit 0
-}
-PUBLISHED=0
-runtime_cleanup() {
-  local status=$?
-  trap - EXIT
-  rm -f -- "${OUTPUT_FILE}"
-  if (( status != 0 )); then
-    printf 'ports-menu-gen: runtime failure; emitting unavailable menu\n' >&2
-    if (( PUBLISHED == 0 )); then
-      emit_unavailable || true
-    fi
-  fi
-  exit 0
-}
-trap runtime_cleanup EXIT
-
-shopt -s nullglob
-top_scripts=()
-nested_level=()
-ROOT=""
-
-load_scripts() {
-  local candidate="$1"
-  local script
-  local top_level=("${candidate}"/*.sh)
-  local nested_candidates=("${candidate}"/*/*.sh)
-
-  top_scripts=()
-  nested_level=()
-  for script in "${top_level[@]}"; do
-    [[ -f "${script}" ]] || continue
-    top_scripts+=("${script}")
-  done
-  for script in "${nested_candidates[@]}"; do
-    [[ -f "${script}" ]] || continue
-    nested_level+=("${script}")
-  done
-
-  if (( ${#top_scripts[@]} + ${#nested_level[@]} > 0 )); then
-    ROOT="${candidate}"
-    return 0
-  fi
-  return 1
-}
-
-if [[ -v RETROPIE_PORTS_DIR ]]; then
-  candidate_roots=("${RETROPIE_PORTS_DIR}")
-else
-  candidate_roots=(
-    "${HOME}/RetroPie/roms/ports"
-    "/home/metsatron/RetroPie/roms/ports"
-  )
-fi
-
-for candidate in "${candidate_roots[@]}"; do
-  [[ -n "${candidate}" && -d "${candidate}" ]] || continue
-  resolved_candidate="$(readlink -f -- "${candidate}" 2>/dev/null)" || continue
-  if load_scripts "${resolved_candidate}"; then
-    break
-  fi
-done
-
-declare -A seen_dirs=()
-nested_dirs=()
-for script in "${nested_level[@]}"; do
-  dir="${script%/*}"
-  if [[ -z "${seen_dirs[${dir}]+present}" ]]; then
-    seen_dirs["$dir"]=1
-    nested_dirs+=("$dir")
-  fi
-done
-
-if [[ -z "${ROOT}" ]]; then
-  if [[ -v RETROPIE_PORTS_DIR ]]; then
-    printf 'ports-menu-gen: no .sh launchers found at depth 1 or 2 below explicit root: %s\n' \
-      "${RETROPIE_PORTS_DIR:-<empty>}" >&2
+emit_refreshing() {
+  if [[ "${MODE}" == "icewm" ]]; then
+    printf '  prog "Ports menu is refreshing — reopen" dialog-warning true\n'
   else
-    printf 'ports-menu-gen: no .sh launchers found in guest or host RetroPie roots\n' >&2
+    printf 'DestroyMenu "Ports"\n'
+    printf 'AddToMenu "Ports" "Ports" Title\n'
+    printf '+ "Ports menu is refreshing — reopen" Nop\n'
   fi
-  emit_unavailable > "${OUTPUT_FILE}"
-  cat -- "${OUTPUT_FILE}"
-  PUBLISHED=1
-  exit 0
-fi
+}
 
-classify_script() {
-  local script="$1"
-  local relative="${script#"${ROOT}"/}"
-  local lower="${relative,,}"
-  local rule pattern group
+# The menu's set of reachable launchers changes when a top-level launcher or
+# immediate child directory changes. A single stat invocation covers the root
+# and every immediate child directory; it does not stat the 498 launcher files.
+root_signature() {
+  local root="$1"
+  LC_ALL=C stat -c '%n:%Y' "${root}" "${root}"/*/ 2>/dev/null || true
+}
 
-  for rule in "${GROUP_RULES[@]}"; do
-    pattern="${rule%%|*}"
-    group="${rule#*|}"
-    if [[ "${lower}" == ${pattern} ]]; then
-      printf '%s' "${group}"
-      return 0
-    fi
+# Select a mounted root without doing a full inventory on the cache-hit path.
+# The first regular glob match is enough to distinguish the real tree from an
+# empty/unmounted directory; the complete bounded glob happens only on build.
+resolve_root() {
+  local candidate resolved script
+  local -a probes
+  if [[ -v RETROPIE_PORTS_DIR ]]; then
+    candidate_roots=("${RETROPIE_PORTS_DIR}")
+  else
+    candidate_roots=(
+      "${HOME}/RetroPie/roms/ports"
+      "/home/metsatron/RetroPie/roms/ports"
+    )
+  fi
+
+  ROOT=''
+  for candidate in "${candidate_roots[@]}"; do
+    [[ -n "${candidate}" && -d "${candidate}" ]] || continue
+    resolved="$(readlink -f -- "${candidate}" 2>/dev/null)" || continue
+    [[ -d "${resolved}" ]] || continue
+    probes=("${resolved}"/*.sh "${resolved}"/*/*.sh)
+    for script in "${probes[@]}"; do
+      if [[ -f "${script}" ]]; then
+        ROOT="${resolved}"
+        return 0
+      fi
+    done
   done
-
-  # Never drop a launcher that has not been added to the table yet.
-  printf '%s' 'Standalone'
+  return 1
 }
 
 menu_quote() {
   local value="$1"
   value="${value//\\/\\\\}"
   value="${value//\"/\\\"}"
-  printf '"%s"' "$value"
-}
-
-declare -A SCRIPT_GROUPS=()
-all_scripts=("${top_scripts[@]}" "${nested_level[@]}")
-for script in "${all_scripts[@]}"; do
-  SCRIPT_GROUPS["${script}"]="$(classify_script "${script}")"
-done
-
-group_has_scripts() {
-  local group="$1"
-  local script
-  for script in "${all_scripts[@]}"; do
-    [[ "${SCRIPT_GROUPS[${script}]}" == "${group}" ]] && return 0
-  done
-  return 1
-}
-
-nested_dir_has_group() {
-  local dir="$1"
-  local group="$2"
-  local script
-  for script in "${nested_level[@]}"; do
-    [[ "${script%/*}" == "${dir}" && "${SCRIPT_GROUPS[${script}]}" == "${group}" ]] && return 0
-  done
-  return 1
+  QUOTED="\"${value}\""
 }
 
 shell_quote() {
-  printf '%q' "$1"
+  printf -v SHELL_QUOTED '%q' "$1"
 }
 
 launch_command() {
   local script="$1"
-  local quoted
-  quoted="$(shell_quote "$script")"
-  printf -v command "sh -c 'cd -- \"\$(dirname \"\$1\")\" && exec \"\$1\"' ports-menu-entry %s" "$quoted"
-  printf '%s' "$command"
+  shell_quote "${script}"
+  printf -v LAUNCH_COMMAND \
+    "sh -c 'cd -- \"\$(dirname \"\$1\")\" && exec \"\$1\"' ports-menu-entry %s" \
+    "${SHELL_QUOTED}"
+}
+
+classify_script() {
+  local script="$1"
+  local relative="${script#"${ROOT}"/}"
+  local lower="${relative,,}"
+  local rule pattern
+
+  for rule in "${GROUP_RULES[@]}"; do
+    pattern="${rule%%|*}"
+    CLASSIFIED_GROUP="${rule#*|}"
+    if [[ "${lower}" == ${pattern} ]]; then
+      return 0
+    fi
+  done
+
+  # Never drop a launcher that has not been added to the table yet.
+  CLASSIFIED_GROUP='Standalone'
+}
+
+declare -a top_scripts=() nested_level=() all_scripts=() nested_dirs=() sorted_nested_dirs=()
+declare -A GROUP_COUNTS=() GROUP_TOP_SCRIPTS=() GROUP_DIR_SCRIPTS=() SEEN_DIRS=()
+
+generate_menu() {
+  local script dir group count
+  top_scripts=("${ROOT}"/*.sh)
+  nested_level=("${ROOT}"/*/*.sh)
+  all_scripts=()
+  nested_dirs=()
+  sorted_nested_dirs=()
+  GROUP_COUNTS=()
+  GROUP_TOP_SCRIPTS=()
+  GROUP_DIR_SCRIPTS=()
+  SEEN_DIRS=()
+
+  for script in "${top_scripts[@]}"; do
+    [[ -f "${script}" ]] && all_scripts+=("${script}")
+  done
+  for script in "${nested_level[@]}"; do
+    [[ -f "${script}" ]] || continue
+    all_scripts+=("${script}")
+    dir="${script%/*}"
+    if [[ -z "${SEEN_DIRS[${dir}]+present}" ]]; then
+      SEEN_DIRS["${dir}"]=1
+      nested_dirs+=("${dir}")
+    fi
+  done
+
+  if (( ${#all_scripts[@]} == 0 )); then
+    emit_unavailable
+    return 0
+  fi
+
+  for script in "${all_scripts[@]}"; do
+    classify_script "${script}"
+    group="${CLASSIFIED_GROUP}"
+    count="${GROUP_COUNTS[${group}]:-0}"
+    GROUP_COUNTS["${group}"]=$((count + 1))
+    if [[ "${script}" == "${ROOT}"/*/* ]]; then
+      dir="${script%/*}"
+      GROUP_DIR_SCRIPTS["${dir}"$'\x1f'"${group}"]+="${script}"$'\n'
+    else
+      GROUP_TOP_SCRIPTS["${group}"]+="${script}"$'\n'
+    fi
+  done
+
+  if (( ${#nested_dirs[@]} > 0 )); then
+    mapfile -t sorted_nested_dirs < <(printf '%s\n' "${nested_dirs[@]}" | LC_ALL=C sort)
+  fi
+
+  if [[ "${MODE}" == 'icewm' ]]; then
+    emit_icewm
+  else
+    emit_fvwm
+  fi
+}
+
+group_has_scripts() {
+  local group="$1"
+  (( ${GROUP_COUNTS[${group}]:-0} > 0 ))
+}
+
+group_dir_has_scripts() {
+  local key="${1}"$'\x1f'"${2}"
+  [[ -n "${GROUP_DIR_SCRIPTS[${key}]+present}" ]]
 }
 
 icewm_entry() {
   local script="$1"
   local label="${script##*/}"
   label="${label%.sh}"
-  printf '  prog %s application-x-executable %s\n' "$(menu_quote "$label")" "$(launch_command "$script")"
+  menu_quote "${label}"
+  local quoted_label="${QUOTED}"
+  launch_command "${script}"
+  printf '  prog %s application-x-executable %s\n' \
+    "${quoted_label}" "${LAUNCH_COMMAND}"
 }
 
 fvwm_entry() {
   local script="$1"
   local label="${script##*/}"
   label="${label%.sh}"
-  printf '+ %s Exec %s &\n' "$(menu_quote "$label")" "$(launch_command "$script")"
+  menu_quote "${label}"
+  local quoted_label="${QUOTED}"
+  launch_command "${script}"
+  printf '+ %s Exec %s &\n' "${quoted_label}" "${LAUNCH_COMMAND}"
 }
 
 emit_icewm() {
-  local group script dir label
+  local group script dir label quoted_group key scripts
   for group in "${GROUP_ORDER[@]}"; do
     group_has_scripts "${group}" || continue
     [[ "${group}" == 'Utilities' ]] && printf '  separator\n'
-    printf '  menu %s %s {\n' \
-      "$(menu_quote "${GROUP_LABELS[${group}]}")" "${GROUP_ICONS[${group}]}"
-    for script in "${top_scripts[@]}"; do
-      [[ "${SCRIPT_GROUPS[${script}]}" == "${group}" ]] || continue
+    menu_quote "${GROUP_LABELS[${group}]}"
+    quoted_group="${QUOTED}"
+    printf '  menu %s %s {\n' "${quoted_group}" "${GROUP_ICONS[${group}]}"
+    scripts="${GROUP_TOP_SCRIPTS[${group}]-}"
+    while IFS= read -r script; do
+      [[ -n "${script}" ]] || continue
       icewm_entry "${script}"
-    done
-    while IFS= read -r dir; do
-      [[ -n "${dir}" ]] || continue
-      nested_dir_has_group "${dir}" "${group}" || continue
+    done <<< "${scripts}"
+    for dir in "${sorted_nested_dirs[@]}"; do
+      group_dir_has_scripts "${dir}" "${group}" || continue
       label="${dir##*/}"
-      printf '    menu %s folder {\n' "$(menu_quote "${label}")"
-      for script in "${nested_level[@]}"; do
-        [[ "${script%/*}" == "${dir}" ]] || continue
-        [[ "${SCRIPT_GROUPS[${script}]}" == "${group}" ]] || continue
+      menu_quote "${label}"
+      printf '    menu %s folder {\n' "${QUOTED}"
+      key="${dir}"$'\x1f'"${group}"
+      scripts="${GROUP_DIR_SCRIPTS[${key}]-}"
+      while IFS= read -r script; do
+        [[ -n "${script}" ]] || continue
         icewm_entry "${script}"
-      done
+      done <<< "${scripts}"
       printf '    }\n'
-    done < <(printf '%s\n' "${nested_dirs[@]}" | LC_ALL=C sort)
+    done
     printf '  }\n'
   done
 }
 
 emit_fvwm() {
-  local group script dir label group_id menu_id index=0
+  local group script dir label group_id menu_id index=0 quoted_group key scripts
   printf 'DestroyMenu "Ports"\nAddToMenu "Ports" "Ports" Title\n'
   for group in "${GROUP_ORDER[@]}"; do
     group_has_scripts "${group}" || continue
     group_id="${GROUP_MENU_IDS[${group}]}"
-    printf '+ %s Popup %s\n' "$(menu_quote "${GROUP_LABELS[${group}]}")" "${group_id}"
+    menu_quote "${GROUP_LABELS[${group}]}"
+    printf '+ %s Popup %s\n' "${QUOTED}" "${group_id}"
   done
   for group in "${GROUP_ORDER[@]}"; do
     group_has_scripts "${group}" || continue
     group_id="${GROUP_MENU_IDS[${group}]}"
+    menu_quote "${GROUP_LABELS[${group}]}"
+    quoted_group="${QUOTED}"
     printf 'DestroyMenu "%s"\nAddToMenu "%s" %s Title\n' \
-      "${group_id}" "${group_id}" "$(menu_quote "${GROUP_LABELS[${group}]}")"
-    for script in "${top_scripts[@]}"; do
-      [[ "${SCRIPT_GROUPS[${script}]}" == "${group}" ]] || continue
+      "${group_id}" "${group_id}" "${quoted_group}"
+    scripts="${GROUP_TOP_SCRIPTS[${group}]-}"
+    while IFS= read -r script; do
+      [[ -n "${script}" ]] || continue
       fvwm_entry "${script}"
-    done
+    done <<< "${scripts}"
     index=0
-    while IFS= read -r dir; do
-      [[ -n "${dir}" ]] || continue
-      nested_dir_has_group "${dir}" "${group}" || continue
+    for dir in "${sorted_nested_dirs[@]}"; do
+      group_dir_has_scripts "${dir}" "${group}" || continue
       index=$((index + 1))
       label="${dir##*/}"
       menu_id="${group_id}Dir${index}"
-      printf '+ %s Popup %s\n' "$(menu_quote "${label}")" "${menu_id}"
+      menu_quote "${label}"
+      printf '+ %s Popup %s\n' "${QUOTED}" "${menu_id}"
       printf 'DestroyMenu "%s"\nAddToMenu "%s" %s Title\n' \
-        "${menu_id}" "${menu_id}" "$(menu_quote "${label}")"
-      for script in "${nested_level[@]}"; do
-        [[ "${script%/*}" == "${dir}" ]] || continue
-        [[ "${SCRIPT_GROUPS[${script}]}" == "${group}" ]] || continue
+        "${menu_id}" "${menu_id}" "${QUOTED}"
+      key="${dir}"$'\x1f'"${group}"
+      scripts="${GROUP_DIR_SCRIPTS[${key}]-}"
+      while IFS= read -r script; do
+        [[ -n "${script}" ]] || continue
         fvwm_entry "${script}"
-      done
-    done < <(printf '%s\n' "${nested_dirs[@]}" | LC_ALL=C sort)
+      done <<< "${scripts}"
+    done
   done
 }
 
-if [[ "$MODE" == "icewm" ]]; then
-  emit_icewm > "${OUTPUT_FILE}"
-else
-  emit_fvwm > "${OUTPUT_FILE}"
+cleanup_build() {
+  rm -f -- "${BUILD_TMP_MENU}" "${BUILD_TMP_STAMP}"
+  if (( LOCK_HELD )); then
+    rmdir -- "${LOCK_DIR}" 2>/dev/null || true
+  fi
+}
+
+build_cache() {
+  local signature
+  mkdir -p -- "${CACHE_DIR}" || return 1
+  if ! mkdir -- "${LOCK_DIR}" 2>/dev/null; then
+    return 0
+  fi
+  LOCK_HELD=1
+  trap cleanup_build EXIT
+
+  resolve_root || return 1
+  signature="$(root_signature "${ROOT}")"
+  [[ -n "${signature}" ]] || return 1
+  BUILD_TMP_MENU="$(mktemp "${CACHE_DIR}/.${MODE}.menu.XXXXXX")"
+  BUILD_TMP_STAMP="$(mktemp "${CACHE_DIR}/.${MODE}.stamp.XXXXXX")"
+  generate_menu > "${BUILD_TMP_MENU}"
+  printf '%s\n' "${signature}" > "${BUILD_TMP_STAMP}"
+  # Publish the complete menu before its matching stamp. A crash between the
+  # two leaves the old stamp, so the next call rebuilds instead of trusting a
+  # half-published pair.
+  mv -f -- "${BUILD_TMP_MENU}" "${CACHE_FILE}"
+  BUILD_TMP_MENU=''
+  mv -f -- "${BUILD_TMP_STAMP}" "${STAMP_FILE}"
+  BUILD_TMP_STAMP=''
+}
+
+if (( BUILD_ONLY )); then
+  build_cache
+  exit $?
 fi
 
-cat -- "${OUTPUT_FILE}"
-PUBLISHED=1
+runtime_cleanup() {
+  local status=$?
+  trap - EXIT
+  if (( status != 0 )); then
+    printf 'ports-menu-gen: runtime failure; emitting unavailable menu\n' >&2
+    emit_unavailable || true
+  fi
+  exit 0
+}
+trap runtime_cleanup EXIT
+
+cache_is_current() {
+  local stamp
+  [[ -s "${CACHE_FILE}" && -f "${STAMP_FILE}" ]] || return 1
+  stamp="$(<"${STAMP_FILE}")"
+  [[ "${stamp}" == "${CURRENT_SIGNATURE}" ]]
+}
+
+refresh_background() {
+  mkdir -p -- "${CACHE_DIR}" 2>/dev/null || return 0
+  if [[ -x /usr/bin/setsid && -x /usr/bin/nohup ]]; then
+    /usr/bin/nohup /usr/bin/setsid "${SELF}" --build "${MODE}" \
+      >/dev/null 2>&1 </dev/null &
+  elif [[ -x /usr/bin/nohup ]]; then
+    /usr/bin/nohup "${SELF}" --build "${MODE}" \
+      >/dev/null 2>&1 </dev/null &
+  else
+    "${SELF}" --build "${MODE}" >/dev/null 2>&1 </dev/null &
+  fi
+}
+
+if ! resolve_root; then
+  if [[ -v RETROPIE_PORTS_DIR ]]; then
+    printf 'ports-menu-gen: no .sh launchers found at depth 1 or 2 below explicit root: %s\n' \
+      "${RETROPIE_PORTS_DIR:-<empty>}" >&2
+  else
+    printf 'ports-menu-gen: no .sh launchers found in guest or host RetroPie roots\n' >&2
+  fi
+  emit_unavailable
+  exit 0
+fi
+
+CURRENT_SIGNATURE="$(root_signature "${ROOT}")"
+if cache_is_current; then
+  cat -- "${CACHE_FILE}"
+  exit 0
+fi
+
+# Give a cold or stale cache a bounded fast path. If a slow NFS cold start
+# exceeds the budget, the old cache (or a valid placeholder) is returned now
+# and a detached worker refreshes it for the next menu open.
+if [[ -n "${TIMEOUT_BIN}" && -x "${TIMEOUT_BIN}" ]]; then
+  REFRESH_BUDGET='0.65s'
+  [[ "${MODE}" == 'fvwm' ]] && REFRESH_BUDGET='1.20s'
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=0.1s "${REFRESH_BUDGET}" \
+    "${SELF}" --build "${MODE}" >/dev/null 2>&1 || true
+fi
+
+if cache_is_current; then
+  cat -- "${CACHE_FILE}"
+else
+  if [[ -s "${CACHE_FILE}" ]]; then
+    cat -- "${CACHE_FILE}"
+  else
+    emit_refreshing
+  fi
+  refresh_background
+fi
 exit 0
 #+END_SRC
