@@ -52,8 +52,18 @@
        sdlpop
        supertux
        openttd
-       ;; Guix main, rung 1 — replaces the discontinued lr-prboom core for the doom key.
+       ;; Doom engines, rung 1 (Guix main).  THREE lanes, deliberately — see the
+       ;; runcommand-shim doom/doom-dsda/doom-crispy keys.
+       ;;   dsda-doom   — maintained prboom+ successor; the 46 wad-only collections.
+       ;;   crispy-doom — the ONLY maintained port that keeps lr-prboom's loose-file
+       ;;                 music substitution ("Digital music packs").  17 of the 53
+       ;;                 collections are symlink farms of loose .mp3 tracks — one
+       ;;                 physical copy fanned out into seventeen arrangements — and
+       ;;                 dsda/woof cannot play them at all (MUSINFO is lump-based:
+       ;;                 it needs the audio repacked into a PWAD).  Without crispy,
+       ;;                 those collections lose their soundtracks silently.
        dsda-doom
+       crispy-doom
        ;; nonguix lane — Mètsàtron's ruling 2026-07-12: guix+nonguix top priority
        eduke32
        fury
