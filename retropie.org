@@ -750,6 +750,7 @@ TIMEOUT_BIN="$(command -v timeout 2>/dev/null || true)"
 if [[ -z "${TIMEOUT_BIN}" && -x /bin/timeout ]]; then
   TIMEOUT_BIN='/bin/timeout'
 fi
+HASH_BIN="$(command -v sha256sum 2>/dev/null || true)"
 CACHE_DIR="${XDG_CACHE_HOME:-${HOME}/.cache}/dotcortex/ports-menu"
 CACHE_FILE="${CACHE_DIR}/${MODE}.menu"
 STAMP_FILE="${CACHE_DIR}/${MODE}.stamp"
@@ -759,6 +760,7 @@ BUILD_TMP_STAMP=''
 LOCK_HELD=0
 ROOT=''
 CURRENT_SIGNATURE=''
+CACHE_PROBLEM_REPORTED=0
 
 emit_unavailable() {
   if [[ "${MODE}" == "icewm" ]]; then
@@ -1022,8 +1024,48 @@ cleanup_build() {
   fi
 }
 
+cache_problem() {
+  if (( ! CACHE_PROBLEM_REPORTED )); then
+    printf 'ports-menu-gen: cache unusable or invalid; generating menu directly\n' >&2
+    CACHE_PROBLEM_REPORTED=1
+  fi
+}
+
+cache_path_is_usable() {
+  local probe
+  if [[ ! -d "${CACHE_DIR}" ]]; then
+    mkdir -p -- "${CACHE_DIR}" 2>/dev/null || return 1
+  fi
+  [[ -r "${CACHE_DIR}" && -x "${CACHE_DIR}" && -w "${CACHE_DIR}" ]] || return 1
+  if [[ -e "${CACHE_FILE}" && ! -r "${CACHE_FILE}" ]]; then
+    return 1
+  fi
+  if [[ -e "${STAMP_FILE}" && ! -r "${STAMP_FILE}" ]]; then
+    return 1
+  fi
+  probe="$(mktemp "${CACHE_DIR}/.probe.XXXXXX" 2>/dev/null)" || return 1
+  rm -f -- "${probe}" || return 1
+}
+
+menu_digest() {
+  local hash_line
+  [[ -n "${HASH_BIN}" ]] || return 1
+  hash_line="$("${HASH_BIN}" -- "$1")" || return 1
+  printf '%s\n' "${hash_line%% *}"
+}
+
+cache_content_is_valid() {
+  local stamp_digest actual_digest
+  [[ -s "${CACHE_FILE}" && -r "${CACHE_FILE}" \
+    && -s "${STAMP_FILE}" && -r "${STAMP_FILE}" ]] || return 1
+  stamp_digest="$(head -n 1 -- "${STAMP_FILE}")" || return 1
+  [[ "${stamp_digest}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  actual_digest="$(menu_digest "${CACHE_FILE}")" || return 1
+  [[ "${actual_digest}" == "${stamp_digest}" ]]
+}
+
 build_cache() {
-  local signature
+  local signature menu_hash
   mkdir -p -- "${CACHE_DIR}" || return 1
   if ! mkdir -- "${LOCK_DIR}" 2>/dev/null; then
     return 0
@@ -1037,7 +1079,13 @@ build_cache() {
   BUILD_TMP_MENU="$(mktemp "${CACHE_DIR}/.${MODE}.menu.XXXXXX")"
   BUILD_TMP_STAMP="$(mktemp "${CACHE_DIR}/.${MODE}.stamp.XXXXXX")"
   generate_menu > "${BUILD_TMP_MENU}"
-  printf '%s\n' "${signature}" > "${BUILD_TMP_STAMP}"
+  if grep -qF 'Ports unavailable — RetroPie tree not mounted' "${BUILD_TMP_MENU}"; then
+    return 1
+  fi
+  menu_hash="$(menu_digest "${BUILD_TMP_MENU}")" || return 1
+  # Put the digest first; the remaining lines are the existing multi-line
+  # root signature. This makes a truncated or corrupt menu a cache miss.
+  printf '%s\n%s\n' "${menu_hash}" "${signature}" > "${BUILD_TMP_STAMP}"
   # Publish the complete menu before its matching stamp. A crash between the
   # two leaves the old stamp, so the next call rebuilds instead of trusting a
   # half-published pair.
@@ -1064,14 +1112,20 @@ runtime_cleanup() {
 trap runtime_cleanup EXIT
 
 cache_is_current() {
-  local stamp
-  [[ -s "${CACHE_FILE}" && -f "${STAMP_FILE}" ]] || return 1
-  stamp="$(<"${STAMP_FILE}")"
-  [[ "${stamp}" == "${CURRENT_SIGNATURE}" ]]
+  local stamp_digest stamped_signature actual_digest
+  [[ -s "${CACHE_FILE}" && -r "${CACHE_FILE}" \
+    && -f "${STAMP_FILE}" && -r "${STAMP_FILE}" ]] || return 1
+  stamp_digest="$(head -n 1 -- "${STAMP_FILE}")" || return 1
+  [[ "${stamp_digest}" =~ ^[[:xdigit:]]{64}$ ]] || return 1
+  stamped_signature="$(tail -n +2 -- "${STAMP_FILE}")" || return 1
+  [[ "${stamped_signature}" == "${CURRENT_SIGNATURE}" ]] || return 1
+  actual_digest="$(menu_digest "${CACHE_FILE}")" || return 1
+  [[ "${actual_digest}" == "${stamp_digest}" ]]
 }
 
 refresh_background() {
-  mkdir -p -- "${CACHE_DIR}" 2>/dev/null || return 0
+  local worker_pid
+  cache_path_is_usable || return 1
   if [[ -x /usr/bin/setsid && -x /usr/bin/nohup ]]; then
     /usr/bin/nohup /usr/bin/setsid "${SELF}" --build "${MODE}" \
       >/dev/null 2>&1 </dev/null &
@@ -1081,6 +1135,8 @@ refresh_background() {
   else
     "${SELF}" --build "${MODE}" >/dev/null 2>&1 </dev/null &
   fi
+  worker_pid=$!
+  kill -0 "${worker_pid}" 2>/dev/null
 }
 
 if ! resolve_root; then
@@ -1095,14 +1151,30 @@ if ! resolve_root; then
 fi
 
 CURRENT_SIGNATURE="$(root_signature "${ROOT}")"
+if ! cache_path_is_usable; then
+  cache_problem
+  generate_menu
+  exit 0
+fi
+
 if cache_is_current; then
   cat -- "${CACHE_FILE}"
   exit 0
 fi
 
+# An existing file without a matching digest is not menu content. Generate
+# directly rather than showing it, or replacing it with a transient notice.
+if [[ -e "${CACHE_FILE}" || -L "${CACHE_FILE}" ]] && ! cache_content_is_valid; then
+  cache_problem
+  generate_menu
+  # The direct menu is already on stdout. Repair a writable cache in the
+  # background for the next open, but never substitute that worker for it.
+  refresh_background || true
+  exit 0
+fi
+
 # Give a cold or stale cache a bounded fast path. If a slow NFS cold start
-# exceeds the budget, the old cache (or a valid placeholder) is returned now
-# and a detached worker refreshes it for the next menu open.
+# exceeds the budget, a detached worker refreshes it for the next menu open.
 if [[ -n "${TIMEOUT_BIN}" && -x "${TIMEOUT_BIN}" ]]; then
   REFRESH_BUDGET='0.65s'
   [[ "${MODE}" == 'fvwm' ]] && REFRESH_BUDGET='1.20s'
@@ -1112,13 +1184,11 @@ fi
 
 if cache_is_current; then
   cat -- "${CACHE_FILE}"
+elif refresh_background; then
+  emit_refreshing
 else
-  if [[ -s "${CACHE_FILE}" ]]; then
-    cat -- "${CACHE_FILE}"
-  else
-    emit_refreshing
-  fi
-  refresh_background
+  cache_problem
+  generate_menu
 fi
 exit 0
 #+END_SRC
