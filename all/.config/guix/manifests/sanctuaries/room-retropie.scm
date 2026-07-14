@@ -52,6 +52,8 @@
        sdlpop
        supertux
        openttd
+       ;; Guix main, rung 1 — replaces the discontinued lr-prboom core for the doom key.
+       dsda-doom
        ;; nonguix lane — Mètsàtron's ruling 2026-07-12: guix+nonguix top priority
        eduke32
        fury
@@ -63,7 +65,7 @@
        libretro-beetle-psx-hw
        libretro-flycast
        libretro-beetle-gba
-       ;; local source builds — Doom and Quake 1 are absent from Guix/nonguix
+       ;; local source builds — retained Doom fallback and Quake 1 (absent from Guix/nonguix)
        libretro-prboom
        libretro-tyrquake
        libretro-px68k
