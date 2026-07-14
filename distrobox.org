@@ -1875,18 +1875,7 @@ prepare_retropie_tree() {
   fi
   ln -sfnT "${RETROPIE_CONTAINER_ROOT}" "${guest_link}"
 
-  if ! podman start "${SANCTUARY}" >/dev/null; then
-    echo "${SANCTUARY}: ERROR — container failed to start" >&2
-    echo "  After the human-gated recreation, run:" >&2
-    echo "    distrobox-sanctuaries-create ${SANCTUARY}" >&2
-    exit 1
-  fi
-  if ! podman exec "${SANCTUARY}" test -d "${RETROPIE_CONTAINER_ROOT}/roms/ports"; then
-    echo "${SANCTUARY}: ERROR — RetroPie bind is absent inside the running container" >&2
-    echo "  Expected: ${RETROPIE_CONTAINER_ROOT}/roms/ports" >&2
-    echo "  This container must be recreated from the updated declaration." >&2
-    exit 1
-  fi
+  sanctuary-retropie-bind-ensure "${SANCTUARY}" "${RETROPIE_CONTAINER_ROOT}"
 }
 
 prepare_retropie_tree
@@ -6437,6 +6426,176 @@ case "$VERB" in
     exit 1
     ;;
 esac
+#+END_SRC
+
+** RetroPie bind lifecycle helper
+
+The RetroPie tree is a direct Podman bind whose source can be an autofs-backed
+NFS path. Podman resolves that bind when the container starts; an already-running
+container therefore needs a stop/start cycle when its bind was captured empty.
+This helper is shared by both launchers so a stale bind never gets misdiagnosed
+as a reason to remove or recreate a sanctuary.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-retropie-bind-ensure :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+SANCTUARY="${1:?sanctuary name required}"
+RETROPIE_CONTAINER_ROOT="${2:?RetroPie container root required}"
+BIND_PATH="${RETROPIE_CONTAINER_ROOT}/roms/ports"
+WAIT_SECONDS="${SANCTUARY_PODMAN_WAIT_SECONDS:-8}"
+WAIT_LOOPS=$((WAIT_SECONDS * 10))
+
+container_state() {
+  podman inspect --format '{{.State.Status}}' "${SANCTUARY}" 2>/dev/null || printf '%s\n' unknown
+}
+
+is_startable() {
+  case "$1" in
+    created|exited|stopped) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+wait_for_state() {
+  local wanted="$1" i state
+  for ((i = 0; i < WAIT_LOOPS; i++)); do
+    state="$(container_state)"
+    [[ "${state}" == "${wanted}" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+wait_for_startable() {
+  local i state
+  for ((i = 0; i < WAIT_LOOPS; i++)); do
+    state="$(container_state)"
+    is_startable "${state}" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+recover_container() {
+  local state after stop_rc
+  state="$(container_state)"
+  case "${state}" in
+    running|stopping)
+      echo "${SANCTUARY}: requesting a bounded clean stop (state: ${state})"
+      if timeout --kill-after=2s "${WAIT_SECONDS}s" podman stop -t 5 "${SANCTUARY}" >/dev/null 2>&1; then
+        :
+      else
+        stop_rc=$?
+        echo "${SANCTUARY}: podman stop did not complete cleanly (exit ${stop_rc}); waiting before escalation"
+      fi
+      ;;
+    created|exited|stopped)
+      return 0
+      ;;
+    *)
+      echo "${SANCTUARY}: ERROR — cannot recover container from state: ${state}" >&2
+      return 1
+      ;;
+  esac
+
+  if wait_for_startable; then
+    after="$(container_state)"
+    echo "${SANCTUARY}: clean stop reached startable state: ${after}"
+    return 0
+  fi
+
+  after="$(container_state)"
+  echo "${SANCTUARY}: container remained in state ${after}; escalating to podman kill"
+  podman kill "${SANCTUARY}" >/dev/null 2>&1 || true
+  if wait_for_state exited; then
+    echo "${SANCTUARY}: podman kill confirmed container reached Exited"
+    return 0
+  fi
+
+  after="$(container_state)"
+  if is_startable "${after}"; then
+    echo "${SANCTUARY}: podman kill reached startable state: ${after}"
+    return 0
+  fi
+  echo "${SANCTUARY}: ERROR — container did not reach Exited or another startable state after podman kill (state: ${after})" >&2
+  return 1
+}
+
+start_container() {
+  local start_rc state
+  if podman start "${SANCTUARY}" >/dev/null 2>&1; then
+    if wait_for_state running; then
+      return 0
+    fi
+    state="$(container_state)"
+    echo "${SANCTUARY}: ERROR — podman start returned success but state is ${state}" >&2
+    return 1
+  fi
+
+  start_rc=$?
+  state="$(container_state)"
+  if [[ "${state}" == "stopping" ]]; then
+    echo "${SANCTUARY}: start refused while container is Stopping; recovering it"
+    recover_container || return 1
+    if podman start "${SANCTUARY}" >/dev/null 2>&1 && wait_for_state running; then
+      return 0
+    fi
+    state="$(container_state)"
+    echo "${SANCTUARY}: ERROR — container still failed to start after Stopping recovery (state: ${state})" >&2
+    return 1
+  fi
+
+  echo "${SANCTUARY}: ERROR — container failed to start (exit ${start_rc}, state: ${state})" >&2
+  return 1
+}
+
+bind_present() {
+  podman exec "${SANCTUARY}" test -d "${BIND_PATH}" >/dev/null 2>&1
+}
+
+restart_for_bind() {
+  echo "${SANCTUARY}: RetroPie bind is stale — restarting the container to re-establish it"
+  recover_container || return 1
+  start_container
+}
+
+state="$(container_state)"
+case "${state}" in
+  running)
+    if ! bind_present; then
+      restart_for_bind || exit 1
+    fi
+    ;;
+  stopping)
+    echo "${SANCTUARY}: container is wedged in Stopping; recovering it before start"
+    recover_container || exit 1
+    start_container || exit 1
+    ;;
+  created|exited|stopped)
+    start_container || exit 1
+    ;;
+  *)
+    echo "${SANCTUARY}: ERROR — container is not startable (state: ${state})" >&2
+    exit 1
+    ;;
+esac
+
+# A bind absent immediately after a normal start is also given one explicit
+# stop/start repair attempt. If it remains absent, report the real state without
+# prescribing container recreation for a mount-lifecycle problem.
+if ! bind_present; then
+  echo "${SANCTUARY}: RetroPie bind is absent after start — restarting once to re-establish it"
+  restart_for_bind || exit 1
+fi
+
+if ! bind_present; then
+  echo "${SANCTUARY}: ERROR — RetroPie bind remains absent after restart" >&2
+  echo "  Expected: ${BIND_PATH}" >&2
+  echo "  The container was not removed or recreated; inspect the declaration and Podman mount state." >&2
+  exit 1
+fi
+
+echo "${SANCTUARY}: RetroPie bind present inside the running container: ${BIND_PATH}"
 #+END_SRC
 
 ** xclass Explorer launcher wrapper
