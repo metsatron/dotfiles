@@ -436,15 +436,12 @@ reproduced.
       :g "C-<prior>" #'la/prev-tab
       :g "C-S-w"     #'la/close-tab)
 
-(defun la/workbench ()
-  (interactive)
-  (let ((buf (current-buffer)))
-    (delete-other-windows)
-    (split-window-right)
-    (other-window 1)
-    (when (fboundp #'treemacs) (treemacs) (other-window 1))
-    (switch-to-buffer buf)))
-(map! :leader :desc "Workbench" "o w" #'la/workbench)
+;; NOTE: the old interactive `la/workbench' (delete-other-windows on the LIVE
+;; frame) is REMOVED. That is precisely the destructive pattern the hardened
+;; layout system at the end of this file exists to replace — an interactive
+;; command that rearranges the frame you are standing in, one M-M-completion
+;; away from demolishing your live workspace. See "@Claude / @Workbench layouts"
+;; below; `SPC o w' now SWITCHES TO the @Workbench workspace instead.
 
 ;;; ===========================================================================
 ;;; vterm — terminal comfort (ported from Spacemacs blk-vterm-basics)
@@ -615,6 +612,206 @@ glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
 (map! :leader
       :desc "Claude Code IDE menu"   "o c" #'claude-code-ide-menu
       :desc "Claude Code IDE toggle" "o o" #'claude-code-ide-toggle)
+
+;;; ===========================================================================
+;;; @Claude / @Workbench layouts (from emacs.org blk-claude-workspace)
+;;; ===========================================================================
+;;
+;; Ported to Doom's :ui workspaces (persp-mode) from Spacemacs' custom layouts.
+;; The kernel and builders are pure window elisp and cross over unchanged; only
+;; the REGISTRATION differs (spacemacs|define-custom-layout -> +workspace-switch).
+;;
+;; The whole design rests on one distinction: these are LAYOUTS, not window
+;; commands. Each door switches to (creating) a dedicated workspace FIRST, then
+;; builds inside it — so invoking one leaves your current workspace intact.
+;; "New" means ADDITIONAL, not IN PLACE OF.
+
+(defvar metsatron/claude-workspace-width 80
+  "Columns for the Claude window in the @Claude layout.
+80 because this window is a TERMINAL, not a pane of prose — it hosts vterm and
+the Claude CLI's TUI, both written against the traditional 80-column terminal.
+Wider just stretches the same wrapped output and starves the editor pane.")
+
+(defvar metsatron/claude-workspace-treemacs-width 20
+  "Columns for the Treemacs side window in both layouts.")
+
+(defvar metsatron/claude-workspace-term-height 10
+  "USABLE lines for the vterm strip beneath the Claude panel in @Claude.
+This is the loom console — a first-class part of the workspace, not a garnish.
+Body lines, not total: `split-window' sizes the TOTAL window, so the mode line
+eats into it; the split is normalised against `window-body-*' afterward.")
+
+(defvar metsatron/workbench-term-height 8
+  "Lines for the vterm strip in the @Workbench layout.")
+
+;;; --- Layout kernel -------------------------------------------------------
+
+(defun metsatron/layout--reset ()
+  "Collapse the current workspace to ONE ordinary window. Deliberately paranoid.
+
+`delete-other-windows' is a FALSE RESET: side windows (Treemacs) are exempt, and
+claude-code-ide stamps its window with `no-delete-other-windows' which vetoes it.
+Two things make this reliable: (1) `window-side' also lives on INTERNAL parent
+windows that `window-list' never returns, so the tree is walked in FULL (clearing
+only leaves leaves the tree corrupt: \"Window X has not same side left as its
+parent\"); (2) `ignore-window-parameters' is bound so the veto cannot fire.
+
+Deletes WINDOWS, never buffers or processes — no Claude session dies here."
+  (letrec ((clear (lambda (w)
+                    (set-window-parameter w 'window-side nil)
+                    (set-window-parameter w 'window-slot nil)
+                    (set-window-parameter w 'no-delete-other-windows nil)
+                    (let ((c (window-child w)))
+                      (while c
+                        (funcall clear c)
+                        (setq c (window-next-sibling c)))))))
+    (funcall clear (frame-root-window)))
+  (let ((ignore-window-parameters t))
+    (delete-other-windows))
+  ;; Transient popups can otherwise reclaim a side slot the moment we rebuild.
+  (dolist (name '("*helm mini*" "*helm buffers*" "*which-key*" "*doom*"))
+    (when (get-buffer name)
+      (let ((kill-buffer-query-functions nil))
+        (ignore-errors (kill-buffer name))))))
+
+(defun metsatron/layout--editor-buffer ()
+  "A real file buffer for the editor pane.
+Must visit a file: a scratch buffer merely named \"claude\" is not an editor
+pane. Falls back to *scratch* only when nothing else exists."
+  (or (seq-find (lambda (b)
+                  (and (buffer-file-name b)
+                       (not (string-prefix-p " " (buffer-name b)))))
+                (buffer-list))
+      (get-buffer-create "*scratch*")))
+
+(defun metsatron/layout--treemacs ()
+  "Open Treemacs, then return to the sole ordinary window."
+  (when (fboundp 'treemacs) (treemacs))
+  (when (fboundp 'treemacs-set-width)
+    (treemacs-set-width metsatron/claude-workspace-treemacs-width))
+  (when-let ((editor (seq-find (lambda (w) (not (window-parameter w 'window-side)))
+                               (window-list))))
+    (select-window editor)))
+
+(defun metsatron/layout--vterm-in (window)
+  "Put a shell in WINDOW — reusing the existing *vterm* rather than spawning."
+  (select-window window)
+  (if-let ((existing (get-buffer "*vterm*")))
+      (set-window-buffer window existing)
+    (if (fboundp 'vterm) (vterm) (ansi-term (or (getenv "SHELL") "/bin/bash")))))
+
+(defun metsatron/claude--live-buffer ()
+  "A Claude TUI buffer with a LIVE process, from ANY client, or nil.
+ADOPTING a running session is the only safe move: the old builder started a fresh
+CLI with `-r' that raced a live session and killed it, taking the user's window.
+Never spawn a Claude when one is running; never do window surgery around a live
+Claude buffer beyond moving it."
+  (let ((ide (and (fboundp 'claude-code-ide--get-buffer-name)
+                  (get-buffer (claude-code-ide--get-buffer-name)))))
+    (or (and ide (get-buffer-process ide) ide)
+        (seq-find (lambda (b)
+                    (and (buffer-live-p b)
+                         (string-match-p "claude" (buffer-name b))
+                         (with-current-buffer b (derived-mode-p 'vterm-mode))
+                         (get-buffer-process b)))
+                  (buffer-list)))))
+
+;;; --- Builders (NON-interactive on purpose — see the doors below) ----------
+
+(defun metsatron/claude-workspace-build ()
+  "Treemacs | editor | [ Claude / vterm ]. NOT interactive by design."
+  (metsatron/layout--reset)
+  (switch-to-buffer (metsatron/layout--editor-buffer))
+  (metsatron/layout--treemacs)
+  (let* ((editor (selected-window))
+         (right  (split-window-right
+                  (max 40 (- (window-total-width editor)
+                             metsatron/claude-workspace-width))))
+         (claude (metsatron/claude--live-buffer)))
+    (if claude
+        ;; ADOPT the running session — `set-window-buffer' only moves the buffer,
+        ;; never touches the process, so the session cannot die here.
+        (set-window-buffer right claude)
+      ;; Nothing running: start one. The width defcustom is set GLOBALLY (not
+      ;; let-bound) because claude-code-ide displays the buffer ASYNCHRONOUSLY,
+      ;; after any `let' here has exited (a let-bound 80 came out as 98).
+      (delete-window right)
+      (setq claude-code-ide-use-side-window t
+            claude-code-ide-window-side 'right
+            claude-code-ide-window-width metsatron/claude-workspace-width)
+      (claude-code-ide)
+      (setq right (and (fboundp 'claude-code-ide--get-buffer-name)
+                       (get-buffer-window (claude-code-ide--get-buffer-name)))))
+    ;; vterm strip UNDER the Claude panel — the loom console. A NEGATIVE size
+    ;; means "give the NEW window this many lines"; sizing the split directly is
+    ;; deterministic. A post-hoc window-resize against window-body-height was
+    ;; tried and is WRONG — the window has not settled, so the layout DRIFTS a
+    ;; line per rebuild (vterm 11->12, Claude 37->38). Do not reintroduce it.
+    (when (window-live-p right)
+      (let ((term (split-window right
+                                (- (1+ metsatron/claude-workspace-term-height))
+                                'below)))
+        (metsatron/layout--vterm-in term)))
+    ;; Width IS safe to normalise: measured against the settled editor split.
+    (when (window-live-p right)
+      (let ((dw (- metsatron/claude-workspace-width (window-body-width right))))
+        (unless (zerop dw) (ignore-errors (window-resize right dw t)))))
+    (when (window-live-p editor) (select-window editor)))
+  ;; Resync the PTY: vterm learns its size from the window, and after the splits
+  ;; the CLI still renders for the OLD width (garbled interleaved output).
+  ;; `claude-code-ide--sync-terminal-dimensions' takes (BUFFER WINDOW). It was
+  ;; once called with NO args inside `ignore-errors' — raising
+  ;; wrong-number-of-arguments into the void, a silent no-op every time. Guard the
+  ;; CONDITION, not the CALL: never wrap a call in ignore-errors to make it "safe".
+  (when-let* (((fboundp 'claude-code-ide--sync-terminal-dimensions))
+              (buf (metsatron/claude--live-buffer))
+              (win (get-buffer-window buf)))
+    (claude-code-ide--sync-terminal-dimensions buf win)))
+
+(defun metsatron/workbench-build ()
+  "Treemacs | [ document / vterm ] | document — two docs side by side.
+NOT interactive by design."
+  (metsatron/layout--reset)
+  (switch-to-buffer (metsatron/layout--editor-buffer))
+  (metsatron/layout--treemacs)
+  (let* ((left  (selected-window))
+         (right (split-window-right)))
+    (select-window left)
+    (let ((term (split-window left
+                              (- (window-total-height left)
+                                 metsatron/workbench-term-height)
+                              'below)))
+      (metsatron/layout--vterm-in term))
+    (when (window-live-p right) (select-window right))))
+
+;;; --- The doors: interactive, workspace-first, hence SAFE ------------------
+;;
+;; `(interactive)' is a CAPABILITY GRANT, not a convenience: it publishes a
+;; command to M-x and every completion frontend, where a destructive one gets
+;; selected by accident eventually (which is how the old workbench got demolished,
+;; 2026-07-13). The BUILDERS above are therefore NOT interactive. These doors are
+;; — but they call `+workspace-switch' FIRST, so even run by accident they build
+;; in the @Claude/@Workbench workspace, never in the one you are standing in.
+(defun metsatron/claude-layout ()
+  "Switch to the @Claude workspace (creating it) and (re)build it."
+  (interactive)
+  (+workspace-switch "@Claude" t)
+  (metsatron/claude-workspace-build))
+
+(defun metsatron/workbench-layout ()
+  "Switch to the @Workbench workspace (creating it) and (re)build it."
+  (interactive)
+  (+workspace-switch "@Workbench" t)
+  (metsatron/workbench-build))
+
+;; Doom owns SPC TAB as the workspace prefix (SPC l is taken by list/llm/collab),
+;; so the layout doors live there. SPC o w + C-c w keep the Spacemacs workbench
+;; muscle memory. (Spacemacs' SPC l c became SPC TAB c.)
+(map! :leader
+      :desc "Layout: @Claude"    "TAB c" #'metsatron/claude-layout
+      :desc "Layout: @Workbench" "TAB w" #'metsatron/workbench-layout
+      :desc "Layout: @Workbench" "o w"   #'metsatron/workbench-layout)
+(global-set-key (kbd "C-c w") #'metsatron/workbench-layout)
 #+END_SRC
 
 * packages.el — package declarations
