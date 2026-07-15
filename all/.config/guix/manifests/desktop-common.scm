@@ -34,6 +34,9 @@
    "jq" "direnv"
    "htop" "btop" "ranger" "chafa"
    "moreutils"
+   "ncurses"   ; clear, tput, reset, tset, infocmp — terminal control on PATH for
+               ; every sanctuary shell (was only in room-fvwm95/sanctuary-sx, so
+               ; `clear` was "command not found" in the IceWM Redstone sanctuary)
 
    ;; --- Clipboard (host-side bridge for sanctuary X selections) ---
    "xclip"
