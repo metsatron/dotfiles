@@ -842,3 +842,20 @@ confirmation first. Runs from ~/DotCortex so relative paths resolve as in a shel
 
 (global-set-key (kbd "C-c m l") #'loom-run-task)
 (map! :leader :desc "Run loom verb" "o l" #'loom-run-task)
+
+;;; ===========================================================================
+;;; custom-file — OUT of the repo (rule 20: no runtime-mutable state in DotCortex)
+;;; ===========================================================================
+;; Doom points custom-file at ~/.config/doom/custom.el, which is inside this
+;; public declarative repo. Redirect it to the cache so Custom's runtime writes
+;; never land in DotCortex. The values we actually want live below, in source —
+;; migrated from the old overlay custom.el, which this replaces.
+(setq custom-file (expand-file-name "custom.el" doom-cache-dir))
+(when (file-exists-p custom-file) (load custom-file 'noerror))
+
+;; Safe local-variable values for working on DotCortex's own org files.
+(dolist (v '((org-babel-default-header-args
+              (:results . "silent") (:comments . "org")
+              (:mkdirp . "yes") (:noweb . "yes"))
+             (eval setq-local org-confirm-babel-evaluate nil)))
+  (add-to-list 'safe-local-variable-values v))
