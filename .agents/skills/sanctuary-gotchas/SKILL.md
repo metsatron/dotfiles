@@ -163,3 +163,11 @@ A Win9x/Human68k `Z:\path>` prompt built by a function whose output lands in `PS
 Fix: double every backslash the function emits — `printf '%s' "${dos//\\/\\\\}"` — so bash renders each `\\` as one literal `\`. zsh needs no such fix: its prompt escapes are `%`-based, backslashes are literal (verify anyway).
 
 Verification trap (this is what shipped the bug): test the RENDERED prompt with `${PS1@P}` (bash 4.4+ expands PS1 exactly as the prompt engine would), on an escape-triggering path such as `/home` or `cd ..` above the guest home — NEVER `printf '%s' "$PS1"` on a benign path like `~/Pictures`. Inspecting the PS1 string value shows the backslashes intact and passes green while the real prompt is mangled.
+
+## `distrobox enter` does NOT reproduce the sanctuary's runtime PATH
+
+The sanctuary's tools (emacs, zsh, `clear`, …) are on PATH because the *launch script* sources the Guix room profiles before starting the desktop — `GUIX_PROFILE=…/desktop-common; . $GUIX_PROFILE/etc/profile`, then room-gaming, room-windows-compat — and every terminal IceWM spawns inherits that environment. A bare `distrobox enter -- bash -lc` does NOT go through the launch script: it sees only `core` + `guix current`, not desktop-common. Asking "is X on PATH in the sanctuary?" that way gives a false negative — it cost two wrong "still not found" verdicts this session on a fix that was actually correct.
+
+To verify sanctuary PATH/env, source the profiles the launch-script way inside the container (or test in a terminal opened inside the running desktop). And note: sourcing a Guix profile's `etc/profile` only adds its `bin/` if `GUIX_PROFILE` is exported *first* — a bare `. etc/profile` is a no-op for PATH. A rebuilt profile also only reaches the user's terminals after a sanctuary relaunch: IceWM-spawned terminals inherit IceWM's stale environment, not the freshly-rebuilt profile.
+
+When a base shell utility is missing in a sanctuary (`clear`, `tput`), the fix is to add its package (`ncurses`) to the shared **desktop-common** manifest in `guix.org`, tangle, and rebuild — never an ANSI-escape shim or a per-sanctuary duplicate. desktop-common is sourced by every sanctuary, so one entry fixes all of them.
