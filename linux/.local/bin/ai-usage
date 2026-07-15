@@ -160,6 +160,18 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         "deepinfra",
         note="Direct DeepInfra usage probe using local env token or deepctl auth token.",
     ),
+    ProviderSpec(
+        "neuralwatt",
+        "NeuralWatt",
+        "neuralwatt",
+        note="Direct NeuralWatt usage probe (NEURALWATT_API_KEY); /v1/quota by default, override with NEURALWATT_USAGE_URL.",
+    ),
+    ProviderSpec(
+        "fireworks",
+        "Fireworks",
+        "fireworks",
+        note="Fireworks account-status probe (FIREWORKS_API_KEY + FIREWORKS_ACCOUNT_ID); no numeric spend endpoint exists.",
+    ),
 )
 
 DEFAULT_PROVIDER_KEYS: tuple[str, ...] = ("codex", "claude", "antigravity", "openrouter")
@@ -1637,6 +1649,159 @@ def fetch_deepinfra(timeout_seconds: float) -> dict[str, Any]:
     }
 
 
+# --- NeuralWatt + Fireworks usage probes ------------------------------------
+#
+# Both are Bearer-token JSON usage endpoints, the same shape as DeepInfra, so
+# they share one probe helper. Research (2026-07-15, Perplexity + Brave):
+#
+#   NeuralWatt: OpenAI-compatible, base https://api.neuralwatt.com/v1, key is
+#     an sk-... token in NEURALWATT_API_KEY. It ships its OWN usage routes (NOT
+#     OpenAI's /dashboard/billing path): /v1/quota (balance/usage/limits),
+#     /v1/usage/energy, /v1/usage/summary. The two research lanes DISAGREED on
+#     the quota JSON schema and the primary docs page would not load, so the
+#     exact field names are UNCONFIRMED. Hence pass-through (compact_json), no
+#     hardcoded field parser, and an env-overridable URL so it repoints without
+#     a code change if /v1/quota turns out wrong. Verify live before hardening.
+#
+#   Fireworks: auth is Bearer FIREWORKS_API_KEY. There is NO numeric spend or
+#     credit REST endpoint — that data is firectl-CLI / Stripe only. The one
+#     account-level route, /v1/accounts/{id}, returns account state plus a
+#     status.reason enum (UNSUSPENDED / CREDIT_DEPLETED /
+#     MONTHLY_SPEND_LIMIT_EXCEEDED / ...): a health signal, not dollars. We
+#     surface that reason; that is the honest ceiling of what Fireworks exposes.
+def _env_token(*env_names: str) -> tuple[str | None, str]:
+    for env_name in env_names:
+        token = os.environ.get(env_name, "").strip()
+        if token:
+            return token, f"env:{env_name}"
+    return None, "env"
+
+
+def _bearer_json_probe(
+    provider: str,
+    label: str,
+    url: str,
+    token: str,
+    timeout_seconds: float,
+    summarize: Any = None,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "DotCortex ai-usage",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            data = json.loads(body)
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        try:
+            data = json.loads(body)
+            detail = data.get("detail") if isinstance(data, dict) else None
+        except json.JSONDecodeError:
+            detail = body.strip()
+            data = None
+        return {
+            "provider": provider,
+            "label": label,
+            "state": "error",
+            "source": "api",
+            "summary": f"{url} returned HTTP {error.code}" + (f": {detail}" if detail else ""),
+            "raw": data,
+        }
+    except urllib.error.URLError as error:
+        return {
+            "provider": provider,
+            "label": label,
+            "state": "error",
+            "source": "api",
+            "summary": f"Request failed: {error.reason}",
+            "raw": None,
+        }
+    except json.JSONDecodeError:
+        return {
+            "provider": provider,
+            "label": label,
+            "state": "error",
+            "source": "api",
+            "summary": "Response was not valid JSON.",
+            "raw": None,
+        }
+
+    return {
+        "provider": provider,
+        "label": label,
+        "state": "ok",
+        "source": "api",
+        "summary": summarize(data) if summarize else compact_json(data),
+        "raw": data,
+    }
+
+
+def fetch_neuralwatt(timeout_seconds: float) -> dict[str, Any]:
+    token, token_source = _env_token("NEURALWATT_API_KEY", "NEURALWATT_TOKEN")
+    if not token:
+        return {
+            "provider": "neuralwatt",
+            "label": "NeuralWatt",
+            "state": "missing",
+            "source": token_source,
+            "summary": "No NeuralWatt token found (set NEURALWATT_API_KEY).",
+            "raw": None,
+        }
+    url = os.environ.get("NEURALWATT_USAGE_URL", "https://api.neuralwatt.com/v1/quota")
+    return _bearer_json_probe("neuralwatt", "NeuralWatt", url, token, timeout_seconds)
+
+
+def _fireworks_summary(data: Any) -> str:
+    # The account endpoint carries no dollar figures — only lifecycle state and a
+    # status.reason enum. Surface those; it is all Fireworks exposes over REST.
+    if isinstance(data, dict):
+        status = data.get("status") if isinstance(data.get("status"), dict) else {}
+        bits = [str(b) for b in (data.get("state"), status.get("reason")) if b]
+        if bits:
+            return " / ".join(bits)
+    return compact_json(data)
+
+
+def fetch_fireworks(timeout_seconds: float) -> dict[str, Any]:
+    token, token_source = _env_token(
+        "FIREWORKS_API_KEY", "FIREWORKS_AI_API_KEY", "FIREWORKS_TOKEN"
+    )
+    if not token:
+        return {
+            "provider": "fireworks",
+            "label": "Fireworks",
+            "state": "missing",
+            "source": token_source,
+            "summary": "No Fireworks token found (set FIREWORKS_API_KEY).",
+            "raw": None,
+        }
+    url = os.environ.get("FIREWORKS_ACCOUNT_URL", "").strip()
+    if not url:
+        account = os.environ.get("FIREWORKS_ACCOUNT_ID", "").strip()
+        if not account:
+            return {
+                "provider": "fireworks",
+                "label": "Fireworks",
+                "state": "missing",
+                "source": token_source,
+                "summary": (
+                    "Set FIREWORKS_ACCOUNT_ID — Fireworks exposes no spend endpoint; "
+                    "/v1/accounts/{id} returns account status only."
+                ),
+                "raw": None,
+            }
+        url = f"https://api.fireworks.ai/v1/accounts/{account}"
+    return _bearer_json_probe(
+        "fireworks", "Fireworks", url, token, timeout_seconds, summarize=_fireworks_summary
+    )
+
+
 # --- Shared result cache + rate-limit backoff -------------------------------
 #
 # Every provider probe funnels through fetch_provider, so the cache lives here
@@ -1694,7 +1859,12 @@ def _cacheable(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _revive(cached: dict[str, Any], spec: ProviderSpec) -> dict[str, Any]:
-    return {**cached, "spec": spec}
+    # Return the cached result verbatim. Do NOT re-embed the ProviderSpec: nothing
+    # downstream reads result["spec"], and a dataclass in the result makes
+    # `ai-usage --json` crash (ProviderSpec is not JSON serializable) on every
+    # cache hit within the TTL. `spec` is kept as a parameter only for call-site
+    # stability; the caller already holds it.
+    return dict(cached)
 
 
 def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
@@ -1714,10 +1884,16 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
         if cached:
             return _revive({**cached, "stale": True}, spec)
         wait = int(backoff_until - now)
+        # Standard result shape (with label, JSON-serializable) — a bare
+        # {spec, state, detail} dict has no label for render_text and cannot be
+        # serialized by --json.
         return {
-            "spec": spec,
+            "provider": spec.key,
+            "label": spec.label,
             "state": "error",
-            "detail": f"rate limited (HTTP 429) — backing off, retrying in {wait}s",
+            "source": "",
+            "summary": f"rate limited (HTTP 429) — backing off, retrying in {wait}s",
+            "raw": None,
         }
 
     result = _fetch_provider_uncached(spec, timeout_seconds)
@@ -1768,6 +1944,12 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
 
     if spec.kind == "deepinfra":
         return fetch_deepinfra(timeout_seconds)
+
+    if spec.kind == "neuralwatt":
+        return fetch_neuralwatt(timeout_seconds)
+
+    if spec.kind == "fireworks":
+        return fetch_fireworks(timeout_seconds)
 
     if spec.kind == "antigravity_kit":
         result = fetch_antigravity_quota(spec, timeout_seconds)
