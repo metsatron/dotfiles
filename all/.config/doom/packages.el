@@ -57,3 +57,10 @@
 ;; deliberately deferred.
 (package! claude-code-ide
   :recipe (:host github :repo "manzaltu/claude-code-ide.el"))
+
+;; Org prettification (Phase 4). org-modern + org-appear already ship with Doom's
+;; (org +pretty) flag, so only valign is added here. valign pixel-aligns table
+;; columns in variable-pitch org buffers. (mixed-pitch from emacs.org is NOT
+;; ported: it was declared but never wired — org-looks does variable-pitch
+;; manually.)
+(package! valign)
