@@ -310,20 +310,63 @@ glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
   (seq-find (lambda (family) (member family (font-family-list)))
             metsatron/terminal-font-preference))
 
-;; --- Scrolling the Claude buffer: leave it to claude-code-ide ---------------
-;; Session 1 (2026-07-14) added a hook that FORWARDED wheel/S-PageUp to the CLI
-;; app, on the theory that the alt-screen TUI had no Emacs-side scrollback. That
-;; is obsolete: claude-code-ide (>= 20260702) ships native scroll management —
-;; `vterm-scroll-to-bottom-on-output nil', copy-mode scrollback, and a smart
-;; renderer that suppresses reflow while scrolled (its bug #1422 workaround).
+;; --- Scrolling the Claude buffer: forward the gesture to the CLI ------------
+;; The Claude TUI paints on the ALTERNATE SCREEN, so the vterm scrollback ring
+;; stays empty — measured live 2026-07-15: the *claude-code* buffer holds exactly
+;; one screenful (54 lines in a 54-row window) no matter how much has scrolled by,
+;; despite `vterm-max-scrollback' 100000. The history therefore lives ONLY inside
+;; the CLI, in its CLAUDE_CODE_NO_FLICKER=1 virtualized scrollback, and the single
+;; way to reach it is to forward the scroll key THROUGH to the app. claude-code-ide
+;; adds no scroll bindings of its own precisely because vterm already forwards
+;; `<prior>'/`<next>' via `vterm--self-insert' — in a bare Emacs it "just works".
 ;;
-;; Observed 2026-07-15 in the LIVE working Spacemacs claude buffer: my forwarding
-;; hook was NOT in the buffer's local map at all (claude-code-ide's own setup
-;; overrode it), and scrollback worked anyway — via the native mechanism. In
-;; Doom the hook can WIN the local map instead and then it BREAKS scrollback,
-;; sending wheel events to the CLI instead of scrolling the vterm buffer. So the
-;; forwarding is removed entirely; native scrollback (wheel/C-u up) is the path.
-;; CLAUDE_CODE_NO_FLICKER=1 (above) and vterm-max-scrollback 100000 stay.
+;; It does NOT just work in Doom: `pixel-scroll-precision-mode' binds PageUp/PageDown
+;; and `ultra-scroll' binds the wheel, both at a priority that SHADOWS vterm's
+;; forwarding (pixel-scroll via minor-mode-map-alist, ultra-scroll from above it).
+;; So the keys scroll the empty Emacs buffer and never reach the CLI. This was
+;; misdiagnosed once (a prior note here claimed copy-mode "native scrollback" was
+;; the path and removed forwarding — but copy-mode scrolls the vterm ring, which
+;; on the alt screen is empty; the note even contradicted itself two lines down).
+;;
+;; Fix: a buffer-local minor mode that forwards the scroll gestures to the app,
+;; registered as an EMULATION map at the front of `emulation-mode-map-alists' —
+;; the only tier that outranks both pixel-scroll (minor-mode maps) and ultra-scroll.
+;; Scoped to claude-code-ide vterm buffers only, so ordinary shell vterms keep
+;; Doom's smooth-scroll. Verified live: PageUp/PageDown/Shift-PageUp/wheel now
+;; scroll the Claude history. CLAUDE_CODE_NO_FLICKER=1 (above) stays load-bearing.
+(defvar metsatron/claude-scroll-forward-map
+  (let ((m (make-sparse-keymap)))
+    (define-key m (kbd "<prior>")      #'vterm-send-prior)
+    (define-key m (kbd "<next>")       #'vterm-send-next)
+    (define-key m (kbd "<S-prior>")    #'vterm-send-prior)
+    (define-key m (kbd "<S-next>")     #'vterm-send-next)
+    ;; A wheel notch = a full page (no finer "scroll N lines" reaches the app
+    ;; without vterm mouse-tracking); tune here if that feels too coarse.
+    (define-key m (kbd "<wheel-up>")   #'vterm-send-prior)
+    (define-key m (kbd "<wheel-down>") #'vterm-send-next)
+    m)
+  "Scroll-key forwarding for the Claude TUI vterm buffer.
+Sends PageUp/PageDown/wheel THROUGH to the CLI so its alt-screen virtualized
+scrollback (CLAUDE_CODE_NO_FLICKER=1) receives them, instead of Doom's
+smooth-scroll modes scrolling the empty Emacs buffer.")
+
+(define-minor-mode metsatron/claude-scroll-forward-mode
+  "Forward scroll gestures to the Claude CLI's own scrollback.
+Enabled in claude-code-ide vterm buffers (see the `after! claude-code-ide'
+advice below). Registered as an emulation map so it outranks
+`pixel-scroll-precision-mode' and `ultra-scroll'."
+  :init-value nil
+  :keymap metsatron/claude-scroll-forward-map)
+
+;; Emulation maps sit above minor-mode-map-alist AND global-map; front of the
+;; list wins. `add-to-list' dedupes (stable map object), so re-tangle is safe.
+(add-to-list 'emulation-mode-map-alists
+             (list (cons 'metsatron/claude-scroll-forward-mode
+                         metsatron/claude-scroll-forward-map)))
+
+(defun metsatron/claude-enable-scroll-forward ()
+  "Turn on `metsatron/claude-scroll-forward-mode' in the current buffer."
+  (metsatron/claude-scroll-forward-mode 1))
 
 ;; --- vterm-copy-mode auto-freeze --------------------------------------------
 ;; Freeze output when you scroll off the bottom (so live output doesn't yank you
@@ -415,7 +458,13 @@ glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
 (after! claude-code-ide
   ;; Expose Emacs to Claude over MCP.
   (when (fboundp 'claude-code-ide-emacs-tools-setup)
-    (claude-code-ide-emacs-tools-setup)))
+    (claude-code-ide-emacs-tools-setup))
+  ;; Forward scroll keys to the CLI in every Claude vterm buffer (see the scroll
+  ;; section above). `--configure-vterm-buffer' runs with the Claude buffer
+  ;; current at setup, so this enables the mode exactly where it belongs.
+  (when (fboundp 'claude-code-ide--configure-vterm-buffer)
+    (advice-add 'claude-code-ide--configure-vterm-buffer :after
+                #'metsatron/claude-enable-scroll-forward)))
 
 ;; Mnemonic leader keys, matching the Spacemacs bindings: c = menu, o = toggle.
 ;; (claude-code-ide-menu / -toggle are autoloaded, so binding pre-load is fine.)
