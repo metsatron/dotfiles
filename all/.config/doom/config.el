@@ -338,3 +338,26 @@ glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
   (add-hook 'vterm-mode-hook #'metsatron/vterm-fonts)
   (add-hook 'vterm-mode-hook #'metsatron/claude-scroll-keys)
   (add-hook 'vterm-mode-hook #'la/vterm-install-freeze-hooks))
+
+;;; ===========================================================================
+;;; Claude Code inside Doom — claude-code-ide (from emacs.org blk-claude-agents)
+;;; ===========================================================================
+
+;; The harness-preserving client: runs the real `claude' CLI in a vterm buffer,
+;; so every hook/skill/plugin in the DotCortex harness fires exactly as in a bare
+;; terminal, AND bridges Emacs to Claude over MCP (xref, imenu, project info,
+;; flycheck exposed as tools). The default for real DotCortex work.
+;;
+;; Only this one client of emacs.org's three is ported; agent-shell and the thin
+;; claude-code wrapper are deferred. CLAUDE_CODE_NO_FLICKER=1 is already exported
+;; in the vterm section above, so the CLI inherits it whichever way it launches.
+(after! claude-code-ide
+  ;; Expose Emacs to Claude over MCP.
+  (when (fboundp 'claude-code-ide-emacs-tools-setup)
+    (claude-code-ide-emacs-tools-setup)))
+
+;; Mnemonic leader keys, matching the Spacemacs bindings: c = menu, o = toggle.
+;; (claude-code-ide-menu / -toggle are autoloaded, so binding pre-load is fine.)
+(map! :leader
+      :desc "Claude Code IDE menu"   "o c" #'claude-code-ide-menu
+      :desc "Claude Code IDE toggle" "o o" #'claude-code-ide-toggle)
