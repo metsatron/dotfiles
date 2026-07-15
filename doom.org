@@ -275,8 +275,15 @@ reproduced.
 ;; See 'C-h v doom-font' for documentation and more examples of what they
 ;; accept. For example:
 ;;
-(setq doom-font (font-spec :family "JetBrainsMono Nerd Font" :size 12 :weight 'regular)
-      doom-variable-pitch-font (font-spec :family "Fira Sans" :size 13))
+;; Editor fonts — reproduce the Spacemacs visual grammar (was blk-fonts in
+;; emacs.org). Observed live in the running Spacemacs: the `default' face
+;; resolves to "SFMono Nerd Font Mono" and `variable-pitch' to "San Francisco
+;; Display", both installed and resolving correctly (not fallbacks). Sizes are
+;; POINT sizes (float), matching Spacemacs' declared :height 110 / 120. vterm
+;; buffers override this with MesloLGS @ 11px — see the terminal section below.
+(setq doom-font (font-spec :family "SFMono Nerd Font Mono" :size 11.0 :weight 'normal)
+      doom-variable-pitch-font (font-spec :family "San Francisco Display" :size 12.0 :weight 'normal)
+      doom-symbol-font (font-spec :family "Symbols Nerd Font Mono"))
 ;;
 ;; If you or Emacs can't find your font, use 'M-x describe-font' to look them
 ;; up, `M-x eval-region' to execute elisp code, and 'M-x doom/reload-font' to
@@ -438,6 +445,153 @@ reproduced.
     (when (fboundp #'treemacs) (treemacs) (other-window 1))
     (switch-to-buffer buf)))
 (map! :leader :desc "Workbench" "o w" #'la/workbench)
+
+;;; ===========================================================================
+;;; vterm — terminal comfort (ported from Spacemacs blk-vterm-basics)
+;;; ===========================================================================
+
+;; The Claude TUI (since CLI v2.1.89) paints on the terminal's ALTERNATE SCREEN,
+;; which writes nothing to the scrollback ring. CLAUDE_CODE_NO_FLICKER=1 is
+;; Anthropic's own answer: alt-screen rendering with VIRTUALIZED scrollback,
+;; reachable by forwarding scroll keys through to the app (see below). Set here
+;; via setenv so it lands in process-environment and is inherited by the CLI
+;; whichever client launches it.
+;; https://github.com/anthropics/claude-code/issues/42670
+(setenv "CLAUDE_CODE_NO_FLICKER" "1")
+
+;; --- Terminal font picker ---------------------------------------------------
+;; Preference order is declared in fonts.org; the first installed family wins,
+;; so the order is load-bearing. IosevkaTerm is the tail guarantee, not the
+;; choice. Height 105 renders an 11px glyph (measured), matching the rest of
+;; Emacs and the standalone terminal.
+(defvar metsatron/terminal-font-preference
+  '("MesloLGS Nerd Font Mono"
+    "FiraCode Nerd Font Mono"
+    "Mononoki Nerd Font Mono"
+    "IosevkaTerm Nerd Font Mono")
+  "Monospace families for terminal buffers, most-preferred first.
+Order is declared in `fonts.org'. `metsatron/terminal-font' picks the first
+family that is actually installed.")
+
+(defvar metsatron/terminal-font-height 105
+  "Face height for terminal buffers (1/10 pt). At 105 MesloLGS renders an 11px
+glyph, matching the rest of Emacs and the standalone terminal. Measure the
+glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
+
+(defun metsatron/terminal-font ()
+  "First installed family from `metsatron/terminal-font-preference', or nil."
+  (seq-find (lambda (family) (member family (font-family-list)))
+            metsatron/terminal-font-preference))
+
+;; --- Scroll a full-screen TUI (the Claude CLI) ------------------------------
+;; Emacs binds the wheel to `mwheel-scroll' and S-PageUp to `scroll-down-command';
+;; both scroll the one-screen-tall Emacs buffer and appear dead. In Claude
+;; buffers ONLY, forward wheel + S-PageUp/Down to the application. A plain shell
+;; vterm keeps Emacs-side scrolling — it has a real scrollback ring.
+(defun metsatron/claude-tui-buffer-p ()
+  "Non-nil if the current buffer hosts a Claude CLI TUI on the alternate screen."
+  (and (derived-mode-p 'vterm-mode)
+       (string-match-p "claude" (buffer-name))))
+
+(defun metsatron/claude-scroll-back (&optional _event)
+  "Scroll the Claude TUI back a page (send PageUp to the application)."
+  (interactive)
+  (vterm-send-prior))
+
+(defun metsatron/claude-scroll-forward (&optional _event)
+  "Scroll the Claude TUI forward a page (send PageDown to the application)."
+  (interactive)
+  (vterm-send-next))
+
+(defun metsatron/claude-scroll-keys ()
+  "Route scroll gestures to the CLI in Claude buffers instead of to Emacs."
+  (when (metsatron/claude-tui-buffer-p)
+    (let ((map (make-sparse-keymap)))
+      (set-keymap-parent map (current-local-map))
+      ;; wheel: X11 sends mouse-4/5, GUI Emacs also sends wheel-up/down
+      (define-key map [wheel-up]        #'metsatron/claude-scroll-back)
+      (define-key map [wheel-down]      #'metsatron/claude-scroll-forward)
+      (define-key map [mouse-4]         #'metsatron/claude-scroll-back)
+      (define-key map [mouse-5]         #'metsatron/claude-scroll-forward)
+      (define-key map (kbd "S-<prior>") #'metsatron/claude-scroll-back)
+      (define-key map (kbd "S-<next>")  #'metsatron/claude-scroll-forward)
+      (use-local-map map))))
+
+;; --- vterm-copy-mode auto-freeze --------------------------------------------
+;; Freeze output when you scroll off the bottom (so live output doesn't yank you
+;; down while reading); unfreeze automatically when you type. Never blocks input.
+;; NOTE: this is the AUTHORITATIVE version. emacs.org's blk-vterm-basics carried
+;; two earlier, dead redefinitions of these same defuns (superseded in place) —
+;; that accidental sediment is deliberately NOT reproduced here.
+(defvar la/vterm--write-commands
+  '(self-insert-command newline newline-and-indent open-line
+    vterm-yank vterm-send-string vterm-send-return
+    evil-insert evil-append evil-append-line
+    evil-open-below evil-open-above
+    evil-change evil-change-line evil-substitute evil-replace
+    evil-delete-char evil-delete-backward-char
+    evil-paste-after evil-paste-before)
+  "Commands that must not run while vterm-copy-mode is active.")
+
+(defun la/vterm--writing-command-p ()
+  (or (and (boundp 'evil-state)
+           (or (evil-insert-state-p) (evil-replace-state-p)))
+      (memq this-command la/vterm--write-commands)))
+
+(defun la/vterm-prevent-read-only-errors ()
+  "Before a write-like command, drop out of vterm-copy-mode."
+  (when (and (derived-mode-p 'vterm-mode)
+             vterm-copy-mode
+             (la/vterm--writing-command-p))
+    (vterm-copy-mode -1)
+    (goto-char (point-max))))
+
+(defun la/vterm--at-bottom-visible-p ()
+  "Non-nil when point-max is fully visible in the selected window."
+  (let ((pm (point-max)))
+    (and (pos-visible-in-window-p pm)
+         (save-excursion
+           (goto-char pm)
+           (eq (window-end (selected-window) t) pm)))))
+
+(defun la/vterm-freeze-when-scrolled ()
+  "Enable vterm-copy-mode when not following the bottom."
+  (when (derived-mode-p 'vterm-mode)
+    (if (la/vterm--at-bottom-visible-p)
+        (when vterm-copy-mode (vterm-copy-mode -1))
+      (unless (or vterm-copy-mode (la/vterm--writing-command-p))
+        (vterm-copy-mode 1)))))
+
+(defun la/vterm-follow-bottom ()
+  "Jump to end and resume following output."
+  (interactive)
+  (goto-char (point-max))
+  (when vterm-copy-mode (vterm-copy-mode -1)))
+
+(after! vterm
+  ;; SINGLE OWNER of vterm-max-scrollback (primary screen only; a full-screen
+  ;; TUI on the alternate screen writes no ring, so raising this won't give the
+  ;; Claude buffer scrollback).
+  (setq vterm-max-scrollback 100000)
+
+  (defun metsatron/vterm-fonts ()
+    (variable-pitch-mode 0)
+    ;; turn off prettify-symbols (can distort TUIs)
+    (setq-local prettify-symbols-alist nil)
+    (when (boundp 'prettify-symbols-mode) (prettify-symbols-mode -1))
+    (when-let ((family (metsatron/terminal-font)))
+      (let ((spec `(:family ,family :height ,metsatron/terminal-font-height)))
+        (face-remap-add-relative 'default     spec)
+        (face-remap-add-relative 'fixed-pitch spec)))
+    (setq-local line-spacing 0))
+
+  (defun la/vterm-install-freeze-hooks ()
+    (add-hook 'pre-command-hook  #'la/vterm-prevent-read-only-errors nil t)
+    (add-hook 'post-command-hook #'la/vterm-freeze-when-scrolled     nil t))
+
+  (add-hook 'vterm-mode-hook #'metsatron/vterm-fonts)
+  (add-hook 'vterm-mode-hook #'metsatron/claude-scroll-keys)
+  (add-hook 'vterm-mode-hook #'la/vterm-install-freeze-hooks))
 #+END_SRC
 
 * packages.el — package declarations
