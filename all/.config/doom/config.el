@@ -97,8 +97,12 @@
 ;; You can also try 'gd' (or 'C-c c d') to jump to their definition and see how
 ;; they are implemented.
 
-;; Start a unique server for Doom
+;; Start a server under a DISTINCT name so Doom coexists with a running
+;; Spacemacs (which holds the default "server" socket). Without this, Doom's
+;; server-start is silently vetoed by server-running-p and `emacsclient -s doom'
+;; cannot reach Doom — which also blocks a Claude from living inside Doom.
 (require 'server)
+(setq server-name "doom")
 (unless (server-running-p) (server-start))
 
 ;; Keep backups & auto-saves out of the way
@@ -306,39 +310,20 @@ glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
   (seq-find (lambda (family) (member family (font-family-list)))
             metsatron/terminal-font-preference))
 
-;; --- Scroll a full-screen TUI (the Claude CLI) ------------------------------
-;; Emacs binds the wheel to `mwheel-scroll' and S-PageUp to `scroll-down-command';
-;; both scroll the one-screen-tall Emacs buffer and appear dead. In Claude
-;; buffers ONLY, forward wheel + S-PageUp/Down to the application. A plain shell
-;; vterm keeps Emacs-side scrolling — it has a real scrollback ring.
-(defun metsatron/claude-tui-buffer-p ()
-  "Non-nil if the current buffer hosts a Claude CLI TUI on the alternate screen."
-  (and (derived-mode-p 'vterm-mode)
-       (string-match-p "claude" (buffer-name))))
-
-(defun metsatron/claude-scroll-back (&optional _event)
-  "Scroll the Claude TUI back a page (send PageUp to the application)."
-  (interactive)
-  (vterm-send-prior))
-
-(defun metsatron/claude-scroll-forward (&optional _event)
-  "Scroll the Claude TUI forward a page (send PageDown to the application)."
-  (interactive)
-  (vterm-send-next))
-
-(defun metsatron/claude-scroll-keys ()
-  "Route scroll gestures to the CLI in Claude buffers instead of to Emacs."
-  (when (metsatron/claude-tui-buffer-p)
-    (let ((map (make-sparse-keymap)))
-      (set-keymap-parent map (current-local-map))
-      ;; wheel: X11 sends mouse-4/5, GUI Emacs also sends wheel-up/down
-      (define-key map [wheel-up]        #'metsatron/claude-scroll-back)
-      (define-key map [wheel-down]      #'metsatron/claude-scroll-forward)
-      (define-key map [mouse-4]         #'metsatron/claude-scroll-back)
-      (define-key map [mouse-5]         #'metsatron/claude-scroll-forward)
-      (define-key map (kbd "S-<prior>") #'metsatron/claude-scroll-back)
-      (define-key map (kbd "S-<next>")  #'metsatron/claude-scroll-forward)
-      (use-local-map map))))
+;; --- Scrolling the Claude buffer: leave it to claude-code-ide ---------------
+;; Session 1 (2026-07-14) added a hook that FORWARDED wheel/S-PageUp to the CLI
+;; app, on the theory that the alt-screen TUI had no Emacs-side scrollback. That
+;; is obsolete: claude-code-ide (>= 20260702) ships native scroll management —
+;; `vterm-scroll-to-bottom-on-output nil', copy-mode scrollback, and a smart
+;; renderer that suppresses reflow while scrolled (its bug #1422 workaround).
+;;
+;; Observed 2026-07-15 in the LIVE working Spacemacs claude buffer: my forwarding
+;; hook was NOT in the buffer's local map at all (claude-code-ide's own setup
+;; overrode it), and scrollback worked anyway — via the native mechanism. In
+;; Doom the hook can WIN the local map instead and then it BREAKS scrollback,
+;; sending wheel events to the CLI instead of scrolling the vterm buffer. So the
+;; forwarding is removed entirely; native scrollback (wheel/C-u up) is the path.
+;; CLAUDE_CODE_NO_FLICKER=1 (above) and vterm-max-scrollback 100000 stay.
 
 ;; --- vterm-copy-mode auto-freeze --------------------------------------------
 ;; Freeze output when you scroll off the bottom (so live output doesn't yank you
@@ -413,7 +398,6 @@ glyph, not the XLFD (Emacs reports pixel size 14 for the em box).")
     (add-hook 'post-command-hook #'la/vterm-freeze-when-scrolled     nil t))
 
   (add-hook 'vterm-mode-hook #'metsatron/vterm-fonts)
-  (add-hook 'vterm-mode-hook #'metsatron/claude-scroll-keys)
   (add-hook 'vterm-mode-hook #'la/vterm-install-freeze-hooks))
 
 ;;; ===========================================================================
@@ -932,6 +916,9 @@ confirmation first. Runs from ~/DotCortex so relative paths resolve as in a shel
   (treemacs-follow-mode 1)
   (treemacs-filewatch-mode 1)
   (treemacs-git-mode 'deferred)
+  ;; Auto-track the current project so SPC p p re-roots the tree (fixes
+  ;; "changing projects didn't change the treemacs root", 2026-07-15).
+  (when (fboundp 'treemacs-project-follow-mode) (treemacs-project-follow-mode 1))
   (defun metsatron/treemacs-narrow ()
     (when (fboundp 'treemacs-set-width) (treemacs-set-width 20)))
   (add-hook 'treemacs-mode-hook #'metsatron/treemacs-narrow)
