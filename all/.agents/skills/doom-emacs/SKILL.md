@@ -37,6 +37,22 @@ Load this when working inside, configuring, or debugging Mètsàtron's Doom Emac
 - **The fix** (`metsatron/claude-scroll-forward-mode` in `doom.org`): a buffer-local minor mode forwarding `<prior>`/`<next>`/`<S-prior>`/`<S-next>`/wheel to the app, registered as an **emulation map at the front of `emulation-mode-map-alists`** — the only tier that outranks BOTH pixel-scroll (minor-mode-map-alist) and ultra-scroll (which wins from above the minor-mode maps). Enabled via `:after` advice on `claude-code-ide--configure-vterm-buffer`, scoped to Claude vterm buffers so ordinary shell vterms keep Doom's smooth-scroll. A wheel notch sends a full PageUp/Down (no finer "scroll N lines" reaches the app without vterm mouse-tracking).
 - Diagnosing scroll-key shadowing: `(minor-mode-key-binding (kbd "<prior>"))` reveals the minor-mode owner; `(key-binding (kbd "<prior>"))` reveals the ultimate winner. When they differ, a higher tier (emulation/global) is winning — you must bind above it, not alongside it.
 
+## GOTCHA — treemacs "defaults to" the wrong project (sealed 2026-07-16)
+
+- Symptom: at startup treemacs roots at a stale/unexpected folder (e.g. a RetroPie `ports` dir) even though `doom-project-root`/`default-directory` are correct. It is NOT a project-root bug — it is persisted treemacs state.
+- Treemacs (with the `treemacs-perspective` integration Doom uses) keeps a per-perspective workspace→project map in `~/.config/emacs/.local/cache/treemacs-persist` (a plain text outline: `* Perspective NAME` / `** project` / ` - path :: …`). A stale entry like `* Perspective main` → `ports` makes treemacs show that folder whenever you are in that perspective. Read the file to see the truth; each perspective has its own root, so one can be wrong while others are fine.
+- **Editing the file alone does NOT stick**: treemacs holds the workspaces in memory and rewrites the file from memory on Emacs exit, clobbering your edit. Fix it LIVE, then let treemacs persist: mutate the workspace struct and call `(treemacs--persist)`. Data-only mutation touches no windows, so it is safe from a hosted vterm (unlike interactive treemacs commands). Back up the cache file first (rule 16) — it is mutable machine-local state, not DotCortex source, so there is nothing to commit for the fix itself.
+  ```elisp
+  (let ((ws (seq-find (lambda (w) (string= (treemacs-workspace->name w) "Perspective main"))
+                      (treemacs-workspaces))))
+    (setf (treemacs-workspace->projects ws)
+          (seq-remove (lambda (p) (string-match-p "RetroPie/isos/ports" (treemacs-project->path p)))
+                      (treemacs-workspace->projects ws)))
+    (treemacs--persist))
+  ```
+- An emptied workspace is dropped from the persist file entirely, so that perspective's treemacs starts clean (prompts for a project) next session. Verify the fix by reading the file back, not by trusting the in-memory report.
+- Note the persp/treemacs-name skew: treemacs workspaces are named `Perspective <persp>`, and a persisted workspace can outlive its perspective (e.g. `main` gone from `(persp-names)` but `Perspective main` still in the file) — that orphan is exactly the kind of stale entry that misroots a fresh session.
+
 ## Keymap priority ladder (highest wins) — for beating a stubborn binding
 
 `overriding-terminal-local-map` > `overriding-local-map` > `emulation-mode-map-alists` > `minor-mode-overriding-map-alist` > char-property keymaps > `minor-mode-map-alist` > buffer-local (major-mode) map > `global-map`. To beat a *global minor mode* in one buffer, `minor-mode-overriding-map-alist` is enough; to beat something bound *above* minor modes (like ultra-scroll's wheel), you need an **emulation map**. Never try to win by binding in the major-mode map — it sits below every minor mode.
