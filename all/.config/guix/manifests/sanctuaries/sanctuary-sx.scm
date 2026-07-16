@@ -5,7 +5,7 @@
 ;; required). This profile is sourced after =desktop-common= inside the container.
 
 
-;; [[file:../../../../../package-guix.org::*sanctuary-sx][sanctuary-sx:1]]
+;; [[file:../../../../../package-guix-habitat.org::*sanctuary-sx][sanctuary-sx:1]]
 ;; Virtual Habitat — sanctuary-sx Guix profile
 ;; XFCE desktop stack for the SX-Window / Ko-Window continuation habitat.
 ;; desktop-common is sourced separately by the launcher.

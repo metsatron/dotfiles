@@ -14,7 +14,7 @@
 ;; Upstream: =https://github.com/RetroPie/EmulationStation=
 
 
-;; [[file:../../../../../../package-guix.org::*RetroPie EmulationStation fork (from source)][RetroPie EmulationStation fork (from source):1]]
+;; [[file:../../../../../../package-guix-habitat.org::*RetroPie EmulationStation fork (from source)][RetroPie EmulationStation fork (from source):1]]
 ;;; Local Guix package — RetroPie's EmulationStation fork
 ;;; Pinned: v2.9.6, recursive submodule checkout
 ;;; License: Expat (MIT)

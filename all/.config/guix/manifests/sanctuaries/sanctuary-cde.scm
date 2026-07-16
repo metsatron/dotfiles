@@ -12,7 +12,7 @@
 ;; desktop in Xephyr; address if configure fails.
 
 
-;; [[file:../../../../../package-guix.org::*sanctuary-cde][sanctuary-cde:1]]
+;; [[file:../../../../../package-guix-habitat.org::*sanctuary-cde][sanctuary-cde:1]]
 ;; Virtual Habitat — sanctuary-cde Guix profile
 ;; CDE 2.5.3 build toolchain and library deps — all sourced from Guix.
 ;; Install target: ~/.local/share/cde (user-writable, persists in sanctuary home).
