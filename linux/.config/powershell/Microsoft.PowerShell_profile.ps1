@@ -1,5 +1,5 @@
 # Redstone 9X — Windows PowerShell profile
-# Projected from DotCortex: distrobox.org
+# Projected from DotCortex: sanctuary-distrobox.org
 
 # Distinguish from native pwsh in prompt colour
 function Prompt {
