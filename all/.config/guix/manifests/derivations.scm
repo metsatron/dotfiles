@@ -1,4 +1,4 @@
-;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:5]]
+;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:5]]
 ;; These packages lack substitutions and the derivations.
 ;; They require extremely heavy local compilation for all dependencies.
 ;; Tooks 11.5h to compile last time on my X230 turboing @3.4Ghz 92C.

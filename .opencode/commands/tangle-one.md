@@ -25,18 +25,18 @@ if the intent is genuinely ambiguous.
 tangle-one shell.org
 
 # Nala/Antigravity/package repo config
-tangle-one nala.org
+tangle-one package-nala.org
 
 # Package manifests
-tangle-one pip.org
-tangle-one npm.org
-tangle-one flatpak.org
+tangle-one package-pip.org
+tangle-one package-npm.org
+tangle-one package-flatpak.org
 
 # Loom control plane (Makefile and verbs)
 tangle-one loom.org
 
 # Bootstrap and system setup
-tangle-one guix.org
+tangle-one package-guix.org
 ```
 
 ## Rules
@@ -51,5 +51,5 @@ tangle-one guix.org
 ## Notes
 
 - `style.org` is handled specially by the existing tangle flow.
-- This is especially useful for files like `shell.org`, `nala.org`,
-  `flatpak.org`, `loom.org`, `pip.org`, and `npm.org`.
+- This is especially useful for files like `shell.org`, `package-nala.org`,
+  `package-flatpak.org`, `loom.org`, `package-pip.org`, and `package-npm.org`.

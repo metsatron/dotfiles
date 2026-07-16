@@ -17,4 +17,4 @@ If no argument is given, ask which org file to tangle.
 ## Notes
 
 - `style.org` is handled specially (runs `loom-style` block first).
-- For most org files (shell.org, pip.org, npm.org, cargo.org, flatpak.org, loom.org, etc.) this works perfectly.
+- For most org files (shell.org, package-pip.org, package-npm.org, package-cargo.org, package-flatpak.org, loom.org, etc.) this works perfectly.

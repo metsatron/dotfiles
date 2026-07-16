@@ -10,7 +10,7 @@
 ;; Upstream: =https://github.com/joncampbell123/dosbox-x=
 
 
-;; [[file:../../../../../../guix.org::*DOSBox-X (from source)][DOSBox-X (from source):1]]
+;; [[file:../../../../../../package-guix.org::*DOSBox-X (from source)][DOSBox-X (from source):1]]
 ;;; Local Guix package — DOSBox-X
 ;;; Pinned: v2026.06.02 source archive (GitHub auto-tarball)
 ;;; License: GPL v2+

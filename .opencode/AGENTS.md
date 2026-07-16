@@ -60,20 +60,20 @@ loom stow:devuan                        # shared: all linux devuan
 - `pclip default` on `Meta+V` is the preferred user-driven way to hear selected assistant output aloud
 - When speech is requested, prefer `pvox say Claude --stdin`; when fast playback matters, prefer `pvox say Claude --stdin --stream` with `PVOX_PLAYER_RAW=aplay`
 - On major task completion, alert by default with `ClaudeMX: "Meu Comandante!"` followed by `Claude: "Check OpenCode!"` unless the user asks for silence
-- Antigravity belongs to DotCortex's `nala.org` layer, including install/repo metadata and user config tangles
+- Antigravity belongs to DotCortex's `package-nala.org` layer, including install/repo metadata and user config tangles
 
 ## Package Manifests (Quick Reference)
 
 | Manager  | Org File       | Loom Verbs                      |
 |----------|----------------|---------------------------------|
-| Pip      | `pip.org`      | `pip:apply`, `pip:diff`         |
-| NPM      | `npm.org`      | `npm:apply`, `npm:diff`         |
-| Guix     | `guix.org`     | `guix:apply`, `guix:pull`       |
-| Flatpak  | `flatpak.org`  | `flatpak:apply`, `flatpak:diff` |
-| Snap     | `snap.org`     | `snap:apply`, `snap:diff`       |
-| Cargo    | `cargo.org`    | `cargo:apply`, `cargo:diff`     |
-| AppImage | `appimage.org` | `appimage:update`               |
-| Homebrew | `homebrew.org` | `brew:apply`                    |
+| Pip      | `package-pip.org`      | `pip:apply`, `pip:diff`         |
+| NPM      | `package-npm.org`      | `npm:apply`, `npm:diff`         |
+| Guix     | `package-guix.org`     | `guix:apply`, `guix:pull`       |
+| Flatpak  | `package-flatpak.org`  | `flatpak:apply`, `flatpak:diff` |
+| Snap     | `package-snap.org`     | `snap:apply`, `snap:diff`       |
+| Cargo    | `package-cargo.org`    | `cargo:apply`, `cargo:diff`     |
+| AppImage | `package-appimage.org` | `appimage:update`               |
+| Homebrew | `package-homebrew.org` | `brew:apply`                    |
 | Apps     | `app.org`      | `app:apply`                     |
 
 ## OpenCode Memory

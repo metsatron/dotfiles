@@ -9,14 +9,14 @@ Each package manager has an `.org` file that tangles a manifest (`.ssv`) and hel
 
 | Manager  | Org File       | Manifest                              | Loom Verbs                        |
 |----------|----------------|---------------------------------------|-----------------------------------|
-| Guix     | `guix.org`     | `.config/guix/manifests/*.scm`        | `guix:apply`, `guix:pull`         |
-| Flatpak  | `flatpak.org`  | `linux/.flatpak/manifest/apps.ssv`    | `flatpak:apply`, `flatpak:diff`   |
-| Snap     | `snap.org`     | `all/.snap/manifest/apps.ssv`         | `snap:apply`, `snap:diff`         |
-| Pip      | `pip.org`      | `all/.pip/manifest/packages.ssv`      | `pip:apply`, `pip:diff`           |
-| NPM      | `npm.org`      | `all/.npm/manifest/global.ssv`        | `npm:apply`, `npm:diff`           |
-| Cargo    | `cargo.org`    | `all/.local/share/dotcortex/manifests/cargo/crates.ssv` | `cargo:apply`, `cargo:diff` |
-| AppImage | `appimage.org` | `all/.appimage/inventory/all.ssv`     | `appimage:update`                 |
-| Homebrew | `homebrew.org` | `all/.homebrew/manifest/brews.ssv`    | `brew:apply`                      |
+| Guix     | `package-guix.org`     | `.config/guix/manifests/*.scm`        | `guix:apply`, `guix:pull`         |
+| Flatpak  | `package-flatpak.org`  | `linux/.flatpak/manifest/apps.ssv`    | `flatpak:apply`, `flatpak:diff`   |
+| Snap     | `package-snap.org`     | `all/.snap/manifest/apps.ssv`         | `snap:apply`, `snap:diff`         |
+| Pip      | `package-pip.org`      | `all/.pip/manifest/packages.ssv`      | `pip:apply`, `pip:diff`           |
+| NPM      | `package-npm.org`      | `all/.npm/manifest/global.ssv`        | `npm:apply`, `npm:diff`           |
+| Cargo    | `package-cargo.org`    | `all/.local/share/dotcortex/manifests/cargo/crates.ssv` | `cargo:apply`, `cargo:diff` |
+| AppImage | `package-appimage.org` | `all/.appimage/inventory/all.ssv`     | `appimage:update`                 |
+| Homebrew | `package-homebrew.org` | `all/.homebrew/manifest/brews.ssv`    | `brew:apply`                      |
 | Apps     | `app.org`      | `all/.app/manifest/apps.ssv`          | `app:apply`                       |
 
 ## SSV Manifest Format

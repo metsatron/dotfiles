@@ -98,7 +98,7 @@ Common mappings:
 - `~/.config/maak/maak.scm` -> `loom.org`
 - `Makefile` -> `loom.org` (the Makefile template block)
 - GTK/terminal themes -> `style.org`
-- Guix manifests -> `guix.org`
+- Guix manifests -> `package-guix.org`
 
 ## Package Manifest Format
 
@@ -112,9 +112,9 @@ openai "" ""
 
 ## Adding a New Package to a Manifest
 
-1. Edit the org file (e.g., `pip.org`)
+1. Edit the org file (e.g., `package-pip.org`)
 2. Add a row to the manifest `#+BEGIN_SRC text` block
-3. Run `tangle-one pip.org` to regenerate the SSV file
+3. Run `tangle-one package-pip.org` to regenerate the SSV file
 4. Run the apply verb: `loom pip:apply`
 
 Or use the capture verb to auto-detect what is installed:

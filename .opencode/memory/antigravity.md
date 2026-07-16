@@ -1,11 +1,11 @@
 # Antigravity Workflow
 
-Antigravity belongs to DotCortex's `nala.org` layer on this machine.
+Antigravity belongs to DotCortex's `package-nala.org` layer on this machine.
 
 ## Ownership
 
-- Source of truth for install and repo metadata: `~/DotCortex/nala.org`
-- Source of truth for Antigravity user config tangles: `~/DotCortex/nala.org`
+- Source of truth for install and repo metadata: `~/DotCortex/package-nala.org`
+- Source of truth for Antigravity user config tangles: `~/DotCortex/package-nala.org`
 - Tangled targets:
   - `~/DotCortex/debian/.nala/manifest/packages.ssv`
   - `~/DotCortex/debian/.nala/manifest/repos.ssv`
@@ -21,7 +21,7 @@ Antigravity belongs to DotCortex's `nala.org` layer on this machine.
 
 - Native package name: `antigravity`
 - Third-party apt repo is the Google Antigravity repository documented in `~/HelmCortex/LOGS/WebClipper/Google Antigravity.md`
-- DotCortex should manage both the repo entry and package install through `nala.org`
+- DotCortex should manage both the repo entry and package install through `package-nala.org`
 
 ## Current Defaults
 
@@ -43,15 +43,15 @@ Antigravity belongs to DotCortex's `nala.org` layer on this machine.
 
 ## Operating Pattern
 
-1. Edit `nala.org`
-2. Run `tangle-one nala.org` or `make tangle`
+1. Edit `package-nala.org`
+2. Run `tangle-one package-nala.org` or `make tangle`
 3. Apply package/repo changes with `loom nala:apply` or the corresponding `nala-*` helpers when relevant
 4. Apply config changes with `make preview-stow`, `make safe-stow`, or the relevant Loom stow verb
 5. Restart Antigravity if terminal behavior or keybindings do not reload live
 
 ## Hotfix Discipline
 
-- If a live edit is made under `~/.config/Antigravity/` or `~/.local/share/applications/`, mirror it back into `nala.org` before ending the task
+- If a live edit is made under `~/.config/Antigravity/` or `~/.local/share/applications/`, mirror it back into `package-nala.org` before ending the task
 - Treat direct live edits as temporary repair unless the user explicitly wants a one-off divergence from DotCortex
 
 ## Shift+Enter Fix

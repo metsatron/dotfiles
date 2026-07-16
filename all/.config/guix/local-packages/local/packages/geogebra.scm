@@ -15,7 +15,7 @@
 ;; - Native deps declared: glibc, gcc:lib, zlib, libx11, libxext, libxrender, libxtst, freetype, alsa-lib
 
 
-;; [[file:../../../../../../guix.org::*GeoGebra Classic 5 (binary + bundled Zulu JRE)][GeoGebra Classic 5 (binary + bundled Zulu JRE):1]]
+;; [[file:../../../../../../package-guix.org::*GeoGebra Classic 5 (binary + bundled Zulu JRE)][GeoGebra Classic 5 (binary + bundled Zulu JRE):1]]
 ;;; Local Guix package — GeoGebra Classic 5
 ;;; Version: 5.2.806.0 (Linux Portable, bundled Azul Zulu OpenJDK 11.0.18)
 ;;; License: GeoGebra non-commercial free (https://www.geogebra.org/license)

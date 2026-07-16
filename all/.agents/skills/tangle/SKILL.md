@@ -1,6 +1,6 @@
 ---
 name: tangle
-description: Tangle Org files (like the current skills.org) into their final destinations (e.g., all/.agents/skills/).
+description: Tangle Org files (like the current agents-skills.org) into their final destinations (e.g., all/.agents/skills/).
 ---
 
 # Tangle Org Sources
@@ -9,7 +9,7 @@ Use this when you need to tangle Org files to their destination. This is used by
 
 ## Use This Skill For
 
-- Tangling individual Org files (e.g., `tangle-one skills.org`)
+- Tangling individual Org files (e.g., `tangle-one agents-skills.org`)
 - Performing a full `make tangle` across all Org files
 
 ## Canonical Commands

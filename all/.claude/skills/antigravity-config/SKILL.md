@@ -15,7 +15,7 @@ Use this when Antigravity should be configured through DotCortex source files.
 
 ## Rules
 
-- Keep package metadata in `nala.org`.
+- Keep package metadata in `package-nala.org`.
 - Keep user config tangles in the repo root Org files.
 - Verify the generated output after tangling.
 - Prefer the established package/source mapping.

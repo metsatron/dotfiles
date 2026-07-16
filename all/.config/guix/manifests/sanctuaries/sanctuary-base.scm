@@ -9,7 +9,7 @@
 ;; =~/.guix-extra-profiles/= profile symlinks.
 
 
-;; [[file:../../../../../guix.org::*sanctuary-base][sanctuary-base:1]]
+;; [[file:../../../../../package-guix.org::*sanctuary-base][sanctuary-base:1]]
 ;; Virtual Habitat — sanctuary base layer (container compat only)
 ;; Packed into a Docker image via `guix pack -f docker`.
 ;; All desktop packages come from the host /gnu/store bind-mount.
