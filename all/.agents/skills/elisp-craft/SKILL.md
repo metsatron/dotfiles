@@ -1,17 +1,17 @@
 ---
 name: elisp-craft
-description: Write and adapt Emacs Lisp for DotCortex — emacs.org block conventions, elisp best practices (defgroup/defcustom/defface, user-error, shell-quote-argument, compile), respectful upstream adaptation with credit, and batch testing with the lexical-binding gotcha.
+description: Write and adapt Emacs Lisp for DotCortex — emacs-spacemacs.org block conventions, elisp best practices (defgroup/defcustom/defface, user-error, shell-quote-argument, compile), respectful upstream adaptation with credit, and batch testing with the lexical-binding gotcha.
 ---
 
 # Elisp Craft — Writing and Adapting Emacs Lisp for DotCortex
 
-Load this before writing ANY Emacs Lisp: new config blocks in `emacs.org`, interactive commands, or adaptations of upstream elisp. The standards below are house style, adopted from Josep Bigorra's heks-emacs (https://codeberg.org/jjba23/heks-emacs) — the project whose maak runner sparked loom.
+Load this before writing ANY Emacs Lisp: new config blocks in `emacs-spacemacs.org`, interactive commands, or adaptations of upstream elisp. The standards below are house style, adopted from Josep Bigorra's heks-emacs (https://codeberg.org/jjba23/heks-emacs) — the project whose maak runner sparked loom.
 
 ## DotCortex Emacs config conventions
 
-- **All elisp is authored in `emacs.org`** as named noweb blocks (`#+NAME: blk-<topic>`), referenced from the `dotspacemacs/user-config` assembly block that tangles to `all/.spacemacs.d.claude/init.el`. Never edit `init.el` directly.
-- Adding a block = two edits: the `** heading` with `#+NAME: blk-X` source block, AND `` in the user-config assembly list. Then `tangle-one emacs.org`.
-- **Keybindings**: check what is taken first (`grep -n 'set-leader-keys\|global-set-key' emacs.org`). User commands get a `SPC o <letter>` Spacemacs leader binding (guarded with `(when (fboundp 'spacemacs/set-leader-keys) …)`) plus a `C-c <prefix> <letter>` global binding. Match the file's `global-set-key (kbd …)` idiom.
+- **Spacemacs elisp is authored in `emacs-spacemacs.org`** as named noweb blocks (`#+NAME: blk-<topic>`), referenced from the `dotspacemacs/user-config` assembly block that tangles to `all/.spacemacs.d.claude/init.el`. Never edit `init.el` directly.
+- Adding a Spacemacs block = two edits: the `** heading` with `#+NAME: blk-X` source block, AND `` in the user-config assembly list. Then `tangle-one emacs-spacemacs.org`.
+- **Keybindings**: check what is taken first (`grep -n 'set-leader-keys\|global-set-key' emacs-spacemacs.org`). User commands get a `SPC o <letter>` Spacemacs leader binding (guarded with `(when (fboundp 'spacemacs/set-leader-keys) …)`) plus a `C-c <prefix> <letter>` global binding. Match the file's `global-set-key (kbd …)` idiom.
 - **Colemak-NEIO law applies**: never build h/j/k/l movement contracts; `n/e/i/o` is the directional home row. See CLAUDE.md rule 18 before binding any motion keys.
 - The tangled `init.el` carries a `lexical-binding: t` cookie — closures over `let*` bindings are safe in the real load, but see the testing gotcha below.
 
@@ -32,7 +32,7 @@ Load this before writing ANY Emacs Lisp: new config blocks in `emacs.org`, inter
 - **Credit twice**: in the org prose (link, author, what his/her design contributed) AND in a comment header in the code block (URL + author).
 - **State what was kept and what changed, and why** — e.g. "kept the annotation-function alignment technique; replaced static file parsing with live `loom` output so the picker never drifts."
 - **Prefer live truth over ported parsers**: if the local system can report its own state (like bare `loom` listing verbs with descriptions), query it instead of porting a parser for a file format the fork does not share.
-- Reference implementation: `blk-loom` in `emacs.org` (loom-run-task, adapted from heks-emacs `maak-run-task`).
+- Reference implementation: `blk-loom` in `emacs-spacemacs.org` (loom-run-task, adapted from heks-emacs `maak-run-task`).
 
 ## Verifying elisp without opening Emacs
 

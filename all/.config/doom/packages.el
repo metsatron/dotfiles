@@ -52,7 +52,7 @@
 
 ;; Claude Code inside Doom — the harness-preserving default (Phase 2 of the
 ;; Spacemacs->Doom migration). Runs the real `claude' CLI in a vterm buffer AND
-;; bridges Emacs to it over MCP. Of emacs.org's three clients, ONLY this one is
+;; bridges Emacs to it over MCP. Of emacs-spacemacs.org's three clients, ONLY this one is
 ;; ported: agent-shell (ACP; harness inert) and the thin claude-code wrapper are
 ;; deliberately deferred.
 (package! claude-code-ide
@@ -73,7 +73,7 @@
 
 ;; Org prettification (Phase 4). org-modern + org-appear already ship with Doom's
 ;; (org +pretty) flag, so only valign is added here. valign pixel-aligns table
-;; columns in variable-pitch org buffers. (mixed-pitch from emacs.org is NOT
+;; columns in variable-pitch org buffers. (mixed-pitch from emacs-spacemacs.org is NOT
 ;; ported: it was declared but never wired — org-looks does variable-pitch
 ;; manually.)
 (package! valign)

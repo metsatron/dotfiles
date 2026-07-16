@@ -20,7 +20,7 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
    - `tangle` — org source block changes that affect tangled output
 
 3. **Determine scope from file paths:**
-   - `emacs` — emacs.org, Spacemacs config
+   - `emacs` — emacs.org, shared profile/build policy
    - `shell` — shell.org, bash/zsh config
    - `flatpak` — flatpak.org, Flatpak management
    - `loom` — loom.org, Makefile, control plane
