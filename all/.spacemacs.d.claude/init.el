@@ -736,6 +736,11 @@
   (spacemacs/declare-prefix "oa" "agent-shell")
   (spacemacs/declare-prefix "os" "claude-code (thin)")
   
+  ;; Agent session buffers are transcripts, not source files; keep the gutter out
+  ;; of the Codex IDE surface while leaving line numbers available elsewhere.
+  (defun metsatron/codex-no-line-numbers ()
+    (display-line-numbers-mode -1))
+  (add-hook 'codex-ide-session-mode-hook #'metsatron/codex-no-line-numbers)
   ;; Scrollback in the Claude buffer.
   ;;
   ;; Since CLI v2.1.89 the Claude TUI runs on the terminal's ALTERNATE SCREEN
