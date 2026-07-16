@@ -110,8 +110,14 @@
             tasks)
            0))
 
-   (task 'all "TOC -> tangle -> ensure Guix dirs"
+   (task 'all "TOC -> tangle -> census -> ensure Guix dirs"
          (lambda () (sh "make all")))
+
+   (task 'lint "Structural + style lint over root org sources"
+         (lambda () (mk "lint")))
+
+   (task 'census "Verify org parses every declared src block (silent-drop detector)"
+         (lambda () (mk "census")))
 
    (task 'hooks:install
          "Install tracked DotCortex git hooks for this checkout"

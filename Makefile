@@ -12,7 +12,7 @@ EXTRA := $(HOME)/.guix-extra-profiles
 STOW_PKGS ?= all
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
-        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint
+        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census
 
 lint:
 | all/.local/bin/org-style-lint
@@ -32,8 +32,13 @@ toc:
 tangle:
 | $(EMACS_BATCH) --eval '(load-file "$(SCRIPT)")' --eval '(dotfiles-batch-tangle "$(ROOT)")'
 
-# all = toc → tangle → guix-dirs only
-all: toc tangle guix-dirs
+# census = does org-element parse every src block the raw text declares?
+# Divergence means blocks are silently dropped from tangling. Fatal.
+census:
+| $(EMACS_BATCH) --eval '(load-file "$(SCRIPT)")' --eval '(dotfiles-batch-census "$(ROOT)")'
+
+# all = toc → tangle → census → guix-dirs
+all: toc tangle census guix-dirs
 
 # Plain stow
 stow:
