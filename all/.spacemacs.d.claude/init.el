@@ -129,7 +129,7 @@
   ;; Git-controlled source file; follow link?" on essentially every file visit.
   ;; Follow silently: we always want the real file under version control, never
   ;; the link. NOTE this means visiting e.g. ~/.spacemacs.d.claude/init.el lands
-  ;; you in TANGLED OUTPUT — read it, never edit it; edit emacs.org instead.
+  ;; you in TANGLED OUTPUT — read it, never edit it; edit emacs-spacemacs.org instead.
   (setq vc-follow-symlinks t)
   (let* ((cache (expand-file-name "~/.spacemacs.d.claude/.cache/"))
          (elpa  (expand-file-name "elpa" cache))

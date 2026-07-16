@@ -9,7 +9,7 @@ description: Drive and inspect the user's RUNNING Emacs over emacsclient — liv
 
 ## Prerequisite
 
-`dotspacemacs-enable-server t` is set in `emacs.org`, so the server comes up at startup. Socket lands in `$XDG_RUNTIME_DIR/emacs/server`.
+`dotspacemacs-enable-server t` is set in `emacs-spacemacs.org`, so the server comes up at startup. Socket lands in `$XDG_RUNTIME_DIR/emacs/server`.
 
 ```bash
 ls /run/user/$(id -u)/emacs/          # socket present?
@@ -84,7 +84,7 @@ emacsclient --eval '(list (cons "persp" (safe-persp-name (get-frame-persp))) (co
 
 The tangled `init.el` only loads at startup. To exercise a change live:
 
-1. `tangle-one emacs.org`
+1. `tangle-one emacs-spacemacs.org`
 2. Extract the block from `init.el` — it is indented inside `dotspacemacs/user-config`, so strip the leading two spaces.
 3. `(load-file "…")` it.
 
@@ -107,5 +107,5 @@ Walks internal nodes (which `window-list` hides), strips the side parameters, th
 
 ## Terminal facts worth not rediscovering
 
-- The Claude CLI TUI runs on the **alternate screen** (`\e[?1049h`). By terminal convention the alt screen writes **nothing** to the scrollback ring. The Claude buffer therefore holds exactly one screenful, and `vterm-max-scrollback` cannot change that — the ring never receives the lines. Not a vterm bug, not a `claude-code-ide` bug, not fixable from Emacs. The only lever is `CLAUDE_CODE_NO_FLICKER=1` (Anthropic's virtualized-scrollback renderer), set in `emacs.org`.
+- The Claude CLI TUI runs on the **alternate screen** (`\e[?1049h`). By terminal convention the alt screen writes **nothing** to the scrollback ring. The Claude buffer therefore holds exactly one screenful, and `vterm-max-scrollback` cannot change that — the ring never receives the lines. Not a vterm bug, not a `claude-code-ide` bug, not fixable from Emacs. The only lever is `CLAUDE_CODE_NO_FLICKER=1` (Anthropic's virtualized-scrollback renderer), set in `emacs-spacemacs.org` and `emacs-doom.org`.
 - `claude-code-ide`'s anti-flicker option installs a **global** `:around` advice on `vterm--filter`. It looks like a prime suspect for vterm misbehaviour and **is not** — a fresh vterm retains full scrollback with it active (measured: 304 lines after `seq 1 300`, advice on and off). Do not blame it without an A/B on a *fresh* buffer.
