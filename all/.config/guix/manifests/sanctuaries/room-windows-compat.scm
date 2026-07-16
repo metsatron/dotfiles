@@ -10,7 +10,7 @@
 ;; - *Local package defs* (=all/.config/guix/local-packages/=): =powershell=, =dosbox-x= (integrated Redstone compatibility lane while the =DOSEMU2= package recipe catches up)
 
 
-;; [[file:../../../../../package-guix.org::*room-windows-compat][room-windows-compat:1]]
+;; [[file:../../../../../package-guix-habitat.org::*room-windows-compat][room-windows-compat:1]]
 ;; Virtual Habitat — room-windows-compat Guix profile
 ;; Windows compatibility layer: Wine, fonts, terminal runtimes, DOS emulation.
 ;; Redstone's active DOS direction is DOSEMU2 for terminal-clean DOS work, while

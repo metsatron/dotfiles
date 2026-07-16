@@ -15,7 +15,7 @@
 ;; Upstream: =https://github.com/captainys/TOWNSEMU=
 
 
-;; [[file:../../../../../../package-guix.org::*retropie-tsugaru (FM-TOWNS, CUI only, from source)][retropie-tsugaru (FM-TOWNS, CUI only, from source):1]]
+;; [[file:../../../../../../package-guix-habitat.org::*retropie-tsugaru (FM-TOWNS, CUI only, from source)][retropie-tsugaru (FM-TOWNS, CUI only, from source):1]]
 ;;; Local Guix package — Tsugaru_CUI (FM-TOWNS)
 ;;; Pinned: tag v20260522
 ;;; License: MIT

@@ -25,7 +25,7 @@
 ;; =powershell= already use.
 
 
-;; [[file:../../../../../package-guix.org::*room-retropie][room-retropie:1]]
+;; [[file:../../../../../package-guix-habitat.org::*room-retropie][room-retropie:1]]
 ;; Virtual Habitat — room-retropie Guix profile
 ;; RetroPie sanctuary runtime: EmulationStation front-end + RetroArch/libretro
 ;; cores + MAME + Mednafen, plus the X68000/PC-98/FM-TOWNS marrow.

@@ -8,7 +8,7 @@
 ;; Upstream: =https://github.com/libretro/libretro-prboom=
 
 
-;; [[file:../../../../../../package-guix.org::*libretro-prboom (Doom, from source)][libretro-prboom (Doom, from source):1]]
+;; [[file:../../../../../../package-guix-habitat.org::*libretro-prboom (Doom, from source)][libretro-prboom (Doom, from source):1]]
 ;;; Local Guix package — libretro-prboom (Doom)
 ;;; Pinned: master @ 31563d6e65faa6b9b7e975754d2062370bba4342
 ;;; License: GPL v2 (bundled COPYING in upstream)

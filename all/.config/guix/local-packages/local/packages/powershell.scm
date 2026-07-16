@@ -8,7 +8,7 @@
 ;; Upstream: =https://github.com/PowerShell/PowerShell/releases=
 
 
-;; [[file:../../../../../../package-guix.org::*PowerShell 7.x (binary)][PowerShell 7.x (binary):1]]
+;; [[file:../../../../../../package-guix-habitat.org::*PowerShell 7.x (binary)][PowerShell 7.x (binary):1]]
 ;;; Local Guix package — PowerShell 7.x binary
 ;;; Pinned: v7.4.7 linux-x64 official Microsoft release
 ;;; License: MIT (Expat)

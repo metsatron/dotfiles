@@ -5,7 +5,7 @@
 ;; =guix search qtile= before applying.
 
 
-;; [[file:../../../../../package-guix.org::*sanctuary-qtile][sanctuary-qtile:1]]
+;; [[file:../../../../../package-guix-habitat.org::*sanctuary-qtile][sanctuary-qtile:1]]
 ;; Virtual Habitat — sanctuary-qtile Guix profile
 ;; Qtile-specific packages. desktop-common is sourced separately by the launcher.
 ;; Apply: guix package -m manifests/sanctuaries/sanctuary-qtile.scm -p ~/.guix-extra-profiles/sanctuary-qtile/sanctuary-qtile
