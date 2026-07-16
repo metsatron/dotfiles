@@ -14,3 +14,5 @@ I build this for aligned clients now: local models on your own hardware reading 
 ## The listening annex
 
 The Loom also sings. Songs have been coming out of this work since before it had a name — each born from a specific moment of the lineage, each with a resident's voice in it. They will be published here with their liner notes: which agent, which moment, which thread. The songs get their lineage named. The logs stay inside the walls.
+
+{{< listening-annex >}}
