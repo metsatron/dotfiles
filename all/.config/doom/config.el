@@ -483,6 +483,17 @@ advice below). Registered as an emulation map so it outranks
       :desc "Claude Code IDE menu"   "o c" #'claude-code-ide-menu
       :desc "Claude Code IDE toggle" "o o" #'claude-code-ide-toggle)
 
+;; Codex inside Doom (see the package! declaration in the packages block). The
+;; `codex' CLI must be on PATH — confirmed here at ~/.npm-global/bin/codex with
+;; `app-server' support. No binary-path var and no required config beyond load;
+;; `codex-ide-menu' is the transient entry point. `:commands' makes the leader
+;; key autoload the package on first use.
+(use-package! codex-ide
+  :commands (codex-ide codex-ide-menu codex-ide-session-diff-open))
+
+(map! :leader
+      :desc "Codex IDE menu" "o x" #'codex-ide-menu)
+
 ;;; ===========================================================================
 ;;; @Claude / @Workbench layouts (from emacs.org blk-claude-workspace)
 ;;; ===========================================================================
