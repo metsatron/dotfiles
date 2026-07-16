@@ -1,0 +1,2556 @@
+#+TITLE: Services Loom: agent-top
+#+DESCRIPTION: agent-top — htop-style operator console over agent-sessiond state
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* agent-top
+Read-only renderer, planned as htop-style operator console.
+Architecture invariants: agent-top is the TUI/operator; agent-sessiond owns process state;
+agent-session owns index write/close/archive. agent-top never writes to native stores.
+
+Function key plan (Phase 2N+):
+  F2 sort · F3 search · F4 toggle-closed · F5 refresh
+  F6 resume/reopen · F7 close(index) · F8 stop(SIGTERM) · F9 kill(SIGKILL)
+  Shift-F9 kill-pgid · Enter jump-to-pane · F10 quit
+
+Action backends:
+  resume  → party[].resume_cmd template; spawn in new tmux pane
+  close   → agent-session close <id>  (writes session-index.json status=closed)
+  stop    → kill -TERM <pid>
+  kill    → kill -KILL <pid>
+  pgkill  → kill -KILL -<pgid>
+  jump    → tmux select-window + select-pane
+
+Metadata gaps: model/provider not in state or index; context_size/window/percent require
+  harness API; CPU% requires two snapshots for delta (cpu_ticks are cumulative).
+
+Implementation phases: 2M non-destructive actions · 2N curses TUI · 2O destructive+confirm · 2P archive search
+
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-top :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+_DEFAULT_STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/HelmCortex/ROOTS/DotRoot/agent-session}"
+if [ -n "${AGENT_TOP_STATE+x}" ]; then
+  AGENT_TOP_STATE_EXPLICIT=1
+else
+  AGENT_TOP_STATE_EXPLICIT=0
+fi
+if [ "$AGENT_TOP_STATE_EXPLICIT" = "1" ]; then
+  export AGENT_TOP_STATE
+else
+  export AGENT_TOP_STATE="${AGENT_SESSIOND_STATE:-${_DEFAULT_STATE_DIR}/state.latest.json}"
+fi
+export AGENT_TOP_STATE_DIR="${AGENT_TOP_STATE_DIR:-${_DEFAULT_STATE_DIR}}"
+export AGENT_TOP_EXTRA_DIRS="${AGENT_TOP_EXTRA_DIRS:-${HOME}/mnt/x230/HelmCortex/ROOTS/DotRoot/agent-session}"
+REFRESH_SECS="${AGENT_TOP_REFRESH:-5}"
+AGENT_TOP_RELOAD_INTERVAL="${AGENT_TOP_RELOAD_INTERVAL:-2}"
+AGENT_TOP_LOCAL_REFRESH_INTERVAL="${AGENT_TOP_LOCAL_REFRESH_INTERVAL:-15}"
+AGENT_TOP_REMOTE_REFRESH_INTERVAL="${AGENT_TOP_REMOTE_REFRESH_INTERVAL:-60}"
+if [ -z "${AGENT_TOP_INDEX:-}" ]; then
+  case "$(hostname 2>/dev/null || echo unknown)" in
+    ThinkPad-T480s|t480s) AGENT_TOP_INDEX="$HOME/mnt/x230/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+    *)                    AGENT_TOP_INDEX="$HOME/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+  esac
+fi
+export AGENT_TOP_INDEX="${AGENT_SESSION_INDEX:-$AGENT_TOP_INDEX}"
+
+_find_agentd() {
+  if command -v agent-sessiond >/dev/null 2>&1; then
+    command -v agent-sessiond
+  elif [ -x "$SCRIPT_DIR/agent-sessiond" ]; then
+    printf '%s/agent-sessiond\n' "$SCRIPT_DIR"
+  else
+    echo "agent-top: agent-sessiond not found" >&2
+    exit 1
+  fi
+}
+
+_find_agent_session() {
+  if command -v agent-session >/dev/null 2>&1; then
+    command -v agent-session
+  elif [ -x "$SCRIPT_DIR/agent-session" ]; then
+    printf '%s/agent-session\n' "$SCRIPT_DIR"
+  else
+    echo "agent-top: agent-session not found" >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: agent-top [CMD] [OPTIONS]
+
+Commands:
+  once [--all] [--refresh|--live] [--all-hosts|--local]
+               render agent state once (default)
+  watch [--all] [--all-hosts|--local] [--no-refresh]
+               refresh/reload state periodically
+  json         print raw agent-sessiond state JSON
+  refresh [--all-hosts|--local]
+               trigger local scan (+ remote SSH copy by default)
+  hosts        list discovered host state files
+  jump <pid|session>   switch tmux to the agent's pane
+  resume <session_id>  resume a session via its harness
+  show <session_id>    show full session details
+  tui [--all-hosts|--local] [--no-refresh]
+               interactive curses operator console
+  keytest              interactive key code diagnostic
+  help                 show this help
+
+Options:
+  --all        include NONE-confidence/noisy processes
+  --all-hosts  aggregate state from all discovered machines (default unless AGENT_TOP_STATE is set)
+  --local      use only local state
+  --no-refresh do not run background/startup refreshes
+               (AGENT_TOP_RELOAD_INTERVAL controls cached reloads, default 2s)
+               (AGENT_TOP_LOCAL_REFRESH_INTERVAL controls local refreshes, default 15s)
+               (AGENT_TOP_REMOTE_REFRESH_INTERVAL controls SSH refreshes, default 60s)
+               (AGENT_TOP_EXTRA_DIRS overrides extra state dirs, colon-separated)
+EOF
+}
+
+default_all_hosts() {
+  [ "${AGENT_TOP_STATE_EXPLICIT:-0}" != "1" ]
+}
+
+mode_default() {
+  if default_all_hosts; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+run_once() {
+  local show_all="${1:-false}"
+  python3 <<PY
+import datetime, json, os, sys
+
+STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", os.path.expanduser("~/HelmCortex/ROOTS/AgentRoot/session-index.json"))
+SHOW_ALL   = "$show_all" == "true"
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+
+BOLD = "\033[1m"
+DIM  = "\033[2m"
+RED  = "\033[31m"
+GRN  = "\033[32m"
+YLW  = "\033[33m"
+CYN  = "\033[36m"
+RST  = "\033[0m"
+
+
+def fmt_bytes(n):
+    if not n:
+        return "—"
+    for unit, thr in [("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)]:
+        if n >= thr:
+            return f"{n/thr:.0f}{unit}"
+    return f"{n}B"
+
+
+def fmt_kb(kb):
+    return fmt_bytes((kb or 0) * 1024)
+
+
+def short_sid(s):
+    if not s:
+        return "—"
+    return s[-12:] if len(s) > 12 else s
+
+
+def short_machine(host):
+    if not host:
+        return "—"
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if "t430"  in hl: return "T430"
+    if "vultr" in hl: return "Vultr"
+    if "vps"   in hl: return "VPS"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h[:8]
+
+
+def short_model(m, width=20):
+    if not m:
+        return "—"
+    if len(m) <= width:
+        return m
+    return ".." + m[-(width - 2):]
+
+
+def cwd_name(path):
+    if not path:
+        return "—"
+    home = os.path.expanduser("~")
+    if path.startswith(home):
+        path = "~" + path[len(home):]
+    return path.rstrip("/").split("/")[-1] or path
+
+
+def tmux_label(a):
+    sn = a.get("tmux_session_name") or ""
+    wn = a.get("tmux_window_name") or ""
+    pi = a.get("tmux_pane_id") or ""
+    if sn and wn and pi:
+        return f"{sn}/{wn}/{pi}"
+    if sn and wn:
+        return f"{sn}/{wn}"
+    if sn:
+        return sn
+    return "—"
+
+
+def fmt_date(s):
+    return (s or "")[:10] or "—"
+
+
+def age_str(secs):
+    if secs is None:
+        return "?"
+    if secs < 60:
+        return f"{int(secs)}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+
+def freshness_badge(secs):
+    if secs is None:
+        return "OLD"
+    if secs < 60:
+        return "FRESH"
+    if secs < 300:
+        return "WARM"
+    if secs < 3600:
+        return "STALE"
+    return "OLD"
+
+
+def state_age_seconds(state, now_utc):
+    try:
+        g = (state.get("generated_at") or "")[:19]
+        if not g:
+            return None
+        return max(0, (now_utc - datetime.datetime.fromisoformat(g)).total_seconds())
+    except Exception:
+        return None
+
+
+def hr(width=82):
+    print(DIM + "─" * width + RST)
+
+
+def compute_tier(agent):
+    has_sid = bool(agent.get("session_id"))
+    has_pane = bool(agent.get("tmux_pane_id"))
+    if has_sid and has_pane:
+        return ("HIGH", GRN)
+    if has_sid:
+        return ("MED", CYN)
+    if has_pane:
+        return ("LOW", YLW)
+    return ("NONE", DIM)
+
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+
+def load_all_states(single_file, all_hosts, state_dir, extra_dirs):
+    if not all_hosts:
+        f = single_file or os.path.join(state_dir, "state.latest.json")
+        if not os.path.isfile(f):
+            return []
+        try:
+            return [(json.load(open(f)), f)]
+        except Exception as e:
+            print(f"\033[31mERROR: {e}\033[0m", file=sys.stderr)
+            sys.exit(1)
+    dirs = [state_dir] + extra_dirs
+    found = discover_state_files(dirs)
+    if not found:
+        f = os.path.join(state_dir, "state.latest.json")
+        if os.path.isfile(f):
+            try:
+                return [(json.load(open(f)), f)]
+            except Exception:
+                pass
+        return []
+    results = []
+    for _, (path, _) in sorted(found.items()):
+        try:
+            results.append((json.load(open(path)), path))
+        except Exception:
+            continue
+    return results
+
+
+states = load_all_states(STATE_FILE, ALL_HOSTS, STATE_DIR, EXTRA_DIRS)
+if not states:
+    err = "no state files found" if ALL_HOSTS else f"state file not found: {STATE_FILE or '(unset)'}"
+    print(f"\033[31mERROR: {err}\033[0m", file=sys.stderr)
+    sys.exit(1)
+
+index = {}
+if os.path.isfile(INDEX_FILE):
+    try:
+        with open(INDEX_FILE) as f:
+            idx_data = json.load(f)
+            idx_list = idx_data.get("sessions", []) if isinstance(idx_data, dict) else idx_data
+            index = {item.get("id"): item for item in idx_list if isinstance(item, dict) and item.get("id")}
+    except Exception:
+        pass
+
+_host_list  = []
+_gen_at_list = []
+_all_agents  = []
+_seen_keys   = set()
+_warnings    = []
+_stores      = {}
+_sessions    = {}
+
+for _st, _spath in states:
+    _h = _st.get("host", "?")
+    if _h not in _host_list:
+        _host_list.append(_h)
+    _g = (_st.get("generated_at") or "")[:19]
+    if _g:
+        _gen_at_list.append((_g, _h))
+    _warnings.extend(_st.get("warnings") or [])
+    if not _stores:
+        _stores = _st.get("native_stores") or {}
+    if not _sessions:
+        _sessions = _st.get("sessions") or {}
+    for _a in (_st.get("active_agents") or []):
+        _key = (_h, _a.get("pid"), _a.get("session_id"))
+        if _key not in _seen_keys:
+            _seen_keys.add(_key)
+            _a2 = dict(_a)
+            _a2["_state_host"] = _h
+            _all_agents.append(_a2)
+
+schema   = states[0][0].get("schema", "?")
+host     = "  ".join(short_machine(h) for h in _host_list) if len(_host_list) > 1 else (_host_list[0] if _host_list else "?")
+gen_at   = max((_g for _g, _ in _gen_at_list), default="?")
+warnings = _warnings
+agents   = _all_agents
+stores   = _stores
+sessions = _sessions
+
+agents_with_tiers = [(a, compute_tier(a)) for a in agents]
+visible = [a for a, (tier, _) in agents_with_tiers if SHOW_ALL or tier != "NONE"]
+visible.sort(key=lambda a: (
+    0 if compute_tier(a)[0] == "HIGH" else 1 if compute_tier(a)[0] == "MED" else 2,
+    a.get("pattern", ""),
+    -(a.get("rss_kb") or 0)
+))
+
+tier_counts = {}
+for a, (tier, _) in agents_with_tiers:
+    tier_counts[tier] = tier_counts.get(tier, 0) + 1
+
+hr()
+print(
+    f"  {BOLD}agent-top{RST}  "
+    f"{DIM}host{RST} {host}  "
+    f"{DIM}generated{RST} {gen_at}  "
+    f"{DIM}schema{RST} {schema}"
+)
+hr()
+wc = RED if warnings else DIM
+summary = f"  processes {len(agents)}"
+if tier_counts.get("HIGH"):
+    summary += f"   {GRN}HIGH{RST} {tier_counts.get('HIGH')}"
+if tier_counts.get("MED"):
+    summary += f"   {CYN}MED{RST} {tier_counts.get('MED')}"
+if tier_counts.get("LOW"):
+    summary += f"   {YLW}LOW{RST} {tier_counts.get('LOW')}"
+if SHOW_ALL and tier_counts.get("NONE"):
+    summary += f"   {DIM}NONE{RST} {tier_counts.get('NONE')}"
+summary += f"   {wc}warnings{RST} {len(warnings)}"
+print(summary)
+_now_utc = datetime.datetime.utcnow()
+_state_badges = []
+_stale_msgs = []
+for _st, _sp in states:
+    _h = _st.get("host", "?")
+    _age = state_age_seconds(_st, _now_utc)
+    _badge = freshness_badge(_age)
+    _state_badges.append(f"{short_machine(_h)} {_badge} {age_str(_age)}")
+    if _age is None or _age > 300:
+        _stale_msgs.append(f"{short_machine(_h)} {_badge} {age_str(_age)} ago")
+if _state_badges:
+    print(f"  state: {', '.join(_state_badges)}")
+if _stale_msgs:
+    _rc = "agent-top refresh" if ALL_HOSTS else "agent-top refresh --local"
+    print(f"  {YLW}STATE STALE: {', '.join(_stale_msgs)} — run: {_rc}{RST}")
+print()
+
+if visible:
+    print(BOLD + "ACTIVE AGENTS" + RST)
+    hr()
+    print(DIM + f"  {'TIER':<5} {'MACH':<5} {'AGENT':<9} {'PID':<6} {'SESSION':<12} {'PROV':<9} {'MODEL':<20} {'CTX%':<5} {'QUESTION'}" + RST)
+    for a in visible:
+        tier_label, tier_color = compute_tier(a)
+        pattern  = a.get("pattern") or "?"
+        pid      = str(a.get("pid") or "?")
+        sid      = short_sid(a.get("session_id"))
+        prov     = (a.get("provider") or "—")[:9]
+        model    = short_model(a.get("model"))
+        cpct     = a.get("context_percent")
+        ctx_s    = (("~" if a.get("metadata_stale") else "") + f"{cpct:.0f}%") if cpct is not None else "—"
+        mach     = a.get("_state_host") or (_host_list[0] if _host_list else "?")
+        question = "—"
+        if a.get("session_id") and a.get("session_id") in index:
+            idx_item = index[a.get("session_id")]
+            q        = idx_item.get("openquestion") or ""
+            question = q[:35] if len(q) > 35 else q
+            mach     = idx_item.get("machine") or a.get("_state_host") or mach
+        mach_s = short_machine(mach)
+        print(
+            f"  {tier_color}{tier_label:<5}{RST} "
+            f"{mach_s:<5} "
+            f"{pattern:<9} "
+            f"{pid:<6} "
+            f"{sid:<12} "
+            f"{prov:<9} "
+            f"{model:<20} "
+            f"{ctx_s:<5} "
+            f"{question}"
+        )
+    print()
+
+if stores:
+    print(BOLD + "NATIVE STORES" + RST)
+    hr()
+    print(DIM + f"  {'NAME':<14} {'PRESENT':<10} {'TYPE':<14} {'SESSIONS':>8}  {'NEWEST':<10}" + RST)
+    for name, info in stores.items():
+        present = info.get("present", False)
+        pc     = GRN if present else RED
+        sym    = "present  " if present else "absent   "
+        stype  = (info.get("type") or "—")[:13]
+        scount = str(info.get("session_count") or 0)
+        newest = fmt_date(info.get("newest_mtime"))
+        print(
+            f"  {name:<14} {pc}{sym}{RST}"
+            f"{stype:<14} {scount:>8}  {newest:<10}"
+        )
+    sc = sessions.get("counts") or {}
+    if sc:
+        print(
+            f"  {DIM}index: {sc.get('total','?')} total "
+            f"({sc.get('open',0)} open, "
+            f"{sc.get('closed',0)} closed, "
+            f"{sc.get('abandoned',0)} abandoned){RST}"
+        )
+    print()
+
+if warnings:
+    print(BOLD + RED + "WARNINGS" + RST)
+    hr()
+    for w in warnings:
+        print(f"  {YLW}!{RST} {w}")
+    print()
+PY
+}
+
+run_refresh() {
+  local all_hosts="${1:-false}"
+  local agentd
+  agentd="$(_find_agentd)"
+  mkdir -p "$AGENT_TOP_STATE_DIR"
+  printf 'Refreshing local state...\n'
+  timeout 30 "$agentd" once
+  if [ "$all_hosts" = "true" ]; then
+    printf 'Refreshing X230 state...\n'
+    if timeout 8 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 \
+         'command -v agent-sessiond >/dev/null 2>&1' 2>/dev/null; then
+      local _remote_host
+      _remote_host="$(timeout 8 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 'hostname 2>/dev/null || echo unknown')"
+      local _remote_state_json
+      _remote_state_json="$(timeout 45 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 "sh -c 'agent-sessiond once >/dev/null 2>&1; \
+        cat ~/HelmCortex/ROOTS/DotRoot/agent-session/state.${_remote_host}.json' 2>/dev/null")"
+      if [ -n "$_remote_state_json" ]; then
+        printf '%s' "$_remote_state_json" \
+          > "${AGENT_TOP_STATE_DIR}/state.${_remote_host}.json"
+        printf 'agent-top: fetched X230 state (%s)\n' "${_remote_host}"
+      else
+        printf 'agent-top: X230 offline / timeout; showing cached state if present\n' >&2
+      fi
+    else
+      printf 'agent-top: X230 offline / timeout; showing cached state if present\n' >&2
+    fi
+  fi
+}
+
+run_hosts() {
+  python3 <<PY
+import datetime, json, os, socket
+
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+
+BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"; YLW = "\033[33m"; RED = "\033[31m"; RST = "\033[0m"
+
+def age_str(secs):
+    if secs < 60:    return f"{int(secs)}s"
+    if secs < 3600:  return f"{int(secs//60)}m"
+    if secs < 86400: return f"{int(secs//3600)}h"
+    return f"{int(secs//86400)}d"
+
+def short_machine(host):
+    if not host: return "—"
+    h = str(host); hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if "t430"  in hl: return "T430"
+    if "vultr" in hl: return "Vultr"
+    if "vps"   in hl: return "VPS"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h[:8]
+
+def freshness(secs, host_key, path):
+    if secs is None:
+        return "offline-cache" if path.startswith(STATE_DIR) else "old"
+    if secs < 60:
+        return "fresh"
+    if secs < 300:
+        return "warm"
+    if secs < 3600:
+        return "stale"
+    return "offline-cache" if path.startswith(STATE_DIR) and "x230" in host_key.lower() else "old"
+
+def source_for(path, host_key):
+    local_host = socket.gethostname()
+    if path.startswith(STATE_DIR):
+        if host_key == local_host or short_machine(host_key) == short_machine(local_host):
+            return "local-cache"
+        return "ssh-cache"
+    return "nfs"
+
+# Deduplicate by host_key, prefer highest mtime
+found = {}  # host_key -> (path, mtime)
+for d in [STATE_DIR] + EXTRA_DIRS:
+    if not os.path.isdir(d):
+        continue
+    try:
+        for fn in os.listdir(d):
+            if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                continue
+            host_key = fn[6:-5]
+            path = os.path.join(d, fn)
+            if not os.path.isfile(path):
+                continue
+            mtime = os.path.getmtime(path)
+            if host_key not in found or mtime > found[host_key][1]:
+                found[host_key] = (path, mtime)
+    except OSError:
+        continue
+
+print(BOLD + "AGENT-SESSION HOST STATE FILES" + RST)
+print(DIM + "─" * 78 + RST)
+print(DIM + f"  {'HOST':<8} {'STATE':<13} {'AGE':<6} {'PROCS':>6}  {'GENERATED':<19}  {'SOURCE':<11} PATH" + RST)
+
+now_utc = datetime.datetime.utcnow()
+for host_key, (path, _) in sorted(found.items()):
+    try:
+        with open(path) as f:
+            s = json.load(f)
+        gen_at  = (s.get("generated_at") or "")[:19]
+        n_procs = len(s.get("active_agents") or [])
+        try:
+            gen_dt  = datetime.datetime.fromisoformat(gen_at)
+            age_s   = (now_utc - gen_dt).total_seconds()
+            age_lbl = age_str(age_s)
+        except Exception:
+            age_s, age_lbl = None, "?"
+        state  = freshness(age_s, host_key, path)
+        source = source_for(path, host_key)
+        color  = GRN if state == "fresh" else YLW if state in ("warm", "stale") else RED
+        mshort = short_machine(host_key)
+        print(f"  {color}{mshort:<8}{RST} {state:<13} {age_lbl:<6} {n_procs:>6}  {gen_at:<19}  {source:<11} {path}")
+    except Exception as e:
+        print(f"  {YLW}{host_key:<18}{RST} (error: {e})  {path}")
+
+if not found:
+    print(f"  {YLW}No host state files found.{RST}")
+    print(f"  Run: agent-top refresh --all-hosts")
+print()
+PY
+}
+
+run_watch() {
+  local show_all="${1:-false}"
+  local all_hosts="${2:-false}"
+  local no_refresh="${3:-false}"
+  local agentd local_pid="" remote_pid="" last_local=0 last_remote=0 last_reload=0
+  agentd="$(_find_agentd)"
+  trap 'exit 0' INT TERM
+  export AGENT_TOP_ALL_HOSTS="$all_hosts"
+  mkdir -p "$AGENT_TOP_STATE_DIR"
+
+  _age_label() {
+    local last="${1:-0}" now age
+    now="$(date +%s)"
+    if [ "$last" -le 0 ] 2>/dev/null; then
+      printf 'never'
+      return
+    fi
+    age=$((now - last))
+    if [ "$age" -lt 60 ]; then printf '%ss ago' "$age"
+    elif [ "$age" -lt 3600 ]; then printf '%sm ago' "$((age / 60))"
+    else printf '%sh ago' "$((age / 3600))"
+    fi
+  }
+
+  _poll_refresh_jobs() {
+    if [ -n "$local_pid" ] && ! ps -p "$local_pid" >/dev/null 2>&1; then
+      if wait "$local_pid" 2>/dev/null; then
+        last_local="$(date +%s)"
+      fi
+      local_pid=""
+    fi
+    if [ -n "$remote_pid" ] && ! ps -p "$remote_pid" >/dev/null 2>&1; then
+      if wait "$remote_pid" 2>/dev/null; then
+        last_remote="$(date +%s)"
+      fi
+      remote_pid=""
+    fi
+  }
+
+  _start_local_refresh() {
+    if [ "$no_refresh" = "true" ] || { [ -n "$local_pid" ] && ps -p "$local_pid" >/dev/null 2>&1; }; then
+      return
+    fi
+    ( timeout 30 "$agentd" once >/dev/null 2>&1 || true ) &
+    local_pid="$!"
+  }
+
+  _start_remote_refresh() {
+    if [ "$no_refresh" = "true" ] || [ "$all_hosts" != "true" ] || { [ -n "$remote_pid" ] && ps -p "$remote_pid" >/dev/null 2>&1; }; then
+      return
+    fi
+    (
+      _json="$(timeout 45 ssh -o ConnectTimeout=5 -o BatchMode=yes x230 "sh -c 'agent-sessiond once >/dev/null 2>&1; cat ~/HelmCortex/ROOTS/DotRoot/agent-session/state.\$(hostname).json'" 2>/dev/null || true)"
+      [ -n "$_json" ] || exit 1
+      if [ -n "$_json" ]; then
+        _host="$(printf '%s' "$_json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("host",""))' 2>/dev/null || true)"
+        [ -n "$_host" ] || exit 1
+        if [ -n "$_host" ]; then
+          printf '%s' "$_json" > "${AGENT_TOP_STATE_DIR}/state.${_host}.json"
+        fi
+      fi
+    ) &
+    remote_pid="$!"
+  }
+
+  while true; do
+    now="$(date +%s)"
+    _poll_refresh_jobs
+    if [ "$no_refresh" != "true" ]; then
+      if [ "$last_local" -eq 0 ] || [ $((now - last_local)) -ge "$AGENT_TOP_LOCAL_REFRESH_INTERVAL" ]; then
+        _start_local_refresh
+      fi
+      if [ "$all_hosts" = "true" ] && { [ "$last_remote" -eq 0 ] || [ $((now - last_remote)) -ge "$AGENT_TOP_REMOTE_REFRESH_INTERVAL" ]; }; then
+        _start_remote_refresh
+      fi
+    fi
+    if [ "$last_reload" -eq 0 ] || [ $((now - last_reload)) -ge "$AGENT_TOP_RELOAD_INTERVAL" ]; then
+      clear
+      printf 'refreshed local: %s' "$(_age_label "$last_local")"
+      if [ "$all_hosts" = "true" ]; then
+        printf '   refreshed X230: %s' "$(_age_label "$last_remote")"
+      fi
+      printf '   reload: %ss\n\n' "$AGENT_TOP_RELOAD_INTERVAL"
+      run_once "$show_all" || true
+      last_reload="$now"
+    fi
+    sleep 1
+  done
+}
+
+run_jump() {
+  local target="${1:-}"
+  if [ -z "$target" ]; then
+    echo "Usage: agent-top jump <pid|session_id>" >&2
+    exit 1
+  fi
+  python3 - "$target" <<'PY'
+import json, os, re, shlex, socket, subprocess, sys
+
+TARGET     = sys.argv[1]
+STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+
+RESUME_ARGV = {
+    "claude":   lambda s: ["claude",   "--resume", s],
+    "opencode": lambda s: ["opencode", "-s",       s],
+    "codex":    lambda s: ["codex",    "resume",   s],
+    "hermes":   lambda s: ["hermes",   "--resume", s],
+}
+
+def local_hostname():
+    return socket.gethostname()
+
+def short_machine(host):
+    if not host:
+        return ""
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def build_tmux_pane_script(pane_id, attach=True):
+    pane_q = shlex.quote(str(pane_id))
+    parts = [
+        f"pane={pane_q}",
+        "session=$(tmux display-message -p -t \"$pane\" '#S') || exit 1",
+        "window=$(tmux display-message -p -t \"$pane\" '#I') || exit 1",
+    ]
+    if attach:
+        parts.append(
+            "tmux select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\" \\; "
+            "attach-session -t \"$session\""
+        )
+    else:
+        parts.append(
+            "tmux switch-client -t \"$session\" \\; "
+            "select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\""
+        )
+    return "; ".join(parts)
+
+def build_remote_tmux_attach_cmd(host_alias, pane_id):
+    return ["ssh", "-t", host_alias, build_tmux_pane_script(pane_id, attach=True)]
+
+def ssh_available(alias):
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", alias, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+def load_states():
+    paths = []
+    if ALL_HOSTS:
+        paths = [p for p, _m in discover_state_files([STATE_DIR] + EXTRA_DIRS).values()]
+    elif STATE_FILE and os.path.isfile(STATE_FILE):
+        paths = [STATE_FILE]
+    elif os.path.isfile(os.path.join(STATE_DIR, "state.latest.json")):
+        paths = [os.path.join(STATE_DIR, "state.latest.json")]
+    rows = []
+    for path in paths:
+        try:
+            state = json.loads(open(path).read())
+        except Exception:
+            continue
+        host = state.get("host") or ""
+        for a in state.get("active_agents", []) or []:
+            r = dict(a)
+            r["_state_host"] = host
+            rows.append(r)
+    return rows
+
+def load_index():
+    if not INDEX_FILE or not os.path.isfile(INDEX_FILE):
+        return {}
+    try:
+        payload = json.loads(open(INDEX_FILE).read())
+        sessions = payload.get("sessions", []) if isinstance(payload, dict) else payload
+        return {s.get("id"): s for s in sessions if isinstance(s, dict) and s.get("id")}
+    except Exception:
+        return {}
+
+agents = load_states()
+if not agents:
+    print("agent-top: no state rows found", file=sys.stderr)
+    sys.exit(1)
+
+hit = None
+if re.fullmatch(r'\d+', TARGET):
+    hit = next((a for a in agents if str(a.get("pid")) == TARGET), None)
+else:
+    hit = next((a for a in agents if a.get("session_id") == TARGET), None)
+    if not hit:
+        matches = [a for a in agents if (a.get("session_id") or "").startswith(TARGET)]
+        if len(matches) == 1:
+            hit = matches[0]
+        elif len(matches) > 1:
+            print(f"Ambiguous: {len(matches)} agents match prefix '{TARGET}'", file=sys.stderr)
+            sys.exit(1)
+
+if not hit:
+    print(f"agent-top: no live agent found for '{TARGET}'", file=sys.stderr)
+    sys.exit(1)
+
+idx = load_index().get(hit.get("session_id")) or {}
+for k, v in idx.items():
+    hit.setdefault(k, v)
+
+host = owner_host(hit)
+alias = None if is_local_host(host) else ssh_alias_for_host(host)
+pane_id = hit.get("tmux_pane_id")
+if not pane_id:
+    sid = hit.get("session_id") or ""
+    argv_fn = RESUME_ARGV.get(hit.get("pattern") or "")
+    if alias and sid and argv_fn:
+        remote = shell_join_remote(hit.get("cwd") or idx.get("cwd") or "", argv_fn(sid))
+        print(shlex.join(["ssh", "-t", alias, remote]))
+        sys.exit(0)
+    print(f"agent-top: pid={hit.get('pid')} ({hit.get('pattern')}) has no tmux pane  [confidence={hit.get('link_confidence')}]")
+    sys.exit(1)
+
+if alias:
+    cmd = build_remote_tmux_attach_cmd(alias, pane_id)
+    print(shlex.join(cmd))
+    if not ssh_available(alias):
+        print(f"{short_machine(host)} offline; jump command not run.", file=sys.stderr)
+        sys.exit(1)
+    os.execvp(cmd[0], cmd)
+
+in_tmux = bool(os.environ.get("TMUX"))
+if in_tmux:
+    print(f"Switching to pane {pane_id}  (agent={hit.get('pattern')} pid={hit.get('pid')})")
+    subprocess.run(["sh", "-c", build_tmux_pane_script(pane_id, attach=False)])
+else:
+    cmd = build_tmux_pane_script(pane_id, attach=True)
+    print(f"Attaching to pane {pane_id}  (agent={hit.get('pattern')} pid={hit.get('pid')})")
+    print(f"  {cmd}")
+    os.execvp("sh", ["sh", "-c", cmd])
+PY
+}
+
+run_resume() {
+  local target="${1:-}"
+  if [ -z "$target" ]; then
+    echo "Usage: agent-top resume <session_id>" >&2
+    exit 1
+  fi
+  python3 - "$target" <<'PY'
+import json, os, shlex, socket, subprocess, sys
+from pathlib import Path
+
+TARGET     = sys.argv[1]
+STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+
+def local_hostname():
+    return socket.gethostname()
+
+def short_machine(host):
+    if not host:
+        return ""
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def build_tmux_pane_script(pane_id, attach=True):
+    pane_q = shlex.quote(str(pane_id))
+    parts = [
+        f"pane={pane_q}",
+        "session=$(tmux display-message -p -t \"$pane\" '#S') || exit 1",
+        "window=$(tmux display-message -p -t \"$pane\" '#I') || exit 1",
+    ]
+    if attach:
+        parts.append(
+            "tmux select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\" \\; "
+            "attach-session -t \"$session\""
+        )
+    else:
+        parts.append(
+            "tmux switch-client -t \"$session\" \\; "
+            "select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\""
+        )
+    return "; ".join(parts)
+
+def build_remote_tmux_attach_cmd(host_alias, pane_id):
+    return ["ssh", "-t", host_alias, build_tmux_pane_script(pane_id, attach=True)]
+
+def owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def ssh_available(alias):
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", alias, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+def load_live_rows():
+    paths = []
+    if ALL_HOSTS:
+        paths = [p for p, _m in discover_state_files([STATE_DIR] + EXTRA_DIRS).values()]
+    elif STATE_FILE and os.path.isfile(STATE_FILE):
+        paths = [STATE_FILE]
+    elif os.path.isfile(os.path.join(STATE_DIR, "state.latest.json")):
+        paths = [os.path.join(STATE_DIR, "state.latest.json")]
+    rows = []
+    for path in paths:
+        try:
+            state = json.loads(open(path).read())
+        except Exception:
+            continue
+        host = state.get("host") or ""
+        for a in state.get("active_agents", []) or []:
+            r = dict(a)
+            r["_state_host"] = host
+            rows.append(r)
+    return rows
+
+entry = None
+if INDEX_FILE and os.path.isfile(INDEX_FILE):
+    payload  = json.loads(open(INDEX_FILE).read())
+    sessions = payload.get("sessions", [])
+    entry    = next((s for s in sessions if s.get("id") == TARGET), None)
+    if not entry:
+        matches = [s for s in sessions if (s.get("id") or "").startswith(TARGET)]
+        if len(matches) == 1:
+            entry = matches[0]
+        elif len(matches) > 1:
+            print(f"Ambiguous prefix '{TARGET}' — {len(matches)} matches:", file=sys.stderr)
+            for m in matches[:5]:
+                print(f"  {m.get('id')} [{m.get('agent')}] {m.get('status')}", file=sys.stderr)
+            sys.exit(1)
+
+live_rows = load_live_rows()
+live = next((a for a in live_rows if a.get("session_id") == (entry or {}).get("id", TARGET)), None)
+if not entry and live:
+    entry = {"id": TARGET, "agent": live.get("pattern"), "cwd": live.get("cwd")}
+if entry and live:
+    for k, v in live.items():
+        entry.setdefault(k, v)
+    entry["_state_host"] = live.get("_state_host") or entry.get("_state_host")
+
+if not entry:
+    print(f"agent-top: session not found: {TARGET}", file=sys.stderr)
+    sys.exit(1)
+
+agent = entry.get("agent") or ""
+sid   = entry["id"]
+cwd   = entry.get("cwd") or ""
+
+RESUME = {
+    "claude":   ["claude",   "--resume", sid],
+    "opencode": ["opencode", "-s",       sid],
+    "codex":    ["codex",    "resume",   sid],
+    "hermes":   ["hermes",   "--resume", sid],
+}
+argv = RESUME.get(agent)
+if not argv:
+    print(f"agent-top: no resume command for agent '{agent}'")
+    if entry.get("file"):
+        print(f"  file: {entry['file']}")
+    sys.exit(0)
+
+host = owner_host(entry)
+if not is_local_host(host):
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        print(f"agent-top: no ssh alias for host '{host}'", file=sys.stderr)
+        sys.exit(1)
+    remote = shell_join_remote(cwd, argv)
+    cmd = ["ssh", "-t", alias, remote]
+    print(f"  {shlex.join(cmd)}", flush=True)
+    if not ssh_available(alias):
+        print(f"{short_machine(host)} offline; resume command not run.", file=sys.stderr)
+        sys.exit(1)
+    os.execvp(cmd[0], cmd)
+
+if cwd:
+    print(f"  cd {shlex.quote(cwd)}")
+    os.chdir(cwd)
+print(f"  {shlex.join(argv)}")
+os.execvp(argv[0], argv)
+PY
+}
+
+run_show() {
+  local target="${1:-}"
+  if [ -z "$target" ]; then
+    echo "Usage: agent-top show <session_id|pid>" >&2
+    exit 1
+  fi
+  python3 - "$target" <<'PY'
+import json, os, re, shlex, socket, sys
+from pathlib import Path
+
+TARGET     = sys.argv[1]
+STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+ALL_HOSTS  = os.environ.get("AGENT_TOP_ALL_HOSTS", "false") in ("1", "true")
+
+BOLD = "\033[1m"; DIM = "\033[2m"; GRN = "\033[32m"
+YLW  = "\033[33m"; RST = "\033[0m"
+
+def hr(n=78): print(DIM + "─" * n + RST)
+def row(k, v, c=""): print(f"  {DIM}{k:<20}{RST} {c}{v or '—'}{RST if c else ''}")
+def fmt_tok(n):
+    if n is None: return "—"
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}k"
+    return str(n)
+
+def local_hostname():
+    return socket.gethostname()
+
+def short_machine(host):
+    if not host:
+        return ""
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def build_tmux_pane_script(pane_id, attach=True):
+    pane_q = shlex.quote(str(pane_id))
+    parts = [
+        f"pane={pane_q}",
+        "session=$(tmux display-message -p -t \"$pane\" '#S') || exit 1",
+        "window=$(tmux display-message -p -t \"$pane\" '#I') || exit 1",
+    ]
+    if attach:
+        parts.append(
+            "tmux select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\" \\; "
+            "attach-session -t \"$session\""
+        )
+    else:
+        parts.append(
+            "tmux switch-client -t \"$session\" \\; "
+            "select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\""
+        )
+    return "; ".join(parts)
+
+def build_remote_tmux_attach_cmd(host_alias, pane_id):
+    return ["ssh", "-t", host_alias, build_tmux_pane_script(pane_id, attach=True)]
+
+def owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def display_resume_command(row, agent, sid, cwd):
+    resume = {
+        "claude":   ["claude", "--resume", sid],
+        "opencode": ["opencode", "-s", sid],
+        "codex":    ["codex", "resume", sid],
+        "hermes":   ["hermes", "--resume", sid],
+    }.get(agent)
+    if not resume:
+        return f"(no command for {agent})"
+    host = owner_host(row)
+    if is_local_host(host):
+        return shell_join_remote(cwd, resume)
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return f"(no ssh alias for {host})"
+    return shlex.join(["ssh", "-t", alias, shell_join_remote(cwd, resume)])
+
+def display_jump_command(row):
+    pane = row.get("tmux_pane_id")
+    if not pane:
+        return ""
+    host = owner_host(row)
+    if is_local_host(host):
+        return build_tmux_pane_script(pane, attach=not bool(os.environ.get("TMUX")))
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return f"(no ssh alias for {host})"
+    return shlex.join(build_remote_tmux_attach_cmd(alias, pane))
+
+def discover_state_files(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+def load_live_agents():
+    paths = []
+    if ALL_HOSTS:
+        paths = [p for p, _m in discover_state_files([STATE_DIR] + EXTRA_DIRS).values()]
+    elif STATE_FILE and os.path.isfile(STATE_FILE):
+        paths = [STATE_FILE]
+    elif os.path.isfile(os.path.join(STATE_DIR, "state.latest.json")):
+        paths = [os.path.join(STATE_DIR, "state.latest.json")]
+    rows = []
+    for path in paths:
+        try:
+            state = json.loads(open(path).read())
+        except Exception:
+            continue
+        host = state.get("host") or ""
+        for a in state.get("active_agents", []) or []:
+            r = dict(a)
+            r["_state_host"] = host
+            rows.append(r)
+    return rows
+
+is_pid = bool(re.fullmatch(r'\d+', TARGET))
+
+entry = None
+if INDEX_FILE and os.path.isfile(INDEX_FILE) and not is_pid:
+    payload  = json.loads(open(INDEX_FILE).read())
+    sessions = payload.get("sessions", [])
+    entry    = next((s for s in sessions if s.get("id") == TARGET), None)
+    if not entry:
+        matches = [s for s in sessions if (s.get("id") or "").startswith(TARGET)]
+        if len(matches) == 1:
+            entry = matches[0]
+        elif len(matches) > 1:
+            print(f"Ambiguous: {len(matches)} sessions match '{TARGET}'", file=sys.stderr)
+            for m in matches[:5]:
+                print(f"  {m.get('id')} [{m.get('agent')}]", file=sys.stderr)
+            sys.exit(1)
+
+all_agents = load_live_agents()
+if is_pid:
+    live_agents = [a for a in all_agents if str(a.get("pid")) == TARGET]
+else:
+    sid_target  = entry["id"] if entry else TARGET
+    live_agents = [a for a in all_agents if a.get("session_id") == sid_target]
+
+if not entry and not live_agents:
+    print(f"agent-top: not found: {TARGET}", file=sys.stderr)
+    sys.exit(1)
+
+hr()
+if entry:
+    agent  = entry.get("agent") or "?"
+    sid    = entry.get("id") or TARGET
+    status = entry.get("status") or "unknown"
+    sc     = GRN if status == "open" else YLW if status == "unknown" else DIM
+    print(f"  {BOLD}{sid}{RST}")
+    hr()
+    row("agent",       agent)
+    row("status",      status, sc)
+    _la = next(iter(live_agents), {})
+    row("provider",    f"{_la.get('provider') or '—'}  [{_la.get('provider_source') or 'unknown'}]")
+    row("model",       f"{_la.get('model') or '—'}  [{_la.get('model_source') or 'unknown'}]")
+    row("machine",     entry.get("machine"))
+    row("cwd",         entry.get("cwd"))
+    row("sessiondate", entry.get("sessiondate"))
+    row("signal",      entry.get("signal"))
+    row("openquestion",entry.get("openquestion"))
+    row("source",      entry.get("file"))
+    _live = next(iter(live_agents), {})
+    merged = dict(entry)
+    if _live:
+        merged["_state_host"] = _live.get("_state_host") or merged.get("_state_host")
+    host = owner_host(merged)
+    run_on = "local" if is_local_host(host) else (ssh_alias_for_host(host) or f"unknown:{host}")
+    row("host",        host)
+    row("run_on",      run_on)
+    if _live.get("tmux_pane_id"):
+        row("jump",    display_jump_command(_live))
+    cwd    = entry.get("cwd") or ""
+    row("resume", display_resume_command(merged, agent, sid, cwd))
+else:
+    print(f"  {BOLD}{TARGET}{RST}  {DIM}(not in index){RST}")
+    if live_agents:
+        _live = live_agents[0]
+        host = owner_host(_live)
+        run_on = "local" if is_local_host(host) else (ssh_alias_for_host(host) or f"unknown:{host}")
+        agent = _live.get("pattern") or "?"
+        sid = _live.get("session_id") or TARGET
+        cwd = _live.get("cwd") or ""
+        row("host",        host)
+        row("run_on",      run_on)
+        if _live.get("tmux_pane_id"):
+            row("jump",    display_jump_command(_live))
+        row("resume",      display_resume_command(_live, agent, sid, cwd))
+
+if live_agents:
+    print()
+    print(f"  {BOLD}LIVE{RST}")
+    hr()
+    for a in live_agents:
+        row("pid",        str(a.get("pid") or "?"), BOLD)
+        row("pattern",    a.get("pattern"))
+        row("confidence", a.get("link_confidence"))
+        row("provider",   f"{a.get('provider') or '—'}  [{a.get('provider_source') or 'unknown'}]")
+        row("model",      f"{a.get('model') or '—'}  [{a.get('model_source') or 'unknown'}]")
+        _cpct  = a.get("context_percent")
+        _age   = a.get("metadata_age_s")
+        _stale = a.get("metadata_stale")
+        def _fmt_age(s):
+            if s is None: return "—"
+            if s < 60:    return f"{s}s"
+            if s < 3600:  return f"{s//60}m"
+            if s < 86400: return f"{s//3600}h"
+            return f"{s//86400}d"
+        row("ctx_size",   f"{fmt_tok(a.get('context_size'))}  [{a.get('context_size_source') or 'unknown'}]")
+        row("ctx_window", f"{fmt_tok(a.get('context_window'))}  [{a.get('context_window_source') or 'unknown'}]")
+        row("ctx_pct",    f"{_cpct:.1f}%" if _cpct is not None else "—")
+        row("meta_age",   f"{_fmt_age(_age)}{'  [stale]' if _stale else ''}")
+        row("tmux_pane",  a.get("tmux_pane_id"))
+        row("rss",        f"{a.get('rss_kb') or 0} KB")
+        row("live_cwd",   a.get("cwd"))
+        if len(live_agents) > 1:
+            print()
+else:
+    print()
+    row("live", "not currently running")
+hr()
+PY
+}
+
+run_tui() {
+  local all_hosts="${1:-false}"
+  local no_refresh="${2:-false}"
+  local agentd agent_session
+  agentd="$(_find_agentd)"
+  agent_session="$(_find_agent_session)"
+  python3 - "$agentd" "$agent_session" "$all_hosts" "$no_refresh" <<'PY'
+import curses, datetime, json, os, shlex, signal, socket, subprocess, sys, time
+
+AGENTD         = sys.argv[1] if len(sys.argv) > 1 else "agent-sessiond"
+AGENT_SESSION  = sys.argv[2] if len(sys.argv) > 2 else "agent-session"
+ALL_HOSTS_FLAG = (sys.argv[3] if len(sys.argv) > 3 else "false") == "true"
+NO_REFRESH     = (sys.argv[4] if len(sys.argv) > 4 else "false") == "true"
+STATE_FILE = os.environ.get("AGENT_TOP_STATE", "")
+INDEX_FILE = os.environ.get("AGENT_TOP_INDEX", "")
+STATE_DIR  = os.environ.get("AGENT_TOP_STATE_DIR", os.path.expanduser(
+    "~/HelmCortex/ROOTS/DotRoot/agent-session"))
+EXTRA_DIRS = [d for d in os.environ.get("AGENT_TOP_EXTRA_DIRS", "").split(":") if d]
+RELOAD_INTERVAL = float(os.environ.get("AGENT_TOP_RELOAD_INTERVAL", "2") or "2")
+LOCAL_REFRESH_INTERVAL = float(os.environ.get("AGENT_TOP_LOCAL_REFRESH_INTERVAL", "15") or "15")
+REMOTE_REFRESH_INTERVAL = float(os.environ.get("AGENT_TOP_REMOTE_REFRESH_INTERVAL", "60") or "60")
+
+# Family hints only — not used for display; actual provider/model comes from state JSON.
+PROVIDER_MAP = {
+    "claude": "anthropic", "opencode": "—",         "codex": "openai",
+    "hermes": "anthropic", "auryn":    "anthropic", "auryn-chan": "anthropic",
+    "helmastra": "openai", "antigravity": "google",
+}
+RESUME_ARGV = {
+    "claude":   lambda s: ["claude",   "--resume", s],
+    "opencode": lambda s: ["opencode", "-s",       s],
+    "codex":    lambda s: ["codex",    "resume",   s],
+    "hermes":   lambda s: ["hermes",   "--resume", s],
+}
+SORT_FIELDS = ["tier", "agent", "pid", "rss", "io_write", "status", "title", "ctx", "model", "prov"]
+
+def fmt_kb(kb):
+    n = (kb or 0) * 1024
+    if not n:
+        return "—"
+    for unit, thr in [("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)]:
+        if n >= thr:
+            return f"{n/thr:.0f}{unit}"
+    return f"{n}B"
+
+def fmt_ctx(n):
+    if n is None: return "—"
+    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:     return f"{n/1_000:.1f}k"
+    return str(n)
+
+def short_sid(s):
+    return (s[-12:] if s and len(s) > 12 else s) or "—"
+
+def short_machine(host):
+    if not host:
+        return "—"
+    h = str(host)
+    hl = h.lower()
+    if "t480s" in hl: return "T480s"
+    if "x230"  in hl: return "X230"
+    if "t430"  in hl: return "T430"
+    if "vultr" in hl: return "Vultr"
+    if "vps"   in hl: return "VPS"
+    if h.startswith("ThinkPad-"): return h[9:]
+    return h[:8]
+
+def local_hostname():
+    return socket.gethostname()
+
+def ssh_alias_for_host(host):
+    h = short_machine(host).lower()
+    if h == "x230":
+        return "x230"
+    return None
+
+def is_local_host(host):
+    h = short_machine(host).lower()
+    lh = short_machine(local_hostname()).lower()
+    return not h or h == lh
+
+def row_owner_host(row):
+    return row.get("_state_host") or row.get("machine") or local_hostname()
+
+def shell_join_remote(cwd, argv):
+    cmd = shlex.join(argv)
+    return f"cd {shlex.quote(cwd)} && {cmd}" if cwd else cmd
+
+def build_tmux_pane_script(pane_id, attach=True):
+    pane_q = shlex.quote(str(pane_id))
+    parts = [
+        f"pane={pane_q}",
+        "session=$(tmux display-message -p -t \"$pane\" '#S') || exit 1",
+        "window=$(tmux display-message -p -t \"$pane\" '#I') || exit 1",
+    ]
+    if attach:
+        parts.append(
+            "tmux select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\" \\; "
+            "attach-session -t \"$session\""
+        )
+    else:
+        parts.append(
+            "tmux switch-client -t \"$session\" \\; "
+            "select-window -t \"$session:$window\" \\; "
+            "select-pane -t \"$pane\""
+        )
+    return "; ".join(parts)
+
+def build_remote_tmux_attach_cmd(host_alias, pane_id):
+    return ["ssh", "-t", host_alias, build_tmux_pane_script(pane_id, attach=True)]
+
+def ssh_command_for(host, remote_script):
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return None
+    return ["ssh", "-t", alias, remote_script]
+
+def ssh_available(alias):
+    try:
+        return subprocess.run(
+            ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes", alias, "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8,
+        ).returncode == 0
+    except Exception:
+        return False
+
+def resume_argv_for(agent, sid):
+    fn = RESUME_ARGV.get(agent)
+    return fn(sid) if fn else []
+
+def resume_command_for_row(r):
+    idx = r.get("_idx") or {}
+    agent = r.get("pattern") or ""
+    sid = r.get("session_id") or ""
+    cwd_v = idx.get("cwd") or r.get("cwd") or ""
+    argv = resume_argv_for(agent, sid)
+    if not argv:
+        return "", [], cwd_v, agent, sid
+    host = row_owner_host(r)
+    if is_local_host(host):
+        return shell_join_remote(cwd_v, argv), argv, cwd_v, agent, sid
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return f"(no ssh alias for {host})", [], cwd_v, agent, sid
+    remote = shell_join_remote(cwd_v, argv)
+    cmd = ["ssh", "-t", alias, remote]
+    return shlex.join(cmd), cmd, cwd_v, agent, sid
+
+def jump_command_for_row(r):
+    pane = r.get("tmux_pane_id")
+    if not pane:
+        return "", []
+    host = row_owner_host(r)
+    if is_local_host(host):
+        script = build_tmux_pane_script(pane, attach=not bool(os.environ.get("TMUX")))
+        return script, ["sh", "-c", script]
+    alias = ssh_alias_for_host(host)
+    if not alias:
+        return f"(no ssh alias for {host})", []
+    cmd = build_remote_tmux_attach_cmd(alias, pane)
+    return shlex.join(cmd), cmd
+
+def short_model(m, width=16):
+    if not m:
+        return "—"
+    if len(m) <= width:
+        return m
+    return ".." + m[-(width - 2):]
+
+def cwd_base(path):
+    if not path:
+        return "—"
+    home = os.path.expanduser("~")
+    p = ("~" + path[len(home):]) if path.startswith(home) else path
+    return p.rstrip("/").split("/")[-1] or p
+
+def age_str(secs):
+    if secs is None:
+        return "?"
+    if secs < 60:
+        return f"{int(secs)}s"
+    if secs < 3600:
+        return f"{int(secs // 60)}m"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h"
+    return f"{int(secs // 86400)}d"
+
+def state_age_seconds(state):
+    try:
+        g = (state.get("generated_at") or "")[:19]
+        if not g:
+            return None
+        return max(0, (datetime.datetime.utcnow() - datetime.datetime.fromisoformat(g)).total_seconds())
+    except Exception:
+        return None
+
+def freshness_badge(secs):
+    if secs is None:
+        return "OLD"
+    if secs < 60:
+        return "FRESH"
+    if secs < 300:
+        return "WARM"
+    if secs < 3600:
+        return "STALE"
+    return "OLD"
+
+def tier_of(a):
+    if a.get("session_id") and a.get("tmux_pane_id"):
+        return "HIGH"
+    if a.get("session_id"):
+        return "MED"
+    if a.get("tmux_pane_id"):
+        return "LOW"
+    return "NONE"
+
+def tier_ord(t):
+    return {"HIGH": 0, "MED": 1, "LOW": 2, "NONE": 3}.get(t, 4)
+
+def discover_state_files_tui(dirs):
+    found = {}
+    for d in dirs:
+        if not os.path.isdir(d):
+            continue
+        try:
+            for fn in os.listdir(d):
+                if not fn.startswith("state.") or fn == "state.latest.json" or not fn.endswith(".json"):
+                    continue
+                host_key = fn[6:-5]
+                path = os.path.join(d, fn)
+                if not os.path.isfile(path):
+                    continue
+                mtime = os.path.getmtime(path)
+                if host_key not in found or mtime > found[host_key][1]:
+                    found[host_key] = (path, mtime)
+        except OSError:
+            continue
+    return found
+
+
+def load_all_states_tui(single_file, all_hosts, state_dir, extra_dirs):
+    if not all_hosts:
+        f = single_file or os.path.join(state_dir, "state.latest.json")
+        if not os.path.isfile(f):
+            return []
+        try:
+            return [(json.load(open(f)), f)]
+        except Exception:
+            return []
+    dirs = [state_dir] + extra_dirs
+    found = discover_state_files_tui(dirs)
+    if not found:
+        f = os.path.join(state_dir, "state.latest.json")
+        if os.path.isfile(f):
+            try:
+                return [(json.load(open(f)), f)]
+            except Exception:
+                pass
+        return []
+    results = []
+    for _, (path, _) in sorted(found.items()):
+        try:
+            results.append((json.load(open(path)), path))
+        except Exception:
+            continue
+    return results
+
+
+def load_data(show_closed=False, all_hosts=False):
+    states_loaded = load_all_states_tui(
+        STATE_FILE if not all_hosts else "",
+        all_hosts, STATE_DIR, EXTRA_DIRS)
+    index = {}
+    if INDEX_FILE and os.path.isfile(INDEX_FILE):
+        try:
+            raw = json.loads(open(INDEX_FILE).read())
+            lst = raw.get("sessions", []) if isinstance(raw, dict) else raw
+            index = {s.get("id"): s for s in lst if isinstance(s, dict) and s.get("id")}
+        except Exception:
+            pass
+    rows = []
+    seen_keys = set()
+    for st, _path in states_loaded:
+        state_host = st.get("host") or "?"
+        for a in (st.get("active_agents") or []):
+            key = (state_host, a.get("pid"), a.get("session_id"))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            tier = tier_of(a)
+            idx  = index.get(a.get("session_id")) or {}
+            ist  = idx.get("status") or ""
+            if not show_closed and ist in ("closed", "abandoned"):
+                continue
+            r = dict(a)
+            r["_tier"]       = tier
+            r["_prov"]       = a.get("provider")              or "—"
+            r["_prov_src"]   = a.get("provider_source")       or "unknown"
+            r["_model"]      = a.get("model")                 or "—"
+            r["_model_src"]  = a.get("model_source")          or "unknown"
+            r["_model_conf"] = a.get("model_confidence")      or "none"
+            r["_ctx_size"]   = a.get("context_size")
+            r["_ctx_src"]    = a.get("context_size_source")   or "unknown"
+            r["_ctx_win"]    = a.get("context_window")
+            r["_ctx_win_src"]= a.get("context_window_source") or "unknown"
+            r["_ctx_pct"]    = a.get("context_percent")
+            r["_meta_stale"] = a.get("metadata_stale") or False
+            r["_meta_age"]   = a.get("metadata_age_s")
+            r["_title"]      = idx.get("openquestion") or idx.get("title") or ""
+            r["_ist"]        = ist or "—"
+            r["_state_host"] = state_host
+            r["_mach"]       = idx.get("machine") or state_host
+            r["_mach_short"] = short_machine(r["_mach"])
+            r["_idx"]        = idx
+            rows.append(r)
+    primary = states_loaded[0][0] if states_loaded else {}
+    return states_loaded, primary, rows
+
+def sort_rows(rows, sf):
+    def key(r):
+        if sf == "tier":     return (tier_ord(r["_tier"]), r.get("pattern", ""))
+        if sf == "agent":    return (r.get("pattern", ""), tier_ord(r["_tier"]))
+        if sf == "pid":      return (r.get("pid") or 0,)
+        if sf == "rss":      return (-(r.get("rss_kb") or 0),)
+        if sf == "io_write": return (-(r.get("io_write_bytes") or 0),)
+        if sf == "status":   return (r.get("_ist", ""), r.get("pattern", ""))
+        if sf == "title":    return (r.get("_title", "").lower(),)
+        if sf == "ctx":      return (-(r.get("_ctx_pct") or 0),)
+        if sf == "model":    return (r.get("_model", ""), r.get("pattern", ""))
+        if sf == "prov":     return (r.get("_prov", ""), r.get("pattern", ""))
+        return (0,)
+    return sorted(rows, key=key)
+
+def filter_rows(rows, q):
+    if not q:
+        return rows
+    ql = q.lower()
+    def m(r):
+        return any(ql in (v or "").lower() for v in [
+            r.get("pattern"), str(r.get("pid") or ""),
+            r.get("session_id"), r.get("_title"), r.get("_mach"),
+            r.get("cwd"), r.get("_ist"), r.get("_prov"),
+        ])
+    return [r for r in rows if m(r)]
+
+DEBUG   = os.environ.get("AGENT_TOP_TUI_DEBUG") == "1"
+_dbg_fh = None
+def dbg(msg):
+    global _dbg_fh
+    if not DEBUG:
+        return
+    if _dbg_fh is None:
+        _dbg_fh = open("/tmp/agent-top-tui.log", "a", buffering=1)
+    _dbg_fh.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
+
+class TUI:
+    HELP = [
+        " agent-top  —  interactive operator console",
+        "",
+        " Navigation  (Colemak-NEIO primary / arrow keys also work)",
+        "  i / UpArrow        move selection up",
+        "  e / DownArrow      move selection down",
+        "  PgUp / PgDn        scroll pages",
+        "  Home / End         jump top/bottom",
+        "",
+        " Actions",
+        "  Enter / o          jump to tmux pane",
+        "  Space              show session details",
+        "  r / F5             refresh (agent-sessiond once)",
+        "  R / F6             resume selected session",
+        "  c / F7             close session (marks index as closed)",
+        "  t / F8             polite stop  (SIGTERM)",
+        "",
+        " Display",
+        "  s / F2             cycle sort field",
+        "  / / F3             incremental search  (Esc clears)",
+        "  a / F4             toggle closed/archive visibility",
+        "",
+        " Not yet wired",
+        "  F9                 kill  (SIGKILL)",
+        "",
+        " Quit",
+        "  q / F10            quit",
+        "  ? / F1             this help",
+        "",
+        " Press any key to close",
+    ]
+
+    def __init__(self, scr):
+        self.scr         = scr
+        self.sel         = 0
+        self.offset      = 0
+        self.sort_idx    = 0
+        self.query       = ""
+        self.searching   = False
+        self.show_closed = False
+        self.all_hosts   = ALL_HOSTS_FLAG
+        self.status_msg  = ""
+        self.status_ts   = 0.0
+        self.refresh_procs = {}
+        self.refresh_started = {}
+        self.last_reload = 0.0
+        self.last_local_refresh = 0.0
+        self.last_remote_refresh = 0.0
+        self.refresh_enabled = not NO_REFRESH
+        self.states      = []
+        self.state       = {}
+        self.all_rows    = []
+        self.visible     = []
+        self.reload()
+        scr.keypad(True)
+        curses.noecho()
+        curses.cbreak()
+        try: curses.curs_set(0)
+        except curses.error: pass
+        scr.timeout(500)
+        self._init_colors()
+        if self.refresh_enabled:
+            self._start_refresh("local", force=True)
+            if self.all_hosts:
+                self._start_refresh("remote", force=True)
+
+    def _init_colors(self):
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            bg = -1
+        except Exception:
+            bg = curses.COLOR_BLACK
+        curses.init_pair(1, curses.COLOR_GREEN,  bg)
+        curses.init_pair(2, curses.COLOR_CYAN,   bg)
+        curses.init_pair(3, curses.COLOR_YELLOW, bg)
+        curses.init_pair(7, curses.COLOR_BLACK,  curses.COLOR_WHITE)
+
+    def tier_attr(self, t):
+        return {
+            "HIGH": curses.color_pair(1) | curses.A_BOLD,
+            "MED":  curses.color_pair(2),
+            "LOW":  curses.color_pair(3),
+            "NONE": curses.A_DIM,
+        }.get(t, curses.A_NORMAL)
+
+    def reload(self):
+        self.states, self.state, self.all_rows = load_data(self.show_closed, self.all_hosts)
+        self.refresh_visible()
+
+    def refresh_visible(self):
+        sf = SORT_FIELDS[self.sort_idx]
+        rows = sort_rows(self.all_rows, sf)
+        self.visible = filter_rows(rows, self.query)
+        if self.sel >= len(self.visible):
+            self.sel = max(0, len(self.visible) - 1)
+
+    def set_status(self, msg):
+        self.status_msg = msg
+        self.status_ts  = time.time()
+
+    def _start_refresh(self, kind, force=False):
+        if not self.refresh_enabled and not force:
+            return
+        if kind in self.refresh_procs and self.refresh_procs[kind].poll() is None:
+            return
+        os.makedirs(STATE_DIR, exist_ok=True)
+        if kind == "local":
+            self.set_status("refreshing local...")
+            self.refresh_procs[kind] = subprocess.Popen(
+                [AGENTD, "once"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.refresh_started[kind] = time.time()
+        elif kind == "remote":
+            self.set_status("refreshing X230...")
+            self.refresh_procs[kind] = subprocess.Popen(
+                ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes",
+                 "x230", "sh", "-c",
+                 "agent-sessiond once >/dev/null 2>&1; "
+                 "cat ~/HelmCortex/ROOTS/DotRoot/agent-session/state.$(hostname).json"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.refresh_started[kind] = time.time()
+
+    def _poll_refreshes(self):
+        now = time.time()
+        for kind, proc in list(self.refresh_procs.items()):
+            if proc.poll() is None:
+                limit = 30 if kind == "local" else 45
+                if now - self.refresh_started.get(kind, now) > limit:
+                    proc.terminate()
+                    proc.communicate()
+                    del self.refresh_procs[kind]
+                    self.set_status("X230 offline / timeout" if kind == "remote" else "local refresh timed out")
+                continue
+            out, err = proc.communicate()
+            del self.refresh_procs[kind]
+            if kind == "local":
+                self.last_local_refresh = now
+                self.set_status("refreshed local")
+            else:
+                if proc.returncode == 0 and out:
+                    try:
+                        d = json.loads(out)
+                        rh = d.get("host", "")
+                        if rh:
+                            with open(os.path.join(STATE_DIR, f"state.{rh}.json"), "wb") as fh:
+                                fh.write(out)
+                            self.last_remote_refresh = now
+                            self.set_status("fetched X230 state")
+                        else:
+                            self.set_status("X230 refresh returned no host")
+                    except Exception as e:
+                        self.set_status(f"X230 refresh parse error: {e}")
+                else:
+                    self.set_status("X230 offline / timeout")
+
+    def _background_tick(self):
+        now = time.time()
+        self._poll_refreshes()
+        if now - self.last_reload >= RELOAD_INTERVAL:
+            self.reload()
+            self.last_reload = now
+        if self.refresh_enabled:
+            if now - self.last_local_refresh >= LOCAL_REFRESH_INTERVAL:
+                self._start_refresh("local")
+            if self.all_hosts and now - self.last_remote_refresh >= REMOTE_REFRESH_INTERVAL:
+                self._start_refresh("remote")
+
+    def _end_curses(self):
+        try: curses.nocbreak()
+        except curses.error: pass
+        try: self.scr.keypad(False)
+        except curses.error: pass
+        try: curses.echo()
+        except curses.error: pass
+        try: curses.endwin()
+        except curses.error: pass
+
+    def draw(self):
+        h, w = self.scr.getmaxyx()
+        if h < 5 or w < 40:
+            try:
+                self.scr.addstr(0, 0, "Terminal too small (need 40x5)")
+            except curses.error:
+                pass
+            self.scr.refresh()
+            return
+        self.scr.erase()
+        self._draw_header(0, w)
+        self._draw_col_hdr(1, w)
+        table_h = h - 3
+        if self.sel < self.offset:
+            self.offset = self.sel
+        elif self.sel >= self.offset + table_h:
+            self.offset = self.sel - table_h + 1
+        for i in range(table_h):
+            ri = self.offset + i
+            if ri >= len(self.visible):
+                break
+            self._draw_row(2 + i, w, self.visible[ri], ri == self.sel)
+        self._draw_status(h - 1, w)
+        self.scr.refresh()
+
+    def _col_widths(self, w):
+        fixed = [
+            ("TIER", 5), ("AGENT", 10), ("PID", 7), ("SESSION", 14),
+            ("STATUS", 6), ("MACH", 6), ("PROV", 9), ("MODEL", 16), ("CTX%", 5), ("RSS", 6), ("PS", 3),
+            ("PANE", 10), ("CWD", 12),
+        ]
+        used = 2 + sum(cw for _, cw in fixed) + len(fixed)
+        return fixed + [("TITLE", max(4, w - used - 1))]
+
+    def _draw_header(self, y, w):
+        sch = self.state.get("schema", "?")
+        sf  = SORT_FIELDS[self.sort_idx]
+        cf  = "  +closed" if self.show_closed else ""
+        ah  = "  [all-hosts]" if self.all_hosts else ""
+        stale_parts = []
+        newest_gat  = ""
+        host_shorts = []
+        for st, _p in (self.states if self.states else [(self.state, "")]):
+            _hst = st.get("host", "?")
+            _hs  = short_machine(_hst)
+            if _hs not in host_shorts:
+                host_shorts.append(_hs)
+            _gat = (st.get("generated_at") or "")[:19]
+            if _gat > newest_gat:
+                newest_gat = _gat
+            _age = state_age_seconds(st)
+            stale_parts.append(f"{_hs}:{freshness_badge(_age)}")
+        hosts_str = ",".join(host_shorts) if host_shorts else "?"
+        stale_flag = "  " + ",".join(stale_parts) if stale_parts else ""
+        hdr = (f" agent-top  {hosts_str}  {newest_gat}  schema:{sch}"
+               f"  active:{len(self.all_rows)}  vis:{len(self.visible)}"
+               f"  sort:{sf}{cf}{ah}{stale_flag}")
+        try:
+            self.scr.addstr(y, 0, hdr[:w - 1].ljust(w - 1),
+                            curses.A_REVERSE | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def _draw_col_hdr(self, y, w):
+        cols = self._col_widths(w)
+        line = "  " + " ".join(f"{name:<{cw}}" for name, cw in cols)
+        try:
+            self.scr.addstr(y, 0, line[:w - 1], curses.A_DIM)
+        except curses.error:
+            pass
+
+    def _draw_row(self, y, w, r, sel):
+        tier = r["_tier"]
+        cols = self._col_widths(w)
+        tw   = cols[-1][1]
+        ps   = (r.get("proc_status") or "?")[:3]
+        mach  = (r.get("_mach_short") or "—")[:6]
+        model = short_model(r.get("_model"))
+        cpct  = r.get("_ctx_pct")
+        if cpct is not None:
+            ctx_s = ("~" if r.get("_meta_stale") else "") + f"{cpct:.0f}%"
+        else:
+            ctx_s = "—"
+        fields = [
+            f"{tier:<5}",
+            f"{(r.get('pattern') or '?')[:10]:<10}",
+            f"{str(r.get('pid') or '?'):<7}",
+            f"{short_sid(r.get('session_id')):<14}",
+            f"{r.get('_ist', '—')[:6]:<6}",
+            f"{mach:<6}",
+            f"{r.get('_prov', '—')[:9]:<9}",
+            f"{model:<16}",
+            f"{ctx_s[:5]:<5}",
+            f"{fmt_kb(r.get('rss_kb'))[:6]:<6}",
+            f"{ps:<3}",
+            f"{(r.get('tmux_pane_id') or '—')[:10]:<10}",
+            f"{cwd_base(r.get('cwd'))[:12]:<12}",
+            f"{(r.get('_title') or '')[:tw]:<{tw}}",
+        ]
+        line = "  " + " ".join(fields)
+        try:
+            if sel:
+                self.scr.addstr(y, 0, line[:w - 1], curses.color_pair(7))
+            else:
+                self.scr.addstr(y, 0, line[:w - 1])
+                self.scr.addstr(y, 2, f"{tier:<5}", self.tier_attr(tier))
+        except curses.error:
+            pass
+
+    def _draw_status(self, y, w):
+        if self.searching:
+            bar = f" /{self.query}█  Esc:clear  Enter:done"
+        elif self.status_msg and (time.time() - self.status_ts) < 5:
+            bar = f" {self.status_msg}"
+        else:
+            now = time.time()
+            local_age = age_str(now - self.last_local_refresh) if self.last_local_refresh else "never"
+            remote_age = age_str(now - self.last_remote_refresh) if self.last_remote_refresh else "never"
+            refresh_s = (
+                f" refreshed local:{local_age}"
+                + (f" X230:{remote_age}" if self.all_hosts else "")
+                + f" reload:{int(RELOAD_INTERVAL)}s"
+            )
+            bar = (" ?:help  s:sort  /:search  a:±closed"
+                   "  r:refresh  Enter:jump  Spc:show  R:resume  c:close  t:stop  q:quit"
+                   + refresh_s)
+        try:
+            self.scr.addstr(y, 0, bar[:w - 1].ljust(w - 1), curses.A_REVERSE)
+        except curses.error:
+            pass
+
+    def run(self):
+        while True:
+            self._background_tick()
+            self.draw()
+            key = self.scr.getch()
+            if key == curses.ERR:
+                continue
+            dbg(f"key={key} name={curses.keyname(key)}")
+            if self.searching:
+                self._search_key(key)
+            elif not self._normal_key(key):
+                break
+
+    def _search_key(self, key):
+        if key == 27:
+            self.searching = False
+            self.query = ""
+            self.refresh_visible()
+        elif key in (curses.KEY_BACKSPACE, 127, 8):
+            self.query = self.query[:-1]
+            self.refresh_visible()
+        elif key == ord('\n'):
+            self.searching = False
+        elif 32 <= key < 127:
+            self.query += chr(key)
+            self.refresh_visible()
+
+    def _normal_key(self, key):
+        n  = len(self.visible)
+        h, _ = self.scr.getmaxyx()
+        pg = max(1, h - 3)
+        # Movement — Colemak-NEIO primary; arrow keys always work
+        if key in (ord('q'), curses.KEY_F10):
+            return False
+        elif key in (curses.KEY_UP, ord('i')):
+            self.sel = max(0, self.sel - 1)
+        elif key in (curses.KEY_DOWN, ord('e')):
+            self.sel = min(max(0, n - 1), self.sel + 1)
+        elif key == curses.KEY_PPAGE:
+            self.sel = max(0, self.sel - pg)
+        elif key == curses.KEY_NPAGE:
+            self.sel = min(max(0, n - 1), self.sel + pg)
+        elif key == curses.KEY_HOME:
+            self.sel = 0
+        elif key == curses.KEY_END:
+            self.sel = max(0, n - 1)
+        # Jump / inspect
+        elif key in (curses.KEY_ENTER, ord('\n'), ord('\r'), ord('o')):
+            self._action_jump()
+        elif key == ord(' '):
+            self._action_show()
+        # Help
+        elif key in (curses.KEY_F1, ord('?')):
+            self._overlay(self.HELP, " Help ")
+        # Sort
+        elif key in (curses.KEY_F2, ord('s')):
+            self.sort_idx = (self.sort_idx + 1) % len(SORT_FIELDS)
+            self.refresh_visible()
+            self.set_status(f"Sort: {SORT_FIELDS[self.sort_idx]}")
+        # Search
+        elif key in (curses.KEY_F3, ord('/')):
+            self.searching = True
+        # Toggle closed
+        elif key in (curses.KEY_F4, ord('a')):
+            self.show_closed = not self.show_closed
+            self.reload()
+            self.set_status(f"Closed sessions: {'shown' if self.show_closed else 'hidden'}")
+        # Refresh
+        elif key in (curses.KEY_F5, ord('r')):
+            self._action_refresh()
+        # Resume
+        elif key in (curses.KEY_F6, ord('R')):
+            self._action_resume()
+        # Close
+        elif key in (curses.KEY_F7, ord('c')):
+            self._action_close()
+        # Polite stop (SIGTERM)
+        elif key in (curses.KEY_F8, ord('t')):
+            self._action_stop()
+        elif key == curses.KEY_F9:
+            self.set_status("F9 kill (SIGKILL) not wired yet")
+        elif key == curses.KEY_RESIZE:
+            self.scr.clear()
+            dbg("resize")
+        return True
+
+    def _sel_row(self):
+        if self.visible and 0 <= self.sel < len(self.visible):
+            return self.visible[self.sel]
+        return None
+
+    def _action_jump(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        host = row_owner_host(r)
+        pane = r.get("tmux_pane_id")
+        if not pane:
+            display, _cmd, _cwd, _agent, _sid = resume_command_for_row(r)
+            if display and not is_local_host(host):
+                self.set_status(display)
+            else:
+                self.set_status(
+                    f"No tmux pane  pid={r.get('pid')} [{r.get('pattern')}]"
+                    f"  conf={r.get('link_confidence')}"
+                )
+            return
+        if not is_local_host(host):
+            alias = ssh_alias_for_host(host)
+            if not alias:
+                self.set_status(f"No ssh alias for host '{host}'")
+                return
+            if not ssh_available(alias):
+                self.set_status(f"{short_machine(host)} offline; jump command not run.")
+                return
+            display, cmd = jump_command_for_row(r)
+            self.set_status(display)
+            dbg(f"jump remote: {display}")
+            self._end_curses()
+            print(f"  {display}")
+            try:
+                os.execvp(cmd[0], cmd)
+            except OSError as e:
+                print(f"agent-top: exec failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        if os.environ.get("TMUX"):
+            try:
+                subprocess.run(["sh", "-c", build_tmux_pane_script(pane, attach=False)], check=False)
+                self.set_status(f"Switched to pane {pane}")
+            except Exception as e:
+                self.set_status(f"tmux error: {e}")
+        else:
+            display, cmd = jump_command_for_row(r)
+            self.set_status(display)
+            self._end_curses()
+            print(f"  {display}")
+            try:
+                os.execvp(cmd[0], cmd)
+            except OSError as e:
+                print(f"agent-top: exec failed: {e}", file=sys.stderr)
+                sys.exit(1)
+
+    def _action_show(self):
+        r = self._sel_row()
+        if not r:
+            return
+        _, w  = self.scr.getmaxyx()
+        idx   = r.get("_idx") or {}
+        agent = r.get("pattern") or "?"
+        sid   = r.get("session_id") or "?"
+        cwd_v = idx.get("cwd") or r.get("cwd") or ""
+        resume_s, _cmd, _cwd, _agent, _sid = resume_command_for_row(r)
+        if not resume_s:
+            resume_s = f"(no command for {agent})"
+        jump_s, _jump_cmd = jump_command_for_row(r)
+        host_v = row_owner_host(r)
+        run_on = "local" if is_local_host(host_v) else (ssh_alias_for_host(host_v) or f"unknown:{host_v}")
+        mw = min(74, w - 4)
+        def _fmt_age(s):
+            if s is None: return "—"
+            if s < 60:    return f"{s}s"
+            if s < 3600:  return f"{s//60}m"
+            if s < 86400: return f"{s//3600}h"
+            return f"{s//86400}d"
+        _meta_age    = r.get("_meta_age")
+        _meta_stale  = r.get("_meta_stale")
+        _cpct_raw    = r.get("_ctx_pct")
+        ctx_pct_text = f"{_cpct_raw:.1f}%" if _cpct_raw is not None else "—"
+        lines = [
+            f" {sid}",
+            "",
+            f" agent:    {agent}",
+            f" status:   {r.get('_ist', '—')}",
+            f" host:     {host_v or '—'}",
+            f" run_on:   {run_on}",
+            f" machine:  {r.get('_mach_short') or '—'}  ({r.get('_mach') or '—'})",
+            f" provider: {r.get('_prov', '—')}  [{r.get('_prov_src', 'unknown')}]",
+            f" model:    {r.get('_model') or '—'}  [{r.get('_model_src', 'unknown')}]",
+            f" ctx_size: {fmt_ctx(r.get('_ctx_size'))}  [{r.get('_ctx_src', 'unknown')}]",
+            f" ctx_win:  {fmt_ctx(r.get('_ctx_win'))}  [{r.get('_ctx_win_src', 'unknown')}]",
+            f" ctx_pct:  {ctx_pct_text}",
+            f" meta_age: {_fmt_age(_meta_age)}{'  [stale]' if _meta_stale else ''}",
+            f" cwd:      {cwd_v or '—'}",
+            f" date:     {idx.get('sessiondate') or '—'}",
+            f" signal:   {idx.get('signal') or '—'}",
+            f" question: {(idx.get('openquestion') or '')[:mw - 12]}",
+            "",
+            f" pid:      {r.get('pid') or '—'}",
+            f" proc:     {r.get('proc_status') or '—'}",
+            f" rss:      {fmt_kb(r.get('rss_kb'))}",
+            f" pane:     {r.get('tmux_pane_id') or '—'}",
+            f" live_cwd: {r.get('cwd') or '—'}",
+            "",
+            f" jump:     {(jump_s or '—')[:mw - 12]}",
+            f" resume:   {resume_s[:mw - 12]}",
+            "",
+            " Press any key to close",
+        ]
+        self._overlay(lines, " Session Details ", w_hint=mw)
+
+    def _action_refresh(self):
+        self._start_refresh("local", force=True)
+        if self.all_hosts:
+            self._start_refresh("remote", force=True)
+        self.set_status("refreshing local..." + (" refreshing X230..." if self.all_hosts else ""))
+
+    def _action_close(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        sid = r.get("session_id") or ""
+        if not sid:
+            self.set_status(
+                f"No session_id  pid={r.get('pid')} [{r.get('pattern')}]"
+            )
+            return
+        ist = r.get("_ist") or ""
+        if ist in ("closed", "abandoned"):
+            self.set_status(f"Already {ist}: {short_sid(sid)}")
+            return
+        agent  = r.get("pattern") or "?"
+        title_s = (r.get("_title") or "")[:25]
+        tail   = f" {title_s}" if title_s else ""
+        prompt = f" Close {short_sid(sid)} [{agent}]{tail}? [y/N] "
+        if not self._confirm(prompt):
+            self.set_status("Close cancelled")
+            return
+        dbg(f"close: {agent} sid={sid[:12]}")
+        try:
+            result = subprocess.run(
+                [AGENT_SESSION, "close", sid],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                self.reload()
+                self.set_status(f"Closed: {short_sid(sid)} [{agent}]")
+            else:
+                err = (result.stderr or result.stdout or "unknown error").strip()[:60]
+                self.set_status(f"Close failed: {err}")
+        except subprocess.TimeoutExpired:
+            self.set_status("Close timed out")
+        except Exception as e:
+            self.set_status(f"Close error: {e}")
+
+    def _action_stop(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        pid = r.get("pid")
+        if not pid:
+            self.set_status(f"No PID  [{r.get('pattern')}]")
+            return
+        try:
+            pid_int = int(pid)
+        except (TypeError, ValueError):
+            self.set_status(f"Invalid PID: {pid!r}")
+            return
+        try:
+            os.kill(pid_int, 0)
+        except ProcessLookupError:
+            self.reload()
+            self.set_status(f"PID {pid_int} no longer exists — reloaded")
+            return
+        except PermissionError:
+            pass  # process exists, owned by another uid
+        agent  = r.get("pattern") or "?"
+        sid    = r.get("session_id") or ""
+        label  = short_sid(sid) if sid else (r.get("_title") or "")[:20]
+        tail   = f" {label}" if label else ""
+        prompt = f" Stop PID {pid_int} [{agent}]{tail}? [y/N] "
+        if not self._confirm(prompt):
+            self.set_status("Stop cancelled")
+            return
+        dbg(f"stop: SIGTERM pid={pid_int} agent={agent}")
+        try:
+            os.kill(pid_int, signal.SIGTERM)
+        except ProcessLookupError:
+            self.reload()
+            self.set_status(f"PID {pid_int} already gone — reloaded")
+            return
+        except PermissionError as e:
+            self.set_status(f"SIGTERM denied: {e}")
+            return
+        except Exception as e:
+            self.set_status(f"Stop error: {e}")
+            return
+        self.reload()
+        self.set_status(f"SIGTERM → PID {pid_int} [{agent}]")
+
+    def _action_resume(self):
+        r = self._sel_row()
+        if not r:
+            self.set_status("No row selected")
+            return
+        idx   = r.get("_idx") or {}
+        agent = r.get("pattern") or ""
+        sid   = r.get("session_id") or ""
+        cwd_v = idx.get("cwd") or r.get("cwd") or ""
+        if not sid:
+            self.set_status("No session_id for selected row")
+            return
+        argv = resume_argv_for(agent, sid)
+        if not argv:
+            self.set_status(f"No resume command for agent '{agent}'")
+            return
+        ist = r.get("_ist") or ""
+        if ist in ("closed", "abandoned"):
+            if not self._confirm(f" Session is {ist}. Resume anyway? [y/N] "):
+                self.set_status("Resume cancelled")
+                return
+        host = row_owner_host(r)
+        if not is_local_host(host):
+            alias = ssh_alias_for_host(host)
+            if not alias:
+                self.set_status(f"No ssh alias for host '{host}'")
+                return
+            remote = shell_join_remote(cwd_v, argv)
+            cmd = ["ssh", "-t", alias, remote]
+            display = shlex.join(cmd)
+            self.set_status(display)
+            if not ssh_available(alias):
+                self.set_status(f"{short_machine(host)} offline; resume command not run.")
+                return
+            dbg(f"resume remote: {display}")
+            self._end_curses()
+            print(f"  {display}")
+            try:
+                os.execvp(cmd[0], cmd)
+            except OSError as e:
+                print(f"agent-top: exec failed: {e}", file=sys.stderr)
+                sys.exit(1)
+        dbg(f"resume: exec {agent} sid={sid[:12]} cwd={cwd_v[:30]!r}")
+        self._end_curses()
+        if cwd_v:
+            print(f"  cd {shlex.quote(cwd_v)}")
+            try:
+                os.chdir(cwd_v)
+            except Exception:
+                pass
+        print(f"  {shlex.join(argv)}")
+        try:
+            os.execvp(argv[0], argv)
+        except OSError as e:
+            print(f"agent-top: exec failed: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    def _confirm(self, prompt):
+        h, w = self.scr.getmaxyx()
+        cw  = min(len(prompt) + 6, w - 4)
+        win = curses.newwin(3, cw, (h - 3) // 2, (w - cw) // 2)
+        win.box()
+        try:
+            win.addstr(1, 1, prompt[:cw - 2])
+        except curses.error:
+            pass
+        win.refresh()
+        k = win.getch()
+        return 32 <= k < 127 and chr(k).lower() == 'y'
+
+    def _overlay(self, lines, title="", w_hint=None):
+        h, w = self.scr.getmaxyx()
+        mw = w_hint if w_hint else min(60, w - 4)
+        mh = min(len(lines) + 2, h - 2)
+        win = curses.newwin(mh, mw, (h - mh) // 2, (w - mw) // 2)
+        win.box()
+        if title:
+            tx = max(0, (mw - len(title)) // 2)
+            try:
+                win.addstr(0, tx, title[:mw - 2], curses.A_BOLD)
+            except curses.error:
+                pass
+        for i, line in enumerate(lines):
+            if i + 1 >= mh - 1:
+                break
+            try:
+                win.addstr(i + 1, 1, line[:mw - 2])
+            except curses.error:
+                pass
+        win.refresh()
+        win.getch()
+
+def _main(stdscr):
+    TUI(stdscr).run()
+
+if not ALL_HOSTS_FLAG and (not STATE_FILE or not os.path.isfile(STATE_FILE)):
+    sys.exit(f"agent-top tui: state file not found: {STATE_FILE or '(unset)'}")
+
+# When run via heredoc, fd 0 is a pipe; restore /dev/tty so curses can read keys
+if not os.isatty(0):
+    _fd = os.open('/dev/tty', os.O_RDWR)
+    os.dup2(_fd, 0)
+    os.close(_fd)
+
+curses.wrapper(_main)
+PY
+}
+
+run_keytest() {
+  python3 - <<'PY'
+import curses, os, sys, time
+
+if not os.isatty(0):
+    _fd = os.open('/dev/tty', os.O_RDWR)
+    os.dup2(_fd, 0)
+    os.close(_fd)
+
+def _keytest(scr):
+    scr.keypad(True)
+    curses.noecho()
+    curses.cbreak()
+    try: curses.curs_set(0)
+    except curses.error: pass
+    scr.timeout(10000)
+    term = os.environ.get("TERM", "?")
+    rows = []
+    while True:
+        scr.clear()
+        h, w = scr.getmaxyx()
+        hdr = f" agent-top keytest   TERM={term}   q/F10=quit"
+        try: scr.addstr(0, 0, hdr[:w - 1].ljust(w - 1), curses.A_REVERSE)
+        except curses.error: pass
+        try: scr.addstr(1, 0, f" {'CODE':<8} {'NAME':<24} {'CHAR':<6} {'TIME'}"[:w-1], curses.A_DIM)
+        except curses.error: pass
+        for i, row in enumerate(rows[-(h - 3):]):
+            try: scr.addstr(i + 2, 0, row[:w - 1])
+            except curses.error: pass
+        scr.refresh()
+        key = scr.getch()
+        if key == curses.ERR:
+            continue
+        if key in (ord('q'), curses.KEY_F10):
+            break
+        name = curses.keyname(key).decode(errors='replace')
+        ch   = chr(key) if 32 <= key < 127 else ""
+        rows.append(f"  {key:<8} {name:<24} {ch!r:<6} {time.strftime('%H:%M:%S')}")
+
+curses.wrapper(_keytest)
+PY
+}
+
+cmd="${1:-once}"
+show_all="false"
+
+case "$cmd" in
+  once|"")
+    do_refresh="false"
+    all_hosts="$(mode_default)"
+    for _arg in "${@:2}"; do
+      case "$_arg" in
+        --all)       show_all="true" ;;
+        --refresh|--live) do_refresh="true" ;;
+        --all-hosts) all_hosts="true" ;;
+        --local)     all_hosts="false" ;;
+      esac
+    done
+    if [ "$do_refresh" = "true" ]; then
+      run_refresh "$all_hosts" >/dev/null 2>&1 || true
+    fi
+    export AGENT_TOP_ALL_HOSTS="$all_hosts"
+    run_once "$show_all"
+    ;;
+  json)
+    if [ ! -s "$AGENT_TOP_STATE" ]; then
+      echo "agent-top: state file not found: $AGENT_TOP_STATE" >&2
+      exit 1
+    fi
+    exec cat "$AGENT_TOP_STATE"
+    ;;
+  hosts)
+    run_hosts
+    ;;
+  watch)
+    all_hosts="$(mode_default)"
+    no_refresh="false"
+    for _arg in "${@:2}"; do
+      case "$_arg" in
+        --all)       show_all="true" ;;
+        --all-hosts) all_hosts="true" ;;
+        --local)     all_hosts="false" ;;
+        --no-refresh) no_refresh="true" ;;
+      esac
+    done
+    run_watch "$show_all" "$all_hosts" "$no_refresh"
+    ;;
+  refresh)
+    all_hosts="$(mode_default)"
+    for _arg in "${@:2}"; do
+      case "$_arg" in
+        --all-hosts) all_hosts="true" ;;
+        --local)     all_hosts="false" ;;
+      esac
+    done
+    run_refresh "$all_hosts"
+    ;;
+  jump)
+    export AGENT_TOP_ALL_HOSTS="$(mode_default)"
+    run_jump "${2:-}"
+    ;;
+  resume)
+    export AGENT_TOP_ALL_HOSTS="$(mode_default)"
+    run_resume "${2:-}"
+    ;;
+  show)
+    export AGENT_TOP_ALL_HOSTS="$(mode_default)"
+    run_show "${2:-}"
+    ;;
+  tui|top|interactive)
+    all_hosts="$(mode_default)"
+    no_refresh="false"
+    for _arg in "${@:2}"; do
+      case "$_arg" in
+        --all-hosts) all_hosts="true" ;;
+        --local)     all_hosts="false" ;;
+        --no-refresh) no_refresh="true" ;;
+      esac
+    done
+    run_tui "$all_hosts" "$no_refresh"
+    ;;
+  keytest)
+    run_keytest
+    ;;
+  help|-h|--help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 1
+    ;;
+esac
+#+END_SRC
+

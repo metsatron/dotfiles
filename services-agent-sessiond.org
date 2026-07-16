@@ -1,0 +1,1913 @@
+#+TITLE: Services Loom: Agent Session Daemon
+#+DESCRIPTION: agent-sessiond session telemetry daemon, agent-session CLI, thread-triage extractor
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* Agent Session Daemon
+Phase-2 telemetry foundation for agent sessions.
+
+=mux-session= remains the transport/attach/create launcher. =agent-session=
+is the human-facing CLI after entering or creating a tmux session.
+=agent-sessiond= is the authoritative daemon and writes state under
+=HelmCortex/ROOTS/DotRoot/agent-session/=. LOGS are notes/TODO storage, not a session
+source. The =HelmCortex/ROOTS/AgentRoot/session-index.json= (written by FORGE/bin/agent-session)
+is the cross-agent session truth; agent-sessiond reads it for summary counts only.
+
+** thread-triage
+Phase-0 Thread-Ledger evidence packet extractor. This is a read-only offline
+archaeology lane over normalized =.MASTER= markdown exports; it never writes
+under HelmCortex.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/thread-triage :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: thread-triage [OPTIONS]
+
+Emit Thread-Ledger Phase-0 evidence packets as JSONL on stdout.
+
+Options:
+  --month YYYY-MM      restrict to export paths containing /YYYY-MM/
+  --root PATH          HelmCortex root (default: ~/HelmCortex)
+  --ledger PATH        skip-list ledger path
+                       (default: ~/HelmCortex/ROOTS/AgentRoot/thread-ledger.json)
+  --include-skipped    emit packets even when the ledger says to skip
+  --limit N            stop after N discovered sessions
+  -h, --help           show this help
+EOF
+}
+
+need_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "thread-triage: python3 is required for JSONL emission" >&2
+    exit 1
+  fi
+}
+
+case "${1:-}" in
+  -h|--help|help)
+    usage
+    exit 0
+    ;;
+esac
+
+need_python
+python3 - "$@" <<'PY'
+import argparse
+import hashlib
+import json
+import os
+import pathlib
+import re
+import sys
+from datetime import datetime, timezone
+
+HEAD_SCAN_MAX_BYTES = 65536
+TAIL_SCAN_MAX_BYTES = 65536
+TURN_TRUNCATE_CHARS = 1500
+TERMINAL_SIGNAL_RE = re.compile(r"\b(commit|handoff|exit|done|shipped)\b", re.I)
+TURN_HEADER_RE = re.compile(r"^##(?: \[(\d+)\])? ([^\n]+?)\s*$", re.M)
+MID_LIST_RE = re.compile(r"(^|\n)\s*(?:[-*+]|\d+[.)])\s+\S[^\n]*\s*$")
+
+HARNESS_DIRS = {
+    "Claude": "claude",
+    "Codex": "codex",
+    "OpenCode": "opencode",
+    "Hermes": "hermes",
+    "Antigravity": "antigravity",
+}
+AGENT_LABELS = {
+    "CLAUDE", "CODEX", "OPENCODE", "HERMES", "ANTIGRAVITY", "ASSISTANT",
+    "AGENT", "SYSTEM",
+}
+FRONTMATTER_KEYS = {
+    "provider", "model", "session_id", "date", "source_utc", "end_date",
+    "cwd", "session_cwd", "workspace_path", "git_branch", "branch", "machine", "host",
+}
+
+
+def warn(msg):
+    print(f"thread-triage: WARN: {msg}", file=sys.stderr)
+
+
+def parse_args(argv):
+    ap = argparse.ArgumentParser(add_help=False)
+    ap.add_argument("--month")
+    ap.add_argument("--root", default=str(pathlib.Path.home() / "HelmCortex"))
+    ap.add_argument(
+        "--ledger",
+        default=str(pathlib.Path.home() / "HelmCortex/ROOTS/AgentRoot/thread-ledger.json"),
+    )
+    ap.add_argument("--include-skipped", action="store_true")
+    ap.add_argument("--limit", type=int)
+    ap.add_argument("-h", "--help", action="store_true")
+    ns, rest = ap.parse_known_args(argv)
+    if ns.help:
+        print("thread-triage: internal help dispatch error", file=sys.stderr)
+        sys.exit(0)
+    if rest:
+        warn(f"ignoring unknown arguments: {' '.join(rest)}")
+    if ns.month and not re.fullmatch(r"\d{4}-\d{2}", ns.month):
+        print("thread-triage: --month must be YYYY-MM", file=sys.stderr)
+        sys.exit(2)
+    return ns
+
+
+def read_head_bytes(path, max_bytes=HEAD_SCAN_MAX_BYTES):
+    try:
+        with open(path, "rb") as fh:
+            return fh.read(max_bytes)
+    except Exception as exc:
+        warn(f"{path}: head read failed: {exc}")
+        return b""
+
+
+def read_tail_bytes(path, max_bytes=TAIL_SCAN_MAX_BYTES):
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+        if size > max_bytes:
+            cut = data.find(b"\n")
+            if cut >= 0:
+                data = data[cut + 1:]
+        return data
+    except Exception as exc:
+        warn(f"{path}: tail read failed: {exc}")
+        return b""
+
+
+def decode(data):
+    return data.decode("utf-8", errors="replace")
+
+
+def iso_from_mtime(path):
+    try:
+        return (datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+                .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    except Exception:
+        return None
+
+
+def trunc(text, n=TURN_TRUNCATE_CHARS):
+    if text is None:
+        return None
+    text = re.sub(r"[ \t]+\n", "\n", text).strip()
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def machine_from_path(path):
+    parts = path.parts
+    if ".MASTER" in parts:
+        idx = parts.index(".MASTER")
+        if idx + 1 < len(parts):
+            return parts[idx + 1]
+    return None
+
+
+def harness_from_path(path):
+    parts = path.parts
+    for raw, canonical in HARNESS_DIRS.items():
+        if raw in parts:
+            return canonical
+    return None
+
+
+def parse_frontmatter(head_text, path):
+    warnings = []
+    fm = {}
+    if not head_text.startswith("---\n"):
+        warnings.append("frontmatter missing from bounded head scan")
+        return fm, warnings
+    end = head_text.find("\n---", 4)
+    if end < 0:
+        warnings.append("frontmatter terminator missing from bounded head scan")
+        return fm, warnings
+    body = head_text[4:end]
+    current_key = None
+    for line in body.splitlines():
+        if not line.strip() or line.startswith("  - "):
+            continue
+        if line.startswith((" ", "\t")) and current_key:
+            continue
+        key, sep, val = line.partition(":")
+        if not sep:
+            continue
+        key = key.strip()
+        if key not in FRONTMATTER_KEYS:
+            current_key = key
+            continue
+        val = val.strip()
+        if ((val.startswith('"') and val.endswith('"')) or
+                (val.startswith("'") and val.endswith("'"))):
+            val = val[1:-1]
+        fm[key] = val if val != "" else None
+        current_key = key
+    if "session_id" not in fm:
+        warnings.append("session_id missing from frontmatter")
+    if not (fm.get("cwd") or fm.get("session_cwd") or fm.get("workspace_path")):
+        warnings.append("cwd missing from frontmatter")
+    return fm, warnings
+
+
+def parse_turns(tail_text):
+    raw_matches = list(TURN_HEADER_RE.finditer(tail_text))
+    matches = []
+    for m in raw_matches:
+        probe = tail_text[m.end():].lstrip().splitlines()
+        first = probe[0].strip() if probe else ""
+        if first.startswith("<time ") or re.fullmatch(r"\*[^*]+\*", first):
+            matches.append(m)
+    turns = []
+    for idx, m in enumerate(matches):
+        start = m.end()
+        end = matches[idx + 1].start() if idx + 1 < len(matches) else len(tail_text)
+        label = m.group(2).strip()
+        body = tail_text[start:end].strip()
+        lines = body.splitlines()
+        if lines and (re.fullmatch(r"\*[^*]+\*", lines[0].strip()) or
+                      lines[0].strip().startswith("<time ")):
+            body = "\n".join(lines[1:]).strip()
+        role = "user" if label.upper() in ("USER", "METSATRON", "MÈTSÀTRON") else "agent"
+        turns.append({
+            "n": int(m.group(1) or (len(turns) + 1)),
+            "label": label,
+            "role": role,
+            "text": body,
+        })
+    return turns
+
+
+def abrupt_heuristics(turns, paths_by_cwd, path, date_text):
+    last = turns[-1] if turns else None
+    last_agent = next((t for t in reversed(turns) if t["role"] == "agent"), None)
+    last_agent_text = last_agent["text"].rstrip() if last_agent else ""
+    ends_mid_tool = False
+    if last_agent_text:
+        ends_mid_tool = (
+            last_agent_text.endswith(("**Bash**", "**Tool**", "**Skill**", "```")) or
+            last_agent_text.count("```") % 2 == 1
+        )
+    ends_mid_list = bool(last_agent_text and MID_LIST_RE.search(last_agent_text))
+    successor = None
+    cwd_key = str(path.parent)
+    siblings = paths_by_cwd.get(cwd_key, [])
+    try:
+        mtime = path.stat().st_mtime
+        for other in siblings:
+            if other == path:
+                continue
+            omt = other.stat().st_mtime
+            if 0 < omt - mtime <= 48 * 3600:
+                successor = str(other)
+                break
+    except Exception:
+        pass
+    return {
+        "last_turn_role": last["role"] if last else None,
+        "last_turn_is_agent": bool(last and last["role"] == "agent"),
+        "last_agent_ends_mid_tool_call": ends_mid_tool,
+        "last_agent_ends_mid_list": ends_mid_list,
+        "successor_same_cwd_within_48h": bool(successor),
+        "successor_path": successor,
+        "source_date": date_text,
+    }
+
+
+def bounded_hash(path, head_bytes, tail_bytes):
+    h = hashlib.sha256()
+    try:
+        size = path.stat().st_size
+    except Exception:
+        size = None
+    h.update(b"thread-triage.bounded.v1\0")
+    h.update(str(size).encode())
+    h.update(b"\0")
+    h.update(head_bytes)
+    h.update(b"\0")
+    h.update(tail_bytes)
+    return h.hexdigest()
+
+
+def ledger_skip_keys(path):
+    keys = set()
+    if not path.exists():
+        return keys
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        warn(f"ledger read failed; treating as empty skip-list: {exc}")
+        return keys
+    entries = payload.get("sessions") if isinstance(payload, dict) else payload
+    if not isinstance(entries, list):
+        warn("ledger has no list/sessions array; treating as empty skip-list")
+        return keys
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        verdict = item.get("verdict") or item.get("status") or item.get("human_verdict")
+        if not verdict or verdict == "unknown":
+            continue
+        h = item.get("hash") or item.get("source_hash") or item.get("bounded_hash")
+        mt = item.get("mtime") or item.get("source_mtime")
+        if h and mt:
+            keys.add((str(h), str(mt)))
+    return keys
+
+
+def discover(root, month):
+    logs = root / "LOGS"
+    for raw in HARNESS_DIRS:
+        base = logs / raw
+        if not base.exists():
+            warn(f"missing export corpus: {base}")
+            continue
+        for path in base.rglob("*.md"):
+            s = path.as_posix()
+            if "/.MASTER/" not in s:
+                continue
+            if "/.CHUNKED/" in s or "/.ROLLED/" in s:
+                continue
+            if month and f"/{month}/" not in s:
+                continue
+            yield path
+
+
+def packet_for(path, paths_by_cwd, skip_keys):
+    warnings = []
+    head_bytes = read_head_bytes(path)
+    tail_bytes = read_tail_bytes(path)
+    head_text = decode(head_bytes)
+    tail_text = decode(tail_bytes)
+    fm, fm_warnings = parse_frontmatter(head_text, path)
+    warnings.extend(fm_warnings)
+    turns = parse_turns(tail_text)
+    if not turns:
+        warnings.append("no turn headers found in bounded tail scan")
+    users = [t for t in turns if t["role"] == "user"]
+    agents = [t for t in turns if t["role"] == "agent"]
+    last_user = users[-1]["text"] if users else ""
+    stat = None
+    try:
+        stat = path.stat()
+    except Exception as exc:
+        warnings.append(f"stat failed: {exc}")
+    content_hash = bounded_hash(path, head_bytes, tail_bytes)
+    mtime = str(stat.st_mtime) if stat else ""
+    skipped = (content_hash, mtime) in skip_keys
+    machine = fm.get("machine") or fm.get("host") or machine_from_path(path)
+    cwd = fm.get("cwd") or fm.get("session_cwd") or fm.get("workspace_path")
+    git_branch = fm.get("git_branch") or fm.get("branch")
+    packet = {
+        "schema": "thread-triage.packet.v1",
+        "harness": harness_from_path(path),
+        "model": fm.get("model"),
+        "session_id": fm.get("session_id") or path.stem,
+        "date": fm.get("datetime") or fm.get("date") or fm.get("source_utc") or iso_from_mtime(path),
+        "cwd": cwd,
+        "machine": machine,
+        "git_branch": git_branch,
+        "source_path": str(path),
+        "source_mtime": mtime or None,
+        "source_size_bytes": stat.st_size if stat else None,
+        "source_hash": content_hash,
+        "source_hash_scheme": "sha256(head64k+tail64k+size)",
+        "skip_list": {
+            "ledger_match": skipped,
+            "matched_by": "source_hash+source_mtime" if skipped else None,
+        },
+        "last_user_turns": [
+            {"n": t["n"], "label": t["label"], "text": trunc(t["text"])}
+            for t in users[-3:]
+        ],
+        "last_agent_turn": (
+            {"n": agents[-1]["n"], "label": agents[-1]["label"], "text": trunc(agents[-1]["text"])}
+            if agents else None
+        ),
+        "terminal_signal": {
+            "regex": r"\b(commit|handoff|exit|done|shipped)\b",
+            "matched": bool(TERMINAL_SIGNAL_RE.search(last_user or "")),
+            "matches": sorted({m.group(1).lower() for m in TERMINAL_SIGNAL_RE.finditer(last_user or "")}),
+        },
+        "abrupt_end": abrupt_heuristics(turns, paths_by_cwd, path, fm.get("date")),
+        "warnings": warnings,
+    }
+    return packet
+
+
+def main(argv):
+    ns = parse_args(argv)
+    root = pathlib.Path(ns.root).expanduser()
+    ledger = pathlib.Path(ns.ledger).expanduser()
+    skip_keys = ledger_skip_keys(ledger)
+    paths = sorted(discover(root, ns.month))
+    if ns.limit:
+        paths = paths[: max(0, ns.limit)]
+    paths_by_cwd = {}
+    for p in paths:
+        paths_by_cwd.setdefault(str(p.parent), []).append(p)
+    for path in paths:
+        try:
+            packet = packet_for(path, paths_by_cwd, skip_keys)
+            if packet["skip_list"]["ledger_match"] and not ns.include_skipped:
+                continue
+            json.dump(packet, sys.stdout, ensure_ascii=False, sort_keys=True)
+            sys.stdout.write("\n")
+        except Exception as exc:
+            warn(f"{path}: packet extraction failed: {exc}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])
+PY
+#+END_SRC
+
+** agent-sessiond
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-sessiond :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/HelmCortex/ROOTS/DotRoot/agent-session}"
+INTERVAL="${AGENT_SESSIOND_INTERVAL:-10}"
+PROC_PATTERNS=(opencode opencode-telegram claude codex hermes pi-agent sapphire)
+
+usage() {
+  cat <<'EOF'
+Usage: agent-sessiond <once|watch|status|native-sample>
+
+Commands:
+  once    collect one snapshot and write JSON atomically
+  watch   collect repeatedly every AGENT_SESSIOND_INTERVAL seconds, default 10
+  status  print a summary of the latest local state snapshot
+  native-sample <claude|codex> [N] [--json]
+          print the N most-recently-modified native sessions
+          for the given agent (default N=5)
+EOF
+}
+
+need_python() {
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "agent-sessiond: python3 is required for JSON emission" >&2
+    exit 1
+  fi
+}
+
+state_file() {
+  local host
+  host="$(hostname 2>/dev/null || echo unknown)"
+  printf '%s/state.%s.json\n' "$STATE_DIR" "$host"
+}
+
+latest_state_file() {
+  printf '%s/state.latest.json\n' "$STATE_DIR"
+}
+
+collect_once() {
+  need_python
+  mkdir -p "$STATE_DIR"
+
+  local host timestamp workdir outfile latest tmp latest_tmp session_index
+  host="$(hostname 2>/dev/null || echo unknown)"
+  timestamp="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  workdir="$(mktemp -d "${TMPDIR:-/tmp}/agent-sessiond.XXXXXX")"
+  outfile="$STATE_DIR/state.$host.json"
+  latest="$(latest_state_file)"
+  tmp="$outfile.tmp.$$"
+  latest_tmp="$latest.tmp.$$"
+
+  # Resolve session-index path (AGENT_SESSION_INDEX env overrides hostname default)
+  session_index="${AGENT_SESSION_INDEX:-}"
+  if [ -z "$session_index" ]; then
+    case "$host" in
+      ThinkPad-T480s|t480s) session_index="$HOME/mnt/x230/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+      *) session_index="$HOME/HelmCortex/ROOTS/AgentRoot/session-index.json" ;;
+    esac
+  fi
+
+  cleanup_collect() {
+    rm -rf "$workdir" "$tmp" "$latest_tmp"
+  }
+  trap cleanup_collect RETURN
+  trap 'cleanup_collect; exit 0' INT TERM
+
+  printf '%s\n' "$host"          >"$workdir/hostname"
+  printf '%s\n' "$timestamp"     >"$workdir/timestamp"
+  printf '%s\n' "$session_index" >"$workdir/session-index-path"
+
+  if command -v tmux >/dev/null 2>&1; then
+    tmux list-sessions -F '#{session_id}	#{session_name}	#{session_windows}	#{?session_attached,attached,detached}	#{session_created}' >"$workdir/tmux-sessions" 2>/dev/null || true
+    tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_index}	#{pane_id}	#{pane_active}	#{pane_current_path}	#{pane_current_command}	#{pane_pid}' >"$workdir/tmux-panes" 2>/dev/null || true
+  else
+    : >"$workdir/tmux-sessions"
+    : >"$workdir/tmux-panes"
+  fi
+
+  : >"$workdir/processes"
+  for pattern in "${PROC_PATTERNS[@]}"; do
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      pid="${line%%[[:space:]]*}"
+      command="${line#"$pid"}"
+      command="${command#"${command%%[![:space:]]*}"}"
+      case "$pid:$command" in
+        "$$:"*|"$BASHPID:"*|*"/agent-sessiond "*|*" agent-sessiond "*|*"pgrep -af $pattern"*)
+          continue
+          ;;
+      esac
+      printf '%s\t%s\t%s\n' "$pattern" "$pid" "$command" >>"$workdir/processes"
+    done < <(pgrep -af "$pattern" 2>/dev/null || true)
+  done
+
+  if command -v telegram-agent-host >/dev/null 2>&1; then
+    if telegram-agent-host status >"$workdir/telegram.out" 2>"$workdir/telegram.err"; then
+      printf '0\n' >"$workdir/telegram.exit"
+    else
+      printf '%s\n' "$?" >"$workdir/telegram.exit"
+    fi
+    printf '1\n' >"$workdir/telegram.available"
+  else
+    : >"$workdir/telegram.out"
+    printf 'telegram-agent-host not found\n' >"$workdir/telegram.err"
+    printf '127\n' >"$workdir/telegram.exit"
+    printf '0\n'   >"$workdir/telegram.available"
+  fi
+
+  python3 - "$workdir" >"$tmp" <<'PY'
+import json
+import os
+import pathlib
+import re
+import shutil
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+
+root = pathlib.Path(sys.argv[1])
+home = pathlib.Path.home()
+
+warnings = []
+
+try:
+    PAGE_SIZE_KB = os.sysconf("SC_PAGESIZE") // 1024
+except (AttributeError, ValueError, OSError):
+    PAGE_SIZE_KB = 4
+
+
+def read_text(name):
+    return (root / name).read_text(errors="replace")
+
+def read_lines(name):
+    return [ln for ln in read_text(name).splitlines() if ln]
+
+def parse_tsv(lines, fields):
+    rows = []
+    for line in lines:
+        parts = line.split("\t")
+        if len(parts) < len(fields):
+            parts.extend([""] * (len(fields) - len(parts)))
+        rows.append(dict(zip(fields, parts[:len(fields)])))
+    return rows
+
+def iso_from_mtime(mt):
+    return (datetime.fromtimestamp(mt, tz=timezone.utc)
+            .isoformat(timespec="seconds")
+            .replace("+00:00", "Z"))
+
+
+# ── /proc metrics (Linux only; all fields guarded) ────────────────────────────
+def proc_metrics(pid_str):
+    m = {"ppid": None, "pgid": None, "sid": None, "proc_status": None,
+         "cwd": None, "cpu_ticks": None, "rss_kb": None,
+         "io_read_bytes": None, "io_write_bytes": None}
+    try:
+        m["cwd"] = os.readlink(f"/proc/{pid_str}/cwd")
+    except OSError:
+        pass
+    try:
+        raw   = pathlib.Path(f"/proc/{pid_str}/stat").read_text()
+        after = raw[raw.rfind(")") + 2:]
+        f     = after.split()
+        m["proc_status"] = f[0]
+        m["ppid"]        = int(f[1])
+        m["pgid"]        = int(f[2])
+        m["sid"]         = int(f[3])
+        m["cpu_ticks"]   = int(f[11]) + int(f[12])
+        m["rss_kb"]      = int(f[21]) * PAGE_SIZE_KB
+    except Exception:
+        pass
+    try:
+        for line in pathlib.Path(f"/proc/{pid_str}/io").read_text().splitlines():
+            k, _, v = line.partition(":")
+            k = k.strip()
+            if k == "read_bytes":
+                m["io_read_bytes"] = int(v.strip())
+            elif k == "write_bytes":
+                m["io_write_bytes"] = int(v.strip())
+    except Exception:
+        pass
+    return m
+
+
+# ── session ID extraction from cmdline ────────────────────────────────────────
+_RESUME_RE       = re.compile(r"(?:--resume|-s)[= ]([A-Za-z0-9/_.:@-]{8,})")
+_CODEX_RESUME_RE = re.compile(r"\bresume\s+([A-Za-z0-9/_.:@-]{8,})")
+
+def session_id_from_cmdline(cmdline, agent):
+    m = _RESUME_RE.search(cmdline)
+    if m:
+        return m.group(1), "cmdline_flag"
+    if agent == "codex":
+        m = _CODEX_RESUME_RE.search(cmdline)
+        if m:
+            return m.group(1), "cmdline_subcommand"
+    return None, None
+
+
+# ── session ID probing via pid session file and fd scanning ───────────────────
+_CLAUDE_SESSIONS_DIR  = home / ".claude/sessions"
+_CODEX_SESSION_FD_RE  = re.compile(r"/\.codex/sessions/.+/([^/]+)\.jsonl$")
+_OPENCODE_LOG_FD_RE   = re.compile(r"/\.local/share/opencode/log/[^/]+\.log$")
+_OPENCODE_SESSION_RE  = re.compile(r"/session/(ses_[A-Za-z0-9_-]{10,})")
+
+def _fd_entries(pid_str):
+    """Yield readlink targets for /proc/<pid>/fd, silently skipping permission errors."""
+    try:
+        for entry in pathlib.Path(f"/proc/{pid_str}/fd").iterdir():
+            try:
+                yield os.readlink(str(entry))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def session_id_probe(pid_str, agent):
+    """Try non-cmdline session ID extraction. Returns (sid, source, fd_path, fd_kind)."""
+    # claude-family: read ~/.claude/sessions/<pid>.json written by claude at startup
+    if agent in ("claude", "auryn", "auryn-chan", "helmastra"):
+        session_file = _CLAUDE_SESSIONS_DIR / f"{pid_str}.json"
+        try:
+            data = json.loads(session_file.read_text())
+            sid = data.get("sessionId")
+            if sid:
+                return sid, "session_file", str(session_file), "claude"
+        except Exception:
+            pass
+    # codex: scan /proc/<pid>/fd for open rollout session jsonl
+    if agent == "codex":
+        for target in _fd_entries(pid_str):
+            m = _CODEX_SESSION_FD_RE.search(target)
+            if m:
+                return m.group(1), "fd_probe", target, "codex"
+    # opencode: find open log file, scan tail for most-recent session request path
+    if agent == "opencode":
+        log_candidates = []
+        for target in _fd_entries(pid_str):
+            if _OPENCODE_LOG_FD_RE.search(target):
+                try:
+                    log_candidates.append((os.path.getsize(target), target))
+                except OSError:
+                    pass
+        if log_candidates:
+            _, log_path = max(log_candidates)
+            try:
+                with open(log_path, errors="replace") as fh:
+                    content = fh.read()
+                matches = list(_OPENCODE_SESSION_RE.finditer(content))
+                if matches:
+                    return matches[-1].group(1), "fd_probe", log_path, "opencode"
+            except Exception:
+                pass
+    return None, None, None, None
+
+
+# ── PPID ancestry helpers for tmux linkage ────────────────────────────────────
+def ppid_read(pid_str):
+    """Return parent PID string from /proc/<pid>/stat, or None."""
+    try:
+        raw   = pathlib.Path(f"/proc/{pid_str}/stat").read_text()
+        after = raw[raw.rfind(")") + 2:]
+        return after.split()[1]
+    except Exception:
+        return None
+
+def ppid_chain_walk(pid_str, pane_pid_set, max_depth=32):
+    """Walk parent chain; return (matched_pane_pid_str, chain) or (None, chain)."""
+    chain = []
+    cur   = ppid_read(pid_str)
+    for _ in range(max_depth):
+        if cur is None or cur in ("0", "1"):
+            break
+        chain.append(cur)
+        if cur in pane_pid_set:
+            return cur, chain
+        cur = ppid_read(cur)
+    return None, chain
+
+
+# ── model context window table (static, source always labeled "model_table") ─
+CONTEXT_WINDOW_SIZES = {
+    "claude-opus-4-7":   200000, "claude-opus-4-5":   200000,
+    "claude-sonnet-4-6": 200000, "claude-sonnet-4-5": 200000,
+    "claude-haiku-4-5":  200000,
+}
+
+def _ctx_window(model):
+    if not model:
+        return None
+    if model in CONTEXT_WINDOW_SIZES:
+        return CONTEXT_WINDOW_SIZES[model]
+    for k, v in CONTEXT_WINDOW_SIZES.items():
+        if model.startswith(k):
+            return v
+    return None
+
+_STALE_THRESH_S = 86400  # metadata older than 24h is stale
+
+
+# ── claude model/context probe (read project JSONL) ──────────────────────────
+_CLAUDE_PROJECTS_DIR = home / ".claude/projects"
+
+def _claude_model_probe(pid_str, session_id):
+    """Return model/usage dict from the most recent assistant JSONL entry."""
+    try:
+        sf   = _CLAUDE_SESSIONS_DIR / f"{pid_str}.json"
+        data = json.loads(sf.read_text())
+        cwd  = data.get("cwd") or ""
+        if not cwd:
+            return {}
+        encoded = cwd.replace("/", "-")
+        jf = _CLAUDE_PROJECTS_DIR / encoded / f"{session_id}.jsonl"
+        if not jf.exists():
+            for d in _CLAUDE_PROJECTS_DIR.iterdir():
+                c = d / f"{session_id}.jsonl"
+                if c.exists():
+                    jf = c
+                    break
+            else:
+                return {}
+        with open(jf, "rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            fh.seek(max(0, size - 65536))
+            tail = fh.read().decode(errors="replace")
+        model = None
+        usage = {}
+        for line in tail.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+                msg   = entry.get("message", {})
+                if msg.get("role") == "assistant" and msg.get("model") and msg.get("usage"):
+                    model = msg["model"]
+                    usage = msg["usage"]
+            except Exception:
+                pass
+        if not model:
+            return {}
+        inp = ((usage.get("input_tokens") or 0) +
+               (usage.get("cache_read_input_tokens") or 0) +
+               (usage.get("cache_creation_input_tokens") or 0))
+        win = _ctx_window(model)
+        pct = round(inp / win * 100, 1) if (win and inp) else None
+        mts = jf.stat().st_mtime
+        return {
+            "provider":              "anthropic",
+            "provider_source":       "claude_jsonl",
+            "model":                 model,
+            "model_source":          "claude_jsonl",
+            "model_confidence":      "high",
+            "context_size":          inp or None,
+            "context_size_source":   "claude_jsonl",
+            "context_window":        win,
+            "context_window_source": "model_table" if win else "unknown",
+            "context_percent":       pct,
+            "metadata_ts":           mts,
+        }
+    except Exception:
+        return {}
+
+
+# ── codex model probe (read logs_2.sqlite) ───────────────────────────────────
+# NOTE: logs_2.sqlite can be multi-GB / tens of millions of rows. A per-PID
+# query (WHERE process_uuid LIKE 'pid:<pid>:%') forces SQLite to walk the
+# ts index across the whole table looking for LIKE matches, which can take
+# minutes per PID with several live codex processes. Instead we run ONE
+# bounded query per collection cycle (ts >= now - horizon, LIMIT N), cache
+# the most-recent match per pid in a module-level dict, and turn
+# _codex_model_probe() into a plain dict lookup. The ts lower bound lets
+# the descending index scan terminate at the horizon regardless of how
+# many rows match feedback_log_body LIKE '%model=%'.
+_CODEX_LOG_DB       = home / ".codex/logs_2.sqlite"
+_CODEX_MODEL_RE     = re.compile(r'\bmodel=([A-Za-z0-9._:/-]+)')
+_CODEX_PID_RE       = re.compile(r'^pid:(\d+):')
+_CODEX_PROBE_HORIZON_S = 48 * 3600
+_CODEX_PROBE_LIMIT     = 2000
+_codex_model_by_pid    = None  # populated on first probe of this cycle
+
+def _codex_model_probe_scan():
+    """One bounded pass over logs_2.sqlite, cached per collection cycle.
+
+    Returns {pid_str: extra_dict} built from the most-recent (ts DESC)
+    matching row per pid within the horizon window."""
+    result = {}
+    if not _CODEX_LOG_DB.exists():
+        return result
+    try:
+        conn = sqlite3.connect(f"file:{_CODEX_LOG_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            conn.execute("PRAGMA busy_timeout=2000")
+            horizon = time.time() - _CODEX_PROBE_HORIZON_S
+            rows = conn.execute(
+                "SELECT process_uuid, feedback_log_body, ts FROM logs "
+                "WHERE ts >= ? AND feedback_log_body LIKE '%model=%' "
+                "ORDER BY ts DESC, ts_nanos DESC LIMIT ?",
+                (horizon, _CODEX_PROBE_LIMIT)
+            ).fetchall()
+        finally:
+            conn.close()
+        for (process_uuid, body, ts) in rows:
+            if not body or not process_uuid:
+                continue
+            pm = _CODEX_PID_RE.match(process_uuid)
+            if not pm:
+                continue
+            pid_str = pm.group(1)
+            if pid_str in result:
+                continue  # already have the most-recent (rows are ts DESC)
+            mm = _CODEX_MODEL_RE.search(body)
+            if mm:
+                result[pid_str] = {
+                    "provider":              "openai",
+                    "provider_source":       "codex_log",
+                    "model":                 mm.group(1),
+                    "model_source":          "codex_log",
+                    "model_confidence":      "high",
+                    "context_size":          None,
+                    "context_size_source":   "unknown",
+                    "context_window":        None,
+                    "context_window_source": "unknown",
+                    "context_percent":       None,
+                    "metadata_ts":           float(ts) if ts else None,
+                }
+    except Exception:
+        return {}
+    return result
+
+def _codex_model_probe(pid_str):
+    """Extract most-recent model for this PID from Codex logs_2.sqlite.
+
+    Backed by a single bounded scan per collection cycle (see
+    _codex_model_probe_scan) instead of a per-PID query."""
+    global _codex_model_by_pid
+    if _codex_model_by_pid is None:
+        _codex_model_by_pid = _codex_model_probe_scan()
+    return _codex_model_by_pid.get(str(pid_str), {})
+
+
+# ── capabilities (binary presence) ───────────────────────────────────────────
+CAPABILITY_BINS = [
+    "python3", "pgrep", "tmux", "fzf",
+    "claude", "opencode", "codex", "hermes",
+    "auryn", "auryn-chan", "helmastra", "codex-astra",
+    "gemma-pi", "gemini-pi", "sapphire", "ductor", "pi-agent",
+    "telegram-agent-host", "obsidian",
+]
+capabilities = {k: shutil.which(k) is not None for k in CAPABILITY_BINS}
+
+
+# ── party registry ────────────────────────────────────────────────────────────
+# type=harness  : agent with a native session store and resume command
+# type=consort  : meta-agent / consort that runs inside a harness (no own store)
+# type=infrastructure : supporting service (transport, gateway, bridge)
+PARTY_STATIC = [
+    {"id": "claude",      "type": "harness",
+     "binary": "claude",  "store_path": str(home / ".claude/projects"),
+     "store_type": "jsonl_dir", "resume_cmd": "claude --resume {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "opencode",    "type": "harness",
+     "binary": "opencode", "store_path": str(home / ".local/share/opencode/opencode.db"),
+     "store_type": "sqlite", "resume_cmd": "opencode -s {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "codex",       "type": "harness",
+     "binary": "codex",   "store_path": str(home / ".codex/sessions"),
+     "store_type": "jsonl_dir", "resume_cmd": "codex resume {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "hermes",      "type": "harness",
+     "binary": "hermes",  "store_path": str(home / ".hermes/state.db"),
+     "store_type": "sqlite", "resume_cmd": "hermes --resume {id}",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "antigravity", "type": "harness",
+     "binary": None,      "store_path": str(home / ".gemini/antigravity"),
+     "store_type": "mixed_dir", "resume_cmd": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "auryn",       "type": "consort",
+     "binary": "auryn",   "harness": "claude",
+     "telegram": True, "tmux": True,
+     "memory": "HelmCortex/ROOTS", "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "auryn-chan",   "type": "consort",
+     "binary": "auryn-chan", "harness": "claude",
+     "telegram": True, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "helmastra",   "type": "consort",
+     "binary": "helmastra", "harness": "opencode",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "codex-astra", "type": "consort",
+     "binary": "codex-astra", "harness": "codex",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "gemma",       "type": "consort",
+     "binary": "gemma-pi", "harness": "ollama", "model": "gemma",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "gemini",      "type": "consort",
+     "binary": "gemini-pi", "harness": "gemini", "model": "gemini",
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "ductor",      "type": "consort",
+     "binary": "ductor",  "harness": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "sapphire",    "type": "consort",
+     "binary": "sapphire", "harness": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "pi-agent",    "type": "consort",
+     "binary": "pi-agent", "harness": None,
+     "telegram": False, "tmux": False,
+     "memory": None, "rag": None, "mcp": None, "tts": False, "stt": False},
+    {"id": "telegram-agent-host", "type": "infrastructure",
+     "binary": "telegram-agent-host", "role": "telegram_gateway"},
+    {"id": "opencode-telegram",   "type": "infrastructure",
+     "binary": None, "process_pattern": "opencode-telegram",
+     "role": "telegram_opencode_bridge"},
+    {"id": "tmux",                "type": "infrastructure",
+     "binary": "tmux", "role": "transport"},
+]
+
+party = []
+for entry in PARTY_STATIC:
+    e = dict(entry)
+    b = e.get("binary")
+    e["binary_present"] = (shutil.which(b) is not None) if b else None
+    party.append(e)
+
+
+# ── raw processes + /proc enrichment ─────────────────────────────────────────
+raw_procs = []
+seen = set()
+for row in parse_tsv(read_lines("processes"), ["pattern", "pid", "command"]):
+    key = (row["pattern"], row["pid"], row["command"])
+    if key in seen:
+        continue
+    seen.add(key)
+    raw_procs.append({**row, **proc_metrics(row["pid"])})
+
+
+# ── tmux ──────────────────────────────────────────────────────────────────────
+tmux_sessions = parse_tsv(read_lines("tmux-sessions"),
+    ["id", "name", "windows", "attached", "created"])
+tmux_panes = parse_tsv(read_lines("tmux-panes"),
+    ["session", "window_index", "window_name", "pane_index",
+     "pane_id", "active", "current_path", "current_command", "pid"])
+pane_by_pid  = {p["pid"]: p for p in tmux_panes if p.get("pid")}
+pane_pid_set = set(pane_by_pid.keys())
+
+
+# ── pid_session_links (evidence table) ───────────────────────────────────────
+pid_session_links = []
+for proc in raw_procs:
+    pid   = proc["pid"]
+    agent = proc["pattern"]
+    sid, sid_src = session_id_from_cmdline(proc["command"], agent)
+    fd_session_path = None
+    fd_session_kind = None
+    if sid is None:
+        sid, sid_src, fd_session_path, fd_session_kind = session_id_probe(pid, agent)
+
+    pane             = None
+    tmux_link_source = None
+    tmux_pane_pid    = None
+    ppid_chain_list  = None
+
+    # 1. Direct PID match (agent pid IS the tmux pane_pid)
+    if pid in pane_by_pid:
+        pane             = pane_by_pid[pid]
+        tmux_link_source = "direct_pid"
+        tmux_pane_pid    = pid
+    # 2. SID match: agent inherits session from pane shell (shell pid == SID)
+    elif proc.get("sid") and str(proc["sid"]) in pane_by_pid:
+        pane             = pane_by_pid[str(proc["sid"])]
+        tmux_link_source = "sid_match"
+        tmux_pane_pid    = str(proc["sid"])
+    # 3. PPID ancestry walk: find a pane_pid among ancestors
+    else:
+        ancestor, chain  = ppid_chain_walk(pid, pane_pid_set)
+        ppid_chain_list  = chain if chain else None
+        if ancestor:
+            pane             = pane_by_pid[ancestor]
+            tmux_link_source = "ppid_chain"
+            tmux_pane_pid    = ancestor
+
+    confidence = ("high"   if (sid and pane) else
+                  "medium" if sid else
+                  "low"    if pane else "none")
+    pid_session_links.append({
+        "pid":               pid,
+        "agent":             agent,
+        "cmdline":           proc["command"][:200],
+        "session_id":        sid,
+        "session_id_source": sid_src,
+        "cwd":               proc.get("cwd"),
+        "ppid":              proc.get("ppid"),
+        "fd_session_path":   fd_session_path,
+        "fd_session_kind":   fd_session_kind,
+        "tmux_pane_id":      pane.get("pane_id")         if pane else None,
+        "tmux_session_name": pane.get("session")         if pane else None,
+        "tmux_window_index": pane.get("window_index")    if pane else None,
+        "tmux_window_name":  pane.get("window_name")     if pane else None,
+        "tmux_link_source":  tmux_link_source,
+        "tmux_pane_pid":     tmux_pane_pid,
+        "ppid_chain":        ppid_chain_list,
+        "confidence":        confidence,
+    })
+links_by_pid = {ln["pid"]: ln for ln in pid_session_links}
+
+
+# ── opencode model/provider lookup (read-only DB probe) ───────────────────────
+_oc_db = home / ".local/share/opencode/opencode.db"
+_model_by_sid = {}
+if _oc_db.exists():
+    _oc_sids = [
+        ln["session_id"] for ln in pid_session_links
+        if ln.get("fd_session_kind") == "opencode" and ln.get("session_id")
+    ]
+    if _oc_sids:
+        try:
+            _conn = sqlite3.connect(f"file:{_oc_db}?mode=ro", uri=True)
+            for _sid in _oc_sids:
+                _row = _conn.execute(
+                    "SELECT json_extract(data,'$.providerID'),"
+                    "       json_extract(data,'$.modelID'),"
+                    "       json_extract(data,'$.tokens.input'),"
+                    "       json_extract(data,'$.tokens.cache.read'),"
+                    "       time_created "
+                    "FROM message "
+                    "WHERE session_id=? "
+                    "  AND json_extract(data,'$.providerID') IS NOT NULL "
+                    "ORDER BY time_created DESC LIMIT 1",
+                    (_sid,)
+                ).fetchone()
+                if _row and _row[0]:
+                    _ctx_inp = (_row[2] or 0) + (_row[3] or 0)
+                    _mts = _row[4] / 1000.0 if _row[4] else None
+                    _model_by_sid[_sid] = {
+                        "provider":     _row[0],
+                        "model":        _row[1] or "—",
+                        "context_size": _ctx_inp if _ctx_inp > 0 else None,
+                        "metadata_ts":  _mts,
+                    }
+            _conn.close()
+        except Exception as _exc:
+            warnings.append(f"opencode model probe: {_exc}")
+
+for ln in pid_session_links:
+    _sid   = ln.get("session_id")
+    _agent = ln.get("agent")
+    _kind  = ln.get("fd_session_kind")
+    _pid   = ln.get("pid")
+    _extra = {}
+    if _kind == "opencode" and _sid and _sid in _model_by_sid:
+        _mi  = _model_by_sid[_sid]
+        _ctx = _mi.get("context_size")
+        _extra = {
+            "provider":              _mi["provider"],
+            "provider_source":       "opencode_db",
+            "model":                 _mi["model"],
+            "model_source":          "opencode_db",
+            "model_confidence":      "high",
+            "context_size":          _ctx,
+            "context_size_source":   "opencode_db" if _ctx else "unknown",
+            "context_window":        None,
+            "context_window_source": "unknown",
+            "context_percent":       None,
+            "metadata_ts":           _mi.get("metadata_ts"),
+        }
+    elif _kind == "claude" and _sid and _pid:
+        _extra = _claude_model_probe(_pid, _sid)
+    elif _agent in ("codex", "codex-astra") and _pid:
+        _extra = _codex_model_probe(_pid)
+    ln["provider"]              = _extra.get("provider")
+    ln["provider_source"]       = _extra.get("provider_source")       or "unknown"
+    ln["model"]                 = _extra.get("model")
+    ln["model_source"]          = _extra.get("model_source")          or "unknown"
+    ln["model_confidence"]      = _extra.get("model_confidence")      or "none"
+    ln["context_size"]          = _extra.get("context_size")
+    ln["context_size_source"]   = _extra.get("context_size_source")   or "unknown"
+    ln["context_window"]        = _extra.get("context_window")
+    ln["context_window_source"] = _extra.get("context_window_source") or "unknown"
+    ln["context_percent"]       = _extra.get("context_percent")
+    _mts = _extra.get("metadata_ts")
+    ln["metadata_ts"]           = _mts
+    ln["metadata_age_s"]        = round(time.time() - _mts) if _mts else None
+    ln["metadata_stale"]        = (ln["metadata_age_s"] or 0) > _STALE_THRESH_S
+
+
+# ── active_agents ─────────────────────────────────────────────────────────────
+active_agents = []
+for proc in raw_procs:
+    pid = proc["pid"]
+    lnk = links_by_pid.get(pid, {})
+    active_agents.append({
+        "pattern":           proc["pattern"],
+        "pid":               pid,
+        "ppid":              proc.get("ppid"),
+        "pgid":              proc.get("pgid"),
+        "sid":               proc.get("sid"),
+        "proc_status":       proc.get("proc_status"),
+        "command":           proc["command"],
+        "cwd":               proc.get("cwd"),
+        "cpu_ticks":         proc.get("cpu_ticks"),
+        "rss_kb":            proc.get("rss_kb"),
+        "io_read_bytes":     proc.get("io_read_bytes"),
+        "io_write_bytes":    proc.get("io_write_bytes"),
+        "session_id":        lnk.get("session_id"),
+        "session_id_source": lnk.get("session_id_source"),
+        "fd_session_path":   lnk.get("fd_session_path"),
+        "fd_session_kind":   lnk.get("fd_session_kind"),
+        "tmux_pane_id":      lnk.get("tmux_pane_id"),
+        "tmux_session_name": lnk.get("tmux_session_name"),
+        "tmux_window_name":  lnk.get("tmux_window_name"),
+        "tmux_pane_pid":     lnk.get("tmux_pane_pid"),
+        "tmux_link_source":  lnk.get("tmux_link_source"),
+        "link_confidence":   lnk.get("confidence"),
+        "provider":              lnk.get("provider"),
+        "provider_source":       lnk.get("provider_source"),
+        "model":                 lnk.get("model"),
+        "model_source":          lnk.get("model_source"),
+        "model_confidence":      lnk.get("model_confidence"),
+        "context_size":          lnk.get("context_size"),
+        "context_size_source":   lnk.get("context_size_source"),
+        "context_window":        lnk.get("context_window"),
+        "context_window_source": lnk.get("context_window_source"),
+        "context_percent":       lnk.get("context_percent"),
+        "metadata_ts":           lnk.get("metadata_ts"),
+        "metadata_age_s":        lnk.get("metadata_age_s"),
+        "metadata_stale":        lnk.get("metadata_stale"),
+    })
+
+
+# ── native_stores ─────────────────────────────────────────────────────────────
+native_stores = {}
+
+claude_root = home / ".claude/projects"
+if claude_root.exists():
+    files  = [f for f in claude_root.rglob("*.jsonl") if "/subagents/" not in f.as_posix()]
+    newest = max((f.stat().st_mtime for f in files), default=None)
+    native_stores["claude"] = {
+        "path": str(claude_root), "type": "jsonl_dir", "present": True,
+        "session_count": len(files),
+        "newest_mtime":  iso_from_mtime(newest) if newest else None,
+    }
+else:
+    native_stores["claude"] = {
+        "path": str(claude_root), "type": "jsonl_dir", "present": False,
+        "session_count": 0, "newest_mtime": None,
+    }
+
+opencode_db = home / ".local/share/opencode/opencode.db"
+if opencode_db.exists():
+    try:
+        conn = sqlite3.connect(f"file:{opencode_db}?mode=ro", uri=True)
+        cnt  = conn.execute("select count(*) from session where time_archived is null").fetchone()[0]
+        conn.close()
+        native_stores["opencode"] = {
+            "path": str(opencode_db), "type": "sqlite", "present": True,
+            "session_count": cnt,
+            "newest_mtime":  iso_from_mtime(opencode_db.stat().st_mtime),
+        }
+    except Exception as exc:
+        warnings.append(f"opencode: sqlite probe failed: {exc}")
+        native_stores["opencode"] = {
+            "path": str(opencode_db), "type": "sqlite", "present": True,
+            "session_count": None, "newest_mtime": None,
+        }
+else:
+    native_stores["opencode"] = {
+        "path": str(opencode_db), "type": "sqlite", "present": False,
+        "session_count": 0, "newest_mtime": None,
+    }
+
+# Codex: primary path is sessions/; logs_2.sqlite may be a newer store format
+codex_sessions = home / ".codex/sessions"
+codex_sqlite   = home / ".codex/logs_2.sqlite"
+codex_entry    = {
+    "path": str(codex_sessions), "type": "jsonl_dir",
+    "present": codex_sessions.exists(),
+    "session_count": 0, "newest_mtime": None,
+}
+if codex_sessions.exists():
+    files  = list(codex_sessions.rglob("*.jsonl"))
+    newest = max((f.stat().st_mtime for f in files), default=None)
+    codex_entry["session_count"] = len(files)
+    codex_entry["newest_mtime"]  = iso_from_mtime(newest) if newest else None
+if codex_sqlite.exists():
+    codex_entry["fallback_path"] = str(codex_sqlite)
+    codex_entry["fallback_type"] = "sqlite"
+    if not codex_sessions.exists():
+        warnings.append(
+            f"codex: {codex_sessions} not found; {codex_sqlite} present"
+            " — store format may have changed")
+native_stores["codex"] = codex_entry
+
+# Hermes: canonical store is state.db; legacy fallback is sessions/*.json
+hermes_db       = home / ".hermes/state.db"
+hermes_sessions = home / ".hermes/sessions"
+hermes_entry    = {
+    "path": str(hermes_db), "type": "sqlite",
+    "present": False, "session_count": 0, "newest_mtime": None,
+}
+if hermes_db.exists():
+    try:
+        conn = sqlite3.connect(f"file:{hermes_db}?mode=ro", uri=True)
+        cnt  = conn.execute("select count(*) from sessions where ended_at is null").fetchone()[0]
+        conn.close()
+        hermes_entry.update({
+            "present": True, "session_count": cnt,
+            "newest_mtime": iso_from_mtime(hermes_db.stat().st_mtime),
+        })
+    except Exception as exc:
+        hermes_entry["present"] = True
+        warnings.append(f"hermes: state.db probe failed: {exc}")
+elif hermes_sessions.exists():
+    files = list(hermes_sessions.glob("session_*.json"))
+    hermes_entry.update({
+        "path": str(hermes_sessions), "type": "json_dir",
+        "present": True, "session_count": len(files),
+    })
+    warnings.append("hermes: state.db not found; legacy sessions/ dir present")
+else:
+    warnings.append(
+        "hermes: no native store found"
+        " (checked ~/.hermes/state.db and ~/.hermes/sessions/)")
+native_stores["hermes"] = hermes_entry
+
+# Antigravity: protobuf conversations + plaintext brain entries
+ag_root = home / ".gemini/antigravity"
+if ag_root.exists():
+    conv_dir  = ag_root / "conversations"
+    brain_dir = ag_root / "brain"
+    pb_cnt    = len(list(conv_dir.glob("*.pb"))) if conv_dir.exists() else 0
+    brain_cnt = (sum(1 for p in brain_dir.iterdir() if p.is_dir())
+                 if brain_dir.exists() else 0)
+    native_stores["antigravity"] = {
+        "path": str(ag_root), "type": "mixed_dir", "present": True,
+        "session_count":  max(pb_cnt, brain_cnt),
+        "pb_conversations": pb_cnt, "brain_entries": brain_cnt,
+        "newest_mtime": None,
+    }
+else:
+    native_stores["antigravity"] = {
+        "path": str(ag_root), "type": "mixed_dir", "present": False,
+        "session_count": 0, "newest_mtime": None,
+    }
+
+
+# ── sessions index summary ────────────────────────────────────────────────────
+index_path_str   = read_text("session-index-path").strip()
+sessions_summary = {
+    "index_path":         index_path_str,
+    "index_exists":       False,
+    "index_generated_at": None,
+    "counts": {"open": 0, "closed": 0, "unknown": 0, "abandoned": 0, "total": 0},
+}
+if index_path_str:
+    index_path = pathlib.Path(index_path_str)
+    if index_path.exists():
+        try:
+            payload = json.loads(index_path.read_text(encoding="utf-8"))
+            entries = payload.get("sessions", [])
+            counts  = {"open": 0, "closed": 0, "unknown": 0, "abandoned": 0,
+                       "total": len(entries)}
+            for s in entries:
+                st = s.get("status") or "unknown"
+                if st in counts:
+                    counts[st] += 1
+            newest_ts = max(
+                (s.get("indexedat") or "" for s in entries), default=None,
+            ) or None
+            sessions_summary.update({
+                "index_exists":       True,
+                "index_generated_at": newest_ts,
+                "counts":             counts,
+            })
+        except Exception as exc:
+            warnings.append(f"sessions: index read failed: {exc}")
+    else:
+        warnings.append(f"sessions: index not found at {index_path_str}")
+
+
+# ── telegram ──────────────────────────────────────────────────────────────────
+try:
+    tg_available = read_text("telegram.available").strip() == "1"
+except Exception:
+    tg_available = False
+try:
+    tg_exit = int(read_text("telegram.exit").strip() or "0")
+except Exception:
+    tg_exit = None
+
+telegram = {
+    "host_available": tg_available,
+    "host_exit_code":  tg_exit,
+    "host_stdout":     read_lines("telegram.out"),
+    "host_stderr":     read_lines("telegram.err"),
+}
+
+
+# ── final assembly ────────────────────────────────────────────────────────────
+state = {
+    "schema":            "agent-sessiond.v2",
+    "host":              read_text("hostname").strip(),
+    "generated_at":      read_text("timestamp").strip(),
+    "party":             party,
+    "active_agents":     active_agents,
+    "sessions":          sessions_summary,
+    "native_stores":     native_stores,
+    "pid_session_links": pid_session_links,
+    "telegram":          telegram,
+    "tmux":              {"sessions": tmux_sessions, "panes": tmux_panes},
+    "capabilities":      capabilities,
+    "warnings":          warnings,
+}
+
+json.dump(state, sys.stdout, indent=2, sort_keys=True)
+sys.stdout.write("\n")
+PY
+
+  mv "$tmp" "$outfile"
+  cp "$outfile" "$latest_tmp"
+  mv "$latest_tmp" "$latest"
+  printf 'agent-sessiond: wrote %s and %s\n' "$outfile" "$latest"
+}
+
+print_status() {
+  need_python
+  local file
+  file="$(state_file)"
+  if [ ! -s "$file" ]; then
+    echo "agent-sessiond: no state file found at $file" >&2
+    exit 1
+  fi
+
+  python3 - "$file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    state = json.load(fh)
+
+tmux_sess  = state.get("tmux", {}).get("sessions", [])
+tmux_panes = state.get("tmux", {}).get("panes", [])
+active     = state.get("active_agents", [])
+stores     = state.get("native_stores", {})
+idx        = state.get("sessions", {})
+warns      = state.get("warnings", [])
+
+print(f"agent-sessiond state: {path}")
+print(f"schema : {state.get('schema', '?')}")
+print(f"host   : {state.get('host', '?')}")
+print(f"time   : {state.get('generated_at', '?')}")
+print(f"tmux   : {len(tmux_sess)} sessions  {len(tmux_panes)} panes")
+if tmux_sess:
+    names = ", ".join(s.get("name", "") for s in tmux_sess if s.get("name"))
+    print(f"         {names}")
+
+if active:
+    print(f"live   : {len(active)} process(es)")
+    for a in active:
+        sid   = a.get("session_id") or "?"
+        pane  = a.get("tmux_pane_id") or "no-pane"
+        rss   = a.get("rss_kb")
+        rss_s = f"  rss={rss}KB" if rss else ""
+        conf  = a.get("link_confidence") or "?"
+        src   = a.get("tmux_link_source") or ""
+        src_s = f"/{src}" if src and a.get("tmux_pane_id") else ""
+        print(f"         {a['pattern']}  pid={a['pid']}  sid={sid}"
+              f"  pane={pane}{src_s}{rss_s}  [{conf}]")
+else:
+    print("live   : none")
+
+counts = idx.get("counts", {})
+if any(counts.get(k, 0) for k in ("open", "closed", "unknown", "abandoned")):
+    print(f"index  : {counts.get('open',0)} open  {counts.get('closed',0)} closed"
+          f"  {counts.get('unknown',0)} unknown  {counts.get('abandoned',0)} abandoned")
+    if not idx.get("index_exists"):
+        print("         (index not found — run FORGE/bin/agent-session scan)")
+
+present = sorted(k for k, v in stores.items() if isinstance(v, dict) and v.get("present"))
+absent  = sorted(k for k, v in stores.items() if isinstance(v, dict) and not v.get("present"))
+if present:
+    print(f"stores : present={','.join(present)}")
+if absent:
+    print(f"         absent={','.join(absent)}")
+
+for w in warns:
+    print(f"WARN   : {w}")
+PY
+}
+
+cmd_native_sample() {
+  need_python
+  local agent="" n=5 json_flag=0 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --json) json_flag=1 ;;
+      claude|codex) agent="$arg" ;;
+      ''|*[!0-9]*) ;;
+      *) n="$arg" ;;
+    esac
+  done
+  if [ -z "$agent" ]; then
+    echo "agent-sessiond: native-sample requires an agent: claude|codex" >&2
+    usage >&2
+    exit 2
+  fi
+
+  python3 - "$agent" "$n" "$json_flag" <<'PY'
+import json
+import pathlib
+import re
+import sys
+from datetime import datetime, timezone
+
+agent, n_arg, json_flag = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+try:
+    N = max(1, int(n_arg))
+except ValueError:
+    N = 5
+
+home = pathlib.Path.home()
+warnings_global = []
+
+HEAD_SCAN_MAX_BYTES = 65536      # bounded head read -- never full-file parse
+TAIL_SCAN_MAX_BYTES = 65536      # bounded tail read
+EXACT_COUNT_MAX_BYTES = 300_000  # below this, count lines exactly; above, estimate
+
+
+def iso_from_epoch(ts):
+    try:
+        return (datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                 .isoformat(timespec="seconds").replace("+00:00", "Z"))
+    except Exception:
+        return None
+
+
+def iso_from_mtime(path):
+    try:
+        return iso_from_epoch(path.stat().st_mtime)
+    except Exception:
+        return None
+
+
+def read_head(path, max_bytes=HEAD_SCAN_MAX_BYTES):
+    """Read a bounded prefix; never seeks past max_bytes."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes)
+        return data.decode(errors="replace")
+    except Exception as exc:
+        warnings_global.append(f"{path.name}: head read failed: {exc}")
+        return ""
+
+
+def read_tail(path, max_bytes=TAIL_SCAN_MAX_BYTES):
+    """Read a bounded suffix; drops a possibly-truncated first partial line."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read()
+        text = data.decode(errors="replace")
+        lines = text.split("\n")
+        if size > max_bytes and lines:
+            lines = lines[1:]
+        return lines
+    except Exception as exc:
+        warnings_global.append(f"{path.name}: tail read failed: {exc}")
+        return []
+
+
+def iter_json_lines(lines):
+    """Yield parsed dicts, skipping unparseable or empty lines silently."""
+    for ln in lines:
+        ln = ln.strip()
+        if not ln:
+            continue
+        try:
+            obj = json.loads(ln)
+        except Exception:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def estimate_message_count(path, tail_lines):
+    """Exact line count for small files; tail-density estimate for large ones."""
+    try:
+        size = path.stat().st_size
+    except Exception:
+        return None, "unknown"
+    if size <= EXACT_COUNT_MAX_BYTES:
+        try:
+            with open(path, "rb") as fh:
+                count = sum(1 for _ in fh)
+            return count, "exact"
+        except Exception:
+            return None, "unknown"
+    sample = [l for l in tail_lines if l.strip()]
+    if not sample:
+        return None, "unknown"
+    tail_bytes = sum(len(l.encode(errors="replace")) + 1 for l in sample)
+    if tail_bytes <= 0:
+        return None, "unknown"
+    avg_len = tail_bytes / len(sample)
+    if avg_len <= 0:
+        return None, "unknown"
+    return round(size / avg_len), "estimated_from_tail_sample"
+
+
+def truncate(s, n=140):
+    if not s:
+        return s
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+# -- claude sample -------------------------------------------------------------
+def sample_claude(path):
+    warnings = []
+    session_id = path.stem
+
+    cwd = None
+    title = None
+    git_branch = None
+    for obj in iter_json_lines(read_head(path).splitlines()):
+        if cwd is None and isinstance(obj.get("cwd"), str):
+            cwd = obj["cwd"]
+        if git_branch is None and isinstance(obj.get("gitBranch"), str):
+            git_branch = obj["gitBranch"]
+        if title is None and obj.get("type") == "user":
+            msg = obj.get("message") or {}
+            content = msg.get("content")
+            if isinstance(content, str):
+                title = content
+            elif isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("type") == "text":
+                        title = block.get("text")
+                        break
+        if cwd and title and git_branch:
+            break
+    if cwd is None:
+        warnings.append("no cwd found in bounded head scan")
+    if title is None:
+        warnings.append("no first user message found in bounded head scan")
+
+    tail_lines = read_tail(path)
+    model = None
+    updated_at = None
+    for obj in reversed(list(iter_json_lines(tail_lines))):
+        if updated_at is None and isinstance(obj.get("timestamp"), str):
+            updated_at = obj["timestamp"]
+        if git_branch is None and isinstance(obj.get("gitBranch"), str):
+            git_branch = obj["gitBranch"]
+        if model is None:
+            msg = obj.get("message") or {}
+            if msg.get("role") == "assistant" and msg.get("model") and msg.get("usage"):
+                model = msg["model"]
+        if model and updated_at:
+            break
+    if model is None:
+        warnings.append("no assistant model found in bounded tail scan")
+    if updated_at is None:
+        updated_at = iso_from_mtime(path)
+        warnings.append("no timestamp in tail scan; fell back to file mtime")
+
+    msg_count, msg_count_source = estimate_message_count(path, tail_lines)
+
+    return {
+        "agent": "claude",
+        "session_id": session_id,
+        "cwd": cwd,
+        "model": model,
+        "git_branch": git_branch,
+        "title": truncate(title),
+        "updated_at": updated_at,
+        "message_count": msg_count,
+        "message_count_source": msg_count_source,
+        "resume_cmd": f"claude --resume {session_id}",
+        "source_path": str(path),
+        "size_bytes": path.stat().st_size if path.exists() else None,
+        "warnings": warnings,
+    }
+
+
+# -- codex sample ----------------------------------------------------------------
+_CODEX_ID_FROM_NAME = re.compile(r"([0-9a-f]{8}-[0-9a-f-]{27,})\.jsonl$")
+
+def sample_codex(path):
+    warnings = []
+    session_id = None
+    cwd = None
+    git_branch = None
+    cli_version = None
+
+    head_text = read_head(path)
+    head_lines = head_text.splitlines()
+    if head_lines:
+        try:
+            first = json.loads(head_lines[0])
+            if first.get("type") == "session_meta":
+                payload = first.get("payload") or {}
+                session_id = payload.get("session_id") or payload.get("id")
+                cwd = payload.get("cwd")
+                cli_version = payload.get("cli_version")
+                git_branch = (payload.get("git") or {}).get("branch")
+        except Exception as exc:
+            warnings.append(f"session_meta parse failed: {exc}")
+    if session_id is None:
+        m = _CODEX_ID_FROM_NAME.search(path.name)
+        session_id = m.group(1) if m else path.stem
+        warnings.append("session_id fell back to filename parse")
+    if cwd is None:
+        warnings.append("no cwd found in session_meta head line")
+
+    tail_lines = read_tail(path)
+    model = None
+    title = None
+    updated_at = None
+    for obj in reversed(list(iter_json_lines(tail_lines))):
+        if updated_at is None and isinstance(obj.get("timestamp"), str):
+            updated_at = obj["timestamp"]
+        if model is None and obj.get("type") == "turn_context":
+            payload = obj.get("payload") or {}
+            if isinstance(payload.get("model"), str):
+                model = payload["model"]
+        if title is None and obj.get("type") == "event_msg":
+            payload = obj.get("payload") or {}
+            if payload.get("type") == "task_complete" and payload.get("last_agent_message"):
+                title = payload["last_agent_message"]
+        if model and title and updated_at:
+            break
+    if model is None:
+        warnings.append("no model found in bounded tail scan (turn_context)")
+    if title is None:
+        warnings.append("no task_complete message found in bounded tail scan")
+    if updated_at is None:
+        updated_at = iso_from_mtime(path)
+        warnings.append("no timestamp in tail scan; fell back to file mtime")
+
+    msg_count, msg_count_source = estimate_message_count(path, tail_lines)
+
+    return {
+        "agent": "codex",
+        "session_id": session_id,
+        "cwd": cwd,
+        "model": model,
+        "git_branch": git_branch,
+        "cli_version": cli_version,
+        "title": truncate(title),
+        "updated_at": updated_at,
+        "message_count": msg_count,
+        "message_count_source": msg_count_source,
+        "resume_cmd": f"codex resume {session_id}",
+        "source_path": str(path),
+        "size_bytes": path.stat().st_size if path.exists() else None,
+        "warnings": warnings,
+    }
+
+
+# -- file discovery --------------------------------------------------------------
+def newest_files(root, pattern, n, exclude_substr=None):
+    if not root.exists():
+        return []
+    files = []
+    for f in root.rglob(pattern):
+        if exclude_substr and exclude_substr in f.as_posix():
+            continue
+        try:
+            files.append((f.stat().st_mtime, f))
+        except OSError:
+            continue
+    files.sort(key=lambda t: t[0], reverse=True)
+    return [f for _, f in files[:n]]
+
+
+samples = []
+if agent == "claude":
+    root = home / ".claude/projects"
+    for f in newest_files(root, "*.jsonl", N, exclude_substr="/subagents/"):
+        try:
+            samples.append(sample_claude(f))
+        except Exception as exc:
+            warnings_global.append(f"{f}: sample_claude failed: {exc}")
+elif agent == "codex":
+    root = home / ".codex/sessions"
+    for f in newest_files(root, "*.jsonl", N):
+        try:
+            samples.append(sample_codex(f))
+        except Exception as exc:
+            warnings_global.append(f"{f}: sample_codex failed: {exc}")
+else:
+    print(f"agent-sessiond: unknown agent '{agent}' (expected claude|codex)", file=sys.stderr)
+    sys.exit(2)
+
+if json_flag:
+    out = {
+        "schema": "agent-sessiond.native-sample.v1",
+        "agent": agent,
+        "samples": samples,
+        "warnings": warnings_global,
+    }
+    json.dump(out, sys.stdout, indent=2, sort_keys=True)
+    sys.stdout.write("\n")
+else:
+    print(f"native-sample: {agent}  ({len(samples)} of requested {N})")
+    for s in samples:
+        sid = s["session_id"][:12] if s.get("session_id") else "?"
+        model = s.get("model") or "?"
+        cwd = s.get("cwd") or "?"
+        updated = s.get("updated_at") or "?"
+        title = s.get("title") or ""
+        print(f"  {sid}  {updated}  {model:<16}  {cwd}")
+        if title:
+            print(f"      {title}")
+        print(f"      resume: {s['resume_cmd']}")
+        for w in s.get("warnings", []):
+            print(f"      WARN: {w}")
+    for w in warnings_global:
+        print(f"WARN: {w}")
+PY
+}
+
+cmd="${1:-status}"
+case "$cmd" in
+  once)
+    collect_once
+    ;;
+  watch)
+    while :; do
+      collect_once
+      sleep "$INTERVAL"
+    done
+    ;;
+  status)
+    print_status
+    ;;
+  native-sample)
+    shift
+    cmd_native_sample "$@"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
+#+END_SRC
+
+** agent-session
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-session :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+STATE_DIR="${AGENT_SESSIOND_STATE_DIR:-$HOME/HelmCortex/ROOTS/DotRoot/agent-session}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+
+agent_sessiond_bin() {
+  if command -v agent-sessiond >/dev/null 2>&1; then
+    command -v agent-sessiond
+  elif [ -x "$SCRIPT_DIR/agent-sessiond" ]; then
+    printf '%s/agent-sessiond\n' "$SCRIPT_DIR"
+  else
+    echo "agent-session: agent-sessiond not found in PATH or $SCRIPT_DIR" >&2
+    exit 1
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+Usage: agent-session [scan|list|all|show <id>|close <id>|preview <file> [<id>]]
+
+Commands:
+  (no args)       open the HelmCortex fzf session picker
+  scan/list/all   delegate to HelmCortex agent-session
+  show/close/...  delegate to HelmCortex agent-session
+
+DotCortex state helpers:
+  status          print agent-sessiond status
+  json            print latest local agent-sessiond state JSON
+  state-scan      run agent-sessiond once
+EOF
+}
+
+state_file() {
+  local host
+  host="$(hostname 2>/dev/null || echo unknown)"
+  printf '%s/state.%s.json\n' "$STATE_DIR" "$host"
+}
+
+_find_hc_agent_session() {
+  # HC owns session-index.json and the fzf session picker.
+  local host
+  host="$(hostname 2>/dev/null || echo unknown)"
+  case "$host" in
+    ThinkPad-T480s|t480s) printf '%s\n' "$HOME/mnt/x230/HelmCortex/FORGE/bin/agent-session" ;;
+    *)                    printf '%s\n' "$HOME/HelmCortex/FORGE/bin/agent-session" ;;
+  esac
+}
+
+exec_hc_agent_session() {
+  local hc_bin
+  hc_bin="$(_find_hc_agent_session)"
+  if [ ! -x "$hc_bin" ]; then
+    echo "agent-session: HC agent-session not found: $hc_bin" >&2
+    exit 1
+  fi
+  exec "$hc_bin" "$@"
+}
+
+cmd="${1:-}"
+case "$cmd" in
+  state-scan)
+    exec "$(agent_sessiond_bin)" once
+    ;;
+  status)
+    exec "$(agent_sessiond_bin)" status
+    ;;
+  json)
+    file="$(state_file)"
+    if [ ! -s "$file" ]; then
+      echo "agent-session: no state file found at $file" >&2
+      exit 1
+    fi
+    exec cat "$file"
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  "")
+    exec_hc_agent_session
+    ;;
+  *)
+    exec_hc_agent_session "$@"
+    ;;
+esac
+#+END_SRC
+
+** Makefile Fragment
+#+BEGIN_SRC makefile :tangle all/.mk/sessions.mk :padline no
+# ~/DotCortex/all/.mk/sessions.mk
+.RECIPEPREFIX := |
+.PHONY: sessions-once sessions-watch sessions-status sessions-top sessions-top-all
+
+AGENT_SESSIOND ?= $(firstword $(wildcard $(HOME)/.local/bin/agent-sessiond $(HOME)/DotCortex/all/.local/bin/agent-sessiond))
+AGENT_SESSION ?= $(firstword $(wildcard $(HOME)/.local/bin/agent-session $(HOME)/DotCortex/all/.local/bin/agent-session))
+AGENT_TOP ?= $(firstword $(wildcard $(HOME)/.local/bin/agent-top $(HOME)/DotCortex/all/.local/bin/agent-top))
+
+sessions-once:
+| @chmod +x $(AGENT_SESSIOND) $(AGENT_SESSION) 2>/dev/null || true
+| $(AGENT_SESSIOND) once
+
+sessions-watch:
+| @chmod +x $(AGENT_SESSIOND) $(AGENT_SESSION) 2>/dev/null || true
+| $(AGENT_SESSIOND) watch
+
+sessions-status:
+| @chmod +x $(AGENT_SESSIOND) $(AGENT_SESSION) 2>/dev/null || true
+| $(AGENT_SESSIOND) status
+
+sessions-top:
+| @chmod +x $(AGENT_TOP) 2>/dev/null || true
+| $(AGENT_TOP) once
+
+sessions-top-all:
+| @chmod +x $(AGENT_TOP) 2>/dev/null || true
+| $(AGENT_TOP) once --all
+#+END_SRC
+
