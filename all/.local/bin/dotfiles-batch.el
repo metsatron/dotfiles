@@ -181,6 +181,57 @@ LC/fonts is expected to be set by style.org - this file must not override it."
             (org-babel-tangle))
           (kill-buffer))))))
 
+;; ---- census: does org parse every block the text declares? ------------------
+;; An unbalanced block, or an unescaped column-0 headline inside a block, makes
+;; org-element parse FEWER src blocks than the raw text declares - org-babel
+;; then tangles fewer outputs, silently. The census compares both counts per
+;; file and fails loudly on any divergence. (Sealed 2026-07-16 after two such
+;; drops shipped: claude.mk orphaned for four days, redstone gtk.css dropped.)
+(defun dotfiles--textual-src-count (file)
+  "Count the src blocks FILE's raw text declares, as a reader would.
+A simple state machine: a BEGIN_SRC line opens a src block; BEGIN_EXAMPLE
+and BEGIN_EXPORT open verbatim blocks whose content is not counted; the
+matching END_ closes.  Nested or unbalanced markers are the linter's job."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (let ((case-fold-search t) (count 0) (inblk nil))
+      (while (not (eobp))
+        (cond
+         ((and (not inblk) (looking-at "[ \t]*#\\+begin_src\\b"))
+          (setq count (1+ count) inblk t))
+         ((and (not inblk) (looking-at "[ \t]*#\\+begin_\\(example\\|export\\)\\b"))
+          (setq inblk t))
+         ((looking-at "[ \t]*#\\+end_\\(src\\|example\\|export\\)\\b")
+          (setq inblk nil)))
+        (forward-line 1))
+      count)))
+
+(defun dotfiles-batch-census (root)
+  "Fail loudly if org-element parses fewer src blocks than ROOT/*.org declare."
+  (interactive "DRoot: ")
+  (setq root (file-name-as-directory (expand-file-name root)))
+  (let ((bad '()))
+    (dolist (f (dotfiles-root-org-files root))
+      (let* ((textual (dotfiles--textual-src-count f))
+             (parsed (with-current-buffer (find-file-noselect f)
+                       (org-mode)
+                       (prog1
+                           (length (org-element-map (org-element-parse-buffer)
+                                       'src-block #'identity))
+                         (kill-buffer)))))
+        (if (= textual parsed)
+            (message "census ok   %-34s %3d blocks" (file-name-nondirectory f) parsed)
+          (push (format "%s: text declares %d src blocks, org parses %d - blocks are being DROPPED"
+                        (file-name-nondirectory f) textual parsed)
+                bad))))
+    (if bad
+        (progn
+          (message "== CENSUS FAILURES ==")
+          (dolist (b (nreverse bad)) (message "!! %s" b))
+          (kill-emacs 1))
+      (message "census: every file parses exactly as declared"))))
+
 (provide 'dotfiles-batch)
 ;;; dotfiles-batch.el ends here
 ;; Maak control plane (Scheme, XDG-friendly):2 ends here
