@@ -1,7 +1,7 @@
 ;; room-retropie
 
 ;; RetroPie sanctuary's runtime profile — the gamepad-first EmulationStation room
-;; (=retropie.org=).  Same one-store-many-rooms substrate every other sanctuary
+;; (=sanctuary-retropie.org=).  Same one-store-many-rooms substrate every other sanctuary
 ;; uses: packages come from the shared Guix store, not from a bespoke apt
 ;; rootfs or RetroPie-Setup's own binary/source install path.
 

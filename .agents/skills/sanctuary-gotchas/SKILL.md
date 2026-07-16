@@ -73,7 +73,7 @@ xsetroot -cursor_name left_ptr   # restore cursor if hidden
 
 Xephyr launched without `-no-host-grab` grabs the host keyboard and pointer. If it exits abnormally the grab is never released and an invisible fullscreen `InputOnly` + `Override Redirect` window remains, swallowing all input.
 
-**Prevention**: always pass `-no-host-grab` — all sanctuary launch scripts in `distrobox.org` include it.
+**Prevention**: always pass `-no-host-grab` — all sanctuary launch scripts in `sanctuary-distrobox.org` include it.
 
 **Recovery** (SSH in or switch to a TTY):
 
@@ -138,7 +138,7 @@ if [ -d /run/host/usr/share/terminfo ]; then
 fi
 ```
 
-Confirm with strace: `openat(".../terminfo/x/xterm")` succeeds and `write(1, "\33[1;40H")` cursor-address (CUP) writes reappear before each redraw (0 → many). Terminal-agnostic (any `$TERM` whose entry exists in the tree) and PSReadLine-version-independent (bundled 2.3.6 is fine — no module vendoring needed). On a full VM it self-neutralizes: no `/run/host`, and the VM's own `/usr/share/terminfo` satisfies .NET (just ensure terminfo is installed). Applied in `distrobox.org` → the `redstone-9x-pwsh` wrapper.
+Confirm with strace: `openat(".../terminfo/x/xterm")` succeeds and `write(1, "\33[1;40H")` cursor-address (CUP) writes reappear before each redraw (0 → many). Terminal-agnostic (any `$TERM` whose entry exists in the tree) and PSReadLine-version-independent (bundled 2.3.6 is fine — no module vendoring needed). On a full VM it self-neutralizes: no `/run/host`, and the VM's own `/usr/share/terminfo` satisfies .NET (just ensure terminfo is installed). Applied in `sanctuary-distrobox.org` → the `redstone-9x-pwsh` wrapper.
 
 ## IceWM ignores the XDG icon theme, and DROPS toolbar buttons whose icon it cannot find
 
