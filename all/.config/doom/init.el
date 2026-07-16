@@ -43,7 +43,7 @@
        ;;neotree           ; a project drawer, like NERDTree for vim
        ophints           ; highlight the region an operation acts on
        (popup +defaults)   ; tame sudden yet inevitable temporary windows
-       smooth-scroll     ; So smooth you won't believe it's not butter
+       ;;smooth-scroll     ; disabled: trackpad redisplay locks up Org buffers
        tabs              ; a tab bar for Emacs
        treemacs          ; a project drawer, like neotree but cooler (no +lsp: eglot, not lsp-mode)
        unicode           ; extended unicode support for various languages
