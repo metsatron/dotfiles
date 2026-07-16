@@ -6,7 +6,7 @@
 ;; stack) stay in =core.scm= only.
 
 
-;; [[file:../../../../package-guix.org::*desktop-common][desktop-common:1]]
+;; [[file:../../../../package-guix-habitat.org::*desktop-common][desktop-common:1]]
 ;; Virtual Habitat — desktop-common Guix profile
 ;; Packages shared across all desktop sanctuaries.
 ;; Host-only items (GUIs, package managers, loom tools) remain in core.scm.
