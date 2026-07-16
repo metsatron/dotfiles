@@ -65,6 +65,12 @@
 (package! codex-ide
   :recipe (:host github :repo "dgillis/emacs-codex-ide"))
 
+;; Pi inside Doom — Emacs frontend for the Pi CLI (dnouri/pi-coding-agent). Runs
+;; `pi --mode rpc' as a subprocess and renders a chat buffer (tree-sitter Markdown)
+;; plus a separate prompt buffer, instead of wrapping the TUI in vterm. On MELPA,
+;; so no :recipe needed.
+(package! pi-coding-agent)
+
 ;; Org prettification (Phase 4). org-modern + org-appear already ship with Doom's
 ;; (org +pretty) flag, so only valign is added here. valign pixel-aligns table
 ;; columns in variable-pitch org buffers. (mixed-pitch from emacs.org is NOT
