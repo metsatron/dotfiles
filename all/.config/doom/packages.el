@@ -58,6 +58,13 @@
 (package! claude-code-ide
   :recipe (:host github :repo "manzaltu/claude-code-ide.el"))
 
+;; Codex inside Doom — the Codex-shaped counterpart to claude-code-ide. Talks to
+;; `codex app-server' (renders native Emacs buffers: diff-mode patches, clickable
+;; file refs, in-buffer approvals) instead of wrapping the TUI in vterm. Not on
+;; MELPA; github-only. transient (its one dep) already ships with Doom via magit.
+(package! codex-ide
+  :recipe (:host github :repo "dgillis/emacs-codex-ide"))
+
 ;; Org prettification (Phase 4). org-modern + org-appear already ship with Doom's
 ;; (org +pretty) flag, so only valign is added here. valign pixel-aligns table
 ;; columns in variable-pitch org buffers. (mixed-pitch from emacs.org is NOT
