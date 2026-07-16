@@ -62,7 +62,7 @@ Common owners:
 
 - shell configs -> `shell.org`
 - Makefile / Loom control plane -> `loom.org`
-- Guix manifests -> `guix.org`
+- Guix manifests -> `package-guix.org`
 - theme and GTK settings -> `style.org`
 
 ## Package Manifest Notes
@@ -77,14 +77,14 @@ openai "" ""
 
 Current manager sources:
 
-- `pip.org`
-- `npm.org`
-- `guix.org`
-- `flatpak.org`
-- `snap.org`
-- `cargo.org`
-- `appimage.org`
-- `homebrew.org`
+- `package-pip.org`
+- `package-npm.org`
+- `package-guix.org`
+- `package-flatpak.org`
+- `package-snap.org`
+- `package-cargo.org`
+- `package-appimage.org`
+- `package-homebrew.org`
 - `app.org`
 
 ## Bootstrap Notes

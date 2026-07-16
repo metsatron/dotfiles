@@ -10,7 +10,7 @@
 ;; All mapped to their Guix equivalents.
 
 
-;; [[file:../../../../../guix.org::*room-fvwm95][room-fvwm95:1]]
+;; [[file:../../../../../package-guix.org::*room-fvwm95][room-fvwm95:1]]
 ;; Virtual Habitat — room-fvwm95 Guix profile
 ;; Build environment for compiling FVWM95 inside sanctuary-redstone-9x.
 ;; NOT a runtime profile — sourced only during the build script.

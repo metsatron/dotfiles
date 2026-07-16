@@ -1,4 +1,4 @@
-;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:2]]
+;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:2]]
 (specifications->manifest
  '(
    "gcc-toolchain"
@@ -10,7 +10,7 @@
    "shellcheck"
    "shfmt"
    "bear"
-   ;; Builds the ghostel native module (libghostty terminal for Emacs, emacs.org)
+   ;; Builds the ghostel native module (libghostty terminal for Emacs, emacs-spacemacs.org)
    ;; from source via `zig build' — the alternative is M-x ghostel-download-module,
    ;; which loads an unaudited prebuilt .so from a third-party GitHub release into
    ;; the Emacs process. Pinned: ghostel states "requires Zig 0.15.2+" and Zig

@@ -15,7 +15,7 @@
 ;; Upstream: =https://github.com/AZO234/NP2kai=
 
 
-;; [[file:../../../../../../guix.org::*retropie-np2kai (PC-98, from source)][retropie-np2kai (PC-98, from source):1]]
+;; [[file:../../../../../../package-guix.org::*retropie-np2kai (PC-98, from source)][retropie-np2kai (PC-98, from source):1]]
 ;;; Local Guix package — NP2kai (PC-98 / Neko Project II kai)
 ;;; Pinned: tag rev.22
 ;;; License: MAME-derived license mix (see upstream COPYING)

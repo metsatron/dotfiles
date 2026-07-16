@@ -1,7 +1,7 @@
 # Makefile Fragment
 
 
-# [[file:../../bots.org::*Makefile Fragment][Makefile Fragment:1]]
+# [[file:../../agents-bots.org::*Makefile Fragment][Makefile Fragment:1]]
 # ~/DotCortex/all/.mk/bots.mk
 .RECIPEPREFIX := |
 .PHONY: bots-list bots-status bots-enable bots-disable bots-start bots-stop bots-sync bots-switch

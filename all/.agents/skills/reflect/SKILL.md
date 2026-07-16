@@ -24,7 +24,7 @@ Use this when a session has enough durable discoveries to justify a short reflec
 |---|---|---|
 | Universal agent behaviour (any repo) | `agents.org`, global block | `all/.claude/CLAUDE.md` → `~/.claude/CLAUDE.md` |
 | Agent behaviour scoped to this repo | `agents.org`, `dotcortex-shared` block | `AGENTS.md` + `CLAUDE.md` |
-| Tool or environment gotcha | matching gotchas skill in `skills.org` (`dotcortex-gotchas`, `sanctuary-gotchas`, `pi-agent-gotchas`) | `all/.claude/skills/...` |
+| Tool or environment gotcha | matching gotchas skill in `agents-skills.org` (`dotcortex-gotchas`, `sanctuary-gotchas`, `pi-agent-gotchas`) | `all/.claude/skills/...` |
 | A fact about one specific config | a comment in the owning `.org` block | that config's tangled file |
 | Outstanding task or follow-up | `~/HelmCortex/LOGS/TODO/{workspace}.md`, or `Machines/{hostname}.md` if machine-specific | — |
 

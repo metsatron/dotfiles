@@ -10,9 +10,9 @@ Use this when the user wants Antigravity configured on this machine.
 ## Workflow
 
 1. Confirm whether the task is about the editor itself or the separate multi-account helper tool
-2. Read the owning Antigravity blocks in `nala.org`
-3. Make changes in `nala.org`
-4. Run `tangle-one nala.org` or `make tangle`
+2. Read the owning Antigravity blocks in `package-nala.org`
+3. Make changes in `package-nala.org`
+4. Run `tangle-one package-nala.org` or `make tangle`
 5. Apply package/repo changes with the Nala flow when needed
 6. Apply config changes with `make preview-stow`, `make safe-stow`, or the relevant Loom stow verb when needed
 7. Verify the live config in `~/.config/Antigravity/User/`
@@ -28,7 +28,7 @@ Use this when the user wants Antigravity configured on this machine.
 ## Rules
 
 - prefer DotCortex-managed edits over direct home-directory patching
-- keep Antigravity ownership in `nala.org`
+- keep Antigravity ownership in `package-nala.org`
 - do not add Flatpak Antigravity integration unless the user explicitly reopens that path
 - do not confuse the editor with the separate multi-account helper tool
 - keep final reporting concrete and path-specific
