@@ -491,6 +491,13 @@ advice below). Registered as an emulation map so it outranks
 (use-package! codex-ide
   :commands (codex-ide codex-ide-menu codex-ide-session-diff-open))
 
+;; Codex session buffers are transcripts, not source files; keep their gutter
+;; clear even though Doom enables line numbers globally.
+(defun metsatron/codex-no-line-numbers ()
+  "Disable line numbers in Codex IDE session buffers."
+  (display-line-numbers-mode -1))
+(add-hook 'codex-ide-session-mode-hook #'metsatron/codex-no-line-numbers t)
+
 (map! :leader
       :desc "Codex IDE menu" "o x" #'codex-ide-menu)
 
@@ -808,7 +815,16 @@ NOT interactive by design."
   (add-hook 'org-mode-hook
             (lambda ()
               (setq-local display-line-numbers t)
-              (display-line-numbers-mode 1))))
+              (display-line-numbers-mode 1)))
+
+  ;; Keep built-in pixel scrolling out of Org buffers. Doom's smooth-scroll
+  ;; module made trackpad input choppy and could lock up during direction
+  ;; changes; the Org presentation modes are safe when the scroll layer is off.
+  (defun metsatron/org-stable-display ()
+    "Disable pixel scrolling in Org buffers for predictable input."
+    (pixel-scroll-precision-mode -1)
+    (pixel-scroll-mode -1))
+  (add-hook 'org-mode-hook #'metsatron/org-stable-display t))
 
 (map! :leader :desc "Org toggle pretty" "o e" #'metsatron/org-toggle-pretty)
 
