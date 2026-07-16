@@ -27,7 +27,7 @@
 ;; the label everywhere it's read from, no locale work needed.
 
 
-;; [[file:../../../../../../guix.org::*gvfs (patched: "Trash" → "Recycle Bin") — PARKED, not currently used][gvfs (patched: "Trash" → "Recycle Bin") — PARKED, not currently used:1]]
+;; [[file:../../../../../../package-guix.org::*gvfs (patched: "Trash" → "Recycle Bin") — PARKED, not currently used][gvfs (patched: "Trash" → "Recycle Bin") — PARKED, not currently used:1]]
 ;;; Local Guix package — gvfs, patched
 ;;; Base: upstream Guix `gvfs` (gnu/packages/gnome.scm, 1.58.0) — inherited,
 ;;; not re-vendored, so source/inputs/build-system stay in sync with Guix.

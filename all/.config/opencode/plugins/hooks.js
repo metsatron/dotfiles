@@ -1,6 +1,6 @@
 // OpenCode hooks plugin
 
-// [[file:../../../../hooks.org::*OpenCode hooks plugin][OpenCode hooks plugin:1]]
+// [[file:../../../../agents-hooks.org::*OpenCode hooks plugin][OpenCode hooks plugin:1]]
 export const HooksPlugin = async ({ $ }) => {
   return {
     "tui.prompt.append": async () => {

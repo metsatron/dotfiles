@@ -5,7 +5,7 @@
 ;; added via source build inside the container in a later phase.
 
 
-;; [[file:../../../../../guix.org::*sanctuary-gnustep][sanctuary-gnustep:1]]
+;; [[file:../../../../../package-guix.org::*sanctuary-gnustep][sanctuary-gnustep:1]]
 ;; Virtual Habitat — sanctuary-gnustep Guix profile
 ;; Window Maker from Guix. GNUstep runtime (base/gui/back) not in Guix channels;
 ;; compile from source inside the container in a later phase.

@@ -1,7 +1,7 @@
 ;; Guix User profile manifests
 ;; Tangling target: =all/.config/guix/manifests/core.scm= and friends.
 
-;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:1]]
+;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:1]]
 (specifications->manifest
  '(
    "git" "git-extras"
@@ -51,7 +51,7 @@
    "smem"
 
    ;; rust/cargo managed via dotcortex-rust-env (rustup) — not Guix
-   ;; cargo crates managed via cargo.org
+   ;; cargo crates managed via package-cargo.org
    ;; "starship"
    ;; "ripgrep"      ; now cargo ripgrep
    ;; "fd"           ; now cargo fd-find

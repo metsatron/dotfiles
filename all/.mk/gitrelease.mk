@@ -1,4 +1,4 @@
-# GitHub release artifact targets. Flatpak bundles are owned by flatpak.org.
+# GitHub release artifact targets. Flatpak bundles are owned by package-flatpak.org.
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 

@@ -20,7 +20,7 @@ Cross-cutting rules:
 
 ## Pattern: Add or Update Package Manifests
 
-1. Identify the correct manager file such as `pip.org`, `npm.org`, or `guix.org`
+1. Identify the correct manager file such as `package-pip.org`, `package-npm.org`, or `package-guix.org`
 2. Edit the manifest block in the org source
 3. Run `make tangle`
 4. Apply with Loom when available, otherwise use the matching `make` target or helper script

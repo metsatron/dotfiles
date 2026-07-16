@@ -6,7 +6,7 @@
  * menu, interlocking with xfce4-appmenu-plugin exactly as
  * org.dotcortex.desktopmenu interlocks with the KDE Global Menu on SonicDE.
  *
- * Tangled from xfce.org — never edit under the overlay.
+ * Tangled from desktop-xfce.org — never edit under the overlay.
  */
 
 namespace DesktopMenubar {
@@ -163,7 +163,7 @@ namespace DesktopMenubar {
             add_sep (help_menu);
             add_action (help_menu, "XFCE Documentation", "xdg-open https://docs.xfce.org/");
             add_action (help_menu, "About Desktop Menubar",
-                "zenity --info --no-wrap --title=Desktop Menubar --text=" + Shell.quote ("DotCortex XFCE Desktop Menubar 0.1.0 — global-menu fallback for XFCE. Tangled from xfce.org."));
+                "zenity --info --no-wrap --title=Desktop Menubar --text=" + Shell.quote ("DotCortex XFCE Desktop Menubar 0.1.0 — global-menu fallback for XFCE. Tangled from desktop-xfce.org."));
 
             menubar.append (brand_item);
             menubar.append (top_item ("File", file_menu));

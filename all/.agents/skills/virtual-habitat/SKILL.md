@@ -84,4 +84,4 @@ Residency tier is provisional until `:agent_pathway_validated: true`.
 2. Add home dirs: `vm-homes-init` (or manually under `$XDG_DATA_HOME/dotcortex/guests/<id>/`)
 3. Add Nexus folder entry in `NEXUS/sanctuaries/<id>/`
 4. Update the `Historical-Unix-Fleet.md` or `Distrobox-Sanctuaries.md` sub-note
-5. Update guest registry table in this skill (via `skills.org` in DotCortex)
+5. Update guest registry table in this skill (via `agents-skills.org` in DotCortex)

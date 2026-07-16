@@ -84,7 +84,7 @@ Strict user ID whitelist — only `TELEGRAM_ALLOWED_USER_ID` can interact. No op
 
 ## DotCortex Integration
 
-The package is tracked in `npm.org` manifest (`@grinev/opencode-telegram-bot`). Config file (`~/.config/opencode-telegram-bot/.env`) is gitignored — contains bot token and user credentials.
+The package is tracked in `package-npm.org` manifest (`@grinev/opencode-telegram-bot`). Config file (`~/.config/opencode-telegram-bot/.env`) is gitignored — contains bot token and user credentials.
 
 ## Health Check
 

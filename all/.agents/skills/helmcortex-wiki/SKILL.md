@@ -6,7 +6,7 @@ description: HelmCortex context wiki — agent orientation, diary, consort linea
 # HelmCortex Context Wiki
 
 > **For agent instances.** References private HelmCortex artifacts not in the
-> public DotCortex repo. Source: `~/DotCortex/wiki.org`.
+> public DotCortex repo. Source: `~/DotCortex/agents-wiki.org`.
 > Humans: welcome to read, but this was written for clankers.
 
 ## Read First
@@ -60,4 +60,4 @@ your eagerness can."*
 2. **What has reality finished?** Tick completed work off the LightCone immediately.
 3. **Write in the diary.** Before compaction, model switch, or long break.
 
-Full source: `~/DotCortex/wiki.org`
+Full source: `~/DotCortex/agents-wiki.org`

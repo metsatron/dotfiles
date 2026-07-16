@@ -1,5 +1,5 @@
-#+TITLE: AppImage Loom — Update, Integrate, and Maintain
-#+DESCRIPTION: AppImage manifest, inventory, and release management
+#+TITLE: AppImage/AppMan Loom — Update, Integrate, and Maintain
+#+DESCRIPTION: AppImage and AppMan manifests, inventory, integration, and release management
 #+AUTHOR: Mètsàtron — Sovereign Weaver
 #+LANGUAGE: en
 #+PROPERTY: header-args :mkdirp yes :results silent
@@ -1160,7 +1160,7 @@ awk 'NR==1 {print; next} $6=="zsync" || $6 ~ /^conf:/ {print}' "$all_ssv" >"$sup
 awk 'NR==1 {print; next} $6=="unmanaged" {print}' "$all_ssv" >"$man_ssv"
 awk 'NR==1 {print; next} $6=="dead" {print}' "$all_ssv" >"$dead_ssv"
 
-ORG_FILE="${ORG_FILE:-$HOME/DotCortex/appimage.org}"
+ORG_FILE="${ORG_FILE:-$HOME/DotCortex/package-appimage.org}"
 if [[ -f "$ORG_FILE" ]]; then
     appimage-org-inject "$ORG_FILE" appimage-inventory-all "$all_ssv" || true
     appimage-org-inject "$ORG_FILE" appimage-inventory-supports "$sup_ssv" || true
@@ -1257,6 +1257,319 @@ fi
 
 echo "== done =="
 #+END_SRC
+
+* AppMan (AM) user-mode manager
+
+Declarative management of [[https://github.com/ivan-hc/AM][AM]] in *AppMan user mode*: a single =~/.local/bin/appman= script, no sudo, apps installed as directories under =~/Applications=. The manifest below is the single source of truth; =am-apply= converges the machine to it.
+
+Why AppMan mode and not system =am=: DotCortex is $HOME-scoped — the system installer writes to =/opt/am= and needs root for every app install, while AppMan is one fetchable script plus a one-line config file, both of which this org file owns.
+
+** How AM tracks installed apps
+An installed app is simply a directory =$APPSDIR/<name>/= containing an executable =remove= script (this is exactly how =APP-MANAGER= itself enumerates installs). Capture/diff below use that on-disk truth instead of parsing =appman -f= pretty output.
+
+** Command surface used here (AM 10.3)
+- =appman -i [FLAGS] NAME= — install (non-interactive once the config file exists)
+- =appman -R NAME= — remove without prompting
+- =appman -u= — update all installed apps and appman itself
+- =appman -c= — clean orphaned launchers/symlinks
+- =appman -q KEYWORD= / =appman -l= — search / list the database
+- =appman --launcher /path/to/File.AppImage= — integrate a local (manual/dead-project) AppImage; interactive, so it stays a manual verb
+
+** AM manifest
+Columns: NAME, FLAGS, EXTRA. FLAGS is passed to =appman -i= (e.g. =--sandbox=, =--force-latest=); use ="" ""= for empty fields.
+Tangling target: =all/.am/manifest/apps.ssv=
+
+#+BEGIN_SRC text :tangle all/.am/manifest/apps.ssv
+# name              flags            extra
+# Examples:
+# appimageupdatetool ""              ""
+# brave              --sandbox       ""
+# You control the world by editing this list.
+#+END_SRC
+
+** AppMan config
+AppMan's only config is one line in =~/.config/appman/appman-config=: the apps directory (relative paths are under =$HOME=). It is written by =am-bootstrap= (not stowed) so appman-written state next to it never dirties the repo. Canonical value: =Applications= → =~/Applications=, shared with the classic AppImage estate in this file.
+
+** Installer tools
+
+*** am-bootstrap
+Fetch the =appman= script and seed the config, fully non-interactive. Idempotent; =FORCE=1= re-downloads.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/am-bootstrap :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+
+BINDIR="${XDG_BIN_HOME:-$HOME/.local/bin}"
+CFGDIR="${XDG_CONFIG_HOME:-$HOME/.config}/appman"
+APPSDIR_LINE="${AM_APPSDIR:-Applications}"
+URL="https://raw.githubusercontent.com/ivan-hc/AM/main/APP-MANAGER"
+
+mkdir -p "$BINDIR" "$CFGDIR"
+
+if [[ ! -f "$CFGDIR/appman-config" ]]; then
+  printf '%s\n' "$APPSDIR_LINE" > "$CFGDIR/appman-config"
+  echo "seeded $CFGDIR/appman-config -> $APPSDIR_LINE"
+fi
+
+if [[ -x "$BINDIR/appman" && "${FORCE:-0}" != "1" ]]; then
+  echo "appman already present: $BINDIR/appman (FORCE=1 to re-download)"
+else
+  tmp="$(mktemp)"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$URL" -o "$tmp"
+  else
+    wget -qO "$tmp" "$URL"
+  fi
+  head -1 "$tmp" | grep -q '^#!' || { echo "download of APP-MANAGER looks wrong, aborting" >&2; rm -f "$tmp"; exit 1; }
+  install -m 0755 "$tmp" "$BINDIR/appman"
+  rm -f "$tmp"
+  echo "installed $BINDIR/appman"
+fi
+
+"$BINDIR/appman" --version 2>/dev/null || true
+#+END_SRC
+
+*** am-capture
+Export currently installed apps into the SSV manifest format.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/am-capture :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+out="${1:-$HOME/DotCortex/all/.am/manifest/apps.ssv}"
+
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/appman/appman-config"
+line="$(head -1 "$cfg" 2>/dev/null || true)"
+case "$line" in
+  /*) appsdir="$line" ;;
+  "") appsdir="$HOME/Applications" ;;
+  *)  appsdir="$HOME/$line" ;;
+esac
+
+tmp="$(mktemp)"
+{
+  echo "# name flags extra"
+  find "$appsdir" -mindepth 2 -maxdepth 2 -name remove -type f -perm -u+x 2>/dev/null \
+    | sed 's|/remove$||; s|.*/||' | sort -u \
+    | while read -r name; do
+        printf '%s "" ""\n' "$name"
+      done
+} > "$tmp"
+mkdir -p "$(dirname "$out")"
+mv "$tmp" "$out"
+echo "Captured to $out"
+#+END_SRC
+
+*** am-diff
+Plan: manifest vs installed.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/am-diff :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+mf="${1:-$HOME/DotCortex/all/.am/manifest/apps.ssv}"
+
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/appman/appman-config"
+line="$(head -1 "$cfg" 2>/dev/null || true)"
+case "$line" in
+  /*) appsdir="$line" ;;
+  "") appsdir="$HOME/Applications" ;;
+  *)  appsdir="$HOME/$line" ;;
+esac
+
+want="$(awk '/^[[:space:]]*($|#)/ {next} {print $1}' "$mf" 2>/dev/null | sort -u || true)"
+installed="$(find "$appsdir" -mindepth 2 -maxdepth 2 -name remove -type f -perm -u+x 2>/dev/null \
+  | sed 's|/remove$||; s|.*/||' | sort -u)"
+
+echo "== To install =="
+comm -13 <(echo "$installed") <(echo "$want") || true
+
+echo "== Extra installed (candidates to remove) =="
+comm -23 <(echo "$installed") <(echo "$want") || true
+#+END_SRC
+
+*** am-apply
+Install missing apps from the manifest; removals only with =--remove-extra=. Dry run with =--dry=.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/am-apply :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+
+REMOVE_EXTRA="${REMOVE_EXTRA:-0}"
+MODE="apply"
+
+while (($#)); do
+  case "$1" in
+    --dry|-n) MODE="dry" ;;
+    --yes|-y) MODE="apply" ;;
+    --remove-extra) REMOVE_EXTRA=1 ;;
+    --) shift; break ;;
+    -h|--help)
+      cat <<'EOF'
+Usage: am-apply [options] [MANIFEST.ssv]
+
+Options:
+  -n, --dry           Dry run (no changes)
+  -y, --yes           Apply changes (default)
+      --remove-extra  Remove installed apps not listed in the manifest
+      --              End of options
+EOF
+      exit 0 ;;
+    *) break ;;
+  esac
+  shift
+done
+
+mf="${1:-$HOME/DotCortex/all/.am/manifest/apps.ssv}"
+
+run() {
+  if [[ "$MODE" == "dry" ]]; then
+    echo "(dry) $*"
+  else
+    echo "+ $*"
+    "$@"
+  fi
+}
+
+# Ensure appman itself (bootstrap is idempotent); make runs with a bare
+# PATH that misses ~/.local/bin, so check the literal path too
+APPMAN="$(command -v appman 2>/dev/null || true)"
+[[ -z "$APPMAN" && -x "${XDG_BIN_HOME:-$HOME/.local/bin}/appman" ]] && APPMAN="${XDG_BIN_HOME:-$HOME/.local/bin}/appman"
+if [[ -z "$APPMAN" ]]; then
+  boot="$HOME/.local/bin/am-bootstrap"
+  [[ -x "$boot" ]] || boot="$HOME/DotCortex/all/.local/bin/am-bootstrap"
+  run "$boot"
+  APPMAN="${XDG_BIN_HOME:-$HOME/.local/bin}/appman"
+fi
+
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/appman/appman-config"
+line="$(head -1 "$cfg" 2>/dev/null || true)"
+case "$line" in
+  /*) appsdir="$line" ;;
+  "") appsdir="$HOME/Applications" ;;
+  *)  appsdir="$HOME/$line" ;;
+esac
+
+installed_list() {
+  find "$appsdir" -mindepth 2 -maxdepth 2 -name remove -type f -perm -u+x 2>/dev/null \
+    | sed 's|/remove$||; s|.*/||' | sort -u
+}
+
+echo "== Apply installs =="
+awk '/^[[:space:]]*($|#)/ {next} {print}' "$mf" | while read -r name flags _extra; do
+  [[ -z "$name" ]] && continue
+  [[ "$flags" == '""' ]] && flags=""
+  if installed_list | grep -qx "$name"; then
+    echo "ok: $name already installed"
+  else
+    # shellcheck disable=SC2086
+    run "$APPMAN" -i $flags "$name"
+  fi
+done
+
+if [[ "$REMOVE_EXTRA" -eq 1 ]]; then
+  echo "== Enforce removals (extras not in manifest) =="
+  want="$(awk '/^[[:space:]]*($|#)/ {next} {print $1}' "$mf" | sort -u)"
+  extras="$(comm -23 <(installed_list) <(echo "$want"))"
+  while read -r name; do
+    [[ -z "$name" ]] && continue
+    run "$APPMAN" -R "$name" || true
+  done <<< "$extras"
+else
+  echo "== Removals skipped, use --remove-extra to enforce =="
+fi
+
+echo "Done. Mode=${MODE}"
+#+END_SRC
+
+*** am-health
+Show appman presence, version, config, and installed-app count.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/am-health :shebang "#!/usr/bin/env bash"
+set -Eeuo pipefail
+
+echo "== appman binary =="
+APPMAN="$(command -v appman 2>/dev/null || true)"
+[[ -z "$APPMAN" && -x "${XDG_BIN_HOME:-$HOME/.local/bin}/appman" ]] && APPMAN="${XDG_BIN_HOME:-$HOME/.local/bin}/appman"
+if [[ -n "$APPMAN" ]]; then
+  echo "found: $APPMAN"
+  "$APPMAN" --version 2>/dev/null || true
+else
+  echo "MISSING — run am-bootstrap (or: loom am:bootstrap)"
+fi
+
+cfg="${XDG_CONFIG_HOME:-$HOME/.config}/appman/appman-config"
+echo "== config ($cfg) =="
+if [[ -f "$cfg" ]]; then
+  cat "$cfg"
+else
+  echo "MISSING — am-bootstrap seeds it"
+fi
+
+line="$(head -1 "$cfg" 2>/dev/null || true)"
+case "$line" in
+  /*) appsdir="$line" ;;
+  "") appsdir="$HOME/Applications" ;;
+  *)  appsdir="$HOME/$line" ;;
+esac
+echo "== apps dir ($appsdir) =="
+count="$(find "$appsdir" -mindepth 2 -maxdepth 2 -name remove -type f -perm -u+x 2>/dev/null | wc -l)"
+echo "installed apps: $count"
+
+mf="$HOME/DotCortex/all/.am/manifest/apps.ssv"
+echo "== manifest ($mf) =="
+if [[ -f "$mf" ]]; then
+  echo "entries: $(awk '/^[[:space:]]*($|#)/ {next} {c++} END{print c+0}' "$mf")"
+else
+  echo "MISSING — tangle package-appimage.org"
+fi
+#+END_SRC
+
+** AppMan Makefile targets
+
+#+BEGIN_SRC makefile :tangle all/.mk/am.mk
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+
+AM_MF        := $(HOME)/DotCortex/all/.am/manifest/apps.ssv
+AM_BOOTSTRAP := $(HOME)/DotCortex/all/.local/bin/am-bootstrap
+AM_CAPTURE   := $(HOME)/DotCortex/all/.local/bin/am-capture
+AM_DIFF      := $(HOME)/DotCortex/all/.local/bin/am-diff
+AM_APPLY     := $(HOME)/DotCortex/all/.local/bin/am-apply
+AM_HEALTH    := $(HOME)/DotCortex/all/.local/bin/am-health
+
+.PHONY: am-bootstrap am-capture am-diff am-apply am-apply-dry am-enforce am-update am-clean am-health
+
+am-bootstrap:
+| $(AM_BOOTSTRAP)
+
+am-capture:
+| $(AM_CAPTURE)
+
+am-diff:
+| $(AM_DIFF)
+
+am-apply:
+| $(AM_APPLY) --yes $(AM_MF)
+
+am-apply-dry:
+| $(AM_APPLY) --dry $(AM_MF)
+
+am-enforce:
+| $(AM_APPLY) --yes --remove-extra $(AM_MF)
+
+am-update:
+| PATH="$(HOME)/.local/bin:$$PATH" appman -u
+
+am-clean:
+| PATH="$(HOME)/.local/bin:$$PATH" appman -c
+
+am-health:
+| $(AM_HEALTH)
+#+END_SRC
+
+** AppMan usage notes
+- Dry run first: =make -f ~/DotCortex/all/.mk/am.mk am-apply-dry= or =loom am:diff=
+- Converge: =loom am:apply= (install-only) / =loom am:apply!= (also removes extras)
+- Update everything AM-managed: =loom am:update=
+- Integrate a manual/dead-project AppImage (interactive): =appman --launcher ~/Applications/Foo.AppImage=, then =appman -c= to clean orphans when files move
+
+*** Relationship to the classic AppImage estate
+AM shares =~/Applications= with the classic AppImage estate. AppMan-managed apps live in *subdirectories* (=~/Applications/<name>/=), while appimaged and apprelease manage *bare top-level* =.AppImage= files — so they coexist without double-integration. Longer term, appimaged can be retired: =appman --launcher= + =appman -c= replaces its integration role for manual/dead AppImages, and database-listed apps migrate to the manifest above.
 
 * Makefile glue (appimage.mk)
 #+BEGIN_SRC makefile :tangle all/.mk/appimage.mk

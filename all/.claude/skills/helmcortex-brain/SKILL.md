@@ -73,4 +73,4 @@ dotcortex-compile --tangle  # also tangle local projections
 dotcortex-export            # export operational Org corpus to LOGS/DotCortex/
 ```
 
-Full source: `~/DotCortex/wiki.org`
+Full source: `~/DotCortex/agents-wiki.org`
