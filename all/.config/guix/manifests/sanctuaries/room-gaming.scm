@@ -23,7 +23,7 @@
 ;; this code path was dormant. See redstone-9x-state-digest.md for the full
 ;; diagnosis (including an unrelated but real XDG_DATA_DIRS cross-sanctuary
 ;; leak found and fixed along the way — kept, see room-gaming/room-windows-compat
-;; sourcing in distrobox.org). The patched gvfs-recycle-bin package definition
+;; sourcing in sanctuary-distrobox.org). The patched gvfs-recycle-bin package definition
 ;; is kept, parked, in local packages/gvfs.scm for whoever resumes this.
 ;; NOTE 2026-07-07: retried PLAIN (unpatched) gvfs to isolate whether the
 ;; earlier crash was inherent to any gvfs trash backend, or specific to the
@@ -39,7 +39,7 @@
 ;; confirm trash:// isolation holds (no host content visible) before
 ;; anything else. The desktop-icon "Recycle Bin" workaround (static
 ;; .desktop + redstone-9x-recycle-bin-watch poller) is disabled, not
-;; deleted, in distrobox.org — re-enable it as part of this revert.
+;; deleted, in sanctuary-distrobox.org — re-enable it as part of this revert.
 ;; NOTE 2026-07-07 (3rd attempt, ROOT CAUSE CONFIRMED): re-added plain gvfs
 ;; to test whether the host-trash leak was caused by long-lived orphaned
 ;; gvfsd-trash daemons (no init/reaper) carrying stale HOME, rather than a
@@ -63,7 +63,7 @@
 ;; gvfs-based trash in sandboxes entirely in favor of the non-GVFS
 ;; icon-watcher workaround — see redstone-9x-state-digest.md.
 ;; NOTE 2026-07-08 (leak blocker LIFTED, but gvfs still kept out HERE):
-;; sanctuary-trash-shield (distrobox.org) now closes the isolation leak at
+;; sanctuary-trash-shield (sanctuary-distrobox.org) now closes the isolation leak at
 ;; launch — it make-rprivate's distrobox's passthrough parents and tmpfs-masks
 ;; the whole ~/mnt tree inside the container's own namespace, so gvfsd-trash
 ;; can no longer see any foreign fleet mount (this is effectively option (a),

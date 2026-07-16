@@ -19,7 +19,7 @@
 ;; $topdir/.Trash-$uid, so without the shield it merged those remote machines'
 ;; trash into this sandboxed room's trash:/// (measured historically: 392
 ;; entries = 68 local + 324 leaked from the host's real ~/mnt/x230/.Trash-1000).
-;; sanctuary-trash-shield (see distrobox.org) closes this at launch, inside the
+;; sanctuary-trash-shield (see sanctuary-distrobox.org) closes this at launch, inside the
 ;; container's isolated mount namespace: it makes the two passthrough parents
 ;; rprivate (so nothing below can propagate to the host) then tmpfs-masks the
 ;; whole ~/mnt tree via both reachable paths, leaving every fleet mount
