@@ -494,6 +494,17 @@ advice below). Registered as an emulation map so it outranks
 (map! :leader
       :desc "Codex IDE menu" "o x" #'codex-ide-menu)
 
+;; Pi inside Doom (see the package! declaration in the packages block). The `pi'
+;; CLI must be on PATH — confirmed here at ~/.npm-global/bin/pi with an existing
+;; ~/.pi/agent/auth.json. `pi-coding-agent' starts/focuses the current project's
+;; session (re-running it restores missing panes); `-toggle' hides/shows them.
+(use-package! pi-coding-agent
+  :commands (pi-coding-agent pi-coding-agent-toggle))
+
+(map! :leader
+      :desc "Pi coding agent"        "o p" #'pi-coding-agent
+      :desc "Pi coding agent toggle" "o P" #'pi-coding-agent-toggle)
+
 ;;; ===========================================================================
 ;;; @Claude / @Workbench layouts (from emacs.org blk-claude-workspace)
 ;;; ===========================================================================
