@@ -8,7 +8,7 @@
 ;; Upstream: =https://github.com/libretro/px68k-libretro=
 
 
-;; [[file:../../../../../../package-guix.org::*libretro-px68k (X68000, from source)][libretro-px68k (X68000, from source):1]]
+;; [[file:../../../../../../package-guix-habitat.org::*libretro-px68k (X68000, from source)][libretro-px68k (X68000, from source):1]]
 ;;; Local Guix package — libretro-px68k (X68000)
 ;;; Pinned: master @ 45dfd4005434d1199b01fb74a5371ec9bc513164
 ;;; License: NonCommercial-style Keropi license (bundled COPYING in upstream)

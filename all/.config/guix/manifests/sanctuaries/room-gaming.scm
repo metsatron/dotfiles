@@ -5,7 +5,7 @@
 ;; Windows-themed rooms like =sanctuary-redstone-9x=).
 
 
-;; [[file:../../../../../package-guix.org::*room-gaming][room-gaming:1]]
+;; [[file:../../../../../package-guix-habitat.org::*room-gaming][room-gaming:1]]
 ;; Virtual Habitat — room-gaming Guix profile
 ;; Desktop stack shared across all gaming-wing sanctuaries.
 ;; Windows compat tools live in room-windows-compat (sourced separately).

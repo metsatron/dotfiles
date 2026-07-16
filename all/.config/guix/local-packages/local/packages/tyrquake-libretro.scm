@@ -8,7 +8,7 @@
 ;; Upstream: =https://github.com/libretro/tyrquake=
 
 
-;; [[file:../../../../../../package-guix.org::*libretro-tyrquake (Quake 1, from source)][libretro-tyrquake (Quake 1, from source):1]]
+;; [[file:../../../../../../package-guix-habitat.org::*libretro-tyrquake (Quake 1, from source)][libretro-tyrquake (Quake 1, from source):1]]
 ;;; Local Guix package — libretro-tyrquake (Quake 1)
 ;;; Pinned: master @ 8f1e7dcdcdd10f840b7020ac6701ae62b07c41a4
 ;;; License: GPL v2 (bundled LICENSE.txt in upstream)
