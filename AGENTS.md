@@ -65,6 +65,17 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     are forbidden by default. Never emit essays, long explanations, or unverified path hierarchies
     between agent handoffs.
 
+17a. **Handoff artifact boundary** -- Handoff Markdown is session log material,
+     not public DotCortex source. Never create or commit `HANDOFF*.md` at the
+     DotCortex repo root, in an overlay, or in any other source-controlled
+     DotCortex path. Archive durable HelmCortex handoffs under
+     `~/HelmCortex/LOGS/handoffs/YYYY-MM-DD-<slug>.md`, exactly as required by
+     the HelmCortex handoff skill. Verify the live destination before writing,
+     and never grant an executor `LOGS/` write access unless archiving is the
+     explicit, bounded task. TaskHandoff payloads must point to the archived
+     artifact or a verified scratchpad path, never invent a root-level handoff
+     filename.
+
 18. **Colemak-NEIO Interaction Law** -- All interactive terminal tools and TUIs built for this
     system must not assume QWERTY/Vim movement keys. Mètsàtron uses **Colemak-NEIO**. Default
     directional movement bindings for any new TUI or interactive script:
