@@ -1,4 +1,4 @@
-;; [[file:../../../../guix.org::*Guix User profile manifests][Guix User profile manifests:4]]
+;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:4]]
 ;; Nonguix-only user manifest.
 ;; Start empty so it never breaks builds; add packages you want from Nonguix.
 (specifications->manifest

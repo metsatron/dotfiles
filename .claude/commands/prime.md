@@ -25,7 +25,7 @@ Do everything above, PLUS:
 1. Read the matching org source file:
    - `emacs` -> `emacs.org`
    - `shell` -> `shell.org`
-   - `flatpak` -> `flatpak.org`
+   - `flatpak` -> `package-flatpak.org`
    - `loom` -> `loom.org`
    - `style` -> `style.org`
    - `tools` -> `tools.org`

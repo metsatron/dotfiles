@@ -31,7 +31,7 @@ Podman establishes bind mounts **when the container starts**. If the mount sourc
 
 Removing distrobox from the Guix core manifest (it was destroying rootless podman storage) orphaned three sanctuaries this way. Recreation is the only fix; the bind sources are immutable container config.
 
-It also changed the *contract*: system distrobox (1.8.x) requires ~30 base commands inside the container and shells out to a **package manager** when any are missing — and a Guix image has none. `sanctuary-base` must therefore satisfy that dependency list natively (see `guix.org`), and pre-seed `/etc/passwd.done` so `distrobox-init` skips its root-password step (Guix's `passwd` is PAM-linked, the image has no PAM service, and the `chpasswd -e` fallback runs unprivileged and cannot open `/etc/passwd`).
+It also changed the *contract*: system distrobox (1.8.x) requires ~30 base commands inside the container and shells out to a **package manager** when any are missing — and a Guix image has none. `sanctuary-base` must therefore satisfy that dependency list natively (see `package-guix.org`), and pre-seed `/etc/passwd.done` so `distrobox-init` skips its root-password step (Guix's `passwd` is PAM-linked, the image has no PAM service, and the `chpasswd -e` fallback runs unprivileged and cannot open `/etc/passwd`).
 
 ## RetroArch ships an `.info` stub for every core that ever existed — only the `.so` is real (sealed 2026-07-14)
 
@@ -170,4 +170,4 @@ The sanctuary's tools (emacs, zsh, `clear`, …) are on PATH because the *launch
 
 To verify sanctuary PATH/env, source the profiles the launch-script way inside the container (or test in a terminal opened inside the running desktop). And note: sourcing a Guix profile's `etc/profile` only adds its `bin/` if `GUIX_PROFILE` is exported *first* — a bare `. etc/profile` is a no-op for PATH. A rebuilt profile also only reaches the user's terminals after a sanctuary relaunch: IceWM-spawned terminals inherit IceWM's stale environment, not the freshly-rebuilt profile.
 
-When a base shell utility is missing in a sanctuary (`clear`, `tput`), the fix is to add its package (`ncurses`) to the shared **desktop-common** manifest in `guix.org`, tangle, and rebuild — never an ANSI-escape shim or a per-sanctuary duplicate. desktop-common is sourced by every sanctuary, so one entry fixes all of them.
+When a base shell utility is missing in a sanctuary (`clear`, `tput`), the fix is to add its package (`ncurses`) to the shared **desktop-common** manifest in `package-guix.org`, tangle, and rebuild — never an ANSI-escape shim or a per-sanctuary duplicate. desktop-common is sourced by every sanctuary, so one entry fixes all of them.

@@ -5,7 +5,7 @@
 # Gets a fresh Linux machine to the point where `loom`
 # and `make tangle && make safe-stow` work. Debian/Devuan
 # system packages are managed through nala/apt; OpenMandriva
-# system packages are managed through the DNF manifest in dnf.org.
+# system packages are managed through the DNF manifest in package-dnf.org.
 # After this script finishes, the operator can refine via loom verbs.
 #
 # Usage:
@@ -183,7 +183,7 @@ case "$PLATFORM" in
         bash "$DNF_APPLY"
     else
       warn "DotCortex DNF manifest not available yet; installing minimal bootstrap packages directly"
-      warn "Re-run after clone/tangle to enforce dnf.org fully"
+      warn "Re-run after clone/tangle to enforce package-dnf.org fully"
       $SUDO dnf --refresh distro-sync -y
       $SUDO dnf --refresh install -y --allowerasing \
         git stow curl wget make gcc gcc-c++ clang emacs-nox \

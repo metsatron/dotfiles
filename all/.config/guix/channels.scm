@@ -1,6 +1,6 @@
-;; [[file:../../../guix.org::*Channel pin (fleet-wide revision lock)][Channel pin (fleet-wide revision lock):1]]
-;; Single source of truth. Tangled only from guix.org.
-;; PINNED 2026-07-14 — see guix.org for why this is load-bearing.
+;; [[file:../../../package-guix.org::*Channel pin (fleet-wide revision lock)][Channel pin (fleet-wide revision lock):1]]
+;; Single source of truth. Tangled only from package-guix.org.
+;; PINNED 2026-07-14 — see package-guix.org for why this is load-bearing.
 (list
   (channel
     (name 'guix)

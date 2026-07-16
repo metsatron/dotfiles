@@ -17,7 +17,7 @@ You are creating a well-structured git commit. The user may provide a hint: $ARG
 3. **Determine scope from file paths:**
    - `emacs` — emacs.org, Spacemacs config
    - `shell` — shell.org, bash/zsh config
-   - `flatpak` — flatpak.org, Flatpak management
+   - `flatpak` — package-flatpak.org, Flatpak management
    - `loom` — loom.org, Makefile, control plane
    - `style` — style.org, LainCore theme
    - `tools` — tools.org, misc tooling
