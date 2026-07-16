@@ -116,8 +116,14 @@
             tasks)
            0))
 
-   (task 'all "TOC -> tangle -> ensure Guix dirs"
+   (task 'all "TOC -> tangle -> census -> ensure Guix dirs"
          (lambda () (sh "make all")))
+
+   (task 'lint "Structural + style lint over root org sources"
+         (lambda () (mk "lint")))
+
+   (task 'census "Verify org parses every declared src block (silent-drop detector)"
+         (lambda () (mk "census")))
 
    (task 'hooks:install
          "Install tracked DotCortex git hooks for this checkout"
@@ -1193,6 +1199,57 @@ LC/fonts is expected to be set by style.org - this file must not override it."
             (org-babel-tangle))
           (kill-buffer))))))
 
+;; ---- census: does org parse every block the text declares? ------------------
+;; An unbalanced block, or an unescaped column-0 headline inside a block, makes
+;; org-element parse FEWER src blocks than the raw text declares - org-babel
+;; then tangles fewer outputs, silently. The census compares both counts per
+;; file and fails loudly on any divergence. (Sealed 2026-07-16 after two such
+;; drops shipped: claude.mk orphaned for four days, redstone gtk.css dropped.)
+(defun dotfiles--textual-src-count (file)
+  "Count the src blocks FILE's raw text declares, as a reader would.
+A simple state machine: a BEGIN_SRC line opens a src block; BEGIN_EXAMPLE
+and BEGIN_EXPORT open verbatim blocks whose content is not counted; the
+matching END_ closes.  Nested or unbalanced markers are the linter's job."
+  (with-temp-buffer
+    (insert-file-contents file)
+    (goto-char (point-min))
+    (let ((case-fold-search t) (count 0) (inblk nil))
+      (while (not (eobp))
+        (cond
+         ((and (not inblk) (looking-at "[ \t]*#\\+begin_src\\b"))
+          (setq count (1+ count) inblk t))
+         ((and (not inblk) (looking-at "[ \t]*#\\+begin_\\(example\\|export\\)\\b"))
+          (setq inblk t))
+         ((looking-at "[ \t]*#\\+end_\\(src\\|example\\|export\\)\\b")
+          (setq inblk nil)))
+        (forward-line 1))
+      count)))
+
+(defun dotfiles-batch-census (root)
+  "Fail loudly if org-element parses fewer src blocks than ROOT/*.org declare."
+  (interactive "DRoot: ")
+  (setq root (file-name-as-directory (expand-file-name root)))
+  (let ((bad '()))
+    (dolist (f (dotfiles-root-org-files root))
+      (let* ((textual (dotfiles--textual-src-count f))
+             (parsed (with-current-buffer (find-file-noselect f)
+                       (org-mode)
+                       (prog1
+                           (length (org-element-map (org-element-parse-buffer)
+                                       'src-block #'identity))
+                         (kill-buffer)))))
+        (if (= textual parsed)
+            (message "census ok   %-34s %3d blocks" (file-name-nondirectory f) parsed)
+          (push (format "%s: text declares %d src blocks, org parses %d - blocks are being DROPPED"
+                        (file-name-nondirectory f) textual parsed)
+                bad))))
+    (if bad
+        (progn
+          (message "== CENSUS FAILURES ==")
+          (dolist (b (nreverse bad)) (message "!! %s" b))
+          (kill-emacs 1))
+      (message "census: every file parses exactly as declared"))))
+
 (provide 'dotfiles-batch)
 ;;; dotfiles-batch.el ends here
 #+END_SRC
@@ -1269,20 +1326,62 @@ exec emacs --batch -Q \
 set -euo pipefail
 
 # Behavior:
-# - Warn on *lowercase* #+begin_src / #+end_src
-# - Do NOT fail the build by default.
-# - Set STRICT_LINT=1 if you want warnings to be fatal.
+# - FATAL on structural breakage in root *.org sources: unbalanced
+#   #+BEGIN_/#+END_ blocks, or a column-0 headline inside a block. Both make
+#   org-element parse fewer blocks than the text declares, so org-babel
+#   silently drops tangled outputs (sealed 2026-07-16: claude.mk orphaned
+#   for four days by a lost #+END_SRC; redstone gtk.css dropped by a bare
+#   CSS universal selector at column 0). A broken parse must never tangle.
+# - Warn on *lowercase* #+begin_src / #+end_src (style).
+# - Warn when a root source exceeds the 100 KB module budget (~25k tokens):
+#   every module must stay loadable by a small-model context window.
+# - Set STRICT_LINT=1 if you want the warnings to be fatal too.
 
 shopt -s nullglob globstar
 STATUS=0
-
-# Match lowercase only (exact), not mixed/uppercase.
-LOWER_BEGIN_RE='^[[:space:]]*#\+begin_src\b'
-LOWER_END_RE='^[[:space:]]*#\+end_src\b'
+FATAL=0
 
 echo "== org-style-lint =="
+
+# --- Structural integrity (FATAL). Root sources only: matches tangle scope. ---
+for f in *.org; do
+  out="$(awk '
+    { low = tolower($0); sub(/^[ \t]+/, "", low) }
+    low ~ /^#\+begin_(src|example|export)/ {
+      if (inblk) printf "%s:%d: #+BEGIN inside the block opened at line %d - close it or escape as ,#+\n", FILENAME, FNR, inblk
+      else inblk = FNR
+      next
+    }
+    low ~ /^#\+end_(src|example|export)/ {
+      if (!inblk) printf "%s:%d: #+END without a matching #+BEGIN (stray or duplicated)\n", FILENAME, FNR
+      inblk = 0
+      next
+    }
+    inblk && /^\*+ / {
+      printf "%s:%d: column-0 headline inside a block breaks the block - escape it with a leading comma (,*)\n", FILENAME, FNR
+    }
+    END { if (inblk) printf "%s: block opened at line %d never closed before EOF\n", FILENAME, inblk }
+  ' "$f")"
+  if [ -n "$out" ]; then
+    printf '%s\n' "$out" | sed 's/^/!! /'
+    FATAL=1
+  fi
+done
+
+# --- Module size budget (warn) ----------------------------------------------
+BUDGET_KB=100
+for f in *.org; do
+  kb=$(( $(stat -c %s "$f") / 1024 ))
+  if [ "$kb" -gt "$BUDGET_KB" ]; then
+    echo "?? $f is ${kb} KB (budget ${BUDGET_KB} KB) - split it; see the module map in README.org"
+    STATUS=1
+  fi
+done
+
+# --- Style: lowercase begin/end (warn) ---------------------------------------
+LOWER_BEGIN_RE='^[[:space:]]*#\+begin_src\b'
+LOWER_END_RE='^[[:space:]]*#\+end_src\b'
 while IFS= read -r -d '' f; do
-  # Report lowercase begin/end
   if grep -nE "$LOWER_BEGIN_RE|$LOWER_END_RE" "$f" >/dev/null 2>&1; then
     echo "!! Lowercase #+begin_src/#+end_src found (prefer UPPERCASE) → $f"
     grep -nE "$LOWER_BEGIN_RE|$LOWER_END_RE" "$f" || true
@@ -1290,7 +1389,11 @@ while IFS= read -r -d '' f; do
   fi
 done < <(printf '%s\0' **/*.org)
 
-if [ "${STRICT_LINT:-0}" = "1" ] && [ $STATUS -ne 0 ]; then
+if [ "$FATAL" -ne 0 ]; then
+  echo "== org-style-lint: STRUCTURAL ERRORS - a broken parse silently drops outputs. Refusing to pass. =="
+  exit 1
+fi
+if [ "${STRICT_LINT:-0}" = "1" ] && [ "$STATUS" -ne 0 ]; then
   exit 1
 fi
 exit 0
@@ -1312,7 +1415,7 @@ EXTRA := $(HOME)/.guix-extra-profiles
 STOW_PKGS ?= all
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
-        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint
+        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census
 
 lint:
 | all/.local/bin/org-style-lint
@@ -1332,8 +1435,13 @@ toc:
 tangle:
 | $(EMACS_BATCH) --eval '(load-file "$(SCRIPT)")' --eval '(dotfiles-batch-tangle "$(ROOT)")'
 
-# all = toc → tangle → guix-dirs only
-all: toc tangle guix-dirs
+# census = does org-element parse every src block the raw text declares?
+# Divergence means blocks are silently dropped from tangling. Fatal.
+census:
+| $(EMACS_BATCH) --eval '(load-file "$(SCRIPT)")' --eval '(dotfiles-batch-census "$(ROOT)")'
+
+# all = toc → tangle → census → guix-dirs
+all: toc tangle census guix-dirs
 
 # Plain stow
 stow:
