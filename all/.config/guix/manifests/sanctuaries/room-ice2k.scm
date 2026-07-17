@@ -36,6 +36,7 @@
    "libxcomposite"   ; control/desk (-lXcomposite)
    "libxrandr"       ; mmc/devmgmt, shell/hotplug (-lXrandr)
    "libxi"           ; mmc/devmgmt, shell/hotplug (-lXi)
+   "libxtst"         ; mmc/devmgmt header <X11/extensions/XTest.h>
    "libxdamage"      ; FOX / composite deps
    "libxfixes"       ; FOX / composite deps
    "libx11"          ; X11 client library
