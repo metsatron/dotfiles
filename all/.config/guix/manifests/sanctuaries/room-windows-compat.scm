@@ -22,9 +22,10 @@
              (gnu packages fontutils)     ; fontconfig
              (gnu packages xdisorg)       ; rxvt-unicode
              (gnu packages compression)   ; unzip
+             (gnu packages gnome)         ; zenity — winetricks --gui dialog backend
              (local packages powershell)  ; local: PowerShell 7.x binary
              (local packages dosbox-x))   ; local: DOSBox-X from source
 
 (packages->manifest
- (list wine64 winetricks fontconfig rxvt-unicode unzip powershell dosbox-x))
+ (list wine64 winetricks fontconfig rxvt-unicode unzip zenity powershell dosbox-x))
 ;; room-windows-compat:1 ends here
