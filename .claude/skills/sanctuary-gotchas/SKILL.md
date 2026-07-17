@@ -179,3 +179,16 @@ The redstone env wrappers (`redstone-9x-run`, `redstone-9x-ie`, `redstone-9x-win
 Two compounding traps from the same incident:
 - A `Bash(run_in_background)` test that loops over tool names keeps **relaunching** wine even after you kill the visible windows — new PIDs reappear because the *driver* is still alive. Kill the background driver process (find it in `ps` on the host) FIRST; killing the wine children is whack-a-mole.
 - `wineserver -k` silently no-ops if its `WINEPREFIX`/socket key doesn't match the running server. To actually clear a stray wine session, SIGKILL by explicit `comm` (`wineserver`, `explorer.exe`, `services.exe`, …) — and only after the relaunch driver is dead, or it respawns instantly.
+
+## The live sanctuary desktop and a headless test share ONE container PID namespace — never blanket-`pkill` (sealed 2026-07-18)
+
+A sanctuary runs the user's live WM (IceWM on `:93`) *inside the container*. A headless render test that starts a second IceWM/rofi on `Xvfb :97` runs in the **same container**, so `distrobox enter … -- pkill -x icewm` / `pkill -x rofi` kills BOTH — the test instance AND the user's live `:93` desktop. Cleanup must target only the test display: iterate `pgrep -x icewm; pgrep -x rofi`, read `/proc/$p/environ`, and `kill` only those with `DISPLAY=:97`. (A blanket pkill got away with it once only because the user had already closed `:93`.) Same rule as the wine cleanup: kill by identity, never by name alone, when a human's session shares the namespace.
+
+## rofi 2.0.0 (Guix): themed-button `action:` fires on CLICK only in `-dmenu` mode (sealed 2026-07-18, the Win95 Run box)
+
+A `.rasi` `button`/custom widget with `action: "kb-custom-1"` etc. does **not** fire on mouse click under `-modes run`/`-show run`/`-show drun` — the click is silently swallowed. It fires correctly under **`-dmenu`**. (Verified exhaustively: real clicks are delivered — dmenu rows double-click-accept — and keyboard bindings work; only the run/drun-mode button click is dead.) So a Win95-style Run box with clickable OK/Cancel/Browse/dropdown buttons must be driven as `-dmenu`, with the wrapper executing the accepted command itself (`setsid bash -c "$out"`) and branching on rofi's exit code (`kb-custom-1`→10, `kb-custom-2`→11, `kb-cancel`→1, accept→0). This is also more Win95-authentic (the real Run box doesn't autocomplete). See `redstone-9x-rofi-run`.
+
+Three attached traps:
+- **Empty `-dmenu` list + button click = SIGSEGV (exit 139).** Always feed ≥1 row (append a trailing blank line). The Run history doubles as the row list; the listview stays `enabled: false` to hide it until the ▼ dropdown reveals it via `-theme-str 'listview { enabled: true; }'`.
+- **`content:` and `action:` on the SAME rasi line → rofi absorbs `action` into the `content` string** (the button ends up with no action). Put every property on its own line; verify with `rofi -dump-theme`.
+- **This build renders no IMAGES in custom theme widgets** — `filename:` icons and `background-image:` both come up blank (text renders fine). So the Win95 corner Run icon and the ▼ dropdown glyph can't be drawn here; the buttons work but stay text/bevel-only. Would need a rofi rebuilt from mainline.
