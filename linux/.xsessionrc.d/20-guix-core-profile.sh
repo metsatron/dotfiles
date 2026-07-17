@@ -86,4 +86,24 @@ if systemctl --user is-active --quiet default.target 2>/dev/null; then
   systemctl --user unset-environment GIO_EXTRA_MODULES 2>/dev/null || true
 fi
 unset GIO_EXTRA_MODULES
+
+# The Guix profile sets GST_PLUGIN_SYSTEM_PATH to ONLY its own plugin dir. That
+# var REPLACES (does not append to) GStreamer's compiled-in OS default, so every
+# system app in this session (e.g. Debian Quod Libet, GStreamer 1.26) stops
+# scanning /usr/lib/.../gstreamer-1.0 and loses pulsesink -> playback dies with
+# "No GStreamer audio sink found". This runs once for the whole session, so it
+# fixes every GUI app regardless of which shell launches it. Append the OS
+# plugin dirs back: each GStreamer core silently skips version-mismatched
+# plugins, so Guix (1.28) and system (1.26) apps each keep their own set.
+if [ -n "${GST_PLUGIN_SYSTEM_PATH:-}" ]; then
+  for __gst in "/usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0" /usr/lib/gstreamer-1.0 /usr/lib64/gstreamer-1.0; do
+    [ -d "$__gst" ] || continue
+    case ":$GST_PLUGIN_SYSTEM_PATH:" in
+      *":$__gst:"*) ;;
+      *) GST_PLUGIN_SYSTEM_PATH="$GST_PLUGIN_SYSTEM_PATH:$__gst" ;;
+    esac
+  done
+  export GST_PLUGIN_SYSTEM_PATH
+  unset __gst
+fi
 # Session wiring for Guix profiles:1 ends here
