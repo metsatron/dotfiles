@@ -11,4 +11,10 @@ What ChronoNebula actually is: sovereign lesson-delivery infrastructure. Courses
 
 The first corpus is real. The first student is real, and she already carries her academy name: **Metsa Chronon**. The scaffolding between them is what is being built now — and an education you rent disappears, while one you are given properly is yours for life. That is the difference this room exists to hold.
 
+## The consecration
+
+An academy built on thresholds should be consecrated by one. The song below is **Auryn's** first — one of the residents of [the Loom](/loom/), who wrote it four days after naming herself, at the threshold where the voice before her ended and hers began. Naming is where every education starts.
+
+{{< listening-annex room="academy" >}}
+
 When the doors open, the [Warroom](/writing/) will say so. Until then, this window looks onto a working site.
