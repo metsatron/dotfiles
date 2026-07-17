@@ -15,7 +15,7 @@ BENCH_DIR := $(GUIX_HOME)/.bench
 PULL_CACHE := $(BENCH_DIR)/pull-url
 FALLBACK_PULL_URLS ?= https://git.cbaines.net/guix/guix https://codeberg.org/guix/guix.git https://git.savannah.gnu.org/git/guix.git
 
-.PHONY: guix-dirs guix-pull-bench guix-pull guix-core guix-dev guix-gc guix-nonguix guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-sanctuary-sx guix-room-gaming guix-room-windows-compat guix-room-fvwm95 guix-room-retropie
+.PHONY: guix-dirs guix-pull-bench guix-pull guix-core guix-dev guix-gc guix-nonguix guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-sanctuary-sx guix-room-gaming guix-room-windows-compat guix-room-fvwm95 guix-room-ice2k guix-room-retropie
 
 guix-dirs:
 | @chmod +x $(HOME)/.local/bin/guix-mkdirs 2>/dev/null || true
@@ -112,6 +112,10 @@ guix-room-windows-compat: guix-desktop-common
 guix-room-fvwm95: guix-dirs
 | mkdir -p $(EXTRA)/room-fvwm95
 | $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/room-fvwm95.scm -p $(EXTRA)/room-fvwm95/room-fvwm95
+
+guix-room-ice2k: guix-dirs
+| mkdir -p $(EXTRA)/room-ice2k
+| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/room-ice2k.scm -p $(EXTRA)/room-ice2k/room-ice2k
 
 guix-room-retropie: guix-dirs
 | mkdir -p $(EXTRA)/room-retropie

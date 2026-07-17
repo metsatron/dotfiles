@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+sanctuary-redstone-9x-ice2k-build - build the ice2k Windows components inside
+                                    the sanctuary-redstone-9x container.
+
+Usage: sanctuary-redstone-9x-ice2k-build
+       sanctuary-redstone-9x-ice2k-build -h | --help
+
+No arguments. Stages ice2k's component sources from the vendor/ice2k submodule,
+compiles them under the room-ice2k Guix profile, and installs the binaries and
+shared libraries into the guest home at ~/.local/ice2k/{bin,lib}.
+
+Prerequisites:
+  1. git submodule present:  git -C ~/DotCortex submodule update --init vendor/ice2k
+  2. FOX toolchain profile:  loom guix:ice2k-apply   (or: make guix-room-ice2k)
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+if (( $# > 0 )); then
+  usage >&2
+  exit 1
+fi
+
+SANCTUARY="sanctuary-redstone-9x"
+GH="${HOME}/.local/share/dotcortex/guests/${SANCTUARY}/home"
+SRC="${HOME}/DotCortex/vendor/ice2k"
+BUILD_DIR="${GH}/.cache/ice2k-build"
+ROOM_PROFILE="${HOME}/.guix-extra-profiles/room-ice2k/room-ice2k/etc/profile"
+
+# ── Preflight ─────────────────────────────────────────────────────────────
+if [[ ! -d "${SRC}/i2klibs" ]]; then
+  echo "ice2k-build: submodule missing at ${SRC}" >&2
+  echo "  Run: git -C \"${HOME}/DotCortex\" submodule update --init vendor/ice2k" >&2
+  exit 1
+fi
+if [[ ! -e "${ROOM_PROFILE}" ]]; then
+  echo "ice2k-build: room-ice2k Guix profile not built (${ROOM_PROFILE})" >&2
+  echo "  Run: loom guix:ice2k-apply   (or: make guix-room-ice2k)" >&2
+  exit 1
+fi
+
+# Buildable component directories, in dependency order (i2klibs first — every
+# program links -linih-i2k -li2kbrand -lctl32 against them).
+COMPONENTS=(
+  i2klibs/ini i2klibs/branding i2klibs/comctl32
+  rundlg shutdown msgina mmc/devmgmt
+  control/sysdm control/desk games/winmine
+  batmeter ice2kver shell/hotplug shell/backmgr
+)
+
+echo "ice2k-build: staging component sources into ${BUILD_DIR}…"
+rm -rf "${BUILD_DIR}"
+for c in "${COMPONENTS[@]}"; do
+  mkdir -p "${BUILD_DIR}/$(dirname "${c}")"
+  cp -a "${SRC}/${c}" "${BUILD_DIR}/${c}"
+done
+
+echo "ice2k-build: compiling inside ${SANCTUARY} (room-ice2k profile)…"
+# The guest home IS the container's $HOME, so ${BUILD_DIR} == ~/.cache/ice2k-build
+# inside the container — no host-path interpolation needed in the inner script.
+sanctuary-exec "${SANCTUARY}" bash -c '
+set -e
+. "${HOME}/.guix-extra-profiles/room-ice2k/room-ice2k/etc/profile"
+
+BUILD_DIR="${HOME}/.cache/ice2k-build"
+PREFIX="${HOME}/.local/ice2k"
+mkdir -p "${PREFIX}/bin" "${PREFIX}/lib" "${PREFIX}/include/ice2k"
+
+# Resolve ice2k in-tree libs/headers via gccs standard search paths so the
+# components hard-coded -lctl32 / -li2kbrand / -linih-i2k link, and redirect
+# installs with PREFIX (replaces ice2ks sudo make install into /usr/local).
+export LIBRARY_PATH="${PREFIX}/lib${LIBRARY_PATH:+:${LIBRARY_PATH}}"
+export CPATH="${PREFIX}/include:${PREFIX}/include/ice2k${CPATH:+:${CPATH}}"
+export CPLUS_INCLUDE_PATH="${PREFIX}/include:${PREFIX}/include/ice2k${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}"
+# Bake an RUNPATH into every output so the ice2k binaries find their own libs
+# AND libFOX at runtime without any session LD_LIBRARY_PATH — ld honours
+# LD_RUN_PATH when the Makefile passes no explicit -rpath (ice2ks do not).
+# room-ice2k is a build profile, but its store-backed lib dir persists after the
+# build, so RUNPATH into it is stable. (The launcher also adds these to
+# LD_LIBRARY_PATH as a belt-and-suspenders fallback if fox-config injects -rpath
+# and suppresses LD_RUN_PATH.)
+export LD_RUN_PATH="${PREFIX}/lib:${HOME}/.guix-extra-profiles/room-ice2k/room-ice2k/lib${LD_RUN_PATH:+:${LD_RUN_PATH}}"
+
+build_one() {
+  echo "  → building $1"
+  (
+    cd "${BUILD_DIR}/$1"
+    make clean >/dev/null 2>&1 || true
+    make -j"$(nproc)"
+    make install PREFIX="${PREFIX}"
+  )
+}
+
+for c in i2klibs/ini i2klibs/branding i2klibs/comctl32 \
+         rundlg shutdown msgina mmc/devmgmt \
+         control/sysdm control/desk games/winmine \
+         batmeter ice2kver shell/hotplug shell/backmgr; do
+  build_one "${c}"
+done
+
+echo "ice2k-build: installed binaries:"
+ls -1 "${PREFIX}/bin" 2>/dev/null | sed "s/^/    /" || true
+echo "ice2k-build: installed libraries:"
+ls -1 "${PREFIX}/lib" 2>/dev/null | sed "s/^/    /" || true
+'
+
+# ── Draw ice2k assets into the guest home (one-time). The launcher does NOT
+# re-copy these each start — they come from the fixed submodule, so per-launch
+# projection would be pure churn (the icon set alone is >100 MB). ──
+echo "ice2k-build: drawing themes / icons / FOX config into the guest…"
+
+# GTK theme (Windows 2000/XP look for GTK apps) — made available, not activated.
+mkdir -p "${GH}/.themes"
+rm -rf "${GH}/.themes/Ice2K"
+cp -a "${SRC}/.themes/Ice2K" "${GH}/.themes/Ice2K"
+
+# Icon themes (SE98, LinXP, …) — available for GTK/pcmanfm and menu-icon grafting.
+mkdir -p "${GH}/.icons"
+for t in default LinXP SE98 standard-with-shadow; do
+  [ -d "${SRC}/.icons/${t}" ] || continue
+  rm -rf "${GH}/.icons/${t}"
+  cp -a "${SRC}/.icons/${t}" "${GH}/.icons/${t}"
+done
+
+# FOX registry — colours/fonts the ice2k FOX programs read at runtime.
+rm -rf "${GH}/.foxrc"
+cp -a "${SRC}/.foxrc" "${GH}/.foxrc"
+
+# ice2k IceWM WM themes (Win2k/XP variants) staged where the launcher does not
+# wipe them; the launcher links these into ~/.icewm/themes/ after its own theme
+# projection so they are selectable without being clobbered each start.
+mkdir -p "${GH}/.local/ice2k/icewm-themes"
+for t in "${SRC}"/icewm-dir/themes/Win2kmod-*; do
+  [ -d "${t}" ] || continue
+  n="$(basename "${t}")"
+  rm -rf "${GH}/.local/ice2k/icewm-themes/${n}"
+  cp -a "${t}" "${GH}/.local/ice2k/icewm-themes/${n}"
+done
+
+echo "ice2k-build: done → ${GH}/.local/ice2k/{bin,lib}, themes/icons/.foxrc drawn"
