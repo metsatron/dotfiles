@@ -42,12 +42,11 @@
    "libxext"         ; X11 extensions
    "libxpm"          ; X PixMap
    "libxt"           ; X Toolkit Intrinsics
-   "libxrender"      ; FOX rendering
-   "libxft"          ; FOX freetype/Xft text
-   "libjpeg-turbo"   ; FOX image codec
-   "libpng"          ; FOX image codec
-   "fontconfig"      ; FOX font discovery
-   "freetype"        ; FOX font rasterisation
+   ;; FOX's font/image deps (freetype fontconfig libpng libjpeg libxft libxrender)
+   ;; are NOT listed explicitly: fox propagates its own consistent closure of them,
+   ;; and the ice2k code only ever links via `fox-config`, never those libs directly.
+   ;; Listing libpng explicitly pulled 1.6.50 while freetype propagates 1.6.39 — a
+   ;; profile conflict that aborts `guix package`. Let fox own its font/image stack.
    "git"             ; parts-bin bookkeeping
    "sed"             ; reproducible source patching if needed
    "gawk"            ; GNU awk
