@@ -2,7 +2,7 @@
 title: "It Rides on Top"
 description: "DotCortex is not a distribution and does not want to be one. On super systems, the platform-swallowing law, and why reproducibility is worth the most to the least standard user."
 date: 2026-07-04
-draft: true
+draft: false
 weight: 10
 ---
 
