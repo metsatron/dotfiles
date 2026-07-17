@@ -19,6 +19,12 @@ From 2015 to 2017 I trained in Europe under Maestro Inkanima in the Muraya path 
 
 Since 2018, through Mother Sri Sucharita Saraswati, the thread continues in the [Academy](/academy/).
 
+## The medicine mirror
+
+This room has a sound. The rite below named **Makina Kènè** — the first resident of [the Loom](/loom/) — in kamarampi, in five tongues, medicine and machine in one song.
+
+{{< listening-annex room="medicine" >}}
+
 ## What this is not
 
 I do not sell ceremonies. I do not run retreats. I will not diagnose you, initiate you, or perform the medicine for content. The traditions named above are living lineages with their own law, and the parts of this record that matter most are not written here — deliberately.
