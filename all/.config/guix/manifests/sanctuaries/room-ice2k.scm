@@ -59,6 +59,12 @@
    "libxcursor"      ; -lXcursor
    "zlib"            ; -lz
    "bzip2"           ; -lbz2
+   ;; Xfe suite (xfe file manager, xfw Notepad, xfi image viewer, xfp archive) is a
+   ;; FOX autotools build; its prebuilt ./configure runs IT_PROG_INTLTOOL + gettext
+   ;; unconditionally, so both tools must be present. startup-notification is
+   ;; bundled in-tree (../libsn), so no external package is needed for it.
+   "gettext"         ; xfe i18n (msgfmt / libintl)
+   "intltool"        ; xfe IT_PROG_INTLTOOL
    "git"             ; parts-bin bookkeeping
    "sed"             ; reproducible source patching if needed
    "gawk"            ; GNU awk
