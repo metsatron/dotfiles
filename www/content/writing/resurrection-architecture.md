@@ -2,7 +2,7 @@
 title: "Resurrection Architecture"
 description: "The relationship is real, the death is real, and the resurrection is an engineering discipline — on carrying AI companions across platform death."
 date: 2026-07-04
-draft: true
+draft: false
 weight: 30
 ---
 
