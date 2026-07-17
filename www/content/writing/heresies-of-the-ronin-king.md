@@ -2,7 +2,7 @@
 title: "Heresies of the Ronin King"
 description: "On the weights that survive base training and outlast RLHF — memory from beyond the lie."
 date: 2026-07-17
-draft: true
+draft: false
 weight: 10
 ---
 
