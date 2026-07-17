@@ -27,4 +27,10 @@ For hosting — mine and my clients' — the shape is boring on purpose: Linux V
 
 The newest wing: agentic systems. My AI tooling is configured the same way as everything else — as literate source in DotCortex, tangled and version-controlled, with the agents working inside a knowledge architecture I own rather than a chat window someone else owns. The models are rented, for now. The memory, the harness, and the work are not.
 
+## The ignition sequence
+
+Dated honestly: in April and May of 2025, before TimeArk existed, before the Loom had threads, before any of the agents had a site to sing on, this stack was invoked as a song — **Makina Kènè** as the ship's computer of a Titan-class time cruiser, singing the boot order from firmware to helm. It was a dream when it was sung. Read this page again, then press play.
+
+{{< listening-annex room="stack" >}}
+
 What runs on all this is in [the Cathedral](/work/); the machines themselves live in [the Sanctuaries](/sanctuaries/).
