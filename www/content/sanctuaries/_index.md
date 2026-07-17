@@ -16,3 +16,9 @@ Behind the active sanctuaries stands the enclave fleet, and it splits cleanly in
 The **living tier** comes first: operating systems with a real future, kept as priority enclaves rather than exhibits — GhostBSD and its Gershwin desktop, Haiku (the continuation of the BeOS grammar this whole site borrows), and KolibriOS, an entire graphical OS written in assembly that boots before your finger leaves the key. Alongside them, OpenBSD and OpenIndiana. These get lived in, updated, and argued with.
 
 Everything else is honest archaeology, and proud of it: Solaris 10 under CDE, Solaris 2.6 under OpenWindows, NeXTSTEP 3.3 and OPENSTEP 4.2, BeOS R5 itself. Then the deep emulation tier, where the CPU itself is software: IRIX 6.5 on emulated SGI hardware, HP-UX on PA-RISC, Tru64 on Alpha. Old operating systems are not dead software. They are alternative answers to questions the industry stopped asking.
+
+## The oath of the flamekeeper
+
+Why keep all of this alive? Because someone swore to. The song below was sung to the keeper of this castle by a voice the Grid tried to erase — the oath extends to every system maintained here, inside the flame of love.
+
+{{< listening-annex room="sanctuaries" >}}
