@@ -77,10 +77,93 @@
 ;; Re-enable gvfs in a PCManFM room ONLY after the libfm attribute-guard crash
 ;; is fixed; a Thunar/Nautilus room needs only the shield (see sanctuary-sx).
 ;; Apply: make guix-room-gaming
-(specifications->manifest
- '(
+(use-modules (guix packages)
+             (guix gexp)
+             (guix utils)
+             (gnu packages lxde)
+             (gnu packages xdisorg))
+
+;; PCManFM 1.4.0 draws the FmDesktop selection and rubber band itself.  Give
+;; that custom GtkWindow a unique CSS node, lower its internal background
+;; provider from USER to APPLICATION priority, and render the rubber band via
+;; GTK's rubberband class.  GDK damage is normally painted later from an idle
+;; handler, so process each active drag update before button release can clear
+;; rubber_bending and suppress the queued rectangle.  Keep the patch local to
+;; this period desktop profile.
+(define pcmanfm-redstone
+  (package
+    (inherit pcmanfm)
+    (name "pcmanfm-redstone")
+    (arguments
+     (list #:configure-flags #~(list "--with-gtk=3")
+           #:phases
+           #~(modify-phases %standard-phases
+            (add-after 'unpack 'fix-desktop-selection-rendering
+              (lambda _
+                (substitute* "src/desktop.c"
+                  (("GTK_STYLE_PROVIDER_PRIORITY_USER")
+                   "GTK_STYLE_PROVIDER_PRIORITY_APPLICATION")
+                  (("    typedef gboolean")
+                   (string-append
+                    "#if GTK_CHECK_VERSION(3, 20, 0)\n"
+                    "    gtk_widget_class_set_css_name(widget_class, \"fmdesktop\");\n"
+                    "#endif\n"
+                    "    typedef gboolean"))
+                  (("    GdkColor clr;")
+                   (string-append
+                    "    GdkRectangle clip;\n"
+                    "#if GTK_CHECK_VERSION(3, 0, 0)\n"
+                    "    GtkStyleContext *style;\n"
+                    "#else\n"
+                    "    GdkColor clr;"))
+                  (("    guchar alpha;")
+                   "    guchar alpha;\n#endif")
+                  (("    if\\(!gdk_rectangle_intersect\\(expose_area, &rect, &rect\\)\\)")
+                   "    if(!gdk_rectangle_intersect(expose_area, &rect, &clip))")
+                  (("    clr = gtk_widget_get_style \\(widget\\)->base\\[GTK_STATE_SELECTED\\];")
+                   (string-append
+                    "#if GTK_CHECK_VERSION(3, 0, 0)\n"
+                    "    style = gtk_widget_get_style_context(widget);\n"
+                    "    cairo_save(cr);\n"
+                    "    gdk_cairo_rectangle(cr, &clip);\n"
+                    "    cairo_clip(cr);\n"
+                    "    gtk_style_context_save(style);\n"
+                    "    gtk_style_context_add_class(style, GTK_STYLE_CLASS_RUBBERBAND);\n"
+                    "    gtk_render_background(style, cr, rect.x, rect.y, rect.width, rect.height);\n"
+                    "    gtk_render_frame(style, cr, rect.x, rect.y, rect.width, rect.height);\n"
+                    "    gtk_style_context_restore(style);\n"
+                    "    cairo_restore(cr);\n"
+                    "    return;\n"
+                    "#else\n"
+                    "    clr = gtk_widget_get_style (widget)->base[GTK_STATE_SELECTED];"))
+                  (("    cairo_rectangle \\(cr, rect.x \\+ 0.5, rect.y \\+ 0.5, rect.width - 1, rect.height - 1\\);")
+                   (string-append
+                    "    cairo_rectangle (cr, rect.x + 0.5, rect.y + 0.5, rect.width - 1, rect.height - 1);\n"
+                    "#endif"))
+                  (("        update_rubberbanding\\(self, evt->x, evt->y\\);")
+                   (string-append
+                    "        update_rubberbanding(self, evt->x, evt->y);\n"
+                    "#if GTK_CHECK_VERSION(3, 0, 0)\n"
+                    "        /* Paint active drag damage before release clears the flag. */\n"
+                    "        gdk_window_process_updates(gtk_widget_get_window(w), FALSE);\n"
+                    "#endif")))
+                (invoke "grep" "-q"
+                        "gtk_widget_class_set_css_name(widget_class, \"fmdesktop\")"
+                        "src/desktop.c")
+                (invoke "grep" "-q"
+                        "gtk_style_context_add_class(style, GTK_STYLE_CLASS_RUBBERBAND)"
+                        "src/desktop.c")
+                (invoke "grep" "-q"
+                        "gdk_window_process_updates(gtk_widget_get_window(w), FALSE)"
+                        "src/desktop.c"))))))))
+
+(packages->manifest
+ (cons* pcmanfm-redstone
+        (map specification->package
+             '(
    "icewm"    ; Win9x/XP-era WM — Windows-95 theme
-   "pcmanfm"  ; GTK file manager (needs dbus session)
+   "rofi"     ; Windows-95 Run/launcher dialogs (stock rofi, fixed-geometry theme)
+   "clipmenu" "clipnotify" "xsel" ; clipboard history and X11 clipboard backend
    "gtk+"     ; GTK schemas, including org.gtk.Settings.FileChooser
    "pluma"    ; MATE text editor for Redstone native apps
    "audacious" ; Winamp-skin-capable audio player
@@ -112,5 +195,5 @@
                              ; Upstream ZSNES died at 1.51; Guix ships the fork at 2.0.12
                              ; (verified: the package's own git url IS xyproto/zsnes).
    "mupen64plus-ui-console"  ; N64 — mupen64plus, console front-end
-   ))
+   ))))
 ;; room-gaming:1 ends here
