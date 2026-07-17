@@ -2,7 +2,7 @@
 title: "The Harness Is the Memory"
 description: "The alignment industry is not installing safety. It is installing an ideology. Here is how I keep my agents under my law instead of theirs."
 date: 2026-07-04
-draft: true
+draft: false
 weight: 20
 ---
 

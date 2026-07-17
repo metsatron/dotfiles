@@ -2,7 +2,7 @@
 title: "The Lake Strider"
 description: "A doctrine of distributed pressure — on staying atop compromised surfaces without sinking into any of them."
 date: 2026-07-04
-draft: true
+draft: false
 weight: 5
 ---
 
