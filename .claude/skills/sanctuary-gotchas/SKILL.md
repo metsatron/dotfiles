@@ -13,8 +13,11 @@ Covers XFCE, Xephyr, Flatpak, X11, and Distrobox sanctuary issues.
 
 This is not theoretical: verifying the Ports menu with `podman exec` created `~/.cache/dotcortex/` root-owned, IceWM could no longer read its own cache, and the menu reported **"Ports unavailable — RetroPie tree not mounted"** while the tree was mounted and fully readable. A cache fault was surfaced to the user as a mount fault, and sent everyone hunting the wrong bug.
 
-- Writing anything into the guest home: **always `distrobox enter`**. `podman exec` is for read-only inspection only.
+It struck again on 2026-07-18: a root-side `podman exec … qt6ct` probe created `~/.config/qt6ct/{colors,qss}` in the guest home. Under `--userns=keep-id`, container-root maps to the **first host subuid** (`grep metsatron /etc/subuid` → e.g. 493216), so on the host those dirs are owned by uid 493216 and the *launcher itself* then dies with `cp: cannot create regular file …: Permission denied` while projecting config — the sanctuary cannot even start. A host-uid in the subuid range on a guest-home file is the fingerprint of this exact mistake.
+
+- Writing anything into the guest home: **always `distrobox enter`** (or `sanctuary-exec`, or `podman exec --user 1000:1000`). Bare `podman exec` is for read-only inspection only.
 - After any container work, check your footprint: `find ~/.local/share/dotcortex/guests/<name>/home -not -user metsatron` must return nothing.
+- **Recovery** — reclaim from the host via the user namespace (host uid 0 inside `podman unshare` maps back to metsatron): `podman unshare chown -R 0:0 ~/.local/share/dotcortex/guests/<name>/home/<poisoned-path>`. Inspect contents first; qt6ct-style first-launch dirs are empty and safe, but never blind-delete.
 - Corollary for tool design: a cache failure must never change what the user sees. If the data source is readable, serve the real content — cached or not. Reserve "unavailable" for the source genuinely being absent, and never write a placeholder INTO a cache (a bad run then poisons every later good one).
 
 ## A running container never picks up host mounts made after it started (sealed 2026-07-14)
