@@ -155,6 +155,7 @@ include $(HOME)/DotCortex/all/.mk/snap.mk
 include $(HOME)/DotCortex/all/.mk/appimage.mk
 include $(HOME)/DotCortex/all/.mk/am.mk
 include $(HOME)/DotCortex/all/.mk/cargo.mk
+include $(HOME)/DotCortex/all/.mk/docs.mk
 include $(HOME)/DotCortex/all/.mk/homebrew.mk
 include $(HOME)/DotCortex/all/.mk/bun.mk
 include $(HOME)/DotCortex/all/.mk/bunx.mk

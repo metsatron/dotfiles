@@ -576,6 +576,15 @@
          "Build manifest on CARGO_BUILD_HOST, verify ABI, install here"
          (lambda () (sh "~/.local/bin/cargo-remote-apply")))
 
+   ;; --- Fleet documentation library (sanctuary-docs.org) ---
+   (task 'docs:build
+         "Build Zeal docsets for this machine (host + sanctuary man corpora)"
+         (lambda () (sh "~/.local/bin/dotcortex-docs-build")))
+
+   (task 'docs:clean
+         "Remove all generated docsets"
+         (lambda () (sh "rm -rf ~/.local/share/dotcortex/docsets")))
+
    ;; --- Homebrew ---
    (task 'brew:apply
          "Enforce Homebrew state from DotCortex manifest"
