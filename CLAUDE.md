@@ -158,7 +158,7 @@ DotCortex is Mètsàtron's declarative, literate, reproducible dotfiles system. 
     every time, never assumed from the design or from an earlier check in the same session."
     Never run =distrobox rm=, =podman rm=, or any equivalent destructive removal against a
     sanctuary container (=sanctuary-qtile=, =sanctuary-gnustep=, =sanctuary-cde=,
-    =sanctuary-redstone-9x=, =sanctuary-sx=, =sanctuary-retropie=, or any future sanctuary)
+    =sanctuary-redstone-9x=, =sanctuary-godzilla-xs=, =sanctuary-retropie=, or any future sanctuary)
     without, every single time, with no grandfathering from a prior approval or a prior
     check in the same conversation:
     - A =podman diff= (or equivalent) review of the container's own writable layer,
