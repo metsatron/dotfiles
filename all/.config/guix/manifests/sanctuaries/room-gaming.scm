@@ -185,6 +185,7 @@
    "gnumeric"    ; Gnumeric — spreadsheet, the Excel/Works stand-in (Accessories)
    "zeal"        ; Zeal — offline documentation browser, the Start-menu "Help"
    "fsearch"     ; FSearch — fast file search, the Start-menu "Find"
+   "qt6ct"       ; Qt6 config tool — drives the built-in "Windows" style + Win95 palette for Zeal, which is a Qt6 app (qtbase-6.9.2), NOT Qt5 — so qt5ct would be inert here. Co-located with Zeal so the qt6ct platformtheme plugin (lib/qt6/plugins/platformthemes/libqt6ct.so) resolves; env-inert in the profile so it never touches session start — QT_QPA_PLATFORMTHEME=qt6ct is set per-app on the menu entries, not in the session command.
    "tcalc"       ; terminal calculator (Accessories) — launched via xterm -e
    "aisleriot"   ; Solitaire card games: Klondike (default) and FreeCell (--variation=freecell)
    "sdl2"         ; SDL2 runtime — dsdmine (Minesweeper) links against it
