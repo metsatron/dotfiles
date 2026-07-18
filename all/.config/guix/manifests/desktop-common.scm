@@ -2,7 +2,7 @@
 
 ;; Packages shared across all three desktop sanctuaries. Extracted from =core.scm=:
 ;; host-only items (gimp, inkscape, vlc, gnome-boxes, cdemu, deskflow, flatpak,
-;; maak, guile, rofi, *fetch, borg, inotify-tools, node, smem, Python science
+;; maak, guile, rofi, alternate fetch tools, borg, inotify-tools, node, smem, Python science
 ;; stack) stay in =core.scm= only.
 
 
@@ -26,7 +26,11 @@
    "zsh-vi-mode" "zsh-autosuggestions" "zsh-history-substring-search"
    "tmux"
 
-   ;; --- Shell prompt ---
+   ;; --- Shell identity and prompt ---
+   ;; fastfetch is consumed by the declared shell identities in both the
+   ;; Redstone and SX rooms.  Keep it in the shared runtime rather than relying
+   ;; on the host core profile leaking into one launcher but not another.
+   "fastfetch"
    "starship"
 
    ;; --- Core utilities ---
