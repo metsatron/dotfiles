@@ -5,7 +5,7 @@ skin: godzilla
 weight: 1
 ---
 
-The Godzilla XS-86000 is the visible identity of `sanctuary-sx` — a habitat rooted in the visual culture of the Sharp X68000: Human68k, SX-Window, and the Japanese workstation grammar of the early 1990s. The chassis is XFCE, shaped by hand until it stopped looking like XFCE; the soul is a machine Sharp never quite built.
+The Godzilla XS-86000 is the visible identity of `sanctuary-godzilla-xs` — a habitat rooted in the visual culture of the Sharp X68000: Human68k, SX-Window, and the Japanese workstation grammar of the early 1990s. The chassis is XFCE, shaped by hand until it stopped looking like XFCE; the soul is a machine Sharp never quite built.
 
 ![The Godzilla XS-86000 desktop as posted on r/unixporn — Winamp mid-track, Castlevania Chronicles in the music library, an AMV playing, and the system driver reporting all buses ready](godzilla-desktop.png)
 
