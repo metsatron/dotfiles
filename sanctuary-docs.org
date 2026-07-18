@@ -1,0 +1,331 @@
+#+TITLE: Sanctuary Docs: DotCortex
+#+DESCRIPTION: Fleet documentation library — Zeal docset generation for sanctuaries and hosts
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:makefile :comments no :padline no
+
+* The Fleet Library
+
+Zeal is the Help engine of the Virtual Habitat: every sanctuary with a Zeal gets a shelf of docsets describing the world it actually lives in. The supersystem owns one generic generator; discovery is per-machine and automatic, so nothing here names a host or hardcodes a corpus. Each machine builds its own truth from what is present, exactly like tangle→stow: the generator syncs via git, the artefacts never do.
+
+Discovery lanes (all automatic, all conditional on presence):
+
+- *Host manuals* — =manpath= on the machine, docset named after the short hostname. The T480s docset reflects Devuan; the X230's reflects its own world.
+- *Sanctuary manuals* — every guest under =$XDG_DATA_HOME/dotcortex/guests/*/home= with Guix profiles gets its own docset from its *current* profile generations only (stale-generation man pages are a trap: a naive find over =.guix-extra-profiles= returns pages for software no longer installed).
+- Later phases add authored layers (Redstone 9X Help, Sanctuary Help), org-export manuals (DotCortex, HelmCortex — the latter only where =~/HelmCortex= resolves, which is the entire secrecy gate), and Texinfo manuals (Emacs, Doom, Spacemacs).
+
+Generated docsets land in =$XDG_DATA_HOME/dotcortex/docsets/= — never committed, never inside =$HOME= config paths — and are symlinked into every guest home that has a Zeal docsets directory. Section→type mapping: 1,8→Command; 2,3,9→Function; 4,5→File; 6→Game; 7→Guide.
+
+The renderer is =mandoc= (declared in the core Guix manifest; the driver self-wraps in =guix shell mandoc= when the profile has not been applied yet, so a fresh machine can build docs before its first =guix:apply=). Pages whose body is a single =.so= redirect are resolved to their target. Incremental rebuilds track source path+mtime+size in a build manifest inside the docset, so an unchanged corpus is a no-op.
+
+* Docset generator
+
+One docset per invocation. Mode =man= takes any number of man roots; later modes (=org=, =info=) join the same CLI. Python for the index/plist/manifest bookkeeping; =mandoc= does all rendering.
+
+#+BEGIN_SRC python :tangle all/.local/bin/dotcortex-docset-gen :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Generate a Dash/Zeal docset. Mode `man`: render man roots via mandoc.
+
+Usage:
+  dotcortex-docset-gen man --name "T480s Manuals" --keyword t480s \
+      --out /path/Name.docset ROOT [ROOT ...]
+
+Rules honoured here:
+  - English pages only (locale subdirs like man/fr/man1 are skipped).
+  - First root wins on (name, section) collisions.
+  - `.so` redirect pages resolve to their target's HTML.
+  - Incremental: unchanged sources (mtime+size) are not re-rendered.
+"""
+import argparse, gzip, json, re, shutil, sqlite3, subprocess, sys
+from datetime import datetime
+from pathlib import Path
+
+TYPE_MAP = {"1": "Command", "8": "Command", "2": "Function", "3": "Function",
+            "9": "Function", "4": "File", "5": "File", "6": "Game", "7": "Guide"}
+
+CSS = """\
+body { background:#ffffe1; color:#000000; font-family:"Tahoma","MS Sans Serif",Verdana,sans-serif; font-size:13px; margin:1.2em 1.6em; max-width:60em; }
+h1,h2 { color:#000000; font-weight:bold; font-size:14px; border:none; text-transform:lowercase; }
+h1::first-letter, h2::first-letter { text-transform:uppercase; }
+h1.Sh, h2.Ss { margin-top:1.2em; }
+code,pre,.Nm,.Fl,.Cm,.Ar,.Pa { font-family:"Courier New",monospace; }
+pre { background:#f4f4dc; border:1px solid #808080; padding:6px 8px; overflow-x:auto; }
+a { color:#000080; }
+table.head, table.foot { width:100%; font-size:11px; color:#000000; }
+"""
+
+PLIST = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>{ident}</string>
+  <key>CFBundleName</key><string>{name}</string>
+  <key>DocSetPlatformFamily</key><string>{keyword}</string>
+  <key>isDashDocset</key><true/>
+  <key>dashIndexFilePath</key><string>index.html</string>
+</dict>
+</plist>
+"""
+
+MANDIR_RE = re.compile(r"^man([0-9])$")
+PAGE_RE = re.compile(r"^(?P<name>.+)\.(?P<sec>[0-9][a-zA-Z0-9]*)(?P<comp>\.(?:gz|zst|bz2|xz))?$")
+SO_RE = re.compile(rb"^\.so\s+(?:.*/)?(?P<target>\S+)\s*$")
+
+
+def read_source(path: Path) -> bytes:
+    """Decompress via stdin pipes: Guix profiles are symlink farms, and zstd
+    REFUSES symlink arguments by default (silently: warning + empty output)."""
+    if path.suffix == ".gz":
+        with gzip.open(path, "rb") as f:
+            return f.read()
+    tool = {".zst": ["zstd", "-dc"], ".bz2": ["bzip2", "-dc"],
+            ".xz": ["xz", "-dc"]}.get(path.suffix)
+    if tool:
+        with path.open("rb") as f:
+            return subprocess.run(tool, stdin=f, check=True,
+                                  capture_output=True).stdout
+    return path.read_bytes()
+
+
+def discover(roots):
+    """Yield (name, sec, digit, path) for English pages, first root wins."""
+    seen = {}
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        for mandir in sorted(root.iterdir()):
+            m = MANDIR_RE.match(mandir.name)
+            if not m or not mandir.is_dir():
+                continue
+            digit = m.group(1)
+            for page in sorted(mandir.iterdir()):
+                if not page.is_file():
+                    continue
+                pm = PAGE_RE.match(page.name)
+                if not pm:
+                    continue
+                key = (pm.group("name"), pm.group("sec"))
+                if key not in seen:
+                    seen[key] = (digit, page)
+    for (name, sec), (digit, page) in seen.items():
+        yield name, sec, digit, page
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("mode", choices=["man"])
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--keyword", required=True)
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--icon-dir", default=str(Path.home() / ".local/share/icons/Chicago95/apps"))
+    ap.add_argument("roots", nargs="+")
+    args = ap.parse_args()
+
+    if shutil.which("mandoc") is None:
+        sys.exit("dotcortex-docset-gen: mandoc not on PATH (run via dotcortex-docs-build, which wraps guix shell)")
+
+    out = Path(args.out)
+    docs = out / "Contents/Resources/Documents"
+    docs.mkdir(parents=True, exist_ok=True)
+    manifest_path = out / "Contents/.build-manifest.json"
+    manifest = {}
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            manifest = {}
+
+    ident = re.sub(r"[^a-z0-9]+", "-", args.name.lower()).strip("-")
+    (out / "Contents/Info.plist").write_text(
+        PLIST.format(ident=ident, name=args.name, keyword=args.keyword))
+    (docs / "style.css").write_text(CSS)
+    for size, dest in (("16", "icon.png"), ("32", "icon@2x.png")):
+        src = Path(args.icon_dir) / size / "help-browser.png"
+        if src.is_file():
+            shutil.copy(src, out / dest)
+
+    pages = list(discover(args.roots))
+    entries = []          # (display_name, type, html)
+    redirects = []        # (name, sec, digit, target_basename)
+    new_manifest = {}
+    rendered = skipped = failed = 0
+
+    for name, sec, digit, path in pages:
+        html = f"{name}.{sec}.html"
+        st = path.stat()
+        stamp = [st.st_mtime, st.st_size]
+        key = str(path)
+        try:
+            src = read_source(path)
+        except (OSError, subprocess.CalledProcessError):
+            failed += 1
+            continue
+        so = SO_RE.match(src.splitlines()[0]) if src else None
+        if so:
+            redirects.append((name, sec, digit, so.group("target").decode(errors="replace")))
+            new_manifest[key] = stamp
+            continue
+        if manifest.get(key) == stamp and (docs / html).is_file():
+            skipped += 1
+        else:
+            proc = subprocess.run(
+                ["mandoc", "-Thtml", "-O", "style=style.css,man=%N.%S.html"],
+                input=src, capture_output=True)
+            if proc.returncode != 0 and not proc.stdout:
+                failed += 1
+                continue
+            (docs / html).write_bytes(proc.stdout)
+            rendered += 1
+        new_manifest[key] = stamp
+        entries.append((f"{name}({sec})", TYPE_MAP.get(digit, "Guide"), html))
+
+    have = {Path(h).name for _, _, h in entries}
+    for name, sec, digit, target in redirects:
+        target_html = f"{target}.html"
+        if target_html in have:
+            entries.append((f"{name}({sec})", TYPE_MAP.get(digit, "Guide"), target_html))
+
+    # Drop HTML for sources that vanished from the corpus.
+    valid = {f"{n}.{s}.html" for (n, s) in
+             {(e[0].rsplit("(", 1)[0], e[0].rsplit("(", 1)[1].rstrip(")")) for e in entries}}
+    for f in docs.glob("*.html"):
+        if f.name not in valid and f.name != "index.html":
+            f.unlink()
+
+    db = out / "Contents/Resources/docSet.dsidx"
+    db.unlink(missing_ok=True)
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT)")
+    con.execute("CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path)")
+    con.executemany("INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?, ?, ?)", entries)
+    con.commit()
+    con.close()
+
+    by_sec = {}
+    for disp, _, _ in entries:
+        sec = disp.rsplit("(", 1)[1].rstrip(")")
+        by_sec[sec] = by_sec.get(sec, 0) + 1
+    rows = "".join(f"<tr><td>Section {s}</td><td>{c}</td></tr>"
+                   for s, c in sorted(by_sec.items()))
+    (docs / "index.html").write_text(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>{args.name}</title><link rel="stylesheet" href="style.css"></head><body>
+<h1>{args.name}</h1>
+<p>{len(entries)} manual pages, generated {datetime.now():%Y-%m-%d %H:%M} by dotcortex-docset-gen.</p>
+<p>Search this docset alone by prefixing queries with <code>{args.keyword}:</code></p>
+<table><tr><th align="left">Section</th><th align="left">Pages</th></tr>{rows}</table>
+</body></html>""")
+
+    manifest_path.write_text(json.dumps(new_manifest))
+    print(f"{args.name}: {len(entries)} entries ({rendered} rendered, {skipped} cached, {failed} failed)")
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
+
+* Guest profile map
+
+Every guest home symlinks the machine's single Guix Package Commons (=~/.guix-extra-profiles=), so "the guest's profiles" cannot be discovered from the filesystem — a naive walk yields the identical union corpus for every guest. This SSV declares which profiles each guest actually activates (mirroring its launcher's preflight list). Guests not listed here fall back to =core=, =desktop-common=, and a profile named after the guest itself, which matches the Phase 1A/1B sanctuary convention.
+
+#+BEGIN_SRC text :tangle all/.local/share/dotcortex/manifests/docsets/guest-profiles.ssv
+# GUEST PROFILES (comma-separated Guix Commons profile names)
+sanctuary-redstone-9x core,desktop-common,room-gaming,room-windows-compat
+#+END_SRC
+
+* Discovery driver
+
+Walks the machine and builds every docset that applies, then links the shelf into every guest that has a Zeal. Idempotent; run any time via =loom docs:build=.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/dotcortex-docs-build :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# Build the fleet documentation library for THIS machine and link it into guests.
+set -euo pipefail
+
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+OUT="$DATA/dotcortex/docsets"
+GUESTS="$DATA/dotcortex/guests"
+GEN="$HOME/.local/bin/dotcortex-docset-gen"
+mkdir -p "$OUT"
+
+# mandoc comes from the core Guix manifest; wrap ephemerally if not yet applied.
+if ! command -v mandoc >/dev/null 2>&1; then
+  if [ -z "${DOTCORTEX_DOCS_WRAPPED:-}" ] && command -v guix >/dev/null 2>&1; then
+    exec env DOTCORTEX_DOCS_WRAPPED=1 guix shell mandoc -- "$0" "$@"
+  fi
+  echo "dotcortex-docs-build: mandoc unavailable and no guix to wrap with" >&2
+  exit 1
+fi
+
+titleize() {  # sanctuary-redstone-9x -> Redstone 9X
+  sed -e 's/^sanctuary-//' -e 's/-/ /g' -e 's/\b\(.\)/\u\1/g' -e 's/\b\([0-9][0-9]*\)x\b/\1X/g' <<<"$1"
+}
+
+# --- Lane 1: host manuals ---------------------------------------------------
+host_short=$(hostname -s | sed 's/^[Tt]hink[Pp]ad-//')
+host_title="$(titleize "$host_short") Manuals"
+host_kw=$(tr '[:upper:]' '[:lower:]' <<<"$host_short")
+mapfile -t host_roots < <(manpath -q 2>/dev/null | tr ':' '\n' | awk 'NF && !seen[$0]++')
+if [ "${#host_roots[@]}" -gt 0 ]; then
+  "$GEN" man --name "$host_title" --keyword "$host_kw" \
+    --out "$OUT/${host_title// /-}.docset" "${host_roots[@]}"
+fi
+
+# --- Lane 2: sanctuary manuals (declared profiles, current generations) -----
+# Guest homes all symlink the shared Package Commons, so each guest's profile
+# set comes from the guest-profiles map (fallback: core, desktop-common, and
+# the guest's same-named profile).
+PROFMAP="$DATA/dotcortex/manifests/docsets/guest-profiles.ssv"
+if [ -d "$GUESTS" ]; then
+  for home in "$GUESTS"/*/home; do
+    [ -d "$home" ] || continue
+    gid=$(basename "$(dirname "$home")")
+    declared=""
+    [ -f "$PROFMAP" ] && declared=$(awk -v g="$gid" '$1==g {print $2}' "$PROFMAP")
+    [ -n "$declared" ] || declared="core,desktop-common,$gid"
+    roots=()
+    for n in ${declared//,/ }; do
+      m="$home/.guix-extra-profiles/$n/$n/share/man"   # profile/profile = CURRENT generation
+      [ -d "$m" ] && roots+=("$m")
+    done
+    [ "${#roots[@]}" -gt 0 ] || continue
+    gtitle="$(titleize "$gid") Manuals"
+    gkw=$(sed 's/^sanctuary-//' <<<"$gid")
+    "$GEN" man --name "$gtitle" --keyword "$gkw" \
+      --out "$OUT/${gtitle// /-}.docset" "${roots[@]}"
+  done
+fi
+
+# --- Link the shelf into every guest that has a Zeal ------------------------
+if [ -d "$GUESTS" ]; then
+  for zdir in "$GUESTS"/*/home/.local/share/Zeal/Zeal/docsets; do
+    [ -d "$zdir" ] || continue
+    for ds in "$OUT"/*.docset; do
+      [ -d "$ds" ] && ln -sfn "$ds" "$zdir/$(basename "$ds")"
+    done
+    # prune dangling symlinks from renamed/removed docsets
+    find "$zdir" -maxdepth 1 -xtype l -delete
+  done
+fi
+
+echo "docs-build: shelf at $OUT"
+#+END_SRC
+
+* Make fragment
+
+#+BEGIN_SRC makefile :tangle all/.mk/docs.mk :padline no
+# ~/DotCortex/all/.mk/docs.mk
+.RECIPEPREFIX := |
+SHELL := /bin/bash
+
+.PHONY: docs-build docs-clean
+
+docs-build:
+| @chmod +x $(HOME)/.local/bin/dotcortex-docs-build $(HOME)/.local/bin/dotcortex-docset-gen 2>/dev/null || true
+| $(HOME)/.local/bin/dotcortex-docs-build
+
+docs-clean:
+| rm -rf $(HOME)/.local/share/dotcortex/docsets
+#+END_SRC
