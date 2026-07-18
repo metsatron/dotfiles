@@ -20,6 +20,18 @@ It struck again on 2026-07-18: a root-side `podman exec … qt6ct` probe created
 - **Recovery** — reclaim from the host via the user namespace (host uid 0 inside `podman unshare` maps back to metsatron): `podman unshare chown -R 0:0 ~/.local/share/dotcortex/guests/<name>/home/<poisoned-path>`. Inspect contents first; qt6ct-style first-launch dirs are empty and safe, but never blind-delete.
 - Corollary for tool design: a cache failure must never change what the user sees. If the data source is readable, serve the real content — cached or not. Reserve "unavailable" for the source genuinely being absent, and never write a placeholder INTO a cache (a bad run then poisons every later good one).
 
+## Qt apps ignore SSL_CERT_FILE — an empty /etc/ssl/certs kills every Qt TLS chain (sealed 2026-07-18)
+
+QSslSocket builds its CA store by SCANNING /etc/ssl/certs (and the Debian-path ca-certificates.crt); `SSL_CERT_FILE`/`SSL_CERT_DIR` steer only plain OpenSSL, which Qt bypasses. The sanctuary image ships /etc/ssl/certs present but EMPTY, so every Qt app (Zeal docset downloads) failed with "issuer certificate of a locally looked up certificate could not be found" while a curl test with the same env passed — verifying with curl proves OpenSSL, not Qt; the passing metric lied for two rounds. Fix: root-side symlink of the desktop-common bundle to `/etc/ssl/certs/ca-certificates.crt`, asserted by the launcher each launch.
+
+## Reaching host apps from a sanctuary: host-spawn, ephemeral session bus, -env DISPLAY (sealed 2026-07-18)
+
+`distrobox-host-exec` and `host-spawn` live in /usr/bin, which the sanctuary session PATH does not include — bare names die silently from menus. host-spawn needs the HOST session bus (org.freedesktop.Flatpak): on the sysv fleet that is a dbus-launch socket at an ephemeral /tmp path — never a fixed `/run/user/1000/bus` (which does not even exist here), so the launcher must inject `$DBUS_SESSION_BUS_ADDRESS` into the menu at launch (`@HOST_SESSION_BUS@` token; /tmp is bind-mounted so the path resolves in-guest). host-spawn forwards almost no environment: without `-env DISPLAY` the app opens on the HOST desktop (:0), not the Xephyr — verified both ways. Also: the `/run/user/1000` bind goes stale like any mount-at-start; prefer /tmp-path sockets.
+
+## IceWM menu icons: size mismatch and absolute paths are the blur (sealed 2026-07-18)
+
+IceWM renders menu icons at MenuIconSize and scales whatever it actually loaded. Two traps: (1) the `~/.icewm/icons` graft must ship art at EVERY configured size (`NAME_SxS.png`) — a 16/32/48 graft under MenuIconSize=22 upscales forever; (2) an absolute-path icon BYPASSES lookup entirely, so `apps/16/foo.png` in a 24px menu is blurry no matter what else exists — absolute references must name art at the rendered size. For pixel-art conversions use nearest-neighbor (`ffmpeg -vf "scale=N:N:flags=neighbor"`), pad non-square sources square, and mind AVIF: the alpha is a second stream (`-filter_complex "[0:0][0:1]alphamerge,…"`) — plain `-i` bakes the background opaque.
+
 ## A running container never picks up host mounts made after it started (sealed 2026-07-14)
 
 Podman establishes bind mounts **when the container starts**. If the mount source is behind an **autofs** automount (e.g. an NFS tree under `~/mnt/`), and the container starts while that automount is not live, it captures an **empty** bind for the entire life of that run. Nested autofs mounts do **not** propagate into a container's mount namespace — `/home/metsatron/mnt` is simply empty inside the guest.
