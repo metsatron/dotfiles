@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+# Declarative XFCE state apply
+
+
+# [[file:../../../sanctuary-godzilla-xs.org::*Declarative XFCE state apply][Declarative XFCE state apply:1]]
+# Restore the captured sanctuary-godzilla-xs XFCE desktop state into the writable guest
+# home.  Existing state is backed up; uncaptured drift is preserved by default.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+sanctuary-godzilla-xs-config-apply - restore declared XFCE desktop state
+
+Usage: sanctuary-godzilla-xs-config-apply [--force]
+       sanctuary-godzilla-xs-config-apply -h | --help
+
+Without --force, preserves an existing guest desktop that differs from
+sanctuary-godzilla-xs-state.org and exits successfully so launch can continue.  --force
+is an explicit restore and still writes a timestamped backup before changing
+the guest home.
+EOF
+}
+
+FORCE=0
+case "${1:-}" in
+  "") ;;
+  --force) FORCE=1 ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+(( $# <= 1 )) || { usage >&2; exit 2; }
+
+REPO="${DOTCORTEX_ROOT:-${HOME}/DotCortex}"
+GUEST_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}/dotcortex/guests/sanctuary-godzilla-xs/home"
+DECLARED="${REPO}/linux/.config/sanctuary-godzilla-xs"
+MANIFEST="${DECLARED}/state.manifest"
+CAPTURE="${REPO}/linux/.local/bin/sanctuary-godzilla-xs-capture"
+STATE_DIR="${GUEST_HOME}/.local/state/dotcortex"
+APPLIED_MANIFEST="${STATE_DIR}/sanctuary-godzilla-xs-state.manifest"
+
+[[ -f "${MANIFEST}" ]] || {
+  echo "sanctuary-godzilla-xs-config-apply: missing declared manifest: ${MANIFEST}" >&2
+  echo "  Run: tangle-one sanctuary-godzilla-xs-state.org" >&2
+  exit 1
+}
+
+sx_session_running() {
+  local pid display
+  for pid in $(pgrep -x xfce4-session 2>/dev/null || true); do
+    display="$(tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null | sed -n 's/^DISPLAY=//p' | head -1)"
+    [[ "${display}" == ":94" ]] && return 0
+  done
+  return 1
+}
+
+if sx_session_running; then
+  echo "sanctuary-godzilla-xs-config-apply: XFCE is still running on :94" >&2
+  echo "  Close sanctuary-godzilla-xs before applying desktop state." >&2
+  exit 1
+fi
+
+XFCONF_LIVE="${GUEST_HOME}/.config/xfce4/xfconf/xfce-perchannel-xml"
+PANEL_LIVE="${GUEST_HOME}/.config/xfce4/panel"
+DESKTOP_LIVE="${GUEST_HOME}/.config/xfce4/desktop"
+
+has_managed_state=0
+[[ -e "${XFCONF_LIVE}" || -L "${XFCONF_LIVE}" ]] && has_managed_state=1
+[[ -e "${PANEL_LIVE}" || -L "${PANEL_LIVE}" ]] && has_managed_state=1
+[[ -e "${DESKTOP_LIVE}" || -L "${DESKTOP_LIVE}" ]] && has_managed_state=1
+
+if (( FORCE == 0 && has_managed_state == 1 )); then
+  set +e
+  "${CAPTURE}"
+  capture_status=$?
+  set -e
+  if (( capture_status == 1 )); then
+    echo "sanctuary-godzilla-xs-config-apply: preserving uncaptured desktop changes" >&2
+    echo "  Launch will continue without overwriting the live desktop." >&2
+    echo "  Promote later (after closing SX): sanctuary-godzilla-xs-capture --apply" >&2
+    echo "  Discard explicitly: sanctuary-godzilla-xs-config-apply --force" >&2
+    exit 0
+  elif (( capture_status != 0 )); then
+    echo "sanctuary-godzilla-xs-config-apply: capture preflight failed" >&2
+    exit "${capture_status}"
+  else
+    echo "sanctuary-godzilla-xs-config-apply: live desktop already matches canonical state"
+    exit 0
+  fi
+fi
+
+timestamp="$(date +%Y%m%d-%H%M%S)"
+backup_root="${STATE_DIR}/sanctuary-godzilla-xs-config-backups/${timestamp}"
+mkdir -p "${backup_root}"
+
+backup_tree() {
+  local src="$1" name="$2"
+  if [[ -e "${src}" || -L "${src}" ]]; then
+    mkdir -p "${backup_root}/${name}"
+    cp -aL "${src}/." "${backup_root}/${name}/"
+  fi
+}
+
+backup_tree "${XFCONF_LIVE}" xfconf
+backup_tree "${PANEL_LIVE}" panel
+backup_tree "${DESKTOP_LIVE}" desktop
+[[ -f "${APPLIED_MANIFEST}" ]] && cp -a "${APPLIED_MANIFEST}" "${backup_root}/applied.manifest"
+
+prepare_writable_dir() {
+  local path="$1"
+  if [[ -L "${path}" ]]; then
+    unlink "${path}"
+  elif [[ -e "${path}" && ! -d "${path}" ]]; then
+    echo "sanctuary-godzilla-xs-config-apply: expected directory: ${path}" >&2
+    exit 1
+  fi
+  mkdir -p "${path}"
+}
+
+prepare_writable_dir "${XFCONF_LIVE}"
+prepare_writable_dir "${PANEL_LIVE}"
+prepare_writable_dir "${DESKTOP_LIVE}"
+
+mkdir -p "${DECLARED}/panel" "${DECLARED}/desktop"
+rsync -a --delete "${DECLARED}/panel/" "${PANEL_LIVE}/"
+rsync -a --delete "${DECLARED}/desktop/" "${DESKTOP_LIVE}/"
+
+is_excluded_channel() {
+  case "$1" in
+    xfce4-session.xml|xfce4-notifyd.xml|displays.xml|xfce4-power-manager.xml|keyboards.xml) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+while IFS= read -r -d '' live_xml; do
+  base="$(basename "${live_xml}")"
+  is_excluded_channel "${base}" && continue
+  if ! awk -F '\t' -v rel="xfconf/${base}" '$1 == "text" && $2 == rel { found=1 } END { exit !found }' "${MANIFEST}"; then
+    rm -f -- "${live_xml}"
+  fi
+done < <(find "${XFCONF_LIVE}" -maxdepth 1 -type f -name '*.xml' -print0)
+
+if [[ -f "${APPLIED_MANIFEST}" ]]; then
+  while IFS=$'\t' read -r kind live_rel declared_rel; do
+    [[ "${kind}" == asset ]] || continue
+    if ! awk -F '\t' -v rel="${live_rel}" '$1 == "asset" && $2 == rel { found=1 } END { exit !found }' "${MANIFEST}"; then
+      case "${live_rel}" in Pictures/*) rm -f -- "${GUEST_HOME}/${live_rel}" ;; esac
+    fi
+  done < "${APPLIED_MANIFEST}"
+fi
+
+while IFS=$'\t' read -r kind live_rel declared_rel; do
+  [[ -n "${kind}" && -n "${live_rel}" && -n "${declared_rel}" ]] || continue
+  case "${kind}:${live_rel}" in
+    text:xfconf/*)
+      install -Dm0644 "${DECLARED}/${declared_rel}" "${GUEST_HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/${live_rel#xfconf/}"
+      ;;
+    text:panel/*|text:desktop/*)
+      # Already materialized by the directory rsync above.
+      ;;
+    asset:Pictures/*)
+      mkdir -p "$(dirname "${GUEST_HOME}/${live_rel}")"
+      base64 --decode "${DECLARED}/${declared_rel}" > "${GUEST_HOME}/${live_rel}.new"
+      chmod 0644 "${GUEST_HOME}/${live_rel}.new"
+      mv -f "${GUEST_HOME}/${live_rel}.new" "${GUEST_HOME}/${live_rel}"
+      ;;
+    *)
+      echo "sanctuary-godzilla-xs-config-apply: unsafe manifest entry: ${kind} ${live_rel}" >&2
+      exit 1
+      ;;
+  esac
+done < "${MANIFEST}"
+
+mkdir -p "${STATE_DIR}"
+cp -a "${MANIFEST}" "${APPLIED_MANIFEST}"
+sha256sum "${REPO}/sanctuary-godzilla-xs-state.org" | awk '{print $1}' > "${STATE_DIR}/sanctuary-godzilla-xs-state.sha256"
+
+echo "sanctuary-godzilla-xs-config-apply: declared desktop state applied"
+echo "  backup: ${backup_root}"
+# Declarative XFCE state apply:1 ends here
