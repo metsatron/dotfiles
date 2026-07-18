@@ -67,7 +67,7 @@
 ;; launch — it make-rprivate's distrobox's passthrough parents and tmpfs-masks
 ;; the whole ~/mnt tree inside the container's own namespace, so gvfsd-trash
 ;; can no longer see any foreign fleet mount (this is effectively option (a),
-;; done container-side without upstream changes; sanctuary-sx re-enabled gvfs
+;; done container-side without upstream changes; sanctuary-godzilla-xs re-enabled gvfs
 ;; on top of it and is safe). gvfs nonetheless stays OUT of room-gaming for an
 ;; INDEPENDENT reason: the PCManFM/libfm desktop-mode crash above (unguarded
 ;; missing GVFS trash-root attributes) is intermittent and unfixed, and
@@ -75,7 +75,7 @@
 ;; + redstone-9x-recycle-bin-watch poller, R9X-TODO-020/021). Re-adding gvfs
 ;; here would trade a working Recycle Bin for that crash risk with no gain.
 ;; Re-enable gvfs in a PCManFM room ONLY after the libfm attribute-guard crash
-;; is fixed; a Thunar/Nautilus room needs only the shield (see sanctuary-sx).
+;; is fixed; a Thunar/Nautilus room needs only the shield (see sanctuary-godzilla-xs).
 ;; Apply: make guix-room-gaming
 (use-modules (guix packages)
              (guix gexp)
