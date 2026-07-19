@@ -74,6 +74,19 @@ flathub com.github.k4zmu2a.spacecadetpinball stable user
 flathub com.snes9x.Snes9x stable user
 #+END_SRC
 
+* Local Flatpak derivatives
+
+Local derivatives keep a second application identity while tracking the payload
+of a declared upstream Flatpak.  This is used for Redstone Obsidian: the distinct
+application ID gives Electron a distinct user-data directory and singleton, so
+Redstone cannot capture host =obsidian://= requests.
+
+Columns: SOURCE_ID, DERIVED_ID, BRANCH, SCOPE.
+#+BEGIN_SRC text :tangle linux/.flatpak/manifest/local-derivatives.ssv
+# source-id derived-id branch scope
+md.obsidian.Obsidian com.tiagopires.ObsidianRedstone stable user
+#+END_SRC
+
 * Sanctuary Flatpak runner
 
 Run a host-installed Flatpak payload from inside a sanctuary.  The app/runtime
@@ -102,6 +115,40 @@ esac
 
 app_id="$1"
 shift
+
+redstone_home="${HOME%/}/"
+redstone_home="${redstone_home%/}"
+redstone_official_id="md.obsidian.Obsidian"
+redstone_derived_id="com.tiagopires.ObsidianRedstone"
+if [[ "${redstone_home}" = */.local/share/dotcortex/guests/sanctuary-redstone-9x/home && \
+      "${app_id}" = "${redstone_official_id}" ]]; then
+  old_app_home="${HOME}/.var/app/${redstone_official_id}"
+  new_app_home="${HOME}/.var/app/${redstone_derived_id}"
+
+  # Preserve the Redstone profile when crossing the new Flatpak identity.  The
+  # copy is one-way and atomic; the old tree remains as a rollback copy.  Never
+  # copy a live Electron singleton because that can produce a split profile.
+  if [[ ! -e "${new_app_home}" && -d "${old_app_home}" ]]; then
+    old_profile="${old_app_home}/config/obsidian"
+    for singleton in SingletonLock SingletonSocket SingletonCookie; do
+      if [[ -e "${old_profile}/${singleton}" || -L "${old_profile}/${singleton}" ]]; then
+        echo "sanctuary-flatpak-run: close the old Redstone Obsidian before profile migration (${singleton} is live or stale)" >&2
+        exit 1
+      fi
+    done
+
+    migration="${new_app_home}.migrating.$$"
+    if [[ -e "${migration}" ]]; then
+      echo "sanctuary-flatpak-run: refusing unexpected migration path: ${migration}" >&2
+      exit 1
+    fi
+    cp -a "${old_app_home}" "${migration}"
+    mv "${migration}" "${new_app_home}"
+    echo "sanctuary-flatpak-run: copied Redstone Obsidian profile to isolated application ID" >&2
+  fi
+
+  app_id="${redstone_derived_id}"
+fi
 
 host_home="${SANCTUARY_HOST_HOME:-/home/metsatron}"
 if [[ -n "${SANCTUARY_FLATPAK_BIN:-}" ]]; then
@@ -327,7 +374,8 @@ fi
 # Bubblewrap sandbox cannot reconstruct the container-managed /etc/resolv.conf
 # mount inside a rootless Distrobox.  Keep Chromium sandboxing enabled, but use
 # Zypak's supported mimic strategy for this sanctuary launch path.
-if [[ "${app_id}" = "md.obsidian.Obsidian" ]]; then
+if [[ "${app_id}" = "md.obsidian.Obsidian" || \
+      "${app_id}" = "com.tiagopires.ObsidianRedstone" ]]; then
   run_args+=("--env=ZYPAK_ZYGOTE_STRATEGY_SPAWN=0")
 fi
 
@@ -500,13 +548,17 @@ Shows what would be installed and what would be removed to match the manifest.
 set -euo pipefail
 MAN="${HOME}/DotCortex/linux/.flatpak/manifest/apps.ssv"
 REL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/releases.ssv"
+LOCAL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/local-derivatives.ssv"
 REL_DIFF_HELPER="${HOME}/.local/bin/flatpak-release-diff"
 [ -x "$REL_DIFF_HELPER" ] || REL_DIFF_HELPER="${HOME}/DotCortex/linux/.local/bin/flatpak-release-diff"
+LOCAL_SYNC_HELPER="${HOME}/.local/bin/flatpak-local-derive"
+[ -x "$LOCAL_SYNC_HELPER" ] || LOCAL_SYNC_HELPER="${HOME}/DotCortex/linux/.local/bin/flatpak-local-derive"
 
 desired_repo_refs(){ awk '$0!~/^#/ && NF>=4{print $2, $3, $4}' "$MAN" | sort -u; }
 desired_app_ids(){
   { awk '$0!~/^#/ && NF>=4{print $2}' "$MAN"
-    [ -f "$REL_MAN" ] && awk '$0!~/^#/ && NF>=4{print $2}' "$REL_MAN" || true; } \
+    [ -f "$REL_MAN" ] && awk '$0!~/^#/ && NF>=4{print $2}' "$REL_MAN" || true
+    [ -f "$LOCAL_MAN" ] && awk '$0!~/^#/ && NF>=4{print $2}' "$LOCAL_MAN" || true; } \
   | sort -u
 }
 installed_refs(){
@@ -537,6 +589,10 @@ done <"$a"
 
 if [ -x "$REL_DIFF_HELPER" ]; then
   "$REL_DIFF_HELPER" || true
+fi
+
+if [ -x "$LOCAL_SYNC_HELPER" ]; then
+  "$LOCAL_SYNC_HELPER" --check || true
 fi
 #+END_SRC
 
@@ -718,6 +774,227 @@ awk '$0!~/^#/ && NF>=4 {print $1 "\t" $2 "\t" $3 "\t" $4}' "$REL_MAN" \
     done
 #+END_SRC
 
+* Local Flatpak derivative builder
+
+Build the Redstone identity from the currently declared and installed official
+Obsidian deployment.  Flatpak's OSTree repository deduplicates the unchanged
+payload; only exported identity files and metadata differ.  The source commit is
+recorded in the derivative metadata so =flatpak:diff= and =flatpak:apply= can
+detect and refresh it after an upstream update.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/flatpak-local-derive :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+MAN="${HOME}/DotCortex/linux/.flatpak/manifest/local-derivatives.ssv"
+REMOTE="dotcortex-local"
+REPO="${HOME}/.local/share/dotcortex/flatpak/repo"
+CACHE_ROOT="${XDG_CACHE_HOME:-${HOME}/.cache}/flatpak/local-derive"
+MODE="${1:-apply}"
+ACTIVE_WORK=""
+
+cleanup_active_work() {
+  [[ -n "${ACTIVE_WORK}" ]] || return 0
+  case "${ACTIVE_WORK}" in
+    "${CACHE_ROOT}/"*)
+      [[ -d "${ACTIVE_WORK}" ]] && find "${ACTIVE_WORK}" -depth -delete
+      ;;
+    *)
+      echo "flatpak-local-derive: refusing unsafe cleanup path: ${ACTIVE_WORK}" >&2
+      return 1
+      ;;
+  esac
+  ACTIVE_WORK=""
+}
+
+trap cleanup_active_work EXIT
+
+if [[ "${MODE}" != "apply" && "${MODE}" != "--check" ]]; then
+  echo "Usage: flatpak-local-derive [--check]" >&2
+  exit 2
+fi
+
+[[ -f "${MAN}" ]] || exit 0
+
+installed_source_commit() {
+  flatpak --user info --show-commit "$1" 2>/dev/null || true
+}
+
+derived_source_commit() {
+  { flatpak --user info --show-metadata "$1" 2>/dev/null || true; } \
+    | awk -F= '$0=="[X-DotCortex]"{section=1; next} /^\[/{section=0} section && $1=="source-commit"{print $2; exit}'
+}
+
+check_one() {
+  local source_id="$1" derived_id="$2" branch="$3" scope="$4"
+  local source_commit derived_commit
+  if [[ "${scope}" != "user" ]]; then
+    echo "  ! ${derived_id}: unsupported local derivative scope ${scope}" >&2
+    return 1
+  fi
+  source_commit="$(installed_source_commit "${source_id}")"
+  derived_commit="$(derived_source_commit "${derived_id}")"
+  if [[ -z "${source_commit}" ]]; then
+    echo "  ! ${derived_id}: source ${source_id} is not installed"
+  elif [[ "${source_commit}" = "${derived_commit}" ]]; then
+    echo "  = ${derived_id} ${scope} (tracks ${source_id} ${source_commit:0:12})"
+  elif [[ -z "${derived_commit}" ]]; then
+    echo "  + ${derived_id} ${scope} (derive from ${source_id} ${source_commit:0:12})"
+  else
+    echo "  ~ ${derived_id} ${scope} (${derived_commit:0:12} -> ${source_commit:0:12})"
+  fi
+}
+
+derive_one() {
+  local source_id="$1" derived_id="$2" branch="$3" scope="$4"
+  local source_commit derived_commit source_dir work build metadata_tmp
+  local source_desktop derived_desktop source_metainfo derived_metainfo icon old_name new_name
+
+  [[ "${scope}" = "user" ]] || {
+    echo "flatpak-local-derive: unsupported scope for ${derived_id}: ${scope}" >&2
+    return 1
+  }
+
+  source_commit="$(installed_source_commit "${source_id}")"
+  [[ -n "${source_commit}" ]] || {
+    echo "flatpak-local-derive: source app is not installed: ${source_id}" >&2
+    return 1
+  }
+  derived_commit="$(derived_source_commit "${derived_id}")"
+
+  if [[ "${source_commit}" != "${derived_commit}" ]]; then
+    source_dir="$(flatpak --user info --show-location "${source_id}")"
+    [[ -d "${source_dir}/files" && -f "${source_dir}/metadata" ]] || {
+      echo "flatpak-local-derive: incomplete source deployment: ${source_dir}" >&2
+      return 1
+    }
+
+    mkdir -p "${CACHE_ROOT}" "${REPO}"
+    work="$(mktemp -d "${CACHE_ROOT}/${derived_id}.XXXXXX")"
+    case "${work}" in
+      "${CACHE_ROOT}/"*) ;;
+      *) echo "flatpak-local-derive: unsafe work directory: ${work}" >&2; return 1 ;;
+    esac
+    ACTIVE_WORK="${work}"
+    build="${work}/build"
+    mkdir -p "${build}"
+
+    # Hard-link the immutable deployment for a cheap build tree.  Every file we
+    # modify is written to a new inode before replacement, so the official
+    # deployment is never edited.
+    cp -al "${source_dir}/files" "${build}/files"
+
+    metadata_tmp="${work}/metadata"
+    awk -v old="${source_id}" -v new="${derived_id}" -v commit="${source_commit}" '
+      { gsub(old,new); print }
+      END {
+        print ""
+        print "[X-DotCortex]"
+        print "source-id=" old
+        print "source-commit=" commit
+      }
+    ' "${source_dir}/metadata" >"${metadata_tmp}"
+    mv "${metadata_tmp}" "${build}/metadata"
+
+    source_desktop="${build}/files/share/applications/${source_id}.desktop"
+    derived_desktop="${build}/files/share/applications/${derived_id}.desktop"
+    [[ -f "${source_desktop}" ]] || {
+      echo "flatpak-local-derive: source desktop file missing: ${source_desktop}" >&2
+      return 1
+    }
+    awk -v old="${source_id}" -v new="${derived_id}" '
+      /^Name=/ { print "Name=Obsidian (Redstone)"; next }
+      { gsub(old,new); print }
+    ' "${source_desktop}" >"${work}/desktop"
+    mv "${work}/desktop" "${derived_desktop}"
+    unlink "${source_desktop}"
+
+    source_metainfo="${build}/files/share/metainfo/${source_id}.metainfo.xml"
+    derived_metainfo="${build}/files/share/metainfo/${derived_id}.metainfo.xml"
+    [[ -f "${source_metainfo}" ]] || {
+      echo "flatpak-local-derive: source metainfo missing: ${source_metainfo}" >&2
+      return 1
+    }
+    awk -v old="${source_id}" -v new="${derived_id}" '
+      { gsub(old,new); sub("<name>Obsidian</name>","<name>Obsidian (Redstone)</name>"); print }
+    ' "${source_metainfo}" >"${work}/metainfo"
+    mv "${work}/metainfo" "${derived_metainfo}"
+    unlink "${source_metainfo}"
+
+    if [[ -f "${build}/files/bin/obsidian.sh" ]]; then
+      awk -v old="${source_id}" -v new="${derived_id}" '{ gsub(old,new); print }' \
+        "${build}/files/bin/obsidian.sh" >"${work}/obsidian.sh"
+      chmod --reference="${build}/files/bin/obsidian.sh" "${work}/obsidian.sh"
+      mv "${work}/obsidian.sh" "${build}/files/bin/obsidian.sh"
+    fi
+
+    while IFS= read -r -d '' icon; do
+      old_name="$(basename "${icon}")"
+      new_name="${old_name/#${source_id}/${derived_id}}"
+      mv "${icon}" "$(dirname "${icon}")/${new_name}"
+    done < <(find "${build}/files/share/icons" -type f -name "${source_id}.*" -print0 2>/dev/null)
+
+    # Appstream data is regenerated from the renamed metainfo during export.
+    if [[ -d "${build}/files/share/app-info" ]]; then
+      find "${build}/files/share/app-info" -depth -delete
+    fi
+
+    flatpak build-finish "${build}"
+    flatpak build-export --no-update-summary "${REPO}" "${build}" "${branch}"
+    flatpak build-update-repo "${REPO}"
+    cleanup_active_work
+  fi
+
+  if flatpak --user remote-list --columns=name | grep -Fxq "${REMOTE}"; then
+    flatpak --user remote-modify --url="file://${REPO}" "${REMOTE}"
+  else
+    flatpak --user remote-add --no-gpg-verify "${REMOTE}" "file://${REPO}"
+  fi
+  flatpak --user install -y --or-update "${REMOTE}" "${derived_id}" "${branch}"
+  flatpak override --user --env=ZYPAK_ZYGOTE_STRATEGY_SPAWN=0 "${derived_id}"
+  echo "flatpak-local-derive: ${derived_id} tracks ${source_id} ${source_commit:0:12}"
+}
+
+if [[ "${MODE}" = "--check" ]]; then
+  echo "[local derivatives]"
+  while read -r source_id derived_id branch scope; do
+    [[ -n "${source_id:-}" ]] || continue
+    check_one "${source_id}" "${derived_id}" "${branch}" "${scope}"
+  done < <(awk '$0!~/^#/ && NF>=4{print $1,$2,$3,$4}' "${MAN}")
+  exit 0
+fi
+
+while read -r source_id derived_id branch scope; do
+  [[ -n "${source_id:-}" ]] || continue
+  derive_one "${source_id}" "${derived_id}" "${branch}" "${scope}"
+done < <(awk '$0!~/^#/ && NF>=4{print $1,$2,$3,$4}' "${MAN}")
+#+END_SRC
+
+* Obsidian host URI ownership
+
+The host always owns =obsidian://= with the official Flathub identity.  Redstone
+sets its own association inside its guest XDG tree and private D-Bus session.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/obsidian-host-uri-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+OFFICIAL_DESKTOP="md.obsidian.Obsidian.desktop"
+SCHEME="x-scheme-handler/obsidian"
+
+command -v xdg-mime >/dev/null 2>&1 || {
+  echo "obsidian-host-uri-apply: xdg-mime not found" >&2
+  exit 1
+}
+
+xdg-mime default "${OFFICIAL_DESKTOP}" "${SCHEME}"
+actual="$(xdg-mime query default "${SCHEME}")"
+if [[ "${actual}" != "${OFFICIAL_DESKTOP}" ]]; then
+  echo "obsidian-host-uri-apply: expected ${OFFICIAL_DESKTOP}, got ${actual:-none}" >&2
+  exit 1
+fi
+
+echo "obsidian-host-uri-apply: host ${SCHEME} -> ${OFFICIAL_DESKTOP}"
+#+END_SRC
+
 * Apply manifest with safe elevation
 Default behavior: **enforce exact state** (install + update + uninstall).
 System-scoped actions try Polkit first; if denied, retry the specific command with sudo.
@@ -728,8 +1005,13 @@ set -euo pipefail
 
 MAN="${HOME}/DotCortex/linux/.flatpak/manifest/apps.ssv"
 REL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/releases.ssv"
+LOCAL_MAN="${HOME}/DotCortex/linux/.flatpak/manifest/local-derivatives.ssv"
 REL_SYNC_HELPER="${HOME}/.local/bin/flatpak-release-sync"
 [ -x "$REL_SYNC_HELPER" ] || REL_SYNC_HELPER="${HOME}/DotCortex/linux/.local/bin/flatpak-release-sync"
+LOCAL_SYNC_HELPER="${HOME}/.local/bin/flatpak-local-derive"
+[ -x "$LOCAL_SYNC_HELPER" ] || LOCAL_SYNC_HELPER="${HOME}/DotCortex/linux/.local/bin/flatpak-local-derive"
+OBSIDIAN_HOST_URI_HELPER="${HOME}/.local/bin/obsidian-host-uri-apply"
+[ -x "$OBSIDIAN_HOST_URI_HELPER" ] || OBSIDIAN_HOST_URI_HELPER="${HOME}/DotCortex/linux/.local/bin/obsidian-host-uri-apply"
 
 # defaults: installs + updates; removals only if UNINSTALL=1
 ENFORCE="${ENFORCE:-1}"
@@ -783,7 +1065,8 @@ desired_repo_refs(){
 }
 desired_app_ids(){
   { awk -v FS="$FS" '$0!~/^#/ && NF>=4{print $2}' "$MAN"
-    [ -f "$REL_MAN" ] && awk -v FS="$FS" '$0!~/^#/ && NF>=4{print $2}' "$REL_MAN" || true; } \
+    [ -f "$REL_MAN" ] && awk -v FS="$FS" '$0!~/^#/ && NF>=4{print $2}' "$REL_MAN" || true
+    [ -f "$LOCAL_MAN" ] && awk -v FS="$FS" '$0!~/^#/ && NF>=4{print $2}' "$LOCAL_MAN" || true; } \
   | sort -u
 }
 installed_refs(){
@@ -873,7 +1156,14 @@ ensure_remotes
 print_plan
 apply_installs
 update_manifested
+if [ -x "$LOCAL_SYNC_HELPER" ]; then
+  "${CLEAN_ENV[@]}" "$LOCAL_SYNC_HELPER"
+fi
 apply_uninstalls
+
+if [ -x "$OBSIDIAN_HOST_URI_HELPER" ]; then
+  "${CLEAN_ENV[@]}" "$OBSIDIAN_HOST_URI_HELPER"
+fi
 
 OBSIDIAN_THEME_HELPER="$HOME/.local/bin/obsidian-win98-theme-apply"
 [ -x "$OBSIDIAN_THEME_HELPER" ] || OBSIDIAN_THEME_HELPER="$HOME/DotCortex/linux/.local/bin/obsidian-win98-theme-apply"
