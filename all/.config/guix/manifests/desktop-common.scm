@@ -53,6 +53,15 @@
    "libxrender"    ; libXcursor runtime dep
    "libxfixes"     ; libXcursor runtime dep
 
+   ;; --- GSettings persistence ---
+   ;; dconf-service + its D-Bus activation file. WITHOUT this, GSettings
+   ;; silently uses the MEMORY backend: apps (Pluma, eom, MATE anything)
+   ;; accept settings changes and forget them at exit ("config seems
+   ;; immutable" — found live 2026-07-19). The private dbus-run-session
+   ;; buses activate dconf-service via XDG_DATA_DIRS service files.
+   "dconf"
+   "glib:bin"    ; gsettings/gdbus CLIs — dconf debugging + scriptable settings
+
    ;; --- Desktop Schemes (redstone-9x-scheme-apply) ---
    ;; XSETTINGS manager: scheme switches restyle running GTK3 apps via SIGHUP.
    "xsettingsd"
