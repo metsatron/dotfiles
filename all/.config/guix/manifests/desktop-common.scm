@@ -53,6 +53,10 @@
    "libxrender"    ; libXcursor runtime dep
    "libxfixes"     ; libXcursor runtime dep
 
+   ;; --- Desktop Schemes (redstone-9x-scheme-apply) ---
+   ;; XSETTINGS manager: scheme switches restyle running GTK3 apps via SIGHUP.
+   "xsettingsd"
+
    ;; --- System sounds (sanctuary-sound helper) ---
    ;; paplay/pactl for the per-sanctuary sound schemes. The host Pulse socket
    ;; is visible in-guest at its default path, so the client tools are all
