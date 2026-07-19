@@ -53,6 +53,13 @@
    "libxrender"    ; libXcursor runtime dep
    "libxfixes"     ; libXcursor runtime dep
 
+   ;; --- System sounds (sanctuary-sound helper) ---
+   ;; paplay/pactl for the per-sanctuary sound schemes. The host Pulse socket
+   ;; is visible in-guest at its default path, so the client tools are all
+   ;; that is needed. room-gaming ships no CLI player at all — this is the
+   ;; only route to a startup chime in the Redstone sanctuary.
+   "pulseaudio"
+
    ;; --- Runtime & certs ---
    "python"
    "gamemode"
