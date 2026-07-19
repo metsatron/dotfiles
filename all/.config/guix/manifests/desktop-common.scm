@@ -61,6 +61,8 @@
    ;; buses activate dconf-service via XDG_DATA_DIRS service files.
    "dconf"
    "glib:bin"    ; gsettings/gdbus CLIs — dconf debugging + scriptable settings
+   "xdg-utils"   ; xdg-mime/xdg-open etc — required by redstone-9x-flatpak-session's
+                 ; URI-routing guard (Codex, 75bfa7345); the container base ships only xdg-open
 
    ;; --- Desktop Schemes (redstone-9x-scheme-apply) ---
    ;; XSETTINGS manager: scheme switches restyle running GTK3 apps via SIGHUP.
