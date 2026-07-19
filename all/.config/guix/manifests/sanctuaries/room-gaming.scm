@@ -81,7 +81,22 @@
              (guix gexp)
              (guix utils)
              (gnu packages lxde)
+             (gnu packages wm)          ; icewm — base for icewm-gradients
              (gnu packages xdisorg))
+
+;; IceWM with compile-time gradient support. Guix's flags omit
+;; CONFIG_GRADIENTS, so Gradients=-listed title pixmaps TILE instead of
+;; interpolating (verified live 2026-07-19: 2px colour-stop images rendered
+;; as pinstripes). With this ON, tiny colour-stop pixmaps become smooth
+;; full-width titlebar gradients — the Windows 98 / Serenity requirement.
+(define icewm-gradients
+  (package
+    (inherit icewm)
+    (name "icewm-gradients")
+    (arguments
+     (substitute-keyword-arguments (package-arguments icewm)
+       ((#:configure-flags flags)
+        #~(cons "-DCONFIG_GRADIENTS=ON" #$flags))))))
 
 ;; PCManFM 1.4.0 draws the FmDesktop selection and rubber band itself.  Give
 ;; that custom GtkWindow a unique CSS node, lower its internal background
@@ -159,9 +174,9 @@
 
 (packages->manifest
  (cons* pcmanfm-redstone
+        icewm-gradients  ; replaces "icewm" spec — gradient-capable build
         (map specification->package
              '(
-   "icewm"    ; Win9x/XP-era WM — Windows-95 theme
    "rofi"     ; Windows-95 Run/launcher dialogs (stock rofi, fixed-geometry theme)
    "clipmenu" "clipnotify" "xsel" ; clipboard history and X11 clipboard backend
    "gtk+"     ; GTK schemas, including org.gtk.Settings.FileChooser
