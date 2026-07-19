@@ -189,6 +189,12 @@
    "gimp"        ; GNU Image Manipulation Program (Accessories)
    "inkscape"    ; SVG/vector graphics editor (Accessories)
    "libreoffice" ; LibreOffice suite (Accessories) — the real Office next to the AbiWord/Gnumeric stand-ins
+   ;; --- MATE + FOX additions (Mètsàtron 2026-07-19) ---
+   "pluma"       ; MATE text editor (Accessories)
+   "geany"       ; lightweight IDE (Development)
+   "eom"         ; Eye of MATE image viewer (Graphics)
+   "mate-system-monitor" ; launched by the taskbar CPU meter (SerenityOS scheme)
+   "fox"         ; FOX toolkit 1.6 — build/customise FOX apps in-room (ships adie, PathFinder)
    "vscodium"    ; VSCodium (nonguix channel) — community telemetry-free VSCode build; binary is `codium`
    "smplayer"    ; SMPlayer — Qt front-end for mpv/mplayer (Multimedia)
    "atril"       ; Atril — MATE document viewer, PDF/PostScript (Accessories)
