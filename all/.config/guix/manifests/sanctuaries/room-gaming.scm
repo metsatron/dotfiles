@@ -196,6 +196,7 @@
    "mate-system-monitor" ; launched by the taskbar CPU meter (SerenityOS scheme)
    "fox"         ; FOX toolkit 1.6 — build/customise FOX apps in-room (ships adie, PathFinder)
    "pavucontrol" ; PulseAudio volume control — pnmixer's VolumeControlCommand target
+   "ark"         ; KDE archive manager — replaces the host-spawned PeaZip (Accessories)
    "vscodium"    ; VSCodium (nonguix channel) — community telemetry-free VSCode build; binary is `codium`
    "smplayer"    ; SMPlayer — Qt front-end for mpv/mplayer (Multimedia)
    "atril"       ; Atril — MATE document viewer, PDF/PostScript (Accessories)
