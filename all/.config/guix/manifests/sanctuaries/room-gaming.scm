@@ -266,6 +266,7 @@ process information (path, size, owner) and pattern-based filtering.")
    "smplayer"    ; SMPlayer — Qt front-end for mpv/mplayer (Multimedia)
    "atril"       ; Atril — MATE document viewer, PDF/PostScript (Accessories)
    "qt6ct"       ; Qt6 config tool — drives the built-in "Windows" style + Win95 palette for Zeal, which is a Qt6 app (qtbase-6.9.2), NOT Qt5 — so qt5ct would be inert here. Co-located with Zeal so the qt6ct platformtheme plugin (lib/qt6/plugins/platformthemes/libqt6ct.so) resolves; env-inert in the profile so it never touches session start — QT_QPA_PLATFORMTHEME=qt6ct is set per-app on the menu entries, not in the session command.
+   "kvantum"     ; Qt5/Qt6 SVG theme engine — CDE dynasty schemes set QT_STYLE="kvantum" (qt6ct's style= key) because CDE's Motif look has no equivalent among qt6ct's built-in styles; the Commonality theme family (linux/.config/Kvantum/) supplies the actual Kvantum SVG theme.
    "tcalc"       ; terminal calculator (Accessories) — launched via xterm -e
    "aisleriot"   ; Solitaire card games: Klondike (default) and FreeCell (--variation=freecell)
    "sdl2"         ; SDL2 runtime — dsdmine (Minesweeper) links against it
