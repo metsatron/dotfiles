@@ -1,0 +1,196 @@
+#!/usr/bin/env bash
+# Local Flatpak derivative builder
+
+# Build the Redstone identity from the currently declared and installed official
+# Obsidian deployment.  Flatpak's OSTree repository deduplicates the unchanged
+# payload; only exported identity files and metadata differ.  The source commit is
+# recorded in the derivative metadata so =flatpak:diff= and =flatpak:apply= can
+# detect and refresh it after an upstream update.
+
+
+# [[file:../../../package-flatpak.org::*Local Flatpak derivative builder][Local Flatpak derivative builder:1]]
+set -euo pipefail
+
+MAN="${HOME}/DotCortex/linux/.flatpak/manifest/local-derivatives.ssv"
+REMOTE="dotcortex-local"
+REPO="${HOME}/.local/share/dotcortex/flatpak/repo"
+CACHE_ROOT="${XDG_CACHE_HOME:-${HOME}/.cache}/flatpak/local-derive"
+MODE="${1:-apply}"
+ACTIVE_WORK=""
+
+cleanup_active_work() {
+  [[ -n "${ACTIVE_WORK}" ]] || return 0
+  case "${ACTIVE_WORK}" in
+    "${CACHE_ROOT}/"*)
+      [[ -d "${ACTIVE_WORK}" ]] && find "${ACTIVE_WORK}" -depth -delete
+      ;;
+    *)
+      echo "flatpak-local-derive: refusing unsafe cleanup path: ${ACTIVE_WORK}" >&2
+      return 1
+      ;;
+  esac
+  ACTIVE_WORK=""
+}
+
+trap cleanup_active_work EXIT
+
+if [[ "${MODE}" != "apply" && "${MODE}" != "--check" ]]; then
+  echo "Usage: flatpak-local-derive [--check]" >&2
+  exit 2
+fi
+
+[[ -f "${MAN}" ]] || exit 0
+
+installed_source_commit() {
+  flatpak --user info --show-commit "$1" 2>/dev/null || true
+}
+
+derived_source_commit() {
+  { flatpak --user info --show-metadata "$1" 2>/dev/null || true; } \
+    | awk -F= '$0=="[X-DotCortex]"{section=1; next} /^\[/{section=0} section && $1=="source-commit"{print $2; exit}'
+}
+
+check_one() {
+  local source_id="$1" derived_id="$2" branch="$3" scope="$4"
+  local source_commit derived_commit
+  if [[ "${scope}" != "user" ]]; then
+    echo "  ! ${derived_id}: unsupported local derivative scope ${scope}" >&2
+    return 1
+  fi
+  source_commit="$(installed_source_commit "${source_id}")"
+  derived_commit="$(derived_source_commit "${derived_id}")"
+  if [[ -z "${source_commit}" ]]; then
+    echo "  ! ${derived_id}: source ${source_id} is not installed"
+  elif [[ "${source_commit}" = "${derived_commit}" ]]; then
+    echo "  = ${derived_id} ${scope} (tracks ${source_id} ${source_commit:0:12})"
+  elif [[ -z "${derived_commit}" ]]; then
+    echo "  + ${derived_id} ${scope} (derive from ${source_id} ${source_commit:0:12})"
+  else
+    echo "  ~ ${derived_id} ${scope} (${derived_commit:0:12} -> ${source_commit:0:12})"
+  fi
+}
+
+derive_one() {
+  local source_id="$1" derived_id="$2" branch="$3" scope="$4"
+  local source_commit derived_commit source_dir work build metadata_tmp
+  local source_desktop derived_desktop source_metainfo derived_metainfo icon old_name new_name
+
+  [[ "${scope}" = "user" ]] || {
+    echo "flatpak-local-derive: unsupported scope for ${derived_id}: ${scope}" >&2
+    return 1
+  }
+
+  source_commit="$(installed_source_commit "${source_id}")"
+  [[ -n "${source_commit}" ]] || {
+    echo "flatpak-local-derive: source app is not installed: ${source_id}" >&2
+    return 1
+  }
+  derived_commit="$(derived_source_commit "${derived_id}")"
+
+  if [[ "${source_commit}" != "${derived_commit}" ]]; then
+    source_dir="$(flatpak --user info --show-location "${source_id}")"
+    [[ -d "${source_dir}/files" && -f "${source_dir}/metadata" ]] || {
+      echo "flatpak-local-derive: incomplete source deployment: ${source_dir}" >&2
+      return 1
+    }
+
+    mkdir -p "${CACHE_ROOT}" "${REPO}"
+    work="$(mktemp -d "${CACHE_ROOT}/${derived_id}.XXXXXX")"
+    case "${work}" in
+      "${CACHE_ROOT}/"*) ;;
+      *) echo "flatpak-local-derive: unsafe work directory: ${work}" >&2; return 1 ;;
+    esac
+    ACTIVE_WORK="${work}"
+    build="${work}/build"
+    mkdir -p "${build}"
+
+    # Hard-link the immutable deployment for a cheap build tree.  Every file we
+    # modify is written to a new inode before replacement, so the official
+    # deployment is never edited.
+    cp -al "${source_dir}/files" "${build}/files"
+
+    metadata_tmp="${work}/metadata"
+    awk -v old="${source_id}" -v new="${derived_id}" -v commit="${source_commit}" '
+      { gsub(old,new); print }
+      END {
+        print ""
+        print "[X-DotCortex]"
+        print "source-id=" old
+        print "source-commit=" commit
+      }
+    ' "${source_dir}/metadata" >"${metadata_tmp}"
+    mv "${metadata_tmp}" "${build}/metadata"
+
+    source_desktop="${build}/files/share/applications/${source_id}.desktop"
+    derived_desktop="${build}/files/share/applications/${derived_id}.desktop"
+    [[ -f "${source_desktop}" ]] || {
+      echo "flatpak-local-derive: source desktop file missing: ${source_desktop}" >&2
+      return 1
+    }
+    awk -v old="${source_id}" -v new="${derived_id}" '
+      /^Name=/ { print "Name=Obsidian (Redstone)"; next }
+      { gsub(old,new); print }
+    ' "${source_desktop}" >"${work}/desktop"
+    mv "${work}/desktop" "${derived_desktop}"
+    unlink "${source_desktop}"
+
+    source_metainfo="${build}/files/share/metainfo/${source_id}.metainfo.xml"
+    derived_metainfo="${build}/files/share/metainfo/${derived_id}.metainfo.xml"
+    [[ -f "${source_metainfo}" ]] || {
+      echo "flatpak-local-derive: source metainfo missing: ${source_metainfo}" >&2
+      return 1
+    }
+    awk -v old="${source_id}" -v new="${derived_id}" '
+      { gsub(old,new); sub("<name>Obsidian</name>","<name>Obsidian (Redstone)</name>"); print }
+    ' "${source_metainfo}" >"${work}/metainfo"
+    mv "${work}/metainfo" "${derived_metainfo}"
+    unlink "${source_metainfo}"
+
+    if [[ -f "${build}/files/bin/obsidian.sh" ]]; then
+      awk -v old="${source_id}" -v new="${derived_id}" '{ gsub(old,new); print }' \
+        "${build}/files/bin/obsidian.sh" >"${work}/obsidian.sh"
+      chmod --reference="${build}/files/bin/obsidian.sh" "${work}/obsidian.sh"
+      mv "${work}/obsidian.sh" "${build}/files/bin/obsidian.sh"
+    fi
+
+    while IFS= read -r -d '' icon; do
+      old_name="$(basename "${icon}")"
+      new_name="${old_name/#${source_id}/${derived_id}}"
+      mv "${icon}" "$(dirname "${icon}")/${new_name}"
+    done < <(find "${build}/files/share/icons" -type f -name "${source_id}.*" -print0 2>/dev/null)
+
+    # Appstream data is regenerated from the renamed metainfo during export.
+    if [[ -d "${build}/files/share/app-info" ]]; then
+      find "${build}/files/share/app-info" -depth -delete
+    fi
+
+    flatpak build-finish "${build}"
+    flatpak build-export --no-update-summary "${REPO}" "${build}" "${branch}"
+    flatpak build-update-repo "${REPO}"
+    cleanup_active_work
+  fi
+
+  if flatpak --user remote-list --columns=name | grep -Fxq "${REMOTE}"; then
+    flatpak --user remote-modify --url="file://${REPO}" "${REMOTE}"
+  else
+    flatpak --user remote-add --no-gpg-verify "${REMOTE}" "file://${REPO}"
+  fi
+  flatpak --user install -y --or-update "${REMOTE}" "${derived_id}" "${branch}"
+  flatpak override --user --env=ZYPAK_ZYGOTE_STRATEGY_SPAWN=0 "${derived_id}"
+  echo "flatpak-local-derive: ${derived_id} tracks ${source_id} ${source_commit:0:12}"
+}
+
+if [[ "${MODE}" = "--check" ]]; then
+  echo "[local derivatives]"
+  while read -r source_id derived_id branch scope; do
+    [[ -n "${source_id:-}" ]] || continue
+    check_one "${source_id}" "${derived_id}" "${branch}" "${scope}"
+  done < <(awk '$0!~/^#/ && NF>=4{print $1,$2,$3,$4}' "${MAN}")
+  exit 0
+fi
+
+while read -r source_id derived_id branch scope; do
+  [[ -n "${source_id:-}" ]] || continue
+  derive_one "${source_id}" "${derived_id}" "${branch}" "${scope}"
+done < <(awk '$0!~/^#/ && NF>=4{print $1,$2,$3,$4}' "${MAN}")
+# Local Flatpak derivative builder:1 ends here
