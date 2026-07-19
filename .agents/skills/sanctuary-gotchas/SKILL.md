@@ -52,6 +52,12 @@ It also changed the *contract*: system distrobox (1.8.x) requires ~30 base comma
 
 `ls lib/libretro/ | grep prboom` "finds" a core that is not installed: `prboom_libretro.info` is metadata, present for hundreds of cores that are absent. **Only `*_libretro.so` proves a core exists.** This produced a false positive that nearly closed a bug that was still open.
 
+## Single-instance GApplications cross the container wall via /tmp D-Bus sockets (sealed 2026-07-19)
+
+Distrobox sanctuaries share the host's /tmp (bind mount), network namespace, AND pid namespace. Host and guest session-bus sockets both live at `unix:path=/tmp/dbus-*` — mutually connectable. A single-instance GApplication (Pluma, Eye of MATE, mate-system-monitor, most MATE/GNOME apps) launched in-guest can find the HOST's primary instance and hand off: the file opens in the host's editor window. Worse, dconf rides the same bus — a guest MATE app that reaches the host bus reads HOST GSettings, so "why is this app using my host config?" is the same bug. Symptoms are silent (the launch "succeeds", exit 0).
+
+Fix: wrap such launches in `dbus-run-session <app>` — a private bus guarantees a fresh in-guest primary instance and a fresh in-guest dconf-service reading the guest's XDG_CONFIG_HOME. The shared pid namespace is also why `pgrep`/`pkill` from inside a sanctuary match HOST processes (use exact patterns, and the `[b]racket` trick — a pkill of a pattern that appears in your own wrapper's cmdline kills your own process group).
+
 ## Flatpak audio dead after PulseAudio restart
 
 Killing PulseAudio (`pulseaudio -k`) destroys `/run/flatpak/pulse/` which `flatpak-session-helper` created at login. The helper does not recreate it on PA restart. Flatpak apps have `PULSE_SERVER=unix:/run/flatpak/pulse/native` baked into their sandbox env but the socket is gone. Menu restart reuses the existing sandbox with a stale bind-mount — it does not help.
