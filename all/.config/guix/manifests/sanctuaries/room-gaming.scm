@@ -81,15 +81,21 @@
              (guix gexp)
              (guix utils)
              (guix download)
+             (guix build-system copy)
              (guix build-system gnu)
+             (guix build-system python)
              ((guix licenses) #:prefix license:)
+             (gnu packages base)
+             (gnu packages crypto)
              (gnu packages lxde)
              (gnu packages wm)          ; icewm — base for icewm-gradients
              (gnu packages xdisorg)
              (gnu packages gnome)       ; gtk+-2, libglade, gnome-vfs, libgnome, gconf, libgtop — netactview deps
              (gnu packages gtk)
              (gnu packages glib)
+             (gnu packages libffi)
              (gnu packages pkg-config)
+             (gnu packages python)
              (gnu packages gettext))
 
 ;; IceWM with compile-time gradient support. Guix's flags omit
@@ -105,6 +111,177 @@
      (substitute-keyword-arguments (package-arguments icewm)
        ((#:configure-flags flags)
         #~(cons "-DCONFIG_GRADIENTS=ON" #$flags))))))
+
+;; IceWM Control Panel 3.2 is the final upstream release (2004).  Its GTK2
+;; interface and every bundled applet are Python 2/PyGTK 2 programs.  Current
+;; Guix still carries Python 2 and GTK2, but no longer carries the three Python
+;; bindings, so keep their last Guix-packaged releases local to this room.
+;; All four packages were built together against the pinned channel commit
+;; 1fef20a1c0c25d887f7abd51e11079a53132fe35 before landing here.
+(define python2-pycairo-legacy
+  (package
+    (name "python2-pycairo")
+    (version "1.18.2")
+    (source
+     (origin
+       (method url-fetch)
+       (uri (string-append "https://github.com/pygobject/pycairo/releases/"
+                           "download/v" version "/pycairo-" version ".tar.gz"))
+       (sha256
+        (base32 "0cb5n4r4nl0k1g90b1gz9iyk4lp7hi03db98i1p52a870bym7f6w"))))
+    (build-system python-build-system)
+    (arguments (list #:python python-2 #:tests? #f))
+    (native-inputs (list pkg-config libxcrypt))
+    (propagated-inputs (list cairo))
+    (home-page "https://cairographics.org/pycairo/")
+    (synopsis "Legacy Python 2 bindings for Cairo")
+    (description "Pycairo provides Python bindings for the Cairo graphics library.")
+    (license (list license:lgpl2.1 license:mpl1.1))))
+
+(define python2-pygobject-2-legacy
+  (package
+    (name "python2-pygobject")
+    (version "2.28.7")
+    (source
+     (origin
+       (method url-fetch)
+       (uri (string-append "mirror://gnome/sources/pygobject/"
+                           (version-major+minor version) "/pygobject-" version ".tar.xz"))
+       (sha256
+        (base32 "0nkam61rsn7y3wik3vw46wk5q2cjfh2iph57hl9m39rc8jijb7dv"))))
+    (build-system gnu-build-system)
+    (native-inputs (list which (list glib "bin") pkg-config dbus libxcrypt))
+    (inputs (list python-2 glib python2-pycairo-legacy gobject-introspection))
+    (propagated-inputs (list libffi))
+    (arguments
+     (list #:tests? #f
+           #:configure-flags #~(list "LIBS=-lcairo-gobject")
+           #:phases
+           #~(modify-phases %standard-phases
+               (add-after 'unpack 'remove-obsolete-error-domain-enum
+                 (lambda _
+                   (substitute* "gi/pygi-info.c"
+                     (((string-append "[[:blank:]]*case GI_INFO_TYPE_ERROR_DOMAIN:\\n"
+                                      "[[:blank:]]*type = &PyGIErrorDomainInfo_Type;\\n"
+                                      "[[:blank:]]*break;\\n")) "")
+                     (("[[:blank:]]*case GI_INFO_TYPE_ERROR_DOMAIN:\\n") "")))))))
+    (home-page "https://pypi.org/project/PyGObject/")
+    (synopsis "Legacy Python 2 bindings for GObject")
+    (description "Legacy Python 2 bindings for GLib, GObject, and GIO.")
+    (license license:lgpl2.1+)))
+
+(define python2-pygtk-legacy
+  (package
+    (name "python2-pygtk")
+    (version "2.24.0")
+    (source
+     (origin
+       (method url-fetch)
+       (uri (string-append "mirror://gnome/sources/pygtk/"
+                           (version-major+minor version) "/pygtk-" version ".tar.bz2"))
+       (sha256
+        (base32 "04k942gn8vl95kwf0qskkv6npclfm31d78ljkrkgyqxxcni1w76d"))))
+    (build-system gnu-build-system)
+    (outputs '("out" "doc"))
+    (native-inputs (list pkg-config libxcrypt))
+    (inputs (list python-2 pango-1.42 libglade glib))
+    (propagated-inputs
+     (list python2-pycairo-legacy python2-pygobject-2-legacy gtk+-2))
+    (arguments
+     (list #:tests? #f
+           #:phases
+           #~(modify-phases %standard-phases
+               (add-before 'configure 'set-gtk-doc-directory
+                 (lambda* (#:key outputs #:allow-other-keys)
+                   (substitute* "docs/Makefile.in"
+                     (("TARGET_DIR = \\$\\(datadir\\)")
+                      (string-append "TARGET_DIR = " (assoc-ref outputs "doc"))))))
+               (add-after 'configure 'fix-codegen
+                 (lambda* (#:key inputs #:allow-other-keys)
+                   (substitute* "pygtk-codegen-2.0"
+                     (("^prefix=.*$")
+                      (string-append "prefix="
+                                     (assoc-ref inputs "python2-pygobject")
+                                     "\\n")))))
+               (add-after 'install 'install-pth
+                 (lambda* (#:key outputs #:allow-other-keys)
+                   (let ((site (string-append (assoc-ref outputs "out")
+                                              "/lib/python2.7/site-packages")))
+                     (call-with-output-file (string-append site "/pygtk.pth")
+                       (lambda (port) (format port "gtk-2.0~%")))))))))
+    (home-page "http://www.pygtk.org/")
+    (synopsis "Legacy Python 2 bindings for GTK 2")
+    (description "PyGTK provides Python 2 bindings for GTK 2.")
+    (license license:lgpl2.1+)))
+
+(define icewm-control-panel
+  (package
+    (name "icewm-control-panel")
+    (version "3.2")
+    (source
+     (origin
+       (method url-fetch)
+       (uri (string-append
+             "mirror://sourceforge/icesoundmanager/Control%20Panel/IceWMCP-3.2/"
+             "IceWMControlPanel-" version ".tar.bz2"))
+       (sha256
+        (base32 "1yasj9f0h0f37lv0c5zgcrbhazd7ddh1gb2w4jdh8lg1bmxx4nb2"))))
+    (build-system copy-build-system)
+    (arguments
+     (list #:install-plan #~'(("." "share/icewmcp"))
+           #:phases
+           #~(modify-phases %standard-phases
+               (add-after 'unpack 'patch-runtime-paths
+                 (lambda* (#:key inputs #:allow-other-keys)
+                   (let ((python (search-input-file inputs "/bin/python2")))
+                     (substitute* "launcher.py"
+                       (("^#! /usr/bin/env python$") (string-append "#!" python)))
+                     ;; Upstream source is ISO-8859-1, which substitute* must
+                     ;; be told explicitly before it can patch the file.
+                     (with-fluids ((%default-port-encoding "ISO-8859-1"))
+                       (substitute* "icewmcp_common.py"
+                         (("^def getBaseDir\\(\\) :$")
+                          (string-append
+                           "def getBaseDir() :\n"
+                           "\treturn os.path.dirname(os.path.realpath(sys.argv[0]))+os.sep"))
+                         ;; IceWM 4.x uses ICEWM_PRIVCFG.  Retain the old
+                         ;; misspelled variable as a compatibility fallback.
+                         (("if os.environ.has_key\\(\"ICEWM_PRVCFG\"\\):[[:blank:]]+ppath=os.environ\\['ICEWM_PRVCFG'\\]")
+                          "if os.environ.has_key(\"ICEWM_PRIVCFG\"): ppath=os.environ['ICEWM_PRIVCFG']\n\telif os.environ.has_key(\"ICEWM_PRVCFG\"): ppath=os.environ['ICEWM_PRVCFG']"))
+                       ;; Replace two extinct optional programs with the
+                       ;; maintained equivalents already carried by Redstone.
+                       (substitute* "applets/gtop.cpl"
+                         (("^Exec=gtop") "Exec=lxtask"))
+                       (substitute* "applets/soundprop.cpl"
+                         (("^Exec=gtkaumix") "Exec=pavucontrol"))))))
+               (add-after 'install 'install-launchers-and-icon
+                 (lambda* (#:key outputs #:allow-other-keys)
+                   (let* ((out (assoc-ref outputs "out"))
+                          (bin (string-append out "/bin"))
+                          (icons (string-append out "/share/icons/hicolor/48x48/apps"))
+                          (launcher (string-append out "/share/icewmcp/launcher.py"))
+                          (python-path (getenv "GUIX_PYTHONPATH")))
+                     (mkdir-p bin)
+                     (mkdir-p icons)
+                     (install-file "icewmcp.png" icons)
+                     (rename-file (string-append icons "/icewmcp.png")
+                                  (string-append icons "/icewm-control-panel.png"))
+                     (chmod launcher #o755)
+                     ;; Menu launches do not inherit Guix's build-time Python
+                     ;; search path, so preserve the complete PyGTK closure in
+                     ;; the installed wrapper.
+                     (wrap-program launcher
+                       `("GUIX_PYTHONPATH" ":" prefix (,python-path)))
+                     (symlink launcher (string-append bin "/IceWMCP"))
+                     (symlink launcher (string-append bin "/icewm-control-panel"))))))))
+    (inputs (list python-2 python2-pygtk-legacy))
+    (home-page "https://icesoundmanager.sourceforge.net/")
+    (synopsis "Classic GTK 2 control panel for IceWM")
+    (description
+     "IceWMCP is a modular Windows Control Panel-style GTK 2 configuration
+suite for IceWM.  This package preserves all bundled applets, help, locales,
+icons, and applet definitions from the final 3.2 release.")
+    (license license:gpl2+)))
 
 ;; Netactview 0.6.4 (2015, last upstream release) — GTK2 graphical netstat
 ;; viewer. IceWM taskbar's Net meter (redstone-9x IceWM prefs,
@@ -224,6 +401,7 @@ process information (path, size, owner) and pattern-based filtering.")
 (packages->manifest
  (cons* pcmanfm-redstone
         icewm-gradients  ; replaces "icewm" spec — gradient-capable build
+        icewm-control-panel ; IceWMCP 3.2 and its complete bundled applet suite
         netactview       ; IceWM taskbar Net meter's NetStatusCommand target
         (map specification->package
              '(
@@ -261,6 +439,8 @@ process information (path, size, owner) and pattern-based filtering.")
    "mate-system-monitor" ; launched by the taskbar CPU meter (SerenityOS scheme)
    "fox"         ; FOX toolkit 1.6 — build/customise FOX apps in-room (ships adie, PathFinder)
    "pavucontrol" ; PulseAudio volume control — pnmixer's VolumeControlCommand target
+   "lxtask"      ; maintained backend for IceWMCP's historical Processes applet
+   "xscreensaver" ; backend and configuration UI for IceWMCP's Screen Saver applet
    "xarchiver"   ; GTK archive manager (Accessories) — replaced Ark; GTK themes cleanly under the sanctuary GTK theme, no KF6/kdeglobals colour-scheme gap, no CSD headerbar
    "vscodium"    ; VSCodium (nonguix channel) — community telemetry-free VSCode build; binary is `codium`
    "smplayer"    ; SMPlayer — Qt front-end for mpv/mplayer (Multimedia)
