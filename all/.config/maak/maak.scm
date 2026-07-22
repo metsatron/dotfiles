@@ -196,6 +196,16 @@
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/desktop-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/desktop-heal\"; \"$HELPER\"")))
 
+   (task 'redstone:refresh
+         "Project current DotCortex config into the running Redstone 9X room and reload it"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/sanctuary-redstone-9x-refresh\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/sanctuary-redstone-9x-refresh\"; \"$HELPER\"")))
+
+   (task 'redstone:check
+         "Report stale projected files in the running Redstone 9X room"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/sanctuary-redstone-9x-refresh\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/sanctuary-redstone-9x-refresh\"; \"$HELPER\" --check")))
+
    (task 'desktop:appmenu "Configure XFCE appmenu xsettings and registrar"
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/xfce-appmenu-configure\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/xfce-appmenu-configure\"; \"$HELPER\"")))
@@ -884,6 +894,7 @@
                         (not (string-prefix? "npm:" nm))
                         (not (string-prefix? "root:" nm))
                         (not (string-prefix? "stow:" nm))
+                        (not (string-prefix? "redstone:" nm))
                         (not (string-prefix? "defaults:" nm))
                         (not (string-prefix? "tmux:" nm))
                         (not (string-prefix? "sessions:" nm))
@@ -910,6 +921,10 @@
   (print-group "Desktop defaults commands"
                (lambda (t)
                  (string-prefix? "defaults:" (task-name-str t))))
+
+  (print-group "Redstone 9X commands"
+               (lambda (t)
+                 (string-prefix? "redstone:" (task-name-str t))))
 
   (print-group "Gnu Guix commands"
                (lambda (t)
