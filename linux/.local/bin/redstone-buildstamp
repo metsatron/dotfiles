@@ -1,0 +1,314 @@
+#!/bin/bash
+# Stable renderer wrapper
+
+
+# [[file:../../../sanctuary-redstone-9x-buildstamp.org::*Stable renderer wrapper][Stable renderer wrapper:1]]
+set -euo pipefail
+
+product_default="Mineshaft Redstone 9X"
+config_home="${XDG_CONFIG_HOME:-${HOME}/.config}"
+data_home="${XDG_DATA_HOME:-${HOME}/.local/share}"
+cache_home="${XDG_CACHE_HOME:-${HOME}/.cache}"
+runtime_root="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/dotcortex/redstone-9x"
+metadata_file="${data_home}/redstone-9x/build.ini"
+defaults_file="${config_home}/redstone-9x/buildstamp.conf"
+local_file="${config_home}/redstone-9x/buildstamp.local"
+scheme_state="${config_home}/redstone-9x/scheme"
+scheme_dir="${config_home}/redstone-9x/schemes"
+text_file="${runtime_root}/buildstamp.txt"
+pid_file="${runtime_root}/buildstamp.pid"
+state_file="${runtime_root}/buildstamp.state"
+command_file="${runtime_root}/buildstamp.command"
+log_file="${cache_home}/redstone-9x/buildstamp.log"
+
+usage() {
+  cat <<'EOF'
+Usage: redstone-buildstamp {start|refresh|stop|show|status}
+
+  start    generate runtime text and start one renderer if needed
+  refresh  reread identity/theme/style and restart only the recorded renderer
+  stop     stop only the validated recorded renderer and remove runtime state
+  show     print the exact product/build/theme text without launching XOSD
+  status   report process, theme, build, display, files, and renderer command
+EOF
+}
+
+warn() {
+  mkdir -p "$(dirname "${log_file}")"
+  printf 'redstone-buildstamp: %s\n' "$*" | tee -a "${log_file}" >&2
+}
+
+ini_value() {
+  local key="$1"
+  [[ -f "${metadata_file}" ]] || return 0
+  awk -F= -v wanted="${key}" '
+    /^\[Build\]$/ { in_build=1; next }
+    /^\[/ { in_build=0 }
+    in_build && $1 == wanted { sub(/^[^=]*=/, ""); print; exit }
+  ' "${metadata_file}"
+}
+
+load_identity() {
+  PRODUCT="$(ini_value product)"
+  BUILD_ID="$(ini_value identifier)"
+  BUILD_COMMIT="$(ini_value commit)"
+  [[ -n "${PRODUCT}" ]] || PRODUCT="${product_default}"
+  [[ -n "${BUILD_ID}" ]] || BUILD_ID="${BUILD_COMMIT:-unknown}"
+
+  SCHEME_ID="$(cat "${scheme_state}" 2>/dev/null || printf 'windows-95')"
+  SCHEME_FILE="${scheme_dir}/${SCHEME_ID}.scheme"
+  SCHEME_TITLE=""
+
+  BUILDSTAMP_ENABLED=1
+  BUILDSTAMP_FONT="-misc-fixed-medium-r-normal--12-*-*-*-c-*-iso10646-1"
+  BUILDSTAMP_FONT_SIZE=12
+  BUILDSTAMP_FOREGROUND="#ffffff"
+  BUILDSTAMP_SHADOW="#000000"
+  BUILDSTAMP_SHADOW_OFFSET=1
+  BUILDSTAMP_RIGHT_MARGIN=14
+  BUILDSTAMP_BOTTOM_MARGIN=12
+  BUILDSTAMP_SHOW_PRODUCT=1
+  BUILDSTAMP_SHOW_BUILD=1
+  BUILDSTAMP_SHOW_THEME=1
+
+  # shellcheck disable=SC1090
+  [[ -r "${defaults_file}" ]] && . "${defaults_file}"
+  # Existing Desktop Scheme declarations are trusted shell assignments.
+  # shellcheck disable=SC1090
+  [[ -r "${SCHEME_FILE}" ]] && . "${SCHEME_FILE}"
+  # Private user override is sourced last and never belongs to DotCortex.
+  # shellcheck disable=SC1090
+  [[ -r "${local_file}" ]] && . "${local_file}"
+
+  [[ -n "${SCHEME_TITLE}" ]] || SCHEME_TITLE="${SCHEME_ID:-Unknown Theme}"
+  [[ -n "${SCHEME_TITLE}" ]] || SCHEME_TITLE="Unknown Theme"
+}
+
+compose_text() {
+  local lines=()
+  [[ "${BUILDSTAMP_SHOW_PRODUCT}" == 1 ]] && lines+=("${PRODUCT}")
+  [[ "${BUILDSTAMP_SHOW_BUILD}" == 1 ]] && lines+=("Build ${BUILD_ID}")
+  [[ "${BUILDSTAMP_SHOW_THEME}" == 1 ]] && lines+=("${SCHEME_TITLE}")
+  if (( ${#lines[@]} == 0 )); then
+    return 1
+  fi
+  printf '%s\n' "${lines[@]}"
+}
+
+resolve_display() {
+  REDSTONE_DISPLAY="${DISPLAY:-:93}"
+  case "${REDSTONE_DISPLAY}" in
+    :93|:93.0) ;;
+    *) warn "refusing non-Redstone display ${REDSTONE_DISPLAY}"; return 1 ;;
+  esac
+  export DISPLAY="${REDSTONE_DISPLAY}"
+}
+
+render_text() {
+  mkdir -p "${runtime_root}"
+  local tmp
+  tmp="$(mktemp "${text_file}.tmp.XXXXXX")"
+  if ! compose_text >"${tmp}"; then
+    rm -f -- "${tmp}"
+    warn "all display lines are disabled"
+    return 1
+  fi
+  chmod 0600 "${tmp}"
+  mv -f -- "${tmp}" "${text_file}"
+}
+
+renderer_path() {
+  command -v osd_cat 2>/dev/null || true
+}
+
+font_for_xosd() {
+  local candidate="${BUILDSTAMP_FONT}"
+  if [[ "${candidate}" != -* ]]; then
+    candidate="-*-${candidate// /-}-medium-r-normal--${BUILDSTAMP_FONT_SIZE}-*-*-*-*-*-iso10646-1"
+  fi
+  if command -v xlsfonts >/dev/null 2>&1 \
+     && ! xlsfonts "${candidate}" 2>/dev/null | grep -q .; then
+    candidate="-misc-fixed-medium-r-normal--12-*-*-*-c-*-iso10646-1"
+  fi
+  printf '%s\n' "${candidate}"
+}
+
+bottom_offset() {
+  local offset="${BUILDSTAMP_BOTTOM_MARGIN}" dims height workarea wy wh reserved
+  if command -v xdpyinfo >/dev/null 2>&1 && command -v xprop >/dev/null 2>&1; then
+    dims="$(xdpyinfo 2>/dev/null | awk '/dimensions:/ { print $2; exit }')"
+    height="${dims#*x}"
+    workarea="$(xprop -root _NET_WORKAREA 2>/dev/null | sed 's/^[^=]*= *//' | cut -d, -f1-4)"
+    if [[ "${height}" =~ ^[0-9]+$ && -n "${workarea}" ]]; then
+      IFS=, read -r _wx wy _ww wh <<< "${workarea// /}"
+      if [[ "${wy}" =~ ^[0-9]+$ && "${wh}" =~ ^[0-9]+$ ]]; then
+        reserved=$(( height - wy - wh ))
+        (( reserved > 0 )) && offset=$(( reserved + BUILDSTAMP_BOTTOM_MARGIN ))
+      fi
+    fi
+  fi
+  printf '%s\n' "${offset}"
+}
+
+process_starttime() {
+  awk '{ print $22 }' "/proc/$1/stat" 2>/dev/null
+}
+
+read_recorded_state() {
+  RECORDED_PID="$(cat "${pid_file}" 2>/dev/null || true)"
+  RECORDED_START=""
+  RECORDED_EXE=""
+  RECORDED_DISPLAY=""
+  if [[ -r "${state_file}" ]]; then
+    while IFS='=' read -r key value; do
+      case "${key}" in
+        starttime) RECORDED_START="${value}" ;;
+        executable) RECORDED_EXE="${value}" ;;
+        display) RECORDED_DISPLAY="${value}" ;;
+      esac
+    done < "${state_file}"
+  fi
+}
+
+recorded_process_is_ours() {
+  read_recorded_state
+  [[ "${RECORDED_PID}" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "${RECORDED_PID}" 2>/dev/null || return 1
+  [[ -n "${RECORDED_START}" && "$(process_starttime "${RECORDED_PID}")" == "${RECORDED_START}" ]] || return 1
+  [[ -n "${RECORDED_EXE}" && "$(readlink -f "/proc/${RECORDED_PID}/exe" 2>/dev/null || true)" == "${RECORDED_EXE}" ]] || return 1
+  return 0
+}
+
+remove_process_state() {
+  rm -f -- "${pid_file}" "${state_file}" "${command_file}"
+}
+
+remove_runtime_state() {
+  remove_process_state
+  rm -f -- "${text_file}"
+}
+
+stop_renderer() {
+  if ! recorded_process_is_ours; then
+    remove_runtime_state
+    return 0
+  fi
+  kill "${RECORDED_PID}" 2>/dev/null || true
+  for _attempt in {1..20}; do
+    kill -0 "${RECORDED_PID}" 2>/dev/null || break
+    sleep 0.1
+  done
+  if kill -0 "${RECORDED_PID}" 2>/dev/null; then
+    kill -KILL "${RECORDED_PID}" 2>/dev/null || true
+  fi
+  remove_runtime_state
+}
+
+start_renderer() {
+  load_identity
+  if [[ "${BUILDSTAMP_ENABLED}" != 1 ]]; then
+    stop_renderer
+    return 0
+  fi
+  resolve_display || return 1
+  render_text || return 1
+  if recorded_process_is_ours; then
+    printf 'redstone-buildstamp: already running (pid=%s)\n' "${RECORDED_PID}"
+    return 0
+  fi
+  # Preserve the freshly rendered text while discarding only stale process
+  # ownership records before launching its new reader.
+  remove_process_state
+
+  local renderer font offset lines
+  renderer="$(renderer_path)"
+  if [[ -z "${renderer}" ]]; then
+    warn "osd_cat is unavailable; desktop startup continues without a stamp"
+    return 0
+  fi
+  if ! command -v xdpyinfo >/dev/null 2>&1 || ! xdpyinfo >/dev/null 2>&1; then
+    warn "Redstone display ${DISPLAY} is unavailable"
+    return 0
+  fi
+  font="$(font_for_xosd)"
+  offset="$(bottom_offset)"
+  lines="$(wc -l < "${text_file}")"
+  args=(
+    --pos=bottom
+    --align=right
+    "--offset=${offset}"
+    "--indent=${BUILDSTAMP_RIGHT_MARGIN}"
+    "--font=${font}"
+    "--colour=${BUILDSTAMP_FOREGROUND}"
+    "--shadow=${BUILDSTAMP_SHADOW_OFFSET}"
+    "--shadowcolour=${BUILDSTAMP_SHADOW}"
+    "--lines=${lines}"
+    --delay=0
+  )
+  mkdir -p "$(dirname "${log_file}")"
+  "${renderer}" "${args[@]}" <"${text_file}" >>"${log_file}" 2>&1 &
+  pid=$!
+  sleep 0.1
+  if ! kill -0 "${pid}" 2>/dev/null; then
+    warn "renderer exited during startup; see ${log_file}"
+    remove_runtime_state
+    return 0
+  fi
+  printf '%s\n' "${pid}" >"${pid_file}"
+  {
+    printf 'starttime=%s\n' "$(process_starttime "${pid}")"
+    printf 'executable=%s\n' "$(readlink -f "/proc/${pid}/exe")"
+    printf 'display=%s\n' "${DISPLAY}"
+  } >"${state_file}"
+  {
+    printf 'DISPLAY=%q ' "${DISPLAY}"
+    printf '%q ' "${renderer}" "${args[@]}"
+    printf '< %q\n' "${text_file}"
+  } >"${command_file}"
+  chmod 0600 "${pid_file}" "${state_file}" "${command_file}"
+  printf 'redstone-buildstamp: started (pid=%s)\n' "${pid}"
+}
+
+show_status() {
+  load_identity
+  resolve_display >/dev/null 2>&1 || REDSTONE_DISPLAY="${DISPLAY:-unknown}"
+  if recorded_process_is_ours; then
+    running="running"
+    pid="${RECORDED_PID}"
+  else
+    running="stopped"
+    pid="-"
+    remove_runtime_state
+  fi
+  printf 'State: %s\n' "${running}"
+  printf 'PID: %s\n' "${pid}"
+  printf 'Active theme: %s\n' "${SCHEME_TITLE}"
+  printf 'Build identity: %s\n' "${BUILD_ID}"
+  printf 'Display: %s\n' "${REDSTONE_DISPLAY}"
+  printf 'Metadata: %s\n' "${metadata_file}"
+  printf 'Runtime text: %s\n' "${text_file}"
+  if [[ -r "${command_file}" ]]; then
+    printf 'Renderer command: %s\n' "$(cat "${command_file}")"
+  else
+    printf 'Renderer command: %s\n' "$(renderer_path)"
+  fi
+}
+
+case "${1:-}" in
+  start) start_renderer ;;
+  refresh)
+    load_identity
+    if [[ "${BUILDSTAMP_ENABLED}" != 1 ]]; then
+      stop_renderer
+    else
+      stop_renderer
+      start_renderer
+    fi
+    ;;
+  stop) stop_renderer ;;
+  show) load_identity; compose_text ;;
+  status) show_status ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
+# Stable renderer wrapper:1 ends here
