@@ -443,6 +443,7 @@ process information (path, size, owner) and pattern-based filtering.")
    "xscreensaver" ; backend and configuration UI for IceWMCP's Screen Saver applet
    "lxinput"     ; ice2k Control Panel Mouse/Keyboard applet backend (control calls `lxinput`)
    "jstest-gtk"  ; ice2k Control Panel Game Controllers applet backend (control calls `jstest-gtk`)
+   "xlockmore"   ; provides `xlock` — backend for ice2k Display applet's Screen Saver tab (desk.cpp parses `xlock` modes for the list and previews via `xlock -mode X -nolock`); ice2k intentionally does not vendor-build it since Guix packages it
    "xarchiver"   ; GTK archive manager (Accessories) — replaced Ark; GTK themes cleanly under the sanctuary GTK theme, no KF6/kdeglobals colour-scheme gap, no CSD headerbar
    "vscodium"    ; VSCodium (nonguix channel) — community telemetry-free VSCode build; binary is `codium`
    "smplayer"    ; SMPlayer — Qt front-end for mpv/mplayer (Multimedia)
