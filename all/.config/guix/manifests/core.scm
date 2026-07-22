@@ -5,7 +5,7 @@
 (specifications->manifest
  '(
    "git" "git-extras"
-   "jq" "direnv" "htop" "btop" "ranger"
+   "jq" "direnv" "htop" "btop" "ranger" "unrar" ; Xarchiver RAR backend (RAR 7 compression support)
    "maak" "guile" "chafa"
    "glibc-locales"   ; for UTF-8 locales
    "procps"
