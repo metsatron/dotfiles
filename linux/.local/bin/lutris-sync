@@ -1,0 +1,230 @@
+#!/bin/bash
+# Hub Sync and Lease
+
+# Host-side control verb. Guests never run this directly against their own filesystem view — the hub is only writable from the host, so =lutris-play= relays via =host-spawn=.
+
+# The lease answers the real household hazard: a Lutris left running in the background on machine A while machine B fires one up. =begin= on B refuses, naming A and the lease age. Same-host re-entry is permissive: both processes share the same local sqlite on a local filesystem, which locks correctly.
+
+
+# [[file:../../../lutris.org::*Hub Sync and Lease][Hub Sync and Lease:1]]
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: lutris-sync <status|pull|push|begin|end|steal> [--force|--yes]
+
+  status  show hub reachability, lease holder, dirty flag, db freshness
+  pull    canonical hub -> local state (refused while local is dirty)
+  push    local state -> canonical hub (backs up hub pga.db first)
+  begin   session start: reconcile state, then take the lease
+  end     session end: push and release the lease
+  steal   remove another machine's lease (asks unless --yes)
+
+Hub root: $LUTRIS_HUB_ROOT override, else readlink -f ~/RetroPie.
+Exit 3 from begin = lease held by another machine; do not launch.
+LUTRIS_SYNC_SKIP_RUNNERS=1 skips the additive runner sync.
+EOF
+}
+
+verb="${1:-}"
+opt="${2:-}"
+[[ -n "$verb" ]] || { usage >&2; exit 2; }
+
+self_host="$(hostname -s 2>/dev/null || hostname)"
+hub_root="${LUTRIS_HUB_ROOT:-$(readlink -f "$HOME/RetroPie" 2>/dev/null || true)}"
+hub_cfg="${hub_root}/stow/.config/lutris"
+hub_data="${hub_root}/stow/.local/share/lutris"
+local_cfg="$HOME/.config/lutris"
+local_data="$HOME/.local/share/lutris"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/lutris-sync"
+dirty_flag="$state_dir/dirty"
+lease_file="$hub_data/.lease"
+mkdir -p "$state_dir"
+
+require_local_state() {
+  if [[ -L "$local_cfg" || -L "$local_data" ]]; then
+    echo "lutris-sync: live state is still symlinked into the shared tree — run lutris-state-local-init first" >&2
+    exit 1
+  fi
+  if [[ ! -d "$local_data" ]]; then
+    echo "lutris-sync: no local Lutris state at $local_data — run lutris-state-local-init first" >&2
+    exit 1
+  fi
+}
+
+hub_ok() {
+  [[ -n "$hub_root" ]] && timeout 10 test -d "$hub_data" 2>/dev/null
+}
+
+lease_fields() {
+  # -> "host token epoch" or nothing
+  [[ -r "$lease_file" ]] || return 1
+  head -n1 "$lease_file" 2>/dev/null
+}
+
+lease_age_human() {
+  local epoch="${1:-0}" now delta
+  [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+  now="$(date +%s)"
+  delta=$(( now - epoch ))
+  if (( delta < 0 )); then delta=0; fi
+  if (( delta >= 86400 )); then printf '%dd %dh' "$((delta/86400))" "$(((delta%86400)/3600))"
+  elif (( delta >= 3600 )); then printf '%dh %dm' "$((delta/3600))" "$(((delta%3600)/60))"
+  else printf '%dm' "$((delta/60))"
+  fi
+}
+
+sync_runners() {
+  # Additive version-directory sync in one direction. Runner trees are huge
+  # (tens of thousands of files); a file-level rsync walk over NFS is too slow
+  # for a per-launch path, so only whole missing version directories move.
+  local src="$1" dst="$2" type_dir ver_dir rel
+  [[ "${LUTRIS_SYNC_SKIP_RUNNERS:-0}" = 1 ]] && return 0
+  [[ -d "$src/runners" ]] || return 0
+  for type_dir in "$src/runners"/*/; do
+    [[ -d "$type_dir" ]] || continue
+    for ver_dir in "$type_dir"*/; do
+      [[ -d "$ver_dir" ]] || continue
+      rel="${ver_dir#"$src/runners/"}"
+      if [[ ! -e "$dst/runners/$rel" ]]; then
+        echo "lutris-sync: fetching runner $rel"
+        mkdir -p "$dst/runners/$(dirname "$rel")"
+        rsync -a "$ver_dir" "$dst/runners/$rel"
+      fi
+    done
+  done
+}
+
+pull_state() {
+  echo "lutris-sync: pull $hub_root -> local"
+  rsync -a --delete "$hub_cfg/" "$local_cfg/"
+  for f in pga.db pga.db-wal pga.db-shm apikey.txt; do
+    if [[ -e "$hub_data/$f" ]]; then rsync -a "$hub_data/$f" "$local_data/$f"
+    elif [[ -e "$local_data/$f" && "$f" != pga.db ]]; then rm -f "$local_data/$f"
+    fi
+  done
+  for d in banners coverart covers lib; do
+    [[ -d "$hub_data/$d" ]] && rsync -a "$hub_data/$d/" "$local_data/$d/"
+  done
+  sync_runners "$hub_data" "$local_data"
+}
+
+push_state() {
+  echo "lutris-sync: push local -> $hub_root"
+  # One-generation rollback of the canonical db and config before the
+  # mirroring push overwrites them (push uses --delete on the config tree).
+  if [[ -f "$hub_data/pga.db" ]]; then
+    cp -f "$hub_data/pga.db" "$hub_data/pga.db.prev"
+  fi
+  if [[ -d "$hub_cfg" ]]; then
+    rsync -a --delete "$hub_cfg/" "$hub_data/.config-prev/"
+  fi
+  rsync -a --delete "$local_cfg/" "$hub_cfg/"
+  for f in pga.db pga.db-wal pga.db-shm apikey.txt; do
+    if [[ -e "$local_data/$f" ]]; then rsync -a "$local_data/$f" "$hub_data/$f"
+    elif [[ -e "$hub_data/$f" && "$f" != pga.db ]]; then rm -f "$hub_data/$f"
+    fi
+  done
+  for d in banners coverart covers lib; do
+    [[ -d "$local_data/$d" ]] && rsync -a "$local_data/$d/" "$hub_data/$d/"
+  done
+  sync_runners "$local_data" "$hub_data"
+}
+
+case "$verb" in
+  status)
+    echo "hub root : ${hub_root:-<unresolved>}"
+    if hub_ok; then echo "hub      : reachable"; else echo "hub      : UNREACHABLE (offline mode)"; fi
+    if [[ -e "$dirty_flag" ]]; then echo "local    : DIRTY (unpushed session state)"; else echo "local    : clean"; fi
+    if fields="$(lease_fields)"; then
+      read -r l_host l_token l_epoch <<<"$fields"
+      echo "lease    : held by $l_host for $(lease_age_human "$l_epoch") (token $l_token)"
+    else
+      echo "lease    : free"
+    fi
+    if [[ -f "$local_data/pga.db" ]]; then
+      echo "local db : $(stat -c '%y %s bytes' "$local_data/pga.db")"
+    else
+      echo "local db : missing (run lutris-state-local-init)"
+    fi
+    if hub_ok && [[ -f "$hub_data/pga.db" ]]; then
+      echo "hub db   : $(stat -c '%y %s bytes' "$hub_data/pga.db")"
+    fi
+    ;;
+  pull)
+    require_local_state
+    hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
+    if [[ -e "$dirty_flag" && "$opt" != "--force" ]]; then
+      echo "lutris-sync: local state is dirty (unpushed session) — push first, or pull --force to discard" >&2
+      exit 1
+    fi
+    pull_state
+    ;;
+  push)
+    require_local_state
+    hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
+    push_state
+    rm -f "$dirty_flag"
+    ;;
+  begin)
+    require_local_state
+    if ! hub_ok; then
+      echo "lutris-sync: hub unreachable — OFFLINE session on local state (will sync when the hub returns)" >&2
+      touch "$dirty_flag"
+      exit 0
+    fi
+    if fields="$(lease_fields)"; then
+      read -r l_host l_token l_epoch <<<"$fields"
+      if [[ "$l_host" != "$self_host" ]]; then
+        if [[ "${LUTRIS_PLAY_STEAL:-0}" = 1 ]]; then
+          echo "lutris-sync: STEALING lease from $l_host (held $(lease_age_human "$l_epoch"))" >&2
+        else
+          echo "lutris-sync: Lutris state is live on ${l_host} (lease held $(lease_age_human "$l_epoch"))." >&2
+          echo "  Close Lutris there first, or run: lutris-sync steal" >&2
+          exit 3
+        fi
+      else
+        echo "lutris-sync: resuming on this machine (existing $self_host lease)"
+      fi
+    fi
+    if [[ -e "$dirty_flag" ]]; then
+      echo "lutris-sync: local state dirty from an unsynced session — pushing local truth first"
+      push_state
+    else
+      pull_state
+    fi
+    printf '%s %s %s\n' "$self_host" "${LUTRIS_LEASE_TOKEN:-$$-$RANDOM}" "$(date +%s)" > "$lease_file"
+    touch "$dirty_flag"
+    ;;
+  end)
+    require_local_state
+    if ! hub_ok; then
+      echo "lutris-sync: hub unreachable at session end — state stays dirty locally" >&2
+      exit 0
+    fi
+    push_state
+    rm -f "$dirty_flag"
+    if fields="$(lease_fields)"; then
+      read -r l_host _ _ <<<"$fields"
+      [[ "$l_host" = "$self_host" ]] && rm -f "$lease_file"
+    fi
+    ;;
+  steal)
+    hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
+    if fields="$(lease_fields)"; then
+      read -r l_host _ l_epoch <<<"$fields"
+      if [[ "$opt" != "--yes" ]]; then
+        printf 'Steal the lease from %s (held %s)? [y/N] ' "$l_host" "$(lease_age_human "$l_epoch")"
+        read -r answer
+        [[ "$answer" = y || "$answer" = Y ]] || { echo "aborted"; exit 1; }
+      fi
+      rm -f "$lease_file"
+      echo "lutris-sync: lease removed (was $l_host)"
+    else
+      echo "lutris-sync: lease already free"
+    fi
+    ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
+# Hub Sync and Lease:1 ends here
