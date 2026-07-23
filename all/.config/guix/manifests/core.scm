@@ -39,7 +39,8 @@
    "whisper-cpp"     ; CPU speech-to-text (whisper-transcribe, telegram voice pipeline)
    ;; "audacity"
    "appmenu-gtk-module"
-   "cdemu-client" "cdemu-daemon"
+   ;; "cdemu-client" "cdemu-daemon"  ; removed 2026-07-23 — CLI-only stub: no gcdemu GUI in Guix, no vhba kernel module, daemon never autostarted. Disc-image inspection handled by fuseiso (userspace FUSE mount) instead.
+   "fuseiso"          ; userspace FUSE mount for CD/DVD images (.iso/.bin/.nrg/.mdf/.img incl. raw 2352-byte sectors) — browse disc contents in the file manager without root, kernel module, or daemon. Drives the disc-mount-browse Thunar action.
    "node"
    "llama-cpp"
 
