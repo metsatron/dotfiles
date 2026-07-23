@@ -77,7 +77,8 @@
 ;; Re-enable gvfs in a PCManFM room ONLY after the libfm attribute-guard crash
 ;; is fixed; a Thunar/Nautilus room needs only the shield (see sanctuary-godzilla-xs).
 ;; Apply: make guix-room-gaming
-(use-modules (guix packages)
+(use-modules (ice-9 ftw)
+             (guix packages)
              (guix gexp)
              (guix utils)
              (guix download)
@@ -97,6 +98,12 @@
              (gnu packages pkg-config)
              (gnu packages python)
              (gnu packages gettext))
+
+(define pcmanfm-redstone-desktop-labels-patch
+  (local-file
+   (string-append (dirname (current-filename))
+                  "/../../patches/pcmanfm-redstone-desktop-labels.patch")
+   "pcmanfm-redstone-desktop-labels.patch"))
 
 ;; IceWM with compile-time gradient support. Guix's flags omit
 ;; CONFIG_GRADIENTS, so Gradients=-listed title pixmaps TILE instead of
@@ -339,6 +346,10 @@ process information (path, size, owner) and pattern-based filtering.")
      (list #:configure-flags #~(list "--with-gtk=3")
            #:phases
            #~(modify-phases %standard-phases
+            (add-after 'unpack 'apply-desktop-label-rendering
+              (lambda _
+                (invoke "patch" "-p1" "-i"
+                        #$pcmanfm-redstone-desktop-labels-patch)))
             (add-after 'unpack 'fix-desktop-selection-rendering
               (lambda _
                 (substitute* "src/desktop.c"
