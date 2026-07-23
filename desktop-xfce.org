@@ -872,6 +872,257 @@ case "${1:-status}" in
 esac
 #+END_SRC
 
+* Disc image mount / browse (fuseiso)
+Replaces the removed CDEmu stub. =fuseiso= is a userspace FUSE filesystem — no kernel module (=vhba=), no daemon, no root — that understands CD/DVD images including *raw 2352-byte-per-sector* =.bin= dumps (the format =7z=/=xarchiver= cannot open, because their ISO9660 parser expects the =CD001= signature at the cooked-sector offset 32769). =disc-mount-browse= resolves the real image (following a =.cue='s =FILE= line case-insensitively, which also sidesteps the common =BEOSR4.BIN= vs =beosr4.bin= case mismatch on a case-sensitive filesystem), mounts it under =$XDG_RUNTIME_DIR/disc-mounts/=, and opens the contents in the file manager — no terminal. =disc-unmount= tears the mount(s) down. Both are wired to Thunar custom actions (=uca.xml=, which Thunar owns as live GUI state and is therefore edited in place, not tangled).
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/disc-mount-browse :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# disc-mount-browse IMAGE
+# FUSE-mount a CD/DVD image (.iso/.bin/.cue/.nrg/.mdf/.img/.toc) and open it in
+# the file manager. Invoked from a Thunar custom action (%f). No terminal: every
+# user-facing failure goes to a zenity dialog.
+set -euo pipefail
+
+err() {
+  if command -v zenity >/dev/null 2>&1; then
+    zenity --error --no-wrap --title="Disc image" --text="$1" 2>/dev/null || true
+  else
+    printf '%s\n' "$1" >&2
+  fi
+  exit 1
+}
+
+[ "$#" -ge 1 ] && [ -n "${1:-}" ] || err "No disc image given."
+command -v fuseiso >/dev/null 2>&1 || \
+  err "fuseiso is not installed.\nAdd it via package-guix.org, then: loom guix:apply"
+
+src="$1"
+[ -e "$src" ] || err "File not found:\n$src"
+
+dir=$(dirname -- "$src")
+base=$(basename -- "$src")
+ext_lc=$(printf '%s' "${base##*.}" | tr '[:upper:]' '[:lower:]')
+
+# Resolve the actual image file to hand to fuseiso.
+img=""
+case "$ext_lc" in
+  cue|toc)
+    # First FILE "<name>" entry in the sheet; resolve case-insensitively.
+    want=$(grep -im1 '^[[:space:]]*FILE' -- "$src" \
+      | sed -E 's/^[[:space:]]*FILE[[:space:]]+"?([^"]*)"?[[:space:]]+[A-Za-z0-9]+[[:space:]]*$/\1/I')
+    if [ -n "$want" ] && [ -e "$dir/$want" ]; then
+      img="$dir/$want"
+    elif [ -n "$want" ]; then
+      hit=$(cd -- "$dir" && ls -1 2>/dev/null | grep -ixF -- "$want" | head -1 || true)
+      [ -n "$hit" ] && img="$dir/$hit"
+    fi
+    if [ -z "$img" ]; then
+      stem="${base%.*}"
+      for e in bin img iso nrg mdf BIN IMG ISO NRG MDF; do
+        [ -e "$dir/$stem.$e" ] && { img="$dir/$stem.$e"; break; }
+      done
+    fi
+    [ -n "$img" ] || err "Could not find the image referenced by:\n$base"
+    ;;
+  *)
+    img="$src"
+    ;;
+esac
+
+root="${XDG_RUNTIME_DIR:-$HOME/.cache}/disc-mounts"
+name=$(basename -- "$img"); name="${name%.*}"
+name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')
+mnt="$root/$name"
+mkdir -p -- "$mnt"
+
+# Mount only if not already mounted at $mnt.
+if ! awk -v mp="$mnt" '$2==mp{f=1} END{exit !f}' /proc/mounts 2>/dev/null; then
+  log=$(mktemp)
+  if ! fuseiso -- "$img" "$mnt" 2>"$log"; then
+    msg=$(cat "$log" 2>/dev/null); rm -f "$log"
+    err "fuseiso could not mount:\n$img\n\n${msg:-(no error output)}"
+  fi
+  rm -f "$log"
+fi
+
+# Open the mount in the file manager (no terminal).
+if command -v thunar >/dev/null 2>&1; then exec thunar "$mnt"
+elif command -v exo-open >/dev/null 2>&1; then exec exo-open "$mnt"
+elif command -v pcmanfm >/dev/null 2>&1; then exec pcmanfm "$mnt"
+else exec xdg-open "$mnt"; fi
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/disc-unmount :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# disc-unmount [IMAGE|MOUNTPOINT]
+# Unmount a fuseiso disc image mounted by disc-mount-browse. With no argument (or
+# an argument that maps to nothing) unmounts every disc image under the runtime
+# mount root. Wired to the Thunar "Unmount disc image" custom action.
+set -euo pipefail
+
+root="${XDG_RUNTIME_DIR:-$HOME/.cache}/disc-mounts"
+
+note() { command -v notify-send >/dev/null 2>&1 && notify-send "Disc image" "$1" 2>/dev/null || true; }
+
+drop() {
+  local m="$1"
+  [ -n "$m" ] || return 0
+  if awk -v mp="$m" '$2==mp{f=1} END{exit !f}' /proc/mounts 2>/dev/null; then
+    fusermount -u -- "$m" 2>/dev/null || umount -- "$m" 2>/dev/null || return 1
+  fi
+  rmdir -- "$m" 2>/dev/null || true
+}
+
+done_any=0
+if [ "$#" -ge 1 ] && [ -n "${1:-}" ]; then
+  arg="$1"
+  if [ -d "$arg" ] && awk -v mp="$arg" '$2==mp{f=1} END{exit !f}' /proc/mounts 2>/dev/null; then
+    drop "$arg" && done_any=1
+  else
+    name=$(basename -- "$arg"); name="${name%.*}"
+    name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '_')
+    if drop "$root/$name"; then done_any=1; fi
+  fi
+fi
+
+# Fall back to unmounting everything if the targeted attempt did nothing.
+if [ "$done_any" -eq 0 ] && [ -d "$root" ]; then
+  for m in "$root"/*/; do
+    [ -d "${m%/}" ] || continue
+    drop "${m%/}" && done_any=1
+  done
+fi
+
+note "Unmounted."
+#+END_SRC
+
+* Thunar custom actions (=uca.xml=)
+Canonical source for Thunar's right-click custom actions. Thunar owns this file as live GUI state (the "Configure custom actions" dialog rewrites it), so historically it drifted unmanaged — the =Mount & browse disc image= / =Unmount disc image= actions were first hand-appended to the live file. This block reclaims the whole file as declarative: it tangles to =linux/.config/Thunar/uca.xml= and is stowed into place, so every action — the pandoc converters, AppImage updater, terminal-here entries, and the disc-image pair — is reproducible on any machine. *Covenant:* edit actions *here*, then re-tangle and stow — not in the Thunar GUI. A GUI edit writes a real file over the stow symlink and diverges until the next stow restores this source. =unique-id= values are stable identifiers Thunar assigns; they are preserved verbatim so existing per-action state (e.g. toolbar placement) is not orphaned.
+
+#+BEGIN_SRC xml :tangle linux/.config/Thunar/uca.xml
+<?xml version="1.0" encoding="UTF-8"?>
+<actions>
+<action>
+  <icon>terminal</icon>
+  <name>Update</name>
+  <unique-id>1573903056061608-1</unique-id>
+  <command>~/.local/bin/appimaged %f</command>
+  <description>Update the AppImage</description>
+  <patterns>*.AppImage;*.appimage</patterns>
+  <directories/>
+  <other-files/>
+</action>
+<action>
+  <icon>utilities-terminal</icon>
+  <name>Open Terminal Here</name>
+  <unique-id>1538583243549443-1</unique-id>
+  <command>exo-open --working-directory %f --launch TerminalEmulator</command>
+  <description>Example for a custom action</description>
+  <patterns>*</patterns>
+  <startup-notify/>
+  <directories/>
+</action>
+<action>
+  <icon>BeOS_terminal</icon>
+  <name>Open WezTerm Here</name>
+  <unique-id>1768003068819458-1</unique-id>
+  <command>flatpak run org.wezfurlong.wezterm start --cwd %f</command>
+  <description></description>
+  <patterns>*</patterns>
+  <directories/>
+</action>
+<action>
+  <icon>ooo-writer</icon>
+  <name>Convert to ODT</name>
+  <unique-id>1745276239387805-1</unique-id>
+  <command>~/.local/bin/md2odt.sh %f</command>
+  <description>Convert Markdown to ODT using Pandoc</description>
+  <patterns>*.markdown;*.md;*.org</patterns>
+  <text-files/>
+</action>
+<action>
+  <icon>gnome-mime-text-org</icon>
+  <name>Convert to Markdown</name>
+  <unique-id>1745276935498372-2</unique-id>
+  <command>~/.local/bin/odt2md.sh %f</command>
+  <description>Convert ODT to Markdown using Pandoc</description>
+  <patterns>*.odt</patterns>
+  <other-files/>
+  <text-files/>
+</action>
+<action>
+  <icon>gnome-mime-text-org</icon>
+  <name>Convert to Org</name>
+  <unique-id>1745276990010937-3</unique-id>
+  <command>~/.local/bin/odt2org.sh %f</command>
+  <description>Convert ODT to Org using Pandoc</description>
+  <patterns>*.odt</patterns>
+  <other-files/>
+  <text-files/>
+</action>
+<action>
+  <icon>gnome-mime-text-org</icon>
+  <name>Convert to Org</name>
+  <unique-id>1751782365784736-1</unique-id>
+  <command>~/.local/bin/md2org.sh %f</command>
+  <description>Convert Markdown to Org using Pandoc</description>
+  <patterns>*.markdown;*.md</patterns>
+  <text-files/>
+</action>
+<action>
+  <icon>gnome-mime-text-org</icon>
+  <name>Convert to Markdown</name>
+  <unique-id>1751782494455560-2</unique-id>
+  <command>~/.local/bin/org2md.sh %f</command>
+  <description>Convert Org to Markdown using Pandoc</description>
+  <patterns>*.org</patterns>
+  <text-files/>
+</action>
+<action>
+  <icon>BeOS_Globe_HTML_Editor</icon>
+  <name>Convert MD to HTML</name>
+  <unique-id>1751854301359711-1</unique-id>
+  <command>~/.local/bin/md2html.sh %f</command>
+  <description>Convert MD to HTML using Pandoc</description>
+  <patterns>*.md</patterns>
+</action>
+<action>
+  <icon>BeOS_Globe_HTML_Editor</icon>
+  <name>Convert HTML to MD</name>
+  <unique-id>1751854355577175-2</unique-id>
+  <command>~/.local/bin/html2md.sh %f</command>
+  <description>Convert HTML to MD using Pandoc</description>
+  <patterns>*.html</patterns>
+  <text-files/>
+</action>
+<action>
+  <icon>Obsidian</icon>
+  <name>Convert to Obsidian</name>
+  <unique-id>1755638576055217-1</unique-id>
+  <command>~/.local/bin/org2obsidian.sh %f</command>
+  <description>Convert Org-Mode to Obsidian Tasks using Pandoc</description>
+  <patterns>*.org</patterns>
+  <text-files/>
+</action>
+<action>
+  <icon>drive-optical</icon>
+  <name>Mount &amp; browse disc image</name>
+  <unique-id>1784800000000000-1</unique-id>
+  <command>~/.local/bin/disc-mount-browse %f</command>
+  <description>FUSE-mount a CD/DVD image (.iso/.bin/.cue/.nrg/.mdf/.img) and open its contents</description>
+  <patterns>*.iso;*.bin;*.cue;*.nrg;*.mdf;*.img;*.toc</patterns>
+  <other-files/>
+</action>
+<action>
+  <icon>media-eject</icon>
+  <name>Unmount disc image</name>
+  <unique-id>1784800000000000-2</unique-id>
+  <command>~/.local/bin/disc-unmount %f</command>
+  <description>Unmount a disc image mounted with fuseiso</description>
+  <patterns>*.iso;*.bin;*.cue;*.nrg;*.mdf;*.img;*.toc</patterns>
+  <other-files/>
+</action>
+</actions>
+#+END_SRC
+
 * Make fragment
 Parity with =plasmoid.mk=; lets =make -f xfce-desktopmenu.mk <target>= drive the same helpers loom verbs call.
 
