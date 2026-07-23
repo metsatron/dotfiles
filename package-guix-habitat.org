@@ -849,6 +849,7 @@ Windows-themed rooms like =sanctuary-redstone-9x=).
              (guix build-system copy)
              (guix build-system gnu)
              (guix build-system python)
+             (guix build-system trivial)  ; gzdoom-engines union (symlink-only output)
              ((guix licenses) #:prefix license:)
              (gnu packages base)
              (gnu packages crypto)
@@ -861,6 +862,10 @@ Windows-themed rooms like =sanctuary-redstone-9x=).
              (gnu packages libffi)
              (gnu packages pkg-config)
              (gnu packages python)
+             (gnu packages games)       ; uzdoom — recipe base for pinned gzdoom engines
+             (gnu packages gl)          ; mesa — libGL RUNPATH for pinned gzdoom
+             (guix download)            ; url-fetch for pinned engine tarballs
+             (guix gexp)
              (gnu packages gettext))
 
 (define pcmanfm-redstone-desktop-labels-patch
@@ -1388,12 +1393,162 @@ process information (path, size, owner) and pattern-based filtering.")
                 (when (zero? (system* "grep" "-q" "XMapRaised" "src/libxosd/xosd.c"))
                   (error "Redstone XOSD still contains XMapRaised"))))))))))
 
+;; Version-exact pinned GZDoom engines for the RetroPie ports contracts.
+;;
+;; The ports .sh scripts pin specific engine builds (gzdoom 4.5.0 for 289
+;; launchers, 4.10.0 for 194) because mod/TC ZScript behaviour drifts across
+;; engine versions — the pin IS the contract (verified live 2026-07-23: uzdoom
+;; 4.14 drew ZScript return-value warnings against LiTDooM). The x230-built FHS
+;; bundles cannot run in the Guix guest (no /lib64 loader; libGL bound to the
+;; wrong driver stack — the GLX wall). Building version-exact from the ZDoom
+;; tag against Guix's own Mesa clears that wall: proven live rendering DOOM 2 at
+;; 1024x819 in-guest, 2026-07-23. lutris-ports-bridge resolves gzdoom/* scripts
+;; to these instead of the paired-loader fallback.
+;;
+;; make-gzdoom: one tag + one hash per pinned version. Inherits uzdoom's proven
+;; recipe; patches (1) the pk3 store search path — gzdoom persists it to
+;; ~/.config/gzdoom/gzdoom.ini and reads it back, so a stale ini shadows a
+;; rebuilt engine (sealed as a gotcha); (2) <cstdio> into the vendored AMD VMA
+;; header, which GCC 14 no longer includes transitively.
+;;
+;; Outputs are VERSION-NAMESPACED (bin/gzdoom-<v>, share/games/gzdoom-<v>) so
+;; multiple pinned engines coexist in the room-gaming profile without colliding
+;; on bin/gzdoom + share/games/doom/gzdoom.pk3. The ports engine resolver maps a
+;; script's ./bin/gzdoom-<v>/ dir to the profile's gzdoom-<v> binary.
+(define* (make-gzdoom version hash #:key (tarball-version version))
+  (package
+    (inherit uzdoom)
+    (name "gzdoom")
+    (version version)
+    (source
+     (origin
+       (method url-fetch)
+       (uri (string-append "https://github.com/ZDoom/gzdoom/archive/g"
+                           tarball-version ".tar.gz"))
+       (file-name (string-append "gzdoom-" version ".tar.gz"))
+       (sha256 (base32 hash))
+       (modules '((guix build utils)))
+       (snippet
+        #~(begin
+            (substitute* "src/gameconfigfile.cpp"
+              (("SetValueForKey \\(\"Path\", \"/usr/local/share/doom\", true\\);" line)
+               (string-append
+                "SetValueForKey (\"Path\", \"$GUIX_GZDOOM_PREFIX/share/games/gzdoom-"
+                #$version "\", true);\n\t\t" line)))
+            (substitute* "src/common/rendering/vulkan/thirdparty/vk_mem_alloc/vk_mem_alloc.h"
+              (("#include <cstring>")
+               "#include <cstring>\n#include <cstdio>"))
+            ;; 4.5.0's src/CMakeLists.txt has a POST_BUILD `link-make` symlink
+            ;; step that calls the absolute /bin/sh, which does not exist in the
+            ;; Guix build sandbox (build fails after the full compile). Resolve
+            ;; sh on PATH instead. No-op for versions (e.g. 4.10.0) that dropped
+            ;; the step — substitute* leaves a non-matching file untouched.
+            (substitute* "src/CMakeLists.txt"
+              (("COMMAND /bin/sh") "COMMAND sh"))
+            ;; 4.5.0 searches for the auxiliary engine pk3s (lights, brightmaps,
+            ;; widescreen gfx) ONLY in the config's search dirs, so a stale
+            ;; ~/.config/gzdoom ini hides them. 4.10.0 already checks progdir
+            ;; first for these — upstream's own robustness fix. Backport it to
+            ;; the older engine so, combined with the pk3-into-bin symlinks
+            ;; below, discovery is fully ini-independent. No-op on any version
+            ;; that already passes `true` (pattern absent → file untouched).
+            (substitute* "src/d_main.cpp"
+              (("BaseFileSearch \\(\"lights.pk3\", NULL, false")
+               "BaseFileSearch (\"lights.pk3\", NULL, true")
+              (("BaseFileSearch \\(\"brightmaps.pk3\", NULL, false")
+               "BaseFileSearch (\"brightmaps.pk3\", NULL, true")
+              (("BaseFileSearch \\(\"game_widescreen_gfx.pk3\", NULL, false")
+               "BaseFileSearch (\"game_widescreen_gfx.pk3\", NULL, true"))))))
+    (arguments
+     (substitute-keyword-arguments (package-arguments uzdoom)
+       ((#:phases phases)
+        #~(modify-phases #$phases
+            ;; Namespace the outputs so pinned versions coexist in one profile.
+            (add-after 'install 'namespace-outputs
+              (lambda _
+                (rename-file (string-append #$output "/bin/gzdoom")
+                             (string-append #$output "/bin/gzdoom-" #$version))
+                (rename-file (string-append #$output "/share/games/doom")
+                             (string-append #$output "/share/games/gzdoom-" #$version))
+                ;; Symlink every engine pk3 into bin/ (progdir). gzdoom locates
+                ;; gzdoom.pk3 and the auxiliaries by checking the running
+                ;; binary's own directory FIRST (see BaseFileSearch), before any
+                ;; ini search path. The real binary lives in bin/, so linking the
+                ;; pk3s here makes discovery independent of any home's stale
+                ;; gzdoom.ini — and progdir resolves to this store bin/ via
+                ;; /proc/self/exe even when the wrapper is run from a profile.
+                (let ((share (string-append #$output "/share/games/gzdoom-"
+                                            #$version)))
+                  (with-directory-excursion (string-append #$output "/bin")
+                    (for-each
+                     (lambda (pk3)
+                       (symlink (string-append "../share/games/gzdoom-"
+                                               #$version "/" (basename pk3))
+                                (basename pk3)))
+                     (find-files share "\\.pk3$"))))))
+            (replace 'wrap-uzdoom
+              (lambda _
+                (wrap-program (string-append #$output "/bin/gzdoom-" #$version)
+                  `("GUIX_GZDOOM_PREFIX" = (,#$output)))))))))
+    (inputs (modify-inputs (package-inputs uzdoom) (prepend mesa)))
+    (synopsis (string-append "GZDoom " version
+                             " (version-exact, pinned mod contracts)"))))
+
+;; Load-bearing pins (frequency from the ports scripts, 2026-07-23).
+(define gzdoom-4.10.0
+  (make-gzdoom "4.10.0"
+               "081ssajrb5xnyk35ngc15sad12qd4wmchsjwfr5gv3840ln540l7"))
+(define gzdoom-4.5.0
+  (make-gzdoom "4.5.0"
+               "07b1csbgh5ai81zad1fsnj74yifmwd5mhhzj55n2llxf3li1msr1"))
+
+;; gzdoom-engines: union of the pinned engines into ONE profile entry.
+;; Guix dedupes a profile by package `name`, so two packages both named
+;; "gzdoom" cannot coexist even though their outputs are namespaced. Rather
+;; than version the package name (which changes the derivation and forces a
+;; full recompile of already-built, verified engines), we symlink each engine's
+;; absolute wrapper into a single trivial output. The wrappers are fully
+;; self-referential (they hardcode GUIX_GZDOOM_PREFIX to their own store path
+;; and exec their absolute real binary), so a bare symlink resolves the pk3 and
+;; runs correctly from any profile. Only the public bin/gzdoom-<v> wrappers are
+;; linked — the hidden .gzdoom-<v>-real binaries stay behind their wrappers.
+(define gzdoom-engines
+  (package
+    (name "gzdoom-engines")
+    (version "1.0")
+    (source #f)
+    (build-system trivial-build-system)
+    (arguments
+     (list
+      #:modules '((guix build utils))
+      #:builder
+      #~(begin
+          (use-modules (guix build utils))
+          (let ((bin (string-append #$output "/bin")))
+            (mkdir-p bin)
+            (for-each
+             (lambda (engine)
+               (for-each
+                (lambda (wrapper)
+                  (let ((base (basename wrapper)))
+                    (when (string-prefix? "gzdoom-" base)
+                      (symlink wrapper (string-append bin "/" base)))))
+                (find-files (string-append engine "/bin") #:directories? #f)))
+             (list #$gzdoom-4.10.0 #$gzdoom-4.5.0))))))
+    (synopsis "Pinned GZDoom engines (version-exact mod contracts) as one profile entry")
+    (description "Symlinks the version-namespaced GZDoom wrappers (gzdoom-4.10.0,
+gzdoom-4.5.0) into a single profile so the ports engine resolver and Lutris both
+find every pinned engine under one bin/ directory.")
+    (home-page (package-home-page gzdoom-4.10.0))
+    (license (package-license gzdoom-4.10.0))))
+
 (packages->manifest
  (cons* pcmanfm-redstone
         xosd-redstone   ; desktop-layer osd_cat for the Redstone build stamp
         icewm-gradients  ; replaces "icewm" spec — gradient-capable build
         icewm-control-panel ; IceWMCP 3.2 and its complete bundled applet suite
         netactview       ; IceWM taskbar Net meter's NetStatusCommand target
+        gzdoom-engines   ; union of the pinned engines (4.10.0 + 4.5.0) as one entry
         (map specification->package
              '(
    "rofi"     ; Windows-95 Run/launcher dialogs (stock rofi, fixed-geometry theme)
