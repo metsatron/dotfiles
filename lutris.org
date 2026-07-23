@@ -1,5 +1,5 @@
 #+TITLE: Lutris Shared Library Topology
-#+DESCRIPTION: X230-backed Lutris, Games, and sanctuary projection policy
+#+DESCRIPTION: Machine-local Lutris state, hub-canonical sync, lease-guarded launches
 #+AUTHOR: Mètsàtron — Sovereign Weaver
 #+LANGUAGE: en
 #+PROPERTY: header-args :mkdirp yes :results silent
@@ -7,88 +7,455 @@
 
 * Purpose
 
-This file declares the shared Lutris storage topology.  It does not reconstruct
-games entry-by-entry and it does not move user-owned game payloads.
+This file declares the fleet Lutris storage topology. It does not reconstruct games entry-by-entry and it does not move user-owned game payloads.
 
-Canonical payload storage:
+The topology changed on 2026-07-23 (second generation). The first generation symlinked every machine's and every sanctuary's live Lutris state (=~/.config/lutris=, =~/.local/share/lutris=, including =pga.db=) into one NFS tree on the fileserver. That violated the Gaming-Sanctuaries transport law (high-churn state on NFS), put a sqlite database behind NFS locking, and made a background Lutris on one machine able to corrupt a fresh launch on another. Sanctuary RO binds of the tree also made =pga.db= unwritable in-guest.
+
+Second generation: *one writable brain per machine, one canonical hub, lease-guarded sync*.
 
 #+BEGIN_SRC text :tangle linux/.config/lutris-shared/topology.txt
-X230 canonical payload roots:
-  ~/Games
-  ~/RetroPie
+Lutris fleet topology — second generation (2026-07-23)
 
-Shared Lutris state:
-  ~/.config/lutris       -> ~/RetroPie/stow/.config/lutris
-  ~/.local/share/lutris  -> ~/RetroPie/stow/.local/share/lutris
+Canonical hub (the fileserver's RetroPie tree; X230 today, T1700 after cutover):
+  <hub>/RetroPie/stow/.config/lutris        canonical Lutris config
+  <hub>/RetroPie/stow/.local/share/lutris   canonical Lutris data (pga.db, art, runners)
+  <hub>/RetroPie/stow/.local/share/lutris/.lease   playtime lease (host token epoch)
 
-Fleet links:
-  T480/T480s ~/Games                 -> ~/mnt/x230/Games
-  T480/T480s ~/RetroPie              -> ~/mnt/x230/RetroPie
-  T480/T480s ~/.config/lutris        -> ~/mnt/x230/RetroPie/stow/.config/lutris
-  T480/T480s ~/.local/share/lutris   -> ~/mnt/x230/RetroPie/stow/.local/share/lutris
+Hub resolution (lutris-sync): $LUTRIS_HUB_ROOT override, else readlink -f ~/RetroPie.
+The hub is never named by machine in code — repointing ~/RetroPie (autofs/mnt +
+symlink) IS the T1700 migration for Lutris.
 
-Sanctuary guest-home links:
-  ~/Games                -> /run/host/home/metsatron/Games
-  ~/RetroPie             -> /run/host/home/metsatron/RetroPie
-  ~/.config/lutris       -> /run/host/home/metsatron/RetroPie/stow/.config/lutris
-  ~/.local/share/lutris  -> /run/host/home/metsatron/RetroPie/stow/.local/share/lutris
+Per-machine live state (REAL local directories, never symlinks into NFS):
+  ~/.config/lutris        machine-local Lutris config
+  ~/.local/share/lutris   machine-local Lutris data
+  ~/.cache/lutris         machine-local, never synced
+
+Sanctuary guest homes (all sanctuaries on a machine share that machine's state):
+  ~/.config/lutris       -> /home/metsatron/.config/lutris
+  ~/.local/share/lutris  -> /home/metsatron/.local/share/lutris
+  (host home is a RW bind inside every sanctuary; verified on Redstone 9X and
+   Godzilla XS 2026-07-23)
+
+Payloads stay shared and hub-resident (unchanged):
+  ~/Games      wine prefixes and portable payloads (fileserver, NFS RW)
+  ~/RetroPie   roms/isos/installers library (fileserver; RO bind in sanctuaries
+               at /run/dotcortex/retropie)
+
+Sync (lutris-sync, runs host-side; guests reach it via host-spawn):
+  begin  = pull canonical -> local (or push-first if a crashed session left the
+           local state dirty), then take the lease
+  end    = push local -> canonical, release the lease
+  synced = config tree, pga.db (+ -wal/-shm), apikey.txt, banners, coverart,
+           covers; runners synced additively by version directory
+  never  = runtime/, cache — machine-local caches Lutris rebuilds itself
+
+Lease law (answers the two-machine overlap hazard):
+  A launch on machine B while machine A holds the lease is REFUSED with a
+  message naming A and the lease age. Same-machine relaunches are permissive
+  (same state, local sqlite locking is sound). Override: lutris-sync steal.
+  Hub unreachable = offline mode: play proceeds on local state, marked dirty,
+  pushed on the next begin/end that can reach the hub.
 
 Policy:
   Lutris-created Wine prefixes under ~/Games are intentional portable payloads.
-  Lutris cache remains machine-local.
   Do not install or download game data from DotCortex.
   Do not delete or replace existing real directories automatically.
 #+END_SRC
 
-* Host Link Apply
+* Machine-Local State Init
 
-Creates or refreshes host-side links for machines that mount X230 at
-=~/mnt/x230=.  Existing real directories are preserved and reported.
+Converts a machine from first-generation symlinked state to real local directories, seeding from the canonical hub. Run once per machine (and once on the hub machine itself — the hub keeps the canonical copy under =RetroPie/stow=, and its live state becomes an ordinary local mirror like everyone else's).
 
-#+BEGIN_SRC bash :tangle linux/.local/bin/lutris-shared-link-host :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+Runners are seeded by default: game configs pin exact runner builds, and old builds are not always re-downloadable, so a machine without the pinned runner cannot start the game. =--no-runners= opts out for tight disks.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/lutris-state-local-init :shebang "#!/bin/bash" :tangle-mode (identity #o755)
 set -euo pipefail
 
-host_name="$(hostname -s 2>/dev/null || hostname 2>/dev/null || printf unknown)"
-x230_root="${X230_MOUNT:-$HOME/mnt/x230}"
+usage() {
+  cat <<'EOF'
+Usage: lutris-state-local-init [--no-runners]
 
-safe_link() {
-  local target="$1"
-  local link="$2"
+Converts ~/.config/lutris and ~/.local/share/lutris from symlinks into the
+shared NFS tree to REAL machine-local directories, seeded from the canonical
+hub (readlink -f ~/RetroPie, override with LUTRIS_HUB_ROOT).
 
-  if [[ ! -e "$target" ]]; then
-    echo "lutris-shared-link-host: missing target $target" >&2
-    return 1
-  fi
-
-  mkdir -p "$(dirname "$link")"
-  if [[ -e "$link" && ! -L "$link" ]]; then
-    echo "lutris-shared-link-host: preserving existing real path $link" >&2
-    return 0
-  fi
-
-  ln -sfnT "$target" "$link"
-  printf '%s -> %s\n' "$link" "$target"
+Idempotent: already-local real directories are left untouched.
+EOF
 }
 
-case "$host_name" in
-  x230|X230|ThinkPad-X230)
-    safe_link "$HOME/RetroPie/stow/.config/lutris" "$HOME/.config/lutris"
-    safe_link "$HOME/RetroPie/stow/.local/share/lutris" "$HOME/.local/share/lutris"
+seed_runners=1
+for arg in "$@"; do
+  case "$arg" in
+    --no-runners) seed_runners=0 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+hub_root="${LUTRIS_HUB_ROOT:-$(readlink -f "$HOME/RetroPie" 2>/dev/null || true)}"
+hub_cfg="${hub_root}/stow/.config/lutris"
+hub_data="${hub_root}/stow/.local/share/lutris"
+
+if [[ -z "$hub_root" || ! -d "$hub_data" ]]; then
+  echo "lutris-state-local-init: canonical hub unreachable (looked at ${hub_root:-<unset>}/stow)" >&2
+  echo "  Mount the fileserver or set LUTRIS_HUB_ROOT, then retry." >&2
+  exit 1
+fi
+
+convert_one() {
+  local link="$1" hub_src="$2"
+  if [[ -L "$link" ]]; then
+    echo "lutris-state-local-init: replacing symlink $link -> $(readlink "$link")"
+    rm "$link"
+  elif [[ -d "$link" ]]; then
+    echo "lutris-state-local-init: $link is already a real local directory — leaving it"
+    return 0
+  elif [[ -e "$link" ]]; then
+    echo "lutris-state-local-init: refusing unexpected non-directory at $link" >&2
+    exit 1
+  fi
+  mkdir -p "$link"
+}
+
+convert_one "$HOME/.config/lutris" "$hub_cfg"
+convert_one "$HOME/.local/share/lutris" "$hub_data"
+
+echo "lutris-state-local-init: seeding config from $hub_cfg"
+rsync -a "$hub_cfg/" "$HOME/.config/lutris/"
+
+echo "lutris-state-local-init: seeding data (db, art, keys) from $hub_data"
+for f in pga.db pga.db-wal pga.db-shm apikey.txt; do
+  [[ -e "$hub_data/$f" ]] && rsync -a "$hub_data/$f" "$HOME/.local/share/lutris/$f"
+done
+for d in banners coverart covers lib; do
+  [[ -d "$hub_data/$d" ]] && rsync -a "$hub_data/$d/" "$HOME/.local/share/lutris/$d/"
+done
+
+if [[ "$seed_runners" -eq 1 && -d "$hub_data/runners" ]]; then
+  echo "lutris-state-local-init: seeding runners (this can be several GB, one-time)"
+  rsync -a "$hub_data/runners/" "$HOME/.local/share/lutris/runners/"
+else
+  echo "lutris-state-local-init: runners NOT seeded — pinned runner builds must be reinstalled per game"
+fi
+
+mkdir -p "$HOME/.cache/lutris"
+echo "lutris-state-local-init: done — this machine now plays from local state, synced by lutris-sync"
+#+END_SRC
+
+* Hub Sync and Lease
+
+Host-side control verb. Guests never run this directly against their own filesystem view — the hub is only writable from the host, so =lutris-play= relays via =host-spawn=.
+
+The lease answers the real household hazard: a Lutris left running in the background on machine A while machine B fires one up. =begin= on B refuses, naming A and the lease age. Same-host re-entry is permissive: both processes share the same local sqlite on a local filesystem, which locks correctly.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/lutris-sync :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: lutris-sync <status|pull|push|begin|end|steal> [--force|--yes]
+
+  status  show hub reachability, lease holder, dirty flag, db freshness
+  pull    canonical hub -> local state (refused while local is dirty)
+  push    local state -> canonical hub (backs up hub pga.db first)
+  begin   session start: reconcile state, then take the lease
+  end     session end: push and release the lease
+  steal   remove another machine's lease (asks unless --yes)
+
+Hub root: $LUTRIS_HUB_ROOT override, else readlink -f ~/RetroPie.
+Exit 3 from begin = lease held by another machine; do not launch.
+LUTRIS_SYNC_SKIP_RUNNERS=1 skips the additive runner sync.
+EOF
+}
+
+verb="${1:-}"
+opt="${2:-}"
+[[ -n "$verb" ]] || { usage >&2; exit 2; }
+
+self_host="$(hostname -s 2>/dev/null || hostname)"
+hub_root="${LUTRIS_HUB_ROOT:-$(readlink -f "$HOME/RetroPie" 2>/dev/null || true)}"
+hub_cfg="${hub_root}/stow/.config/lutris"
+hub_data="${hub_root}/stow/.local/share/lutris"
+local_cfg="$HOME/.config/lutris"
+local_data="$HOME/.local/share/lutris"
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/lutris-sync"
+dirty_flag="$state_dir/dirty"
+lease_file="$hub_data/.lease"
+mkdir -p "$state_dir"
+
+require_local_state() {
+  if [[ -L "$local_cfg" || -L "$local_data" ]]; then
+    echo "lutris-sync: live state is still symlinked into the shared tree — run lutris-state-local-init first" >&2
+    exit 1
+  fi
+  if [[ ! -d "$local_data" ]]; then
+    echo "lutris-sync: no local Lutris state at $local_data — run lutris-state-local-init first" >&2
+    exit 1
+  fi
+}
+
+hub_ok() {
+  [[ -n "$hub_root" ]] && timeout 10 test -d "$hub_data" 2>/dev/null
+}
+
+lease_fields() {
+  # -> "host token epoch" or nothing
+  [[ -r "$lease_file" ]] || return 1
+  head -n1 "$lease_file" 2>/dev/null
+}
+
+lease_age_human() {
+  local epoch="${1:-0}" now delta
+  [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
+  now="$(date +%s)"
+  delta=$(( now - epoch ))
+  if (( delta < 0 )); then delta=0; fi
+  if (( delta >= 86400 )); then printf '%dd %dh' "$((delta/86400))" "$(((delta%86400)/3600))"
+  elif (( delta >= 3600 )); then printf '%dh %dm' "$((delta/3600))" "$(((delta%3600)/60))"
+  else printf '%dm' "$((delta/60))"
+  fi
+}
+
+sync_runners() {
+  # Additive version-directory sync in one direction. Runner trees are huge
+  # (tens of thousands of files); a file-level rsync walk over NFS is too slow
+  # for a per-launch path, so only whole missing version directories move.
+  local src="$1" dst="$2" type_dir ver_dir rel
+  [[ "${LUTRIS_SYNC_SKIP_RUNNERS:-0}" = 1 ]] && return 0
+  [[ -d "$src/runners" ]] || return 0
+  for type_dir in "$src/runners"/*/; do
+    [[ -d "$type_dir" ]] || continue
+    for ver_dir in "$type_dir"*/; do
+      [[ -d "$ver_dir" ]] || continue
+      rel="${ver_dir#"$src/runners/"}"
+      if [[ ! -e "$dst/runners/$rel" ]]; then
+        echo "lutris-sync: fetching runner $rel"
+        mkdir -p "$dst/runners/$(dirname "$rel")"
+        rsync -a "$ver_dir" "$dst/runners/$rel"
+      fi
+    done
+  done
+}
+
+pull_state() {
+  echo "lutris-sync: pull $hub_root -> local"
+  rsync -a --delete "$hub_cfg/" "$local_cfg/"
+  for f in pga.db pga.db-wal pga.db-shm apikey.txt; do
+    if [[ -e "$hub_data/$f" ]]; then rsync -a "$hub_data/$f" "$local_data/$f"
+    elif [[ -e "$local_data/$f" && "$f" != pga.db ]]; then rm -f "$local_data/$f"
+    fi
+  done
+  for d in banners coverart covers lib; do
+    [[ -d "$hub_data/$d" ]] && rsync -a "$hub_data/$d/" "$local_data/$d/"
+  done
+  sync_runners "$hub_data" "$local_data"
+}
+
+push_state() {
+  echo "lutris-sync: push local -> $hub_root"
+  # One-generation rollback of the canonical db and config before the
+  # mirroring push overwrites them (push uses --delete on the config tree).
+  if [[ -f "$hub_data/pga.db" ]]; then
+    cp -f "$hub_data/pga.db" "$hub_data/pga.db.prev"
+  fi
+  if [[ -d "$hub_cfg" ]]; then
+    rsync -a --delete "$hub_cfg/" "$hub_data/.config-prev/"
+  fi
+  rsync -a --delete "$local_cfg/" "$hub_cfg/"
+  for f in pga.db pga.db-wal pga.db-shm apikey.txt; do
+    if [[ -e "$local_data/$f" ]]; then rsync -a "$local_data/$f" "$hub_data/$f"
+    elif [[ -e "$hub_data/$f" && "$f" != pga.db ]]; then rm -f "$hub_data/$f"
+    fi
+  done
+  for d in banners coverart covers lib; do
+    [[ -d "$local_data/$d" ]] && rsync -a "$local_data/$d/" "$hub_data/$d/"
+  done
+  sync_runners "$local_data" "$hub_data"
+}
+
+case "$verb" in
+  status)
+    echo "hub root : ${hub_root:-<unresolved>}"
+    if hub_ok; then echo "hub      : reachable"; else echo "hub      : UNREACHABLE (offline mode)"; fi
+    if [[ -e "$dirty_flag" ]]; then echo "local    : DIRTY (unpushed session state)"; else echo "local    : clean"; fi
+    if fields="$(lease_fields)"; then
+      read -r l_host l_token l_epoch <<<"$fields"
+      echo "lease    : held by $l_host for $(lease_age_human "$l_epoch") (token $l_token)"
+    else
+      echo "lease    : free"
+    fi
+    if [[ -f "$local_data/pga.db" ]]; then
+      echo "local db : $(stat -c '%y %s bytes' "$local_data/pga.db")"
+    else
+      echo "local db : missing (run lutris-state-local-init)"
+    fi
+    if hub_ok && [[ -f "$hub_data/pga.db" ]]; then
+      echo "hub db   : $(stat -c '%y %s bytes' "$hub_data/pga.db")"
+    fi
     ;;
-  *)
-    safe_link "$x230_root/Games" "$HOME/Games"
-    safe_link "$x230_root/RetroPie" "$HOME/RetroPie"
-    safe_link "$x230_root/RetroPie/stow/.config/lutris" "$HOME/.config/lutris"
-    safe_link "$x230_root/RetroPie/stow/.local/share/lutris" "$HOME/.local/share/lutris"
+  pull)
+    require_local_state
+    hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
+    if [[ -e "$dirty_flag" && "$opt" != "--force" ]]; then
+      echo "lutris-sync: local state is dirty (unpushed session) — push first, or pull --force to discard" >&2
+      exit 1
+    fi
+    pull_state
     ;;
+  push)
+    require_local_state
+    hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
+    push_state
+    rm -f "$dirty_flag"
+    ;;
+  begin)
+    require_local_state
+    if ! hub_ok; then
+      echo "lutris-sync: hub unreachable — OFFLINE session on local state (will sync when the hub returns)" >&2
+      touch "$dirty_flag"
+      exit 0
+    fi
+    if fields="$(lease_fields)"; then
+      read -r l_host l_token l_epoch <<<"$fields"
+      if [[ "$l_host" != "$self_host" ]]; then
+        if [[ "${LUTRIS_PLAY_STEAL:-0}" = 1 ]]; then
+          echo "lutris-sync: STEALING lease from $l_host (held $(lease_age_human "$l_epoch"))" >&2
+        else
+          echo "lutris-sync: Lutris state is live on ${l_host} (lease held $(lease_age_human "$l_epoch"))." >&2
+          echo "  Close Lutris there first, or run: lutris-sync steal" >&2
+          exit 3
+        fi
+      else
+        echo "lutris-sync: resuming on this machine (existing $self_host lease)"
+      fi
+    fi
+    if [[ -e "$dirty_flag" ]]; then
+      echo "lutris-sync: local state dirty from an unsynced session — pushing local truth first"
+      push_state
+    else
+      pull_state
+    fi
+    printf '%s %s %s\n' "$self_host" "${LUTRIS_LEASE_TOKEN:-$$-$RANDOM}" "$(date +%s)" > "$lease_file"
+    touch "$dirty_flag"
+    ;;
+  end)
+    require_local_state
+    if ! hub_ok; then
+      echo "lutris-sync: hub unreachable at session end — state stays dirty locally" >&2
+      exit 0
+    fi
+    push_state
+    rm -f "$dirty_flag"
+    if fields="$(lease_fields)"; then
+      read -r l_host _ _ <<<"$fields"
+      [[ "$l_host" = "$self_host" ]] && rm -f "$lease_file"
+    fi
+    ;;
+  steal)
+    hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
+    if fields="$(lease_fields)"; then
+      read -r l_host _ l_epoch <<<"$fields"
+      if [[ "$opt" != "--yes" ]]; then
+        printf 'Steal the lease from %s (held %s)? [y/N] ' "$l_host" "$(lease_age_human "$l_epoch")"
+        read -r answer
+        [[ "$answer" = y || "$answer" = Y ]] || { echo "aborted"; exit 1; }
+      fi
+      rm -f "$lease_file"
+      echo "lutris-sync: lease removed (was $l_host)"
+    else
+      echo "lutris-sync: lease already free"
+    fi
+    ;;
+  -h|--help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac
+#+END_SRC
+
+* Universal Launch Shim
+
+Every Lutris launch on every machine and in every sanctuary goes through this. It wraps the real launch command in =lutris-sync begin= / =end=, refusing to launch (with an on-screen message when X is available) when another machine holds the lease.
+
+Inside a sanctuary the sync verbs run on the *host* via =host-spawn= against the host session bus — the guest's own filesystem view cannot write the hub (autofs does not propagate into containers and the RetroPie bind is deliberately read-only). The host bus address is projected into the guest at session launch as =~/.config/sanctuary/host-session-bus=. If that plumbing is missing the game still launches; sync is skipped with a loud warning, never silently.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/lutris-play :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+set -u
+
+usage() {
+  cat <<'EOF'
+Usage: lutris-play [-- <command args...>]
+
+Runs the given command (default: launch the Lutris client) inside a
+lutris-sync begin/end envelope. Refuses to launch when another machine
+holds the playtime lease. LUTRIS_PLAY_STEAL=1 overrides the refusal.
+EOF
+}
+
+if [[ "${1:-}" = "-h" || "${1:-}" = "--help" ]]; then
+  usage
+  exit 0
+fi
+[[ "${1:-}" = "--" ]] && shift
+
+host_home="${SANCTUARY_HOST_HOME:-/home/metsatron}"
+in_guest=0
+case "$HOME" in
+  */.local/share/dotcortex/guests/*/home) in_guest=1 ;;
 esac
 
-echo "lutris-shared-link-host: cache stays local at $HOME/.cache/lutris"
+notify() {
+  local msg="$1"
+  echo "lutris-play: $msg" >&2
+  if [[ -n "${DISPLAY:-}" ]]; then
+    if command -v xmessage >/dev/null 2>&1; then
+      xmessage -center -timeout 20 "lutris-play: $msg" >/dev/null 2>&1 &
+    elif command -v notify-send >/dev/null 2>&1; then
+      notify-send "Lutris" "$msg" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+sync_call() {
+  if [[ "$in_guest" -eq 1 ]]; then
+    local bus_file="$HOME/.config/sanctuary/host-session-bus" bus=""
+    [[ -r "$bus_file" ]] && bus="$(head -n1 "$bus_file")"
+    if [[ -z "$bus" || ! -x /usr/bin/host-spawn ]]; then
+      notify "no host bridge for sync ($1 skipped) — playtime will not sync this session"
+      return 0
+    fi
+    DBUS_SESSION_BUS_ADDRESS="$bus" /usr/bin/host-spawn "$host_home/.local/bin/lutris-sync" "$1"
+  else
+    "$host_home/.local/bin/lutris-sync" "$1"
+  fi
+}
+
+sync_call begin
+begin_rc=$?
+if [[ "$begin_rc" -eq 3 ]]; then
+  notify "Lutris is live on another machine — close it there first (or LUTRIS_PLAY_STEAL=1)"
+  exit 3
+elif [[ "$begin_rc" -ne 0 ]]; then
+  notify "lutris-sync begin failed (rc=$begin_rc) — launching on local state anyway"
+fi
+
+if [[ "$#" -eq 0 ]]; then
+  if [[ "$in_guest" -eq 1 ]]; then
+    set -- "$HOME/.local/bin/sanctuary-flatpak-run" net.lutris.Lutris
+  else
+    set -- flatpak run net.lutris.Lutris
+  fi
+fi
+
+"$@"
+run_rc=$?
+
+sync_call end || notify "lutris-sync end failed — run 'lutris-sync push' when the hub is reachable"
+
+exit "$run_rc"
 #+END_SRC
 
 * Health Check
 
-Reports the effective shared paths without mutating them.
+Reports the effective paths without mutating them.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/lutris-shared-health :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 set -euo pipefail
@@ -105,17 +472,19 @@ show_path() {
   fi
 }
 
-echo "Host paths"
-show_path "$HOME/Games"
-show_path "$HOME/RetroPie"
+echo "Live state (must be REAL local directories, not symlinks)"
 show_path "$HOME/.config/lutris"
 show_path "$HOME/.local/share/lutris"
 show_path "$HOME/.cache/lutris"
 
 echo
-echo "Shared Lutris roots"
-show_path "$HOME/RetroPie/stow/.config/lutris"
-show_path "$HOME/RetroPie/stow/.local/share/lutris"
+echo "Payload roots (shared, hub-resident)"
+show_path "$HOME/Games"
+show_path "$HOME/RetroPie"
+
+echo
+echo "Sync state"
+"$HOME/.local/bin/lutris-sync" status || true
 
 echo
 echo "Guest projections"
@@ -124,10 +493,10 @@ if [[ -d "$guests_root" ]]; then
   for home in "$guests_root"/*/home; do
     [[ -d "$home" ]] || continue
     printf '%s\n' "$home"
-    for rel in Games RetroPie .config/lutris .local/share/lutris; do
+    for rel in Games RetroPie .config/lutris .local/share/lutris .config/sanctuary/host-session-bus; do
       path="$home/$rel"
       if [[ -e "$path" || -L "$path" ]]; then
-        printf '  %s -> %s\n' "$rel" "$(readlink "$path" 2>/dev/null || true)"
+        printf '  %s -> %s\n' "$rel" "$(readlink "$path" 2>/dev/null || cat "$path" 2>/dev/null || true)"
       else
         printf '  %s MISSING\n' "$rel"
       fi
