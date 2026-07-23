@@ -237,6 +237,21 @@ sync_runners() {
   done
 }
 
+stats_refresh() {
+  # PixelForge integration (2026-07-23): regenerate the PixelCortex Lutris
+  # gamelist after every successful push, so the playtime/stats index can
+  # never silently go stale again — the 2025 pipeline sat frozen for a year
+  # precisely because nothing ever triggered it. Best-effort by design: a
+  # missing scraper, missing python3, or scraper failure never fails a sync.
+  # Disable with LUTRIS_STATS_HOOK=0.
+  [[ "${LUTRIS_STATS_HOOK:-1}" = 1 ]] || return 0
+  local scraper="$HOME/HelmCortex/FORGE/PixelForge/scripts/parse_lutris_db.py"
+  [[ -f "$scraper" ]] || return 0
+  command -v python3 >/dev/null 2>&1 || return 0
+  timeout 30 python3 "$scraper" >/dev/null 2>&1 \
+    || echo "lutris-sync: stats refresh failed (non-fatal)" >&2
+}
+
 pull_state() {
   echo "lutris-sync: pull $hub_root -> local"
   rsync -a --delete "$hub_cfg/" "$local_cfg/"
@@ -307,6 +322,7 @@ case "$verb" in
     hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
     push_state
     rm -f "$dirty_flag"
+    stats_refresh
     ;;
   begin)
     require_local_state
@@ -350,6 +366,7 @@ case "$verb" in
       read -r l_host _ _ <<<"$fields"
       [[ "$l_host" = "$self_host" ]] && rm -f "$lease_file"
     fi
+    stats_refresh
     ;;
   steal)
     hub_ok || { echo "lutris-sync: hub unreachable" >&2; exit 1; }
@@ -375,26 +392,36 @@ esac
 
 Every Lutris launch on every machine and in every sanctuary goes through this. It wraps the real launch command in =lutris-sync begin= / =end=, refusing to launch (with an on-screen message when X is available) when another machine holds the lease.
 
-Inside a sanctuary the sync verbs run on the *host* via =host-spawn= against the host session bus — the guest's own filesystem view cannot write the hub (autofs does not propagate into containers and the RetroPie bind is deliberately read-only). The host bus address is projected into the guest at session launch as =~/.config/sanctuary/host-session-bus=. If that plumbing is missing the game still launches; sync is skipped with a loud warning, never silently.
+*Sanctuary launches execute on the HOST, not in the guest.* Discovered 2026-07-23 while smoke-testing the first gen-2 launch: game payloads and Wine prefixes live under =~/Games=, an autofs path that never propagates into containers (and is tmpfs-masked by the trash shield), and the containers carry no Games bind — so a wine-runner game launched in-guest finds no prefix and Lutris starts creating one into the mask. The host traverses autofs fine, and the sanctuary's X socket lives in shared =/tmp=, so the correct shape is: in-guest =lutris-play= relays the entire launch to its host-side twin via =host-spawn= (forwarding =DISPLAY=/=XAUTHORITY= so the game renders inside the sanctuary), and the host-side twin runs =lutris-sync= directly plus the flatpak with =HOME= pointed at the guest home (=sanctuary-flatpak-run= accepts that; =SANCTUARY_FLATPAK_SYSTEM_DIR= is repointed to the host's real =/var/lib/flatpak= since =/run/host= only exists in-guest). The host bus address comes from the projected =~/.config/sanctuary/host-session-bus=. If the relay plumbing is missing the game still launches in-guest with a loud warning — degraded (RetroPie-payload games may work; Games-payload ones cannot), never silent.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/lutris-play :shebang "#!/bin/bash" :tangle-mode (identity #o755)
 set -u
 
 usage() {
   cat <<'EOF'
-Usage: lutris-play [-- <command args...>]
+Usage: lutris-play [--guest-home <dir>] [-- <command args...>]
 
 Runs the given command (default: launch the Lutris client) inside a
 lutris-sync begin/end envelope. Refuses to launch when another machine
 holds the playtime lease. LUTRIS_PLAY_STEAL=1 overrides the refusal.
+
+In-guest invocations relay the whole launch to the host via host-spawn
+(game payloads live behind autofs the guest cannot traverse); the game
+renders back into the sanctuary display. --guest-home is the host-side
+half of that relay: sync runs against the host state while the launch
+command runs with HOME set to the guest home.
 EOF
 }
 
-if [[ "${1:-}" = "-h" || "${1:-}" = "--help" ]]; then
-  usage
-  exit 0
-fi
-[[ "${1:-}" = "--" ]] && shift
+guest_home=""
+while :; do
+  case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --guest-home) guest_home="${2:?--guest-home needs a directory}"; shift 2 ;;
+    --) shift; break ;;
+    *) break ;;
+  esac
+done
 
 host_home="${SANCTUARY_HOST_HOME:-/home/metsatron}"
 in_guest=0
@@ -414,21 +441,45 @@ notify() {
   fi
 }
 
-sync_call() {
-  if [[ "$in_guest" -eq 1 ]]; then
-    local bus_file="$HOME/.config/sanctuary/host-session-bus" bus=""
-    [[ -r "$bus_file" ]] && bus="$(head -n1 "$bus_file")"
-    if [[ -z "$bus" || ! -x /usr/bin/host-spawn ]]; then
-      notify "no host bridge for sync ($1 skipped) — playtime will not sync this session"
-      return 0
+if [[ "$in_guest" -eq 1 ]]; then
+  bus_file="$HOME/.config/sanctuary/host-session-bus"
+  bus=""
+  [[ -r "$bus_file" ]] && bus="$(head -n1 "$bus_file")"
+  if [[ -n "$bus" && -x /usr/bin/host-spawn ]]; then
+    export DBUS_SESSION_BUS_ADDRESS="$bus"
+    exec /usr/bin/host-spawn -no-pty -env DISPLAY,XAUTHORITY \
+      "$host_home/.local/bin/lutris-play" --guest-home "$HOME" -- "$@"
+  fi
+  notify "no host bridge — degraded in-guest launch, no sync, Games-payload titles cannot start"
+fi
+
+sync_bin="$host_home/.local/bin/lutris-sync"
+
+launch() {
+  if [[ -n "$guest_home" ]]; then
+    if [[ "$#" -eq 0 ]]; then
+      set -- "$guest_home/.local/bin/sanctuary-flatpak-run" net.lutris.Lutris
     fi
-    DBUS_SESSION_BUS_ADDRESS="$bus" /usr/bin/host-spawn "$host_home/.local/bin/lutris-sync" "$1"
+    HOME="$guest_home" SANCTUARY_FLATPAK_SYSTEM_DIR="${SANCTUARY_FLATPAK_SYSTEM_DIR:-/var/lib/flatpak}" "$@"
   else
-    "$host_home/.local/bin/lutris-sync" "$1"
+    if [[ "$#" -eq 0 ]]; then
+      if [[ "$in_guest" -eq 1 ]]; then
+        set -- "$HOME/.local/bin/sanctuary-flatpak-run" net.lutris.Lutris
+      else
+        set -- flatpak run net.lutris.Lutris
+      fi
+    fi
+    "$@"
   fi
 }
 
-sync_call begin
+if [[ "$in_guest" -eq 1 ]]; then
+  # Degraded in-guest fallback: no hub access from here, launch without sync.
+  launch "$@"
+  exit $?
+fi
+
+"$sync_bin" begin
 begin_rc=$?
 if [[ "$begin_rc" -eq 3 ]]; then
   notify "Lutris is live on another machine — close it there first (or LUTRIS_PLAY_STEAL=1)"
@@ -437,18 +488,10 @@ elif [[ "$begin_rc" -ne 0 ]]; then
   notify "lutris-sync begin failed (rc=$begin_rc) — launching on local state anyway"
 fi
 
-if [[ "$#" -eq 0 ]]; then
-  if [[ "$in_guest" -eq 1 ]]; then
-    set -- "$HOME/.local/bin/sanctuary-flatpak-run" net.lutris.Lutris
-  else
-    set -- flatpak run net.lutris.Lutris
-  fi
-fi
-
-"$@"
+launch "$@"
 run_rc=$?
 
-sync_call end || notify "lutris-sync end failed — run 'lutris-sync push' when the hub is reachable"
+"$sync_bin" end || notify "lutris-sync end failed — run 'lutris-sync push' when the hub is reachable"
 
 exit "$run_rc"
 #+END_SRC
