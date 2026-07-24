@@ -848,5 +848,19 @@ find every pinned engine under one bin/ directory.")
                              ; Upstream ZSNES died at 1.51; Guix ships the fork at 2.0.12
                              ; (verified: the package's own git url IS xyproto/zsnes).
    "mupen64plus-ui-console"  ; N64 — mupen64plus, console front-end
+
+   ;; --- BeOS-style Demos suite (Mètsàtron 2026-07-23, contract sealed) --------
+   ;; The authentic BeOS GLTeapot / Mandelbrot / Kaleidoscope / 3dmov binaries
+   ;; are x86 BeOS ELF and belong to the future BeOS/Haiku enclave — these are
+   ;; the real Linux-native stand-ins, no approximations, all Guix main = rung 1.
+   "xaos"        ; Mandelbrot — real-time interactive fractal zoomer
+   "golly"       ; Game of Life — Conway/Gosper cellular-automaton explorer
+   "glmark2"     ; the famous OpenGL scenes reel — stands in for the spinning
+                 ; Utah teapot until a packaged GLUT teapot demo lands (see below)
+   "mesa-utils"  ; provides glxgears — the classic GL gears demo
+   ;; Kaleidoscope is already covered by "xscreensaver" above (kaleidescope hack).
+   ;; TODO(teapot): no standalone Guix package for a literal spinning Utah teapot
+   ;; (mesa-demos isn't packaged). Authentic touch = a ~40-line GLUT program in
+   ;; local-packages/; glmark2 covers "famous GL scenes" in the meantime.
    ))))
 ;; room-gaming:1 ends here
