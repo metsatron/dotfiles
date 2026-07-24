@@ -778,6 +778,79 @@ find every pinned engine under one bin/ directory.")
     (home-page (package-home-page gzdoom-4.10.0))
     (license (package-license gzdoom-4.10.0))))
 
+;; --- 3D Teapot — the authentic BeOS GLTeapot, Linux-native -----------------
+;; The literal Newell/Utah teapot, lit and spinning, via freeglut's built-in
+;; glutSolidTeapot.  No prebuilt teapot exists in Guix (mesa-demos is
+;; unpackaged), so this is the ~40-line GLUT program promised in the demos
+;; contract (2026-07-23), compiled in-profile against freeglut + GLU + mesa.
+;; Press q or Escape to quit.  Mètsàtron 2026-07-24.
+(define redstone-glteapot
+  (package
+    (name "redstone-glteapot")
+    (version "1.0")
+    (source
+     (plain-file "glteapot.c" "\
+#include <GL/freeglut.h>
+#include <GL/glu.h>
+static float a = 0.f;
+static void disp(void){
+  glClear(GL_COLOR_BUFFER_BIT|GL_DEPTH_BUFFER_BIT);
+  glLoadIdentity(); gluLookAt(0,0,6, 0,0,0, 0,1,0);
+  glRotatef(20,1,0,0); glRotatef(a,0,1,0);
+  { GLfloat d[]={0.62f,0.64f,0.70f,1.f}; glMaterialfv(GL_FRONT,GL_DIFFUSE,d); }
+  glutSolidTeapot(1.6); glutSwapBuffers();
+}
+static void idle(void){ a+=0.4f; if(a>360)a-=360; glutPostRedisplay(); }
+static void resh(int w,int h){
+  glViewport(0,0,w,h); glMatrixMode(GL_PROJECTION); glLoadIdentity();
+  gluPerspective(40.0,(double)w/(h?h:1),1.0,20.0); glMatrixMode(GL_MODELVIEW);
+}
+static void key(unsigned char k,int x,int y){ (void)x;(void)y;
+  if(k==27||k=='q') glutLeaveMainLoop(); }
+int main(int argc,char**argv){
+  glutInit(&argc,argv);
+  glutInitDisplayMode(GLUT_DOUBLE|GLUT_RGB|GLUT_DEPTH);
+  glutInitWindowSize(520,440); glutCreateWindow(\"GLTeapot\");
+  glClearColor(0,0,0,1);
+  glEnable(GL_DEPTH_TEST); glEnable(GL_LIGHTING);
+  glEnable(GL_LIGHT0); glEnable(GL_NORMALIZE);
+  { GLfloat lp[]={2,2,3,0}, ld[]={0.95f,0.9f,0.75f,1},
+           la[]={0.2f,0.2f,0.22f,1}, ms[]={1,1,1,1};
+    glLightfv(GL_LIGHT0,GL_POSITION,lp); glLightfv(GL_LIGHT0,GL_DIFFUSE,ld);
+    glLightfv(GL_LIGHT0,GL_AMBIENT,la); glMaterialfv(GL_FRONT,GL_SPECULAR,ms);
+    glMaterialf(GL_FRONT,GL_SHININESS,64.f); }
+  glutDisplayFunc(disp); glutReshapeFunc(resh);
+  glutIdleFunc(idle); glutKeyboardFunc(key);
+  glutMainLoop(); return 0;
+}
+"))
+    (build-system gnu-build-system)
+    (arguments
+     (list
+      #:tests? #f
+      #:phases
+      #~(modify-phases %standard-phases
+          (delete 'configure)
+          (replace 'unpack
+            (lambda* (#:key source #:allow-other-keys)
+              (copy-file source "glteapot.c")))
+          (replace 'build
+            (lambda _
+              (invoke "gcc" "glteapot.c" "-O2" "-o" "redstone-glteapot"
+                      "-lglut" "-lGLU" "-lGL" "-lm")))
+          (replace 'install
+            (lambda* (#:key outputs #:allow-other-keys)
+              (install-file "redstone-glteapot"
+                            (string-append (assoc-ref outputs "out")
+                                           "/bin")))))))
+    (inputs (list freeglut glu mesa))
+    (home-page "https://en.wikipedia.org/wiki/Utah_teapot")
+    (synopsis "Spinning Utah teapot — Linux-native BeOS GLTeapot stand-in")
+    (description "A minimal freeglut program that renders the lit, rotating
+Newell/Utah teapot: the Linux-native counterpart to BeOS's iconic GLTeapot
+demo.  Press q or Escape to quit.")
+    (license license:x11)))
+
 (packages->manifest
  (cons* pcmanfm-redstone
         xosd-redstone   ; desktop-layer osd_cat for the Redstone build stamp
@@ -785,6 +858,7 @@ find every pinned engine under one bin/ directory.")
         icewm-control-panel ; IceWMCP 3.2 and its complete bundled applet suite
         netactview       ; IceWM taskbar Net meter's NetStatusCommand target
         gzdoom-engines   ; union of the pinned engines (4.10.0 + 4.5.0) as one entry
+        redstone-glteapot ; authentic spinning Utah teapot (BeOS GLTeapot, in-profile GLUT build)
         (map specification->package
              '(
    "rofi"     ; Windows-95 Run/launcher dialogs (stock rofi, fixed-geometry theme)
@@ -833,7 +907,8 @@ find every pinned engine under one bin/ directory.")
    "atril"       ; Atril — MATE document viewer, PDF/PostScript (Accessories)
    "qt6ct"       ; Qt6 config tool — drives the built-in "Windows" style + Win95 palette for Zeal, which is a Qt6 app (qtbase-6.9.2), NOT Qt5 — so qt5ct would be inert here. Co-located with Zeal so the qt6ct platformtheme plugin (lib/qt6/plugins/platformthemes/libqt6ct.so) resolves; env-inert in the profile so it never touches session start — QT_QPA_PLATFORMTHEME=qt6ct is set per-app on the menu entries, not in the session command.
    "kvantum"     ; Qt5/Qt6 SVG theme engine — CDE dynasty schemes set QT_STYLE="kvantum" (qt6ct's style= key) because CDE's Motif look has no equivalent among qt6ct's built-in styles; the Commonality theme family (linux/.config/Kvantum/) supplies the actual Kvantum SVG theme.
-   "tcalc"       ; terminal calculator (Accessories) — launched via xterm -e
+   "tcalc"       ; terminal calculator — legacy fvwm95 spin only; Accessories switched to mate-calc
+   "mate-calc"   ; MATE calculator (Accessories) — the actual GUI calculator, replaces xcalc; matches the room's Pluma/Eye of MATE/Atril MATE-app theming
    "aisleriot"   ; Solitaire card games: Klondike (default) and FreeCell (--variation=freecell)
    "sdl2"         ; SDL2 runtime — dsdmine (Minesweeper) links against it
    "gnubg"       ; GNU Backgammon (Games)
