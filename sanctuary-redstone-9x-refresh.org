@@ -28,11 +28,13 @@ usage() {
 sanctuary-redstone-9x-refresh - refresh the running Redstone 9X projection
 
 Usage:
-  sanctuary-redstone-9x-refresh [--check] [--no-reload]
+  sanctuary-redstone-9x-refresh [--check] [--no-reload] [--layout] [--capture-layout]
 
-  --check       report whether the room and key projected files are current
-  --no-reload   project files and reapply the active scheme without reloading IceWM
-  -h, --help    show this help
+  --check           report whether the room and key projected files are current
+  --no-reload       project files and reapply the active scheme without reloading IceWM
+  --layout          apply the declared desktop icon layout and bounce the desktop layer
+  --capture-layout  freeze the room's CURRENT icon arrangement back into the manifest
+  -h, --help        show this help
 
 This command is for guest-home configuration: IceWM menu/toolbar/preferences,
 desktop launchers, Redstone wrappers, shell/rofi config, and Desktop Schemes.
@@ -45,6 +47,8 @@ while (( $# )); do
   case "$1" in
     --check) MODE="check" ;;
     --no-reload) RELOAD=0 ;;
+    --layout) MODE="layout" ;;
+    --capture-layout) MODE="capture-layout" ;;
     -h|--help) usage; exit 0 ;;
     *) echo "redstone refresh: unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
@@ -169,6 +173,65 @@ project_dir() {
   mv -- "${tmp}" "${dst}"
 }
 
+if [[ "${MODE}" == "layout" || "${MODE}" == "capture-layout" ]]; then
+  # Desktop icon layout is a narrow, explicit operation: it must NOT ride along
+  # with a normal refresh, because a refresh is routine and moving someone's
+  # icons is not. Both directions run against the GUEST home from the host --
+  # the config file is plain host-side state -- but the pcmanfm bounce that
+  # makes the new positions take effect has to happen inside the room, via
+  # `distrobox enter` (never bare `podman exec`, which runs as container root
+  # and would leave root-owned files behind).
+  LAYOUT_BIN="${GUEST_HOME}/.local/bin/redstone-9x-desktop-layout"
+  project_file "${REPO_ROOT}/linux/.local/bin/redstone-9x-desktop-layout" "${LAYOUT_BIN}" 755
+  project_file "${REPO_ROOT}/linux/.config/redstone-9x/desktop-layout.ssv" \
+    "${GUEST_HOME}/.config/redstone-9x/desktop-layout.ssv"
+
+  if [[ "${MODE}" == "capture-layout" ]]; then
+    # Capture writes the REPO manifest, not the guest copy — the repo is the
+    # source of truth, and a capture that only updated the projection would be
+    # silently discarded by the next refresh.
+    HOME="${GUEST_HOME}" \
+      REDSTONE_DESKTOP_MANIFEST="${REPO_ROOT}/linux/.config/redstone-9x/desktop-layout.ssv" \
+      /bin/bash "${LAYOUT_BIN}" --capture
+    echo "[redstone-refresh] manifest updated in place — re-tangle sanctuary-redstone-9x-desktop.org to fold it back into org source"
+    exit 0
+  fi
+
+  # DISPLAY must be the ROOM's, not the host's. The writer probes the screen to
+  # decide rows-per-column, and this runs on the host, where $DISPLAY is the
+  # host session -- a different resolution on any machine where the two differ.
+  # Xephyr runs with -ac, so a host-side xdpyinfo against :93 succeeds.
+  HOME="${GUEST_HOME}" DISPLAY="${DISPLAY_NUM}" /bin/bash "${LAYOUT_BIN}"
+
+  LIVE_XAUTHORITY="$(proc_env_value "${ICEWM_PID}" XAUTHORITY 2>/dev/null || true)"
+  [[ -n "${LIVE_XAUTHORITY}" ]] || LIVE_XAUTHORITY="${HOME}/.Xauthority"
+  layout_env=(
+    "HOME=${GUEST_HOME}"
+    "DISPLAY=${DISPLAY_NUM}"
+    "XAUTHORITY=${LIVE_XAUTHORITY}"
+    "XDG_CONFIG_HOME=${GUEST_HOME}/.config"
+    "XDG_DATA_HOME=${GUEST_HOME}/.local/share"
+    "XDG_CACHE_HOME=${GUEST_HOME}/.cache"
+    "PATH=${GUEST_HOME}/.local/bin:${GUIX_PROFILES}/desktop-common/desktop-common/bin:${GUIX_PROFILES}/room-gaming/room-gaming/bin:/usr/local/bin:/usr/bin:/bin"
+  )
+  echo "[redstone-refresh] bouncing the desktop layer to load the new layout"
+  # --desktop-off then --desktop, NOT a bare --desktop: against a running
+  # instance the second invocation is a single-instance handoff that never
+  # re-reads desktop-items-0.conf. Same reason scheme-apply cycles it.
+  distrobox enter "${SANCTUARY}" -- env "${layout_env[@]}" pcmanfm --desktop-off || true
+  sleep 1
+  distrobox enter "${SANCTUARY}" -- env "${layout_env[@]}" pcmanfm --desktop >/dev/null 2>&1 &
+  sleep 1
+  # Destroying the desktop window takes the build-stamp renderer down with it --
+  # its glyph windows are stacked against the desktop, so `--desktop-off` leaves
+  # no stamp on screen and nothing restarts it. The full refresh path already
+  # ends with this for the same reason; the narrow layout path needs it too.
+  distrobox enter "${SANCTUARY}" -- env "${layout_env[@]}" \
+    "${GUEST_HOME}/.local/bin/redstone-buildstamp" refresh >/dev/null 2>&1 || true
+  echo "[redstone-refresh] desktop layout applied"
+  exit 0
+fi
+
 echo "[redstone-refresh] projecting lightweight config into ${GUEST_HOME}"
 
 mkdir -p "${GUEST_HOME}/.icewm" "${GUEST_HOME}/Desktop" "${GUEST_HOME}/.local/bin"
@@ -183,22 +246,47 @@ sed -i \
   -e "s|@DESKTOP_COMMON_SSL_CERT@|${GUIX_PROFILES}/desktop-common/desktop-common/etc/ssl/certs/ca-certificates.crt|g" \
   "${GUEST_HOME}/.icewm/menu"
 
-# IceWM themes: launch bulk-copies the whole themes tree once; refresh stays
-# light by filling only the GAPS — project each scheme-declared ICEWM_THEME dir
-# the running guest is missing. Without this a NEW scheme's chrome (e.g. the
-# BeOS-tab dynasty: BeOS-Max-Tab / BeOS-Personal-Tab / icedano) is unselectable
-# in a refreshed room — the same defect class as the wine/ reg projection gap
-# (2026-07-22). Existing theme dirs are left untouched (the guest themes dir is
-# a real dir that also carries ice2k theme symlinks), so this never re-copies.
+# IceWM themes: launch bulk-copies the whole themes tree once; refresh converges
+# each scheme-declared ICEWM_THEME dir — projecting the ones the running guest is
+# missing, and re-projecting the ones whose contents have drifted from the repo.
+# Without the missing half, a NEW scheme's chrome (e.g. the BeOS-tab dynasty:
+# BeOS-Max-Tab / BeOS-Personal-Tab / icedano) is unselectable in a refreshed room
+# — the same defect class as the wine/ reg projection gap (2026-07-22).
+#
+# This used to skip on mere existence (`[[ -e … ]] && continue`), which made it
+# gap-fill only: a theme dir already in the guest could never be updated, so any
+# EDIT to an existing theme's pixmaps was invisible forever while a brand-new
+# theme appeared fine. That is what stranded the SerenityOS caption buttons
+# (2026-07-25): the triangle glyphs landed correctly in all 33 Serenity-* dirs in
+# the repo, but only the 3 whose guest copies had been deleted by hand during
+# that session picked them up — the other 30 kept the Win95 donor's bar/square
+# minimize glyph, so the arrow captions looked like they applied to some Serenity
+# themes and not others. The repo was right the whole time; the projection was
+# the liar.
+#
+# The original reason for the skip was real but narrower than the guard: the
+# guest themes dir ALSO carries ice2k's theme symlinks, and project_dir rm -rf's
+# its destination. So exclude symlinks specifically, and converge everything
+# else. diff -rq is cheap here — these are small pixmap dirs, and each distinct
+# ICEWM_THEME is only examined once even though ~104 schemes reference them.
 mkdir -p "${GUEST_HOME}/.icewm/themes"
+_seen_themes=""
 for _schemefile in "${REPO_ROOT}/linux/.config/redstone-9x/schemes/"*.scheme; do
   [[ -f "${_schemefile}" ]] || continue
   # shellcheck disable=SC1090
   _itheme="$(. "${_schemefile}"; printf %s "${ICEWM_THEME:-}")"
   [[ -n "${_itheme}" ]] || continue
-  [[ -e "${GUEST_HOME}/.icewm/themes/${_itheme}" ]] && continue
-  [[ -d "${REPO_ROOT}/linux/.icewm/themes/${_itheme}" ]] \
-    && project_dir "${REPO_ROOT}/linux/.icewm/themes/${_itheme}" "${GUEST_HOME}/.icewm/themes/${_itheme}"
+  # Many schemes share one IceWM theme; only consider each dir once per refresh.
+  case ":${_seen_themes}:" in *":${_itheme}:"*) continue ;; esac
+  _seen_themes="${_seen_themes}:${_itheme}"
+  _isrc="${REPO_ROOT}/linux/.icewm/themes/${_itheme}"
+  _idst="${GUEST_HOME}/.icewm/themes/${_itheme}"
+  [[ -d "${_isrc}" ]] || continue
+  # ice2k's entries are symlinks into its own tree — never ours to replace.
+  [[ -L "${_idst}" ]] && continue
+  if [[ ! -e "${_idst}" ]] || ! diff -rq "${_isrc}" "${_idst}" >/dev/null 2>&1; then
+    project_dir "${_isrc}" "${_idst}"
+  fi
 done
 
 # Converge the managed desktop corpus while preserving unrelated user files.
@@ -251,6 +339,7 @@ scripts=(
   redstone-9x-host-gtk
   redstone-9x-menu-recent
   redstone-9x-menu-desktop
+  redstone-9x-desktop-layout
 )
 
 # Preserve the host-session bus that was resolved at launch. The live IceWM bus
@@ -305,6 +394,11 @@ project_file "${REPO_ROOT}/linux/.config/redstone-9x/gtk-3.0/settings.ini" \
 project_file "${REPO_ROOT}/linux/.config/redstone-9x/gtk-3.0/gtk.css.in" \
   "${GUEST_HOME}/.config/gtk-3.0/gtk.css.in"
 project_file "${REPO_ROOT}/linux/.config/redstone-9x/gtk-2.0/gtkrc" "${GUEST_HOME}/.gtkrc-2.0"
+# Declarative desktop icon layout manifest. Projected, but deliberately NOT
+# applied here: a refresh must not move icons the user has since dragged. Apply
+# explicitly with `loom redstone:layout`.
+project_file "${REPO_ROOT}/linux/.config/redstone-9x/desktop-layout.ssv" \
+  "${GUEST_HOME}/.config/redstone-9x/desktop-layout.ssv"
 
 project_dir "${REPO_ROOT}/linux/.config/redstone-9x/schemes" \
   "${GUEST_HOME}/.config/redstone-9x/schemes"
