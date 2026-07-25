@@ -68,7 +68,15 @@ fi
 # On client machines HelmCortex is an NFS mount; a dead mount makes bare -d/ls
 # block in uninterruptible I/O and hangs every shell start + command lookup.
 # timeout caps the probe (this runs before path_dir_healthy is defined).
-if timeout 2 test -d "$HOME/HelmCortex/FORGE/bin" 2>/dev/null && timeout 2 ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
+# On a client machine ~/HelmCortex is a SYMLINK into an NFS mount, so putting the
+# FORGE bins on PATH makes every bare-name command lookup stat NFS — and a dead
+# mount then hangs every command in every already-running shell, which no
+# startup-time guard can prevent. Clients get local shims instead (see
+# helmcortex-shims.org); only the native host, where ~/HelmCortex is a real
+# directory, puts the real bins on PATH.
+if [ -L "$HOME/HelmCortex" ]; then
+  [ -d "$HOME/.local/hx/bin" ] && export PATH="$HOME/.local/hx/bin:$PATH"
+elif timeout 2 test -d "$HOME/HelmCortex/FORGE/bin" 2>/dev/null && timeout 2 ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
   export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
 fi
 
