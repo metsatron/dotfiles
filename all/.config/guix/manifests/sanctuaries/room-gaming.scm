@@ -941,12 +941,41 @@ demo.  Press q or Escape to quit.")
    "kmahjongg"   ; KMahjongg — tile-matching solitaire
    "kshisen"     ; KShisen — Shisen-Sho, the KMahjongg variant
    "kpat"        ; KPatience — card solitaire collection (binary is `kpat`)
-   "kirigami"    ; QML runtime dep of KNewStuff's "Get New ..." dialog. KNS ships
-                 ; its own QML compiled into the binary (qrc:/qt/qml/org/kde/
-                 ; newstuff/), but that QML does `import org.kde.kirigami`, which
-                 ; no other package here provides — so KPatience's Get New Card
-                 ; Decks/Backgrounds died with "module org.kde.kirigami is not
-                 ; installed" while the games themselves ran fine (2026-07-25).
+   ;; Board / logic
+   "kreversi"    ; KReversi — Reversi/Othello, the game Windows 1.0 shipped with
+   "bovo"        ; Bovo — five-in-a-row (Gomoku)
+   "kfourinline" ; KFourInLine — Connect Four
+   "ksquares"    ; KSquares — dots and boxes
+   "knights"     ; KNights — chess front-end
+   "kigo"        ; Kigo — Go, against the GnuGo engine
+   "kajongg"     ; Kajongg — four-player Mah Jongg (the real tile game, not solitaire)
+   "lskat"       ; LSkat — Lieutenant Skat, two-player card game
+   "kiriki"      ; Kiriki — Yahtzee-style dice
+   ;; Puzzle
+   "katomic"     ; KAtomic — Sokoban-like molecule assembly
+   "skladnik"    ; Skladnik — Sokoban (this IS the renamed ksokoban; that name is retired)
+   "klines"      ; Kolor Lines — colour-line elimination
+   "kmines"      ; KMines — KDE's Minesweeper
+   "picmi"       ; Picmi — nonogram / picross
+   "kblocks"     ; KBlocks — falling-block puzzler
+   ;; Arcade / action
+   "kbounce"     ; KBounce — Jezzball
+   "kbreakout"   ; KBreakOut — Breakout
+   "kapman"      ; Kapman — Pac-Man
+   "kgoldrunner" ; KGoldrunner — Lode Runner
+   "ksnakeduel"  ; KSnakeDuel — Tron light-cycles
+   "granatier"   ; Granatier — Bomberman
+   "kolf"        ; Kolf — minigolf
+   ;; --- KF6 runtime deps of the KNewStuff "Get New ..." dialogs ---
+   ;; KNS ships its dialog QML compiled into each binary (qrc:/qt/qml/org/kde/
+   ;; newstuff/), but that QML imports modules no game pulls in itself. They
+   ;; surface one at a time as each import is satisfied: kirigami first
+   ;; (DialogContent.qml:10), then kcmutils (Page.qml:12) once kirigami
+   ;; resolved. Both are QML-only deps — see @ROOM_QT6_QML@ in the menu, because
+   ;; installing them is NOT enough: room-gaming's etc/profile exports no QML
+   ;; import path, so the modules stay invisible to Qt without it.
+   "kirigami"    ; org.kde.kirigami  — KNS DialogContent.qml
+   "kcmutils"    ; org.kde.kcmutils  — KNS Page.qml
    "vscodium"    ; VSCodium (nonguix channel) — community telemetry-free VSCode build; binary is `codium`
    "smplayer"    ; SMPlayer — Qt front-end for mpv/mplayer (Multimedia)
    "atril"       ; Atril — MATE document viewer, PDF/PostScript (Accessories)
