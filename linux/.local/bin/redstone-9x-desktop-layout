@@ -1,0 +1,227 @@
+#!/usr/bin/env bash
+# The applier
+
+# =--capture= is the inverse: it reads the positions PCManFM currently holds and rewrites the manifest in that order, so an arrangement produced by dragging icons can be frozen into source instead of being lost the next time something restarts the desktop.  This mirrors the capture/apply pattern every package manager in this repo already uses.
+
+# Writing is section-aware.  The =[*]= block and every key in it belong to =redstone-9x-scheme-apply=; this script only ever replaces the per-icon groups after it, and never reorders or rewrites =[*]=.  The two writers therefore cannot clobber each other.
+
+
+# [[file:../../../sanctuary-redstone-9x-desktop.org::*The applier][The applier:1]]
+# Pin Redstone 9X desktop icons to a declared column-major order.
+#
+# PCManFM stores fixed icon positions as one key-file group per file BASENAME
+# holding integer x=/y= in ABSOLUTE screen pixels (pcmanfm-1.4.0 src/desktop.c,
+# load_item_pos line ~310).  Group present == position fixed; there is no
+# separate flag.  Unlisted icons keep auto-arranging and skip occupied slots.
+set -euo pipefail
+
+MANIFEST="${REDSTONE_DESKTOP_MANIFEST:-${HOME}/.config/redstone-9x/desktop-layout.ssv}"
+CONF="${REDSTONE_PCMANFM_CONF:-${HOME}/.config/pcmanfm/default/desktop-items-0.conf}"
+DESKTOP_DIR="${REDSTONE_DESKTOP_DIR:-${HOME}/Desktop}"
+
+# Geometry — see the org section above for the derivation from desktop.c.
+# cell_w is exact (font-independent); cell_h is pinned to the widest font any
+# scheme uses so the layout does not move when the theme changes.
+CELL_W="${REDSTONE_DESKTOP_CELL_W:-116}"
+CELL_H="${REDSTONE_DESKTOP_CELL_H:-86}"
+MARGIN="${REDSTONE_DESKTOP_MARGIN:-2}"
+
+mode=apply
+case "${1:-}" in
+  --capture) mode=capture ;;
+  --print)   mode=print ;;
+  --apply|"") mode=apply ;;
+  *) echo "usage: redstone-9x-desktop-layout [--apply|--capture|--print]" >&2; exit 2 ;;
+esac
+
+[[ -f "${CONF}" ]] || { echo "redstone-9x-desktop-layout: no pcmanfm conf at ${CONF}" >&2; exit 0; }
+
+# --- Screen geometry -------------------------------------------------------
+# Probe the real screen when there is an X display to ask (which is whenever the
+# room is actually running), and fall back to 1080p otherwise so a layout
+# computed at launch, before the WM, is still deterministic. Callers that run
+# from the HOST must pass DISPLAY=:93 explicitly -- the host session is a
+# different screen, and silently measuring the wrong one is the classic trap.
+_sw=""; _sh=""; _taskbar=0
+if [[ -n "${DISPLAY:-}" ]] && command -v xdpyinfo >/dev/null 2>&1; then
+  read -r _sw _sh <<<"$(xdpyinfo 2>/dev/null | awk '/dimensions:/ {split($2, d, "x"); print d[1], d[2]; exit}')"
+  # _NET_WORKAREA excludes struts (the IceWM taskbar). Its height vs the screen
+  # height is the only honest measure of what the bar reserves; do not assume 28.
+  if [[ -n "${_sh}" ]] && command -v xprop >/dev/null 2>&1; then
+    _wah="$(xprop -root _NET_WORKAREA 2>/dev/null | sed 's/^[^=]*= *//' | cut -d, -f4 | tr -d ' ')"
+    [[ "${_wah}" =~ ^[0-9]+$ ]] && (( _sh > _wah )) && _taskbar=$(( _sh - _wah ))
+  fi
+fi
+: "${_sw:=1920}"
+: "${_sh:=1080}"
+(( _taskbar > 0 )) || _taskbar=29
+
+# --- Build-stamp exclusion zone --------------------------------------------
+# redstone-buildstamp paints two right-aligned glyph rows just above the
+# taskbar. Read ITS config rather than restating the numbers, so the two cannot
+# drift apart. Each rendered row is font_size + 2 px tall (verified against the
+# live windows on :93: derived top = 1009, measured top = 1009).
+BS_CONF="${HOME}/.config/redstone-9x/buildstamp.conf"
+BS_PRODUCT=12; BS_DETAIL=12; BS_GAP=2; BS_BOTTOM=12
+if [[ -f "${BS_CONF}" ]]; then
+  _v() { sed -n "s/^${1}=//p" "${BS_CONF}" | tr -d '"' | tail -n1; }
+  [[ "$(_v BUILDSTAMP_PRODUCT_FONT_SIZE)" =~ ^[0-9]+$ ]] && BS_PRODUCT="$(_v BUILDSTAMP_PRODUCT_FONT_SIZE)"
+  [[ "$(_v BUILDSTAMP_DETAIL_FONT_SIZE)"  =~ ^[0-9]+$ ]] && BS_DETAIL="$(_v BUILDSTAMP_DETAIL_FONT_SIZE)"
+  [[ "$(_v BUILDSTAMP_LINE_GAP)"          =~ ^[0-9]+$ ]] && BS_GAP="$(_v BUILDSTAMP_LINE_GAP)"
+  [[ "$(_v BUILDSTAMP_BOTTOM_MARGIN)"     =~ ^[0-9]+$ ]] && BS_BOTTOM="$(_v BUILDSTAMP_BOTTOM_MARGIN)"
+fi
+BS_HEIGHT=$(( (BS_PRODUCT + 2) + BS_GAP + (BS_DETAIL + 2) ))
+BS_TOP=$(( _sh - _taskbar - BS_BOTTOM - BS_HEIGHT ))
+
+# Rows per column. PCManFM clamps a loaded position UP to the work area origin
+# but never DOWN to its bottom edge, so an over-tall column does not wrap -- it
+# puts icons behind the taskbar or off-screen entirely.
+ROWS="${REDSTONE_DESKTOP_ROWS:-$(( (_sh - _taskbar - MARGIN) / CELL_H ))}"
+(( ROWS > 0 )) || ROWS=1
+
+# Anchor resolution. Anchored icons are placed absolutely and take no part in
+# the column flow, so a corner icon stays put no matter how the list grows.
+# Bottom anchors clear the build stamp; GAP keeps the label off the glyph rows.
+ANCHOR_GAP="${REDSTONE_DESKTOP_ANCHOR_GAP:-4}"
+resolve_anchor() { # anchor -> "x y" on stdout, empty if unrecognised
+  local a="$1" ax ay
+  case "${a}" in
+    *,*)
+      ax="${a%%,*}"; ay="${a##*,}"
+      [[ "${ax}" =~ ^-?[0-9]+$ && "${ay}" =~ ^-?[0-9]+$ ]] || return 1
+      ;;
+    bottom-right) ax=$(( _sw - MARGIN - CELL_W )); ay=$(( BS_TOP - ANCHOR_GAP - CELL_H )) ;;
+    bottom-left)  ax="${MARGIN}";                  ay=$(( BS_TOP - ANCHOR_GAP - CELL_H )) ;;
+    top-right)    ax=$(( _sw - MARGIN - CELL_W )); ay="${MARGIN}" ;;
+    top-left)     ax="${MARGIN}";                  ay="${MARGIN}" ;;
+    *) return 1 ;;
+  esac
+  (( ax < MARGIN )) && ax="${MARGIN}"
+  (( ay < MARGIN )) && ay="${MARGIN}"
+  printf '%s %s' "${ax}" "${ay}"
+}
+
+if [[ "${mode}" == "capture" ]]; then
+  [[ -f "${MANIFEST}" ]] || { echo "redstone-9x-desktop-layout: no manifest to rewrite" >&2; exit 1; }
+  # Anchored entries must survive the round trip. Their whole point is that they
+  # do NOT sit in the column flow, so capturing them as ordinary flowed icons
+  # would silently demote a pinned corner icon on the first capture. Carry the
+  # existing name->anchor map across and re-emit those lines verbatim at the end.
+  anchored_names=""; anchored_lines=""
+  while IFS= read -r l; do
+    l="${l%%#*}"; l="${l#"${l%%[![:space:]]*}"}"; l="${l%"${l##*[![:space:]]}"}"
+    [[ "${l}" == *" @"* ]] || continue
+    anchored_names="${anchored_names}|${l%%" @"*}"
+    anchored_lines="${anchored_lines}${l}"$'\n'
+  done < "${MANIFEST}"
+
+  # Read every per-icon group and sort column-major (by x, then y).
+  awk -v cw="${CELL_W}" -v skip="${anchored_names}" '
+    BEGIN { n_skip = split(substr(skip, 2), sk, "|") }
+    function is_anchored(k,   i) {
+      for (i = 1; i <= n_skip; i++) if (sk[i] == k) return 1
+      return 0
+    }
+    /^\[/ {
+      g = $0; sub(/^\[/, "", g); sub(/\]$/, "", g)
+      if (g == "*") { cur = ""; next }
+      cur = g; x[cur] = 0; y[cur] = 0; seen[++n] = cur; next
+    }
+    cur != "" && /^x=/ { v = $0; sub(/^x=/, "", v); x[cur] = v + 0 }
+    cur != "" && /^y=/ { v = $0; sub(/^y=/, "", v); y[cur] = v + 0 }
+    END {
+      for (i = 1; i <= n; i++) {
+        k = seen[i]
+        if (is_anchored(k)) continue
+        printf "%d\t%d\t%s\n", int(x[k]/cw), y[k], k
+      }
+    }
+  ' "${CONF}" | sort -n -k1,1 -k2,2 | awk -F'\t' '
+    NR == 1 { col = $1 }
+    { if ($1 != col) { print "---"; col = $1 } print $3 }
+  ' > "${MANIFEST}.new"
+  [[ -z "${anchored_lines}" ]] || printf '%s' "${anchored_lines}" >> "${MANIFEST}.new"
+  if [[ ! -s "${MANIFEST}.new" ]]; then
+    rm -f "${MANIFEST}.new"
+    echo "redstone-9x-desktop-layout: no fixed icon positions to capture" >&2
+    exit 1
+  fi
+  # Keep the manifest's leading comment header.
+  { sed -n '1,/^[^#]/p' "${MANIFEST}" | sed '$d'; cat "${MANIFEST}.new"; } > "${MANIFEST}.tmp"
+  mv "${MANIFEST}.tmp" "${MANIFEST}"
+  rm -f "${MANIFEST}.new"
+  # Count every icon line, anchored ones included -- they do not end in .desktop.
+  echo "redstone-9x-desktop-layout: captured $(grep -cE '^[^#[:space:]].*\.desktop' "${MANIFEST}") icons into ${MANIFEST}"
+  exit 0
+fi
+
+[[ -f "${MANIFEST}" ]] || { echo "redstone-9x-desktop-layout: no manifest at ${MANIFEST}" >&2; exit 0; }
+
+# Walk the manifest into [basename] x= y= groups.
+layout="$(
+  col=0; row=0; maxcol=0
+  while IFS= read -r line; do
+    line="${line%%#*}"; line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"
+    [[ -z "${line}" ]] && continue
+    # A declared break moves past every column used SO FAR, not merely col+1.
+    # If a previous group overflowed ROWS it already consumed col+1, and a naive
+    # increment would drop the next declared column on top of that spill --
+    # producing orphan one-icon columns instead of the declared arrangement.
+    if [[ "${line}" == "---" ]]; then col=$((maxcol + 1)); row=0; continue; fi
+    # "name @anchor" pins absolutely and is skipped by the flow.
+    anchor=""
+    if [[ "${line}" == *" @"* ]]; then
+      anchor="${line##*" @"}"
+      line="${line%%" @"*}"
+      line="${line%"${line##*[![:space:]]}"}"
+    fi
+    [[ -e "${DESKTOP_DIR}/${line}" ]] || continue
+    if [[ -n "${anchor}" ]]; then
+      if pos="$(resolve_anchor "${anchor}")"; then
+        printf '[%s]\nx=%s\ny=%s\n\n' "${line}" "${pos%% *}" "${pos##* }"
+      else
+        echo "redstone-9x-desktop-layout: unknown anchor '@${anchor}' on ${line}" >&2
+      fi
+      continue
+    fi
+    if [[ "${row}" -ge "${ROWS}" ]]; then col=$((col + 1)); row=0; fi
+    (( col > maxcol )) && maxcol="${col}"
+    printf '[%s]\nx=%d\ny=%d\n\n' "${line}" \
+      "$((MARGIN + col * CELL_W))" "$((MARGIN + row * CELL_H))"
+    row=$((row + 1))
+  done < "${MANIFEST}"
+)"
+
+if [[ -z "${layout}" ]]; then
+  echo "redstone-9x-desktop-layout: manifest named no icons present in ${DESKTOP_DIR}" >&2
+  exit 0
+fi
+
+if [[ "${mode}" == "print" ]]; then printf '%s\n' "${layout}"; exit 0; fi
+
+# Replace ONLY the per-icon groups; [*] and its keys belong to scheme-apply.
+tmp="$(mktemp "${CONF}.XXXXXX")"
+# Trailing blank lines are dropped, not carried: this script appends its own
+# separator, so keeping them would grow the file by one blank line per run.
+awk '
+  /^\[/ {
+    g = $0; sub(/^\[/, "", g); sub(/\]$/, "", g)
+    keep = (g == "*")
+  }
+  keep {
+    if ($0 ~ /^[[:space:]]*$/) { pending++; next }
+    while (pending > 0) { print ""; pending-- }
+    print
+  }
+' "${CONF}" > "${tmp}"
+# Guard: never emit a conf that lost its [*] block.
+if ! grep -q '^\[\*\]' "${tmp}"; then
+  rm -f "${tmp}"
+  echo "redstone-9x-desktop-layout: ${CONF} has no [*] section; refusing to rewrite" >&2
+  exit 1
+fi
+printf '\n%s\n' "${layout}" >> "${tmp}"
+chmod --reference="${CONF}" "${tmp}" 2>/dev/null || chmod 644 "${tmp}"
+mv "${tmp}" "${CONF}"
+echo "redstone-9x-desktop-layout: pinned $(grep -c '^\[' <<<"${layout}") icons in ${CONF}"
+# The applier:1 ends here
