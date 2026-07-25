@@ -211,6 +211,11 @@
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/sanctuary-redstone-9x-refresh\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/sanctuary-redstone-9x-refresh\"; \"$HELPER\" --layout")))
 
+   (task 'redstone:programs
+         "Reproject the Redstone 9X Programs menu as a browsable directory tree"
+         (lambda ()
+           (sh "GH=\"$HOME/.local/share/dotcortex/guests/sanctuary-redstone-9x/home\"; HELPER=\"$GH/.local/bin/redstone-9x-program-tree\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/redstone-9x-program-tree\"; HOME=\"$GH\" /bin/bash \"$HELPER\"")))
+
    (task 'redstone:layout-capture
          "Freeze the running room's current desktop icon arrangement into the manifest"
          (lambda ()
