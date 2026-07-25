@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+"""xfce-host-keys — suspend/restore the XFCE host keybinding layer.
+
+A fullscreen sanctuary guest only receives every keystroke if the host stops
+grabbing them first. This releases the whole XFCE keybinding layer on demand
+and puts it back. Mechanism, evidence and scars: x11.org.
+
+Speaks to xfconfd over D-Bus rather than shelling out to xfconf-query, which
+needs one process per property: 146 spawns per toggle measured 4.2 s against
+~0.1 s here. Process spawns are exactly what a CPU-starved machine cannot
+afford, and this runs on a keypress.
+"""
+import os
+import subprocess
+import sys
+
+try:
+    import dbus
+except ImportError:  # pragma: no cover - environment guard
+    sys.exit("xfce-host-keys: python dbus bindings unavailable; cannot reach xfconfd")
+
+CHANNEL = "xfce4-keyboard-shortcuts"
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "dotcortex")
+STATE = os.path.join(STATE_DIR, "xfce-host-keys.state")
+
+# The two shortcut providers on this channel, each grabbing its own bindings:
+# xfsettingsd owns commands/*, xfwm4 grabs xfwm4/* itself. Both must move.
+TREES = ("xfwm4", "commands")
+
+# Accelerators that are NEVER suspended, matched on the final path component.
+# The toggle key MUST stay here: without it the script deletes its own escape
+# hatch and leaves a session with no shortcuts and no key left to restore them.
+EXEMPT = {"XF86Favorites"}
+
+# Refuse to suspend if fewer than this many bindings are found. This is the
+# double-suspend guard: a second suspend would write an already-empty set over
+# the state file and the real bindings would be unrecoverable.
+MIN_BINDINGS = 10
+
+
+def note(msg):
+    print(f"xfce-host-keys: {msg}")
+    try:
+        subprocess.run(["notify-send", "-t", "2500", "Sanctuary", msg],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def xfconf():
+    bus = dbus.SessionBus()
+    return dbus.Interface(
+        bus.get_object("org.xfce.Xfconf", "/org/xfce/Xfconf"), "org.xfce.Xfconf")
+
+
+def is_binding(path):
+    """True for leaf accelerator properties under custom/ only.
+
+    Deeper paths (…/startup-notify) are per-binding metadata and …/custom/override
+    is a boolean; both carry non-string types, so a prefix sweep would corrupt them
+    on restore. The default/ subtrees are excluded because they are not ours to
+    delete — they come from the root-owned system XML, so xfconf resets them
+    straight back, and they would sit in the state file as entries that were never
+    actually suspended, hollowing out the restore check that counts them.
+    """
+    parts = path.split("/")
+    return (len(parts) == 4 and parts[0] == "" and parts[1] in TREES
+            and parts[2] == "custom" and parts[3] != "override")
+
+
+def check_override(props):
+    """Warn if the undeletable system defaults are not being overridden.
+
+    They are inert only while the custom provider wins. If either flag goes
+    false those bindings become live and unsuspendable, and no xfconf mechanism
+    can release them — so say so rather than silently under-delivering.
+    """
+    for tree in TREES:
+        key = f"/{tree}/custom/override"
+        if not bool(props.get(key, False)):
+            print(f"xfce-host-keys: WARNING — {key} is not true; the system default "
+                  f"{tree} bindings cannot be suspended and will stay grabbed",
+                  file=sys.stderr)
+
+
+def read_state():
+    entries = []
+    with open(STATE) as fh:
+        for line in fh:
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            path, _, value = line.partition("\t")
+            if path:
+                entries.append((path, value))
+    return entries
+
+
+def suspend(xfc):
+    if os.path.exists(STATE):
+        print(f"xfce-host-keys: already suspended ({STATE}) — nothing to do")
+        return 0
+    props = xfc.GetAllProperties(CHANNEL, "/")
+    check_override(props)
+    saved = sorted(
+        (str(p), str(v)) for p, v in props.items()
+        if is_binding(str(p)) and str(p).rsplit("/", 1)[1] not in EXEMPT)
+    if len(saved) < MIN_BINDINGS:
+        sys.exit(f"xfce-host-keys: only {len(saved)} bindings found (expected at "
+                 f"least {MIN_BINDINGS}) — refusing to suspend")
+
+    # State lands on disk, flushed and fsynced, BEFORE a single property is
+    # deleted. Never the reverse: the alternative failure mode is a session with
+    # no keyboard shortcuts and no record of what they were.
+    os.makedirs(STATE_DIR, exist_ok=True)
+    tmp = STATE + ".new"
+    with open(tmp, "w") as fh:
+        for path, value in saved:
+            fh.write(f"{path}\t{value}\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, STATE)
+
+    for path, _ in saved:
+        xfc.ResetProperty(CHANNEL, path, False)
+    note(f"host keys OFF — {len(saved)} bindings released to the sanctuary")
+    return 0
+
+
+def restore(xfc):
+    if not os.path.exists(STATE):
+        print("xfce-host-keys: not suspended — nothing to restore")
+        return 0
+    entries = read_state()
+    for path, value in entries:
+        xfc.SetProperty(CHANNEL, path, dbus.String(value))
+
+    # Verify before discarding the evidence: a partial restore must keep its
+    # state file so a second run, or the login autostart, can finish the job.
+    have = {str(p) for p in xfc.GetAllProperties(CHANNEL, "/")}
+    missing = [p for p, _ in entries if p not in have]
+    if missing:
+        sys.exit(f"xfce-host-keys: {len(missing)}/{len(entries)} bindings did not "
+                 f"come back — state kept at {STATE}")
+
+    os.remove(STATE)
+    note(f"host keys ON — {len(entries)} bindings restored")
+    return 0
+
+
+def status(xfc):
+    if os.path.exists(STATE):
+        print(f"suspended — {len(read_state())} bindings held in {STATE}")
+    else:
+        props = xfc.GetAllProperties(CHANNEL, "/")
+        live = sum(1 for p in props if is_binding(str(p)))
+        print(f"active — {live} bindings live on channel {CHANNEL}")
+    return 0
+
+
+def main(argv):
+    command = argv[1] if len(argv) > 1 else "toggle"
+    try:
+        xfc = xfconf()
+    except dbus.DBusException as exc:
+        sys.exit(f"xfce-host-keys: cannot reach xfconfd over D-Bus: {exc}")
+
+    if command in ("suspend", "off"):
+        return suspend(xfc)
+    if command in ("restore", "on"):
+        return restore(xfc)
+    if command == "status":
+        return status(xfc)
+    if command == "toggle":
+        return restore(xfc) if os.path.exists(STATE) else suspend(xfc)
+    sys.exit("usage: xfce-host-keys [toggle|suspend|restore|status]")
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
