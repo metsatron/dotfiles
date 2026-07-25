@@ -950,10 +950,8 @@ demo.  Press q or Escape to quit.")
    "kigo"        ; Kigo — Go, against the GnuGo engine
    "kajongg"     ; Kajongg — four-player Mah Jongg (the real tile game, not solitaire)
    "lskat"       ; LSkat — Lieutenant Skat, two-player card game
-   "kiriki"      ; Kiriki — Yahtzee-style dice
    ;; Puzzle
    "katomic"     ; KAtomic — Sokoban-like molecule assembly
-   "skladnik"    ; Skladnik — Sokoban (this IS the renamed ksokoban; that name is retired)
    "klines"      ; Kolor Lines — colour-line elimination
    "kmines"      ; KMines — KDE's Minesweeper
    "picmi"       ; Picmi — nonogram / picross
@@ -961,11 +959,6 @@ demo.  Press q or Escape to quit.")
    ;; Arcade / action
    "kbounce"     ; KBounce — Jezzball
    "kbreakout"   ; KBreakOut — Breakout
-   "kapman"      ; Kapman — Pac-Man
-   "kgoldrunner" ; KGoldrunner — Lode Runner
-   "ksnakeduel"  ; KSnakeDuel — Tron light-cycles
-   "granatier"   ; Granatier — Bomberman
-   "kolf"        ; Kolf — minigolf
    ;; --- KF6 runtime deps of the KNewStuff "Get New ..." dialogs ---
    ;; KNS ships its dialog QML compiled into each binary (qrc:/qt/qml/org/kde/
    ;; newstuff/), but that QML imports modules no game pulls in itself. They
