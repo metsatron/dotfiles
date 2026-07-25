@@ -36,13 +36,23 @@
    "gimp" "inkscape" "birdtray" "icedove" "gnome-boxes"
    "vlc"
    "mpd" "mpd-mpc"   ; music daemon + CLI — fleet DJ lane (music.org: config/autostart; menu.org: rofi-mpd Super+m; library: HelmCortex/NADA)
-   "whisper-cpp"     ; CPU speech-to-text (whisper-transcribe, telegram voice pipeline)
+   ;; whisper-cpp: DELIBERATELY ABSENT — moved to the inference profile with llama-cpp
+   ;; (ruling 2026-07-25). It links its own ggml-for-whisper, which carries the identical
+   ;; defect: zero AVX2, zero AVX-512, zero FMA, 13108 SSE. Speech-to-text was running
+   ;; scalar for as long as this package has been installed.
    ;; "audacity"
    "appmenu-gtk-module"
    ;; "cdemu-client" "cdemu-daemon"  ; removed 2026-07-23 — CLI-only stub: no gcdemu GUI in Guix, no vhba kernel module, daemon never autostarted. Disc-image inspection handled by fuseiso (userspace FUSE mount) instead.
    "fuseiso"          ; userspace FUSE mount for CD/DVD images (.iso/.bin/.nrg/.mdf/.img incl. raw 2352-byte sectors) — browse disc contents in the file manager without root, kernel module, or daemon. Drives the disc-mount-browse Thunar action.
    "node"
-   "llama-cpp"
+   ;; llama-cpp: DELIBERATELY ABSENT — moved to the inference profile (ruling 2026-07-25).
+   ;; Guix's stock ggml is compiled for baseline x86_64: disassembly of libggml-cpu.so shows
+   ;; zero %ymm (AVX2), zero %zmm (AVX-512) and zero vfmadd against 13158 %xmm — scalar SSE
+   ;; on CPUs that advertise avx2+fma, which is most of the reason local embedding ran at
+   ;; ~13 tok/s against ~890 tok/s on a properly-built box. The fix needs a per-machine
+   ;; -march=native build, so it cannot live in a manifest shared by every machine.
+   ;; See "Inference profile" below. Not every machine should carry it either — the X230 is
+   ;; the fileserver and does no local inference at all.
 
    "python"
    "python-numpy" "python-sympy" "python-coloredlogs" "python-humanfriendly"
