@@ -235,7 +235,15 @@ fi
 # On client machines HelmCortex is an NFS mount; a dead mount makes bare -d/ls
 # block in uninterruptible I/O and hangs every shell start + command lookup.
 # timeout caps the probe (this runs before path_dir_healthy is defined).
-if timeout 2 test -d "$HOME/HelmCortex/FORGE/bin" 2>/dev/null && timeout 2 ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
+# On a client machine ~/HelmCortex is a SYMLINK into an NFS mount, so putting the
+# FORGE bins on PATH makes every bare-name command lookup stat NFS — and a dead
+# mount then hangs every command in every already-running shell, which no
+# startup-time guard can prevent. Clients get local shims instead (see
+# helmcortex-shims.org); only the native host, where ~/HelmCortex is a real
+# directory, puts the real bins on PATH.
+if [ -L "$HOME/HelmCortex" ]; then
+  [ -d "$HOME/.local/hx/bin" ] && export PATH="$HOME/.local/hx/bin:$PATH"
+elif timeout 2 test -d "$HOME/HelmCortex/FORGE/bin" 2>/dev/null && timeout 2 ls -d "$HOME/HelmCortex/FORGE/bin" >/dev/null 2>&1; then
   export PATH="$HOME/HelmCortex/FORGE/bin:$PATH"
 fi
 
@@ -1278,6 +1286,34 @@ fi
 
 <<shared-claude-path>>
 
+# Dedupe PATH, keeping the FIRST occurrence so "local first" ordering survives.
+# This block is sourced more than once in a normal login shell (.bash_profile ->
+# .bash_exports, then .bashrc -> .bash_exports), and several stanzas above
+# prepend unconditionally, so without this PATH accumulates duplicates on every
+# pass -- which is how the HelmCortex FORGE entries came to appear three times
+# each in a live session. Written with pure parameter expansion and no word
+# splitting on purpose: zsh does not split unquoted $PATH the way bash does, so
+# an IFS-based loop here would behave differently in the two shells.
+_dc_dedupe_path() {
+  _dc_out=""; _dc_rest="$PATH"
+  while [ -n "$_dc_rest" ]; do
+    _dc_d="${_dc_rest%%:*}"
+    case "$_dc_rest" in
+      *:*) _dc_rest="${_dc_rest#*:}" ;;
+      *)   _dc_rest="" ;;
+    esac
+    [ -n "$_dc_d" ] || continue
+    case ":${_dc_out}:" in
+      *":${_dc_d}:"*) ;;
+      *) _dc_out="${_dc_out:+$_dc_out:}$_dc_d" ;;
+    esac
+  done
+  PATH="$_dc_out"
+}
+_dc_dedupe_path
+unset -f _dc_dedupe_path 2>/dev/null || true
+unset _dc_out _dc_rest _dc_d 2>/dev/null || true
+
 export PATH
 
 # Editor
@@ -1298,22 +1334,33 @@ HISTCONTROL=ignoreboth
 # --------------------------------------------------
 
 # Add local bin directories to PATH. The shared-exports-min loop below consumes
-# this array and guards every entry with path_dir_healthy (timeout-bounded):
-# HelmCortex is an NFS mount on client machines, and a wedged mount must never
-# hang shell startup. Bash has no .zshenv equivalent, so this array is the only
-# place bash picks up the FORGE tools (auryn, pvox, helmcortex-*) -- keep it in
-# sync with the zsh list in .zsh_exports. .cargo/bin is absent on purpose:
-# .bashrc sources ~/.cargo/env instead.
+# this array and guards every entry with path_dir_healthy (timeout-bounded).
+# Bash has no .zshenv equivalent, so this array is the only place bash picks up
+# the FORGE tools -- keep it in sync with the zsh list in .zsh_exports.
+# .cargo/bin is absent on purpose: .bashrc sources ~/.cargo/env instead.
 custom_paths=(
   "$HOME/bin"
   "$HOME/.local/bin"
   "$HOME/Apps"
   "$HOME/.scripts"
-  "$HOME/HelmCortex/FORGE/bin"
-  "$HOME/HelmCortex/FORGE/PixelForge/bin"
-  "$HOME/HelmCortex/FORGE/VoxForge/bin"
   "$HOME/stl/prefix"
 )
+
+# HelmCortex reaches PATH one of two ways, decided by whether this machine hosts
+# it natively. On a client ~/HelmCortex is a SYMLINK into NFS, and putting the
+# FORGE bins on PATH makes every bare-name command lookup stat the mount -- so a
+# dead server hangs every command in every already-running shell, which
+# path_dir_healthy cannot prevent because it only runs at startup. Clients get
+# local shims instead; the native host uses the real bins. See helmcortex-shims.org.
+if [ -L "$HOME/HelmCortex" ]; then
+  custom_paths+=("$HOME/.local/hx/bin")
+else
+  custom_paths+=(
+    "$HOME/HelmCortex/FORGE/bin"
+    "$HOME/HelmCortex/FORGE/PixelForge/bin"
+    "$HOME/HelmCortex/FORGE/VoxForge/bin"
+  )
+fi
 
 # if command -v powerline-daemon >/dev/null 2>&1; then
 #   powerline-daemon -q
@@ -1351,13 +1398,25 @@ for dir in \
   "$HOME/.local/bin" \
   "$HOME/.cargo/bin" \
   "$HOME/Apps" \
-  "$HOME/HelmCortex/FORGE/bin" \
-  "$HOME/HelmCortex/FORGE/PixelForge/bin" \
-  "$HOME/HelmCortex/FORGE/VoxForge/bin" \
   "$HOME/stl/prefix"
 do
   path_dir_healthy "$dir" && path+="$dir"
 done
+
+# HelmCortex: local shims on client machines (~/HelmCortex is an NFS symlink
+# there, and NFS in PATH hangs every command lookup when the server dies), real
+# FORGE bins only on the native host. See helmcortex-shims.org.
+if [ -L "$HOME/HelmCortex" ]; then
+  [ -d "$HOME/.local/hx/bin" ] && path+="$HOME/.local/hx/bin"
+else
+  for dir in \
+    "$HOME/HelmCortex/FORGE/bin" \
+    "$HOME/HelmCortex/FORGE/PixelForge/bin" \
+    "$HOME/HelmCortex/FORGE/VoxForge/bin"
+  do
+    path_dir_healthy "$dir" && path+="$dir"
+  done
+fi
 
 #+END_SRC
 
@@ -1507,6 +1566,17 @@ HISTFILESIZE=20000
 #+BEGIN_SRC sh :tangle all/.bash_profile :tangle-mode (identity #o644)
 #!/bin/bash
 # ~/.bash_profile
+
+# PATH first, and independently of .bashrc. .bashrc returns immediately for a
+# non-interactive shell ([[ $- != *i* ]] && return), so a login-but-not-
+# interactive bash -- scripts, cron, ssh commands, .desktop launchers -- never
+# reached .bash_exports and came up with neither ~/.local/bin nor the HelmCortex
+# shims on PATH. Sourcing it here fixes that; the dedupe inside shared-exports-min
+# makes the second pass via .bashrc harmless.
+if [ -f "$HOME/.bash_exports" ]; then
+    . "$HOME/.bash_exports"
+fi
+
 # Source .bashrc if it exists
 if [ -f "$HOME/.bashrc" ]; then
     source "$HOME/.bashrc"
