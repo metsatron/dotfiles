@@ -202,16 +202,28 @@ Harness-exclusive config lives in its own directory. Nothing crosses these bound
 | `.codex/` | Codex only | Codex-specific config and skills |
 | `.agents/` | Universal (non-Claude) | Skills and config for OpenCode, Codex, and future agents |
 
-Skills are authored in the =agents-skills*.org= family — =agents-skills.org= (schema note, session skills, universal tools), =agents-skills-dotcortex.org=, =agents-skills-helmcortex.org=, =agents-skills-harness.org= — with one of three emission modes:
+### Where a new skill belongs — the two-lane bridge (migrated 2026-07-25)
 
-| Mode | Tangle target | Scope | Deploy |
-|------|--------------|-------|--------|
-| Stow-global | =all/.claude/skills/X/SKILL.md= + =all/.agents/skills/X/SKILL.md= | All sessions on all machines | =loom stow:*= → =~/.claude/skills/= |
-| DotCortex-scoped | =.claude/skills/X/SKILL.md= + =.agents/skills/X/SKILL.md= | Only when CWD is DotCortex | No stow needed — loaded by CWD |
-| Direct-global | =~/.claude/skills/X/SKILL.md= (absolute) | All sessions, no stow cycle | Write directly |
+**Ask first: is this skill about DotCortex, or about Mètsàtron's environment?** DotCortex is a public repo. It owns only the skills that operate DotCortex itself. Everything describing userspace or HelmCortex internals belongs to the HelmCortex lane, which reaches =$HOME= anyway — so nothing is lost by putting it there, and the public repo stays clean for anyone forking it.
 
-Current DotCortex-scoped skills: =dotcortex-*= (loom, bootstrap, gotchas, multihost, package-manifests, packages), =helmcortex-nexus=.
-All other skills in the family are stow-global.
+| Lane | Authored in | Emitted to | Deployed by |
+|------|------------|-----------|-------------|
+| DotCortex, stow-global | =agents-skills*.org= → =all/.claude/skills/X/SKILL.md= + =all/.agents/skills/X/SKILL.md= | overlay | =loom stow:*= → =~/.claude/skills/= |
+| DotCortex-scoped | =agents-skills*.org= → =.claude/skills/X/SKILL.md= + =.agents/skills/X/SKILL.md= | repo root | none — loaded by CWD |
+| **HelmCortex userspace** | =HelmCortex/FORGE/harness/userspace/SKILLS.md= | =NEXUS/stow/userspace/.{claude,agents,codex,opencode}/skills/= | =helmcortex-compile= then =helmstow= → =~/.claude/skills/= |
+| Direct-global | — | =~/.claude/skills/X/SKILL.md= (absolute) | write directly |
+
+**DotCortex stow-global now holds exactly six skills**: =loom=, =tangle=, =prime=, =commit=, =todo=, =handoff=. If you are about to add a seventh, you almost certainly want the userspace lane instead. The other twenty-three moved there on 2026-07-25 — they described the environment and HelmCortex, not DotCortex, and several were trying to be the bridge that lane now is.
+
+=handoff= is the one deliberate exception: HelmCortex's own harness owns a richer version for its scope, but DotCortex keeps the generic one because deleting it would drop =handoff= out of =~/.claude/skills= entirely for non-HelmCortex sessions.
+
+DotCortex-scoped skills: =dotcortex-*= (bootstrap, borg, gotchas, icons, loom, multihost, package-manifests, packages, update), =helmcortex-nexus=, =json-canvas=, =obsidian-bases=, =obsidian-cli=, =obsidian-markdown=, =pi-agent-gotchas=, =redstone-9x-*=, =sanctuary-gotchas=.
+
+#### Two traps in the compiler, both live
+
+**Skill names are global across scopes.** =~/.gemini/antigravity/skills= and =NEXUS/stow/linux/.hermes/skills= are written by *every* scope and are NOT derived from =workspace_root=. Two scopes sharing a skill name means whichever compiled last wins — silently, no conflict reported. A scope that does not own the global agent surfaces must set ="emit_global_substrates": false= in its =FORGE/brain/{scope}/spec.json=; =userspace= does. Before adding a skill name that already exists in another scope, check =grep -l "SKILL: <name>" FORGE/harness/*/{SKILLS,COMMANDS}.md= — searching only =SKILLS.md= will miss half the definitions.
+
+**=~/.gemini/antigravity/skills= is never backed up.** The compiler backs up replaced skills for other substrates into =~/Downloads/helmcortex-backups/=, but not that one. An overwrite there is unrecoverable.
 
 HelmCortex and its workspaces (FORGE, bridge) maintain their own skill harnesses compiled by =helmcortex-compile= from =FORGE/harness/{workspace}/SKILLS.md=. These may intentionally override global skills with project-specific content. Never duplicate a purely generic skill in a project harness — if it has no project-specific content, rely on the global version.
 
@@ -488,4 +500,4 @@ The `.zshenv` file (tangled from `shell.org`) sources Guix profiles for ALL zsh 
 
 ## Claude Code Rules
 
-- **Skills are in `.claude/skills/`** -- authored in the `agents-skills*.org` family, never edited directly. Stow-global skills tangle to `all/.claude/skills/` and are stowed to `~/.claude/skills/`. DotCortex-scoped skills tangle to `.claude/skills/` and are active only when CWD is DotCortex. HelmCortex and its workspaces manage their own skills via `FORGE/harness/{workspace}/SKILLS.md` compiled by `helmcortex-compile`.
+- **Skills are in `.claude/skills/`** -- authored in the `agents-skills*.org` family, never edited directly. Stow-global skills tangle to `all/.claude/skills/` and are stowed to `~/.claude/skills/`. DotCortex-scoped skills tangle to `.claude/skills/` and are active only when CWD is DotCortex. HelmCortex and its workspaces manage their own skills via `FORGE/harness/{workspace}/SKILLS.md` compiled by `helmcortex-compile`. **Most new skills belong in the HelmCortex `userspace` lane, not here** -- DotCortex stow-global holds only six (`loom`, `tangle`, `prime`, `commit`, `todo`, `handoff`); anything describing userspace or HelmCortex internals goes to `FORGE/harness/userspace/SKILLS.md`, which still reaches `~/.claude/skills/` via `helmstow`. See the two-lane bridge table above.
