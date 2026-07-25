@@ -711,8 +711,16 @@ process information (path, size, owner) and pattern-based filtering.")
                 ;; binary's own directory FIRST (see BaseFileSearch), before any
                 ;; ini search path. The real binary lives in bin/, so linking the
                 ;; pk3s here makes discovery independent of any home's stale
-                ;; gzdoom.ini — and progdir resolves to this store bin/ via
-                ;; /proc/self/exe even when the wrapper is run from a profile.
+                ;; gzdoom.ini.
+                ;;
+                ;; This comment used to end "and progdir resolves to this store
+                ;; bin/ via /proc/self/exe even when the wrapper is run from a
+                ;; profile". That was false, and it cost every gzdoom port a
+                ;; launch: gzdoom derives progdir from *argv[0]*, not
+                ;; /proc/self/exe. Proven by running one identical binary two
+                ;; ways — same /proc/self/exe, argv[0] a full path vs a bare
+                ;; name — where only the bare-name run failed. See the wrapper
+                ;; phase below for why that mattered.
                 (let ((share (string-append #$output "/share/games/gzdoom-"
                                             #$version)))
                   (with-directory-excursion (string-append #$output "/bin")
@@ -724,8 +732,28 @@ process information (path, size, owner) and pattern-based filtering.")
                      (find-files share "\\.pk3$"))))))
             (replace 'wrap-uzdoom
               (lambda _
-                (wrap-program (string-append #$output "/bin/gzdoom-" #$version)
-                  `("GUIX_GZDOOM_PREFIX" = (,#$output)))))))))
+                (let ((exe (string-append #$output "/bin/gzdoom-" #$version)))
+                  (wrap-program exe
+                    `("GUIX_GZDOOM_PREFIX" = (,#$output)))
+                  ;; wrap-program emits `exec -a "${0##*/}" <real> "$@"`, which
+                  ;; hands the engine a bare basename as argv[0]. gzdoom derives
+                  ;; progdir from argv[0], so with no directory component it
+                  ;; could not see the pk3s symlinked beside the real binary
+                  ;; directly above, and every launch died with "Cannot find
+                  ;; gzdoom.pk3" — through the Ports menu, through Lutris, and
+                  ;; from a bare shell alike. The engines built and installed
+                  ;; fine, which is exactly why this survived an artifact-level
+                  ;; review: a green build proves the thing was built, never
+                  ;; that it runs.
+                  ;;
+                  ;; Dropping -a restores a path-bearing argv[0] (the real
+                  ;; binary's own store path), so progdir lands in this store
+                  ;; bin/ no matter how the engine was invoked — including via
+                  ;; the room-gaming profile symlink, whose own bin/ cannot
+                  ;; carry the pk3s because 4.10.0 and 4.5.0 would collide on
+                  ;; identical filenames in the union.
+                  (substitute* exe
+                    (("exec -a \"\\$\\{0##\\*/\\}\" ") "exec ")))))))))
     (inputs (modify-inputs (package-inputs uzdoom) (prepend mesa)))
     (synopsis (string-append "GZDoom " version
                              " (version-exact, pinned mod contracts)"))))
