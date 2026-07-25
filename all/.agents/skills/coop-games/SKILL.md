@@ -31,21 +31,15 @@ All binaries live in the `room-gaming` Guix profile and appear under **KDE Games
 | KSquares | `ksquares` | Hotseat relay | Dots and boxes |
 | Kigo | `kigo` | Hotseat relay | Go, via GnuGo. Board state is large — relay is slow |
 | LSkat | `lskat` | Hotseat relay | Two-player card game; hidden information |
-| Kiriki | `kiriki` | Hotseat relay | Yahtzee-style dice; probability is the whole game |
 | Kajongg | `kajongg` | Hotseat relay | Four-player Mah Jongg; has its own server |
 | KMines | `kmines` | Solver | Constraint propagation solves most boards outright |
 | Picmi | `picmi` | Solver | Nonogram line-solving |
 | KAtomic | `katomic` | Solver | BFS/A* over a small grid |
-| Skladnik | `skladnik` | Solver | Sokoban (this IS the renamed `ksokoban`) |
 | Kolor Lines | `klines` | Solver | Greedy + lookahead |
 | KPatience | `kpat` | Solver | Solitaire; solvability varies by variant |
 | KMahjongg / KShisen | `kmahjongg` `kshisen` | Solver | Tile-matching; layout is readable |
 | KBlocks | `kblocks` | Spectator | Falling blocks, real-time |
 | KBounce, KBreakOut | `kbounce` `kbreakout` | Spectator | Real-time |
-| Kapman, KGoldrunner | `kapman` `kgoldrunner` | Spectator | Real-time |
-| KSnakeDuel | `ksnakeduel` | Spectator | Two-player Tron — HE can play both sides |
-| Granatier | `granatier` | Spectator | Bomberman, multiplayer |
-| Kolf | `kolf` | Spectator | Minigolf; turn-based but physics-driven |
 
 ## Ground rules
 
