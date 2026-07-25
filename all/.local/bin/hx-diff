@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# hx-diff — report drift: manifest vs generated shims, and (when the mount is up)
+# manifest vs live HelmCortex. Read-only. See helmcortex-shims.org.
+set -euo pipefail
+
+HELM="${HELMCORTEX_ROOT:-$HOME/HelmCortex}"
+SCAN_DIRS=(FORGE/bin FORGE/VoxForge/bin FORGE/PixelForge/bin)
+MANIFEST="${HELM}/ROOTS/DotCortex/helmcortex-shims.ssv"
+CACHE="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/hx/manifest.ssv"
+SHIM_DIR="${HOME}/.local/hx/bin"
+
+src=""
+if timeout -k 1 2 test -r "${MANIFEST}" 2>/dev/null; then src="${MANIFEST}"
+elif [ -r "${CACHE}" ]; then src="${CACHE}"
+else echo "hx-diff: no manifest and no cache"; exit 1; fi
+echo "manifest: ${src}"
+
+m="$(mktemp)"; s="$(mktemp)"; trap 'rm -f "${m}" "${s}"' EXIT
+awk '!/^#/ && NF {print $1}' "${src}" | sort > "${m}"
+find "${SHIM_DIR}" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort > "${s}"
+
+echo "manifest tools: $(wc -l < "${m}")   generated shims: $(wc -l < "${s}")"
+if diff -q "${m}" "${s}" >/dev/null; then
+  echo "  shims in sync with manifest"
+else
+  comm -23 "${m}" "${s}" | sed 's/^/  missing shim: /'
+  comm -13 "${m}" "${s}" | sed 's/^/  orphan shim:  /'
+fi
+
+# The timeout guard in every generated shim is only load-bearing on a 'soft' NFS
+# mount. On a 'hard' mount stat() blocks uninterruptibly, no signal can bound it,
+# and every guard in this system becomes decorative. Check the invariant rather
+# than trusting the comment that asserts it. Deliberately reports only soft/hard —
+# never echoes the raw options, which carry addresses.
+# The '|| true' is load-bearing: findmnt exits nonzero when the target does not
+# resolve, and under 'set -e' + pipefail that would kill hx-diff on a dead mount —
+# precisely the situation it exists to report on.
+mnt="$(timeout -k 1 2 findmnt -no FSTYPE,OPTIONS -T "${HELM}" 2>/dev/null | tail -1 || true)"
+if [ -z "${mnt}" ]; then
+  echo "mount check: could not read mount info for ${HELM}"
+elif ! printf '%s' "${mnt}" | grep -q 'nfs'; then
+  echo "mount check: not NFS — shim timeout guards are not load-bearing here"
+elif printf '%s' "${mnt}" | grep -qw 'soft'; then
+  echo "mount check: NFS mount is 'soft' — shim timeout guards are effective"
+else
+  echo "mount check: WARNING — NFS mount is NOT 'soft'." >&2
+  echo "  A hard mount blocks stat() uninterruptibly. Every hx guard becomes" >&2
+  echo "  decorative and a wedged server will hang the shim exactly like the bare" >&2
+  echo "  PATH entries these replaced. Restore 'soft' before relying on the shims." >&2
+fi
+
+# Live comparison only when HelmCortex actually answers.
+if timeout -k 1 2 test -d "${HELM}/FORGE/bin" 2>/dev/null; then
+  l="$(mktemp)"
+  # Same artefact filter as hx-capture. If these two ever disagree, hx-diff reports
+  # permanent phantom drift for files capture is right to ignore.
+  for d in "${SCAN_DIRS[@]}"; do
+    find "${HELM}/${d}" -maxdepth 1 -type f -executable \
+      ! -name '*.backup-*' ! -name '*.bak' ! -name '*.orig' ! -name '*.rej' \
+      ! -name '*.save' ! -name '*.disabled' ! -name '*~' ! -name '.*' ! -name '#*' \
+      -printf '%f\n' 2>/dev/null
+  done | sort > "${l}"
+  echo "live HelmCortex tools: $(wc -l < "${l}")"
+  if diff -q "${m}" "${l}" >/dev/null; then
+    echo "  manifest matches live HelmCortex"
+  else
+    comm -13 "${m}" "${l}" | sed 's/^/  NEW in HelmCortex (run hx-capture): /'
+    comm -23 "${m}" "${l}" | sed 's/^/  gone from HelmCortex: /'
+  fi
+  rm -f "${l}"
+else
+  echo "live comparison skipped — HelmCortex unreachable"
+fi

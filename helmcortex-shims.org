@@ -1,0 +1,308 @@
+#+TITLE: HelmCortex shims — keeping a dead NFS mount from hanging the whole system
+#+DESCRIPTION: Local bash shims for HelmCortex FORGE tools, so PATH lookup never touches NFS
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+OPTIONS: toc:2
+
+* The problem this solves
+
+On every machine except the one that hosts HelmCortex natively, =~/HelmCortex= is a symlink into an NFS mount. Three of its directories — =FORGE/bin=, =FORGE/VoxForge/bin=, =FORGE/PixelForge/bin= — used to sit near the *front* of =PATH=. PATH resolution =stat()=s every directory entry in order, so with those present, **every bare-name command execution on the system reaches across NFS before it can find anything local**. When the mount is healthy that costs a fraction of a millisecond. When the server sleeps, drops off the tailnet, or is simply rebooting, the mounts are =soft,timeo=30,retrans=2= — three seconds per attempt, two retries — and *every command you type* pays it. Not just HelmCortex tools: =ls=, =git=, your rofi launcher, your window-manager keybinds.
+
+=shell.org= already guarded this at shell *startup* with a timeout-bounded =path_dir_healthy=, and that guard is correct as far as it goes. It cannot go far enough: it runs once, when the shell starts. If the mount is healthy at 09:00 and the server goes down at 14:00, the directory is still in =PATH= and every command in every already-running shell hangs. Startup guarding cannot close a hole that opens at runtime.
+
+The fix is to take NFS out of =PATH= entirely and reach it only when someone actually asks for a HelmCortex tool. A shim does exactly that: it is a **local regular file**, so PATH resolution finds it on local disk and never leaves the machine. NFS is touched only on invocation.
+
+This does *not* make the tools work when the mount is down — nothing can, the code lives there. What it does is convert a **system-wide hang into a per-tool one**, and give that one tool a two-second failure with a readable reason instead of a nine-second stall.
+
+* Why a shim and not a symlink
+
+A symlink placed in =PATH= would defeat the entire exercise, because PATH resolution follows symlinks: =stat()= on a link whose target is on NFS is an NFS operation. The shim has to be a real local file whose *body* references the remote path, so that nothing dereferences anything remote until the shim actually runs. This distinction is the difference between a fix and a placebo, and it is easy to get backwards.
+
+* Where the pieces live, and why
+
+The generated shims name every HelmCortex tool. That list is not a neutral inventory — it is a map of a private operation, naming which vendors are pipelined, which client work exists, and which archival and research machinery is running. It does not belong in a public repository, so **DotCortex carries only the generic machinery**: the capture, apply and diff scripts, which contain no tool names. The data lives in HelmCortex.
+
+| Layer | Location | Tracked? |
+|-------+----------+----------|
+| Generator | =all/.local/bin/hx-{capture,apply,diff}= (this file) | DotCortex, public |
+| Manifest (authoritative) | =HelmCortex/ROOTS/DotCortex/helmcortex-shims.ssv= | HelmCortex, private |
+| Manifest (local cache) | =~/.local/share/dotcortex/hx/manifest.ssv= | untracked |
+| Generated shims | =~/.local/hx/bin/= | untracked |
+
+The manifest sits in =ROOTS/= because that is where HelmCortex keeps indexed data — =FORGE/harness/= is the source layer for compiled agent behaviour and emphatically not a datastore. It sits under =ROOTS/DotCortex/= following the compiler's own precedent of filing an index under its consumer's name, exactly as =ROOTS/Hermes/helmcortex-skills.json= does.
+
+The **local cache is the point of the whole arrangement**: it is what lets a machine regenerate its shims with the mount dead. Capture needs the mount; apply does not.
+
+One consequence to state plainly, because it is easy to assume otherwise: **=ROOTS/= is deliberately not tracked by HelmCortex's git**. Its =.gitignore= is deny-all with explicit un-ignores, and it carries the comment "ROOTS: backed up by helmcortex-sync, not tracked in git". So the manifest is backed up but *not versioned*, and there is no commit diff to review when the tool list changes. =hx-diff= is the review mechanism instead — and it is the better one for this job, because it compares three things a commit diff cannot: the manifest, the shims actually generated on this machine, and the live contents of HelmCortex. Do not reach for =git log= here expecting history that was never kept.
+
+* The guards, and what each one is for
+
+**Capture refuses a short manifest.** If capture ever runs while the mount is down, half-populated, or pointed somewhere wrong, it would otherwise write an empty list — and apply would faithfully delete all ninety-odd shims. =MIN_TOOLS= is the floor that makes that impossible. This is the same shape as the double-suspend guard in =xfce-host-keys=: the dangerous case is not the operation failing, it is the operation succeeding against an empty input.
+
+**Capture probes before it scans.** A directory that does not answer within the timeout aborts the whole capture rather than contributing zero tools to the total.
+
+**Capture ignores backup and editor artefacts.** Editing a HelmCortex tool in place leaves an executable sibling next to it — =pvox.backup-20260725-181959=, an editor swap file, a =.orig= from a merge. Without a filter those become shims on =PATH=, and removing the backup later leaves an orphan that nothing but =hx-apply= would ever notice. =hx-diff= applies the identical filter to its live scan; if the two ever drift apart, =hx-diff= reports permanent phantom drift for files capture is correctly ignoring.
+
+**Apply prunes only what the manifest disowns**, and prints every addition and removal. Orphan removal is the feature that keeps a renamed or deleted tool from leaving a shim that fails confusingly later.
+
+**Apply prefers the live manifest and falls back to the cache**, announcing which it used. Silent fallback is the failure mode this house names most often; the source of truth for a given run should never be a guess.
+
+** The one assumption the timeout guard rests on
+
+Every probe here is =timeout -k 1 2=, not a bare =timeout 2=, and the reason is worth writing down because it is invisible from the outside.
+
+There are two ways HelmCortex can be gone, and they behave nothing alike. If the path simply does not resolve — the automount failed, the export vanished, the symlink dangles — =test -d= returns =ENOENT= immediately and the guard fires in about ten milliseconds. That is the easy case and it is fully verified. The hard case is a server that is still *reachable at the TCP level* but has stopped answering RPCs: a wedged x230, a suspended host, a tailnet that is up but blackholed. There =stat()= does not return, it blocks in the kernel, and whether the guard can save you depends entirely on how the mount was made.
+
+The mount is =nfs4 … soft,timeo=30,retrans=2=. On a **soft** mount the RPC wait is =TASK_KILLABLE=, so a fatal signal breaks it — but =timeo= is measured in tenths of a second, so 3 s per attempt across 2 retransmits means the kernel may take the better part of ten seconds to give up on its own. The =timeout= is what bounds that. Plain =timeout= sends =SIGTERM=, which does in fact break a killable wait (a default-disposition =SIGTERM= causes a group exit, which posts =SIGKILL= to the thread), but that chain has more links in it than a safety guard should depend on. The =-k 1= appends an unconditional =SIGKILL= one second later, which needs no reasoning at all to be correct.
+
+**On a =hard= mount none of this works.** Hard-mount RPC waits are =TASK_UNINTERRUPTIBLE=; the process sits in =D= state and no signal — not =SIGKILL=, not anything — will move it until the server comes back. Every guard in this file would be decorative, and the shims would hang exactly like the bare =PATH= entries they were built to replace. **The =soft= mount option is therefore a load-bearing part of this design, not an incidental detail of how the share happens to be configured today.** =hx-diff= checks it on every run and says so out loud, because a documented invariant that nothing verifies is an invariant that quietly stops being true.
+
+* Capture — scan HelmCortex and write the manifest
+
+#+BEGIN_SRC bash :tangle all/.local/bin/hx-capture :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# hx-capture — scan HelmCortex FORGE bin directories and write the shim manifest.
+# Requires the mount to be reachable. Writes the authoritative manifest into
+# HelmCortex (private) and refreshes the machine-local cache. See helmcortex-shims.org.
+set -euo pipefail
+
+HELM="${HELMCORTEX_ROOT:-$HOME/HelmCortex}"
+SCAN_DIRS=(FORGE/bin FORGE/VoxForge/bin FORGE/PixelForge/bin)
+MANIFEST="${HELM}/ROOTS/DotCortex/helmcortex-shims.ssv"
+CACHE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/hx"
+CACHE="${CACHE_DIR}/manifest.ssv"
+
+# Floor guard: a capture that finds fewer than this many tools is assumed broken
+# (dead mount, wrong root, partial listing) and must not be allowed to overwrite
+# a good manifest with a short one — apply would then delete every real shim.
+MIN_TOOLS=20
+PROBE_TIMEOUT=5
+
+die() { echo "hx-capture: $*" >&2; exit 1; }
+
+[ -n "${HELM}" ] || die "HELMCORTEX_ROOT is empty"
+
+# Probe every directory first. A dir that does not answer aborts the run rather
+# than silently contributing zero entries to the total.
+for d in "${SCAN_DIRS[@]}"; do
+  if ! timeout -k 1 "${PROBE_TIMEOUT}" test -d "${HELM}/${d}" 2>/dev/null; then
+    die "${HELM}/${d} did not answer in ${PROBE_TIMEOUT}s — mount down? refusing to capture"
+  fi
+done
+
+tmp="$(mktemp)"
+trap 'rm -f "${tmp}"' EXIT
+{
+  echo "# HelmCortex shim manifest — generated by hx-capture, do not hand-edit."
+  echo "# Consumed by hx-apply to generate ~/.local/hx/bin/ shims."
+  echo "# NAME DIR"
+} > "${tmp}"
+
+count=0
+skipped=0
+for d in "${SCAN_DIRS[@]}"; do
+  while IFS= read -r f; do
+    [ -n "${f}" ] || continue
+    name="$(basename "${f}")"
+    # Editing a tool in place leaves an executable sibling behind — a timestamped
+    # backup, an editor swap file, a merge leftover. Those are not tools and must
+    # not become shims: they would be shimmed onto PATH, and deleting the backup
+    # later would leave an orphan that only hx-apply notices. Filter at the source.
+    case "${name}" in
+      *.backup-*|*.bak|*.orig|*.rej|*.save|*.disabled|*~|.*|\#*)
+        skipped=$((skipped + 1)); continue ;;
+    esac
+    printf '%s %s\n' "${name}" "${d}" >> "${tmp}"
+    count=$((count + 1))
+  done < <(find "${HELM}/${d}" -maxdepth 1 -type f -executable -printf '%p\n' 2>/dev/null | sort)
+done
+[ "${skipped}" -eq 0 ] || echo "hx-capture: skipped ${skipped} backup/editor artefact(s)"
+
+if [ "${count}" -lt "${MIN_TOOLS}" ]; then
+  die "found only ${count} tools (floor is ${MIN_TOOLS}) — refusing to write a short manifest"
+fi
+
+# Duplicate tool names across directories would make the shim ambiguous: two
+# manifest rows, one output file, last writer wins silently. Catch it here.
+dupes="$(awk '!/^#/ {print $1}' "${tmp}" | sort | uniq -d)"
+if [ -n "${dupes}" ]; then
+  die "duplicate tool names across scan dirs, shim would be ambiguous: $(echo ${dupes} | tr '\n' ' ')"
+fi
+
+mkdir -p "$(dirname "${MANIFEST}")" "${CACHE_DIR}"
+cp -f "${tmp}" "${MANIFEST}"
+cp -f "${tmp}" "${CACHE}"
+echo "hx-capture: ${count} tools -> ${MANIFEST}"
+echo "hx-capture: cache refreshed -> ${CACHE}"
+#+END_SRC
+
+* Apply — generate the shims
+
+#+BEGIN_SRC bash :tangle all/.local/bin/hx-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# hx-apply — generate local shims from the manifest. Works with the mount DOWN,
+# by falling back to the machine-local cache. See helmcortex-shims.org.
+set -euo pipefail
+
+HELM="${HELMCORTEX_ROOT:-$HOME/HelmCortex}"
+MANIFEST="${HELM}/ROOTS/DotCortex/helmcortex-shims.ssv"
+CACHE_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/hx"
+CACHE="${CACHE_DIR}/manifest.ssv"
+SHIM_DIR="${HOME}/.local/hx/bin"
+PROBE_TIMEOUT=2
+
+die() { echo "hx-apply: $*" >&2; exit 1; }
+
+# Prefer the authoritative manifest; fall back to the cache. Announce which was
+# used — a run whose source of truth is ambiguous is worse than one that fails.
+src=""
+if timeout -k 1 "${PROBE_TIMEOUT}" test -r "${MANIFEST}" 2>/dev/null; then
+  src="${MANIFEST}"
+  mkdir -p "${CACHE_DIR}"
+  cp -f "${MANIFEST}" "${CACHE}" 2>/dev/null || true
+  echo "hx-apply: source = HelmCortex manifest (mount up, cache refreshed)"
+elif [ -r "${CACHE}" ]; then
+  src="${CACHE}"
+  echo "hx-apply: source = local cache (HelmCortex unreachable)"
+else
+  die "no manifest and no cache — run hx-capture on a machine that can see HelmCortex"
+fi
+
+mkdir -p "${SHIM_DIR}"
+
+wanted="$(mktemp)"; trap 'rm -f "${wanted}"' EXIT
+added=0; kept=0
+
+while read -r name dir; do
+  case "${name}" in ''|\#*) continue ;; esac
+  [ -n "${dir}" ] || continue
+  echo "${name}" >> "${wanted}"
+  target="${SHIM_DIR}/${name}"
+  new="$(mktemp)"
+  cat > "${new}" <<SHIM
+#!/usr/bin/env bash
+# hx shim — ${name}  (generated by hx-apply; edit helmcortex-shims.org, not this)
+set -euo pipefail
+DIR="\$HOME/HelmCortex/${dir}"
+TOOL="${name}"
+REAL="\$DIR/\$TOOL"
+
+# Is the mount alive? Bounded at 2s because a wedged soft NFS mount takes ~9s to
+# give up on its own (timeo=30 is tenths of a second, x2 retransmits). -k adds an
+# unconditional SIGKILL so the bound does not depend on SIGTERM breaking a killable
+# RPC wait. Relies on the mount being 'soft'; see helmcortex-shims.org.
+if ! timeout -k 1 2 test -d "\$DIR" 2>/dev/null; then
+  echo "hx: HelmCortex unreachable — \$DIR did not answer in 2s" >&2
+  exit 69
+fi
+
+# Is the tool actually there and runnable?
+if ! timeout -k 1 2 test -x "\$REAL" 2>/dev/null; then
+  echo "hx: \$TOOL missing or not executable at \$REAL" >&2
+  exit 127
+fi
+
+# Run it from its own directory so relative modules resolve; keep the caller's
+# cwd reachable for any tool that needs to resolve a user-supplied path.
+export HX_CALLER_PWD="\$PWD"
+cd "\$DIR"
+exec "\$REAL" "\$@"
+SHIM
+  chmod 755 "${new}"
+  if [ -f "${target}" ] && cmp -s "${new}" "${target}"; then
+    kept=$((kept + 1)); rm -f "${new}"
+  else
+    mv -f "${new}" "${target}"
+    added=$((added + 1)); echo "  + ${name}  (${dir})"
+  fi
+done < "${src}"
+
+# Prune orphans: shims whose tool is no longer in the manifest.
+removed=0
+if [ -d "${SHIM_DIR}" ]; then
+  while IFS= read -r existing; do
+    [ -n "${existing}" ] || continue
+    n="$(basename "${existing}")"
+    if ! grep -qxF "${n}" "${wanted}"; then
+      rm -f "${existing}"; removed=$((removed + 1)); echo "  - ${n}  (orphan)"
+    fi
+  done < <(find "${SHIM_DIR}" -maxdepth 1 -type f 2>/dev/null)
+fi
+
+echo "hx-apply: ${added} written, ${kept} unchanged, ${removed} pruned -> ${SHIM_DIR}"
+#+END_SRC
+
+* Diff — report drift without changing anything
+
+#+BEGIN_SRC bash :tangle all/.local/bin/hx-diff :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# hx-diff — report drift: manifest vs generated shims, and (when the mount is up)
+# manifest vs live HelmCortex. Read-only. See helmcortex-shims.org.
+set -euo pipefail
+
+HELM="${HELMCORTEX_ROOT:-$HOME/HelmCortex}"
+SCAN_DIRS=(FORGE/bin FORGE/VoxForge/bin FORGE/PixelForge/bin)
+MANIFEST="${HELM}/ROOTS/DotCortex/helmcortex-shims.ssv"
+CACHE="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/hx/manifest.ssv"
+SHIM_DIR="${HOME}/.local/hx/bin"
+
+src=""
+if timeout -k 1 2 test -r "${MANIFEST}" 2>/dev/null; then src="${MANIFEST}"
+elif [ -r "${CACHE}" ]; then src="${CACHE}"
+else echo "hx-diff: no manifest and no cache"; exit 1; fi
+echo "manifest: ${src}"
+
+m="$(mktemp)"; s="$(mktemp)"; trap 'rm -f "${m}" "${s}"' EXIT
+awk '!/^#/ && NF {print $1}' "${src}" | sort > "${m}"
+find "${SHIM_DIR}" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null | sort > "${s}"
+
+echo "manifest tools: $(wc -l < "${m}")   generated shims: $(wc -l < "${s}")"
+if diff -q "${m}" "${s}" >/dev/null; then
+  echo "  shims in sync with manifest"
+else
+  comm -23 "${m}" "${s}" | sed 's/^/  missing shim: /'
+  comm -13 "${m}" "${s}" | sed 's/^/  orphan shim:  /'
+fi
+
+# The timeout guard in every generated shim is only load-bearing on a 'soft' NFS
+# mount. On a 'hard' mount stat() blocks uninterruptibly, no signal can bound it,
+# and every guard in this system becomes decorative. Check the invariant rather
+# than trusting the comment that asserts it. Deliberately reports only soft/hard —
+# never echoes the raw options, which carry addresses.
+# The '|| true' is load-bearing: findmnt exits nonzero when the target does not
+# resolve, and under 'set -e' + pipefail that would kill hx-diff on a dead mount —
+# precisely the situation it exists to report on.
+mnt="$(timeout -k 1 2 findmnt -no FSTYPE,OPTIONS -T "${HELM}" 2>/dev/null | tail -1 || true)"
+if [ -z "${mnt}" ]; then
+  echo "mount check: could not read mount info for ${HELM}"
+elif ! printf '%s' "${mnt}" | grep -q 'nfs'; then
+  echo "mount check: not NFS — shim timeout guards are not load-bearing here"
+elif printf '%s' "${mnt}" | grep -qw 'soft'; then
+  echo "mount check: NFS mount is 'soft' — shim timeout guards are effective"
+else
+  echo "mount check: WARNING — NFS mount is NOT 'soft'." >&2
+  echo "  A hard mount blocks stat() uninterruptibly. Every hx guard becomes" >&2
+  echo "  decorative and a wedged server will hang the shim exactly like the bare" >&2
+  echo "  PATH entries these replaced. Restore 'soft' before relying on the shims." >&2
+fi
+
+# Live comparison only when HelmCortex actually answers.
+if timeout -k 1 2 test -d "${HELM}/FORGE/bin" 2>/dev/null; then
+  l="$(mktemp)"
+  # Same artefact filter as hx-capture. If these two ever disagree, hx-diff reports
+  # permanent phantom drift for files capture is right to ignore.
+  for d in "${SCAN_DIRS[@]}"; do
+    find "${HELM}/${d}" -maxdepth 1 -type f -executable \
+      ! -name '*.backup-*' ! -name '*.bak' ! -name '*.orig' ! -name '*.rej' \
+      ! -name '*.save' ! -name '*.disabled' ! -name '*~' ! -name '.*' ! -name '#*' \
+      -printf '%f\n' 2>/dev/null
+  done | sort > "${l}"
+  echo "live HelmCortex tools: $(wc -l < "${l}")"
+  if diff -q "${m}" "${l}" >/dev/null; then
+    echo "  manifest matches live HelmCortex"
+  else
+    comm -13 "${m}" "${l}" | sed 's/^/  NEW in HelmCortex (run hx-capture): /'
+    comm -23 "${m}" "${l}" | sed 's/^/  gone from HelmCortex: /'
+  fi
+  rm -f "${l}"
+else
+  echo "live comparison skipped — HelmCortex unreachable"
+fi
+#+END_SRC
