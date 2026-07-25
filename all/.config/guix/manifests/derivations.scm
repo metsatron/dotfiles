@@ -1,4 +1,4 @@
-;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:5]]
+;; [[file:../../../../package-guix.org::*Inference profile — CPU-tuned llama.cpp and whisper.cpp][Inference profile — CPU-tuned llama.cpp and whisper.cpp:2]]
 ;; These packages lack substitutions and the derivations.
 ;; They require extremely heavy local compilation for all dependencies.
 ;; Tooks 11.5h to compile last time on my X230 turboing @3.4Ghz 92C.
@@ -16,4 +16,4 @@
 
 ;; QtDeclarative (both 5.15.16 and 6.9.2) is among the heaviest units here.
 ;; But the Pandoc/Haskell stack is also a whale when it doesn’t have substitutes.
-;; Guix User profile manifests:5 ends here
+;; Inference profile — CPU-tuned llama.cpp and whisper.cpp:2 ends here

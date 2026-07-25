@@ -80,6 +80,14 @@ guix-nonguix: guix-dirs
 | mkdir -p $(EXTRA)/nonguix
 | $(GUIX) package -m $(GUIX_HOME)/manifests/nonguix.scm -p $(EXTRA)/nonguix/nonguix
 
+# CPU-tuned local inference (llama.cpp + whisper.cpp). NOT part of guix-apply: transformed
+# packages have no substitutes, so this compiles ggml, llama.cpp and whisper.cpp from source
+# — an explicit, per-machine decision rather than something every apply drags along.
+# The X230 must never get this profile: it is the fileserver and does no local inference.
+guix-inference: guix-dirs
+| mkdir -p $(EXTRA)/inference
+| $(GUIX) package -m $(GUIX_HOME)/manifests/inference.scm -p $(EXTRA)/inference/inference
+
 # Virtual Habitat — sanctuary substrate profiles (Phase 0B stubs; apply in Phase 1A)
 guix-desktop-common: guix-dirs
 | mkdir -p $(EXTRA)/desktop-common
