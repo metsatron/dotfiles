@@ -206,6 +206,16 @@
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/sanctuary-redstone-9x-refresh\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/sanctuary-redstone-9x-refresh\"; \"$HELPER\" --check")))
 
+   (task 'redstone:layout
+         "Apply the declared Redstone 9X desktop icon layout and bounce the desktop"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/sanctuary-redstone-9x-refresh\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/sanctuary-redstone-9x-refresh\"; \"$HELPER\" --layout")))
+
+   (task 'redstone:layout-capture
+         "Freeze the running room's current desktop icon arrangement into the manifest"
+         (lambda ()
+           (sh "HELPER=\"$HOME/.local/bin/sanctuary-redstone-9x-refresh\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/sanctuary-redstone-9x-refresh\"; \"$HELPER\" --capture-layout")))
+
    (task 'desktop:appmenu "Configure XFCE appmenu xsettings and registrar"
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/xfce-appmenu-configure\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/xfce-appmenu-configure\"; \"$HELPER\"")))
@@ -241,6 +251,14 @@
 
    (task 'guix:apply "Build core+dev profiles"
          (lambda () (mk-guix "guix-core guix-dev guix-nonguix")))
+
+   ;; CPU-tuned local inference. Deliberately NOT folded into guix:apply — the transformed
+   ;; ggml/llama.cpp/whisper.cpp have no substitutes and compile from source, so applying
+   ;; this is a per-machine decision. The build is multi-variant (GGML_CPU_ALL_VARIANTS)
+   ;; and therefore portable, unlike an -march=native build. Apply on the local-inference
+   ;; fallbacks: T480s, T480, and the T1700 when it lands. Never the X230 — fileserver.
+   (task 'guix:inference-apply "Build CPU-tuned inference profile (llama.cpp + whisper.cpp, multi-variant CPU backends)"
+         (lambda () (mk-guix "guix-inference")))
 
    ;; Virtual Habitat sanctuary substrate profiles (Phase 0B declared; apply in Phase 1A)
    (task 'guix:sanctuary-apply "Build desktop-common + sanctuary + gaming + windows-compat + retropie Guix profiles"
@@ -697,6 +715,17 @@
 
    (task 'pip:health "Show DotCortex Python/pip env and versions"
          (lambda () (sh "~/.local/bin/pip-health")))
+
+   ;; --- HelmCortex shims (see helmcortex-shims.org) ---
+   ;; capture needs the mount; apply and diff work from the local cache without it.
+   (task 'hx:capture "Scan HelmCortex FORGE bins and write the shim manifest"
+         (lambda () (sh "~/.local/bin/hx-capture")))
+
+   (task 'hx:apply "Generate local HelmCortex shims from the manifest"
+         (lambda () (sh "~/.local/bin/hx-apply")))
+
+   (task 'hx:diff "Plan: manifest vs generated shims vs live HelmCortex"
+         (lambda () (sh "~/.local/bin/hx-diff")))
 
    ;; --- Nala / apt ---
    (task 'nala:repos "Ensure third-party apt repos are configured"
