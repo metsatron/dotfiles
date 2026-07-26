@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -14,15 +16,105 @@ THEME_SIZES = {
     # Chicago95 declares exactly these in its index.theme. Emitting a size it does
     # not declare produces a file GTK will never look at.
     "Chicago95": (16, 22, 24, 32, 48, 256),
+    # Windows-family packs: places/<size>/ grammar, same declared size ladder.
+    "Win98SE": (16, 22, 24, 32, 48, 64, 72, 96),
+    "SE98": (16, 22, 24, 32, 48, 64, 72, 96),
+    "LinXP": (16, 22, 24, 32, 48, 64, 72, 96),
+    "Win31": (16, 22, 24, 32, 48),
+    "Serenity95": (16, 22, 24, 32, 48),
 }
 
+# Themes are not all laid out the same way. Two grammars exist here:
+#   <theme>/<category>/<size>/NAME.png     (Chicago95, Win98SE, SE98, LinXP, ...)
+#   <theme>/<size>x<size>/<category>/NAME.png  (Irixium)
+# Passing the wrong one writes a file GTK will never look at, which looks like a
+# silent no-op rather than an error.
+SIZE_FIRST_THEMES = {"Irixium"}
 
+
+def theme_icon_dir(theme: str, size: int, category: str) -> Path:
+    if theme in SIZE_FIRST_THEMES:
+        return Path(f"linux/.local/share/icons/{theme}/{size}x{size}/{category}")
+    if theme == "indigo-reality" and size == 256 and category == "apps":
+        return Path(f"linux/.local/share/icons/{theme}/{category}/256FIXED")
+    return Path(f"linux/.local/share/icons/{theme}/{category}/{size}")
+
+
+# Backwards-compatible alias: existing callers pass apps-only.
 def theme_app_dir(theme: str, size: int) -> Path:
-    if theme == "Irixium":
-        return Path(f"linux/.local/share/icons/{theme}/{size}x{size}/apps")
-    if theme == "indigo-reality" and size == 256:
-        return Path(f"linux/.local/share/icons/{theme}/apps/256FIXED")
-    return Path(f"linux/.local/share/icons/{theme}/apps/{size}")
+    return theme_icon_dir(theme, size, "apps")
+
+
+def file_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def art_exists_elsewhere(theme_root: Path, digest: str, exclude: Path) -> list[Path]:
+    """Every other file in the theme carrying byte-identical art.
+
+    This is the whole basis of the uniqueness guard: overwriting a name whose art
+    is duplicated under other names destroys nothing, because the art survives.
+    Overwriting the ONLY copy destroys it. On 2026-07-26 that distinction was the
+    difference between a lossless edit to Win98SE/SE98 (art present under eight
+    other names) and genuine destruction in Chicago95 (art present nowhere else).
+    """
+    matches = []
+    exclude = exclude.resolve() if exclude.exists() else exclude
+    for candidate in theme_root.rglob("*"):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        try:
+            if candidate.resolve() == exclude:
+                continue
+            if file_digest(candidate) == digest:
+                matches.append(candidate)
+        except OSError:
+            continue
+    return matches
+
+
+def guard_destination(dest: Path, theme_root: Path, preserve_as: str | None,
+                      allow_destroy: bool) -> None:
+    """Refuse to destroy art that exists nowhere else in the theme.
+
+    Also refuses to write THROUGH a symlink. cp -f onto a symlink follows it and
+    overwrites the link's target — on 2026-07-26 that silently replaced
+    Chicago95's generic places/{22,24}/folder.png while the intended destination
+    was folder-documents.png. Symlinks are unlinked and replaced, never followed.
+    """
+    if dest.is_symlink():
+        target = os.readlink(dest)
+        print(f"  replacing symlink {dest.name} -> {target} (not writing through it)")
+        dest.unlink()
+        return
+    if not dest.exists():
+        return
+
+    digest = file_digest(dest)
+    duplicates = art_exists_elsewhere(theme_root, digest, dest)
+    if duplicates:
+        rels = ", ".join(sorted(p.name for p in duplicates)[:4])
+        print(f"  replacing {dest.name}; art survives as {rels}")
+        return
+
+    if preserve_as:
+        keep = dest.with_name(f"{preserve_as}{dest.suffix}")
+        if keep.exists() or keep.is_symlink():
+            raise SystemExit(f"--preserve-as target already exists: {keep}")
+        dest.rename(keep)
+        print(f"  preserved unique art: {dest.name} -> {keep.name}")
+        return
+
+    if allow_destroy:
+        print(f"  DESTROYING unique art at {dest} (--force-destroy)")
+        return
+
+    raise SystemExit(
+        f"refusing to destroy unique art: {dest}\n"
+        f"  This is the only copy of this image in {theme_root.name}.\n"
+        f"  Re-run with --preserve-as <name> to rename it first, "
+        f"or --force-destroy to overwrite it anyway."
+    )
 
 
 def parse_csv(value: str) -> list[str]:
@@ -157,13 +249,42 @@ def main() -> int:
              "stretching it. Game sprites are rarely square (Doom's STFST01 is 24x29) "
              "and the default resize to (size, size) silently distorts them.",
     )
+    parser.add_argument(
+        "--category",
+        default="apps",
+        help="icon-theme category directory: apps, places, mimetypes, ... (default apps)",
+    )
+    parser.add_argument(
+        "--from-theme-icon",
+        default="",
+        help="copy an existing icon in the SAME theme, per size, byte-for-byte, "
+             "instead of resampling a source image. Use for aliasing one icon "
+             "name onto another (e.g. folder-documents from user-home) where "
+             "resampling would degrade hand-made per-size pixel art. When given, "
+             "the positional source argument is ignored.",
+    )
+    parser.add_argument(
+        "--preserve-as",
+        default="",
+        help="if a destination holds art found nowhere else in the theme, rename "
+             "it to this name instead of destroying it",
+    )
+    parser.add_argument(
+        "--force-destroy",
+        action="store_true",
+        help="permit overwriting art that exists nowhere else in the theme. "
+             "Never use casually: the working-tree copy is gone.",
+    )
     parser.add_argument("--repo-root", default=".", help="DotCortex repository root")
     args = parser.parse_args()
 
     repo_root = Path(args.repo_root).expanduser().resolve()
-    source = Path(args.source).expanduser().resolve()
-    if not source.is_file():
-        raise SystemExit(f"missing source image: {source}")
+    if args.from_theme_icon:
+        source = None
+    else:
+        source = Path(args.source).expanduser().resolve()
+        if not source.is_file():
+            raise SystemExit(f"missing source image: {source}")
 
     names = parse_csv(args.names)
     themes = parse_csv(args.themes)
@@ -172,40 +293,70 @@ def main() -> int:
         raise SystemExit("--names must contain at least one icon name")
 
     resample = Image.Resampling.NEAREST if args.resample == "nearest" else Image.Resampling.LANCZOS
-    image = Image.open(source).convert("RGBA")
-    transparent_color = (255, 0, 255) if args.magic_pink else args.transparent_color
-    if transparent_color is not None:
-        if args.transparent_tolerance < 0:
-            raise SystemExit("--transparent-tolerance must be zero or greater")
-        image = remove_color_key(image, transparent_color, args.transparent_tolerance)
-    if args.trim_padding < 0:
-        raise SystemExit("--trim-padding must be zero or greater")
-    if args.trim_transparent:
-        image = trim_transparent(image, args.trim_padding)
-    if args.square:
-        image = pad_to_square(image)
+    image = None
+    if source is not None:
+        image = Image.open(source).convert("RGBA")
+        transparent_color = (255, 0, 255) if args.magic_pink else args.transparent_color
+        if transparent_color is not None:
+            if args.transparent_tolerance < 0:
+                raise SystemExit("--transparent-tolerance must be zero or greater")
+            image = remove_color_key(image, transparent_color, args.transparent_tolerance)
+        if args.trim_padding < 0:
+            raise SystemExit("--trim-padding must be zero or greater")
+        if args.trim_transparent:
+            image = trim_transparent(image, args.trim_padding)
+        if args.square:
+            image = pad_to_square(image)
 
     written = 0
+    skipped = 0
     for theme in themes:
+        theme_root = repo_root / f"linux/.local/share/icons/{theme}"
+        if not theme_root.is_dir():
+            raise SystemExit(f"no such theme directory: {theme_root}")
         sizes = explicit_sizes or THEME_SIZES.get(theme)
         if not sizes:
             raise SystemExit(f"unknown theme without explicit --sizes: {theme}")
         for size in sizes:
-            app_dir = repo_root / theme_app_dir(theme, size)
-            app_dir.mkdir(parents=True, exist_ok=True)
-            scaled = image.resize((size, size), resample)
-            primary = app_dir / f"{names[0]}.png"
-            if primary.exists() or primary.is_symlink():
-                replace_path(primary)
-            scaled.save(primary)
-            print(f"{primary.relative_to(repo_root)} {size}x{size}")
+            icon_dir = repo_root / theme_icon_dir(theme, size, args.category)
+            if args.from_theme_icon:
+                # Per-size exact copy. Only act where the donor exists at this
+                # size: silently synthesising a missing size would invent art the
+                # pack never had.
+                donor = icon_dir / f"{args.from_theme_icon}.png"
+                if not donor.exists():
+                    print(f"  skip {theme} {size}px: no donor {donor.name}")
+                    skipped += 1
+                    continue
+                payload = donor.resolve().read_bytes()
+            else:
+                icon_dir.mkdir(parents=True, exist_ok=True)
+                payload = None
+
+            if not icon_dir.is_dir():
+                print(f"  skip {theme} {size}px: no {args.category}/{size} directory")
+                skipped += 1
+                continue
+
+            primary = icon_dir / f"{names[0]}.png"
+            guard_destination(primary, theme_root, args.preserve_as or None, args.force_destroy)
+            if payload is not None:
+                primary.write_bytes(payload)
+                print(f"{primary.relative_to(repo_root)} {size}x{size} (from {args.from_theme_icon})")
+            else:
+                image.resize((size, size), resample).save(primary)
+                print(f"{primary.relative_to(repo_root)} {size}x{size}")
             written += 1
             for name in names[1:]:
-                alias = app_dir / f"{name}.png"
+                alias = icon_dir / f"{name}.png"
+                guard_destination(alias, theme_root, args.preserve_as or None, args.force_destroy)
                 write_icon_alias(alias, primary.name, args.copy_aliases)
                 mode = "copy" if args.copy_aliases else "symlink"
                 print(f"{alias.relative_to(repo_root)} -> {primary.name} ({mode})")
                 written += 1
+
+    if skipped:
+        print(f"icon-theme-inject: skipped {skipped} size(s) with no donor/directory")
 
     print(f"icon-theme-inject: wrote {written} icon files")
     return 0
