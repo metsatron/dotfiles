@@ -92,16 +92,25 @@ If a new theme has a different app-directory grammar, add it to `THEME_SIZES` an
 - Generate real size-specific PNGs; never put a huge source PNG directly into tiny icon directories.
 - Prefer exact square sources. If the source is not square, decide whether to crop, pad, or preserve aspect before generating.
 
+## Inheritance: a child theme's GENERIC name beats the parent's SPECIFIC one
+
+GTK's `choose_icon()` iterates **theme-first, not name-first**. Given `choose_icon(["folder-documents", "folder"])`, it tries *every* requested name in the child theme before falling through to the parent. So a child that defines only generic `folder` wins with `folder` — the parent's correct `folder-documents` is never reached.
+
+Any theme with `Inherits=` that ships a partial `places/` set is exposed. Win31 and Serenity95 both inherited Chicago95 and defined only `folder`, so every user-space folder — including My Documents — rendered plain while the parent had correct art the whole time. Fix by giving the child its own copy of each specific name; do not "fix" the parent.
+
+**Verify through the real call path.** `lookup_icon("folder-documents")` resolves correctly even when the desktop is visibly wrong, because a single-name lookup cannot express the fallback list. Reproduce with `choose_icon([...])` in the same order the consumer uses, or you will confirm a bug does not exist while looking straight at it.
+
 ## Cache Gotchas
 
 - `icons-home-sync` removes repo-side icon caches and rebuilds live caches when possible.
 - Some remixed themes can make `gtk-update-icon-cache` report an invalid cache while icon lookup still works. Verify actual files before assuming failure.
 - If a panel or launcher keeps an old icon, restart the launcher/panel or log out/in after the files are correct.
+- **`find` without `-L` reports a symlinked theme dir as empty.** `find <symlink-to-dir> -type f` returns nothing and `du -sh` shows 4.0K, which reads exactly like an empty directory. Six themes were reported as "empty dirs, nothing to migrate" on that basis when they were symlinks into a staging tree with 178 files behind them. Always `find -L` before concluding a theme has no content, and `ls -ld` before calling anything a directory.
 
 ## Useful Tools To Prefer
 
-- Pillow: deterministic scripted resize; already works well for DotCortex helpers.
-- ImageMagick: format conversion, inspection, sprite sheets, batch transforms.
+- Pillow: deterministic scripted resize; already works well for DotCortex helpers. **It cannot read every XPM** — its plugin handles only simple 1-char/pixel files, so the ice2k `Win2kmod-*` icons make it report *every* file in the tree as corrupt, touched or not. A checker that fails files you never modified is the checker failing; confirm with ImageMagick before believing damage.
+- ImageMagick: format conversion, inspection, sprite sheets, batch transforms. The reliable XPM validator here — `convert f.xpm -format '%wx%h' info:`.
 - oxipng: lossless PNG optimization after generation.
 - pngquant: lossy palette compression when small files matter.
 - Aseprite or LibreSprite: manual pixel-art editing and per-size cleanup.

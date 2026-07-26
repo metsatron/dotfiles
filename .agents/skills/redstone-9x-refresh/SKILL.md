@@ -56,6 +56,29 @@ Require a full sanctuary relaunch for:
 If the helper says the room is not running, do not launch it merely to test the
 refresh. Report that state or relaunch only when the user asked for a launch.
 
+## `redstone:refresh` does NOT reload icons — it does not restart pcmanfm
+
+The refresh reloads IceWM. `pcmanfm --desktop` **survives it with the same PID**, holding every icon it resolved at startup, so an icon-tree change is invisible no matter how many times you refresh. Do not kill it — nothing is guaranteed to respawn it and the desktop goes with it.
+
+The lever is XSETTINGS: GTK rebuilds its icon cache when the theme *name* changes. Flip it away and back, HUP each time, and restore the file byte-for-byte:
+
+```bash
+C=~/.local/share/dotcortex/guests/sanctuary-redstone-9x/home/.config/xsettingsd/xsettingsd.conf
+cp "$C" /tmp/xsettingsd.orig
+sed -i 's|^Net/IconThemeName ".*"|Net/IconThemeName "Chicago95"|' "$C"; pkill -HUP -x xsettingsd; sleep 3
+cp /tmp/xsettingsd.orig "$C"; pkill -HUP -x xsettingsd
+```
+
+Expect a visible flash of the intermediate theme. Verify with `diff` that the config is back to its original.
+
+**Order matters, and it is the cheap mistake.** Write the files first, THEN refresh. A refresh that ran before the change landed proves nothing, and the resulting "it didn't work" sends you hunting for a cache bug that isn't there — check `ps -eo pid,lstart` for the consumer against the file's `stat` mtime before theorising.
+
+## Taskbar widgets are invisible to `xwd -root`
+
+`xwd -root` does not capture the IceWM taskbar's child windows on `:93`. Crop the taskbar band and you get pure wallpaper, which reads exactly like "the widget isn't rendering" — it is, you just cannot see it. Even `xwd -id <TaskBar>` misses them, because the Start button, pager and tray are each their own X window.
+
+Use `xwininfo -root -tree` as the primary evidence (it lists `Workspaces`, `TaskBarMenu`, `SystemTray` with geometry and children), and `xwd -id <the specific child>` when you need pixels. Never conclude a taskbar widget is missing from a root capture.
+
 ## Safety
 
 - Never edit files under `linux/` directly; they are tangled output.

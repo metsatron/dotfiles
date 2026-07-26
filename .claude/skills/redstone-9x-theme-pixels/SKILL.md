@@ -41,6 +41,20 @@ Do NOT assume which source column/row of a pixmap lands on which screen pixel �
 
 The refresh reloads the WM visibly and the guest is often on the user's screen. Batch edits, deploy once, capture once. If the user is actively watching/using the room, say what a live experiment will do and get a go-ahead before repeatedly reloading it. A read-only `import -window root` capture does not disturb anything; a `refresh` (WM reload) does.
 
+## Law 7 — IceWM TILES taskbar pixmaps; the only safe shape is a few px wide at EXACTLY the bar's height
+
+`taskbarbg`, `taskbutton*` and `workspacebutton*` are **tiled, not stretched**. A fixed-width bevel pixmap therefore repeats `[ ][ ]` across any button wider than one tile — the defect that forced the CDE task-button bevel to be reverted in `8ef9ba7f0`, after headless renders missed it because the probe buttons were narrower than a single tile.
+
+`BeOS-r5` is the reference: **every** taskbar pixmap is `3 × 24` — three pixels wide, and exactly the taskbar's height. A 3px tile repeats seamlessly at any width while the fixed height keeps buttons flush with the bar. Read the height from the theme's own `taskbarbg.xpm` instead of hardcoding it. Only top/bottom bevel rows can exist — a horizontally tiled strip has no left or right edge.
+
+The alternative is registering wide pixmaps in `Gradients="…"`, which makes IceWM **stretch** them instead (how `nIceCDE.*` does its `90 × 37` workspace buttons). Both work; do not mix them in one theme, and check which a theme already uses before adding pixmaps.
+
+A theme that ships **no** `workspacebutton*` at all falls back to IceWM drawing the pager itself, which does not line up with the bar. The CDE variants inherit their taskbar from the Windows-95 donor, which ships none.
+
+## Law 8 — A generator fix does not reach already-built themes, and hand-patches drift
+
+Theme dirs are vendored payload. After fixing a generator, the built output is still wrong, so it must be patched too — and a reimplemented patch silently diverges from the pipeline. Backfill by **executing the generator's own function source** (extract the heredoc, `ast.parse`, keep the `FunctionDef` nodes you need, `exec`), or reconstruct the emitted string and `diff` it against a patched file to prove byte-equality. Never hand-write the same logic twice.
+
 ## Theme dirs are vendored payload
 
 `linux/.icewm/themes/<Theme>/` is edited **directly** (git-tracked), unlike everything else under `linux/` which is tangled. Provenance is documented in `sanctuary-redstone-9x-schemes.org`. Pixmap taxonomy: `title{A,I}{L,M,T,P,S,J,B,Q,R}` = titlebar background tiles; `frame{A,I}{TL,T,TR,L,R,BL,B,BR}` = border + corners; `close/minimize/maximize/restore{A,I}` = caption buttons (16×48 = two 24px frames). `A`=active, `I`=inactive, `d`-prefix=dialog.
