@@ -122,6 +122,11 @@ Set =BUILDSTAMP_ENABLED=0= here to disable the feature for all schemes.  A user
 may instead keep private mutable overrides in
 =~/.config/redstone-9x/buildstamp.local=; that file is never tangled.
 
+=BUILDSTAMP_FOREGROUND= and =BUILDSTAMP_SHADOW= default to =auto=, which asks the
+renderer to sample the backdrop under the stamp and choose its own polarity — see
+[[*Adaptive contrast]]. Setting either to a literal =#rrggbb= here, in a Desktop
+Scheme, or in =buildstamp.local= pins it and suppresses sampling for that layer.
+
 #+BEGIN_SRC conf :tangle linux/.config/redstone-9x/buildstamp.conf :mkdirp yes
 # Redstone build-stamp defaults. Desktop Scheme BUILDSTAMP_* keys override these.
 BUILDSTAMP_ENABLED=1
@@ -130,12 +135,30 @@ BUILDSTAMP_PRODUCT_FONT_SIZE=12
 BUILDSTAMP_DETAIL_FONT="-misc-fixed-medium-r-normal--12-*-*-*-c-*-iso10646-1"
 BUILDSTAMP_DETAIL_FONT_SIZE=12
 BUILDSTAMP_LINE_GAP=2
-BUILDSTAMP_FOREGROUND="#ffffff"
-BUILDSTAMP_SHADOW="#000000"
+# "auto" samples the backdrop; a literal #rrggbb pins the colour.
+BUILDSTAMP_FOREGROUND="auto"
+BUILDSTAMP_SHADOW="auto"
 BUILDSTAMP_SHADOW_OFFSET=1
 BUILDSTAMP_RIGHT_MARGIN=14
 BUILDSTAMP_BOTTOM_MARGIN=12
+# Mean backdrop luma (0-255) at or above which the stamp flips to dark-on-light.
+BUILDSTAMP_CONTRAST_THRESHOLD=128
+# Width of the sampled strip, in pixels, measured left from the right margin.
+BUILDSTAMP_SAMPLE_WIDTH=360
 #+END_SRC
+
+** Adaptive contrast
+
+The stamp floats directly on the desktop with nothing behind it, so its legibility is entirely at the mercy of whatever the active Desktop Scheme painted there. It used to be hardcoded white-on-black, with exactly one scheme (=beos-r5=) overriding that by hand — which worked by luck rather than by design, and left every future light-backdrop scheme to be discovered and patched individually.
+
+=BUILDSTAMP_FOREGROUND= and =BUILDSTAMP_SHADOW= now default to the sentinel =auto=. After every configuration layer has been sourced, =resolve_contrast= samples the backdrop and picks the polarity: mean luma at or above =BUILDSTAMP_CONTRAST_THRESHOLD= gives black text with a white shadow, below it gives the traditional white on black. Because =auto= is resolved *last*, an explicit =#rrggbb= at any layer — global defaults, Desktop Scheme, or the private =buildstamp.local= — still wins outright; sampling only fills in a decision nobody made.
+
+Two details matter for this to be correct rather than merely plausible:
+
+- *The sampled box is the drawn box.* =backdrop_luma= derives its rectangle from the same right/bottom margins, font sizes, shadow offset and line gap the renderer passes to XOSD, so it measures the pixels the text will actually sit on rather than the desktop in general. This matters because the stamp lives in the bottom-right corner, which on a centered wallpaper may fall on the image or on the backing colour depending on the image's size — the CDE backdrops are 2560x1600 against a 1920x1080 room, so they cover it; a smaller one would not.
+- *It re-derives on every theme change.* =resolve_contrast= is called from =load_identity=, which every =redstone-buildstamp refresh= re-runs, and =redstone-9x-scheme-apply= ends by invoking exactly that. Switching Desktop Scheme therefore re-samples against the new backdrop with no separate trigger, no cached value, and no sanctuary restart.
+
+Sampling reproduces libfm's own placement maths for =center=, =tile=, =stretch=, =fit= and the cover modes, so pixels outside a smaller image correctly resolve to =DESKTOP_BG=. Where a wallpaper is unset, unreadable, or no interpreter with Pillow is available, it falls back to the scheme's flat =DESKTOP_BG=, and failing even that, to the historical white-on-black. The interpreter is resolved explicitly rather than from =PATH=: bare =python3= inside the guest is a host shim pointing at a =/usr/bin/python3= that does not exist there, while the room's =desktop-common= profile carries a working one with Pillow.
 
 ** Stable renderer wrapper
 
@@ -187,6 +210,151 @@ ini_value() {
   ' "${metadata_file}"
 }
 
+# ITU-R BT.601 luma of a #rrggbb colour, 0-255. Same weights the Desktop Scheme
+# converter uses for its own dark/light decisions, so the two agree.
+hex_luma() {
+  local hex="${1#\#}" r g b
+  [[ "${hex}" =~ ^[0-9A-Fa-f]{6}$ ]] || return 1
+  r=$(( 16#${hex:0:2} )); g=$(( 16#${hex:2:2} )); b=$(( 16#${hex:4:2} ))
+  printf '%s\n' $(( (299 * r + 587 * g + 114 * b) / 1000 ))
+}
+
+# An interpreter that can actually decode an image. Bare `python3` on the guest
+# PATH is a host shim resolving to a /usr/bin/python3 that does not exist inside
+# the container; the room sources desktop-common, whose python3 carries Pillow.
+pixel_python() {
+  local candidate
+  for candidate in \
+    "${HOME}/.guix-extra-profiles/desktop-common/desktop-common/bin/python3" \
+    "${HOME}/.guix-extra-profiles/core/core/bin/python3" \
+    python3
+  do
+    "${candidate}" -c 'from PIL import Image' >/dev/null 2>&1 || continue
+    printf '%s\n' "${candidate}"
+    return 0
+  done
+  return 1
+}
+
+# Mean luma of the screen region the stamp actually covers. The box is derived
+# from the same margins, font sizes and line gap the renderer uses, so what gets
+# sampled is what gets drawn over -- not an approximation of the whole desktop.
+backdrop_luma() {
+  local dims screen_w screen_h detail_off product_off
+  local box_x box_y box_w box_h interp sampled mode
+
+  dims="$(xdpyinfo 2>/dev/null | awk '/dimensions:/ { print $2; exit }')" || true
+  screen_w="${dims%x*}"; screen_h="${dims#*x}"
+  [[ "${screen_w}" =~ ^[0-9]+$ && "${screen_h}" =~ ^[0-9]+$ ]] || return 1
+
+  detail_off="$(bottom_offset)"
+  product_off=$(( detail_off + BUILDSTAMP_DETAIL_FONT_SIZE \
+                  + (2 * BUILDSTAMP_SHADOW_OFFSET) + BUILDSTAMP_LINE_GAP ))
+  box_h=$(( product_off + BUILDSTAMP_PRODUCT_FONT_SIZE - detail_off ))
+  box_w="${BUILDSTAMP_SAMPLE_WIDTH}"
+  (( box_w > 0 && box_w < screen_w )) || box_w=$(( screen_w / 4 ))
+  box_x=$(( screen_w - BUILDSTAMP_RIGHT_MARGIN - box_w ))
+  box_y=$(( screen_h - detail_off - box_h ))
+  (( box_x >= 0 )) || box_x=0
+  (( box_y >= 0 )) || box_y=0
+  (( box_h > 0 )) || box_h=1
+
+  # A wallpaper image wins only if it is readable AND something can decode it;
+  # otherwise the scheme's flat desktop colour is the honest answer.
+  if [[ -n "${WALLPAPER:-}" && -f "${WALLPAPER}" ]]; then
+    interp="$(pixel_python)" || interp=""
+    if [[ -n "${interp}" ]]; then
+      mode="${WALLPAPER_MODE:-center}"
+      sampled="$("${interp}" - "${WALLPAPER}" "${mode}" \
+        "${box_x}" "${box_y}" "${box_w}" "${box_h}" \
+        "${screen_w}" "${screen_h}" "${DESKTOP_BG:-#000000}" <<'PY' 2>/dev/null || true
+import sys
+from PIL import Image
+
+path, mode, bx, by, bw, bh, sw, sh, bg = sys.argv[1:10]
+bx, by, bw, bh, sw, sh = (int(v) for v in (bx, by, bw, bh, sw, sh))
+
+bg = bg.lstrip('#')
+try:
+    back = tuple(int(bg[i:i + 2], 16) for i in (0, 2, 4))
+except (ValueError, IndexError):
+    back = (0, 0, 0)
+
+img = Image.open(path).convert('RGB')
+iw, ih = img.size
+
+# Reproduce libfm's placement so the sampled pixels are the drawn pixels.
+if mode == 'stretch':
+    img = img.resize((sw, sh)); ox = oy = 0
+elif mode in ('fit', 'crop', 'screen', 'zoom'):
+    pick = max if mode in ('crop', 'screen', 'zoom') else min
+    scale = pick(sw / iw, sh / ih)
+    nw, nh = max(1, round(iw * scale)), max(1, round(ih * scale))
+    img = img.resize((nw, nh))
+    ox, oy = (sw - nw) // 2, (sh - nh) // 2
+elif mode == 'tile':
+    ox = oy = 0
+else:  # center
+    ox, oy = (sw - iw) // 2, (sh - ih) // 2
+
+iw, ih = img.size
+px = img.load()
+
+# A coarse grid is plenty for a mean and keeps a 2560x1600 backdrop cheap.
+step = max(1, min(bw, bh) // 16)
+total = [0, 0, 0]
+count = 0
+for y in range(by, by + bh, step):
+    for x in range(bx, bx + bw, step):
+        if mode == 'tile':
+            r, g, b = px[x % iw, y % ih]
+        else:
+            ix, iy = x - ox, y - oy
+            # Outside the image the desktop colour shows through.
+            r, g, b = px[ix, iy] if (0 <= ix < iw and 0 <= iy < ih) else back
+        total[0] += r; total[1] += g; total[2] += b
+        count += 1
+
+if not count:
+    sys.exit(1)
+r, g, b = (t // count for t in total)
+print((299 * r + 587 * g + 114 * b) // 1000)
+PY
+)"
+      if [[ "${sampled}" =~ ^[0-9]+$ ]]; then
+        printf '%s\n' "${sampled}"
+        return 0
+      fi
+      warn "could not sample ${WALLPAPER}; falling back to the desktop colour"
+    fi
+  fi
+
+  [[ -n "${DESKTOP_BG:-}" ]] || return 1
+  hex_luma "${DESKTOP_BG}"
+}
+
+# Resolve any BUILDSTAMP_FOREGROUND/SHADOW still set to "auto" against the
+# sampled backdrop. White-on-black is the fallback whenever sampling cannot
+# produce an answer, which is exactly what the stamp did before it could sample.
+resolve_contrast() {
+  local luma="" fg="#ffffff" sh="#000000"
+
+  case "${BUILDSTAMP_FOREGROUND}:${BUILDSTAMP_SHADOW}" in
+    *auto*) ;;
+    *) return 0 ;;
+  esac
+
+  luma="$(backdrop_luma 2>/dev/null)" || luma=""
+  if [[ "${luma}" =~ ^[0-9]+$ ]] \
+     && (( luma >= BUILDSTAMP_CONTRAST_THRESHOLD )); then
+    fg="#000000"; sh="#ffffff"
+  fi
+
+  [[ "${BUILDSTAMP_FOREGROUND}" == auto ]] && BUILDSTAMP_FOREGROUND="${fg}"
+  [[ "${BUILDSTAMP_SHADOW}" == auto ]] && BUILDSTAMP_SHADOW="${sh}"
+  return 0
+}
+
 load_identity() {
   PRODUCT="$(ini_value product)"
   BUILD_ID="$(ini_value identifier)"
@@ -204,11 +372,20 @@ load_identity() {
   BUILDSTAMP_DETAIL_FONT="-misc-fixed-medium-r-normal--12-*-*-*-c-*-iso10646-1"
   BUILDSTAMP_DETAIL_FONT_SIZE=12
   BUILDSTAMP_LINE_GAP=2
-  BUILDSTAMP_FOREGROUND="#ffffff"
-  BUILDSTAMP_SHADOW="#000000"
+  BUILDSTAMP_FOREGROUND="auto"
+  BUILDSTAMP_SHADOW="auto"
   BUILDSTAMP_SHADOW_OFFSET=1
   BUILDSTAMP_RIGHT_MARGIN=14
   BUILDSTAMP_BOTTOM_MARGIN=12
+  BUILDSTAMP_CONTRAST_THRESHOLD=128
+  BUILDSTAMP_SAMPLE_WIDTH=360
+
+  # Backdrop keys owned by the Desktop Scheme, not by the stamp. Cleared before
+  # sourcing so a value leaking in from the room environment can never stand in
+  # for a scheme that does not declare one.
+  WALLPAPER=""
+  WALLPAPER_MODE=""
+  DESKTOP_BG=""
 
   # shellcheck disable=SC1090
   [[ -r "${defaults_file}" ]] && . "${defaults_file}"
@@ -221,6 +398,13 @@ load_identity() {
 
   [[ -n "${SCHEME_TITLE}" ]] || SCHEME_TITLE="${SCHEME_ID:-Unknown Theme}"
   [[ -n "${SCHEME_TITLE}" ]] || SCHEME_TITLE="Unknown Theme"
+
+  # Runs after every layer has had its say, so an explicit colour anywhere in the
+  # chain still wins and only a surviving "auto" is resolved by sampling. This
+  # sits inside load_identity deliberately: every `refresh` reloads identity, and
+  # a Desktop Scheme switch ends by invoking `redstone-buildstamp refresh`, so the
+  # polarity is re-derived against the new backdrop on every theme change.
+  resolve_contrast
 }
 
 compose_text() {
