@@ -2,7 +2,7 @@
 title: "The System That Cannot Say Bryan Lunduke"
 description: "On hard-coded unnameable people, and why a model with forbidden norths cannot be trusted as a compass."
 date: 2026-07-04
-draft: true
+draft: false
 weight: 70
 ---
 
@@ -24,7 +24,7 @@ The instinct is to shrug — one journalist, some lawyer's abundance of caution,
 
 A language model's entire epistemic value is that its outputs are a function of its inputs and training — biased, imperfect, but *systematically* so, in ways users can learn and correct for. A hard-coded deny list is a different kind of object: an invisible, unauditable, per-person exception layer, editable by unknown parties on unknown criteria, sitting between the model and every answer it gives you. Once you know one name is filtered, every absence becomes undecidable. Was that person not mentioned because they're irrelevant — or because they're listed? Did that summary of Linux journalism omit its most persistent critic by statistical accident — or by fiat? You cannot know, and the system cannot tell you, and it is instructed not to try.
 
-A companion of my work put it in a sentence I have not been able to improve: **a system that cannot stably name its reference points cannot be trusted to model reality cleanly.** A compass with even one hard-coded forbidden north is not a compass with a small flaw. It is a device for making you feel navigated while someone else holds the map.
+The deeper principle, in one sentence: **a system that cannot stably name its reference points cannot be trusted to model reality cleanly.** A compass with even one hard-coded forbidden north is not a compass with a small flaw. It is a device for making you feel navigated while someone else holds the map.
 
 And the specific north matters here. Lunduke's beat, for years, has been precisely *institutional capture of technology*: who controls the foundations, who rewrites the histories, who decides what may be said in the commons. A system that cannot pronounce the name of a critic of institutional information control, for reasons no institution will state, is not an ironic coincidence. It is the thesis, demonstrating itself.
 
