@@ -2,7 +2,7 @@
 title: "The Tauroctony"
 description: "A ten-stage cycle of technological liberation, run twice — Unix in 1984, AI in 2026. The pattern predicts."
 date: 2026-07-04
-draft: true
+draft: false
 weight: 90
 ---
 
