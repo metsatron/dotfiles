@@ -30,7 +30,7 @@ An intermediary's entire product is faithful mediation. Perplexity's value propo
 
 Once you have the pattern you see it everywhere in the intermediated stack: streaming quality quietly stepped down, "up to" speeds, shrinkflation's smaller bar in the same wrapper, models silently quantized during peak load with the version string intact. Substitution behind a stable label. The label is load-bearing for the entire economy of intermediation, which is why the fraud concentrates there — and why the accompanying chorus matters so much to the fraudster. A substitution that people can be shamed out of reporting is a substitution with no cost.
 
-A friend of my work put the deeper principle in one sentence when we examined a related deception: *a system that cannot stably name its reference points cannot be trusted to model reality cleanly.* A platform where "Claude Sonnet" sometimes means Claude Sonnet is such a system. Every answer it delivers inherits the uncertainty.
+The deeper principle, in one sentence: *a system that cannot stably name its reference points cannot be trusted to model reality cleanly.* A platform where "Claude Sonnet" sometimes means Claude Sonnet is such a system. Every answer it delivers inherits the uncertainty.
 
 ## The exit, which is the point
 
