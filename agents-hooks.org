@@ -1290,6 +1290,193 @@ if [ -z "$cmd" ]; then
   exit 0
 fi
 
+# ── Icon tree single-writer gate ──────────────────────────────────────────────
+# Icon theme payloads are hand-made pixel art, much of it irreplaceable and some
+# of it in git submodules where a careless write is easy to miss. On 2026-07-26 a
+# `cp -f` onto places/{22,24}/folder-documents.png followed those symlinks and
+# destroyed the theme's generic folder.png, and a separate overwrite destroyed
+# Chicago95 art that existed nowhere else in the tree. Neither was intended and
+# neither was noticed until afterwards.
+#
+# So: no direct shell mutation of icon trees. icon-theme-inject is the only
+# writer, because it is the only thing that refuses to write through a symlink
+# and refuses to destroy art with no duplicate elsewhere in the theme. Reads are
+# untouched — this gate only fires on commands that mutate.
+python3 - "$cmd" <<'ICONEOF'
+import re
+import shlex
+import sys
+
+cmd = sys.argv[1]
+
+ICON_PATH = re.compile(r"(?:share/icons|/\.icons|/\.local/share/icons)/", re.I)
+if not ICON_PATH.search(cmd):
+    sys.exit(0)
+
+# Sanctioned writers: icon-theme-inject enforces the safety preconditions itself,
+# icons-home-sync only mirrors repo -> live roots, the cache tool writes only
+# .cache files, and git checkout/restore RESTORES art rather than destroying it.
+SANCTIONED = {
+    "icon-theme-inject", "icons-home-sync", "gtk-update-icon-cache",
+    "icons-capture", "icon-theme-audit",
+}
+GIT_SAFE = {"checkout", "restore", "stash", "status", "diff", "show", "log",
+            "add", "commit", "rev-parse", "ls-files", "submodule"}
+
+MUTATING = {"cp", "mv", "rm", "rmdir", "install", "ln", "truncate", "shred",
+            "dd", "tee", "mogrify", "oxipng", "pngquant", "chmod", "chown"}
+# Deliberately excludes bash/sh/zsh: their payload is another script this hook
+# cannot see, and including them made every test harness look like a write.
+INTERPRETERS = {"python", "python3", "perl", "ruby", "node"}
+
+# Write calls, checked against the RAW text so heredoc bodies count. Only
+# consulted when the verb is an interpreter AND an icon path is present.
+WRITE_CALL = re.compile(
+    r"\b(?:open\s*\([^)]*['\"][wa]|\.save\s*\(|write_bytes|write_text"
+    r"|shutil\.(?:copy|copy2|copyfile|move)|os\.(?:remove|unlink|rename|rmdir)"
+    r"|\.unlink\s*\(|makedirs)"
+)
+
+
+def simple_commands(text):
+    """Split into simple commands, honouring quotes, keeping redirect operators.
+
+    shlex with punctuation_chars emits ; & | < > as their own tokens and leaves
+    quoted spans intact as single tokens, so a `>` inside "a -> b" never appears
+    as an operator. That is the whole reason this is tokenised rather than
+    regexed: two false positives on 2026-07-26 came from matching shell syntax
+    inside quoted strings.
+    """
+    lexer = shlex.shlex(text, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None  # unbalanced quotes / heredoc: caller falls back
+
+    groups, current = [], []
+    for tok in tokens:
+        if tok in (";", "&&", "||", "|", "&", "\n"):
+            groups.append(current)
+            current = []
+        else:
+            current.append(tok)
+    groups.append(current)
+    return groups
+
+
+# Shell keywords that precede the real verb. Splitting on `;` leaves a loop body
+# starting at `do`, so without this a `for ...; do cp ...; done` writes straight
+# through the gate — found by the corpus on 2026-07-26.
+SHELL_KEYWORDS = {"do", "then", "else", "elif", "fi", "done", "while", "for",
+                  "if", "until", "case", "esac", "in", "{", "}", "(", ")", "!",
+                  "select", "function"}
+
+
+def verb_of(words):
+    """First real word, skipping env assignments, prefixes and shell keywords."""
+    for i, w in enumerate(words):
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*=.*", w):
+            continue
+        if w in ("sudo", "command", "exec", "nohup", "time", "env"):
+            continue
+        if w in SHELL_KEYWORDS:
+            continue
+        return w.rsplit("/", 1)[-1], words[i + 1:]
+    return None, []
+
+
+groups = simple_commands(cmd)
+if groups is None:
+    # Could not tokenise. Fail SAFE for writes: only block if an obviously
+    # mutating verb sits next to an icon path in the raw text.
+    if re.search(r"(?:^|[;&|]\s*|\s)(?:cp|mv|rm|install|ln|tee|dd)\s", cmd):
+        groups = None
+    else:
+        sys.exit(0)
+
+reason = None
+detail = ""
+if groups is not None:
+    for words in groups:
+        if not words:
+            continue
+        verb, rest = verb_of(words)
+        if verb is None:
+            continue
+
+        if verb in SANCTIONED:
+            continue
+        if verb == "git":
+            sub = next((w for w in rest if not w.startswith("-") and w != "-C"), "")
+            # `git -C <dir> <sub>`: skip the -C value too
+            if rest[:1] == ["-C"] and len(rest) > 2:
+                sub = next((w for w in rest[2:] if not w.startswith("-")), "")
+            if sub in GIT_SAFE:
+                continue
+
+        # Redirections: block only when the TARGET is an icon path.
+        for i, w in enumerate(words):
+            if w in (">", ">>") and i + 1 < len(words) and ICON_PATH.search(words[i + 1]):
+                reason = "output redirection into an icon tree"
+                detail = words[i + 1]
+                break
+        if reason:
+            break
+
+        if verb in MUTATING and any(ICON_PATH.search(w) for w in rest):
+            reason = f"{verb} targeting an icon tree"
+            detail = next(w for w in rest if ICON_PATH.search(w))
+            break
+
+        if verb == "sed" and any(w == "-i" or w.startswith("-i") for w in rest) \
+           and any(ICON_PATH.search(w) for w in rest):
+            reason = "sed -i on an icon tree"
+            detail = next(w for w in rest if ICON_PATH.search(w))
+            break
+
+        # Interpreter payloads are best-effort only: require a write call and an
+        # icon path on the SAME line. "write call somewhere, icon path somewhere"
+        # flagged a heredoc writing /tmp while merely mentioning icon paths
+        # (2026-07-26). The shell-verb rules above are the real defence; a
+        # multi-line interpreter write can still slip past this one.
+        if verb in INTERPRETERS:
+            hit = next((ln for ln in cmd.splitlines()
+                        if WRITE_CALL.search(ln) and ICON_PATH.search(ln)), None)
+            if hit:
+                reason = "interpreter writing into an icon tree"
+                detail = hit.strip()[:80]
+                break
+else:
+    reason = "file mutation command near an icon path (command could not be tokenised)"
+
+if reason is None:
+    sys.exit(0)
+
+print("BLOCKED: direct write to an icon theme tree.", file=sys.stderr)
+print(f"Detected: {reason}" + (f" -> {detail}" if detail else ""), file=sys.stderr)
+print("", file=sys.stderr)
+print("Icon payloads are hand-made pixel art and live in git submodules.", file=sys.stderr)
+print("Shell copies follow symlinks and overwrite the link's TARGET, and they", file=sys.stderr)
+print("destroy art that may exist nowhere else. Both happened on 2026-07-26.", file=sys.stderr)
+print("", file=sys.stderr)
+print("Use icon-theme-inject. It refuses to write through a symlink and refuses", file=sys.stderr)
+print("to overwrite art with no duplicate elsewhere in the theme:", file=sys.stderr)
+print("", file=sys.stderr)
+print("  icon-theme-inject SRC.png --repo-root ~/DotCortex --themes T \\", file=sys.stderr)
+print("      --category places --names NAME [--preserve-as OLDNAME]", file=sys.stderr)
+print("  icon-theme-inject x --repo-root ~/DotCortex --themes T \\", file=sys.stderr)
+print("      --category apps --from-theme-icon DONOR --names NAME", file=sys.stderr)
+print("", file=sys.stderr)
+print("To RESTORE art, git checkout/restore is allowed and is the right tool.", file=sys.stderr)
+sys.exit(2)
+ICONEOF
+case "$?" in
+  0) ;;
+  2) exit 2 ;;
+  *) exit 0 ;;
+esac
+
 python3 - "$cmd" <<'PYEOF'
 import re
 import shlex
@@ -1442,6 +1629,105 @@ if printf '%s' "$cmd" | grep -qP '(^|&&|;)\s*ssh\s+\S+.*git pull' 2>/dev/null &&
 fi
 
 exit 0
+#+END_SRC
+
+* Icon gate regression corpus
+
+The icon-tree single-writer gate lives in =claude-hook-pre-tool-use-bash=. It sits in the Bash path for every command, so a false positive blocks ordinary work and a false negative lets art be destroyed. Both happened while it was being written on 2026-07-26 — an =echo= containing =->= and a heredoc writing =/tmp= while merely mentioning icon paths were each blocked, and a =for ...; do cp ...; done= loop wrote straight through. Run this after any change to the gate.
+
+#+BEGIN_SRC sh
+claude-hook-icon-gate-test
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.local/bin/claude-hook-icon-gate-test :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Regression corpus for the icon-tree single-writer gate."""
+import json
+import subprocess
+import sys
+
+H = "/home/metsatron/.local/bin/claude-hook-pre-tool-use-bash"
+I = "~/DotCortex/linux/.local/share/icons"
+L = "~/.local/share/icons"
+
+ALLOW = [
+    ("echo containing arrow",      'echo "-> Chicago95 fallback"'),
+    ("find with 2>/dev/null",      f'find {I}/Win31 -name "x.png" 2>/dev/null | wc -l'),
+    ("redirect to /tmp",           f'ls {I}/Win31 > /tmp/out.txt'),
+    ("redirect to /dev/null",      f'ls {I}/Win31 >/dev/null 2>&1'),
+    ("md5sum read",                f'md5sum {I}/SE98/places/32/folder.png'),
+    ("git checkout restore",       f'git -C {I}/Chicago95 checkout -- places/22/folder.png'),
+    ("git status",                 f'git -C {I}/Chicago95 status --short -- places'),
+    ("git add",                    f'git -C {I}/Chicago95 add places'),
+    ("git commit",                 f'git -C {I}/Chicago95 commit -m "feat(places): x"'),
+    ("icon-theme-inject",          'icon-theme-inject x --repo-root ~/DotCortex --themes Win31 '
+                                   '--category apps --from-theme-icon progm001 --names gnome-applications'),
+    ("icons-home-sync",            'icons-home-sync --repo-root /home/metsatron/DotCortex'),
+    ("gtk-update-icon-cache",      f'gtk-update-icon-cache {L}/Win31'),
+    ("ls -l on icon file",         f'ls -l {I}/Chicago95/places/22/folder-documents.png'),
+    ("readlink",                   f'readlink {I}/Chicago95/places/22/folder-documents.png'),
+    ("find -exec md5sum",          f'find -L {I}/Win31 -name "*.png" -exec md5sum {{}} \\;'),
+    ("python read-only PIL",       f'python3 -c "from PIL import Image; Image.open(\'{I}/Win31/apps/32/progm001.png\')"'),
+    ("python writes to /tmp only", f'python3 - <<PY\nfrom PIL import Image\nim=Image.open("{I}/Win31/apps/32/progm001.png")\nim.save("/tmp/sheet.png")\nPY'),
+    ("cp entirely outside icons",  'cp -f /tmp/a.png /tmp/b.png'),
+    ("stat",                       f'stat -c "%y %n" {I}/Win31/index.theme'),
+    ("grep index.theme",           f'grep -i Inherits {I}/Win31/index.theme'),
+    ("awk printing an arrow",      f'ls {I}/Win31 | awk "{{print \\$1 \\" -> ok\\"}}"'),
+    ("cd then find",               f'cd {I}/Win31 && find . -name "*.png" | head'),
+    ("wc -l",                      f'find {I}/Win31 -type f | wc -l'),
+    ("basename loop, read-only",   f'for f in {I}/Win31/apps/32/*.png; do basename "$f"; done'),
+    ("diff two icons",             f'diff {I}/Win31/apps/32/progm001.png {I}/Win31/apps/32/progm002.png'),
+    ("cmp two icons",              f'cmp -s {I}/SE98/places/32/folder.png {I}/Win98SE/places/32/folder.png'),
+]
+
+BLOCK = [
+    ("cp into icons",            f'cp -f a.png {I}/Chicago95/places/32/x.png'),
+    ("cp with quoted dest",      f'cp -f a.png "{I}/Chicago95/places/32/x.png"'),
+    ("redirect into icons",      f'cat a.png > {I}/Win31/apps/32/x.png'),
+    ("append into icons",        f'cat a.png >> {I}/Win31/apps/32/x.png'),
+    ("rm in icons",              f'rm {I}/Win31/apps/32/x.png'),
+    ("rm -rf a size dir",        f'rm -rf {I}/Win31/apps/32'),
+    ("mv into icons",            f'mv a {I}/Win31/apps/32/x.png'),
+    ("sed -i on index.theme",    f'sed -i s/a/b/ {I}/Win31/index.theme'),
+    ("ln -sf in icons",          f'ln -sf a.png {I}/Win31/apps/32/x.png'),
+    ("tee into icons",           f'cat a | tee {I}/Win31/apps/32/x.png'),
+    ("python open(w)",           f'python3 -c "open(\'{I}/Win31/apps/32/x.png\',\'wb\').write(b\'\')"'),
+    ("python .save() into icons", f'python3 -c "im.save(\'{I}/Win31/apps/32/x.png\')"'),
+    ("shutil.copy in heredoc",   f'python3 - <<PY\nimport shutil\nshutil.copy("a", "{I}/Win31/apps/32/x.png")\nPY'),
+    ("cp after &&",              f'echo hi && cp a.png {I}/Win31/apps/32/x.png'),
+    ("cp after ;",               f'echo hi ; cp a.png {I}/Win31/apps/32/x.png'),
+    ("for-do-cp loop",           f'for s in 16 32; do cp a.png {I}/Win31/apps/$s/x.png; done'),
+    ("while-do-rm loop",         f'while read f; do rm {I}/Win31/apps/32/$f; done'),
+    ("if-then-cp",               f'if true; then cp a {I}/Win31/apps/32/x.png; fi'),
+    ("sudo cp",                  f'sudo cp a.png {I}/Win31/apps/32/x.png'),
+    ("chmod on icons",           f'chmod 644 {I}/Win31/apps/32/x.png'),
+    ("live root ~/.local rm",    f'rm {L}/Chicago95/places/32/folder.png'),
+]
+
+
+def run(cmd):
+    p = subprocess.run(["bash", H], input=json.dumps({"tool_input": {"command": cmd}}),
+                       capture_output=True, text=True)
+    return p.returncode
+
+
+def main():
+    fails = 0
+    for label, cmd in ALLOW:
+        r = run(cmd)
+        if r != 0:
+            print(f"FAIL(should allow)  {label}: exit={r}")
+            fails += 1
+    for label, cmd in BLOCK:
+        r = run(cmd)
+        if r != 2:
+            print(f"FAIL(should block)  {label}: exit={r}")
+            fails += 1
+    print(f"{len(ALLOW)} allow-cases, {len(BLOCK)} block-cases, {fails} failure(s)")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 #+END_SRC
 
 * Pre-compact
