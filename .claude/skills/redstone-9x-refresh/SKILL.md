@@ -79,6 +79,24 @@ Expect a visible flash of the intermediate theme. Verify with `diff` that the co
 
 Use `xwininfo -root -tree` as the primary evidence (it lists `Workspaces`, `TaskBarMenu`, `SystemTray` with geometry and children), and `xwd -id <the specific child>` when you need pixels. Never conclude a taskbar widget is missing from a root capture.
 
+## The guest has no `/usr/bin/env` — shebangs must be `#!/bin/bash`
+
+Any new `redstone-9x-*` wrapper must use `#!/bin/bash`. The sanctuary guest is a Guix-populated container: `/bin/bash` is a store symlink, but `/usr/bin/env` was never created and does not exist. A `#!/usr/bin/env bash` script runs perfectly on the host and fails at `exec` time in the room with `ENOENT`.
+
+The trap is the error text. IceWM reports it as:
+
+```
+IceWM: Warning: Failed to execute /home/metsatron/.local/bin/redstone-9x-<tool>: No such file or directory
+```
+
+which names *the launcher*, not the interpreter — so it reads as a broken symlink or an unstowed file, and sends you auditing `ls -l` on a symlink that is perfectly correct. Check the shebang first: `head -1` the tangled script and compare it against a sibling that works. Every existing wrapper already uses `#!/bin/bash`.
+
+Confirm interpreter presence in-guest rather than on the host, since the host has both:
+
+```bash
+sanctuary-exec sanctuary-redstone-9x sh -c 'ls -l /usr/bin/env /bin/bash'
+```
+
 ## Safety
 
 - Never edit files under `linux/` directly; they are tangled output.
