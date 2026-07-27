@@ -37,12 +37,16 @@ agy            tar_gz   https://storage.googleapis.com/antigravity-public/antigr
 # expected asset: https://github.com/subhangR/agent-maestro/releases/download/v0.1.0/maestro-desktop-linux-x64.AppImage
 ttyd           curl_bin   https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64   ""   ""   none   ""   ""
 # herdr: agent-aware terminal multiplexer (Rust). Prebuilt binary — building from git needs Zig (vendored libghostty-vt).
-# Tracks the latest GitHub release via /releases/latest/download; {arch} -> uname -m picks herdr-linux-{x86_64,aarch64}.
-herdr          curl_bin   https://github.com/ogulcancelik/herdr/releases/latest/download/herdr-linux-{arch}   ""   ""   none   ""   ""
+# VERSION-PINNED to the newest release whose daemon protocol the herdr-web bridge below supports — never
+# /releases/latest: herdr 0.7.5 bumped daemon protocol 16->17 while the newest bridge release (v0.3.3) still
+# caps at 16, which silently decapitates phone/web access. Both pins move together, gated by the
+# herdr-stack-update handshake test (see the herdr stack update gate section). v0.7.4 = protocol 16,
+# handshake-verified against bridge v0.3.3 on 2026-07-28. {arch} -> uname -m picks herdr-linux-{x86_64,aarch64}.
+herdr          curl_bin   https://github.com/ogulcancelik/herdr/releases/download/v0.7.4/herdr-linux-{arch}   ""   ""   none   ""   ""
 # herdr-web: browser UI + bridge for herdr sessions (third-party companion, github.com/kcosr/herdr-web). Needs herdr >= 0.7.2 (daemon protocol 16).
 # The bridge has NO authentication — never serve it with --host 0.0.0.0; use the herdr-web-tailnet wrapper below, which binds the Tailscale IP only.
-# Version-pinned like flyline: bump the URL and sha256 together on upgrade.
-herdr-web      tar_gz     https://github.com/kcosr/herdr-web/releases/download/v0.3.2/herdr-web-v0.3.2-linux-x86_64.tar.gz  ~/.local/herdr-web.app  bin  all  sha256=7ce9572818747f18737a8e9f27a147e321cf256a6fa318a2e377938443c2305e strip=1  ""
+# Version-pinned like flyline: bump the URL and sha256 together on upgrade — and only in lockstep with the herdr pin above, via herdr-stack-update.
+herdr-web      tar_gz     https://github.com/kcosr/herdr-web/releases/download/v0.3.3/herdr-web-v0.3.3-linux-x86_64.tar.gz  ~/.local/herdr-web.app  bin  all  sha256=1b4c4dbe877de0ff905e54b7a4deb3886061d84f1131eb98d6bafd3a60b72bae strip=1  ""
 # flyline: Bash readline replacement, loaded via `enable -f libflyline.so.VERSION flyline` (see shell.org .bashrc block).
 # Not a PATH executable (hence LINK_MODE=none) — pinned to v1.3.0 x86_64-unknown-linux-gnu (this host's target); bump both this URL and the .bashrc path together on upgrade.
 flyline        tar_gz     https://github.com/HalFrgrd/flyline/releases/download/v1.3.0/libflyline-v1.3.0-x86_64-unknown-linux-gnu.tar.gz  ~/.local/flyline.app  .  none  sha256=21bb0a7a0e417496ff68ef8379cadc05d35e42aee357fc64ad9a8d95f69320f8  ""
@@ -162,6 +166,519 @@ if [ "$autostart" -eq 1 ]; then
 fi
 
 exec "$app" --host "$ip" --port "$port" --allow-origin http://localhost "$@"
+#+END_SRC
+
+* herdr stack update gate
+
+Deterministic update gate for the herdr + herdr-web pair: BRIDGE LEADS, HERDR FOLLOWS. herdr-web (kcosr/herdr-web, third-party) pins a maximum herdr daemon protocol; a herdr release that outruns it silently kills the phone/web access path (herdr 0.7.5/protocol 17 vs bridge ceiling 16, discovered 2026-07-27 when Hermes killed a live server chasing exactly this). The compatibility oracle is a real handshake in a fully isolated sandbox (own HOME/XDG, own HERDR_SOCKET_PATH via env -i, random loopback port) — never a static grep, because the bridge's ceiling only exists in its runtime refusal text. herdr itself never self-updates unattended (disassembly-verified: the background updater thread is check-only; the install path is reachable only from the =herdr update= CLI), so this script is the sole mover of both versions. Default is =--dry-run=; =--selftest= validates the classifier against known-good and known-bad pairs before any verdict is trusted. Validated live on the X230 2026-07-27/28: bridge v0.3.2 -> v0.3.3 promoted under a running daemon, herdr correctly held at protocol 16.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/herdr-stack-update :shebang "#!/usr/bin/env bash" :mkdirp yes
+# herdr-stack-update — deterministic update gate for the herdr + herdr-web stack.
+#
+# Policy: BRIDGE LEADS, HERDR FOLLOWS.
+# herdr-web (kcosr/herdr-web) is a third-party companion that pins a maximum
+# Herdr daemon protocol. A herdr release whose protocol exceeds the bridge's
+# ceiling silently decapitates the phone/web access path. So no herdr version is
+# ever promoted until a real bridge has been observed to serve against it.
+#
+# The compatibility oracle is a live handshake, never a static grep: the bridge's
+# protocol ceiling is not present as a number in its binary — only its runtime
+# refusal text reveals it.
+#
+# Every handshake runs against a fully isolated sandbox daemon (own HOME, own
+# XDG_*, own HERDR_SOCKET_PATH) on a random 127.0.0.1 port. The live daemon and
+# the live bridge are never contacted, signalled, or reconfigured.
+#
+# Default mode is --dry-run: nothing is installed, every decision is printed.
+
+set -uo pipefail
+
+# ---------------------------------------------------------------- configuration
+
+HERDR_REPO="ogulcancelik/herdr"
+BRIDGE_REPO="kcosr/herdr-web"
+
+LAB="${HERDR_GATE_LAB:-$HOME/tmp/herdr-gate-lab}"
+STAGE="$LAB/stage"
+RUN="$LAB/run"
+LOGS="$LAB/logs"
+
+INSTALLED_HERDR="${HERDR_GATE_INSTALLED_HERDR:-$HOME/.local/bin/herdr}"
+INSTALLED_BRIDGE_ROOT="${HERDR_GATE_INSTALLED_BRIDGE:-$HOME/.local/herdr-web.app}"
+
+DRY_RUN=1
+HANDOFF=0
+KEEP=0
+SELFTEST=0
+PLATFORM_HERDR_ASSET="herdr-linux-x86_64"
+PLATFORM_BRIDGE_ASSET_GLOB="linux-x86_64.tar.gz"
+
+# Sandbox PIDs started by this script. Torn down by exact PID only — never by
+# name pattern, because a name pattern would match the live production daemon.
+SANDBOX_PIDS=()
+
+# ---------------------------------------------------------------------- logging
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '[info]  %s\n' "$*"; }
+warn() { printf '[warn]  %s\n' "$*" >&2; }
+err()  { printf '[error] %s\n' "$*" >&2; }
+step() { printf '\n=== %s ===\n' "$*"; }
+# Every skip/drop is announced. No silent decisions.
+skip() { printf '[skip]  %s\n' "$*"; }
+
+usage() {
+  cat <<'USAGE'
+usage: herdr-stack-update [--dry-run|--apply] [--handoff] [--keep] [--help]
+
+  --dry-run   (default) resolve, stage, handshake-test, and print verdicts only.
+  --apply     perform promotion. Refuses while a live `herdr server` is running
+              unless --handoff is also given and the installed herdr supports
+              live handoff.
+  --handoff   acknowledge that promotion may use herdr's live-handoff path.
+  --keep      keep sandbox homes/sockets after the run (they are kept anyway
+              inside the lab dir; this also keeps the extracted candidates).
+  --selftest  validate the classifier itself against known ground truth: a
+              known-good pair must classify PASS and a known-bad pair must
+              classify FAIL-newer. Installs nothing. Run this before trusting
+              any verdict — a detector that cannot fail is not a detector.
+USAGE
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --apply)   DRY_RUN=0 ;;
+    --handoff) HANDOFF=1 ;;
+    --keep)    KEEP=1 ;;
+    --selftest) SELFTEST=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) err "unknown argument: $1"; usage; exit 2 ;;
+  esac
+  shift
+done
+
+# --------------------------------------------------------------------- teardown
+
+teardown_sandbox() {
+  local pid
+  for pid in "${SANDBOX_PIDS[@]:-}"; do
+    [ -n "${pid:-}" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+    fi
+  done
+  sleep 1
+  for pid in "${SANDBOX_PIDS[@]:-}"; do
+    [ -n "${pid:-}" ] || continue
+    kill -0 "$pid" 2>/dev/null && kill -9 "$pid" 2>/dev/null
+  done
+  SANDBOX_PIDS=()
+}
+trap teardown_sandbox EXIT INT TERM
+
+# ------------------------------------------------------------------- discovery
+
+# latest_tag <owner/repo> -> vX.Y.Z on stdout
+# Primary: GitHub API. Fallback (rate limit / API outage): the Location header of
+# the /releases/latest redirect, which needs no token and no quota.
+latest_tag() {
+  local repo="$1" tag=""
+  tag=$(curl -sf --max-time 20 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1)
+  if [ -n "$tag" ]; then
+    printf '%s' "$tag"; return 0
+  fi
+  warn "GitHub API gave no tag for $repo (rate limit?); falling back to redirect header"
+  tag=$(curl -sI --max-time 20 "https://github.com/$repo/releases/latest" 2>/dev/null \
+        | tr -d '\r' | sed -n 's|^[Ll]ocation:.*/releases/tag/||p' | head -1)
+  [ -n "$tag" ] || return 1
+  printf '%s' "$tag"
+}
+
+asset_url() {
+  local repo="$1" pattern="$2"
+  curl -sf --max-time 20 "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"browser_download_url": *"\([^"]*\)".*/\1/p' \
+    | grep -- "$pattern" | grep -v '\.sha256$' | head -1
+}
+
+ver_num() { printf '%s' "${1#v}"; }
+
+# ver_gt A B -> true if A > B (dotted numeric)
+ver_gt() {
+  local a b
+  a=$(ver_num "$1"); b=$(ver_num "$2")
+  [ "$a" = "$b" ] && return 1
+  [ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -1)" = "$a" ]
+}
+
+protocol_of_binary() {
+  strings "$1" 2>/dev/null | grep -oE '"protocol": *[0-9]+' | grep -oE '[0-9]+' | sort -u | head -1
+}
+
+# The bridge exposes no --version and embeds no version string, so identity is
+# established by content hash. A candidate whose binary hashes equal to the
+# installed one is the same build, whatever the tag says.
+bridge_fingerprint() {
+  [ -x "$1/bin/herdr-web-bridge" ] || { printf 'absent'; return; }
+  sha256sum "$1/bin/herdr-web-bridge" | cut -d' ' -f1
+}
+
+free_port() {
+  python3 - <<'PY'
+import socket
+s = socket.socket(); s.bind(("127.0.0.1", 0))
+print(s.getsockname()[1]); s.close()
+PY
+}
+
+# ---------------------------------------------------------------- the handshake
+
+# handshake <herdr-binary> <bridge-root> <tag>
+# Prints one classification line to stdout:
+#   PASS <http-code>
+#   FAIL-newer <daemon-protocol> <bridge-ceiling>
+#   FAIL-older <daemon-protocol> <bridge-floor>
+#   FAIL-other <reason>
+# Diagnostics go to stderr and to $LOGS/<tag>-{daemon,bridge}.log.
+handshake() {
+  local herdr_bin="$1" bridge_root="$2" tag="$3"
+  local sh="$RUN/$tag-home" sock="$RUN/$tag.sock" csock="$RUN/$tag-client.sock"
+  local dlog="$LOGS/$tag-daemon.log" blog="$LOGS/$tag-bridge.log"
+  local port dpid bpid i code
+
+  if [ ! -x "$herdr_bin" ]; then printf 'FAIL-other missing-herdr-binary\n'; return; fi
+  if [ ! -x "$bridge_root/bin/herdr-web-bridge" ]; then printf 'FAIL-other missing-bridge-binary\n'; return; fi
+
+  rm -rf "$sh"; mkdir -p "$sh/.config" "$sh/.local/state" "$sh/.local/share" "$sh/.cache"
+  rm -f "$sock" "$csock"
+  port=$(free_port)
+
+  # env -i: the sandbox inherits nothing. Any stray HERDR_SOCKET_PATH in the
+  # operator's shell would otherwise aim the sandbox at the live daemon.
+  env -i PATH=/usr/bin:/bin TERM=xterm-256color HOME="$sh" \
+      XDG_CONFIG_HOME="$sh/.config" XDG_STATE_HOME="$sh/.local/state" \
+      XDG_DATA_HOME="$sh/.local/share" XDG_CACHE_HOME="$sh/.cache" \
+      XDG_RUNTIME_DIR="$RUN" \
+      HERDR_SOCKET_PATH="$sock" HERDR_CLIENT_SOCKET_PATH="$csock" \
+      "$herdr_bin" server >"$dlog" 2>&1 &
+  dpid=$!
+  SANDBOX_PIDS+=("$dpid")
+
+  for i in $(seq 1 60); do [ -S "$sock" ] && break; sleep 0.25; done
+  if [ ! -S "$sock" ]; then
+    printf 'FAIL-other sandbox-daemon-no-socket\n'
+    kill "$dpid" 2>/dev/null
+    return
+  fi
+  # Isolation assertion: the sandbox socket must live under the lab tree.
+  case "$sock" in
+    "$LAB"/*) : ;;
+    *) err "REFUSING: sandbox socket escaped the lab dir: $sock"; kill "$dpid" 2>/dev/null; printf 'FAIL-other socket-escaped-lab\n'; return ;;
+  esac
+
+  env -i PATH=/usr/bin:/bin HOME="$sh" \
+      XDG_CONFIG_HOME="$sh/.config" XDG_STATE_HOME="$sh/.local/state" \
+      XDG_DATA_HOME="$sh/.local/share" XDG_CACHE_HOME="$sh/.cache" \
+      XDG_RUNTIME_DIR="$RUN" HERDR_SOCKET_PATH="$sock" \
+      "$bridge_root/bin/herdr-web-bridge" \
+        --host 127.0.0.1 --port "$port" \
+        --static-dir "$bridge_root/share/herdr-web/web" >"$blog" 2>&1 &
+  bpid=$!
+  SANDBOX_PIDS+=("$bpid")
+
+  # Give the bridge time either to bind or to refuse.
+  code=""
+  for i in $(seq 1 20); do
+    sleep 0.5
+    kill -0 "$bpid" 2>/dev/null || break
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 "http://127.0.0.1:$port/" 2>/dev/null)
+    case "$code" in 200|30[0-9]) break ;; esac
+  done
+
+  local verdict
+  if kill -0 "$bpid" 2>/dev/null && case "$code" in 200|30[0-9]) true ;; *) false ;; esac; then
+    verdict="PASS $code"
+  else
+    local msg dproto ceiling floor
+    msg=$(tr -d '\r' < "$blog")
+    dproto=$(printf '%s' "$msg" | sed -n 's/.*Herdr daemon protocol \([0-9]\+\).*/\1/p' | head -1)
+    if printf '%s' "$msg" | grep -q 'is newer than this herdr-web bridge supports'; then
+      ceiling=$(printf '%s' "$msg" | sed -n 's/.*need protocol \([0-9]\+\) or older.*/\1/p' | head -1)
+      verdict="FAIL-newer ${dproto:-?} ${ceiling:-?}"
+    elif printf '%s' "$msg" | grep -q 'is too old for herdr-web'; then
+      floor=$(printf '%s' "$msg" | sed -n 's/.*need protocol \([0-9]\+\).*/\1/p' | head -1)
+      verdict="FAIL-older ${dproto:-?} ${floor:-?}"
+    else
+      verdict="FAIL-other $(printf '%s' "$msg" | head -1 | tr ' ' '_' | cut -c1-160)"
+      [ -n "$(printf '%s' "$msg")" ] || verdict="FAIL-other bridge-died-without-message(http=${code:-none})"
+    fi
+  fi
+
+  kill "$bpid" 2>/dev/null; kill "$dpid" 2>/dev/null
+  sleep 1
+  kill -0 "$bpid" 2>/dev/null && kill -9 "$bpid" 2>/dev/null
+  kill -0 "$dpid" 2>/dev/null && kill -9 "$dpid" 2>/dev/null
+  printf '%s\n' "$verdict"
+}
+
+# ------------------------------------------------------------------------ main
+
+mkdir -p "$STAGE" "$RUN" "$LOGS"
+
+step "live services (must be untouched by this run)"
+LIVE_BEFORE=$(pgrep -fa 'herdr server|herdr-web-bridge' | grep -v 'herdr-stack-update' || true)
+printf '%s\n' "${LIVE_BEFORE:-<none>}"
+LIVE_HERDR_PIDS=$(pgrep -x -f 'herdr server' 2>/dev/null | tr '\n' ' ')
+
+if [ "$SELFTEST" = 1 ]; then
+  step "SELFTEST — validating the classifier against ground truth"
+  # Never test against the live install in place: copy it into the lab first.
+  SELF_BRIDGE="$STAGE/bridge-installed"
+  [ -x "$SELF_BRIDGE/bin/herdr-web-bridge" ] || cp -a "$INSTALLED_BRIDGE_ROOT" "$SELF_BRIDGE"
+  SELF_GOOD="$STAGE/herdr-selftest-good"
+  [ -x "$SELF_GOOD" ] || cp "$INSTALLED_HERDR" "$SELF_GOOD"
+  SELF_BAD=$(ls -1 "$STAGE"/herdr-0.7.5 2>/dev/null | head -1)
+  rc=0
+
+  info "known-good pair: installed herdr ($(protocol_of_binary "$SELF_GOOD")) x copy of installed bridge"
+  G=$(handshake "$SELF_GOOD" "$SELF_BRIDGE" "selftest-good")
+  log "  => $G  (expected PASS)"
+  case "$G" in PASS*) info "selftest PASS-case OK" ;; *) err "selftest PASS-case FAILED: $G"; rc=1 ;; esac
+
+  if [ -n "${SELF_BAD:-}" ] && [ -x "$SELF_BAD" ]; then
+    info "known-bad pair: $SELF_BAD (protocol $(protocol_of_binary "$SELF_BAD")) x copy of installed bridge"
+    B=$(handshake "$SELF_BAD" "$SELF_BRIDGE" "selftest-bad")
+    log "  => $B  (expected FAIL-newer)"
+    log "  bridge said: $(head -1 "$LOGS/selftest-bad-bridge.log" 2>/dev/null)"
+    case "$B" in FAIL-newer*) info "selftest FAIL-case OK; captured ceiling = $(printf '%s' "$B" | awk '{print $3}')" ;;
+                 *) err "selftest FAIL-case did not classify FAIL-newer: $B"; rc=1 ;; esac
+  else
+    skip "no protocol-newer herdr staged; FAIL-case not exercised"
+  fi
+
+  teardown_sandbox
+  step "live services after selftest"
+  LIVE_AFTER=$(pgrep -fa 'herdr server|herdr-web-bridge' | grep -v 'herdr-stack-update' || true)
+  printf '%s\n' "${LIVE_AFTER:-<none>}"
+  [ "$LIVE_BEFORE" = "$LIVE_AFTER" ] && info "live herdr/bridge processes unchanged" \
+    || { err "LIVE PROCESS SET CHANGED"; rc=4; }
+  exit $rc
+fi
+
+step "installed versions"
+INST_HERDR_VER=""
+if [ -x "$INSTALLED_HERDR" ]; then
+  INST_HERDR_VER=$("$INSTALLED_HERDR" --version 2>/dev/null | awk '{print $2}')
+  info "herdr        $INST_HERDR_VER  ($INSTALLED_HERDR, protocol $(protocol_of_binary "$INSTALLED_HERDR"))"
+else
+  warn "no installed herdr at $INSTALLED_HERDR"
+fi
+INST_BRIDGE_FP=$(bridge_fingerprint "$INSTALLED_BRIDGE_ROOT")
+info "bridge       sha256:${INST_BRIDGE_FP:0:16}  ($INSTALLED_BRIDGE_ROOT)"
+
+step "upstream latest releases"
+HERDR_TAG=$(latest_tag "$HERDR_REPO")   || { err "cannot resolve latest $HERDR_REPO tag"; exit 1; }
+BRIDGE_TAG=$(latest_tag "$BRIDGE_REPO") || { err "cannot resolve latest $BRIDGE_REPO tag"; exit 1; }
+info "herdr        latest $HERDR_TAG   (installed ${INST_HERDR_VER:-unknown})"
+info "herdr-web    latest $BRIDGE_TAG"
+
+step "stage candidates"
+CAND_HERDR="$STAGE/herdr-$(ver_num "$HERDR_TAG")"
+if [ -x "$CAND_HERDR" ]; then
+  skip "candidate herdr already staged: $CAND_HERDR"
+else
+  info "downloading herdr $HERDR_TAG"
+  curl -fsSL -o "$CAND_HERDR.part" \
+    "https://github.com/$HERDR_REPO/releases/download/$HERDR_TAG/$PLATFORM_HERDR_ASSET" \
+    && mv "$CAND_HERDR.part" "$CAND_HERDR" && chmod +x "$CAND_HERDR" \
+    || { rm -f "$CAND_HERDR.part"; err "herdr download failed"; exit 1; }
+fi
+CAND_HERDR_PROTO=$(protocol_of_binary "$CAND_HERDR")
+info "candidate herdr $HERDR_TAG protocol $CAND_HERDR_PROTO"
+
+CAND_BRIDGE_ROOT="$STAGE/bridge-$(ver_num "$BRIDGE_TAG")"
+if [ -x "$CAND_BRIDGE_ROOT/bin/herdr-web-bridge" ]; then
+  skip "candidate bridge already staged: $CAND_BRIDGE_ROOT"
+else
+  BURL=$(asset_url "$BRIDGE_REPO" "$PLATFORM_BRIDGE_ASSET_GLOB")
+  if [ -z "$BURL" ]; then
+    BURL="https://github.com/$BRIDGE_REPO/releases/download/$BRIDGE_TAG/herdr-web-$BRIDGE_TAG-linux-x86_64.tar.gz"
+    warn "asset list unavailable; guessing conventional asset URL: $BURL"
+  fi
+  info "downloading bridge $BRIDGE_TAG"
+  rm -rf "$CAND_BRIDGE_ROOT.tmp"; mkdir -p "$CAND_BRIDGE_ROOT.tmp"
+  if curl -fsSL "$BURL" | tar -xz -C "$CAND_BRIDGE_ROOT.tmp"; then
+    # Normalise: find the dir that actually contains bin/herdr-web-bridge.
+    ROOTDIR=$(find "$CAND_BRIDGE_ROOT.tmp" -maxdepth 3 -type f -name herdr-web-bridge -printf '%h\n' | head -1)
+    if [ -n "$ROOTDIR" ]; then
+      rm -rf "$CAND_BRIDGE_ROOT"; mv "$(dirname "$ROOTDIR")" "$CAND_BRIDGE_ROOT" 2>/dev/null \
+        || mv "$ROOTDIR/.." "$CAND_BRIDGE_ROOT" 2>/dev/null
+      chmod +x "$CAND_BRIDGE_ROOT/bin/herdr-web-bridge" 2>/dev/null
+    else
+      err "bridge tarball has no bin/herdr-web-bridge"
+    fi
+  else
+    err "bridge download/extract failed"
+  fi
+  rm -rf "$CAND_BRIDGE_ROOT.tmp"
+fi
+CAND_BRIDGE_FP=$(bridge_fingerprint "$CAND_BRIDGE_ROOT")
+if [ "$CAND_BRIDGE_FP" = "$INST_BRIDGE_FP" ]; then
+  info "candidate bridge is byte-identical to the installed bridge"
+  BRIDGE_IS_NEW=0
+else
+  BRIDGE_IS_NEW=1
+fi
+
+# Installed bridge is always a valid test partner and is the fallback partner
+# when the candidate bridge is unusable.
+BEST_BRIDGE="$CAND_BRIDGE_ROOT"
+BEST_BRIDGE_LABEL="candidate $BRIDGE_TAG"
+if [ ! -x "$CAND_BRIDGE_ROOT/bin/herdr-web-bridge" ]; then
+  skip "candidate bridge unusable; falling back to installed bridge as test partner"
+  BEST_BRIDGE="$INSTALLED_BRIDGE_ROOT"
+  BEST_BRIDGE_LABEL="installed"
+  BRIDGE_IS_NEW=0
+fi
+
+step "handshake T1: candidate herdr $HERDR_TAG  x  $BEST_BRIDGE_LABEL bridge"
+T1=$(handshake "$CAND_HERDR" "$BEST_BRIDGE" "t1")
+log "T1 => $T1"
+[ -s "$LOGS/t1-bridge.log" ] && log "    bridge said: $(head -1 "$LOGS/t1-bridge.log")"
+
+T2=""
+if [ "${T1%% *}" != "PASS" ] && [ -x "$INSTALLED_HERDR" ]; then
+  step "handshake T2: INSTALLED herdr ${INST_HERDR_VER}  x  $BEST_BRIDGE_LABEL bridge"
+  info "T1 did not pass; testing whether the new bridge is safe with the daemon already installed"
+  T2=$(handshake "$INSTALLED_HERDR" "$BEST_BRIDGE" "t2")
+  log "T2 => $T2"
+  [ -s "$LOGS/t2-bridge.log" ] && log "    bridge said: $(head -1 "$LOGS/t2-bridge.log")"
+else
+  skip "T2 not needed (T1 passed, or no installed herdr to test against)"
+fi
+
+# ------------------------------------------------------------------- promotion
+
+step "verdicts"
+PROMOTE_HERDR=0
+PROMOTE_BRIDGE=0
+HERDR_REASON=""
+BRIDGE_REASON=""
+
+if [ "${T1%% *}" = "PASS" ]; then
+  if [ -n "$INST_HERDR_VER" ] && ! ver_gt "$HERDR_TAG" "$INST_HERDR_VER"; then
+    HERDR_REASON="already at or ahead of $HERDR_TAG"
+  else
+    PROMOTE_HERDR=1
+    HERDR_REASON="pair handshake PASS with $BEST_BRIDGE_LABEL bridge"
+  fi
+  if [ "$BRIDGE_IS_NEW" = 1 ]; then
+    PROMOTE_BRIDGE=1
+    BRIDGE_REASON="pair handshake PASS; promoted together with herdr"
+  else
+    BRIDGE_REASON="candidate is byte-identical to installed bridge"
+  fi
+else
+  case "$T1" in
+    FAIL-newer*)
+      set -- $T1
+      HERDR_REASON="HELD: daemon protocol ${2} exceeds bridge ceiling ${3} ($BEST_BRIDGE_LABEL bridge refuses to start)"
+      ;;
+    FAIL-older*)
+      set -- $T1
+      HERDR_REASON="HELD: daemon protocol ${2} is below bridge floor ${3}"
+      ;;
+    *)
+      HERDR_REASON="HELD: handshake inconclusive ($T1) — see $LOGS/t1-bridge.log"
+      ;;
+  esac
+  # Bridge may still advance on its own if it works with the daemon we run today.
+  if [ "$BRIDGE_IS_NEW" = 1 ] && [ "${T2%% *}" = "PASS" ]; then
+    PROMOTE_BRIDGE=1
+    BRIDGE_REASON="passes against the CURRENTLY INSTALLED herdr ${INST_HERDR_VER}; safe to advance alone"
+  elif [ "$BRIDGE_IS_NEW" = 0 ]; then
+    BRIDGE_REASON="no new bridge build available"
+  else
+    BRIDGE_REASON="HELD: candidate bridge did not pass against installed herdr ${INST_HERDR_VER} ($T2)"
+  fi
+fi
+
+printf 'VERDICT herdr     %-8s %s\n'  "$HERDR_TAG"  "$([ "$PROMOTE_HERDR" = 1 ] && echo "PROMOTE — $HERDR_REASON" || echo "HOLD — $HERDR_REASON")"
+printf 'VERDICT herdr-web %-8s %s\n'  "$BRIDGE_TAG" "$([ "$PROMOTE_BRIDGE" = 1 ] && echo "PROMOTE — $BRIDGE_REASON" || echo "HOLD — $BRIDGE_REASON")"
+
+step "promotion"
+if [ "$DRY_RUN" = 1 ]; then
+  info "DRY-RUN: nothing will be installed."
+  [ "$PROMOTE_HERDR" = 1 ]  && log "WOULD install $CAND_HERDR -> $INSTALLED_HERDR"        || skip "would NOT touch $INSTALLED_HERDR"
+  [ "$PROMOTE_BRIDGE" = 1 ] && log "WOULD install $CAND_BRIDGE_ROOT -> $INSTALLED_BRIDGE_ROOT" || skip "would NOT touch $INSTALLED_BRIDGE_ROOT"
+else
+  # Bridge promotion is safe with a live daemon AND a live bridge: the install is
+  # a directory swap via mv (rename), so the running bridge keeps its old inode
+  # and the new build takes effect on its next (re)start. Only herdr promotion
+  # needs the live-server guard.
+  if [ "$PROMOTE_BRIDGE" = 1 ]; then
+    log "installing bridge $BRIDGE_TAG (directory swap; running bridge keeps old inode until restarted)"
+    STAGED_NEW="$INSTALLED_BRIDGE_ROOT.new.$$"
+    rm -rf "$STAGED_NEW"
+    cp -a "$CAND_BRIDGE_ROOT" "$STAGED_NEW" || { err "staging copy failed"; exit 5; }
+    rm -rf "$INSTALLED_BRIDGE_ROOT.prev"
+    mv "$INSTALLED_BRIDGE_ROOT" "$INSTALLED_BRIDGE_ROOT.prev" || { err "backup move failed"; rm -rf "$STAGED_NEW"; exit 5; }
+    if mv "$STAGED_NEW" "$INSTALLED_BRIDGE_ROOT"; then
+      info "bridge installed; previous kept at $INSTALLED_BRIDGE_ROOT.prev"
+    else
+      err "swap failed; restoring previous bridge"
+      mv "$INSTALLED_BRIDGE_ROOT.prev" "$INSTALLED_BRIDGE_ROOT"
+      rm -rf "$STAGED_NEW"
+      exit 5
+    fi
+  else
+    skip "bridge not promoted: $BRIDGE_REASON"
+  fi
+  if [ "$PROMOTE_HERDR" = 1 ]; then
+    if [ -n "${LIVE_HERDR_PIDS// /}" ] && [ "$HANDOFF" != 1 ]; then
+      err "REFUSING herdr promotion: live herdr server running (pids: $LIVE_HERDR_PIDS) and --handoff not given."
+      err "Re-run with --handoff, or promote while no server is running."
+      exit 3
+    fi
+    # Install the STAGED, GATE-TESTED binary — never `herdr update`, which pulls
+    # whatever is latest at that moment and can leap past the gate.
+    log "installing herdr $HERDR_TAG (staged binary, mv swap)"
+    cp "$CAND_HERDR" "$INSTALLED_HERDR.new.$$" && chmod +x "$INSTALLED_HERDR.new.$$" || { err "herdr staging copy failed"; exit 5; }
+    cp -p "$INSTALLED_HERDR" "$INSTALLED_HERDR.prev" 2>/dev/null || true
+    mv "$INSTALLED_HERDR.new.$$" "$INSTALLED_HERDR" || { err "herdr swap failed"; rm -f "$INSTALLED_HERDR.new.$$"; exit 5; }
+    info "herdr installed; previous kept at $INSTALLED_HERDR.prev"
+    if [ -n "${LIVE_HERDR_PIDS// /}" ] && [ "$HANDOFF" = 1 ]; then
+      if "$INSTALLED_HERDR" server --help 2>&1 | grep -q 'live-handoff'; then
+        log "attempting live handoff of the running server"
+        "$INSTALLED_HERDR" server live-handoff || warn "live handoff failed; old server still running old binary until restarted"
+      else
+        warn "installed herdr has no live-handoff; running server keeps old binary until restarted"
+      fi
+    fi
+  else
+    skip "herdr not promoted: $HERDR_REASON"
+  fi
+fi
+
+step "live services after run"
+teardown_sandbox
+LIVE_AFTER=$(pgrep -fa 'herdr server|herdr-web-bridge' | grep -v 'herdr-stack-update' || true)
+printf '%s\n' "${LIVE_AFTER:-<none>}"
+if [ "$LIVE_BEFORE" = "$LIVE_AFTER" ]; then
+  info "live herdr/bridge processes unchanged"
+elif [ "$DRY_RUN" = 1 ]; then
+  # A dry run must never change the live process set — that is a hard failure.
+  err "LIVE PROCESS SET CHANGED DURING A DRY RUN — investigate immediately"
+  exit 4
+else
+  # An --apply run with --handoff may legitimately replace the server PID.
+  warn "live process set changed (expected only if a handoff/restart was part of promotion) — review above"
+fi
+
+[ "$KEEP" = 1 ] || skip "sandbox homes left in $RUN for inspection (nothing is auto-deleted in lab mode)"
+exit 0
 #+END_SRC
 
 * obsidian-web tailnet gate (caddy login screen)
