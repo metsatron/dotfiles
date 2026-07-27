@@ -53,6 +53,18 @@ stow:
 #   "existing target is not owned by stow: FILE"
 # If preview reports "existing target is stowed to a different package",
 # abort before backing up/removing anything: that target is already repo-owned.
+#
+# LESSON (2026-07-27, the .codex migration): repair_mutable_agent_dir converts a
+# whole-directory agent symlink (~/.codex -> NEXUS/stow/userspace/.codex) back
+# into a real local directory and moves the runtime state home. Across a mount
+# boundary `mv` is copy-then-unlink, so a LIVE process writing into the source
+# makes the unlink fail AFTER the copy has already succeeded. Under `set -e`
+# that aborted the entire safe-stow: the migration was actually complete, but
+# stow never ran and the failure read as "nothing worked".
+# A failed move is now non-fatal and distinguishes the two cases — destination
+# already arrived (partial move, only the source needs clearing) versus nothing
+# copied (fall back to cp -a). Leftovers are reported loudly and stow continues.
+# Never re-tighten this into a bare `mv` under set -e.
 safe-stow:
 | set -euo pipefail; \
 | cd $(HOME)/DotCortex; \
@@ -78,7 +90,19 @@ safe-stow:
 |       mv "$$target/$$name" "$$backup"; \
 |     fi; \
 |     echo "   move runtime $$entry -> $$target/$$name"; \
-|     mv "$$entry" "$$target/$$name"; \
+|     if mv "$$entry" "$$target/$$name" 2>/dev/null; then \
+|       continue; \
+|     fi; \
+|     if [ -e "$$target/$$name" ] || [ -L "$$target/$$name" ]; then \
+|       echo "   !! partial move: $$target/$$name arrived, source not released"; \
+|     else \
+|       cp -a "$$entry" "$$target/$$name" 2>/dev/null || { \
+|         echo "   !! FAILED to migrate $$entry — left in place, stow continuing"; \
+|         continue; \
+|       }; \
+|     fi; \
+|     rm -rf "$$entry" 2>/dev/null || \
+|       echo "   !! source still held: $$entry — stop the app writing it, then re-run"; \
 |   done; \
 | }; \
 | repair_mutable_agent_dir .claude; \
