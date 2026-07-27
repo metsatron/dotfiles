@@ -1,0 +1,430 @@
+#!/bin/bash
+set -euo pipefail
+
+SANCTUARY="sanctuary-redstone-9x"
+GUESTS_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/guests"
+GUEST_HOME="${GUESTS_DIR}/${SANCTUARY}/home"
+WINEPREFIX="${WINEPREFIX:-${GUEST_HOME}/.wine-redstone}"
+MEDIA="${GUESTS_DIR}/${SANCTUARY}/media/encarta94"
+DRIVE="f"                       # see "map the drive" below for why not D:
+DRIVE_C="${WINEPREFIX}/drive_c"
+DEST="${DRIVE_C}/ENCARTA"
+WINDIR="${DRIVE_C}/windows"
+SYSDIR="${WINDIR}/system"
+FONTSDIR="${WINDIR}/Fonts"
+ICONDIR="${GUEST_HOME}/.local/share/icons"
+ICEWM_ICONS="${GUEST_HOME}/.icewm/icons"
+HICOLOR="${ICONDIR}/hicolor"
+ICON_SIZES="16 22 24 32 48"
+MARKER="${DEST}/.dotcortex-encarta-complete"
+WINE_PROFILE="${HOME}/.guix-extra-profiles/room-windows-compat/room-windows-compat"
+
+# Operator-supplied; never vendored (copyrighted Microsoft media, public repo).
+ISO="${ENCARTA_ISO:-${HOME}/Downloads/microsoft-encarta-94/microsoft-encarta-94.iso}"
+
+FORCE=0; RESTAGE=0
+for a in "$@"; do
+  case "${a}" in
+    --force)   FORCE=1 ;;
+    --restage) FORCE=1; RESTAGE=1 ;;
+  esac
+done
+
+if [[ -f "${MARKER}" && "${FORCE}" -eq 0 ]]; then
+  echo "redstone-9x-encarta: already provisioned (${DEST}) — use --force to redo"
+  exit 0
+fi
+
+if [[ ! -d "${WINEPREFIX}" ]]; then
+  echo "redstone-9x-encarta: Wine prefix missing: ${WINEPREFIX}" >&2
+  echo "  Launch the sanctuary once so the prefix initialiser runs." >&2
+  exit 1
+fi
+
+find_python() {
+  local c
+  for c in python3 "${HOME}/.guix-extra-profiles/desktop-common/desktop-common/bin/python3" \
+           "${HOME}/.guix-extra-profiles/core/core/bin/python3"; do
+    "${c}" -c 'import struct' >/dev/null 2>&1 && { printf '%s\n' "${c}"; return 0; }
+  done
+  return 1
+}
+PY="$(find_python)" || { echo "redstone-9x-encarta: no working python3" >&2; exit 1; }
+
+# ---------------------------------------------------------------- stage disc
+# 630 MB of it is content that never moves, so only restage on demand.
+if [[ "${RESTAGE}" -eq 1 || ! -f "${MEDIA}/ENCYC94/ENCARTA.MVB" ]]; then
+  if [[ ! -f "${ISO}" ]]; then
+    echo "redstone-9x-encarta: disc image not found: ${ISO}"
+    echo "  Supply one with ENCARTA_ISO=/path/to.iso, or fetch the Internet"
+    echo "  Archive item 'microsoft-encarta-94'. Skipping."
+    exit 0
+  fi
+  echo "redstone-9x-encarta: staging disc from ${ISO}…"
+  rm -rf "${MEDIA}"
+  mkdir -p "${MEDIA}"
+  "${PY}" - "${ISO}" "${MEDIA}" <<'PYHSFS'
+"""Extract a High Sierra (pre-ISO9660) CD-ROM image.
+
+Encarta 94 is High Sierra, which bsdtar, 7z and fuseiso all refuse to read. The
+format is ISO9660's ancestor; the field offsets that matter differ:
+
+  Primary Volume Descriptor (sector 16)
+    +8    volume descriptor type
+    +9    standard identifier "CDROM"   (ISO9660: "CD001" at +1)
+    +136  logical block size            (ISO9660: +128)
+    +180  root directory record         (ISO9660: +156)
+
+  Directory record
+    +2    extent LBA   (both-endian, 8 bytes)
+    +10   data length  (both-endian, 8 bytes)
+    +24   flags        (ISO9660: +25)
+    +32   file identifier length
+    +33   file identifier
+"""
+import os
+import struct
+import sys
+
+SECTOR = 2048
+
+
+def le32(b, off):
+    return struct.unpack_from("<I", b, off)[0]
+
+
+class HighSierra:
+    def __init__(self, path):
+        self.f = open(path, "rb")
+        self.f.seek(16 * SECTOR)
+        pvd = self.f.read(SECTOR)
+        if pvd[9:14] != b"CDROM":
+            raise ValueError("not a High Sierra image")
+        self.block_size = struct.unpack_from("<H", pvd, 136)[0] or SECTOR
+        self.volume_id = pvd[48:80].decode("ascii", "replace").strip()
+        self.root = pvd[180:180 + 34]
+
+    def read_extent(self, lba, length):
+        self.f.seek(lba * self.block_size)
+        return self.f.read(length)
+
+    def entries(self, lba, length):
+        data = self.read_extent(lba, length)
+        pos, out = 0, []
+        while pos < len(data):
+            rec_len = data[pos]
+            if rec_len == 0:
+                nxt = ((pos // self.block_size) + 1) * self.block_size
+                if nxt <= pos:
+                    break
+                pos = nxt
+                continue
+            rec = data[pos:pos + rec_len]
+            if len(rec) < 33:
+                break
+            ext_lba, size, flags = le32(rec, 2), le32(rec, 10), rec[24]
+            name = rec[33:33 + rec[32]]
+            pos += rec_len
+            if name in (b"\x00", b"\x01"):        # '.' and '..'
+                continue
+            out.append((name.decode("ascii", "replace").split(";")[0],
+                        ext_lba, size, bool(flags & 0x02)))
+        return out
+
+    def walk(self, lba=None, size=None, prefix=""):
+        if lba is None:
+            lba, size = le32(self.root, 2), le32(self.root, 10)
+        for name, ext, sz, is_dir in self.entries(lba, size):
+            path = f"{prefix}/{name}" if prefix else name
+            if is_dir:
+                yield path, None, None, True
+                yield from self.walk(ext, sz, path)
+            else:
+                yield path, ext, sz, False
+
+
+image, dest = sys.argv[1], sys.argv[2]
+hs = HighSierra(image)
+files = dirs = total = 0
+for path, lba, size, is_dir in hs.walk():
+    out = os.path.join(dest, path)
+    if is_dir:
+        os.makedirs(out, exist_ok=True)
+        dirs += 1
+        continue
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "wb") as fh:
+        fh.write(hs.read_extent(lba, size))
+    files += 1
+    total += size
+print(f"redstone-9x-encarta: volume {hs.volume_id!r} — "
+      f"{files} files, {dirs} dirs, {total / 1048576:.1f} MiB")
+PYHSFS
+else
+  echo "redstone-9x-encarta: disc already staged at ${MEDIA} (--restage to redo)"
+fi
+
+[[ -f "${MEDIA}/ENCARTA/ENCART94.EXE" ]] || {
+  echo "redstone-9x-encarta: staged disc incomplete — ENCART94.EXE missing" >&2; exit 1; }
+
+# ------------------------------------------------------------- map the drive
+# F:, not the D: the sample INI assumes. The Redstone prefix already carries
+# orphaned device links d:: -> /dev/sda1 and e:: -> /dev/sda with no matching
+# drive letters, and hanging a drive off a letter whose device node points at a
+# raw host disk invites Wine to read volume info from it. F: is clean.
+#
+# The type MUST be cdrom. Encarta enumerates for a CD-ROM drive and reports
+# "The files cannot be located. Make sure the Encarta CD-ROM disc is in the
+# correct drive" when it finds none, even with BookPath pointing somewhere real.
+#
+# A bare dosdevices symlink is not sufficient on its own: wineboot reconciles
+# drives against the registry and drops an unregistered link.
+mkdir -p "${WINEPREFIX}/dosdevices"
+ln -sfn "${MEDIA}" "${WINEPREFIX}/dosdevices/${DRIVE}:"
+
+# `wine reg` needs no X server — it creates no window — so this works from a
+# headless provisioning run.
+WINEDEBUG=-all wine reg add 'HKLM\Software\Wine\Drives' \
+  /v "${DRIVE}:" /d cdrom /f >/dev/null 2>&1 \
+  || echo "redstone-9x-encarta: WARN could not register ${DRIVE}: as cdrom" >&2
+
+# ------------------------------------------------------------------- install
+# Faithful to \MSSTP\MANUAL\INSTALL.BAT, Recommended (Faster) layout.
+mkdir -p "${DEST}" "${SYSDIR}"
+
+copy_from_disc() {   # copy_from_disc <relative-disc-path> <dest-dir>
+  local src="${MEDIA}/$1" dst="$2"
+  if [[ -f "${src}" ]]; then
+    cp -f "${src}" "${dst}/$(basename "$1")"
+  else
+    echo "redstone-9x-encarta: WARN missing on disc: $1" >&2
+  fi
+}
+
+echo "redstone-9x-encarta: installing application files…"
+for f in USA.THS DICT.EXE ENCART94.LEX ENC94BU.DLL ENC94HLP.DLL ENC94IMG.DLL \
+         ENC94IM.DLL ENC94UI.DLL ENC94PLY.DLL ENC94SPL.DLL MTOOLS94.DLL \
+         POEMWINC.DLL STRING94.TBL TOPICS94.LST MVDIB10.DLL MVFS2.DLL \
+         MVMCI2.DLL MVSRCH10.DLL MVBRKR10.DLL MVTTL10.DLL ENCART94.EXE \
+         MEDV10.DLL; do
+  copy_from_disc "ENCARTA/${f}" "${DEST}"
+done
+copy_from_disc "README.WRI" "${DEST}"
+
+echo "redstone-9x-encarta: installing shared system files…"
+for f in WRITE.EXE WRITE.HLP; do copy_from_disc "ENCARTA/${f}" "${WINDIR}"; done
+copy_from_disc "MMCAT/CATSTUB.EXE" "${WINDIR}"
+
+for f in ANIBUTON.VBX SBC.VBX CCFCURS.DLL COMMDLG.DLL CMDIALOG.VBX \
+         DWSPYDLL.DLL MMP.DLL MCI.VBX THREED.VBX GRID.VBX VBRUN300.DLL \
+         CTL3D.DLL ICCVID.DRV DISPDIB.DLL MCIMMP.DRV; do
+  copy_from_disc "ENCARTA/${f}" "${SYSDIR}"
+done
+copy_from_disc "ENCARTA/ENCARAPI/ENCARAPI.DLL" "${SYSDIR}"
+copy_from_disc "ENCYC94/MM/VBEXE/GSWDLL.DLL" "${SYSDIR}"
+copy_from_disc "ENCYC94/MM/VBEXE/GSW.EXE" "${SYSDIR}"
+for f in PICCLIP.VBX SPUSH.VBX; do copy_from_disc "MMCAT/${f}" "${SYSDIR}"; done
+# Fonts go to BOTH places. INSTALL.BAT puts them in SYSTEM, which is right for
+# real Windows 3.x, but Wine only enumerates C:\windows\Fonts — and even then it
+# will not pick up a bitmap .FON unless it is registered, because wineboot's font
+# pass is what populates the font tables. Without this Encarta refuses to start
+# with "The necessary text fonts are not available."
+mkdir -p "${FONTSDIR}"
+for n in 1 2 3 4 5 6 7; do
+  copy_from_disc "FONTS/V${n}SP.FON" "${SYSDIR}"
+  copy_from_disc "FONTS/V${n}SP.FON" "${FONTSDIR}"
+  WINEDEBUG=-all wine reg add \
+    'HKLM\Software\Microsoft\Windows NT\CurrentVersion\Fonts' \
+    /v "V${n} Lucida Sans (All res)" /d "C:\\windows\\Fonts\\V${n}SP.FON" /f \
+    >/dev/null 2>&1 || true
+done
+
+# INSTALL.BAT guards these four with "if exist" so a newer multimedia runtime is
+# never clobbered. Wine ships its own; honour the guard rather than overwrite.
+for f in MCIAVI.DRV MSVIDEO.DLL MSACM.DRV MSADPCM.ACM; do
+  if [[ -e "${SYSDIR}/${f}" ]]; then
+    echo "redstone-9x-encarta: keeping existing ${f} (INSTALL.BAT if-exist guard)"
+  else
+    copy_from_disc "ENCARTA/${f}" "${SYSDIR}"
+  fi
+done
+
+# ----------------------------------------------------------------- INI files
+echo "redstone-9x-encarta: writing ENCARTA.INI and patching WIN/SYSTEM/CONTROL.INI…"
+"${PY}" - "${WINDIR}" <<'PYINI'
+"""Apply the INI changes documented in \\MSSTP\\MANUAL\\MSETUP.WRI.
+
+Idempotent by construction: a key already present in its section keeps its
+existing value, so re-running never disturbs settings the user has changed and
+never duplicates lines.
+"""
+import os
+import sys
+
+windir = sys.argv[1]
+
+ENCARTA_INI = """[94Options]
+InstPath=C:\\ENCARTA
+CodePath=C:\\ENCARTA
+BookPath=F:\\ENCYC94\\
+ShowTitleScreen=1
+IntroPlaySounds=1
+FlipPictures=1
+LinkMedia=1
+SaveWindowLayout=0
+SetBookmarkOnExit=1
+SpellFile=C:\\ENCARTA\\ENCART94.LEX
+JumpColor=255
+"""
+
+PATCHES = {
+    "win.ini": {
+        "Fonts": {f"V{n} Lucida Sans": f"v{n}sp.fon" for n in range(1, 8)},
+        "Encarta": {
+            "FILE_usa.dct": "",
+            "FILE_usa.ths": "",
+            "ThsFile": "C:\\ENCARTA\\usa.ths",
+            "DctFile": "F:\\encarta\\usa.dct",
+        },
+        "mci extensions": {"AVI": "AVIVideo", "mmm": "MMMovie"},
+        "Microsoft Multimedia Catalog": {
+            "catalognum": "1",
+            "path": "F:\\mmcat\\",
+            "parentCD": "Microsoft Encarta 1994",
+        },
+    },
+    "system.ini": {
+        "Drivers": {"Wavemapper": "msacm.drv", "VIDC.CVID": "iccvid.drv"},
+        "mci": {"MMMovie": "mcimmp.drv", "AVIVideo": "mciavi.drv"},
+        "MSACM": {"Install": "msadpcm.acm"},
+    },
+    "control.ini": {
+        "Userinstallable.driver": {"VIDC.CVID": "iccvid.drv"},
+        "related.desc": {"VIDC.CVID": ""},
+    },
+}
+
+
+def find_ini(name):
+    """Wine's INI names vary in case across prefixes; match case-insensitively."""
+    for entry in os.listdir(windir):
+        if entry.lower() == name:
+            return os.path.join(windir, entry)
+    return os.path.join(windir, name)
+
+
+def patch(path, sections):
+    try:
+        with open(path, "r", encoding="latin-1") as fh:
+            lines = fh.read().splitlines()
+    except FileNotFoundError:
+        lines = []
+
+    added = 0
+    for section, keys in sections.items():
+        # locate section span
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.strip().lower() == f"[{section}]".lower():
+                start = i
+                break
+        if start is None:
+            if lines and lines[-1].strip():
+                lines.append("")
+            lines.append(f"[{section}]")
+            start = len(lines) - 1
+            end = len(lines)
+        else:
+            end = len(lines)
+            for j in range(start + 1, len(lines)):
+                if lines[j].lstrip().startswith("["):
+                    end = j
+                    break
+        present = set()
+        for ln in lines[start + 1:end]:
+            if "=" in ln:
+                present.add(ln.split("=", 1)[0].strip().lower())
+        insert = []
+        for key, val in keys.items():
+            if key.lower() in present:
+                continue
+            insert.append(f"{key}={val}")
+            added += 1
+        if insert:
+            lines[end:end] = insert
+
+    with open(path, "w", encoding="latin-1") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return added
+
+
+with open(os.path.join(windir, "ENCARTA.INI"), "w", encoding="latin-1") as fh:
+    fh.write(ENCARTA_INI)
+
+total = 0
+for name, sections in PATCHES.items():
+    total += patch(find_ini(name), sections)
+print(f"redstone-9x-encarta: ENCARTA.INI written, {total} INI key(s) added")
+PYINI
+
+# -------------------------------------------------------------------- icons
+PY_PIL=""
+for c in python3 "${HOME}/.guix-extra-profiles/desktop-common/desktop-common/bin/python3"; do
+  "${c}" -c 'from PIL import Image' >/dev/null 2>&1 && { PY_PIL="${c}"; break; }
+done
+WRESTOOL="${WINE_PROFILE}/bin/wrestool"
+ICOTOOL="${WINE_PROFILE}/bin/icotool"
+if [[ -x "${WRESTOOL}" && -x "${ICOTOOL}" && -n "${PY_PIL}" ]]; then
+  echo "redstone-9x-encarta: extracting icons…"
+  TMPICO="$(mktemp -d)"
+  trap 'rm -rf "${TMPICO}"' EXIT
+  export LC_ALL=C
+  mkdir -p "${TMPICO}/staged"
+  for entry in "encarta:${DEST}/ENCART94.EXE" "catalog:${WINDIR}/CATSTUB.EXE"; do
+    slug="${entry%%:*}"; exe="${entry#*:}"
+    [[ -f "${exe}" ]] || continue
+    rm -rf "${TMPICO:?}/work"; mkdir -p "${TMPICO}/work/out"
+    "${WRESTOOL}" -x -t 14 -o "${TMPICO}/work" "${exe}" 2>/dev/null || true
+    ico="$(find "${TMPICO}/work" -maxdepth 1 -type f -name '*.ico' | sort | head -1)"
+    [[ -n "${ico}" ]] || continue
+    "${ICOTOOL}" -x -o "${TMPICO}/work/out" "${ico}" 2>/dev/null || true
+    # Sort by width THEN depth: these groups mix sizes, and a depth-only sort
+    # can pick a 16x16 and upscale it into every larger slot.
+    png="$(find "${TMPICO}/work/out" -type f -name '*.png' \
+             | sed 's/.*_\([0-9]\+\)x[0-9]\+x\([0-9]\+\)\.png$/\1 \2 &/' \
+             | sort -k1,1nr -k2,2nr | head -1 | cut -d' ' -f3-)"
+    [[ -n "${png}" ]] && cp -f "${png}" "${TMPICO}/staged/encarta94-${slug}.png"
+  done
+  "${PY_PIL}" - "${TMPICO}/staged" "${ICEWM_ICONS}" "${HICOLOR}" ${ICON_SIZES} <<'PYICON'
+import os
+import sys
+
+from PIL import Image
+
+staged, icewm_dir, hicolor = sys.argv[1], sys.argv[2], sys.argv[3]
+sizes = [int(s) for s in sys.argv[4:]]
+os.makedirs(icewm_dir, exist_ok=True)
+written = 0
+for name in sorted(os.listdir(staged)):
+    if not name.endswith(".png"):
+        continue
+    stem = name[:-4]
+    src = Image.open(os.path.join(staged, name)).convert("RGBA")
+    for size in sizes:
+        img = src if src.size == (size, size) else src.resize((size, size), Image.NEAREST)
+        img.save(os.path.join(icewm_dir, f"{stem}_{size}x{size}.png"))
+        apps = os.path.join(hicolor, f"{size}x{size}", "apps")
+        os.makedirs(apps, exist_ok=True)
+        img.save(os.path.join(apps, f"{stem}.png"))
+        written += 1
+print(f"redstone-9x-encarta: {written} icon files across {len(sizes)} sizes")
+PYICON
+else
+  echo "redstone-9x-encarta: icon tooling unavailable — menu will use the generic Wine icon"
+fi
+
+touch "${MARKER}"
+echo "redstone-9x-encarta: ready"
+echo "  code: ${DEST}"
+echo "  disc: ${MEDIA} (mapped as ${DRIVE^^}:)"
+echo "  Launch with: redstone-9x-encarta"
