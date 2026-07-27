@@ -70,6 +70,7 @@ GUIX_PROFILES="${HOME}/.guix-extra-profiles"
 FONT_STAGE="${GUESTS_DIR}/${SANCTUARY}/fonts"
 RETROPIE_HOST_ROOT="${HOME}/RetroPie"
 RETROPIE_CONTAINER_ROOT="/run/dotcortex/retropie"
+GAMES_CONTAINER_ROOT="/run/dotcortex/games"
 
 # Preflight: verify all required Guix profiles exist before launching.
 _missing=0
@@ -113,6 +114,19 @@ prepare_retropie_tree() {
   ln -sfnT "${RETROPIE_CONTAINER_ROOT}" "${guest_link}"
 
   sanctuary-retropie-bind-ensure "${SANCTUARY}" "${RETROPIE_CONTAINER_ROOT}"
+
+  # ~/Games is the same shape as ~/RetroPie: a host symlink onto the private
+  # autofs/NFS tree, bound into the container at a fixed path by
+  # sanctuary-distrobox. Point the guest home's own ~/Games at that bind so the
+  # room sees the library at the SAME logical path the host uses. Unlike
+  # RetroPie this is not fatal when absent -- Games is a convenience mount, and
+  # the room is perfectly usable without the remote share.
+  local games_link="${GUEST_HOME}/Games"
+  if [[ -e "${games_link}" && ! -L "${games_link}" ]]; then
+    echo "${SANCTUARY}: refusing to replace non-symlink guest path: ${games_link}" >&2
+  else
+    ln -sfnT "${GAMES_CONTAINER_ROOT}" "${games_link}"
+  fi
 }
 
 prepare_retropie_tree
@@ -269,6 +283,73 @@ quick_exec=1
     printf '[config]\nquick_exec=1\n\n' | cat - "${GUEST_HOME}/.config/libfm/libfm.conf" > "${GUEST_HOME}/.config/libfm/libfm.conf.tmp"
     mv "${GUEST_HOME}/.config/libfm/libfm.conf.tmp" "${GUEST_HOME}/.config/libfm/libfm.conf"
   fi
+  # XDG user dirs, Windows shell-folder shape. Two facts drive this design, both
+  # measured with `gio info -a standard::icon` on 2026-07-26:
+  #
+  #   1. Without ~/.config/user-dirs.dirs, g_get_user_special_dir() returns NULL
+  #      for every well-known folder, so libfm cannot tell Documents from any
+  #      other directory and renders generic "folder" for all of them — even
+  #      though every scheme's pack ships folder-documents/-pictures/-music/
+  #      -videos/-download/-templates/-publicshare at 32px (Serenity95 gets them
+  #      through Inherits=Chicago95).
+  #   2. GLib picks the special-folder icon by LITERAL PATH EQUALITY against the
+  #      XDG value — it does not resolve symlinks first. A symlink sitting beside
+  #      the real dir gets `inode-directory`, identical to a plain folder.
+  #
+  # (2) is what makes the Windows layout possible. Point XDG at "My Pictures"
+  # INSIDE Documents and let that name be a symlink to the real top-level dir:
+  # the Windows-named entry inherits folder-pictures, content still lives at one
+  # canonical Linux path, and writes through either name land in the same place.
+  # The cost is that only one of the two names can carry the icon, so the
+  # top-level $HOME/Pictures drops to generic — cheap here, since this is the
+  # guest home, $HOME is not on the desktop, and browsing goes through My
+  # Documents. Desktop, Documents and Public stay top-level: XP has no "My"
+  # form for them.
+  for _d in Desktop Documents Downloads Music Pictures Videos Public Templates; do
+    mkdir -p "${GUEST_HOME}/${_d}"
+  done
+  # Shell-folder aliases. Replace only what is safe to replace: an absent entry,
+  # an EMPTY directory (the 23 July skeleton), or a symlink already pointing at
+  # the right target. A directory with anything in it is left exactly as found
+  # and reported — never silently deleted.
+  _shell_folder() {
+    local _link="${GUEST_HOME}/Documents/$1" _target="../$2"
+    if [[ -L "${_link}" ]]; then
+      [[ "$(readlink "${_link}")" == "${_target}" ]] && return 0
+      rm -f "${_link}"
+    elif [[ -d "${_link}" ]]; then
+      if rmdir "${_link}" 2>/dev/null; then :; else
+        echo "${SANCTUARY}: Documents/$1 is a non-empty directory — left as-is, XDG will not point at it" >&2
+        return 1
+      fi
+    elif [[ -e "${_link}" ]]; then
+      echo "${SANCTUARY}: Documents/$1 exists and is not a directory — left as-is" >&2
+      return 1
+    fi
+    ln -sfn "${_target}" "${_link}"
+  }
+  _shell_folder "My Pictures" Pictures
+  _shell_folder "My Music"    Music
+  _shell_folder "My Videos"   Videos
+  _shell_folder "Downloads"   Downloads
+  _shell_folder "Templates"   Templates
+  # Rewritten whenever it is absent or still carries a managed marker, so an
+  # existing guest migrates from the flat layout. A file the user has edited by
+  # hand (marker gone) is left alone.
+  if [[ ! -f "${GUEST_HOME}/.config/user-dirs.dirs" ]] \
+     || grep -q '^# managed by sanctuary-redstone-9x' "${GUEST_HOME}/.config/user-dirs.dirs" 2>/dev/null; then
+    printf '# managed by sanctuary-redstone-9x — delete this line to take manual control
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_PICTURES_DIR="$HOME/Documents/My Pictures"
+XDG_MUSIC_DIR="$HOME/Documents/My Music"
+XDG_VIDEOS_DIR="$HOME/Documents/My Videos"
+XDG_DOWNLOAD_DIR="$HOME/Documents/Downloads"
+XDG_TEMPLATES_DIR="$HOME/Documents/Templates"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+'       > "${GUEST_HOME}/.config/user-dirs.dirs"
+  fi
+
   # pcmanfm's "Compress"/"Extract" context actions use libfm's selected archiver.
   # Pin it to the in-sanctuary xarchiver so archive ops stay local and never
   # fall through to a host-spawned handler. (A prior session host-installed
@@ -908,7 +989,30 @@ fi
 sanctuary-teardown-stale-session "${SANCTUARY}" "${DISPLAY_NUM}"
 
 # ── Xephyr ──
-Xephyr "${DISPLAY_NUM}" -fullscreen -br -ac -dpi 96 -no-host-grab &
+# -fullscreen alone takes the whole X SCREEN, which on a multi-head desktop is
+# the bounding box of every output — the room then spans both monitors (found
+# 2026-07-26: a 3000x1920 screen from a 1920x1080 laptop plus a portrait
+# 1080x1920 external, so the room straddled both). -output restricts fullscreen
+# to one RandR output's geometry, which is what "fullscreen" is meant to mean
+# here. Default to the RandR primary, fall back to the first connected output,
+# and fall back again to plain -fullscreen on a single-head host or if xrandr
+# is unavailable. Override with REDSTONE_XEPHYR_OUTPUT=HDMI-2 to move the room.
+xephyr_geometry=(-fullscreen)
+if command -v xrandr >/dev/null 2>&1; then
+  _xout="${REDSTONE_XEPHYR_OUTPUT:-}"
+  if [[ -z "${_xout}" ]]; then
+    _xout="$(xrandr --query 2>/dev/null | awk '/ connected primary/{print $1; exit}')"
+    [[ -n "${_xout}" ]] || _xout="$(xrandr --query 2>/dev/null | awk '/ connected/{print $1; exit}')"
+  fi
+  # Only restrict when there is more than one connected output; on a single head
+  # -output and -fullscreen are equivalent and -fullscreen is the safer default.
+  _xcount="$(xrandr --query 2>/dev/null | grep -c ' connected')"
+  if [[ -n "${_xout}" && "${_xcount}" -gt 1 ]]; then
+    xephyr_geometry=(-output "${_xout}")
+    echo "${SANCTUARY}: restricting Xephyr to output ${_xout} (${_xcount} outputs connected)" >&2
+  fi
+fi
+Xephyr "${DISPLAY_NUM}" "${xephyr_geometry[@]}" -br -ac -dpi 96 -no-host-grab &
 XEPHYR_PID=$!
 trap "kill ${XEPHYR_PID} 2>/dev/null || true" EXIT
 
