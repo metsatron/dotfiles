@@ -1,0 +1,596 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import ast
+import hashlib
+import io
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path, PurePosixPath
+
+from PIL import Image, ImageColor, UnidentifiedImageError
+
+
+UPSTREAM_URL = "https://github.com/KDE/kde1-kdebase.git"
+GENERATED_MARKER = ".dotcortex-kde1-generated"
+CACHE_NAMES = {"icon-theme.cache", ".icon-theme.cache"}
+TARGET_SIZES = (16, 22, 24, 32, 48)
+CATEGORIES = ("actions", "apps", "mimetypes", "places")
+CONTEXTS = {
+    "actions": "Actions",
+    "apps": "Applications",
+    "mimetypes": "MimeTypes",
+    "places": "Places",
+}
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    key: str
+    theme: str
+    title: str
+    date: str
+    description: str
+    commit: str
+    tree: str
+    archive_sha256: str
+
+
+SNAPSHOTS = (
+    Snapshot(
+        key="alpha",
+        theme="KDE-1-Alpha-Original",
+        title="KDE 1 Alpha Original",
+        date="1997-04-13",
+        description="Initial imported KDE 1-era source corpus; not a tagged release.",
+        commit="69f6d6cc97cda34c0c78aa9fd77daff54a74e5a1",
+        tree="c5aec1fb26aee86ac3c8b256b4cf5e24149db701",
+        archive_sha256="3b7c99c9526cbab65a6db2987ad138c6fb6ac1cb2583f18babf474a71658520c",
+    ),
+    Snapshot(
+        key="warm",
+        theme="KDE-1-Beta-Warm-Original",
+        title="KDE 1 Beta Warm Original",
+        date="1997-09-13",
+        description="Earliest commit carrying the warm sculpted folder corpus.",
+        commit="d24816a21faa05c0ced504c0d000ac2f3b7c85b0",
+        tree="7fd6a7d6ba2402522da6b9f6a7d744a1257c261a",
+        archive_sha256="ff94557dc838d8aa77bb2969484afc8cc46a79e539508c418e7ecceb980c2a5c",
+    ),
+    Snapshot(
+        key="classic",
+        theme="KDE-1-Classic-Silver-Original",
+        title="KDE 1 Classic Silver Original",
+        date="1998-02-23",
+        description="Earliest icon-tidy commit carrying the silver Classic corpus.",
+        commit="c3d129d194a13937a60a8ab07901b6537dec03d2",
+        tree="5c192291a9ca443ddefd12facd82e4a1fa278099",
+        archive_sha256="9ccb9ed91fa6a80526caab0fe098c2961fec45da456b40c71ac222d9a7965432",
+    ),
+    Snapshot(
+        key="hicolor",
+        theme="KDE-1-HiColor-Original",
+        title="KDE 1 HiColor Original",
+        date="1999-08-01",
+        description="Earliest commit introducing the 32/48px HiColor replacement art.",
+        commit="145ee70ed281ab2c5b02a19b3046476c49006ff7",
+        tree="2b8771529eff2fa44734a2007c4e037359297e50",
+        archive_sha256="e4ec897945dd78c199b14ec96f7f07eee5f119ea47127479e962b774630d9ed1",
+    ),
+)
+
+
+@dataclass
+class SourceIcon:
+    source: PurePosixPath
+    name: str
+    category: str
+    image: Image.Image
+    decoder: str
+
+    @property
+    def side(self) -> int:
+        return max(self.image.size)
+
+
+PLACE_WORDS = {
+    "cdrom", "desktop", "disk", "drive", "floppy", "folder", "home",
+    "lockedfolder", "network", "ofolder", "trash", "trashcan",
+}
+ACTION_WORDS = {
+    "back", "bottom", "close", "configure", "copy", "cut", "delete",
+    "down", "edit", "exec", "exit", "fileclose", "fileopen", "find",
+    "forward", "help", "left", "lock", "logout", "new", "next", "open",
+    "paste", "previous", "print", "redo", "reload", "right", "run",
+    "save", "search", "stop", "top", "undo", "up",
+}
+MIME_WORDS = {
+    "archive", "audio", "binary", "document", "html", "image", "mime",
+    "pdf", "sound", "source", "tar", "text", "video",
+}
+
+ALIASES = {
+    "folder": ("places", ("folder",)),
+    "folder-open": ("places", ("folder-open", "ofolder", "open-folder")),
+    "folder-locked": ("places", ("lockedfolder", "folder-locked")),
+    "user-home": ("places", ("kfm-home", "home", "folder-home", "folder")),
+    "user-desktop": ("places", ("desktop", "kfm-home", "folder")),
+    "user-trash": ("places", ("trashcan", "trash", "trashcan-empty")),
+    "user-trash-full": ("places", ("trashcan-full", "trash-full", "trashcan")),
+    "drive-harddisk": ("places", ("harddisk", "disk", "drive", "folder")),
+    "drive-removable-media": ("places", ("floppy", "disk", "drive")),
+    "media-optical": ("places", ("cdrom", "disk", "drive")),
+    "network-workgroup": ("places", ("network", "world", "folder")),
+    "system-file-manager": ("apps", ("kfm", "filemanager", "folder")),
+    "web-browser": ("apps", ("netscape", "kfm", "www", "world")),
+    "utilities-terminal": ("apps", ("konsole", "kvt", "terminal")),
+    "text-editor": ("apps", ("kedit", "editor", "edit")),
+    "system-search": ("apps", ("kfind", "find", "search")),
+    "preferences-system": ("apps", ("kcontrol", "control", "configure")),
+    "applications-other": ("apps", ("kmenu", "kde", "kpanel")),
+    "utilities-file-archiver": ("apps", ("ark", "archive", "tar")),
+    "help-browser": ("apps", ("kdehelp", "help")),
+    "system-run": ("actions", ("run", "exec", "kmenu")),
+    "system-log-out": ("actions", ("logout", "exit", "lock")),
+}
+
+
+def run_git(repo: Path, *args: str, stdout: int | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True,
+        stdout=stdout if stdout is not None else subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def archive_for(repo: Path, snapshot: Snapshot) -> bytes:
+    resolved = run_git(
+        repo, "rev-parse", "--verify", f"{snapshot.commit}^{{commit}}"
+    ).stdout.decode().strip()
+    if resolved != snapshot.commit:
+        raise SystemExit(
+            f"{snapshot.key}: commit mismatch: expected {snapshot.commit}, got {resolved}"
+        )
+    tree = run_git(repo, "show", "-s", "--format=%T", snapshot.commit).stdout.decode().strip()
+    if tree != snapshot.tree:
+        raise SystemExit(
+            f"{snapshot.key}: tree mismatch: expected {snapshot.tree}, got {tree}"
+        )
+    archive = run_git(repo, "archive", "--format=tar", snapshot.commit).stdout
+    actual_sha = hashlib.sha256(archive).hexdigest()
+    if actual_sha != snapshot.archive_sha256:
+        raise SystemExit(
+            f"{snapshot.key}: archive checksum mismatch: "
+            f"expected {snapshot.archive_sha256}, got {actual_sha}"
+        )
+    return archive
+
+
+def normalized_name(source: PurePosixPath) -> str:
+    name = source.stem.lower().replace("_", "-").replace(" ", "-")
+    name = re.sub(r"^(mini|large|tiny)-", "", name)
+    name = re.sub(r"[^a-z0-9.+-]+", "-", name).strip("-")
+    return name or "unnamed"
+
+
+def category_for(source: PurePosixPath, name: str) -> str:
+    words = set(re.split(r"[-.+]", name))
+    source_text = str(source).lower()
+    if words & PLACE_WORDS:
+        return "places"
+    if "mimetype" in source_text or words & MIME_WORDS:
+        return "mimetypes"
+    if "toolbar" in source_text or words & ACTION_WORDS:
+        return "actions"
+    return "apps"
+
+
+def square_canvas(image: Image.Image) -> Image.Image:
+    rgba = image.convert("RGBA")
+    if rgba.width == rgba.height:
+        return rgba
+    side = max(rgba.size)
+    square = Image.new("RGBA", (side, side), (0, 0, 0, 0))
+    square.paste(rgba, ((side - rgba.width) // 2, (side - rgba.height) // 2))
+    return square
+
+
+def source_priority(icon: SourceIcon) -> tuple[int, int, str]:
+    parts = icon.source.parts
+    if len(parts) == 2 and parts[0] == "pics":
+        rank = 0
+    elif "pics" in parts:
+        rank = 1
+    elif "icons" in parts:
+        rank = 2
+    else:
+        rank = 3
+    return rank, len(parts), str(icon.source)
+
+
+def xpm_color(value: str) -> tuple[int, int, int, int]:
+    color = value.strip()
+    if color.lower() == "none":
+        return 0, 0, 0, 0
+    if color.startswith("#") and len(color) in {4, 7, 10, 13}:
+        digits = len(color) - 1
+        width = digits // 3
+        maximum = (16 ** width) - 1
+        channels = [
+            round(int(color[1 + offset : 1 + offset + width], 16) * 255 / maximum)
+            for offset in range(0, digits, width)
+        ]
+        return channels[0], channels[1], channels[2], 255
+    if color.lower().startswith("rgb:"):
+        channels = color[4:].split("/")
+        if len(channels) == 3 and all(re.fullmatch(r"[0-9a-fA-F]{1,4}", item) for item in channels):
+            values = [
+                round(int(item, 16) * 255 / ((16 ** len(item)) - 1))
+                for item in channels
+            ]
+            return values[0], values[1], values[2], 255
+    grey = re.fullmatch(r"gr[ae]y([0-9]{1,3})", color, re.IGNORECASE)
+    if grey:
+        value = round(min(100, int(grey.group(1))) * 255 / 100)
+        return value, value, value, 255
+    shade = re.fullmatch(r"([a-z][a-z ]*?)([1-4])", color, re.IGNORECASE)
+    if shade:
+        base_name = shade.group(1).strip().lower()
+        x11_bases = {
+            "green": (0, 255, 0),
+            "maroon": (176, 48, 96),
+            "purple": (160, 32, 240),
+        }
+        base = x11_bases.get(base_name, ImageColor.getrgb(base_name))
+        factor = {1: 1.0, 2: 238 / 255, 3: 205 / 255, 4: 139 / 255}[
+            int(shade.group(2))
+        ]
+        return tuple(round(channel * factor) for channel in base) + (255,)
+    rgb = ImageColor.getrgb(color)
+    return rgb[0], rgb[1], rgb[2], 255
+
+
+def decode_xpm_fallback(payload: bytes) -> Image.Image:
+    strings = []
+    for line in payload.decode("latin-1").splitlines():
+        start = line.find('"')
+        end = line.rfind('"')
+        if start < 0 or end <= start:
+            continue
+        try:
+            strings.append(ast.literal_eval(line[start : end + 1]))
+        except (SyntaxError, ValueError):
+            continue
+
+    header_index = -1
+    header = None
+    for index, value in enumerate(strings):
+        fields = value.split()
+        if len(fields) >= 4 and all(field.isdigit() for field in fields[:4]):
+            header_index = index
+            header = tuple(int(field) for field in fields[:4])
+            break
+    if header is None:
+        raise ValueError("XPM header not found")
+
+    width, height, color_count, chars_per_pixel = header
+    color_lines = strings[header_index + 1 : header_index + 1 + color_count]
+    pixel_lines = strings[
+        header_index + 1 + color_count : header_index + 1 + color_count + height
+    ]
+    if len(color_lines) != color_count or len(pixel_lines) != height:
+        raise ValueError("truncated XPM palette or pixel rows")
+
+    palette = {}
+    for line in color_lines:
+        key = line[:chars_per_pixel]
+        definition = line[chars_per_pixel:]
+        match = re.search(
+            r"(?:^|\s)c\s+(.+?)(?=\s+[msg]\s+|$)",
+            definition,
+        )
+        if not match:
+            if definition.strip().lower() == "none":
+                palette[key] = (0, 0, 0, 0)
+                continue
+            raise ValueError(f"XPM color definition missing for {key!r}")
+        palette[key] = xpm_color(match.group(1))
+
+    image = Image.new("RGBA", (width, height))
+    pixels = image.load()
+    transparent_key = next(
+        (key for key, rgba in palette.items() if rgba[3] == 0),
+        next(iter(palette)),
+    )
+    for y, row in enumerate(pixel_lines):
+        if len(row) < width * chars_per_pixel:
+            missing = width - (len(row) // chars_per_pixel)
+            row += transparent_key * missing
+        for x in range(width):
+            key = row[x * chars_per_pixel : (x + 1) * chars_per_pixel]
+            if key not in palette:
+                raise ValueError(f"unknown XPM palette key {key!r}")
+            pixels[x, y] = palette[key]
+    return image
+
+
+def decode_image(payload: bytes, suffix: str) -> tuple[Image.Image, str]:
+    try:
+        with Image.open(io.BytesIO(payload)) as opened:
+            return opened.convert("RGBA"), "pillow"
+    except (OSError, ValueError, UnidentifiedImageError):
+        if suffix.lower() != ".xpm":
+            raise
+    return decode_xpm_fallback(payload), "xpm-fallback"
+
+
+def load_sources(archive: bytes) -> tuple[list[SourceIcon], dict[str, bytes], list[str]]:
+    icons = []
+    metadata = {}
+    skipped = []
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tf:
+        for member in tf.getmembers():
+            source = PurePosixPath(member.name)
+            if not member.isfile() or source.is_absolute() or ".." in source.parts:
+                continue
+            payload_file = tf.extractfile(member)
+            if payload_file is None:
+                continue
+            payload = payload_file.read()
+            if str(source) in {"AUTHORS", "COPYING", "README"}:
+                metadata[str(source)] = payload
+            if source.suffix.lower() not in {".png", ".xpm"}:
+                continue
+            try:
+                image, decoder = decode_image(payload, source.suffix)
+            except (OSError, ValueError, UnidentifiedImageError) as exc:
+                detail = str(exc).replace("\t", " ").replace("\n", " ")
+                if detail == "XPM header not found":
+                    reason = "not-xpm-image"
+                elif source.suffix.lower() == ".xpm":
+                    reason = "malformed-xpm"
+                else:
+                    reason = "decode-error"
+                skipped.append(f"{source}\t{reason}\t{detail}")
+                continue
+            if min(image.size) < 8 or max(image.size) > 128:
+                skipped.append(f"{source}\tnon-icon-dimensions\t{image.width}x{image.height}")
+                continue
+            if max(image.size) > min(image.size) * 2:
+                skipped.append(f"{source}\tnon-icon-aspect\t{image.width}x{image.height}")
+                continue
+            name = normalized_name(source)
+            icons.append(
+                SourceIcon(
+                    source=source,
+                    name=name,
+                    category=category_for(source, name),
+                    image=image,
+                    decoder=decoder,
+                )
+            )
+    for required in ("AUTHORS", "COPYING", "README"):
+        if required not in metadata:
+            raise SystemExit(f"upstream snapshot missing {required}")
+    if not icons:
+        raise SystemExit("upstream snapshot yielded no usable icons")
+    return icons, metadata, skipped
+
+
+def choose_source(candidates: list[SourceIcon], target_size: int) -> SourceIcon:
+    return min(
+        candidates,
+        key=lambda icon: (
+            abs(icon.side - target_size),
+            source_priority(icon),
+            -icon.side,
+        ),
+    )
+
+
+def write_index(theme: Path, snapshot: Snapshot) -> None:
+    directories = [
+        f"{size}x{size}/{category}"
+        for size in TARGET_SIZES
+        for category in CATEGORIES
+    ]
+    lines = [
+        "[Icon Theme]",
+        f"Name={snapshot.title}",
+        f"Comment={snapshot.description}",
+        "Inherits=KDE-Classic,Chicago95,hicolor",
+        "Directories=" + ",".join(directories),
+        "",
+    ]
+    for size in TARGET_SIZES:
+        for category in CATEGORIES:
+            lines.extend(
+                [
+                    f"[{size}x{size}/{category}]",
+                    f"Size={size}",
+                    f"Context={CONTEXTS[category]}",
+                    "Type=Threshold",
+                    "",
+                ]
+            )
+    (theme / "index.theme").write_text("\n".join(lines), encoding="utf-8")
+
+
+def file_fingerprint(root: Path) -> list[tuple[str, str]]:
+    return [
+        (
+            str(item.relative_to(root)),
+            hashlib.sha256(item.read_bytes()).hexdigest()
+            if not item.is_symlink()
+            else f"link:{os.readlink(item)}",
+        )
+        for item in sorted(root.rglob("*"))
+        if item.is_file() or item.is_symlink()
+    ]
+
+
+def build_snapshot(archive: bytes, snapshot: Snapshot, destination: Path) -> dict[str, int]:
+    destination.mkdir()
+    icons, metadata, skipped = load_sources(archive)
+
+    (destination / GENERATED_MARKER).write_text(snapshot.commit + "\n", encoding="ascii")
+    (destination / ".gitattributes").write_text(
+        "AUTHORS -text -diff\nCOPYING -text -diff\nREADME.upstream -text -diff\n",
+        encoding="ascii",
+    )
+    (destination / "AUTHORS").write_bytes(metadata["AUTHORS"])
+    (destination / "COPYING").write_bytes(metadata["COPYING"])
+    (destination / "README.upstream").write_bytes(metadata["README"])
+    (destination / "PROVENANCE").write_text(
+        "\n".join(
+            (
+                f"Upstream: {UPSTREAM_URL}",
+                f"Snapshot: {snapshot.key}",
+                f"Date: {snapshot.date}",
+                f"Description: {snapshot.description}",
+                f"Commit: {snapshot.commit}",
+                f"Tree: {snapshot.tree}",
+                f"Git archive SHA-256: {snapshot.archive_sha256}",
+                "Conversion: Pillow RGBA; transparent square padding; nearest-neighbour standard sizes.",
+                "Native renderings: upstream-native/<original path>.png",
+                "",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    for icon in icons:
+        native = destination / "upstream-native" / Path(str(icon.source)).with_suffix(".png")
+        native.parent.mkdir(parents=True, exist_ok=True)
+        icon.image.save(native, optimize=True)
+
+    families: dict[str, list[SourceIcon]] = {}
+    for icon in icons:
+        families.setdefault(icon.name, []).append(icon)
+
+    written: dict[tuple[int, str], Path] = {}
+    mapping_lines = [
+        "icon_name\ttarget_size\tcategory\tsource\tsource_dimensions\tdecoder"
+    ]
+    for name, candidates in sorted(families.items()):
+        category = min(candidates, key=source_priority).category
+        for size in TARGET_SIZES:
+            source = choose_source(candidates, size)
+            target = destination / f"{size}x{size}" / category / f"{name}.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            image = square_canvas(source.image)
+            if image.size != (size, size):
+                image = image.resize((size, size), Image.Resampling.NEAREST)
+            image.save(target, optimize=True)
+            written[(size, name)] = target
+            mapping_lines.append(
+                f"{name}\t{size}\t{category}\t{source.source}\t"
+                f"{source.image.width}x{source.image.height}\t{source.decoder}"
+            )
+
+    aliases_written = 0
+    for alias, (category, donors) in sorted(ALIASES.items()):
+        for size in TARGET_SIZES:
+            donor = next((written.get((size, name)) for name in donors if (size, name) in written), None)
+            if donor is None:
+                continue
+            target = destination / f"{size}x{size}" / category / f"{alias}.png"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if target.exists():
+                continue
+            target.write_bytes(donor.read_bytes())
+            written[(size, alias)] = target
+            aliases_written += 1
+
+    (destination / "source-map.tsv").write_text(
+        "\n".join(mapping_lines) + "\n", encoding="utf-8"
+    )
+    (destination / "skipped-images.tsv").write_text(
+        "source\treason\tdetail\n" + "\n".join(skipped) + ("\n" if skipped else ""),
+        encoding="utf-8",
+    )
+    write_index(destination, snapshot)
+
+    caches = [item for item in destination.rglob("*") if item.name in CACHE_NAMES]
+    if caches:
+        raise SystemExit(f"forbidden icon cache generated: {caches[0]}")
+    return {
+        "source_images": len(icons),
+        "xpm_fallback": sum(icon.decoder == "xpm-fallback" for icon in icons),
+        "families": len(families),
+        "standard_png": len(written),
+        "aliases": aliases_written,
+        "skipped": len(skipped),
+    }
+
+
+def install_built(built: Path, output: Path) -> str:
+    if output.exists() and not (output / GENERATED_MARKER).is_file():
+        raise SystemExit(f"refusing to replace unmarked icon theme: {output}")
+    if output.is_dir() and file_fingerprint(output) == file_fingerprint(built):
+        return "unchanged"
+
+    old = output.parent / f".{output.name}.old-{os.getpid()}"
+    if output.exists():
+        output.rename(old)
+    built.rename(output)
+    if old.exists():
+        shutil.rmtree(old)
+    return "generated"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Build additive XDG icon themes from pinned official KDE 1 history."
+    )
+    parser.add_argument("source_repo", help="clone of https://github.com/KDE/kde1-kdebase.git")
+    parser.add_argument("--repo-root", default=str(Path.home() / "DotCortex"))
+    parser.add_argument(
+        "--only",
+        choices=tuple(snapshot.key for snapshot in SNAPSHOTS),
+        help="build one snapshot instead of all four",
+    )
+    args = parser.parse_args()
+
+    source_repo = Path(args.source_repo).expanduser().resolve()
+    repo_root = Path(args.repo_root).expanduser().resolve()
+    if not (source_repo / ".git").is_dir():
+        raise SystemExit(f"not a Git worktree: {source_repo}")
+
+    selected = [
+        snapshot
+        for snapshot in SNAPSHOTS
+        if args.only is None or snapshot.key == args.only
+    ]
+    output_root = repo_root / "linux/.local/share/icons"
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    for snapshot in selected:
+        archive = archive_for(source_repo, snapshot)
+        with tempfile.TemporaryDirectory(
+            prefix=f".{snapshot.theme}-", dir=output_root
+        ) as tmp:
+            built = Path(tmp) / snapshot.theme
+            counts = build_snapshot(archive, snapshot, built)
+            status = install_built(built, output_root / snapshot.theme)
+        print(
+            f"kde1-icon-variants-import: snapshot={snapshot.key} "
+            f"commit={snapshot.commit} archive_sha256={snapshot.archive_sha256}"
+        )
+        print(
+            "kde1-icon-variants-import: "
+            + " ".join(f"{key}={value}" for key, value in counts.items())
+            + f" status={status}"
+        )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
