@@ -888,6 +888,9 @@
    (task 'claude:health "Show installed Claude Code plugins vs manifest"
          (lambda () (sh "~/.local/bin/claude-plugins-health")))
 
+   (task 'claude:settings "Tangle shared settings baseline and merge into live settings.json (preserves machine-local model)"
+         (lambda () (sh "tangle-one agents-hooks.org && ~/.local/bin/claude-settings-apply")))
+
    ))
 ;; --- Pretty printing for help ---
 
