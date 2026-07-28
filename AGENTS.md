@@ -221,7 +221,7 @@ Harness-exclusive config lives in its own directory. Nothing crosses these bound
 
 =handoff= is the one deliberate exception: HelmCortex's own harness owns a richer version for its scope, but DotCortex keeps the generic one because deleting it would drop =handoff= out of =~/.claude/skills= entirely for non-HelmCortex sessions.
 
-DotCortex-scoped skills: =dotcortex-*= (bootstrap, borg, gotchas, icons, loom, multihost, package-manifests, packages, update), =helmcortex-nexus=, =json-canvas=, =obsidian-bases=, =obsidian-cli=, =obsidian-markdown=, =pi-agent-gotchas=, =redstone-9x-*=, =sanctuary-gotchas=.
+DotCortex-scoped skills: =dotcortex-*= (bootstrap, borg, gotchas, icons, loom, multihost, package-manifests, packages, update), =redstone-9x-*=, =sanctuary-gotchas=. Six more moved to the userspace lane on 2026-07-27 (=helmcortex-nexus=, =pi-agent-gotchas=, =json-canvas=, =obsidian-bases=, and the =obsidian-cli=/=obsidian-markdown= reference payloads that had been stranded here) — everything left is genuinely about DotCortex-managed systems.
 
 #### Two traps in the compiler, both live
 
@@ -230,6 +230,8 @@ DotCortex-scoped skills: =dotcortex-*= (bootstrap, borg, gotchas, icons, loom, m
 **=~/.gemini/antigravity/skills= is never backed up.** The compiler backs up replaced skills for other substrates into =~/Downloads/helmcortex-backups/=, but not that one. An overwrite there is unrecoverable.
 
 HelmCortex and its workspaces (FORGE, bridge) maintain their own skill harnesses compiled by =helmcortex-compile= from =FORGE/harness/{workspace}/SKILLS.md=. These may intentionally override global skills with project-specific content. Never duplicate a purely generic skill in a project harness — if it has no project-specific content, rely on the global version.
+
+**The full cross-repo map lives in the =harness-bridge= skill** (userspace lane, so it is in =~/.claude/skills/= for every session). It lays out both build systems side by side — DotCortex is literate org+make (=tangle= → overlays → =loom stow=), HelmCortex is markdown+python (=FORGE/harness/{scope}/*.md= → =helmcortex-compile=, which must run with cwd inside =~/HelmCortex=, → =helmstow=) — plus the canonical home of every knowledge category and the step-by-step workflow for updating a userspace skill from a DotCortex session. Load it whenever work spans both systems or before adding/moving any skill.
 
 ## Research Protocol
 
@@ -293,23 +295,9 @@ executing here is cheaper than burning tokens in circles.
 ## Model Guidance
 
 - Main session model cannot be changed autonomously -- use `/model sonnet|haiku` yourself.
-- **Opus 4.8 is viable current top tier** (1M context; architecture, debugging, novel
-  work). The earlier "Opus is not viable, use Sonnet" directive was an April 2026
-  artifact from a period of severe Opus degradation; that regime is over (corrected
-  2026-07-05). Sonnet 5 is the standard workhorse; Haiku is mechanical-only.
-- Subagents (via the Agent tool):
-  - **Haiku (`claude-haiku-4-5-20251001`)** -- mechanical execution: file ops, grep,
-    glob, reading files, git log/status, quick lookups. Zero ambiguity only.
-  - **Sonnet (`claude-sonnet-5`)** -- standard coding, debugging, most tasks.
-  - **Sonnet + thinking high/max** -- architecture, deep multi-file analysis, complex
-    refactors. Never default all subagents to this tier.
-  - **Opus 4.8 (`claude-opus-4-8`)** -- hardest architecture, multi-file reasoning,
-    long-context work; use deliberately, not as a blanket default.
-- When spawning subagents via the Agent tool, always set the `model` parameter
-  explicitly. Never let it default to the current session model for all subagents.
-- Never silently switch model -- state which model and why, one line.
-- Model hints per skill are in each skill's `model:` frontmatter field in `.claude/skills/`.
-  Respect them when spawning subagents for skill-scoped work.
+- **The subagent tier table has ONE home: the `subagent-routing` skill** (authored in `HelmCortex/FORGE/harness/userspace/SKILLS.md`, deployed to `~/.claude/skills/` via the userspace lane, so every session sees it). Load it before spawning subagents via the Agent tool. It carries the current tier rulings — including the provisional Opus 5 entry — and supersedes any tier table previously restated here; do not re-add one, that is how drift happens.
+- Standing rules that stay here: always set the `model` parameter explicitly per subagent (never default all subagents to the session model), and never silently switch model -- state which model and why, one line.
+- Skill `model:` frontmatter is **BANNED in every scope** -- the key is operative in Claude Code and silently switches the executing model for the skill's turns (frontmatter pins removed in `15edb66de`; law sealed 2026-07-11 in `HelmCortex/FORGE/harness/HelmCortex/META-AGENTS.md`, with the cache law). Model hints live as inert `<!-- model -->` comment blocks in harness sources instead.
 
 ## Build & Apply
 
