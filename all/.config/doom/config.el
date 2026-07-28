@@ -3,6 +3,29 @@
 ;; Place your private configuration here! Remember, you do not need to run 'doom
 ;; sync' after modifying this file!
 
+;; --- Environment bootstrap (ported from emacs-spacemacs.org blk-user-init) ---
+
+;; Every dotfile in $HOME is a stow symlink into the DotCortex git repo, so the
+;; default `vc-follow-symlinks' value of 'ask fires "Symbolic link to
+;; Git-controlled source file; follow link?" on essentially every file visit.
+;; Follow silently: we always want the real file under version control, never
+;; the link.
+(setq vc-follow-symlinks t)
+
+;; Prefer GUIX_PROFILE/bin first in Emacs' own PATH/exec-path, so subprocesses
+;; (ripgrep, git, python3, ...) resolve Guix-installed tools first regardless
+;; of how Doom was launched (GUI launcher, systemd, emacsclient from a plain
+;; shell may all carry a thinner ambient PATH than an interactive zsh login).
+(let ((gp (getenv "GUIX_PROFILE")))
+  (when (and gp (file-directory-p (expand-file-name "bin" gp)))
+    (add-to-list 'exec-path (expand-file-name "bin" gp))
+    (setenv "PATH" (concat (expand-file-name "bin" gp)
+                            path-separator
+                            (getenv "PATH")))))
+
+;; Treemacs: use whatever python3 is first in exec-path (i.e. Guix's).
+(with-eval-after-load 'treemacs
+  (setq treemacs-python-executable (or (executable-find "python3") "python3")))
 
 ;; Some functionality uses this to identify you, e.g. GPG configuration, email
 ;; clients, file templates and snippets. It is optional.
@@ -285,6 +308,12 @@
 ;; whichever client launches it.
 ;; https://github.com/anthropics/claude-code/issues/42670
 (setenv "CLAUDE_CODE_NO_FLICKER" "1")
+
+;; --- Ad hoc quick-shell popup placement (ported from emacs-spacemacs.org's
+;; `shell' layer: shell-default-height 10, shell-default-position 'bottom).
+;; Scoped to plain `*vterm*' buffers only — claude-code-ide and codex-ide manage
+;; their own side-window placement and are untouched by this rule.
+(set-popup-rule! "^\\*vterm\\*" :side 'bottom :size 10 :select t :quit t)
 
 ;; --- Terminal font picker ---------------------------------------------------
 ;; Preference order is declared in fonts.org; the first installed family wins,
