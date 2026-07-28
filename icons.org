@@ -287,6 +287,248 @@ if __name__ == "__main__":
     raise SystemExit(main())
 #+END_SRC
 
+* KDE-Classic deterministic importer
+
+KDE 1 Alpha uses the native KDE-Classic icon corpus from KDE Artwork 4.14.3,
+not a recoloured modern theme.  The importer accepts only the pinned upstream
+archive, extracts only =IconThemes/kdeclassic=, preserves every native PNG,
+repairs the malformed =64x64apps= index entry, adds the Redstone fallback chain,
+and fills missing 22/24px slots with nearest-neighbour scaling.  Repository-side
+icon caches are forbidden.
+
+#+BEGIN_SRC python :tangle all/.local/bin/kde-classic-import :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import tarfile
+import tempfile
+from pathlib import Path, PurePosixPath
+
+from PIL import Image
+
+
+ARCHIVE_SHA256 = "93dce7cbde334b31f07d7ebfcc00b3431695f685f8ccd9c8ef8f94d883f80ef4"
+ARCHIVE_PREFIX = PurePosixPath("kdeartwork-4.14.3/IconThemes/kdeclassic")
+TARGET_SIZES = (22, 24)
+CACHE_NAMES = {"icon-theme.cache", ".icon-theme.cache"}
+CONTEXTS = {
+    "actions": "Actions",
+    "animations": "Animations",
+    "apps": "Applications",
+    "categories": "Categories",
+    "devices": "Devices",
+    "emblems": "Emblems",
+    "filesystems": "FileSystems",
+    "mimetypes": "MimeTypes",
+    "places": "Places",
+}
+
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def extract_theme(archive: Path, destination: Path) -> None:
+    """Extract regular files below the one pinned theme prefix, without links."""
+    with tarfile.open(archive, "r:*") as tf:
+        selected = 0
+        for member in tf.getmembers():
+            member_path = PurePosixPath(member.name)
+            try:
+                relative = member_path.relative_to(ARCHIVE_PREFIX)
+            except ValueError:
+                continue
+            if not relative.parts:
+                continue
+            if member.issym() or member.islnk() or member.isdev():
+                raise SystemExit(f"unsafe archive member: {member.name}")
+            if relative.is_absolute() or ".." in relative.parts:
+                raise SystemExit(f"unsafe archive path: {member.name}")
+            target = destination.joinpath(*relative.parts)
+            if member.isdir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            if not member.isfile():
+                continue
+            source = tf.extractfile(member)
+            if source is None:
+                raise SystemExit(f"cannot read archive member: {member.name}")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read())
+            os.chmod(target, member.mode & 0o777)
+            selected += 1
+    if selected == 0:
+        raise SystemExit(f"archive contains no files below {ARCHIVE_PREFIX}")
+
+
+def native_pngs(theme: Path) -> tuple[list[tuple[int, Path, Path]], int]:
+    entries = []
+    nonstandard = 0
+    for size_dir in sorted(theme.iterdir()):
+        match = re.fullmatch(r"(\d+)x\1", size_dir.name)
+        if not match or not size_dir.is_dir():
+            continue
+        size = int(match.group(1))
+        for icon in sorted(size_dir.rglob("*.png")):
+            relative = icon.relative_to(size_dir)
+            with Image.open(icon) as image:
+                if image.size != (size, size):
+                    # KDE-Classic intentionally carries a few glyph-shaped
+                    # native canvases (for example 16x16/actions/3downarrow.png
+                    # is 12x18). Inventory them, but never normalize or rewrite
+                    # upstream art merely because its logical directory is
+                    # square.
+                    nonstandard += 1
+            entries.append((size, relative, icon))
+    return entries, nonstandard
+
+
+def fill_panel_sizes(theme: Path, native: list[tuple[int, Path, Path]]) -> int:
+    by_relative: dict[Path, list[tuple[int, Path]]] = {}
+    for size, relative, icon in native:
+        by_relative.setdefault(relative, []).append((size, icon))
+
+    generated = 0
+    for target_size in TARGET_SIZES:
+        for relative, sources in sorted(by_relative.items(), key=lambda item: str(item[0])):
+            target = theme / f"{target_size}x{target_size}" / relative
+            if target.exists():
+                continue
+            source_size, source = min(
+                sources,
+                key=lambda item: (abs(item[0] - target_size), -item[0]),
+            )
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with Image.open(source) as image:
+                image.resize(
+                    (target_size, target_size), Image.Resampling.NEAREST
+                ).save(target, optimize=True)
+            generated += 1
+    return generated
+
+
+def indexed_directories(theme: Path) -> list[str]:
+    directories = []
+    for size_dir in theme.iterdir():
+        match = re.fullmatch(r"(\d+)x\1", size_dir.name)
+        if not match or not size_dir.is_dir():
+            continue
+        for category in size_dir.iterdir():
+            if category.is_dir() and any(category.glob("*.png")):
+                directories.append(f"{size_dir.name}/{category.name}")
+    return sorted(
+        directories,
+        key=lambda value: (int(value.split("x", 1)[0]), value.split("/", 1)[1]),
+    )
+
+
+def repair_index(theme: Path) -> None:
+    index = theme / "index.theme"
+    text = index.read_text(encoding="utf-8")
+    text = text.replace("64x64apps", "64x64/apps")
+    if not re.search(r"^Inherits=", text, re.MULTILINE):
+        text = text.replace(
+            "DisplayDepth=32\n",
+            "DisplayDepth=32\nInherits=Chicago95,hicolor\n",
+            1,
+        )
+
+    directories = indexed_directories(theme)
+    text = re.sub(
+        r"^Directories=.*$",
+        "Directories=" + ",".join(directories),
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    sections = set(re.findall(r"^\[([0-9]+x[0-9]+/[^]]+)\]$", text, re.MULTILINE))
+    additions = []
+    for directory in directories:
+        if directory in sections:
+            continue
+        size_text, category = directory.split("/", 1)
+        size = int(size_text.split("x", 1)[0])
+        context = CONTEXTS.get(category, category.title())
+        additions.append(
+            f"\n[{directory}]\nSize={size}\nContext={context}\nType=Threshold\n"
+        )
+    index.write_text(text.rstrip() + "\n" + "".join(additions), encoding="utf-8")
+
+
+def tree_fingerprint(root: Path) -> list[tuple[str, str]]:
+    return [
+        (str(path.relative_to(root)), digest(path))
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    ]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "archive",
+        nargs="?",
+        default=str(Path.home() / "Downloads/kdeartwork-4.14.3.tar.xz"),
+    )
+    parser.add_argument("--repo-root", default=str(Path.home() / "DotCortex"))
+    args = parser.parse_args()
+
+    archive = Path(args.archive).expanduser().resolve()
+    repo = Path(args.repo_root).expanduser().resolve()
+    if not archive.is_file():
+        raise SystemExit(f"missing KDE Artwork archive: {archive}")
+    actual_sha = digest(archive)
+    if actual_sha != ARCHIVE_SHA256:
+        raise SystemExit(
+            f"KDE Artwork checksum mismatch: expected {ARCHIVE_SHA256}, got {actual_sha}"
+        )
+
+    output = repo / "linux/.local/share/icons/KDE-Classic"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".kde-classic-", dir=output.parent) as tmp:
+        built = Path(tmp) / "KDE-Classic"
+        built.mkdir()
+        extract_theme(archive, built)
+        for required in ("LICENSE", "AUTHORS", "index.theme"):
+            if not (built / required).is_file():
+                raise SystemExit(f"archive theme missing {required}")
+        native, native_nonstandard = native_pngs(built)
+        generated = fill_panel_sizes(built, native)
+        repair_index(built)
+
+        caches = [path for path in built.rglob("*") if path.name in CACHE_NAMES]
+        if caches:
+            raise SystemExit(f"archive/import produced forbidden icon cache: {caches[0]}")
+
+        status = "generated"
+        if output.is_dir() and tree_fingerprint(output) == tree_fingerprint(built):
+            status = "unchanged"
+        else:
+            old = output.parent / f".{output.name}.old-{os.getpid()}"
+            if output.exists():
+                output.rename(old)
+            built.rename(output)
+            if old.exists():
+                shutil.rmtree(old)
+
+    total_png = sum(1 for _ in output.rglob("*.png"))
+    print(f"kde-classic-import: archive_sha256={actual_sha}")
+    print(
+        f"kde-classic-import: native_png={len(native)} "
+        f"native_nonstandard_dimensions={native_nonstandard} "
+        f"generated_22_24={generated} total_png={total_png} status={status}"
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
 * App icon injection helper
 Scale a source image into one or more repo-managed icon themes, using the
 theme's directory grammar. This is for app icon aliases such as =kitty=,
