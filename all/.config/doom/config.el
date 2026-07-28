@@ -501,6 +501,15 @@ advice below). Registered as an emulation map so it outranks
 (map! :leader
       :desc "Codex IDE menu" "o x" #'codex-ide-menu)
 
+;; codex-ide's session-list and status buffers bind their own RET to open/resume
+;; the entry at point, but evil's normal/motion state map claims plain RET first
+;; (`evil-ret', which just moves down a line) — override it back per mode so RET
+;; does what the package intends instead of silently scrolling.
+(map! :map codex-ide-status-mode-map
+      :nv "RET" #'codex-ide-status-mode-display-session-at-point
+      :map codex-ide-session-list-mode-map
+      :nv "RET" #'codex-ide-session-list-display-session-at-point)
+
 ;; Pi inside Doom (see the package! declaration in the packages block). The `pi'
 ;; CLI must be on PATH — confirmed here at ~/.npm-global/bin/pi with an existing
 ;; ~/.pi/agent/auth.json. `pi-coding-agent' starts/focuses the current project's
