@@ -11,7 +11,8 @@ This is a Linux-first wrapper that chooses the best local usage probe per
 provider instead of forcing everything through =codexbar=. It prefers
 =fuelcheck-cli= for OAuth/local providers, =antigravity-kit auth quota=
 for Antigravity, =gemini-cli-usage= for Gemini CLI quotas, keeps
-=codexbar= where it is actually useful on Linux, and adds direct
+=codexbar= where it is actually useful on Linux, augments Codex with the
+count and local expiry countdown for banked rate-limit resets, and adds direct
 Bearer-token probes for DeepInfra (env token or =deepctl auth token=),
 NeuralWatt (=NEURALWATT_API_KEY=, =/v1/quota=), and Fireworks
 (=FIREWORKS_API_KEY= + =FIREWORKS_ACCOUNT_ID=; account-status only, since
@@ -86,6 +87,8 @@ ANTIGRAVITY_CLOUD_CODE_BASE_URL = "https://cloudcode-pa.googleapis.com"
 ANTIGRAVITY_QUOTA_API_URL = f"{ANTIGRAVITY_CLOUD_CODE_BASE_URL}/v1internal:fetchAvailableModels"
 ANTIGRAVITY_LOAD_CODE_ASSIST_URL = f"{ANTIGRAVITY_CLOUD_CODE_BASE_URL}/v1internal:loadCodeAssist"
 ANTIGRAVITY_USER_AGENT = "antigravity/1.11.3 Darwin/arm64"
+CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
+CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
 
 NF = {
     "check": "\uf058",
@@ -753,6 +756,74 @@ def format_codex_status_line(label: str, pct_left: Any, raw: dict[str, Any]) -> 
     return f"  {FGY}{label:<8}{R} {bar} {round(remaining_pct):>3d}%{reset_suffix}"
 
 
+def expiry_week_percent(value: str | None, now: datetime | None = None) -> float | None:
+    expiry = parse_iso_datetime(value)
+    if not expiry:
+        return None
+
+    current = now or datetime.now(timezone.utc)
+    seconds_left = max(
+        0.0,
+        min(float(7 * 24 * 60 * 60), (expiry - current).total_seconds()),
+    )
+    return (seconds_left / (7 * 24 * 60 * 60)) * 100.0
+
+
+def format_codex_reset_credit_lines(raw: dict[str, Any]) -> list[str]:
+    reset_credits = raw.get("resetCredits")
+    if not isinstance(reset_credits, dict):
+        error = raw.get("resetCreditsError")
+        if isinstance(error, str) and error:
+            bar = format_bar(0.0, 20, color=RD)
+            return [
+                f"  {FGY}{'banked':<8}{R} {bar}   ?  "
+                f"{RD}{NF['hourglass']} unavailable ({error}){R}"
+            ]
+        return []
+
+    credits = reset_credits.get("credits")
+    if not isinstance(credits, list):
+        credits = []
+
+    available = reset_credits.get("availableCount")
+    if not isinstance(available, int) or isinstance(available, bool):
+        available = sum(
+            1
+            for credit in credits
+            if isinstance(credit, dict) and credit.get("status") == "available"
+        )
+
+    available_credits = [
+        credit
+        for credit in credits
+        if isinstance(credit, dict) and credit.get("status") == "available"
+    ]
+    available_credits.sort(key=lambda credit: str(credit.get("expiresAt") or ""))
+
+    if not available_credits:
+        bar = format_bar(0.0, 20)
+        return [f"  {FGY}{'banked':<8}{R} {bar}   0"]
+
+    lines: list[str] = []
+    for index, credit in enumerate(available_credits, start=1):
+        expires_at = credit.get("expiresAt")
+        expiry_text = expires_at if isinstance(expires_at, str) else None
+        pct = expiry_week_percent(expiry_text)
+        countdown = format_countdown(expiry_text) or "?"
+        if pct is None:
+            bar = format_bar(0.0, 20, color=RD)
+            pct_text = "  ?%"
+        else:
+            bar = format_bar(pct, 20)
+            pct_text = f"{round(pct):>3d}%"
+        lines.append(
+            f"  {FGY}{f'bank {index}':<8}{R} {bar} {pct_text}  "
+            f"{FGY}{NF['hourglass']} {countdown}{R}"
+        )
+
+    return lines
+
+
 def week_of_year_label(value: str | None) -> str | None:
     dt = parse_iso_datetime(value)
     if not dt:
@@ -883,6 +954,102 @@ def codexbar_path() -> list[str] | None:
     if shutil.which("codexbar"):
         return ["codexbar"]
     return None
+
+
+def codex_auth_tokens() -> tuple[str | None, str | None]:
+    try:
+        data = json.loads(CODEX_AUTH_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, None
+
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, dict):
+        return None, None
+
+    access_token = tokens.get("access_token")
+    account_id = tokens.get("account_id")
+    if not isinstance(access_token, str) or not access_token:
+        access_token = None
+    if not isinstance(account_id, str) or not account_id:
+        account_id = None
+    return access_token, account_id
+
+
+def fetch_codex_reset_credits(timeout_seconds: float) -> tuple[dict[str, Any] | None, str | None]:
+    access_token, account_id = codex_auth_tokens()
+    if not access_token or not account_id:
+        return None, "Codex auth tokens unavailable"
+
+    request = urllib.request.Request(
+        CODEX_RESET_CREDITS_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "ChatGPT-Account-ID": account_id,
+            "Accept": "application/json",
+            "User-Agent": "DotCortex ai-usage",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return None, f"HTTP {error.code}"
+    except urllib.error.URLError as error:
+        return None, f"request failed: {error.reason}"
+    except (TimeoutError, ValueError):
+        return None, "invalid or timed-out response"
+
+    if not isinstance(data, dict) or not isinstance(data.get("credits"), list):
+        return None, "unexpected response shape"
+
+    credits: list[dict[str, Any]] = []
+    for credit in data["credits"]:
+        if not isinstance(credit, dict):
+            continue
+        credits.append(
+            {
+                "resetType": credit.get("reset_type"),
+                "status": credit.get("status"),
+                "expiresAt": credit.get("expires_at"),
+            }
+        )
+
+    available_count = data.get("available_count")
+    if not isinstance(available_count, int) or isinstance(available_count, bool):
+        available_count = sum(1 for credit in credits if credit.get("status") == "available")
+
+    total_earned_count = data.get("total_earned_count")
+    if not isinstance(total_earned_count, int) or isinstance(total_earned_count, bool):
+        total_earned_count = None
+
+    return {
+        "availableCount": available_count,
+        "totalEarnedCount": total_earned_count,
+        "credits": credits,
+    }, None
+
+
+def enrich_codex_reset_credits(
+    result: dict[str, Any],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    reset_credits, error = fetch_codex_reset_credits(timeout_seconds)
+    raw = result.get("raw")
+    if not isinstance(raw, dict):
+        raw = {}
+    else:
+        raw = dict(raw)
+
+    if reset_credits is not None:
+        raw["resetCredits"] = reset_credits
+        raw.pop("resetCreditsError", None)
+    elif error:
+        raw["resetCreditsError"] = error
+
+    result = dict(result)
+    result["raw"] = raw
+    return result
 
 
 def fetch_codexbar(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
@@ -1901,9 +2068,18 @@ def _revive(cached: dict[str, Any], spec: ProviderSpec) -> dict[str, Any]:
     return dict(cached)
 
 
+def _provider_cache_key(spec: ProviderSpec) -> str:
+    # The Codex result grew resetCredits in 2026-07. Keep it isolated from
+    # pre-feature watchers that still read and write the older result shape.
+    if spec.key == "codex":
+        return "codex-v2"
+    return spec.key
+
+
 def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
     now = time.time()
-    entry = _cache_read(spec.key)
+    cache_key = _provider_cache_key(spec)
+    entry = _cache_read(cache_key)
     cached = entry.get("result")
 
     # Serve a fresh cache without touching the network. This is what makes N
@@ -1937,7 +2113,7 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
         step = int(entry.get("backoff_step", 0))
         delay = BACKOFF_STEPS[min(step, len(BACKOFF_STEPS) - 1)]
         _cache_write(
-            spec.key,
+            cache_key,
             {
                 "ts": float(entry.get("ts", 0)),
                 "result": cached,
@@ -1953,13 +2129,19 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
     # an error would serve the error back for the whole TTL.
     if result.get("state") != "error":
         _cache_write(
-            spec.key,
+            cache_key,
             {"ts": now, "result": _cacheable(result), "backoff_until": 0, "backoff_step": 0},
         )
     return result
 
 
 def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
+    if spec.key == "codex":
+        result = fetch_codexbar(spec, timeout_seconds)
+        if result["state"] == "ok":
+            return enrich_codex_reset_credits(result, timeout_seconds)
+        return result
+
     if spec.key == "gemini":
         result = fetch_gemini_cli_usage(spec, timeout_seconds)
         if result["state"] == "missing" and spec.fuelcheck_provider:
@@ -2135,6 +2317,8 @@ def render_text(results: list[dict[str, Any]]) -> None:
                 ideal = format_week_left_line("wk", weekly_reset_at if isinstance(weekly_reset_at, str) else None)
                 if ideal:
                     print(ideal)
+                for line in format_codex_reset_credit_lines(raw):
+                    print(line)
                 continue
 
         if item["provider"] == "codex" and isinstance(raw, dict) and (
@@ -2150,6 +2334,8 @@ def render_text(results: list[dict[str, Any]]) -> None:
             ideal = format_week_left_line("wk", weekly_reset_at)
             if ideal:
                 print(ideal)
+            for line in format_codex_reset_credit_lines(raw):
+                print(line)
             continue
 
         if item["provider"] in {"codex", "claude"} and isinstance(raw, dict):
@@ -2186,6 +2372,9 @@ def render_text(results: list[dict[str, Any]]) -> None:
             ideal = format_week_left_line("wk", weekly_reset_at if isinstance(weekly_reset_at, str) else None)
             if ideal:
                 print(ideal)
+            if item["provider"] == "codex":
+                for line in format_codex_reset_credit_lines(raw):
+                    print(line)
 
         elif item["provider"] == "gemini" and isinstance(raw, dict):
             account_quota = raw.get("account_quota")
@@ -2386,4 +2575,3 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 #+END_SRC
-
