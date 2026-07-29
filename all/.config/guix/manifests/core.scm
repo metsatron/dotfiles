@@ -61,6 +61,7 @@
 
    "smem"
    "mandoc"          ; roff→HTML renderer for the fleet documentation library (sanctuary-docs.org)
+   "libheif"         ; heif-dec/heif-info — decode iPhone HEIC photos (herdr-web uploads) to JPEG/PNG for agent vision; agents' ffmpeg tile-grid fallback lives in the heic-photos userspace skill
 
    ;; rust/cargo managed via dotcortex-rust-env (rustup) — not Guix
    ;; cargo crates managed via package-cargo.org
