@@ -18,5 +18,18 @@
    "wmnd"           ; network dock tile
    "wmamixer"       ; audio mixer dock tile (undocked by default; root-menu launch)
    "font-tex-gyre"  ; TeX Gyre Heros — Helvetica-metric titlebar/menu font
+   ;; ── GNUstep source-build toolchain (sanctuary-gnustep-build, Phase B) ──
+   ;; No gcc-objc in Guix → the runtime is clang + libobjc2 (ng-gnu-gnu combo).
+   "clang-toolchain" ; Objective-C compiler for the ng runtime
+   "libobjc2"       ; GNUstep ObjC2 runtime (2.2.1)
+   "make"           ; GNU make (gnustep-make is built from source, 2.9.3)
+   "pkg-config"
+   "tar" "gzip"     ; install steps (manpage compression) need them in-guest
+   "libffi"         ; NSInvocation / DO forwarding
+   "libxml2" "gnutls" "icu4c" "zlib"     ; gnustep-base
+   "curl"           ; libcurl — hard dep of base's ObjC-2.0 toolchain path
+   "cairo"          ; gnustep-back backend — propagates freetype/fontconfig/libpng
+   "libx11" "libxext" "libxrender" "libxt" ; X11 for back (Xt required by x11 server)
+   "libjpeg-turbo" "libtiff"             ; gnustep-gui image reps (libpng via cairo)
    ))
 ;; sanctuary-gnustep:1 ends here
