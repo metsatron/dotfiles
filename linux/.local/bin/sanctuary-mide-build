@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Source build: sanctuary-mide-build
+
+# Host-side build driver following the =sanctuary-cde-build= pattern: an inner script heredoc executed through =sanctuary-exec= inside the container. Build order is Osiris 2.4.4 (meson), then MiDesktop =libs= → =base= → =utils= (CMake + Ninja, =CMAKE_BUILD_TYPE=Debug= per upstream README). Each stage is guarded by its own sentinel file inside =/opt/kde1= and the whole script is safe to re-run; a re-run after success is a fast no-op. Upstream notes CMake may warn about missing xcb/xkb/libtiff even when they are present — ignorable as long as compilation succeeds.
+
+
+# [[file:../../../sanctuary-mide.org::*Source build: sanctuary-mide-build][Source build: sanctuary-mide-build:1]]
+# Build Osiris 2.4.4 + MiDesktop 1.2 from source inside sanctuary-mide.
+# Run once from the host: sanctuary-mide-build
+# Sources: https://centre.libranext.com/libranext/{osiris,mide}
+set -euo pipefail
+
+usage() {
+  cat <<EOF
+sanctuary-mide-build - build Osiris + MiDesktop inside sanctuary-mide
+
+Usage: sanctuary-mide-build
+       sanctuary-mide-build -h | --help
+
+No arguments. Clones, compiles, and installs the Osiris toolkit (2.4.4)
+and MiDesktop (branch 1.2: libs, base, utils) into /opt/kde1 — a bind
+volume backed by the host at
+~/.local/share/dotcortex/guests/sanctuary-mide/opt-kde1, so the install
+and its stage sentinels survive container recreation. Idempotent:
+completed stages are skipped via sentinel files.
+EOF
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+if (( $# > 0 )); then
+  usage >&2
+  exit 1
+fi
+
+OSIRIS_TAG="2.4.4"
+MIDE_BRANCH="1.2"
+SANCTUARY="sanctuary-mide"
+GUIX_PROFILES="${HOME}/.guix-extra-profiles"
+
+# Heredoc builds the inner script — outer-shell vars (OSIRIS_TAG, MIDE_BRANCH,
+# GUIX_PROFILES) expand at heredoc time; inner-shell vars are deferred via \$.
+INNER_SCRIPT=$(cat <<INNER_EOF
+set -eo pipefail
+
+PREFIX=/opt/kde1
+SRC=\${HOME}/.local/share/mide-src
+
+# Pre-declare vars the Guix profile scripts append to — they run under set -u
+# semantics in some layers and must never hit an unbound variable.
+export PKG_CONFIG_PATH="\${PKG_CONFIG_PATH:-}"
+export LD_LIBRARY_PATH="\${LD_LIBRARY_PATH:-}"
+export CMAKE_PREFIX_PATH="\${CMAKE_PREFIX_PATH:-}"
+
+GUIX_PROFILE=${GUIX_PROFILES}/desktop-common/desktop-common
+. \${GUIX_PROFILE}/etc/profile
+GUIX_PROFILE=${GUIX_PROFILES}/sanctuary-mide/sanctuary-mide
+. \${GUIX_PROFILE}/etc/profile
+export CURL_CA_BUNDLE=\${GIT_SSL_CAINFO}
+
+if [ ! -d "\${PREFIX}" ] || [ ! -w "\${PREFIX}" ]; then
+  echo "\${PREFIX} is missing or not writable — the opt-kde1 bind volume is absent." >&2
+  echo "Recreate the container: distrobox-sanctuaries-create sanctuary-mide" >&2
+  exit 1
+fi
+
+# Single merged prefix: Osiris and MiDesktop both live in /opt/kde1
+# (KDE1-era merged QTDIR/KDEDIR convention).
+export QTDIR=\${PREFIX}
+export KDEDIR=\${PREFIX}
+export CMAKE_PREFIX_PATH=\${PREFIX}\${CMAKE_PREFIX_PATH:+:\${CMAKE_PREFIX_PATH}}
+export PKG_CONFIG_PATH=\${PREFIX}/lib/pkgconfig\${PKG_CONFIG_PATH:+:\${PKG_CONFIG_PATH}}
+# Osiris (meson, --libdir=lib) installs to lib; MiDesktop (CMake) detects
+# lib64 — both are live library dirs in this prefix.
+export LD_LIBRARY_PATH=\${PREFIX}/lib:\${PREFIX}/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}
+export PATH=\${PREFIX}/bin:\${PATH}
+
+mkdir -p "\${SRC}"
+cd "\${SRC}"
+
+if [ ! -d osiris ]; then
+  echo "Cloning Osiris ${OSIRIS_TAG}..."
+  git clone --depth 1 --branch ${OSIRIS_TAG} https://centre.libranext.com/libranext/osiris.git
+fi
+if [ ! -d mide ]; then
+  echo "Cloning MiDesktop ${MIDE_BRANCH}..."
+  git clone --depth 1 --branch ${MIDE_BRANCH} https://centre.libranext.com/libranext/mide.git
+fi
+
+# ── Stage 1: Osiris toolkit (meson) ─────────────────────────────────────────
+if [ ! -f "\${PREFIX}/.sentinel-osiris-${OSIRIS_TAG}" ]; then
+  echo "Building Osiris ${OSIRIS_TAG}..."
+  cd "\${SRC}/osiris"
+  # Osiris' post-install script writes /etc/ld.so.conf.d and /etc/profile.d,
+  # which are root-owned container-layer paths an unprivileged sanctuary user
+  # cannot touch — and unnecessary here: the launcher and this build export
+  # PATH/LD_LIBRARY_PATH explicitly. Neutralize it (idempotent).
+  if ! grep -q 'DotCortex: skipped' _install_generate_ldconfig_profile.sh; then
+    sed -i '1a exit 0 # DotCortex: skipped — /etc unwritable in sanctuary; env set by launcher' \
+      _install_generate_ldconfig_profile.sh
+  fi
+  # --libdir=lib pins the meson libdir so PKG_CONFIG_PATH/LD_LIBRARY_PATH above
+  # stay correct regardless of platform-detected multiarch defaults.
+  meson setup build --prefix="\${PREFIX}" --libdir=lib
+  ninja -C build
+  ninja -C build install
+  touch "\${PREFIX}/.sentinel-osiris-${OSIRIS_TAG}"
+else
+  echo "Osiris ${OSIRIS_TAG} already installed (sentinel present)"
+fi
+
+# MiDesktop's OsirisMacros.cmake hardcodes /opt/osiris/bin/moc; Osiris is
+# co-installed in /opt/kde1 here — repoint it (idempotent).
+sed -i 's|/opt/osiris/bin/moc|/opt/kde1/bin/moc|g' \
+  "\${SRC}/mide/libs/cmake/OsirisMacros.cmake"
+# libs installs its CMake modules (FindKDE1.cmake etc.) into CMAKE_ROOT and an
+# ld.so.conf.d snippet into /etc — the former is the read-only Guix store, the
+# latter is disposable container layer. Keep both inside the prefix; base and
+# utils get the module dir via -DCMAKE_MODULE_PATH below. (idempotent)
+sed -i \
+  -e 's|DESTINATION \${CMAKE_ROOT}/Modules)|DESTINATION \${CMAKE_INSTALL_PREFIX}/share/cmake/Modules)|' \
+  -e 's|DESTINATION "/etc/ld.so.conf.d/")|DESTINATION "\${CMAKE_INSTALL_PREFIX}/etc/ld.so.conf.d/")|' \
+  "\${SRC}/mide/libs/CMakeLists.txt"
+# base likewise installs a profile.d snippet and a display-manager xsession
+# entry to absolute system paths — unwritable and pointless in the sanctuary
+# (the launcher execs startmidesktop directly). Keep them in the prefix.
+sed -i \
+  -e 's|DESTINATION "/etc/profile.d/"|DESTINATION "\${CMAKE_INSTALL_PREFIX}/etc/profile.d/"|' \
+  -e 's|DESTINATION "/usr/share/xsessions/"|DESTINATION "\${CMAKE_INSTALL_PREFIX}/share/xsessions/"|' \
+  "\${SRC}/mide/base/CMakeLists.txt"
+
+# ── Stages 2-4: MiDesktop libs → base → utils (CMake + Ninja) ───────────────
+for section in libs base utils; do
+  if [ -f "\${PREFIX}/.sentinel-mide-\${section}" ]; then
+    echo "MiDesktop \${section} already installed (sentinel present)"
+    continue
+  fi
+  echo "Building MiDesktop \${section}..."
+  cd "\${SRC}/mide/\${section}"
+  mkdir -p build
+  cd build
+  # MiDesktop's bundled FindOsiris.cmake searches only the hardcoded
+  # /opt/osiris prefix; point it at the co-installed /opt/kde1 tree instead.
+  cmake -G Ninja \
+    -DCMAKE_INSTALL_PREFIX="\${PREFIX}" \
+    -DCMAKE_BUILD_TYPE=Debug \
+    -DCMAKE_PREFIX_PATH="\${PREFIX}" \
+    -DOSIRIS_INCLUDE_DIR="\${PREFIX}/include/osiris" \
+    -DOSIRIS_LIBRARY_DIR="\${PREFIX}/lib" \
+    -DCMAKE_MODULE_PATH="\${PREFIX}/share/cmake/Modules" \
+    -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+    ..
+  ninja
+  ninja install
+  touch "\${PREFIX}/.sentinel-mide-\${section}"
+done
+
+if [ -x "\${PREFIX}/bin/startmidesktop" ]; then
+  echo "MiDesktop ${MIDE_BRANCH} installed to \${PREFIX}"
+  echo "Session starter: \${PREFIX}/bin/startmidesktop"
+  echo "Launch with: sanctuary-mide-launch"
+else
+  echo "Build finished but \${PREFIX}/bin/startmidesktop is missing — inspect the base stage." >&2
+  exit 1
+fi
+INNER_EOF
+)
+sanctuary-exec "${SANCTUARY}" sh -c "${INNER_SCRIPT}"
+# Source build: sanctuary-mide-build:1 ends here
