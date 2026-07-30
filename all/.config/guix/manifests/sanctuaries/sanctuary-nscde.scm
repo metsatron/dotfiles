@@ -36,6 +36,23 @@
    "rofi"          ; launcher integration
    "xclip"         ; screenshots to clipboard
    "imagemagick"   ; screenshots to file (import/convert)
+   ;; Private session bus — the launcher wraps the session in dbus-run-session
+   ;; so in-room single-instance apps (GIMP, Firefox, LibreOffice) can never
+   ;; rendezvous with host instances over the leaked host bus address
+   "dbus"
+   ;; ── Application suite ─────────────────────────────────────────────────
+   ;; The room must OWN its applications: distrobox bind-mounts the host home,
+   ;; so a menu entry for an app missing from this profile falls through to
+   ;; the host's binary (and via the host D-Bus, to the host's running
+   ;; instance — the GIMP hijack of 2026-07-30). Modeled on sanctuary-cde's
+   ;; roster, kept to the core; extend on demand.
+   "gimp"           ; image editor (the reported hijack case)
+   "firefox"        ; web browser
+   "icedove"        ; mail (Thunderbird libre; front-panel mail slot)
+   "libreoffice"    ; office suite
+   "vlc"            ; media player
+   "emacs"          ; editor
+   "pcmanfm"        ; X file manager — first-run setup found none to offer
    ;; Fallback terminal inside the sanctuary (also NsCDE first-setup requirement)
    "xterm"
    ))
