@@ -3,6 +3,29 @@
 ;; Place your private configuration here! Remember, you do not need to run 'doom
 ;; sync' after modifying this file!
 
+;; --- Environment bootstrap (ported from emacs-spacemacs.org blk-user-init) ---
+
+;; Every dotfile in $HOME is a stow symlink into the DotCortex git repo, so the
+;; default `vc-follow-symlinks' value of 'ask fires "Symbolic link to
+;; Git-controlled source file; follow link?" on essentially every file visit.
+;; Follow silently: we always want the real file under version control, never
+;; the link.
+(setq vc-follow-symlinks t)
+
+;; Prefer GUIX_PROFILE/bin first in Emacs' own PATH/exec-path, so subprocesses
+;; (ripgrep, git, python3, ...) resolve Guix-installed tools first regardless
+;; of how Doom was launched (GUI launcher, systemd, emacsclient from a plain
+;; shell may all carry a thinner ambient PATH than an interactive zsh login).
+(let ((gp (getenv "GUIX_PROFILE")))
+  (when (and gp (file-directory-p (expand-file-name "bin" gp)))
+    (add-to-list 'exec-path (expand-file-name "bin" gp))
+    (setenv "PATH" (concat (expand-file-name "bin" gp)
+                            path-separator
+                            (getenv "PATH")))))
+
+;; Treemacs: use whatever python3 is first in exec-path (i.e. Guix's).
+(with-eval-after-load 'treemacs
+  (setq treemacs-python-executable (or (executable-find "python3") "python3")))
 
 ;; Some functionality uses this to identify you, e.g. GPG configuration, email
 ;; clients, file templates and snippets. It is optional.
@@ -286,6 +309,12 @@
 ;; https://github.com/anthropics/claude-code/issues/42670
 (setenv "CLAUDE_CODE_NO_FLICKER" "1")
 
+;; --- Ad hoc quick-shell popup placement (ported from emacs-spacemacs.org's
+;; `shell' layer: shell-default-height 10, shell-default-position 'bottom).
+;; Scoped to plain `*vterm*' buffers only — claude-code-ide and codex-ide manage
+;; their own side-window placement and are untouched by this rule.
+(set-popup-rule! "^\\*vterm\\*" :side 'bottom :size 10 :select t :quit t)
+
 ;; --- Terminal font picker ---------------------------------------------------
 ;; Preference order is declared in fonts.org; the first installed family wins,
 ;; so the order is load-bearing. IosevkaTerm is the tail guarantee, not the
@@ -480,10 +509,68 @@ advice below). Registered as an emulation map so it outranks
           (lambda () (when display-line-numbers-mode
                        (metsatron/claude-no-line-numbers))))
 
+(defgroup metsatron-agent-ide-notifications nil
+  "Herdr-backed notifications for AI clients hosted inside Doom."
+  :group 'tools)
+
+(defcustom metsatron/agent-ide-notifier "agent-ide-notify"
+  "Program that delivers request and completion notifications through Herdr."
+  :type 'string
+  :group 'metsatron-agent-ide-notifications)
+
+(defun metsatron/agent-ide--project-label (session)
+  "Return a compact project label for Codex IDE SESSION."
+  (if-let* ((directory (and session
+                            (fboundp 'codex-ide-session-directory)
+                            (codex-ide-session-directory session))))
+      (file-name-nondirectory (directory-file-name directory))
+    "current project"))
+
+(defun metsatron/agent-ide--notify (kind title body)
+  "Asynchronously notify with KIND, TITLE, and BODY through Herdr.
+KIND is the symbol `request' or `done'.  Missing notification support is a
+quiet no-op so agent lifecycle hooks can never interrupt an IDE session."
+  (when-let* ((program (executable-find metsatron/agent-ide-notifier)))
+    (make-process
+     :name (format "agent-ide-notify-%s" kind)
+     :command (list program (symbol-name kind) title body)
+     :connection-type 'pipe
+     :noquery t
+     :buffer nil)))
+
+(defun metsatron/claude-code-ide--with-session-marker (original &rest args)
+  "Call ORIGINAL with ARGS while marking only this Claude IDE subprocess.
+Claude hooks inherit `CLAUDE_CODE_IDE_EL_SESSION=1', which distinguishes the
+IDE integration from ordinary Claude sessions and ordinary Emacs vterms."
+  (let ((process-environment (cons "CLAUDE_CODE_IDE_EL_SESSION=1"
+                                   process-environment))
+        (vterm-environment (cons "CLAUDE_CODE_IDE_EL_SESSION=1"
+                                 vterm-environment)))
+    (apply original args)))
+
+(defun metsatron/codex-ide-notify (event session _payload)
+  "Deliver Herdr notifications for Codex IDE EVENT affecting SESSION."
+  (let ((project (metsatron/agent-ide--project-label session)))
+    (pcase event
+      ('approval-requested
+       (metsatron/agent-ide--notify
+        'request "Codex IDE needs input"
+        (format "Waiting for approval in %s" project)))
+      ('turn-completed
+       (metsatron/agent-ide--notify
+        'done "Codex IDE"
+        (format "Turn completed in %s" project))))))
+
 (after! claude-code-ide
   ;; Expose Emacs to Claude over MCP.
   (when (fboundp 'claude-code-ide-emacs-tools-setup)
     (claude-code-ide-emacs-tools-setup))
+  ;; Claude's hook JSON has no IDE-origin field. Inject a marker only while this
+  ;; package creates its terminal, so Notification/Stop hooks never alert for an
+  ;; ordinary Claude terminal or an unrelated vterm.
+  (when (fboundp 'claude-code-ide--create-terminal-session)
+    (advice-add 'claude-code-ide--create-terminal-session :around
+                #'metsatron/claude-code-ide--with-session-marker))
   ;; Forward scroll keys to the CLI in every Claude vterm buffer (see the scroll
   ;; section above). `--configure-vterm-buffer' runs with the Claude buffer
   ;; current at setup, so this enables the mode exactly where it belongs.
@@ -506,6 +593,38 @@ advice below). Registered as an emulation map so it outranks
 ;; key autoload the package on first use.
 (use-package! codex-ide
   :commands (codex-ide codex-ide-menu codex-ide-session-diff-open))
+
+(defun metsatron/codex-ide-compact ()
+  "Compact the current idle Codex IDE thread.
+The app-server acknowledges submission immediately; the ordinary
+`contextCompaction' item and turn lifecycle report actual completion."
+  (interactive)
+  (let* ((session (codex-ide-slash-command--current-session))
+         (thread-id (codex-ide-session-thread-id session)))
+    (unless (and (stringp thread-id)
+                 (not (string-empty-p thread-id)))
+      (user-error "No active Codex thread"))
+    (when (codex-ide-session-current-turn-id session)
+      (user-error "A turn is active; /compact would replace it"))
+    (unless (process-live-p (codex-ide-session-process session))
+      (user-error "The Codex app-server is not running"))
+    (codex-ide--request-async
+     session
+     "thread/compact/start"
+     `((threadId . ,thread-id))
+     (lambda (_result error)
+       (if error
+           (message "Codex compaction request failed: %s"
+                    (or (alist-get 'message error) error))
+         (message "Codex compaction started"))))))
+
+(after! codex-ide
+  (add-to-list
+   'codex-ide-slash-commands
+   '("compact"
+     metsatron/codex-ide-compact
+     "Compact the current thread history."))
+  (add-hook 'codex-ide-session-event-hook #'metsatron/codex-ide-notify))
 
 ;; Codex session buffers are transcripts, not source files; keep their gutter
 ;; clear even though Doom enables line numbers globally.

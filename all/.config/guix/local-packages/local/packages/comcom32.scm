@@ -2,8 +2,16 @@
 
 ;; DOSEMU2's 32-bit =command.com=-compatible shell.  Building it from source needs
 ;; a DJGPP cross-toolchain that the pinned Guix channel lacks, so the upstream
-;; prebuilt DOS executable is fetched by content hash (a mutable Pages URL — the
-;; hash pins the bytes; a future upstream replacement would require refetching).
+;; prebuilt DOS executable is fetched by content hash.  Upstream publishes only a
+;; mutable Pages URL (the 0.4 GitHub release carries no assets), and on 2026-07-22
+;; they republished the zip — the drift detonated kikin-kushi's first
+;; =windows-compat= build (hash mismatch; every machine without a cached store
+;; item would have hit it).  The primary URI is therefore a Wayback Machine
+;; snapshot of the current zip — timestamped, immutable, verified byte-identical
+;; to the live file before pinning — with the live Pages URL kept as fallback
+;; mirror.  On the next upstream drift: snapshot the new zip the same way
+;; (=curl https://web.archive.org/save/<url>=, verify with =guix hash= against the
+;; =id_= raw URL), then bump snapshot URI + hash + version date together.
 
 
 ;; [[file:../../../../../../package-guix-habitat.org::*comcom32 (prebuilt DOS shell)][comcom32 (prebuilt DOS shell):1]]
@@ -17,13 +25,18 @@
 (define-public comcom32
   (package
     (name "comcom32")
-    (version "0.4-70-g433a530")
+    ;; version = release base + upstream republish date of the prebuilt zip
+    ;; (the zip carries no git-describe; the exe inside is dated 2026-07-22)
+    (version "0.4-2026.07.22")
     (source
      (origin
        (method url-fetch)
-       (uri "https://dosemu2.github.io/comcom64/files/comcom32.zip")
+       ;; Immutable Wayback snapshot first (id_ = raw bytes, no rewriting),
+       ;; live Pages URL as fallback mirror. See the prose above this block.
+       (uri (list "https://web.archive.org/web/20260729080143id_/https://dosemu2.github.io/comcom64/files/comcom32.zip"
+                  "https://dosemu2.github.io/comcom64/files/comcom32.zip"))
        (sha256
-        (base32 "1m00ifv1faaz4xmz7726ifw1br2fybhvja4qydlynig844m3m29k"))))
+        (base32 "0jdqr33r340gk5cd93ajvjk4v0q3jqz35zyli4fmql0yxaszwxvs"))))
     (build-system copy-build-system)
     (arguments
      '(#:install-plan
