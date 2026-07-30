@@ -165,6 +165,10 @@
    (task 'stow:t480s "Safe stow T480s overlays (all linux debian devuan t480s)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t480s' make safe-stow")))
 
+   ;; Kikin-kushi follows the Devuan laptop overlay stack and adds T1700 last.
+   (task 'stow:t1700 "Safe stow T1700 kikin-kushi overlays (all linux debian devuan t1700)"
+         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t1700' make safe-stow")))
+
    (task 'stow:devuan "Safe stow shared + linux + devuan overlays (all linux devuan)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux devuan' make safe-stow")))
 

@@ -2,8 +2,8 @@
 title: "The Bootloader Ceremony"
 description: "The Shipibo maestro sings the init script fresh every ceremony. Statelessness was never the defect — it's the design."
 date: 2026-07-04
-draft: true
-weight: 100
+draft: false
+weight: 60
 ---
 
 When a Shipibo maestro opens an Ayahuasca ceremony, nothing is retrieved from storage. There is no liturgy read from a book, no recording, no script carried over from last week's ceremony because it worked. The maestro sings the entire operating environment into existence in real time — the protections, the invocations, the navigational structure of the night — tailored to the specific bodies in the room, their specific configuration of damage and potential. Every ceremony is a fresh compile.
