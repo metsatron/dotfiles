@@ -77,3 +77,8 @@
 ;; ported: it was declared but never wired — org-looks does variable-pitch
 ;; manually.)
 (package! valign)
+
+;; Propagates buffer-local environment variables (e.g. from `direnv') into
+;; indirect/child buffers, so a direnv-derived PATH/env reaches subprocesses
+;; spawned from them. Ported from emacs-spacemacs.org's additional-packages.
+(package! inheritenv)
