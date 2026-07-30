@@ -271,7 +271,7 @@
 
    ;; Virtual Habitat sanctuary substrate profiles (Phase 0B declared; apply in Phase 1A)
    (task 'guix:sanctuary-apply "Build desktop-common + sanctuary + gaming + windows-compat + retropie Guix profiles"
-         (lambda () (mk-guix "guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-sanctuary-godzilla-xs guix-sanctuary-nscde guix-room-gaming guix-room-windows-compat guix-room-retropie")))
+         (lambda () (mk-guix "guix-desktop-common guix-sanctuary-qtile guix-sanctuary-gnustep guix-sanctuary-cde guix-sanctuary-godzilla-xs guix-sanctuary-mide guix-sanctuary-nscde guix-room-gaming guix-room-windows-compat guix-room-retropie")))
 
    ;; Per-sanctuary / per-room apply verbs. The combined guix:sanctuary-apply is one
    ;; fail-fast make chain, so a single broken profile (e.g. an upstream test failure
@@ -289,6 +289,8 @@
          (lambda () (mk-guix "guix-sanctuary-cde")))
    (task 'guix:sx-apply "Build sanctuary-godzilla-xs profile (+ desktop-common)"
          (lambda () (mk-guix "guix-sanctuary-godzilla-xs")))
+   (task 'guix:mide-apply "Build sanctuary-mide profile (Osiris/MiDesktop KDE 1 build toolchain, + desktop-common)"
+         (lambda () (mk-guix "guix-sanctuary-mide")))
    (task 'guix:nscde-apply "Build sanctuary-nscde profile (FVWM3 + ksh93/NsCDE build toolchain, + desktop-common)"
          (lambda () (mk-guix "guix-sanctuary-nscde")))
    (task 'guix:gaming-apply "Build room-gaming profile (+ desktop-common)"
