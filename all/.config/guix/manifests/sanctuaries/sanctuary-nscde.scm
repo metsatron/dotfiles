@@ -55,5 +55,12 @@
    "pcmanfm"        ; X file manager — first-run setup found none to offer
    ;; Fallback terminal inside the sanctuary (also NsCDE first-setup requirement)
    "xterm"
+   ;; NsCDE tool-registry gaps (audit 2026-07-31): appfinder resolves these
+   ;; InfoStore slots from app-catalog candidate lists — without a candidate
+   ;; on PATH the front-panel/subpanel button is silently dead.
+   "pavucontrol"    ; volumectrl slot — Multimedia subpanel Volume Control
+   "xcalc"          ; calculator slot — Tools subpanel Calculator
+   "arandr"         ; xrandr-GUI slot — Screen Settings subpanel entry
+   "xpdf"           ; Office subpanel PDF entries (Motif-native viewer)
    ))
 ;; sanctuary-nscde:1 ends here
