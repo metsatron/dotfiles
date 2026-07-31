@@ -24,6 +24,10 @@
    ;; glibc); linux-pam supplies pam_appl.h — both for base/kcheckpass.
    "libtiff" "libxcb" "libxpm" "libxt"
    "libxcrypt" "linux-pam"
+   ;; xprop: launcher polls the KWM_RUNNING root property to gate the session
+   ;; start order (kwm must be listening before kpanel/kfm fire their
+   ;; fire-and-forget region/module client messages — see sanctuary-mide.org).
+   "xprop"
    ;; Fallback terminal inside the sanctuary
    "xterm"
    ))
