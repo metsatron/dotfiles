@@ -150,6 +150,22 @@ sed -i \
   -e 's|DESTINATION "/usr/share/xsessions/"|DESTINATION "\${CMAKE_INSTALL_PREFIX}/share/xsessions/"|' \
   "\${SRC}/mide/base/CMakeLists.txt"
 
+# kwm's init-phase X error handler (base/kwm/main.C) aborts the whole window
+# manager on ANY X error except BadWindow/BadColor. In a nested Xephyr, kwm
+# intermittently gets a transient X_CopyArea(0x0): BadDrawable while building a
+# titlebar decoration whose pixmap momentarily loads as 0x0 — one async error
+# then kills the session (observed 2026-07-30). Extend the existing ignore list
+# to also tolerate BadDrawable/BadPixmap during init, exactly as it already
+# tolerates BadWindow/BadColor. Idempotent (guarded); invalidate the base
+# sentinel so kwm is rebuilt when the patch is first applied.
+if ! grep -q 'DotCortex: tolerate transient pixmap' "\${SRC}/mide/base/kwm/main.C"; then
+  # NB: use '#' as the sed delimiter — the C pattern contains '||', which would
+  # collide with a '|' delimiter and mis-parse the command.
+  sed -i 's#e->error_code == BadWindow || e->error_code == BadColor))#e->error_code == BadWindow || e->error_code == BadColor || e->error_code == BadDrawable || e->error_code == BadPixmap)) /* DotCortex: tolerate transient pixmap errors during init */#' \
+    "\${SRC}/mide/base/kwm/main.C"
+  rm -f "\${PREFIX}/.sentinel-mide-base"
+fi
+
 # ── Stages 2-4: MiDesktop libs → base → utils (CMake + Ninja) ───────────────
 for section in libs base utils; do
   if [ -f "\${PREFIX}/.sentinel-mide-\${section}" ]; then
@@ -191,7 +207,9 @@ sanctuary-exec "${SANCTUARY}" sh -c "${INNER_SCRIPT}"
 
 * Launcher: sanctuary-mide-launch
 
-Same shape as =sanctuary-qtile-launch=: dedicated Xephyr display, stale-session teardown, clipboard bridge, trash shield, then the session inside the container via =sanctuary-exec=. The session entry is MiDesktop's own =/opt/kde1/bin/startmidesktop= (verified upstream: =base/configfiles_in/mi.desktop.in= execs it as the XSession). Never run kdm inside Xephyr — it is a display manager wanting VT/PAM control. If the desktop has not been built yet the launcher falls back to a bare xterm with instructions rather than dying silently.
+Same shape as =sanctuary-qtile-launch=: dedicated Xephyr display, stale-session teardown, clipboard bridge, trash shield, then the session inside the container via =sanctuary-exec=. If the desktop has not been built yet the launcher falls back to a bare xterm with instructions rather than dying silently. Never run kdm inside Xephyr — it is a display manager wanting VT/PAM control.
+
+*Session start order (why we do not exec startmidesktop).* Upstream's =startmidesktop= launches the window manager =kwm= LAST, after =kpanel= and =kfm=. In KDE1 the panel and the desktop reserve their screen area by sending =kwm= a single =KWM_WINDOW_REGION_CHANGED= client message, and register as modules the same fire-and-forget way (=KWMModuleApplication::connectToKWM=). =kwm= ingests the reserved region *only* from that live message — it never re-reads the =KWM_WINDOW_REGION_*= root property at startup (=libs/kdecore/kwm.cpp=, =base/kwm/manager.C:663=). So when the modules start before =kwm= is listening, the reservation is lost and both consumers fall back to =getWindowRegion='s full-screen default anchored at =(0,0)=. That default coincides with a bottom panel (so it looks fine) but places window titlebars and desktop icons *under* a top panel — the exact symptom seen 2026-07-30. The launcher therefore runs its own ordered sequence: =kwm= first, wait until it publishes =KWM_RUNNING= on the root window (polled with =xprop=), then =kfm=/=krootwm=/=kpanel=/=kbgndwm=/=miwelcome=, and finally =wait= on the =kwm= PID so session lifetime matches upstream's =exec kwm=. The session entry MiDesktop declares for a login-manager XSession is =/opt/kde1/bin/startmidesktop= (=base/configfiles_in/mi.desktop.in=); we reproduce its meaningful steps in the correct order rather than inheriting its ordering bug.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/sanctuary-mide-launch :shebang "#!/usr/bin/env bash"
 # Launch sanctuary-mide: Xephyr :95 + MiDesktop (KDE 1.1.2 fork) inside the Guix container.
@@ -242,11 +260,72 @@ DISPLAY="${DISPLAY_NUM}" sanctuary-exec "${SANCTUARY}" sh -c "
   export KDEDIR=/opt/kde1
   export PATH=/opt/kde1/bin:\${PATH}
   export LD_LIBRARY_PATH=/opt/kde1/lib:/opt/kde1/lib64\${LD_LIBRARY_PATH:+:\${LD_LIBRARY_PATH}}
-  if [ -x /opt/kde1/bin/startmidesktop ]; then
-    exec /opt/kde1/bin/startmidesktop
+  # KDE1's kprocess needs a valid \$SHELL; sanctuary-exec's env allowlist drops
+  # it, which produced 'Could not find a valid shell'. Point it at a real
+  # interpreter present inside the container.
+  export SHELL=\"\$(command -v bash || command -v zsh || echo /bin/sh)\"
+  if [ ! -x /opt/kde1/bin/kwm ]; then
+    echo 'MiDesktop not built — run sanctuary-mide-build first.' >&2
+    exec xterm -title 'sanctuary-mide: run sanctuary-mide-build first'
   fi
-  echo 'startmidesktop not found — run sanctuary-mide-build first.' >&2
-  exec xterm -title 'sanctuary-mide: run sanctuary-mide-build first'
+  # Pre-create the runtime dirs the components stat during init so kwm and the
+  # modules never race a half-populated tree (kdisknav lives in the rw /opt
+  # bind volume; the theme Work dir and Games target live in the guest home).
+  mkdir -p /opt/kde1/share/apps/kdisknav \
+           \"\${HOME}/.kde/share/apps/kthememgr/Work\" \
+           \"\${HOME}/Games\" 2>/dev/null || true
+  # Start the session in the correct order — DELIBERATELY NOT via upstream's
+  # startmidesktop, which execs the window manager LAST. In KDE1 the panel
+  # (kpanel) and desktop (kfm) reserve their screen area by sending kwm a
+  # one-shot KWM_WINDOW_REGION_CHANGED client message, and register as modules
+  # the same fire-and-forget way (KWMModuleApplication::connectToKWM). kwm only
+  # ingests the region on that live message — it never re-reads the root
+  # property at startup — so if the modules start before kwm is listening, the
+  # reservation is lost forever and kwm/kfm fall back to the full-screen
+  # default anchored at (0,0). That default silently masks a bottom panel but
+  # puts window titlebars and desktop icons UNDER a top panel. Fix: bring kwm
+  # up FIRST, wait until it publishes KWM_RUNNING on the root window, then
+  # start the modules so their announcements are heard. Session lifetime tracks
+  # kwm, exactly as upstream's 'exec kwm' did.
+  kcontrol -init 2>/dev/null || true
+  # Bring kwm up FIRST and supervise it. kwm's init-phase X error handler can
+  # abort on a transient BadDrawable while building titlebar decorations
+  # (patched to tolerate that in sanctuary-mide-build; this retry is
+  # belt-and-braces and also catches any other transient init failure). Each
+  # attempt clears any stale KWM_RUNNING (an aborted kwm can leave the property
+  # behind), launches kwm, and accepts it only once KWM_RUNNING is present AND
+  # kwm is still alive a second later (init aborts happen within ~1-2s).
+  KWM_PID=
+  kwm_attempt=1
+  while [ \"\${kwm_attempt}\" -le 5 ]; do
+    xprop -root -remove KWM_RUNNING 2>/dev/null || true
+    kwm &
+    KWM_PID=\$!
+    if timeout 12 sh -c 'until xprop -root KWM_RUNNING 2>/dev/null | grep -q =; do sleep 0.2; done'; then
+      sleep 1
+      if kill -0 \"\${KWM_PID}\" 2>/dev/null && xprop -root KWM_RUNNING 2>/dev/null | grep -q =; then
+        break
+      fi
+    fi
+    echo \"sanctuary-mide: kwm failed to initialise (attempt \${kwm_attempt}/5), retrying…\" >&2
+    kill \"\${KWM_PID}\" 2>/dev/null || true
+    wait \"\${KWM_PID}\" 2>/dev/null || true
+    KWM_PID=
+    kwm_attempt=\$((kwm_attempt+1))
+  done
+  if [ -z \"\${KWM_PID}\" ]; then
+    echo 'sanctuary-mide: kwm would not stay up after 5 attempts.' >&2
+    exec xterm -title 'sanctuary-mide: kwm failed to start (see terminal output)'
+  fi
+  # Audio is unsupported upstream (no sound); best-effort, never fatal.
+  kaudioserver 2>/dev/null || true
+  kwmsound 2>/dev/null &
+  kfm &
+  krootwm &
+  kpanel &
+  kbgndwm &
+  miwelcome &
+  wait \"\${KWM_PID}\"
 "
 
 kill "${XEPHYR_PID}" 2>/dev/null || true
