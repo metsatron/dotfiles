@@ -1,0 +1,633 @@
+#!/usr/bin/env python3
+"""Black-box tests for the claude-warm PTY supervisor."""
+
+from __future__ import annotations
+
+import json
+import fcntl
+import os
+import pty
+import pathlib
+import select
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import unittest
+
+
+HERE = pathlib.Path(__file__).resolve()
+REPO = HERE.parents[5]
+WARM = REPO / "all/.local/bin/claude-warm"
+HOOK = REPO / "all/.local/bin/claude-hook-idle-event"
+STATUSLINE = REPO / "all/.local/bin/claude-statusline"
+
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import fcntl
+import os
+import select
+import signal
+import struct
+import subprocess
+import sys
+import termios
+
+
+def report_size(_signum=None, _frame=None):
+    try:
+        raw = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, columns = struct.unpack("HH", raw[:4])
+        os.write(1, (f"SIZE:{rows}x{columns}\n").encode())
+    except OSError:
+        pass
+
+
+def main():
+    os.write(1, (f"ARGS:{sys.argv[1:]!r}\n").encode())
+    report_size()
+    signal.signal(signal.SIGWINCH, report_size)
+    channel_child = None
+    if "--spawn-channel-process" in sys.argv:
+        channel_child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", "server.ts"]
+        )
+    if "--exit-status=7" in sys.argv:
+        return 7
+    try:
+        while True:
+            readable, _, _ = select.select([0], [], [], 0.1)
+            if not readable:
+                continue
+            data = os.read(0, 65536)
+            if not data:
+                return 0
+            os.write(1, (f"INPUT:{data!r}\n").encode())
+            if b"/compact" in data:
+                os.write(1, b"COMPACT_RECEIVED\n")
+    finally:
+        if channel_child is not None and channel_child.poll() is None:
+            channel_child.terminate()
+            channel_child.wait()
+
+
+raise SystemExit(main())
+'''
+
+
+def wait_until(predicate, timeout=5.0, message="condition did not become true"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+class Session:
+    """One supervised fake Claude process and its private runtime directory."""
+
+    def __init__(
+        self,
+        delay=10,
+        ttl=60,
+        extra_args=(),
+        terminal=False,
+        channel=False,
+        attach_wait=30,
+        recovery_cooldown=0,
+        recovery_confirm=1,
+        spawn_channel=False,
+    ):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
+        self.fake = self.root / "fake-claude"
+        self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
+        self.fake.chmod(0o700)
+        self.transcript = self.root / "transcript.jsonl"
+        self.transcript.write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "XDG_RUNTIME_DIR": str(self.root),
+                "CLAUDE_IDLE_REAL_EXECUTABLE": str(self.fake),
+                "CLAUDE_IDLE_COMPACT_SECONDS": str(delay),
+                "CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS": str(ttl),
+                "CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS": "30",
+                "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS": "1",
+                "CLAUDE_IDLE_CACHE_PROFILE": "long",
+                "CLAUDE_IDLE_COMPACTION_DEBUG": "1",
+                "XDG_STATE_HOME": str(self.root / "state"),
+                "CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS": str(attach_wait),
+                "CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS": str(recovery_cooldown),
+                "CLAUDE_IDLE_CHANNEL_RECOVERY_CONFIRM_SECONDS": str(recovery_confirm),
+            }
+        )
+        if channel:
+            extra_args = ("--channels", "plugin:fixture@fixture", *extra_args)
+            if spawn_channel:
+                extra_args = (*extra_args, "--spawn-channel-process")
+        self.parent_master = None
+        if terminal:
+            self.parent_master, parent_slave = pty.openpty()
+            self.process = subprocess.Popen(
+                [str(WARM), *extra_args],
+                stdin=parent_slave,
+                stdout=parent_slave,
+                stderr=parent_slave,
+                env=environment,
+            )
+            os.close(parent_slave)
+            self.output_fd = self.parent_master
+        else:
+            self.process = subprocess.Popen(
+                [str(WARM), *extra_args],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            assert self.process.stdout is not None
+            self.output_fd = self.process.stdout.fileno()
+        os.set_blocking(self.output_fd, False)
+        self.output = bytearray()
+        self.state_path = wait_until(self._find_state, message="state file missing")
+        self.channel = self.state_path.parent.name
+        self.socket_path = self.state_path.parent / "control.sock"
+        self.session_id = "fixture-session"
+
+    def _find_state(self):
+        paths = list((self.root / "claude-idle-compaction").glob("claude-*/state.json"))
+        return paths[0] if paths else None
+
+    def read_state(self):
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def output_contains(self, needle):
+        if isinstance(needle, str):
+            needle = needle.encode()
+        while True:
+            ready, _, _ = select.select([self.output_fd], [], [], 0)
+            if not ready:
+                break
+            data = os.read(self.output_fd, 65536)
+            if not data:
+                break
+            self.output.extend(data)
+        return needle in self.output
+
+    def wait_output(self, needle, timeout=5):
+        try:
+            wait_until(lambda: self.output_contains(needle), timeout, f"missing output {needle!r}")
+        except AssertionError as error:
+            raise AssertionError(
+                f"{error}; state={self.read_state()!r}; output={bytes(self.output)!r}"
+            ) from error
+
+    def ipc(self, message):
+        message = dict(message)
+        message.setdefault("kind", "event")
+        message.setdefault("channel", self.channel)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(str(self.socket_path))
+            connection.sendall((json.dumps(message) + "\n").encode())
+            return json.loads(connection.recv(65536).decode())
+
+    def event(self, event, **fields):
+        message = {"event": event, "session_id": self.session_id, **fields}
+        return self.ipc(message)
+
+    def status(self, tokens=80000, session_id=None, timestamp=None):
+        payload = {
+            "channel": self.channel,
+            "session_id": session_id or self.session_id,
+            "current_input_context_tokens": tokens,
+            "update_timestamp": timestamp if timestamp is not None else time.time(),
+        }
+        path = self.state_path.parent / "status.json"
+        temporary = path.with_name(".status-test.tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        temporary.replace(path)
+
+    def append_transcript(self, entry):
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry) + "\n")
+
+    def control(self, command, **fields):
+        return self.ipc({"kind": "control", "command": command, **fields})
+
+    def submit_local_byte(self, data=b"x"):
+        if self.parent_master is not None:
+            os.write(self.parent_master, data)
+        else:
+            assert self.process.stdin is not None
+            self.process.stdin.write(data)
+            self.process.stdin.flush()
+
+    def set_size(self, rows, columns):
+        assert self.parent_master is not None
+        fcntl.ioctl(self.parent_master, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, columns, 0, 0))
+
+    def stop_and_bind(self):
+        self.event("session-start", transcript_path=str(self.transcript))
+        self.status()
+        self.event("stop", stop_hook_active=False)
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.event("session-end")
+            except (OSError, ConnectionError, json.JSONDecodeError):
+                pass
+            if self.process.stdin is not None:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+            elif self.parent_master is not None:
+                self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.send_signal(signal.SIGTERM)
+                self.process.wait(timeout=5)
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        if self.parent_master is not None:
+            os.close(self.parent_master)
+            self.parent_master = None
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class ClaudeWarmTests(unittest.TestCase):
+    def setUp(self):
+        self.sessions = []
+
+    def tearDown(self):
+        for session in reversed(self.sessions):
+            session.close()
+
+    def make_session(self, **kwargs):
+        session = Session(**kwargs)
+        self.sessions.append(session)
+        return session
+
+    def test_arguments_and_full_pty_submission(self):
+        session = self.make_session(delay=0, extra_args=("--resume", "fixture", "--model", "test"))
+        session.wait_output("ARGS:['--resume', 'fixture', '--model', 'test']")
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        self.assertEqual(session.read_state()["compacting"], True)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+
+    def test_resize_signal_reaches_child(self):
+        session = self.make_session(terminal=True)
+        session.wait_output("SIZE:")
+        session.set_size(55, 123)
+        session.process.send_signal(signal.SIGWINCH)
+        # The supervisor owns the child PTY.  The changed size must reach the
+        # fake child through its SIGWINCH handler.
+        session.wait_output("SIZE:55x123")
+
+    def test_local_keystroke_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.submit_local_byte(b"draft")
+        try:
+            wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "user-input")
+        except AssertionError as error:
+            raise AssertionError(f"{error}; state={session.read_state()!r}; output={bytes(session.output)!r}") from error
+        time.sleep(1.3)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_transcript_append_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        # The production transcript is JSONL; a complete non-attachment entry
+        # represents remote/channel activity without putting message content in
+        # the supervisor log.
+        session.append_transcript({"type": "message"})
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "transcript-activity")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_channel_prompt_event_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.event("user-prompt-submit")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "prompt-submit")
+        time.sleep(1.3)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_stale_snapshot_and_session_mismatch_block(self):
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        session.status(timestamp=time.time() - 120)
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-snapshot-stale")
+        session.status(session_id="replacement-session")
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-session-mismatch")
+
+    def test_below_threshold_and_expired_ttl_do_not_inject(self):
+        session = self.make_session(delay=30, ttl=1)
+        session.stop_and_bind()
+        session.status(tokens=69999)
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "below-token-threshold")
+        time.sleep(1.2)
+        session.status(tokens=80000)
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "cache-already-cold")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_profile_change_rearms_with_new_delay(self):
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        before = session.read_state()["timer_deadline"]
+        session.control("profile", profile="short")
+        after = session.read_state()
+        self.assertEqual(after["cache_profile"], "short")
+        self.assertNotEqual(after["timer_deadline"], before)
+
+    def test_hook_and_statusline_route_to_owner(self):
+        session = self.make_session(delay=30)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CLAUDE_IDLE_OWNER": "pty-supervisor",
+                "CLAUDE_IDLE_CHANNEL": session.channel,
+                "CLAUDE_IDLE_CONTROL_SOCKET": str(session.socket_path),
+                "CLAUDE_IDLE_RUNTIME_DIR": str(session.state_path.parent),
+            }
+        )
+        start = {
+            "hook_event_name": "SessionStart",
+            "session_id": session.session_id,
+            "transcript_path": str(session.transcript),
+        }
+        subprocess.run(
+            [str(HOOK)], input=json.dumps(start).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        status = {
+            "session_id": session.session_id,
+            "context_window": {"total_input_tokens": 80000},
+        }
+        subprocess.run(
+            [str(STATUSLINE)], input=json.dumps(status).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        wait_until(lambda: session.read_state() and session.read_state()["session_id"] == session.session_id)
+        snapshot = json.loads((session.state_path.parent / "status.json").read_text())
+        self.assertEqual(snapshot["current_input_context_tokens"], 80000)
+        stop = {
+            "hook_event_name": "Stop",
+            "session_id": session.session_id,
+            "stop_hook_active": False,
+            "last_assistant_message": "fixture completion",
+        }
+        subprocess.run(
+            [str(HOOK)], input=json.dumps(stop).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        wait_until(lambda: session.read_state() and session.read_state()["dirty"])
+
+    def test_two_sessions_are_isolated(self):
+        first = self.make_session(delay=0)
+        second = self.make_session(delay=30)
+        self.assertNotEqual(first.channel, second.channel)
+        first.stop_and_bind()
+        first.wait_output("COMPACT_RECEIVED")
+        self.assertFalse(second.read_state()["dirty"])
+        second.stop_and_bind()
+        second.submit_local_byte(b"x")
+        time.sleep(0.2)
+        self.assertFalse(second.output_contains("COMPACT_RECEIVED"))
+
+    def test_channel_launch_attach_pass_and_fail(self):
+        attached = self.make_session(
+            channel=True,
+            spawn_channel=True,
+            attach_wait=2,
+        )
+        wait_until(
+            lambda: attached.read_state() and attached.read_state()["channel_health"] == "attached",
+            message="channel process was not recognized",
+        )
+        self.assertIn("plugin:fixture:fixture", attached.read_state()["watched_servers"])
+        failed = self.make_session(channel=True, attach_wait=0)
+        wait_until(
+            lambda: failed.read_state() and failed.read_state()["channel_health"] == "failed-attach",
+            message="missing channel process was not reported",
+        )
+
+    def test_channel_death_is_idempotent_and_bounded(self):
+        session = self.make_session(
+            channel=True,
+            spawn_channel=True,
+            attach_wait=2,
+            recovery_confirm=1,
+        )
+        session.stop_and_bind()
+        removed = {
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        }
+        session.append_transcript(removed)
+        session.append_transcript(removed)
+        wait_until(
+            lambda: session.read_state() and session.read_state()["channel_recovery_pending"],
+            message="channel death did not create a recovery generation",
+        )
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_attempts"] >= 1
+            and session.read_state()["channel_recovery_awaiting"],
+            message="first reconnect was not injected",
+        )
+        session.wait_output("/mcp reconnect plugin:fixture:fixture", timeout=3)
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_attempts"] >= 2
+            and session.read_state()["channel_recovery_awaiting"],
+            message="second reconnect was not bounded/injected",
+        )
+        session.wait_output("/mcp reconnect plugin:fixture:fixture", timeout=3)
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_reload_attempted"]
+            and session.read_state()["channel_recovery_awaiting"],
+            message="reload fallback was not injected",
+        )
+        session.wait_output("/reload-plugins", timeout=3)
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state() and session.read_state()["channel_health"] == "dead",
+            message="bounded recovery did not fail visibly",
+            timeout=6,
+        )
+        # The fake child echoes the command once before each INPUT line. Count
+        # the bytes received by the child, not the echoed terminal display.
+        self.assertEqual(
+            bytes(session.output).count(b"INPUT:b'/mcp reconnect plugin:fixture:fixture\\n'"),
+            2,
+        )
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'/reload-plugins\\n'"), 1)
+
+    def test_channel_add_reemission_does_not_start_recovery(self):
+        session = self.make_session(channel=True, spawn_channel=True, attach_wait=2)
+        session.stop_and_bind()
+        added = {
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": ["plugin:fixture:fixture"],
+                "removedNames": [],
+            },
+        }
+        session.append_transcript(added)
+        session.append_transcript(added)
+        wait_until(
+            lambda: session.read_state() and session.read_state()["channel_health"] == "attached"
+        )
+        time.sleep(1.2)
+        self.assertFalse(session.read_state()["channel_recovery_pending"])
+        self.assertIsNone(session.read_state()["timer_deadline"])
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+
+    def test_channel_recovery_confirmation_does_not_rearm_on_command_stop(self):
+        session = self.make_session(
+            channel=True,
+            spawn_channel=True,
+            attach_wait=2,
+            recovery_confirm=2,
+        )
+        session.stop_and_bind()
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        })
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_awaiting"]
+        )
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": ["plugin:fixture:fixture"],
+                "removedNames": [],
+            },
+        })
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_health"] == "attached"
+            and not session.read_state()["channel_recovery_pending"]
+        )
+        session.event("stop", stop_hook_active=False)
+        time.sleep(0.2)
+        self.assertIsNone(session.read_state()["timer_deadline"])
+
+    def test_channel_death_waits_for_idle_and_prompt_cancels(self):
+        session = self.make_session(channel=True, spawn_channel=True, attach_wait=2)
+        session.event("session-start", transcript_path=str(session.transcript))
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": ["plugin:fixture:fixture"],
+                "removedNames": [],
+            },
+        })
+        session.event("user-prompt-submit")
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        })
+        wait_until(lambda: session.read_state() and session.read_state()["channel_recovery_pending"])
+        self.assertIsNone(session.read_state()["timer_deadline"])
+        time.sleep(0.5)
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+        session.event("user-prompt-submit")
+        wait_until(lambda: session.read_state() and not session.read_state()["channel_recovery_pending"])
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+
+    def test_channel_death_mid_turn_waits_for_stop(self):
+        session = self.make_session(channel=True, spawn_channel=True, attach_wait=2)
+        session.event("session-start", transcript_path=str(session.transcript))
+        session.event("user-prompt-submit")
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        })
+        wait_until(lambda: session.read_state() and session.read_state()["channel_recovery_pending"])
+        time.sleep(0.5)
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+        session.event("stop", stop_hook_active=False)
+        wait_until(lambda: session.output_contains("/mcp reconnect plugin:fixture:fixture"))
+
+    def test_inject_is_whitelist_only(self):
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        refused = session.control("inject", text="/bin/sh")
+        self.assertFalse(refused["ok"])
+        accepted = session.control("inject", text="/reload-plugins")
+        self.assertTrue(accepted["ok"])
+        session.wait_output("/reload-plugins")
+
+    def test_exit_status_and_runtime_cleanup(self):
+        session = self.make_session(extra_args=("--exit-status=7",))
+        session.wait_output("ARGS:")
+        session.process.wait(timeout=5)
+        self.assertEqual(session.process.returncode, 7)
+        runtime = session.root
+        session.close()
+        self.assertFalse(runtime.exists())
+
+    def test_signal_propagation_and_runtime_cleanup(self):
+        session = self.make_session()
+        session.wait_output("ARGS:")
+        runtime = session.root
+        session.process.send_signal(signal.SIGTERM)
+        session.process.wait(timeout=5)
+        self.assertEqual(session.process.returncode, 128 + signal.SIGTERM)
+        session.close()
+        self.assertFalse(runtime.exists())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

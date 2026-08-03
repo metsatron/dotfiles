@@ -45,6 +45,7 @@ import os
 import select
 import signal
 import struct
+import subprocess
 import sys
 import termios
 
@@ -62,18 +63,28 @@ def main():
     os.write(1, (f"ARGS:{sys.argv[1:]!r}\n").encode())
     report_size()
     signal.signal(signal.SIGWINCH, report_size)
+    channel_child = None
+    if "--spawn-channel-process" in sys.argv:
+        channel_child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(60)", "server.ts"]
+        )
     if "--exit-status=7" in sys.argv:
         return 7
-    while True:
-        readable, _, _ = select.select([0], [], [], 0.1)
-        if not readable:
-            continue
-        data = os.read(0, 65536)
-        if not data:
-            return 0
-        os.write(1, (f"INPUT:{data!r}\n").encode())
-        if b"/compact" in data:
-            os.write(1, b"COMPACT_RECEIVED\n")
+    try:
+        while True:
+            readable, _, _ = select.select([0], [], [], 0.1)
+            if not readable:
+                continue
+            data = os.read(0, 65536)
+            if not data:
+                return 0
+            os.write(1, (f"INPUT:{data!r}\n").encode())
+            if b"/compact" in data:
+                os.write(1, b"COMPACT_RECEIVED\n")
+    finally:
+        if channel_child is not None and channel_child.poll() is None:
+            channel_child.terminate()
+            channel_child.wait()
 
 
 raise SystemExit(main())
@@ -93,7 +104,18 @@ def wait_until(predicate, timeout=5.0, message="condition did not become true"):
 class Session:
     """One supervised fake Claude process and its private runtime directory."""
 
-    def __init__(self, delay=10, ttl=60, extra_args=(), terminal=False):
+    def __init__(
+        self,
+        delay=10,
+        ttl=60,
+        extra_args=(),
+        terminal=False,
+        channel=False,
+        attach_wait=30,
+        recovery_cooldown=0,
+        recovery_confirm=1,
+        spawn_channel=False,
+    ):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
         self.fake = self.root / "fake-claude"
         self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
@@ -111,8 +133,16 @@ class Session:
                 "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS": "1",
                 "CLAUDE_IDLE_CACHE_PROFILE": "long",
                 "CLAUDE_IDLE_COMPACTION_DEBUG": "1",
+                "XDG_STATE_HOME": str(self.root / "state"),
+                "CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS": str(attach_wait),
+                "CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS": str(recovery_cooldown),
+                "CLAUDE_IDLE_CHANNEL_RECOVERY_CONFIRM_SECONDS": str(recovery_confirm),
             }
         )
+        if channel:
+            extra_args = ("--channels", "plugin:fixture@fixture", *extra_args)
+            if spawn_channel:
+                extra_args = (*extra_args, "--spawn-channel-process")
         self.parent_master = None
         if terminal:
             self.parent_master, parent_slave = pty.openpty()
@@ -198,6 +228,10 @@ class Session:
         temporary = path.with_name(".status-test.tmp")
         temporary.write_text(json.dumps(payload), encoding="utf-8")
         temporary.replace(path)
+
+    def append_transcript(self, entry):
+        with self.transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(entry) + "\n")
 
     def control(self, command, **fields):
         return self.ipc({"kind": "control", "command": command, **fields})
@@ -296,7 +330,10 @@ class ClaudeWarmTests(unittest.TestCase):
     def test_transcript_append_cancels(self):
         session = self.make_session(delay=1)
         session.stop_and_bind()
-        session.transcript.write_text("remote-channel-entry\n", encoding="utf-8")
+        # The production transcript is JSONL; a complete non-attachment entry
+        # represents remote/channel activity without putting message content in
+        # the supervisor log.
+        session.append_transcript({"type": "message"})
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "transcript-activity")
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
@@ -370,6 +407,17 @@ class ClaudeWarmTests(unittest.TestCase):
         wait_until(lambda: session.read_state() and session.read_state()["session_id"] == session.session_id)
         snapshot = json.loads((session.state_path.parent / "status.json").read_text())
         self.assertEqual(snapshot["current_input_context_tokens"], 80000)
+        stop = {
+            "hook_event_name": "Stop",
+            "session_id": session.session_id,
+            "stop_hook_active": False,
+            "last_assistant_message": "fixture completion",
+        }
+        subprocess.run(
+            [str(HOOK)], input=json.dumps(stop).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        wait_until(lambda: session.read_state() and session.read_state()["dirty"])
 
     def test_two_sessions_are_isolated(self):
         first = self.make_session(delay=0)
@@ -383,12 +431,211 @@ class ClaudeWarmTests(unittest.TestCase):
         time.sleep(0.2)
         self.assertFalse(second.output_contains("COMPACT_RECEIVED"))
 
+    def test_channel_launch_attach_pass_and_fail(self):
+        attached = self.make_session(
+            channel=True,
+            spawn_channel=True,
+            attach_wait=2,
+        )
+        wait_until(
+            lambda: attached.read_state() and attached.read_state()["channel_health"] == "attached",
+            message="channel process was not recognized",
+        )
+        self.assertIn("plugin:fixture:fixture", attached.read_state()["watched_servers"])
+        failed = self.make_session(channel=True, attach_wait=0)
+        wait_until(
+            lambda: failed.read_state() and failed.read_state()["channel_health"] == "failed-attach",
+            message="missing channel process was not reported",
+        )
+
+    def test_channel_death_is_idempotent_and_bounded(self):
+        session = self.make_session(
+            channel=True,
+            spawn_channel=True,
+            attach_wait=2,
+            recovery_confirm=1,
+        )
+        session.stop_and_bind()
+        removed = {
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        }
+        session.append_transcript(removed)
+        session.append_transcript(removed)
+        wait_until(
+            lambda: session.read_state() and session.read_state()["channel_recovery_pending"],
+            message="channel death did not create a recovery generation",
+        )
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_attempts"] >= 1
+            and session.read_state()["channel_recovery_awaiting"],
+            message="first reconnect was not injected",
+        )
+        session.wait_output("/mcp reconnect plugin:fixture:fixture", timeout=3)
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_attempts"] >= 2
+            and session.read_state()["channel_recovery_awaiting"],
+            message="second reconnect was not bounded/injected",
+        )
+        session.wait_output("/mcp reconnect plugin:fixture:fixture", timeout=3)
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_reload_attempted"]
+            and session.read_state()["channel_recovery_awaiting"],
+            message="reload fallback was not injected",
+        )
+        session.wait_output("/reload-plugins", timeout=3)
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state() and session.read_state()["channel_health"] == "dead",
+            message="bounded recovery did not fail visibly",
+            timeout=6,
+        )
+        # The fake child echoes the command once before each INPUT line. Count
+        # the bytes received by the child, not the echoed terminal display.
+        self.assertEqual(
+            bytes(session.output).count(b"INPUT:b'/mcp reconnect plugin:fixture:fixture\\n'"),
+            2,
+        )
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'/reload-plugins\\n'"), 1)
+
+    def test_channel_add_reemission_does_not_start_recovery(self):
+        session = self.make_session(channel=True, spawn_channel=True, attach_wait=2)
+        session.stop_and_bind()
+        added = {
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": ["plugin:fixture:fixture"],
+                "removedNames": [],
+            },
+        }
+        session.append_transcript(added)
+        session.append_transcript(added)
+        wait_until(
+            lambda: session.read_state() and session.read_state()["channel_health"] == "attached"
+        )
+        time.sleep(1.2)
+        self.assertFalse(session.read_state()["channel_recovery_pending"])
+        self.assertIsNone(session.read_state()["timer_deadline"])
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+
+    def test_channel_recovery_confirmation_does_not_rearm_on_command_stop(self):
+        session = self.make_session(
+            channel=True,
+            spawn_channel=True,
+            attach_wait=2,
+            recovery_confirm=2,
+        )
+        session.stop_and_bind()
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        })
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_recovery_awaiting"]
+        )
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": ["plugin:fixture:fixture"],
+                "removedNames": [],
+            },
+        })
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["channel_health"] == "attached"
+            and not session.read_state()["channel_recovery_pending"]
+        )
+        session.event("stop", stop_hook_active=False)
+        time.sleep(0.2)
+        self.assertIsNone(session.read_state()["timer_deadline"])
+
+    def test_channel_death_waits_for_idle_and_prompt_cancels(self):
+        session = self.make_session(channel=True, spawn_channel=True, attach_wait=2)
+        session.event("session-start", transcript_path=str(session.transcript))
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": ["plugin:fixture:fixture"],
+                "removedNames": [],
+            },
+        })
+        session.event("user-prompt-submit")
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        })
+        wait_until(lambda: session.read_state() and session.read_state()["channel_recovery_pending"])
+        self.assertIsNone(session.read_state()["timer_deadline"])
+        time.sleep(0.5)
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+        session.event("user-prompt-submit")
+        wait_until(lambda: session.read_state() and not session.read_state()["channel_recovery_pending"])
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+
+    def test_channel_death_mid_turn_waits_for_stop(self):
+        session = self.make_session(channel=True, spawn_channel=True, attach_wait=2)
+        session.event("session-start", transcript_path=str(session.transcript))
+        session.event("user-prompt-submit")
+        session.append_transcript({
+            "type": "attachment",
+            "attachment": {
+                "type": "mcp_instructions_delta",
+                "addedNames": [],
+                "removedNames": ["plugin:fixture:fixture"],
+            },
+        })
+        wait_until(lambda: session.read_state() and session.read_state()["channel_recovery_pending"])
+        time.sleep(0.5)
+        self.assertFalse(session.output_contains("/mcp reconnect"))
+        session.event("stop", stop_hook_active=False)
+        wait_until(lambda: session.output_contains("/mcp reconnect plugin:fixture:fixture"))
+
+    def test_inject_is_whitelist_only(self):
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        refused = session.control("inject", text="/bin/sh")
+        self.assertFalse(refused["ok"])
+        accepted = session.control("inject", text="/reload-plugins")
+        self.assertTrue(accepted["ok"])
+        session.wait_output("/reload-plugins")
+
     def test_exit_status_and_runtime_cleanup(self):
         session = self.make_session(extra_args=("--exit-status=7",))
         session.wait_output("ARGS:")
         session.process.wait(timeout=5)
         self.assertEqual(session.process.returncode, 7)
         runtime = session.root
+        session.close()
+        self.assertFalse(runtime.exists())
+
+    def test_signal_propagation_and_runtime_cleanup(self):
+        session = self.make_session()
+        session.wait_output("ARGS:")
+        runtime = session.root
+        session.process.send_signal(signal.SIGTERM)
+        session.process.wait(timeout=5)
+        self.assertEqual(session.process.returncode, 128 + signal.SIGTERM)
         session.close()
         self.assertFalse(runtime.exists())
 
