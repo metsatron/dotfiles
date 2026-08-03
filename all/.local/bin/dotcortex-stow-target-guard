@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# Cross-harness stow target guard
+
+# The machine-target check is shared by Claude Code, Codex, and =make safe-stow=.
+# The harness hooks are useful early warnings, but =safe-stow= is the enforcement
+# boundary: a direct terminal invocation must not be able to apply an X230 or
+# T480s overlay on the wrong host. Shared overlays (=all linux debian devuan
+# termux=) are valid everywhere. Exactly one machine-specific overlay may appear
+# in a package set, and it must match the live hostname. Unknown package names
+# remain outside this guard so future non-fleet overlays are not silently
+# reclassified as laptop targets.
+
+# The command mode accepts the Claude/Codex shell command text and understands
+# =loom stow:<machine>=, direct =stow <machine>=, =make safe-stow= with
+# =STOW_PKGS=, and the legacy =make x11-apply= X230 path. The package mode is
+# what the Make recipe calls after expanding =STOW_PKGS=.
+
+
+# [[file:../../../agents-hooks.org::*Cross-harness stow target guard][Cross-harness stow target guard:1]]
+#!/usr/bin/env python3
+"""Fail-closed host/overlay validation for every DotCortex stow path."""
+
+import argparse
+import json
+import re
+import shlex
+import socket
+import sys
+
+
+SHARED_PACKAGES = {"all", "linux", "debian", "devuan", "termux"}
+HOST_ALIASES = {
+    "ThinkPad-T480s": "t480s",
+    "t480s": "t480s",
+    "ThinkPad-X230": "x230",
+    "x230": "x230",
+    "ThinkPad-T480": "t480",
+    "t480": "t480",
+    "ThinkPad-T1700": "t1700",
+    "t1700": "t1700",
+    "OpenMandriva": "openmandriva",
+    "openmandriva": "openmandriva",
+    "s24": "s24",
+}
+EXPECTED_HOSTS = {
+    "x230": {"x230", "ThinkPad-X230"},
+    "t480s": {"t480s", "ThinkPad-T480s"},
+    "t480": {"t480", "ThinkPad-T480"},
+    "t1700": {"t1700", "ThinkPad-T1700"},
+    "openmandriva": {"openmandriva", "OpenMandriva"},
+    "s24": {"s24"},
+}
+MACHINE_PACKAGES = set(EXPECTED_HOSTS)
+
+
+def short_host(raw_host):
+    return HOST_ALIASES.get(raw_host, raw_host)
+
+
+def block(reason, target, raw_host, where, codex):
+    short = short_host(raw_host)
+    message = (
+        "DotCortex stow target does not match the machine it would run on. "
+        f"Requested target: {target}. Would run on: {where} "
+        f"(alias: {short}). {reason}"
+    )
+    if codex:
+        print(json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": message,
+            }
+        }))
+        return 0
+    print("BLOCKED: " + message, file=sys.stderr)
+    print(f"Use the stow verb for '{short}', or run this on the matching machine.", file=sys.stderr)
+    return 2
+
+
+def validate(packages, raw_host, where, codex=False):
+    targets = [pkg for pkg in packages if pkg in MACHINE_PACKAGES]
+    unique_targets = list(dict.fromkeys(targets))
+    if len(unique_targets) > 1:
+        return block(
+            "A package set may contain only one machine-specific overlay.",
+            ", ".join(unique_targets),
+            raw_host,
+            where,
+            codex,
+        )
+    if not unique_targets:
+        return 0
+    target = unique_targets[0]
+    expected = EXPECTED_HOSTS[target]
+    if raw_host not in expected and short_host(raw_host) not in expected:
+        return block(
+            f"Expected host: {', '.join(sorted(expected))}.",
+            target,
+            raw_host,
+            where,
+            codex,
+        )
+    return 0
+
+
+def ssh_destination(command):
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        words = command.split()
+    if not words or words[0] != "ssh":
+        return None
+    consuming_flags = {"-p", "-i", "-o", "-l", "-F", "-J", "-b", "-e", "-c", "-L", "-R", "-D", "-W", "-S"}
+    index = 1
+    while index < len(words):
+        word = words[index]
+        if word in consuming_flags:
+            index += 2
+            continue
+        if word.startswith("-"):
+            index += 1
+            continue
+        return word.rsplit("@", 1)[-1]
+    return None
+
+
+def command_targets(command):
+    targets = []
+    loom_pattern = r"(?:^|[;&|]\s*)(?:\S*/)?loom\s+stow(?::([A-Za-z0-9_-]+))?"
+    for match in re.finditer(loom_pattern, command):
+        targets.append(match.group(1) or "all")
+
+    direct_pattern = r"(?:^|[;&|]\s*)(?:\S*/)?stow\s+(x230|t480s|t480|t1700|s24|openmandriva)\b"
+    for match in re.finditer(direct_pattern, command):
+        targets.append(match.group(1))
+
+    if re.search(r"(?:^|[;&|]\s*)(?:\S*/)?make(?:\s+-f\s+\S+)?\s+(?:safe-stow|stow)\b", command):
+        assignment = re.search(
+            r"(?:^|\s)STOW_PKGS=(?:\"([^\"]*)\"|'([^']*)'|([^\s;&|]+))",
+            command,
+        )
+        if assignment:
+            targets.extend(shlex.split(next(value for value in assignment.groups() if value is not None)))
+        else:
+            targets.append("all")
+    if re.search(r"(?:^|[;&|]\s*)(?:\S*/)?make(?:\s+-f\s+\S+)?\s+x11-apply\b", command):
+        targets.append("x230")
+    return targets
+
+
+def validate_command(command, codex=False):
+    targets = command_targets(command)
+    if not targets:
+        return 0
+    destination = ssh_destination(command)
+    if destination:
+        raw_host = destination.split(".", 1)[0]
+        where = f"ssh destination '{destination}'"
+    else:
+        raw_host = socket.gethostname().split(".", 1)[0]
+        where = f"local host '{raw_host}'"
+    return validate(targets, raw_host, where, codex)
+
+
+def codex_command_from_stdin():
+    try:
+        payload = json.load(sys.stdin)
+        tool_input = payload.get("tool_input", {})
+        return tool_input.get("command", "") if isinstance(tool_input, dict) else ""
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    modes = parser.add_mutually_exclusive_group(required=True)
+    modes.add_argument("--packages", help="space-separated STOW_PKGS value")
+    modes.add_argument("--command", help="shell command text to inspect")
+    modes.add_argument("--codex-json", action="store_true", help="read a Codex PreToolUse payload from stdin")
+    args = parser.parse_args()
+
+    if args.packages is not None:
+        return validate(
+            shlex.split(args.packages),
+            socket.gethostname().split(".", 1)[0],
+            f"local host '{socket.gethostname().split('.', 1)[0]}'",
+        )
+    if args.command is not None:
+        return validate_command(args.command)
+    command = codex_command_from_stdin()
+    if command is None:
+        return block("The Codex hook payload could not be parsed.", "unknown", socket.gethostname(), "local host", True)
+    return validate_command(command, codex=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+# Cross-harness stow target guard:1 ends here
