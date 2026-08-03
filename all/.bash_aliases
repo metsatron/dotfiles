@@ -176,11 +176,15 @@ alias glib-compile-schemas='hostenv glib-compile-schemas'
 # better back-and-forth main model (ruling 2026-08-03: Opus 5 is weak at
 # multi-turn but stronger and cheaper than Opus 4.8 on single-shot, which is
 # exactly the advisor call shape). Advisor pairing rule: advisor >= main.
-alias claude-opus='claude-warm --model claude-opus-4-6 --advisor claude-opus-5'
+# NOTE: no claude-opus alias here — that name belongs to the canonical
+# HelmCortex/FORGE/bin/claude-opus launcher (identity session in the
+# HelmCortex root, --telegram channel support); an alias shadows PATH in
+# interactive zsh and would strand --telegram at the claude CLI. The any-dir
+# advised shortcut lives on as cco.
 alias claude-sonnet='claude-warm --model claude-sonnet-4-6 --advisor claude-opus-5'
 alias cch='claude-warm --model claude-haiku-4-5'
 alias ccs='claude-sonnet'
-alias cco='claude-opus'
+alias cco='claude-warm --model claude-opus-4-6 --advisor claude-opus-5'
 
 # ttyd web terminal server
 alias ttyd-serve='ttyd --writable --port 7681 zsh'
