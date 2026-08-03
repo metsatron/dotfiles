@@ -102,7 +102,7 @@ fi
 # Shared SSH agent for all zsh invocations, including noninteractive SSH
 # commands like `ssh host 'git fetch'`. Keep the key-unlock prompt in the
 # interactive exports path; `.zshenv` only needs the agent env.
-if [ -x "$HOME/.local/bin/ssh-agent-ensure" ]; then
+if [ -z "${DOTCORTEX_DISABLE_SSH_AGENT:-}" ] && [ -x "$HOME/.local/bin/ssh-agent-ensure" ]; then
   eval "$("$HOME/.local/bin/ssh-agent-ensure" --print)"
 fi
 
