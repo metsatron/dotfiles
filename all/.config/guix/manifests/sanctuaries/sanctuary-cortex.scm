@@ -1,0 +1,51 @@
+;; Virtual Habitat — sanctuary-cortex Guix profile
+;; Apply with sanctuary-cortex-guix-apply.
+(specifications->manifest
+ '(
+   ;; XFCE session, window manager, panels, and settings
+   "xfce4-session"
+   "xfwm4"
+   "xfconf"
+   "xfce4-panel"
+   "xfce4-settings"
+   "xfdesktop"
+   "xfce4-appfinder"
+   "xfce4-notifyd"
+   "xfce4-power-manager"
+   "xfce4-taskmanager"
+   "xfce4-terminal"
+   "xfce4-clipman-plugin"
+   "xfce4-pulseaudio-plugin"
+   "xfce4-whiskermenu-plugin"
+   "xfce4-xkb-plugin"
+   "xfce4-places-plugin"
+   ;; XFCE desktop libraries, menus, file manager, and thumbnails
+   "exo"
+   "garcon"
+   "thunar"
+   "thunar-volman"
+   "gvfs"
+   "tumbler"
+   "shared-mime-info"
+   "desktop-file-utils"
+   "hicolor-icon-theme"
+   ;; Session and application bridge
+   "dbus"
+   "flatpak"
+   "xdg-desktop-portal"
+   "xdg-desktop-portal-gtk"
+   ;; Basic tools used by the projected X230 configuration
+   "bash"
+   "zsh"
+   "coreutils"
+   "findutils"
+   "grep"
+   "sed"
+   "gawk"
+   "rsync"
+   "git"
+   "jq"
+   "xdpyinfo"
+   "xrandr"
+   "xterm"
+   ))
