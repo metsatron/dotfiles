@@ -305,7 +305,7 @@ class ClaudeWarmTests(unittest.TestCase):
             "type": "system",
             "subtype": "local_command",
             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1)),
-            "content": "/compact: Not enough messages to compact.",
+            "content": "Not enough messages to compact.",
         })
         wait_until(
             lambda: session.read_state()
