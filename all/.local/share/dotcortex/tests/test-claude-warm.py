@@ -326,6 +326,17 @@ class ClaudeWarmTests(unittest.TestCase):
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "transcript-activity")
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
+    def test_stop_bookkeeping_does_not_cancel_idle_timer(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.append_transcript({"type": "system", "subtype": "stop_hook_summary"})
+        session.append_transcript({"type": "system", "subtype": "turn_duration"})
+        time.sleep(0.2)
+        state = session.read_state()
+        self.assertIsNotNone(state["timer_deadline"])
+        self.assertNotEqual(state["last_cancellation_reason"], "transcript-activity")
+        session.wait_output("COMPACT_RECEIVED", timeout=3)
+
     def test_channel_prompt_event_cancels(self):
         session = self.make_session(delay=1)
         session.stop_and_bind()
