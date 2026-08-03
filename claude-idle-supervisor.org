@@ -50,6 +50,15 @@ bookkeeping, not renewed channel activity; the transcript guard ignores these
 shapes observed in the installed transcript while continuing to invalidate on
 user, assistant, attachment, and other unknown entries.
 
+When Claude rejects an injected =/compact= because the session is too small,
+the installed version records a =system/local_command= JSONL entry containing
+both the fixed =/compact= marker and the fixed =Not enough messages= marker,
+without emitting =PostCompact=.  The supervisor treats that source-backed
+shape as an asynchronous compaction failure: it clears =compacting=, retains
+=dirty=, and ignores the command's possible later Stop so the failed request
+cannot start an idle-compaction loop.  Other transcript activity remains a
+conservative cancellation signal.
+
 The channel guard is deliberately generic.  It derives watched server names
 from =--channels= (or the explicit
 =CLAUDE_IDLE_WATCHED_SERVERS= override), and never embeds a Telegram bot name,
@@ -124,6 +133,7 @@ EXPECTED_COMPLETION_SYSTEM_SUBTYPES = frozenset(
 EXPECTED_COMPLETION_TRANSCRIPT_TYPES = frozenset(
     {"last-prompt", "mode", "permission-mode", "ai-title"}
 )
+COMPACTION_FAILURE_MARKER = "not enough messages"
 
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -510,6 +520,8 @@ class Supervisor:
         self.enabled = True
         self.dirty = False
         self.compacting = False
+        self.compaction_requested_at: float | None = None
+        self.compaction_ignore_next_stop = False
         self.current_tokens: int | None = None
         self.status_timestamp: float | None = None
         self.last_normal_stop: float | None = None
@@ -586,6 +598,7 @@ class Supervisor:
             "status_snapshot_timestamp": self.status_timestamp,
             "dirty": self.dirty,
             "compacting": self.compacting,
+            "compaction_ignore_next_stop": self.compaction_ignore_next_stop,
             "last_normal_stop": self.last_normal_stop,
             "last_local_input": self.last_local_input,
             "last_lifecycle_activity": self.last_lifecycle_activity,
@@ -742,6 +755,40 @@ class Supervisor:
             self.transcript_offset = 0
             self.transcript_partial = b""
 
+    def _compaction_failed(self, reason: str) -> None:
+        """Clear an asynchronous compaction failure without making it dirty twice."""
+        if not self.compacting:
+            return
+        self.compacting = False
+        self.compaction_requested_at = None
+        self.compaction_ignore_next_stop = True
+        self.dirty = True
+        self.last_cancellation_reason = "compaction-failed"
+        log(
+            f"compaction-failed channel={short_id(self.channel)} reason={reason}"
+        )
+        self._guard_log("compaction-failed", reason=reason)
+        self._write_state()
+
+    def _is_failed_compaction_entry(self, entry: dict) -> bool:
+        """Recognize only Claude's observed fixed marker for rejected /compact."""
+        if not self.compacting:
+            return False
+        if entry.get("type") != "system" or entry.get("subtype") != "local_command":
+            return False
+        content = entry.get("content")
+        if not isinstance(content, str):
+            return False
+        lowered = content.lower()
+        if "/compact" not in lowered or COMPACTION_FAILURE_MARKER not in lowered:
+            return False
+        entry_timestamp = transcript_entry_timestamp(entry)
+        return not (
+            self.compaction_requested_at
+            and entry_timestamp is not None
+            and entry_timestamp <= self.compaction_requested_at
+        )
+
     def _abort_recovery(self, reason: str) -> None:
         """Stop a pending recovery after activity that is not the death marker."""
         if self.recovery_pending:
@@ -888,6 +935,8 @@ class Supervisor:
             # PostCompact clears the governor state; these lines must not look
             # like a remote Telegram turn in the meantime.
             if self.compacting:
+                if self._is_failed_compaction_entry(entry):
+                    self._compaction_failed("transcript-rejected")
                 continue
             if self.last_normal_stop:
                 if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
@@ -1245,6 +1294,8 @@ class Supervisor:
         self.timer_generation += 1
         if purpose == "compact":
             self.compacting = True
+            self.compaction_requested_at = now()
+            self.compaction_ignore_next_stop = False
             self.last_cancellation_reason = "compaction-requested"
         elif purpose == "recovery":
             self.recovery_awaiting = True
@@ -1260,6 +1311,7 @@ class Supervisor:
         except OSError as error:
             if purpose == "compact":
                 self.compacting = False
+                self.compaction_requested_at = None
                 self.dirty = True
                 self.last_cancellation_reason = "compaction-injection-failed"
                 log(f"compaction-failed channel={short_id(self.channel)} error={error}")
@@ -1305,6 +1357,8 @@ class Supervisor:
                 self.recovery_command_inflight = False
                 self.recovery_expected_stop = False
                 self.recovery_ignore_next_stop = False
+                self.compaction_requested_at = None
+                self.compaction_ignore_next_stop = False
                 self.channel_health = "none" if not self.watched_servers else "reconnecting"
                 self.channel_attach_checked = not bool(self.watched_servers)
                 self.channel_attach_deadline = (
@@ -1337,6 +1391,12 @@ class Supervisor:
                 self._guard_log("recovery-command-stopped")
                 self._write_state()
                 return {"ok": True, "ignored": "recovery-command-stop"}
+            if self.compaction_ignore_next_stop:
+                self.compaction_ignore_next_stop = False
+                self.status = "idle"
+                self.last_lifecycle_activity = current
+                self.cancel("compaction-failed-stop")
+                return {"ok": True, "ignored": "compaction-failed-stop"}
             if self.compacting:
                 self.status = "idle"
                 self.cancel("compaction-stop")
@@ -1365,6 +1425,7 @@ class Supervisor:
         if event == "user-prompt-submit":
             self.status = "active"
             self.last_lifecycle_activity = current
+            self.compaction_ignore_next_stop = False
             if self.recovery_ignore_next_stop:
                 self._guard_log("recovery-command-prompt-submit")
             elif self.recovery_awaiting and self.recovery_command_inflight:
@@ -1378,6 +1439,8 @@ class Supervisor:
             self.status = "idle"
             self.dirty = False
             self.compacting = False
+            self.compaction_requested_at = None
+            self.compaction_ignore_next_stop = False
             self.current_tokens = None
             self.status_timestamp = None
             self.last_lifecycle_activity = current
@@ -1391,6 +1454,8 @@ class Supervisor:
             self._abort_recovery("session-end")
             self.cancel("session-end")
         elif event == "stop-failure":
+            if self.compacting:
+                self._compaction_failed("stop-failure")
             self.status = "error"
             self.last_lifecycle_activity = current
             self._abort_recovery("stop-failure")
