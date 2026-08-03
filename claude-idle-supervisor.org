@@ -1,0 +1,1039 @@
+#+TITLE: Claude Code idle-compaction PTY supervisor
+#+DESCRIPTION: Canonical source for the PTY-owning ordinary Claude launcher
+#+AUTHOR: Mètsàtron
+#+PROPERTY: header-args :mkdirp yes :comments both
+
+* Design notes
+
+This launcher is the owner for ordinary interactive Claude Code processes. It
+uses Python's =pty.fork= so the Claude child receives a real controlling
+terminal while the parent owns the PTY master for the entire process lifetime.
+The parent proxies bytes in both directions, propagates terminal geometry and
+signals, and is the only component permitted to write the automatic =/compact=
+submission.  Claude hook helpers communicate with the per-session Unix socket;
+they never write to a terminal.
+
+The default values intentionally match the Emacs governor: 55 minutes and a
+60-minute warm-cache TTL for the long profile, 4 minutes and 5 minutes for the
+short profile, and an absolute 70,000 current input-context threshold.  The
+environment variables documented in =--help= are the supervisor's configurable
+surface.  There is no automatic usage-credit TTL inference.
+
+* Versioned integration notes
+
+The Claude-side adapter was checked against the installed Claude Code
+=2.1.220= integration.  =Stop= uses the documented =stop_hook_active= field
+and accepts only the literal false value; =last_assistant_message= is not
+forwarded because it is not needed by the governor.  =UserPromptSubmit= and
+=PostCompact= are routed by their documented event names; the adapter forwards
+only =session_id=, =transcript_path= on =SessionStart=, and the fixed event
+symbol.  The adapter deliberately does not read or invent =background_tasks=
+or =session_crons= fields.
+
+The installed status-line schema supplies =session_id= and
+=context_window.total_input_tokens=, with the documented
+=current_usage.input_tokens=, =cache_creation_input_tokens=, and
+=cache_read_input_tokens= sum as fallback.  Output tokens are excluded.  The
+snapshot is the only token source for this supervisor; transcript content is
+watched only for post-Stop activity.
+
+The owner contract is explicit: =CLAUDE_IDLE_OWNER=emacs= belongs to
+=claude-code-ide.el=, =CLAUDE_IDLE_OWNER=pty-supervisor= belongs to this
+launcher, and sessions launched by neither owner remain unsupported legacy
+processes.  This source does not replace the =claude= executable globally.
+
+#+BEGIN_SRC python :tangle all/.local/bin/claude-warm :shebang "#!/usr/bin/env python3" :comments no
+"""PTY-owning Claude launcher and per-session idle-compaction supervisor."""
+
+from __future__ import annotations
+
+import ctypes
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import pty
+import re
+import selectors
+import shutil
+import signal
+import socket
+import struct
+import sys
+import termios
+import time
+import tty
+import uuid
+
+
+CHANNEL_RE = re.compile(r"^claude-[0-9a-f]{32}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
+EVENTS = {
+    "session-start",
+    "stop",
+    "user-prompt-submit",
+    "post-compact",
+    "session-activity",
+    "stop-failure",
+    "session-end",
+}
+CONTROL_COMMANDS = {
+    "state",
+    "show",
+    "enable",
+    "disable",
+    "profile",
+    "cancel",
+    "trigger",
+}
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    """Read a bounded integer configuration value from the environment."""
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+IDLE_SECONDS = {
+    "long": env_int("CLAUDE_IDLE_COMPACT_SECONDS", 55 * 60),
+    "short": env_int("CLAUDE_SHORT_CACHE_IDLE_COMPACT_SECONDS", 4 * 60),
+}
+TTL_SECONDS = {
+    "long": env_int("CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS", 60 * 60),
+    "short": env_int("CLAUDE_IDLE_COMPACT_SHORT_CACHE_TTL_SECONDS", 5 * 60),
+}
+MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
+STATUS_MAX_AGE = env_int("CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS", 120, 1)
+TRANSCRIPT_POLL_SECONDS = env_int(
+    "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS", 2, 1
+)
+DEBUG = os.environ.get("CLAUDE_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
+
+
+def log(message: str) -> None:
+    """Write concise supervisor diagnostics without prompts or message data."""
+    if DEBUG:
+        print(f"[claude-warm] {message}", file=sys.stderr, flush=True)
+
+
+def short_id(value: object) -> str:
+    """Return a non-sensitive truncated identifier for diagnostics."""
+    text = str(value or "unknown")
+    return text if len(text) <= 12 else text[:8] + "…"
+
+
+def now() -> float:
+    """Return wall-clock seconds used for cache-deadline comparisons."""
+    return time.time()
+
+
+def monotonic() -> float:
+    """Return monotonic seconds used only for local retry/poll scheduling."""
+    return time.monotonic()
+
+
+def atomic_json(path: pathlib.Path, payload: dict) -> None:
+    """Write PAYLOAD atomically with owner-only permissions."""
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def safe_mkdir(path: pathlib.Path) -> None:
+    """Create PATH as a private directory."""
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def effective_profile(requested: str | None) -> str:
+    """Resolve a requested Claude cache profile without guessing backend TTL."""
+    requested = requested or os.environ.get("CLAUDE_IDLE_CACHE_PROFILE", "auto")
+    if requested in {"long", "short"}:
+        return requested
+    force_short = os.environ.get("FORCE_PROMPT_CACHING_5M", "").lower()
+    force_long = os.environ.get("ENABLE_PROMPT_CACHING_1H", "").lower()
+    if force_short in {"1", "true", "yes"}:
+        return "short"
+    if force_long in {"1", "true", "yes"}:
+        return "long"
+    return "long"
+
+
+def runtime_root() -> pathlib.Path:
+    """Return the required XDG runtime root or fail before launching Claude."""
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for supervised Claude sessions")
+    root = pathlib.Path(value) / "claude-idle-compaction"
+    safe_mkdir(root)
+    return root
+
+
+def resolve_claude() -> str:
+    """Resolve the real Claude executable without recursively selecting this wrapper."""
+    explicit = os.environ.get("CLAUDE_IDLE_REAL_EXECUTABLE")
+    candidates = [explicit] if explicit else []
+    found = shutil.which("claude")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            str(pathlib.Path.home() / ".local/bin/claude"),
+            str(pathlib.Path.home() / ".npm-global/bin/claude"),
+        ]
+    )
+    wrapper = pathlib.Path(__file__).resolve()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = pathlib.Path(candidate).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved == wrapper or not resolved.is_file() or not os.access(resolved, os.X_OK):
+            continue
+        if resolved.name in {"claude-warm", "claude-warmctl"}:
+            continue
+        return str(resolved)
+    raise RuntimeError("real Claude executable not found; set CLAUDE_IDLE_REAL_EXECUTABLE")
+
+
+def child_alive(pid: int | None) -> bool:
+    """Return whether PID is still a live process."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def write_all(fd: int, data: bytes) -> None:
+    """Write all DATA to a nonblocking descriptor."""
+    offset = 0
+    while offset < len(data):
+        try:
+            written = os.write(fd, data[offset:])
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            time.sleep(0.002)
+            continue
+        if written <= 0:
+            raise OSError(errno.EIO, "PTY write returned zero bytes")
+        offset += written
+
+
+class Inotify:
+    """Small Linux inotify wrapper used for event-driven transcript monitoring."""
+
+    EVENT = struct.Struct("iIII")
+    IN_MODIFY = 0x00000002
+    IN_CLOSE_WRITE = 0x00000008
+    IN_MOVED_TO = 0x00000080
+    IN_ATTRIB = 0x00000004
+    IN_Q_OVERFLOW = 0x00004000
+    MASK = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_ATTRIB
+
+    def __init__(self, directory: pathlib.Path):
+        self.fd = -1
+        self.watch_descriptor = -1
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            init1 = libc.inotify_init1
+            init1.argtypes = [ctypes.c_int]
+            init1.restype = ctypes.c_int
+            add_watch = libc.inotify_add_watch
+            add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+            add_watch.restype = ctypes.c_int
+            self.fd = init1(os.O_NONBLOCK | os.O_CLOEXEC)
+            if self.fd < 0:
+                raise OSError(ctypes.get_errno(), "inotify_init1")
+            self.watch_descriptor = add_watch(self.fd, os.fsencode(str(directory)), self.MASK)
+            if self.watch_descriptor < 0:
+                raise OSError(ctypes.get_errno(), "inotify_add_watch")
+            self.directory = directory
+        except Exception:
+            self.close()
+            raise
+
+    def read(self) -> list[tuple[int, str]]:
+        """Drain pending events as `(mask, name)' pairs."""
+        events: list[tuple[int, str]] = []
+        while True:
+            try:
+                data = os.read(self.fd, 65536)
+            except BlockingIOError:
+                break
+            if not data:
+                break
+            offset = 0
+            while offset + self.EVENT.size <= len(data):
+                _, mask, _, name_length = self.EVENT.unpack_from(data, offset)
+                offset += self.EVENT.size
+                raw_name = data[offset : offset + name_length]
+                offset += name_length
+                name = raw_name.split(b"\0", 1)[0].decode("utf-8", "replace")
+                events.append((mask, name))
+        return events
+
+    def close(self) -> None:
+        """Close the inotify descriptor."""
+        if self.fd >= 0:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = -1
+
+
+class Supervisor:
+    """Own one Claude PTY, lifecycle socket, state file, and idle timer."""
+
+    def __init__(self, argv: list[str], executable: str):
+        self.argv = argv
+        self.executable = executable
+        self.channel = "claude-" + uuid.uuid4().hex
+        self.root = runtime_root()
+        self.session_dir = self.root / self.channel
+        safe_mkdir(self.session_dir)
+        self.socket_path = self.session_dir / "control.sock"
+        self.state_path = self.session_dir / "state.json"
+        self.snapshot_path = self.session_dir / "status.json"
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o600)
+        self.socket.listen(8)
+        self.socket.setblocking(False)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.socket, selectors.EVENT_READ, "server")
+        self.pid: int | None = None
+        self.master_fd: int | None = None
+        self.child_tty: str | None = None
+        self.child_status: int | None = None
+        self.stdin_eof = False
+        self.terminal_attributes = None
+        self.stdin_flags: int | None = None
+        self.session_id: str | None = None
+        self.transcript_path: pathlib.Path | None = None
+        self.transcript_baseline: tuple[int, int] | None = None
+        self.transcript_activity_at: float | None = None
+        self.inotify: Inotify | None = None
+        self.status = "starting"
+        self.enabled = True
+        self.dirty = False
+        self.compacting = False
+        self.current_tokens: int | None = None
+        self.status_timestamp: float | None = None
+        self.last_normal_stop: float | None = None
+        self.last_local_input: float | None = None
+        self.last_lifecycle_activity: float | None = None
+        self.cache_profile_requested = os.environ.get("CLAUDE_IDLE_CACHE_PROFILE", "auto")
+        self.cache_profile = effective_profile(self.cache_profile_requested)
+        self.timer_deadline: float | None = None
+        self.timer_generation = 0
+        self.last_cancellation_reason: str | None = None
+        self.shutdown_requested = False
+        self.child_exited_at: float | None = None
+        self.next_transcript_poll = monotonic() + TRANSCRIPT_POLL_SECONDS
+        self._write_state()
+
+    def state(self) -> dict:
+        """Return safe persisted state for controls and diagnostics."""
+        return {
+            "channel": self.channel,
+            "pid": self.pid,
+            "pty_master_owned": self.master_fd is not None,
+            "pty_master_fd": self.master_fd,
+            "pty_child_terminal": self.child_tty,
+            "control_socket": str(self.socket_path),
+            "session_id": self.session_id,
+            "transcript_path": str(self.transcript_path) if self.transcript_path else None,
+            "status": self.status,
+            "current_input_context_tokens": self.current_tokens,
+            "status_snapshot_timestamp": self.status_timestamp,
+            "dirty": self.dirty,
+            "compacting": self.compacting,
+            "last_normal_stop": self.last_normal_stop,
+            "last_local_input": self.last_local_input,
+            "last_lifecycle_activity": self.last_lifecycle_activity,
+            "cache_profile": self.cache_profile,
+            "cache_profile_requested": self.cache_profile_requested,
+            "timer_deadline": self.timer_deadline,
+            "last_cancellation_reason": self.last_cancellation_reason,
+        }
+
+    def _write_state(self) -> None:
+        """Persist the current state atomically."""
+        try:
+            atomic_json(self.state_path, self.state())
+        except OSError as error:
+            log(f"state-write-failed channel={short_id(self.channel)} error={error}")
+
+    def cancel(self, reason: str) -> None:
+        """Invalidate the one-shot timer and retain the cancellation reason."""
+        self.timer_deadline = None
+        self.timer_generation += 1
+        self.last_cancellation_reason = reason
+        log(f"cancelled:{reason} channel={short_id(self.channel)}")
+        self._write_state()
+
+    def arm(self) -> None:
+        """Arm exactly one timer after a valid ordinary Stop event."""
+        if not (
+            self.enabled
+            and self.dirty
+            and self.status == "idle"
+            and not self.compacting
+            and self.last_normal_stop
+            and child_alive(self.pid)
+            and self.timer_deadline is None
+        ):
+            return
+        self.timer_generation += 1
+        self.timer_deadline = self.last_normal_stop + IDLE_SECONDS[self.cache_profile]
+        log(
+            f"armed channel={short_id(self.channel)} profile={self.cache_profile} "
+            f"delay={IDLE_SECONDS[self.cache_profile]}"
+        )
+        self._write_state()
+
+    def _set_transcript(self, value: object) -> None:
+        """Bind and watch a validated Claude transcript path."""
+        if not isinstance(value, str) or not value or len(value) > 4096:
+            return
+        path = pathlib.Path(value).expanduser()
+        self.transcript_path = path
+        try:
+            stat = path.stat()
+            self.transcript_baseline = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            self.transcript_baseline = None
+        if self.inotify:
+            self.inotify.close()
+            self.inotify = None
+        try:
+            self.inotify = Inotify(path.parent)
+            self.selector.register(self.inotify.fd, selectors.EVENT_READ, "inotify")
+        except Exception:
+            self.inotify = None
+            log(f"transcript-watcher=fallback channel={short_id(self.channel)}")
+        self._write_state()
+
+    def _transcript_changed(self) -> bool:
+        """Return whether the bound transcript has changed since its baseline."""
+        if not self.transcript_path:
+            return False
+        try:
+            stat = self.transcript_path.stat()
+            current = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return False
+        if self.transcript_baseline is None:
+            self.transcript_baseline = current
+            return False
+        return current != self.transcript_baseline
+
+    def _record_transcript_activity(self) -> None:
+        """Cancel pending work after a transcript append outside governor compaction."""
+        if self.last_normal_stop and not self.compacting and self._transcript_changed():
+            self.transcript_activity_at = now()
+            self.cancel("transcript-activity")
+
+    def _install_terminal(self) -> None:
+        """Put the caller's terminal in raw mode and register stdin."""
+        fd = sys.stdin.fileno()
+        is_terminal = os.isatty(fd)
+        self.stdin_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        if is_terminal:
+            self.terminal_attributes = termios.tcgetattr(fd)
+            tty.setraw(fd)
+        os.set_blocking(fd, False)
+        try:
+            self.selector.register(sys.stdin, selectors.EVENT_READ, "stdin")
+        except OSError:
+            # Some non-interactive runners expose stdin through a descriptor
+            # that cannot be registered with epoll.  There is no local
+            # keystroke stream to supervise in that case; a real TTY must
+            # remain fail-loud because local-input cancellation is safety
+            # critical there.
+            if is_terminal:
+                raise
+            log("stdin-not-pollable")
+        if is_terminal:
+            self._resize()
+
+    def _restore_terminal(self) -> None:
+        """Restore the caller's terminal exactly once."""
+        if self.terminal_attributes is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.terminal_attributes)
+            except OSError:
+                pass
+            self.terminal_attributes = None
+        if self.stdin_flags is not None:
+            try:
+                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, self.stdin_flags)
+            except OSError:
+                pass
+            self.stdin_flags = None
+
+    def _resize(self) -> None:
+        """Propagate the caller's current window size to the Claude PTY."""
+        if self.master_fd is None or not os.isatty(sys.stdout.fileno()):
+            return
+        try:
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            winsize = struct.pack("HHHH", size.lines, size.columns, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            if self.pid and child_alive(self.pid):
+                os.kill(self.pid, signal.SIGWINCH)
+        except OSError:
+            pass
+
+    def _forward_signal(self, signum: int, _frame: object) -> None:
+        """Forward process signals to Claude's process group."""
+        if self.pid and child_alive(self.pid):
+            try:
+                os.killpg(self.pid, signum)
+            except OSError:
+                try:
+                    os.kill(self.pid, signum)
+                except OSError:
+                    pass
+        if signum in {signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}:
+            self.shutdown_requested = True
+
+    def _install_signals(self) -> None:
+        """Install forwarding handlers for terminal lifecycle signals."""
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            signal.signal(signum, self._forward_signal)
+        signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize())
+
+    def launch(self) -> None:
+        """Fork Claude on a real PTY and begin byte-level proxying."""
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CLAUDE_IDLE_CHANNEL": self.channel,
+                "CLAUDE_IDLE_OWNER": "pty-supervisor",
+                "CLAUDE_IDLE_CONTROL_SOCKET": str(self.socket_path),
+                "CLAUDE_IDLE_RUNTIME_DIR": str(self.session_dir),
+                "CLAUDE_IDLE_SUPERVISOR_PID": str(os.getpid()),
+            }
+        )
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            try:
+                os.execvpe(self.executable, [self.executable, *self.argv], environment)
+            except BaseException as error:
+                print(f"claude-warm: failed to exec Claude: {error}", file=sys.stderr)
+                os._exit(127)
+        self.pid = pid
+        self.master_fd = master_fd
+        os.set_blocking(master_fd, False)
+        self.child_tty = self._read_child_tty()
+        self.selector.register(master_fd, selectors.EVENT_READ, "master")
+        self._install_signals()
+        self._install_terminal()
+        self._write_state()
+
+    def _read_child_tty(self) -> str | None:
+        """Return the child stdin terminal path from the live process table."""
+        if not self.pid:
+            return None
+        try:
+            candidate = os.readlink(f"/proc/{self.pid}/fd/0")
+            # Immediately after forkpty the child can still expose the
+            # supervisor's inherited pipe while it is between fork and exec.
+            # Cache only an actual terminal path; the final gate will retry
+            # until exec has installed the PTY slave.
+            return candidate if candidate.startswith("/dev/") else None
+        except OSError:
+            return None
+
+    def _pty_still_owned(self) -> bool:
+        """Verify the live child still owns the PTY slave and its process group."""
+        if not self.pid or self.master_fd is None or not child_alive(self.pid):
+            return False
+        if self.child_tty is None:
+            self.child_tty = self._read_child_tty()
+        try:
+            return (
+                os.getpgid(self.pid) == self.pid
+                and self.child_tty is not None
+                and os.readlink(f"/proc/{self.pid}/fd/0") == self.child_tty
+            )
+        except OSError:
+            return False
+
+    def _read_snapshot(self) -> tuple[dict | None, str | None]:
+        """Read and validate a fresh status-line snapshot."""
+        try:
+            with self.snapshot_path.open(encoding="utf-8") as stream:
+                payload = json.load(stream)
+        except (OSError, ValueError):
+            return None, "status-snapshot-missing"
+        if not isinstance(payload, dict):
+            return None, "status-snapshot-invalid"
+        if payload.get("channel") != self.channel:
+            return None, "status-channel-mismatch"
+        if payload.get("session_id") != self.session_id:
+            return None, "status-session-mismatch"
+        tokens = payload.get("current_input_context_tokens")
+        timestamp = payload.get("update_timestamp")
+        if not isinstance(tokens, int) or tokens < 0:
+            return None, "status-token-invalid"
+        if not isinstance(timestamp, (int, float)):
+            return None, "status-timestamp-invalid"
+        if now() - float(timestamp) > STATUS_MAX_AGE:
+            return None, "status-snapshot-stale"
+        self.current_tokens = tokens
+        self.status_timestamp = float(timestamp)
+        return payload, None
+
+    def _gate_reason(self) -> str | None:
+        """Return the first failed final eligibility condition, if any."""
+        if not self.enabled:
+            return "session-disabled"
+        if self.status != "idle":
+            return "session-active"
+        if not self.dirty:
+            return "clean"
+        if self.compacting:
+            return "already-compacting"
+        if not self._pty_still_owned():
+            return "pty-or-process-gone"
+        if not self.session_id or not SESSION_RE.fullmatch(self.session_id):
+            return "session-unbound"
+        if not self.last_normal_stop:
+            return "no-normal-stop"
+        if self.last_lifecycle_activity and self.last_lifecycle_activity > self.last_normal_stop:
+            return "lifecycle-activity"
+        if self.last_local_input and self.last_local_input > self.last_normal_stop:
+            return "user-input"
+        if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
+            return "transcript-activity"
+        if now() - self.last_normal_stop >= TTL_SECONDS[self.cache_profile]:
+            return "cache-already-cold"
+        _, snapshot_error = self._read_snapshot()
+        if snapshot_error:
+            return snapshot_error
+        if (self.current_tokens or 0) < MIN_TOKENS:
+            return "below-token-threshold"
+        return None
+
+    def attempt(self, expected_generation: int | None = None) -> bool:
+        """Run the final gate and inject one validated `/compact` submission."""
+        if expected_generation is not None and expected_generation != self.timer_generation:
+            return False
+        reason = self._gate_reason()
+        if reason:
+            self.last_cancellation_reason = reason
+            log(f"cancelled:{reason} channel={short_id(self.channel)}")
+            self._write_state()
+            return False
+        self.compacting = True
+        self.status = "active"
+        self.cancel("compaction-requested")
+        try:
+            if self.master_fd is None:
+                raise OSError(errno.EIO, "PTY master unavailable")
+            write_all(self.master_fd, b"/compact\r")
+        except OSError as error:
+            self.compacting = False
+            self.dirty = True
+            self.last_cancellation_reason = "compaction-injection-failed"
+            log(f"compaction-failed channel={short_id(self.channel)} error={error}")
+            self._write_state()
+            return False
+        log(f"compaction-requested channel={short_id(self.channel)}")
+        self._write_state()
+        return True
+
+    def _handle_event(self, message: dict) -> dict:
+        """Handle one validated lifecycle event from the Claude hook adapter."""
+        if message.get("kind") != "event" or message.get("channel") != self.channel:
+            return {"ok": False, "error": "invalid-event-owner"}
+        event = message.get("event")
+        session_id = message.get("session_id")
+        if event not in EVENTS or not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
+            return {"ok": False, "error": "invalid-event"}
+        if event == "session-start":
+            if self.session_id and self.session_id != session_id:
+                self.cancel("session-replaced")
+                self.dirty = False
+            self.session_id = session_id
+            self._set_transcript(message.get("transcript_path"))
+            self.status = "starting"
+            self.last_lifecycle_activity = now()
+            self._write_state()
+            return {"ok": True}
+        if self.session_id != session_id:
+            return {"ok": False, "error": "session-mismatch"}
+        current = now()
+        if event == "stop":
+            if message.get("stop_hook_active") is not False:
+                return {"ok": True, "ignored": "stop-hook-active"}
+            if self.compacting:
+                self.status = "idle"
+                self.cancel("compaction-stop")
+                return {"ok": True, "ignored": "compaction-stop"}
+            self.status = "idle"
+            self.dirty = True
+            self.last_normal_stop = current
+            self.last_lifecycle_activity = current
+            self.last_local_input = None
+            self.transcript_activity_at = None
+            self.transcript_baseline = None
+            try:
+                if self.transcript_path:
+                    stat = self.transcript_path.stat()
+                    self.transcript_baseline = (stat.st_mtime_ns, stat.st_size)
+            except OSError:
+                pass
+            self.cancel("new-normal-turn")
+            self.arm()
+            return {"ok": True}
+        if event == "user-prompt-submit":
+            self.status = "active"
+            self.last_lifecycle_activity = current
+            self.cancel("prompt-submit")
+        elif event == "post-compact":
+            self.status = "idle"
+            self.dirty = False
+            self.compacting = False
+            self.current_tokens = None
+            self.status_timestamp = None
+            self.last_lifecycle_activity = current
+            self.cancel("compaction-completed")
+            log(f"compaction-completed channel={short_id(self.channel)}")
+        elif event == "session-end":
+            self.status = "ended"
+            self.last_lifecycle_activity = current
+            self.cancel("session-end")
+        elif event == "stop-failure":
+            self.status = "error"
+            self.last_lifecycle_activity = current
+            self.cancel("stop-failure")
+        else:
+            self.status = "active"
+            self.last_lifecycle_activity = current
+            self.cancel("session-activity")
+        self._write_state()
+        return {"ok": True}
+
+    def _handle_control(self, message: dict) -> dict:
+        """Handle one local control command without exposing prompts or secrets."""
+        if message.get("kind") != "control":
+            return {"ok": False, "error": "invalid-control"}
+        if message.get("channel") != self.channel:
+            return {"ok": False, "error": "invalid-control-owner"}
+        command = message.get("command")
+        if command not in CONTROL_COMMANDS:
+            return {"ok": False, "error": "unknown-control"}
+        if command == "state":
+            return {"ok": True, "state": self.state()}
+        if command == "enable":
+            self.enabled = True
+            self.arm()
+        elif command == "disable":
+            self.enabled = False
+            self.cancel("session-disabled")
+        elif command == "profile":
+            profile = message.get("profile")
+            if profile not in {"long", "short", "auto"}:
+                return {"ok": False, "error": "invalid-profile"}
+            self.cache_profile_requested = profile
+            self.cache_profile = effective_profile(profile)
+            self.cancel("profile-changed")
+            self.arm()
+        elif command == "cancel":
+            self.cancel("manual-cancel")
+        elif command == "trigger":
+            self.attempt()
+        self._write_state()
+        return {"ok": True, "state": self.state()}
+
+    def _serve_one(self, connection: socket.socket) -> None:
+        """Read and answer one hook/control request from the local socket."""
+        try:
+            connection.settimeout(1.0)
+            data = connection.recv(65536)
+            if not data:
+                return
+            message = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+            if not isinstance(message, dict):
+                response = {"ok": False, "error": "invalid-json"}
+            elif message.get("kind") == "event":
+                response = self._handle_event(message)
+            else:
+                response = self._handle_control(message)
+            connection.sendall((json.dumps(response, separators=(",", ":")) + "\n").encode())
+        except (OSError, ValueError, UnicodeError) as error:
+            log(f"ipc-error channel={short_id(self.channel)} error={error}")
+        finally:
+            connection.close()
+
+    def _read_stdin(self) -> None:
+        """Proxy local terminal input and cancel work on every post-Stop byte."""
+        try:
+            data = os.read(sys.stdin.fileno(), 65536)
+        except (OSError, BlockingIOError):
+            return
+        if not data:
+            self.stdin_eof = True
+            if self.master_fd is not None:
+                try:
+                    write_all(self.master_fd, b"\x04")
+                except OSError:
+                    pass
+            try:
+                self.selector.unregister(sys.stdin)
+            except Exception:
+                pass
+            return
+        self.last_local_input = now()
+        if self.last_normal_stop and self.last_local_input > self.last_normal_stop:
+            self.cancel("user-input")
+        if self.master_fd is not None:
+            try:
+                write_all(self.master_fd, data)
+            except OSError:
+                self.shutdown_requested = True
+        self._write_state()
+
+    def _read_master(self) -> bool:
+        """Proxy Claude output to the caller and report whether the PTY remains open."""
+        if self.master_fd is None:
+            return False
+        try:
+            data = os.read(self.master_fd, 65536)
+        except OSError as error:
+            if error.errno in {errno.EIO, errno.EBADF}:
+                return False
+            return True
+        if not data:
+            return False
+        try:
+            write_all(sys.stdout.fileno(), data)
+            sys.stdout.flush()
+        except OSError:
+            self.shutdown_requested = True
+        return True
+
+    def _child_has_exited(self) -> bool:
+        """Reap the child once and retain its real exit status."""
+        if self.child_status is not None or not self.pid:
+            return self.child_status is not None
+        try:
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.child_status = 1 << 8
+            return True
+        if waited_pid == self.pid:
+            self.child_status = status
+            self.child_exited_at = now()
+            self.status = "exited"
+            self.cancel("process-exit")
+            return True
+        return False
+
+    def _handle_inotify(self) -> None:
+        """Cancel work when the watched transcript changes after Stop."""
+        if not self.inotify:
+            return
+        for mask, name in self.inotify.read():
+            if mask & Inotify.IN_Q_OVERFLOW:
+                self.cancel("transcript-watcher-overflow")
+            elif self.transcript_path and name == self.transcript_path.name:
+                self._record_transcript_activity()
+
+    def run(self) -> int:
+        """Run the PTY proxy until Claude exits, then restore and clean up."""
+        self.launch()
+        master_open = True
+        try:
+            while master_open:
+                child_exited = self._child_has_exited()
+                if self.timer_deadline is not None and now() >= self.timer_deadline:
+                    generation = self.timer_generation
+                    self.timer_deadline = None
+                    self.attempt(generation)
+                if not self.inotify and monotonic() >= self.next_transcript_poll:
+                    self.next_transcript_poll = monotonic() + TRANSCRIPT_POLL_SECONDS
+                    self._record_transcript_activity()
+                if child_exited:
+                    master_open = self._read_master()
+                    if not master_open:
+                        break
+                timeout = 1.0
+                if self.timer_deadline is not None:
+                    timeout = max(0.0, min(timeout, self.timer_deadline - now()))
+                if not self.inotify:
+                    timeout = min(timeout, max(0.0, self.next_transcript_poll - monotonic()))
+                events = self.selector.select(timeout)
+                for key, _mask in events:
+                    if key.data == "server":
+                        try:
+                            connection, _ = self.socket.accept()
+                            self._serve_one(connection)
+                        except BlockingIOError:
+                            pass
+                    elif key.data == "master":
+                        master_open = self._read_master()
+                    elif key.data == "stdin":
+                        self._read_stdin()
+                    elif key.data == "inotify":
+                        self._handle_inotify()
+                if self.shutdown_requested and self.pid and child_alive(self.pid):
+                    self._forward_signal(signal.SIGHUP, None)
+            self._child_has_exited()
+            if self.child_status is None and self.pid:
+                try:
+                    _, self.child_status = os.waitpid(self.pid, 0)
+                except ChildProcessError:
+                    self.child_status = 1 << 8
+            return os.waitstatus_to_exitcode(self.child_status or 0)
+        finally:
+            self._restore_terminal()
+            self.cleanup()
+
+    def cleanup(self) -> None:
+        """Close PTY/IPC resources and remove only this session's runtime directory."""
+        try:
+            self.selector.close()
+        except Exception:
+            pass
+        if self.inotify:
+            self.inotify.close()
+            self.inotify = None
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(self.session_dir)
+        except OSError:
+            pass
+
+
+def control_socket(channel: str) -> pathlib.Path:
+    """Return a validated session control socket path."""
+    if not CHANNEL_RE.fullmatch(channel):
+        raise RuntimeError("invalid Claude idle-compaction channel")
+    return runtime_root() / channel / "control.sock"
+
+
+def send_control(channel: str, command: str, **fields: object) -> dict:
+    """Send one safe control command to a supervised session."""
+    path = control_socket(channel)
+    message = {"kind": "control", "channel": channel, "command": command, **fields}
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(2.0)
+        connection.connect(str(path))
+        connection.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode())
+        data = connection.recv(65536)
+        return json.loads(data.decode("utf-8"))
+    finally:
+        connection.close()
+
+
+def list_sessions() -> int:
+    """List live or stale supervised session state without prompt contents."""
+    root = runtime_root()
+    found = False
+    for state_path in sorted(root.glob("claude-*/state.json")):
+        found = True
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        state["live"] = child_alive(state.get("pid"))
+        print(json.dumps(state, sort_keys=True))
+    if not found:
+        print("no supervised Claude sessions")
+    return 0
+
+
+def control_main(argv: list[str]) -> int:
+    """Implement claude-warmctl controls."""
+    if not argv or argv[0] in {"-h", "--help"}:
+        print("usage: claude-warmctl list | show CHANNEL | enable CHANNEL | disable CHANNEL")
+        print("       claude-warmctl profile CHANNEL long|short|auto")
+        print("       claude-warmctl cancel CHANNEL | trigger CHANNEL")
+        return 0
+    command = argv[0]
+    if command == "list":
+        return list_sessions()
+    if command not in CONTROL_COMMANDS:
+        print(f"unknown control command: {command}", file=sys.stderr)
+        return 2
+    if len(argv) < 2:
+        print(f"{command} requires CHANNEL", file=sys.stderr)
+        return 2
+    channel = argv[1]
+    fields = {"profile": argv[2]} if command == "profile" and len(argv) >= 3 else {}
+    if command == "profile" and not fields:
+        print("profile requires long, short, or auto", file=sys.stderr)
+        return 2
+    try:
+        response = send_control(channel, "state" if command == "show" else command, **fields)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"control failed: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(response, indent=2, sort_keys=True))
+    return 0 if response.get("ok") else 1
+
+
+def main(argv: list[str]) -> int:
+    """Launch Claude or dispatch a control command."""
+    if argv and argv[0] == "--control":
+        return control_main(argv[1:])
+    if argv and argv[0] in {"-h", "--help"}:
+        print("usage: claude-warm [CLAUDE OPTIONS...]", file=sys.stdout)
+        print("Runs the real Claude CLI through a full PTY supervisor.")
+        print("Environment: CLAUDE_IDLE_CACHE_PROFILE, CLAUDE_IDLE_COMPACTION_DEBUG,")
+        print("CLAUDE_IDLE_COMPACT_SECONDS, CLAUDE_SHORT_CACHE_IDLE_COMPACT_SECONDS,")
+        print("CLAUDE_IDLE_COMPACT_MIN_TOKENS, CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS")
+        print("Use claude-warmctl for per-session state and controls.")
+        return 0
+    try:
+        supervisor = Supervisor(argv, resolve_claude())
+        return supervisor.run()
+    except (OSError, RuntimeError) as error:
+        print(f"claude-warm: {error}", file=sys.stderr)
+        return 69
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle all/.local/bin/claude-warmctl :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+exec "$(dirname "$0")/claude-warm" --control "$@"
+#+END_SRC

@@ -14,6 +14,12 @@ Use this when adding, replacing, or debugging app icons in DotCortex-managed ico
 - `icons.org` owns helper scripts and process notes; edit it for workflow changes.
 - Do not commit `icon-theme.cache` or `.icon-theme.cache`.
 
+## SE98 vs Win98SE — settled provenance, do NOT re-investigate (sealed 2026-07-31)
+
+`SE98` and `Win98SE` are two applied instances of ONE upstream theme — `nestoris/Win98SE` on GitHub ("SE98 icon theme … based on Windows 98 SE style and grassmunk/Chicago95"; the author's own description: *"Enhanced Classic icon theme (used with Win98 Second Edition, WinME, Win2K systems)"*). That upstream ships both win2k and win98 variants of the version-specific icons, toggled by `win2k_icons.awk` / `win98_icons.awk`. DotCortex vendors two applied instances: **`Win98SE` = the win98 variant** (used by the `windows-98` scheme) and **`SE98` = the win2k variant** (used by the `windows-2000` scheme — it is genuinely Windows 2000/ME icons; 2000 and ME shared the set). The name "SE98" is the legitimate upstream project name, not a claim about the applied variant.
+
+Decisive proof if you ever doubt it again: `SE98/devices/{16,32,48}/computer.png` is byte-identical to `computer_win2k.png`, while `Win98SE`'s is byte-identical to `computer_win98.png`. The ~90% byte-overlap between the two themes (7283/8119 files identical) is **expected** — one upstream, and 98/ME/2000 shared most of shell32 — it is **not** duplication to "clean up". `SE98` is intentional and correct for `windows-2000`, with no downstream modifications. Do NOT rename it, dedupe it against `Win98SE`, replace it, or "source real 2000 icons" — the icons are already correct; the only gap was this note.
+
 ## THE THEMES ARE GIT SUBMODULES — a plain `git add` will not capture your icons
 
 `Chicago95`, `BeOS-r5-Icons`, `Irixium`, `Iris`, `indigo-reality`, `Platinum9`, `irix-icons-linux` and `Throbbers` are each a **separate git repository** (mostly Mètsàtron's own GitLab forks). `icon-theme-inject` writes *inside* a submodule working tree. DotCortex only tracks the submodule's commit pointer, so from the DotCortex root your new PNGs appear as a single ` m <theme>` line and `git add <path/to/icon.png>` fails with *"Pathspec is in submodule"*. Commit them and they are silently absent.

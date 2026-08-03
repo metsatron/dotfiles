@@ -68,6 +68,10 @@ stow:
 safe-stow:
 | set -euo pipefail; \
 | cd $(HOME)/DotCortex; \
+| STOW_GUARD="$(HOME)/.local/bin/dotcortex-stow-target-guard"; \
+| [ -x "$$STOW_GUARD" ] || STOW_GUARD="$(HOME)/DotCortex/all/.local/bin/dotcortex-stow-target-guard"; \
+| [ -x "$$STOW_GUARD" ] || { echo "safe-stow: missing dotcortex-stow-target-guard — refusing to continue" >&2; exit 1; }; \
+| "$$STOW_GUARD" --packages "$(STOW_PKGS)"; \
 | repair_mutable_agent_dir() { \
 |   local rel="$$1" target="$(HOME)/$$1" resolved entry name rel_entry ts backup; \
 |   [ -L "$$target" ] || return 0; \
