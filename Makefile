@@ -10,6 +10,11 @@ EXTRA := $(HOME)/.guix-extra-profiles
 
 # Stow packages you normally manage here
 STOW_PKGS ?= all
+# Stow target defaults to the current home; sanctuary helpers override it with
+# the persistent guest home because the DotCortex checkout is a host-visible
+# symlink from inside Distrobox.
+STOW_TARGET ?= $(HOME)
+STOW_FLAGS = --target="$(STOW_TARGET)"
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
         stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census
@@ -42,7 +47,7 @@ all: toc tangle census guix-dirs
 
 # Plain stow
 stow:
-| cd $(HOME)/DotCortex && stow $(STOW_PKGS)
+| cd $(HOME)/DotCortex && stow $(STOW_FLAGS) $(STOW_PKGS)
 
 # Safe stow with timestamped backups of real files
 # LESSON: stow 2.4+ changed conflict message format from:
@@ -116,7 +121,7 @@ safe-stow:
 | for pkg in $(STOW_PKGS); do \
 |   preview_file=$$(mktemp); \
 |   echo ">> preview $$pkg"; \
-|   stow -n --ignore='\.bak\.' $$pkg >"$$preview_file" 2>&1 || true; \
+|   stow $(STOW_FLAGS) -n --ignore='\.bak\.' $$pkg >"$$preview_file" 2>&1 || true; \
 |   if grep -q 'existing target is stowed to a different package:' "$$preview_file"; then \
 |     cat "$$preview_file"; \
 |     rm -f "$$preview_file"; \
@@ -129,11 +134,11 @@ safe-stow:
 |       "$$preview_file" \
 |     | { grep -v '^HelmCortex$$' || true; } \
 |     | while read -r t; do \
-|         case "$$t" in /*) abs="$$t" ;; *) abs="$(HOME)/$$t" ;; esac; \
+|         case "$$t" in "$(STOW_TARGET)"/*) abs="$$t" ;; /*) abs="$$t" ;; *) abs="$(STOW_TARGET)/$$t" ;; esac; \
 |         if [ -e "$$abs" ] || [ -L "$$abs" ]; then \
 |           if [ "$$t" = ".config/opencode/opencode.json" ]; then \
-|             HELPER="$(HOME)/.local/bin/dotcortex-opencode-config-merge-guard"; \
-|             [ -x "$$HELPER" ] || HELPER="$(HOME)/DotCortex/all/.local/bin/dotcortex-opencode-config-merge-guard"; \
+|             HELPER="$(STOW_TARGET)/.local/bin/dotcortex-opencode-config-merge-guard"; \
+|             [ -x "$$HELPER" ] || HELPER="$(STOW_TARGET)/DotCortex/all/.local/bin/dotcortex-opencode-config-merge-guard"; \
 |             if [ -x "$$HELPER" ]; then \
 |               "$$HELPER" apply; \
 |               continue; \
@@ -148,11 +153,11 @@ safe-stow:
 |       done; \
 |   rm -f "$$preview_file"; \
 |   echo ">> stow $$pkg"; \
-|   if stow --ignore='\.bak\.' $$pkg 2>&1; then \
+|   if stow $(STOW_FLAGS) --ignore='\.bak\.' $$pkg 2>&1; then \
 |     true; \
 |   else \
 |     echo ">> stow $$pkg conflict — retrying with --ignore=HelmCortex"; \
-|     stow --ignore='HelmCortex' --ignore='\.bak\.' $$pkg; \
+|     stow $(STOW_FLAGS) --ignore='HelmCortex' --ignore='\.bak\.' $$pkg; \
 |   fi; \
 | done; \
 | case " $(STOW_PKGS) " in \
@@ -167,11 +172,11 @@ safe-stow:
 | esac
 
 preview-stow:
-| cd $(HOME)/DotCortex && stow -n $(STOW_PKGS) || true
+| cd $(HOME)/DotCortex && stow $(STOW_FLAGS) -n $(STOW_PKGS) || true
 
 # X11 apply for x230 overlay
 x11-apply: tangle
-| cd $(HOME)/DotCortex && stow x230
+| cd $(HOME)/DotCortex && stow $(STOW_FLAGS) x230
 | @echo "✅ X11 applied."
 
 include $(HOME)/DotCortex/all/.mk/flatpak.mk
