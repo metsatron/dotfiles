@@ -419,6 +419,35 @@ class ClaudeWarmTests(unittest.TestCase):
         )
         wait_until(lambda: session.read_state() and session.read_state()["dirty"])
 
+    def test_statusline_registry_fallback_without_owner_environment(self):
+        session = self.make_session(delay=30)
+        session.event("session-start", transcript_path=str(session.transcript))
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "XDG_RUNTIME_DIR": str(session.root),
+                "CLAUDE_IDLE_OWNER": "",
+                "CLAUDE_IDLE_CHANNEL": "",
+                "CLAUDE_IDLE_RUNTIME_DIR": "",
+            }
+        )
+        payload = {
+            "session_id": session.session_id,
+            "cwd": str(REPO),
+            "model": {"display_name": "Claude Test"},
+            "context_window": {"total_input_tokens": 81234},
+        }
+        subprocess.run(
+            [str(STATUSLINE)], input=json.dumps(payload).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        snapshot_path = session.state_path.parent / "status.json"
+        wait_until(lambda: snapshot_path.exists())
+        snapshot = json.loads(snapshot_path.read_text())
+        self.assertEqual(snapshot["channel"], session.channel)
+        self.assertEqual(snapshot["session_id"], session.session_id)
+        self.assertEqual(snapshot["current_input_context_tokens"], 81234)
+
     def test_two_sessions_are_isolated(self):
         first = self.make_session(delay=0)
         second = self.make_session(delay=30)
