@@ -42,6 +42,23 @@ The owner contract is explicit: =CLAUDE_IDLE_OWNER=emacs= belongs to
 launcher, and sessions launched by neither owner remain unsupported legacy
 processes.  This source does not replace the =claude= executable globally.
 
+The channel guard is deliberately generic.  It derives watched server names
+from =--channels= (or the explicit
+=CLAUDE_IDLE_WATCHED_SERVERS= override), and never embeds a Telegram bot name,
+chat identifier, or message.  Claude Code 2.1.220 and the installed Telegram
+plugin 0.0.6 emit attachment deltas whose observed server identity is
+=plugin:telegram:telegram=; that identity is therefore the derived default
+for that channel specification.  The slash-command response itself remains
+overrideable with =CLAUDE_IDLE_RECONNECT_SERVER= until a healthy live session
+has confirmed the exact =/mcp reconnect= command path.
+
+Channel recovery uses the same final PTY gate as compaction.  It watches only
+new transcript JSONL lines, treats watched =removedNames= entries as channel
+death, waits for a matching watched =addedNames= entry, and gives up after two
+reconnect attempts plus one =/reload-plugins= attempt.  The persistent guard
+log is private state under =XDG_STATE_HOME=; it contains event names and safe
+diagnostics, never prompts or channel message contents.
+
 #+BEGIN_SRC python :tangle all/.local/bin/claude-warm :shebang "#!/usr/bin/env python3" :comments no
 """PTY-owning Claude launcher and per-session idle-compaction supervisor."""
 
@@ -86,7 +103,12 @@ CONTROL_COMMANDS = {
     "profile",
     "cancel",
     "trigger",
+    "inject",
 }
+
+INJECT_RE = re.compile(r"^/mcp reconnect ([A-Za-z0-9_.:-]{1,128})$")
+CHANNEL_DEATH_MARKER = "removedNames"
+CHANNEL_ATTACH_MARKER = "addedNames"
 
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
@@ -95,6 +117,97 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
         return max(minimum, int(os.environ.get(name, str(default))))
     except ValueError:
         return default
+
+
+def channel_arguments(argv: list[str]) -> list[str]:
+    """Return channel specifications without changing the child argv."""
+    specifications: list[str] = []
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument.startswith("--channels="):
+            specifications.extend(
+                value for value in argument.split("=", 1)[1].split(",") if value
+            )
+        elif argument == "--channels":
+            index += 1
+            while index < len(argv) and not argv[index].startswith("-"):
+                specifications.extend(value for value in argv[index].split(",") if value)
+                index += 1
+            continue
+        index += 1
+    return specifications
+
+
+def watched_server_names(argv: list[str]) -> tuple[str, ...]:
+    """Derive safe attachment names from --channels or an explicit override."""
+    override = os.environ.get("CLAUDE_IDLE_WATCHED_SERVERS", "")
+    if override:
+        candidates = [value.strip() for value in override.split(",") if value.strip()]
+    else:
+        candidates = []
+        for specification in channel_arguments(argv):
+            base = specification.split("@", 1)[0]
+            if not base:
+                continue
+            candidates.append(base)
+            parts = [part for part in base.split(":") if part]
+            if len(parts) >= 2:
+                # Claude's plugin attachment names are derived from the
+                # channel namespace and plugin name.  Keep both observed
+                # spellings available without hard-coding a provider.
+                candidates.append(base + ":" + parts[-1])
+                candidates.append(base.replace(":", "_") + "_" + parts[-1])
+    return tuple(sorted({value for value in candidates if re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", value)}))
+
+
+def validate_inject_command(
+    command: object,
+    watched: tuple[str, ...],
+    reconnect_command: str | None,
+) -> bool:
+    """Allow only fixed governor commands and the session's watched reconnect."""
+    if not isinstance(command, str) or len(command) > 256:
+        return False
+    if command in {"/compact", "/reload-plugins"}:
+        return True
+    if command == reconnect_command:
+        return True
+    match = INJECT_RE.fullmatch(command)
+    return bool(match and match.group(1) in watched)
+
+
+def channel_process_patterns() -> tuple[str, ...]:
+    """Return safe process-name fragments used for launch-time attachment checks."""
+    configured = os.environ.get("CLAUDE_IDLE_CHANNEL_PROCESS_PATTERNS", "")
+    values = [value.strip() for value in configured.split(",") if value.strip()]
+    return tuple(values or ["server.ts"])
+
+
+def persistent_state_root() -> pathlib.Path:
+    """Return the private, durable state root for post-mortem guard logs."""
+    base = os.environ.get("XDG_STATE_HOME") or str(pathlib.Path.home() / ".local/state")
+    root = pathlib.Path(base) / "claude-idle-compaction"
+    safe_mkdir(root)
+    return root
+
+
+def proc_children(pid: int) -> list[int]:
+    """Read one Linux process's direct children without invoking a scanner."""
+    try:
+        value = pathlib.Path(f"/proc/{pid}/task/{pid}/children").read_text()
+    except OSError:
+        return []
+    return [int(child) for child in value.split() if child.isdigit()]
+
+
+def process_command_line(pid: int) -> str:
+    """Read a process command line for a local, non-secret attach check."""
+    try:
+        raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return ""
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
 
 
 IDLE_SECONDS = {
@@ -109,6 +222,18 @@ MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
 STATUS_MAX_AGE = env_int("CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS", 120, 1)
 TRANSCRIPT_POLL_SECONDS = env_int(
     "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS", 2, 1
+)
+CHANNEL_ATTACH_WAIT_SECONDS = env_int(
+    "CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS", 30, 0
+)
+CHANNEL_RECOVERY_COOLDOWN_SECONDS = env_int(
+    "CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS", 3, 0
+)
+CHANNEL_RECOVERY_CONFIRM_SECONDS = env_int(
+    "CLAUDE_IDLE_CHANNEL_RECOVERY_CONFIRM_SECONDS", 5, 1
+)
+DEBUG_LOG_MAX_BYTES = env_int(
+    "CLAUDE_IDLE_CHANNEL_DEBUG_MAX_BYTES", 2 * 1024 * 1024, 65536
 )
 DEBUG = os.environ.get("CLAUDE_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
 
@@ -309,10 +434,16 @@ class Supervisor:
     def __init__(self, argv: list[str], executable: str):
         self.argv = argv
         self.executable = executable
+        self.channel_specs = tuple(channel_arguments(argv))
+        self.watched_servers = watched_server_names(argv)
+        self.channel_process_patterns = channel_process_patterns()
         self.channel = "claude-" + uuid.uuid4().hex
         self.root = runtime_root()
         self.session_dir = self.root / self.channel
         safe_mkdir(self.session_dir)
+        self.state_root = persistent_state_root()
+        self.guard_log_path = self.state_root / f"{self.channel}.channel-guard.log"
+        self.debug_log_path = self.state_root / f"{self.channel}.claude-debug.log"
         self.socket_path = self.session_dir / "control.sock"
         self.state_path = self.session_dir / "state.json"
         self.snapshot_path = self.session_dir / "status.json"
@@ -333,6 +464,9 @@ class Supervisor:
         self.session_id: str | None = None
         self.transcript_path: pathlib.Path | None = None
         self.transcript_baseline: tuple[int, int] | None = None
+        self.transcript_inode: int | None = None
+        self.transcript_offset = 0
+        self.transcript_partial = b""
         self.transcript_activity_at: float | None = None
         self.inotify: Inotify | None = None
         self.status = "starting"
@@ -347,12 +481,42 @@ class Supervisor:
         self.cache_profile_requested = os.environ.get("CLAUDE_IDLE_CACHE_PROFILE", "auto")
         self.cache_profile = effective_profile(self.cache_profile_requested)
         self.timer_deadline: float | None = None
+        self.timer_kind: str | None = None
         self.timer_generation = 0
         self.last_cancellation_reason: str | None = None
+        self.last_channel_activity: float | None = None
+        self.last_channel_event: str | None = None
+        self.last_channel_death: float | None = None
+        self.channel_marker_seen = False
+        self.channel_turn_seen = False
+        self.channel_attach_checked = not bool(self.watched_servers)
+        self.channel_attach_deadline = (
+            monotonic() + CHANNEL_ATTACH_WAIT_SECONDS if self.watched_servers else None
+        )
+        self.channel_health = "none" if not self.watched_servers else "reconnecting"
+        self.recovery_pending = False
+        self.recovery_awaiting = False
+        self.recovery_command_inflight = False
+        self.recovery_expected_stop = False
+        self.recovery_ignore_next_stop = False
+        self.recovery_attempts = 0
+        self.recovery_reload_attempted = False
+        self.recovery_generation = 0
+        self.recovery_command = self._default_recovery_command()
+        self.next_debug_bound = monotonic() + 5
         self.shutdown_requested = False
         self.child_exited_at: float | None = None
         self.next_transcript_poll = monotonic() + TRANSCRIPT_POLL_SECONDS
+        self._guard_log("supervisor-started")
         self._write_state()
+
+    def _default_recovery_command(self) -> str | None:
+        """Return the source-backed/default reconnect command, if configured."""
+        configured = os.environ.get("CLAUDE_IDLE_RECONNECT_SERVER", "").strip()
+        server = configured or (self.watched_servers[1] if len(self.watched_servers) > 1 else (self.watched_servers[0] if self.watched_servers else ""))
+        if not server or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", server):
+            return None
+        return f"/mcp reconnect {server}"
 
     def state(self) -> dict:
         """Return safe persisted state for controls and diagnostics."""
@@ -365,6 +529,21 @@ class Supervisor:
             "control_socket": str(self.socket_path),
             "session_id": self.session_id,
             "transcript_path": str(self.transcript_path) if self.transcript_path else None,
+            "channel_specs": list(self.channel_specs),
+            "watched_servers": list(self.watched_servers),
+            "channel_health": self.channel_health,
+            "channel_marker_seen": self.channel_marker_seen,
+            "channel_turn_seen": self.channel_turn_seen,
+            "channel_attach_checked": self.channel_attach_checked,
+            "channel_attach_deadline": self.channel_attach_deadline,
+            "channel_recovery_pending": self.recovery_pending,
+            "channel_recovery_awaiting": self.recovery_awaiting,
+            "channel_recovery_ignore_next_stop": self.recovery_ignore_next_stop,
+            "channel_recovery_attempts": self.recovery_attempts,
+            "channel_recovery_reload_attempted": self.recovery_reload_attempted,
+            "channel_reconnect_command": self.recovery_command,
+            "channel_guard_log": str(self.guard_log_path),
+            "channel_debug_log": str(self.debug_log_path) if self.watched_servers else None,
             "status": self.status,
             "current_input_context_tokens": self.current_tokens,
             "status_snapshot_timestamp": self.status_timestamp,
@@ -376,8 +555,55 @@ class Supervisor:
             "cache_profile": self.cache_profile,
             "cache_profile_requested": self.cache_profile_requested,
             "timer_deadline": self.timer_deadline,
+            "timer_kind": self.timer_kind,
             "last_cancellation_reason": self.last_cancellation_reason,
+            "last_channel_activity": self.last_channel_activity,
+            "last_channel_event": self.last_channel_event,
+            "last_channel_death": self.last_channel_death,
         }
+
+    def _guard_log(self, event: str, **fields: object) -> None:
+        """Append one safe, durable channel-guard observation."""
+        if not self.watched_servers:
+            return
+        payload = {
+            "timestamp": now(),
+            "event": event,
+            "channel": short_id(self.channel),
+            "health": self.channel_health,
+            **fields,
+        }
+        try:
+            with self.guard_log_path.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
+            os.chmod(self.guard_log_path, 0o600)
+        except OSError as error:
+            log(f"channel-log-write-failed channel={short_id(self.channel)} error={error}")
+
+    def _notice(self, message: str) -> None:
+        """Emit a fixed, prompt-free diagnostic on the user's terminal."""
+        try:
+            sys.stderr.write(f"\r\n[claude-warm channel {short_id(self.channel)}] {message}\r\n")
+            sys.stderr.flush()
+        except OSError:
+            pass
+
+    def _bound_debug_log(self) -> None:
+        """Keep the optional Claude debug capture bounded for long-running bots."""
+        if not self.watched_servers:
+            return
+        try:
+            size = self.debug_log_path.stat().st_size
+            if size <= DEBUG_LOG_MAX_BYTES:
+                return
+            with self.debug_log_path.open("rb") as stream:
+                stream.seek(-DEBUG_LOG_MAX_BYTES, os.SEEK_END)
+                tail = stream.read()
+            with self.debug_log_path.open("wb") as stream:
+                stream.write(tail)
+            self._guard_log("debug-log-trimmed", bytes=DEBUG_LOG_MAX_BYTES)
+        except OSError:
+            pass
 
     def _write_state(self) -> None:
         """Persist the current state atomically."""
@@ -389,9 +615,11 @@ class Supervisor:
     def cancel(self, reason: str) -> None:
         """Invalidate the one-shot timer and retain the cancellation reason."""
         self.timer_deadline = None
+        self.timer_kind = None
         self.timer_generation += 1
         self.last_cancellation_reason = reason
         log(f"cancelled:{reason} channel={short_id(self.channel)}")
+        self._guard_log("cancelled", reason=reason)
         self._write_state()
 
     def arm(self) -> None:
@@ -404,13 +632,38 @@ class Supervisor:
             and self.last_normal_stop
             and child_alive(self.pid)
             and self.timer_deadline is None
+            and not self.recovery_pending
         ):
             return
         self.timer_generation += 1
         self.timer_deadline = self.last_normal_stop + IDLE_SECONDS[self.cache_profile]
+        self.timer_kind = "compact"
         log(
             f"armed channel={short_id(self.channel)} profile={self.cache_profile} "
             f"delay={IDLE_SECONDS[self.cache_profile]}"
+        )
+        self._guard_log(
+            "armed",
+            kind="compact",
+            profile=self.cache_profile,
+            delay=IDLE_SECONDS[self.cache_profile],
+        )
+        self._write_state()
+
+    def _arm_recovery(self, delay: int | None = None) -> None:
+        """Arm the shared one-shot timer for one bounded channel recovery step."""
+        if not self.recovery_pending or self.compacting or not child_alive(self.pid):
+            return
+        self.timer_generation += 1
+        self.timer_kind = "channel-recovery"
+        self.timer_deadline = now() + (
+            CHANNEL_RECOVERY_COOLDOWN_SECONDS if delay is None else max(0, delay)
+        )
+        self._guard_log(
+            "armed",
+            kind="channel-recovery",
+            delay=(CHANNEL_RECOVERY_COOLDOWN_SECONDS if delay is None else max(0, delay)),
+            recovery_generation=self.recovery_generation,
         )
         self._write_state()
 
@@ -420,11 +673,7 @@ class Supervisor:
             return
         path = pathlib.Path(value).expanduser()
         self.transcript_path = path
-        try:
-            stat = path.stat()
-            self.transcript_baseline = (stat.st_mtime_ns, stat.st_size)
-        except OSError:
-            self.transcript_baseline = None
+        self._reset_transcript_cursor()
         if self.inotify:
             self.inotify.close()
             self.inotify = None
@@ -436,25 +685,177 @@ class Supervisor:
             log(f"transcript-watcher=fallback channel={short_id(self.channel)}")
         self._write_state()
 
-    def _transcript_changed(self) -> bool:
-        """Return whether the bound transcript has changed since its baseline."""
+    def _reset_transcript_cursor(self) -> None:
+        """Start tailing at the current end, never replaying old prompt data."""
         if not self.transcript_path:
-            return False
+            self.transcript_baseline = None
+            self.transcript_inode = None
+            self.transcript_offset = 0
+            self.transcript_partial = b""
+            return
         try:
             stat = self.transcript_path.stat()
-            current = (stat.st_mtime_ns, stat.st_size)
+            self.transcript_baseline = (stat.st_mtime_ns, stat.st_size)
+            self.transcript_inode = stat.st_ino
+            self.transcript_offset = stat.st_size
+            self.transcript_partial = b""
         except OSError:
-            return False
-        if self.transcript_baseline is None:
-            self.transcript_baseline = current
-            return False
-        return current != self.transcript_baseline
+            self.transcript_baseline = None
+            self.transcript_inode = None
+            self.transcript_offset = 0
+            self.transcript_partial = b""
+
+    def _abort_recovery(self, reason: str) -> None:
+        """Stop a pending recovery after activity that is not the death marker."""
+        if self.recovery_pending:
+            self.recovery_pending = False
+            self.recovery_awaiting = False
+            self.recovery_command_inflight = False
+            self.recovery_expected_stop = False
+            self._guard_log("recovery-aborted", reason=reason)
+        self.cancel(reason)
+
+    def _watched_names(self, value: object) -> set[str]:
+        """Validate one attachment-name list without retaining untrusted text."""
+        if not isinstance(value, list):
+            return set()
+        return {
+            item
+            for item in value
+            if isinstance(item, str)
+            and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", item)
+        }
+
+    def _start_channel_recovery(self, removed: set[str]) -> None:
+        """Create one recovery generation for a newly observed channel death."""
+        watched_removed = sorted(removed.intersection(self.watched_servers))
+        if not watched_removed:
+            return
+        if self.recovery_pending:
+            self._guard_log("channel-death-duplicate", servers=watched_removed)
+            return
+        current = now()
+        self.channel_health = "reconnecting"
+        self.last_channel_activity = current
+        self.last_channel_event = "removed"
+        self.last_channel_death = current
+        self.recovery_pending = True
+        self.recovery_awaiting = False
+        self.recovery_command_inflight = False
+        self.recovery_expected_stop = False
+        self.recovery_ignore_next_stop = False
+        self.recovery_attempts = 0
+        self.recovery_reload_attempted = False
+        self.recovery_generation += 1
+        self.transcript_activity_at = current
+        self.cancel("channel-death")
+        self._guard_log(
+            "channel-dead",
+            servers=watched_removed,
+            recovery_generation=self.recovery_generation,
+        )
+        self._notice("channel server disappeared; recovery is waiting for an idle turn")
+        if self.status == "idle" and self.last_normal_stop:
+            self._arm_recovery()
+        self._write_state()
+
+    def _complete_channel_recovery(self, source: str) -> None:
+        """Mark the current death generation recovered after a watched add delta."""
+        if not self.recovery_pending:
+            return
+        self.recovery_pending = False
+        self.recovery_awaiting = False
+        self.recovery_command_inflight = False
+        # The attachment may confirm before Claude emits Stop for the slash
+        # command.  Consume that one completion without making it a dirty
+        # ordinary turn or arming the idle-compaction timer.
+        self.recovery_expected_stop = False
+        self.recovery_ignore_next_stop = True
+        self.channel_health = "attached"
+        self.last_channel_event = "added"
+        self.cancel("channel-reconnected")
+        self._guard_log("channel-recovered", source=source)
+        self._notice("channel server reattached")
+        self._write_state()
+
+    def _handle_attachment_delta(self, attachment: dict) -> None:
+        """Handle Claude's undocumented-but-observed attachment delta shape."""
+        added = self._watched_names(attachment.get(CHANNEL_ATTACH_MARKER))
+        removed = self._watched_names(attachment.get(CHANNEL_DEATH_MARKER))
+        watched_added = sorted(added.intersection(self.watched_servers))
+        watched_removed = sorted(removed.intersection(self.watched_servers))
+        if not watched_added and not watched_removed:
+            return
+        self.channel_turn_seen = True
+        if watched_added:
+            self.last_channel_activity = now()
+            self.channel_marker_seen = True
+            self.last_channel_event = "added"
+            self.channel_health = "attached"
+            self.channel_attach_checked = True
+            self._guard_log("channel-attached-marker", servers=watched_added)
+            if self.recovery_pending and self.recovery_awaiting:
+                self._complete_channel_recovery("attachment-added")
+            elif self.last_normal_stop and not self.compacting:
+                self.cancel("channel-activity")
+        if watched_removed:
+            if self.recovery_pending:
+                self._guard_log("channel-death-duplicate", servers=watched_removed)
+            else:
+                self.last_channel_activity = now()
+                self.last_channel_event = "removed"
+                self._start_channel_recovery(set(watched_removed))
+        self._write_state()
+
+    def _tail_transcript(self) -> None:
+        """Parse only complete new JSONL lines, retaining a partial tail safely."""
+        if not self.transcript_path:
+            return
+        try:
+            stat = self.transcript_path.stat()
+            if self.transcript_inode != stat.st_ino or stat.st_size < self.transcript_offset:
+                self.transcript_offset = 0
+                self.transcript_partial = b""
+                self.transcript_inode = stat.st_ino
+            with self.transcript_path.open("rb") as stream:
+                stream.seek(self.transcript_offset)
+                chunk = stream.read()
+            self.transcript_offset += len(chunk)
+        except OSError:
+            return
+        if not chunk:
+            return
+        data = self.transcript_partial + chunk
+        lines = data.split(b"\n")
+        self.transcript_partial = lines.pop()
+        for raw_line in lines:
+            if not raw_line.strip():
+                continue
+            try:
+                entry = json.loads(raw_line.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                self._guard_log("transcript-line-unparseable")
+                continue
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("type") == "attachment" and isinstance(entry.get("attachment"), dict):
+                self._handle_attachment_delta(entry["attachment"])
+                continue
+            # A compacting session is expected to append system/boundary lines.
+            # PostCompact clears the governor state; these lines must not look
+            # like a remote Telegram turn in the meantime.
+            if self.compacting:
+                continue
+            if self.last_normal_stop:
+                current = now()
+                self.transcript_activity_at = current
+                self.last_channel_activity = current
+                self.last_channel_event = "transcript"
+                self._abort_recovery("transcript-activity")
 
     def _record_transcript_activity(self) -> None:
-        """Cancel pending work after a transcript append outside governor compaction."""
-        if self.last_normal_stop and not self.compacting and self._transcript_changed():
-            self.transcript_activity_at = now()
-            self.cancel("transcript-activity")
+        """Tail the transcript after inotify or fallback-poll notification."""
+        self._tail_transcript()
 
     def _install_terminal(self) -> None:
         """Put the caller's terminal in raw mode and register stdin."""
@@ -536,12 +937,14 @@ class Supervisor:
                 "CLAUDE_IDLE_CONTROL_SOCKET": str(self.socket_path),
                 "CLAUDE_IDLE_RUNTIME_DIR": str(self.session_dir),
                 "CLAUDE_IDLE_SUPERVISOR_PID": str(os.getpid()),
+                "CLAUDE_IDLE_WATCHED_SERVERS": ",".join(self.watched_servers),
             }
         )
         pid, master_fd = pty.fork()
         if pid == 0:
             try:
-                os.execvpe(self.executable, [self.executable, *self.argv], environment)
+                child_argv = self._child_argv()
+                os.execvpe(self.executable, [self.executable, *child_argv], environment)
             except BaseException as error:
                 print(f"claude-warm: failed to exec Claude: {error}", file=sys.stderr)
                 os._exit(127)
@@ -583,6 +986,49 @@ class Supervisor:
         except OSError:
             return False
 
+    def _channel_process_present(self) -> bool:
+        """Return whether a watched channel process is a Claude descendant."""
+        if not self.pid or not self.watched_servers:
+            return False
+        pending = proc_children(self.pid)
+        seen: set[int] = set()
+        while pending:
+            candidate = pending.pop()
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            command_line = process_command_line(candidate)
+            if any(pattern in command_line for pattern in self.channel_process_patterns):
+                return True
+            pending.extend(proc_children(candidate))
+        return False
+
+    def _check_channel_attach(self) -> None:
+        """Verify launch-time channel attachment without requiring a first message."""
+        if self.channel_attach_checked or not self.watched_servers:
+            return
+        if self._channel_process_present():
+            self.channel_attach_checked = True
+            self.channel_health = "attached"
+            self._guard_log("channel-attached-process")
+            self._write_state()
+            return
+        if self.channel_attach_deadline is not None and monotonic() >= self.channel_attach_deadline:
+            self.channel_attach_checked = True
+            self.channel_health = "failed-attach"
+            self.cancel("channel-attach-failed")
+            self._guard_log("channel-attach-failed")
+            self._notice("channel did not attach; the terminal session remains running")
+            self._write_state()
+
+    def _child_argv(self) -> list[str]:
+        """Add private Claude debug capture only for channel sessions."""
+        if not self.watched_servers:
+            return list(self.argv)
+        if any(argument == "--debug" or argument.startswith("--debug-") for argument in self.argv):
+            return list(self.argv)
+        return [*self.argv, "--debug-file", str(self.debug_log_path)]
+
     def _read_snapshot(self) -> tuple[dict | None, str | None]:
         """Read and validate a fresh status-line snapshot."""
         try:
@@ -608,14 +1054,12 @@ class Supervisor:
         self.status_timestamp = float(timestamp)
         return payload, None
 
-    def _gate_reason(self) -> str | None:
+    def _gate_reason(self, purpose: str = "compact") -> str | None:
         """Return the first failed final eligibility condition, if any."""
         if not self.enabled:
             return "session-disabled"
         if self.status != "idle":
             return "session-active"
-        if not self.dirty:
-            return "clean"
         if self.compacting:
             return "already-compacting"
         if not self._pty_still_owned():
@@ -628,42 +1072,174 @@ class Supervisor:
             return "lifecycle-activity"
         if self.last_local_input and self.last_local_input > self.last_normal_stop:
             return "user-input"
-        if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
-            return "transcript-activity"
+        if purpose == "compact":
+            if not self.dirty:
+                return "clean"
+            if self.recovery_pending:
+                return "channel-recovery-pending"
+            if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
+                return "transcript-activity"
+        elif purpose == "recovery":
+            if not self.recovery_pending:
+                return "no-channel-recovery"
+            if self.recovery_awaiting:
+                return "recovery-awaiting-confirmation"
+            if self.last_channel_event != "removed":
+                return "channel-activity"
+            if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
+                # The removal marker is the reason for recovery.  Any other
+                # transcript line is handled by _tail_transcript and changes
+                # last_channel_event away from `removed'.
+                if self.last_channel_activity != self.transcript_activity_at:
+                    return "transcript-activity"
+        elif purpose != "manual":
+            return "unknown-injection-purpose"
         if now() - self.last_normal_stop >= TTL_SECONDS[self.cache_profile]:
-            return "cache-already-cold"
+            if purpose == "compact":
+                return "cache-already-cold"
         _, snapshot_error = self._read_snapshot()
-        if snapshot_error:
+        if purpose == "compact" and snapshot_error:
             return snapshot_error
-        if (self.current_tokens or 0) < MIN_TOKENS:
+        if purpose == "compact" and (self.current_tokens or 0) < MIN_TOKENS:
             return "below-token-threshold"
         return None
 
-    def attempt(self, expected_generation: int | None = None) -> bool:
-        """Run the final gate and inject one validated `/compact` submission."""
+    def _schedule_next_recovery(self) -> None:
+        """Schedule another bounded recovery step after a missing confirmation."""
+        self.recovery_awaiting = False
+        self.recovery_command_inflight = False
+        self.recovery_expected_stop = False
+        self._arm_recovery()
+
+    def _fail_channel_recovery(self) -> None:
+        """Stop retrying a death generation and surface the failure visibly."""
+        self.recovery_pending = False
+        self.recovery_awaiting = False
+        self.recovery_command_inflight = False
+        self.recovery_expected_stop = False
+        self.channel_health = "dead"
+        self.cancel("channel-dead")
+        self._guard_log(
+            "channel-recovery-failed",
+            reconnect_attempts=self.recovery_attempts,
+            reload_attempted=self.recovery_reload_attempted,
+        )
+        self._notice("channel recovery failed after bounded retries; inspect claude-warmctl show")
+        self._write_state()
+
+    def _recovery_step(self, expected_generation: int) -> None:
+        """Inject one reconnect/reload step, never more than once per timer."""
+        if expected_generation != self.timer_generation or not self.recovery_pending:
+            return
+        reason = self._gate_reason("recovery")
+        if reason:
+            self.last_cancellation_reason = reason
+            self._guard_log("recovery-gate-refused", reason=reason)
+            if reason in {"session-active", "no-normal-stop"}:
+                self._write_state()
+                return
+            self._abort_recovery(reason)
+            return
+        if self.recovery_attempts < 2:
+            command = self.recovery_command
+            if not command:
+                self._fail_channel_recovery()
+                return
+            self.recovery_attempts += 1
+        elif not self.recovery_reload_attempted:
+            command = "/reload-plugins"
+            self.recovery_reload_attempted = True
+        else:
+            self._fail_channel_recovery()
+            return
+        if not self.attempt(
+            expected_generation,
+            command=command,
+            purpose="recovery",
+        ):
+            self._schedule_next_recovery()
+
+    def _recovery_confirmation(self, expected_generation: int) -> None:
+        """Retry or fail when the expected attachment delta did not arrive."""
+        if expected_generation != self.timer_generation or not self.recovery_pending:
+            return
+        if self.channel_health == "attached" and self.channel_marker_seen:
+            self._complete_channel_recovery("confirmation")
+            return
+        self._guard_log(
+            "channel-recovery-unconfirmed",
+            reconnect_attempts=self.recovery_attempts,
+            reload_attempted=self.recovery_reload_attempted,
+        )
+        self._schedule_next_recovery()
+
+    def attempt(
+        self,
+        expected_generation: int | None = None,
+        command: str = "/compact",
+        purpose: str = "compact",
+    ) -> bool:
+        """Run the final gate and inject one validated command through the PTY."""
         if expected_generation is not None and expected_generation != self.timer_generation:
             return False
-        reason = self._gate_reason()
+        reason = self._gate_reason(purpose)
         if reason:
             self.last_cancellation_reason = reason
             log(f"cancelled:{reason} channel={short_id(self.channel)}")
+            self._guard_log("gate-refused", purpose=purpose, reason=reason)
             self._write_state()
             return False
-        self.compacting = True
+        if not validate_inject_command(command, self.watched_servers, self.recovery_command):
+            self.last_cancellation_reason = "inject-command-refused"
+            self._guard_log("inject-refused", purpose=purpose)
+            self._write_state()
+            return False
         self.status = "active"
-        self.cancel("compaction-requested")
+        self.timer_deadline = None
+        self.timer_kind = None
+        self.timer_generation += 1
+        if purpose == "compact":
+            self.compacting = True
+            self.last_cancellation_reason = "compaction-requested"
+        elif purpose == "recovery":
+            self.recovery_awaiting = True
+            self.recovery_command_inflight = True
+            self.recovery_expected_stop = True
+            self.last_cancellation_reason = "channel-recovery-requested"
+        else:
+            self.last_cancellation_reason = "manual-injection-requested"
         try:
             if self.master_fd is None:
                 raise OSError(errno.EIO, "PTY master unavailable")
-            write_all(self.master_fd, b"/compact\r")
+            write_all(self.master_fd, (command + "\r").encode("utf-8"))
         except OSError as error:
-            self.compacting = False
-            self.dirty = True
-            self.last_cancellation_reason = "compaction-injection-failed"
-            log(f"compaction-failed channel={short_id(self.channel)} error={error}")
+            if purpose == "compact":
+                self.compacting = False
+                self.dirty = True
+                self.last_cancellation_reason = "compaction-injection-failed"
+                log(f"compaction-failed channel={short_id(self.channel)} error={error}")
+            elif purpose == "recovery":
+                self.recovery_awaiting = False
+                self.recovery_command_inflight = False
+                self.recovery_expected_stop = False
+                self.status = "idle"
+                self.last_cancellation_reason = "channel-recovery-injection-failed"
+                log(f"channel-recovery-failed channel={short_id(self.channel)} error={error}")
+            else:
+                self.status = "idle"
+                self.last_cancellation_reason = "manual-injection-failed"
             self._write_state()
             return False
-        log(f"compaction-requested channel={short_id(self.channel)}")
+        if purpose == "recovery":
+            self.timer_generation += 1
+            self.timer_kind = "channel-recovery-confirm"
+            self.timer_deadline = now() + CHANNEL_RECOVERY_CONFIRM_SECONDS
+            self._guard_log("channel-recovery-requested", command=command)
+        elif purpose == "compact":
+            log(f"compaction-requested channel={short_id(self.channel)}")
+            self._guard_log("compaction-requested")
+        else:
+            self._guard_log("manual-injection-requested", command=command)
         self._write_state()
         return True
 
@@ -679,10 +1255,21 @@ class Supervisor:
             if self.session_id and self.session_id != session_id:
                 self.cancel("session-replaced")
                 self.dirty = False
+                self.recovery_pending = False
+                self.recovery_awaiting = False
+                self.recovery_command_inflight = False
+                self.recovery_expected_stop = False
+                self.recovery_ignore_next_stop = False
+                self.channel_health = "none" if not self.watched_servers else "reconnecting"
+                self.channel_attach_checked = not bool(self.watched_servers)
+                self.channel_attach_deadline = (
+                    monotonic() + CHANNEL_ATTACH_WAIT_SECONDS if self.watched_servers else None
+                )
             self.session_id = session_id
             self._set_transcript(message.get("transcript_path"))
             self.status = "starting"
             self.last_lifecycle_activity = now()
+            self._guard_log("session-bound")
             self._write_state()
             return {"ok": True}
         if self.session_id != session_id:
@@ -691,30 +1278,57 @@ class Supervisor:
         if event == "stop":
             if message.get("stop_hook_active") is not False:
                 return {"ok": True, "ignored": "stop-hook-active"}
+            if self.recovery_ignore_next_stop:
+                self.recovery_ignore_next_stop = False
+                self.status = "idle"
+                self.last_lifecycle_activity = current
+                self.cancel("recovery-command-stop")
+                self._guard_log("recovery-command-stop")
+                return {"ok": True, "ignored": "recovery-command-stop"}
+            if self.recovery_awaiting and self.recovery_expected_stop:
+                self.status = "idle"
+                self.recovery_command_inflight = False
+                self.recovery_expected_stop = False
+                self._guard_log("recovery-command-stopped")
+                self._write_state()
+                return {"ok": True, "ignored": "recovery-command-stop"}
             if self.compacting:
                 self.status = "idle"
                 self.cancel("compaction-stop")
                 return {"ok": True, "ignored": "compaction-stop"}
+            if (
+                self.last_normal_stop
+                and self.status == "idle"
+                and self.dirty
+                and current - self.last_normal_stop < 0.5
+            ):
+                self._guard_log("duplicate-stop")
+                return {"ok": True, "ignored": "duplicate-stop"}
             self.status = "idle"
             self.dirty = True
             self.last_normal_stop = current
             self.last_lifecycle_activity = current
             self.last_local_input = None
             self.transcript_activity_at = None
-            self.transcript_baseline = None
-            try:
-                if self.transcript_path:
-                    stat = self.transcript_path.stat()
-                    self.transcript_baseline = (stat.st_mtime_ns, stat.st_size)
-            except OSError:
-                pass
+            self._reset_transcript_cursor()
             self.cancel("new-normal-turn")
-            self.arm()
+            if self.recovery_pending:
+                self._arm_recovery()
+            else:
+                self.arm()
             return {"ok": True}
         if event == "user-prompt-submit":
             self.status = "active"
             self.last_lifecycle_activity = current
-            self.cancel("prompt-submit")
+            if self.recovery_ignore_next_stop:
+                self._guard_log("recovery-command-prompt-submit")
+            elif self.recovery_awaiting and self.recovery_command_inflight:
+                self.recovery_command_inflight = False
+                self._guard_log("recovery-command-prompt-submit")
+            elif self.recovery_pending:
+                self._abort_recovery("prompt-submit")
+            else:
+                self.cancel("prompt-submit")
         elif event == "post-compact":
             self.status = "idle"
             self.dirty = False
@@ -722,20 +1336,29 @@ class Supervisor:
             self.current_tokens = None
             self.status_timestamp = None
             self.last_lifecycle_activity = current
+            self._reset_transcript_cursor()
             self.cancel("compaction-completed")
             log(f"compaction-completed channel={short_id(self.channel)}")
+            self._guard_log("compaction-completed")
         elif event == "session-end":
             self.status = "ended"
             self.last_lifecycle_activity = current
+            self._abort_recovery("session-end")
             self.cancel("session-end")
         elif event == "stop-failure":
             self.status = "error"
             self.last_lifecycle_activity = current
+            self._abort_recovery("stop-failure")
             self.cancel("stop-failure")
         else:
             self.status = "active"
             self.last_lifecycle_activity = current
-            self.cancel("session-activity")
+            if self.recovery_pending and not self.recovery_expected_stop:
+                self._abort_recovery("session-activity")
+            elif self.recovery_pending and self.recovery_expected_stop:
+                self._guard_log("recovery-command-activity")
+            else:
+                self.cancel("session-activity")
         self._write_state()
         return {"ok": True}
 
@@ -763,11 +1386,24 @@ class Supervisor:
             self.cache_profile_requested = profile
             self.cache_profile = effective_profile(profile)
             self.cancel("profile-changed")
-            self.arm()
+            if self.recovery_pending:
+                self._arm_recovery()
+            else:
+                self.arm()
         elif command == "cancel":
-            self.cancel("manual-cancel")
+            self._abort_recovery("manual-cancel")
         elif command == "trigger":
-            self.attempt()
+            success = self.attempt()
+            self._write_state()
+            return {"ok": success, "state": self.state()}
+        elif command == "inject":
+            text = message.get("text")
+            if not validate_inject_command(text, self.watched_servers, self.recovery_command):
+                return {"ok": False, "error": "inject-command-refused", "state": self.state()}
+            purpose = "compact" if text == "/compact" else "manual"
+            success = self.attempt(command=text, purpose=purpose)
+            self._write_state()
+            return {"ok": success, "state": self.state()}
         self._write_state()
         return {"ok": True, "state": self.state()}
 
@@ -810,7 +1446,9 @@ class Supervisor:
                 pass
             return
         self.last_local_input = now()
-        if self.last_normal_stop and self.last_local_input > self.last_normal_stop:
+        if self.recovery_pending:
+            self._abort_recovery("user-input")
+        elif self.last_normal_stop and self.last_local_input > self.last_normal_stop:
             self.cancel("user-input")
         if self.master_fd is not None:
             try:
@@ -852,6 +1490,7 @@ class Supervisor:
             self.child_exited_at = now()
             self.status = "exited"
             self.cancel("process-exit")
+            self._guard_log("process-exit", exit_code=os.waitstatus_to_exitcode(status))
             return True
         return False
 
@@ -862,6 +1501,7 @@ class Supervisor:
         for mask, name in self.inotify.read():
             if mask & Inotify.IN_Q_OVERFLOW:
                 self.cancel("transcript-watcher-overflow")
+                self._record_transcript_activity()
             elif self.transcript_path and name == self.transcript_path.name:
                 self._record_transcript_activity()
 
@@ -872,13 +1512,27 @@ class Supervisor:
         try:
             while master_open:
                 child_exited = self._child_has_exited()
+                self._check_channel_attach()
                 if self.timer_deadline is not None and now() >= self.timer_deadline:
                     generation = self.timer_generation
+                    kind = self.timer_kind
                     self.timer_deadline = None
-                    self.attempt(generation)
-                if not self.inotify and monotonic() >= self.next_transcript_poll:
+                    self.timer_kind = None
+                    if kind == "compact":
+                        self.attempt(generation)
+                    elif kind == "channel-recovery":
+                        self._recovery_step(generation)
+                    elif kind == "channel-recovery-confirm":
+                        self._recovery_confirmation(generation)
+                # inotify is the fast path; this low-frequency reconciliation
+                # poll also covers editor-style atomic replacement and dropped
+                # queue notifications without becoming a busy scanner.
+                if monotonic() >= self.next_transcript_poll:
                     self.next_transcript_poll = monotonic() + TRANSCRIPT_POLL_SECONDS
                     self._record_transcript_activity()
+                if monotonic() >= self.next_debug_bound:
+                    self.next_debug_bound = monotonic() + 5
+                    self._bound_debug_log()
                 if child_exited:
                     master_open = self._read_master()
                     if not master_open:
@@ -886,8 +1540,7 @@ class Supervisor:
                 timeout = 1.0
                 if self.timer_deadline is not None:
                     timeout = max(0.0, min(timeout, self.timer_deadline - now()))
-                if not self.inotify:
-                    timeout = min(timeout, max(0.0, self.next_transcript_poll - monotonic()))
+                timeout = min(timeout, max(0.0, self.next_transcript_poll - monotonic()))
                 events = self.selector.select(timeout)
                 for key, _mask in events:
                     if key.data == "server":
@@ -985,6 +1638,7 @@ def control_main(argv: list[str]) -> int:
         print("usage: claude-warmctl list | show CHANNEL | enable CHANNEL | disable CHANNEL")
         print("       claude-warmctl profile CHANNEL long|short|auto")
         print("       claude-warmctl cancel CHANNEL | trigger CHANNEL")
+        print("       claude-warmctl inject CHANNEL /compact|/reload-plugins|/mcp reconnect SERVER")
         return 0
     command = argv[0]
     if command == "list":
@@ -1000,6 +1654,11 @@ def control_main(argv: list[str]) -> int:
     if command == "profile" and not fields:
         print("profile requires long, short, or auto", file=sys.stderr)
         return 2
+    if command == "inject":
+        if len(argv) < 3:
+            print("inject requires a whitelisted command", file=sys.stderr)
+            return 2
+        fields = {"text": " ".join(argv[2:])}
     try:
         response = send_control(channel, "state" if command == "show" else command, **fields)
     except (OSError, RuntimeError, ValueError) as error:
@@ -1018,7 +1677,9 @@ def main(argv: list[str]) -> int:
         print("Runs the real Claude CLI through a full PTY supervisor.")
         print("Environment: CLAUDE_IDLE_CACHE_PROFILE, CLAUDE_IDLE_COMPACTION_DEBUG,")
         print("CLAUDE_IDLE_COMPACT_SECONDS, CLAUDE_SHORT_CACHE_IDLE_COMPACT_SECONDS,")
-        print("CLAUDE_IDLE_COMPACT_MIN_TOKENS, CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS")
+        print("CLAUDE_IDLE_COMPACT_MIN_TOKENS, CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS,")
+        print("CLAUDE_IDLE_WATCHED_SERVERS, CLAUDE_IDLE_RECONNECT_SERVER,")
+        print("CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS, CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS")
         print("Use claude-warmctl for per-session state and controls.")
         return 0
     try:
@@ -1029,8 +1690,13 @@ def main(argv: list[str]) -> int:
         return 69
 
 
+def shell_exit_code(status: int) -> int:
+    """Represent a child signal termination with the conventional 128+N code."""
+    return 128 - status if status < 0 else status
+
+
 if __name__ == "__main__":
-    raise SystemExit(main(sys.argv[1:]))
+    raise SystemExit(shell_exit_code(main(sys.argv[1:])))
 #+END_SRC
 
 #+BEGIN_SRC bash :tangle all/.local/bin/claude-warmctl :shebang "#!/usr/bin/env bash" :comments no
