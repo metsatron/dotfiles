@@ -296,6 +296,40 @@ class ClaudeWarmTests(unittest.TestCase):
         session.event("post-compact")
         wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
 
+    def test_rejected_compaction_clears_transient_flag_without_rearm(self):
+        session = self.make_session(delay=0)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        self.assertTrue(session.read_state()["compacting"])
+        session.append_transcript({
+            "type": "system",
+            "subtype": "local_command",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1)),
+            "content": "/compact: Not enough messages to compact.",
+        })
+        wait_until(
+            lambda: session.read_state()
+            and not session.read_state()["compacting"]
+            and session.read_state()["last_cancellation_reason"] == "compaction-failed"
+        )
+        self.assertTrue(session.read_state()["dirty"])
+        session.event("stop", stop_hook_active=False)
+        time.sleep(0.2)
+        self.assertIsNone(session.read_state()["timer_deadline"])
+        self.assertEqual(bytes(session.output).count(b"COMPACT_RECEIVED"), 1)
+
+    def test_stop_failure_clears_compacting_and_preserves_dirty(self):
+        session = self.make_session(delay=0)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        session.event("stop-failure")
+        wait_until(
+            lambda: session.read_state()
+            and not session.read_state()["compacting"]
+            and session.read_state()["status"] == "error"
+        )
+        self.assertTrue(session.read_state()["dirty"])
+
     def test_resize_signal_reaches_child(self):
         session = self.make_session(terminal=True)
         session.wait_output("SIZE:")
