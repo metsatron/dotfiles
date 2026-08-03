@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+# [[file:../../../agents-hooks.org::*Agent IDE notifications][Agent IDE notifications:3]]
+# ~/DotCortex/all/.local/bin/claude-hook-idle-event
+# Forward only validated lifecycle facts.  The hook never submits terminal input
+# and never passes prompts, summaries, transcript paths, or authentication data.
+# The two supported owning-client modes are `emacs' (claude-code-ide.el) and
+# `pty-supervisor' (claude-warm).  Hooks from legacy/unowned Claude processes
+# remain harmless no-ops.
+set -u
+
+[ -n "${CLAUDE_IDLE_CHANNEL:-}" ] || exit 0
+owner="${CLAUDE_IDLE_OWNER:-}"
+case "$owner" in
+  emacs|pty-supervisor) ;;
+  *) exit 0 ;;
+esac
+
+[[ "$CLAUDE_IDLE_CHANNEL" =~ ^claude-[0-9a-f]{32}$ ]] || exit 0
+
+payload=$(cat 2>/dev/null || true)
+command -v jq >/dev/null 2>&1 || exit 0
+[ -n "$payload" ] || exit 0
+jq -e . >/dev/null 2>&1 <<<"$payload" || exit 0
+
+event=$(jq -r '.hook_event_name // empty' <<<"$payload" 2>/dev/null || true)
+session_id=$(jq -r '.session_id // empty' <<<"$payload" 2>/dev/null || true)
+transcript_path=$(jq -r '.transcript_path // empty' <<<"$payload" 2>/dev/null || true)
+stop_hook_active=$(jq -r 'if has("stop_hook_active") then .stop_hook_active else empty end' \
+  <<<"$payload" 2>/dev/null || true)
+case "$event" in
+  Stop)
+    # Stop officially documents only stop_hook_active and last_assistant_message.
+    [ "$stop_hook_active" = "false" ] || exit 0
+    event_symbol=stop ;;
+  SessionStart) event_symbol=session-start ;;
+  UserPromptSubmit) event_symbol=user-prompt-submit ;;
+  PostCompact) event_symbol=post-compact ;;
+  PreCompact|PreToolUse|PostToolUse) event_symbol=session-activity ;;
+  Notification) event_symbol=session-activity ;;
+  StopFailure) event_symbol=stop-failure ;;
+  SessionEnd) event_symbol=session-end ;;
+  *) exit 0 ;;
+esac
+
+case "$session_id" in
+  "") exit 0 ;;
+  *[!A-Za-z0-9._:-]*) exit 0 ;;
+esac
+
+if [ "$owner" = "pty-supervisor" ]; then
+  [ -n "${CLAUDE_IDLE_CONTROL_SOCKET:-}" ] || exit 0
+  command -v python3 >/dev/null 2>&1 || exit 0
+  # Pass only fixed event names and validated identifiers to the IPC client.
+  # The supervisor owns the PTY; this hook never writes terminal bytes.
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 3s python3 - "$CLAUDE_IDLE_CONTROL_SOCKET" "$event_symbol" \
+      "$CLAUDE_IDLE_CHANNEL" "$session_id" "$stop_hook_active" "$transcript_path" <<'PY' \
+      >/dev/null 2>&1 || true
+import json
+import socket
+import sys
+
+path, event, channel, session_id, stop_hook_active, transcript_path = sys.argv[1:]
+message = {
+    "kind": "event",
+    "event": event,
+    "channel": channel,
+    "session_id": session_id,
+}
+if event == "stop":
+    message["stop_hook_active"] = stop_hook_active == "false"
+if event == "session-start" and transcript_path:
+    message["transcript_path"] = transcript_path
+with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+    connection.settimeout(2.0)
+    connection.connect(path)
+    connection.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode())
+    connection.recv(4096)
+PY
+  fi
+  exit 0
+fi
+
+[ -n "${CLAUDE_IDLE_EMACS_SERVER:-}" ] || exit 0
+[[ "$CLAUDE_IDLE_EMACS_SERVER" =~ ^[A-Za-z0-9._-]+$ ]] || exit 0
+# The values are strictly validated above, so this expression contains no
+# untrusted shell interpolation or prompt content.  A missing Emacs server is
+# a harmless no-op: hooks must never disrupt Claude.
+expr="(metsatron/claude-idle-compact-handle-hook '$event_symbol \"$CLAUDE_IDLE_CHANNEL\" \"$session_id\")"
+# A hook must not wait forever when the named Doom server is stopped or
+# restarting.  `timeout' is part of the normal GNU userspace; if unavailable,
+# fail closed rather than risking a blocked Claude hook process.
+if command -v timeout >/dev/null 2>&1; then
+  timeout 3s emacsclient -s "$CLAUDE_IDLE_EMACS_SERVER" --eval "$expr" \
+    >/dev/null 2>&1 || true
+fi
+exit 0
+# Agent IDE notifications:3 ends here
