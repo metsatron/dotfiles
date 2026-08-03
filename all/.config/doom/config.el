@@ -3,6 +3,8 @@
 ;; Place your private configuration here! Remember, you do not need to run 'doom
 ;; sync' after modifying this file!
 
+(load! "metsatron-idle-compaction")
+
 ;; --- Environment bootstrap (ported from emacs-spacemacs.org blk-user-init) ---
 
 ;; Every dotfile in $HOME is a stow symlink into the DotCortex git repo, so the
@@ -540,13 +542,26 @@ quiet no-op so agent lifecycle hooks can never interrupt an IDE session."
 
 (defun metsatron/claude-code-ide--with-session-marker (original &rest args)
   "Call ORIGINAL with ARGS while marking only this Claude IDE subprocess.
-Claude hooks inherit `CLAUDE_CODE_IDE_EL_SESSION=1', which distinguishes the
-IDE integration from ordinary Claude sessions and ordinary Emacs vterms."
-  (let ((process-environment (cons "CLAUDE_CODE_IDE_EL_SESSION=1"
-                                   process-environment))
-        (vterm-environment (cons "CLAUDE_CODE_IDE_EL_SESSION=1"
-                                 vterm-environment)))
-    (apply original args)))
+Claude hooks inherit `CLAUDE_CODE_IDE_EL_SESSION=1' and the explicit
+`CLAUDE_IDLE_OWNER=emacs'.  The idle governor also has a separate
+`CLAUDE_IDLE_OWNER=pty-supervisor' path for ordinary Claude sessions launched
+by `claude-warm'; legacy Claude processes launched by neither owner are not
+retrofitted."
+  (let* ((channel (format "claude-%032x" (random most-positive-fixnum)))
+         (marker "CLAUDE_CODE_IDE_EL_SESSION=1")
+         (idle-owner "CLAUDE_IDLE_OWNER=emacs")
+         (idle-channel (format "CLAUDE_IDLE_CHANNEL=%s" channel))
+         (idle-server (format "CLAUDE_IDLE_EMACS_SERVER=%s"
+                              metsatron-idle-compaction-emacs-server))
+         (process-environment (append (list marker idle-owner idle-channel idle-server)
+                                      process-environment))
+         (vterm-environment (append (list marker idle-owner idle-channel idle-server)
+                                    vterm-environment))
+         (result (apply original args)))
+    (when (and (consp result) (bufferp (car result)))
+      (metsatron/claude-idle-compact-register
+       channel (car result) (cdr result) (nth 5 args)))
+    result))
 
 (defun metsatron/codex-ide-notify (event session _payload)
   "Deliver Herdr notifications for Codex IDE EVENT affecting SESSION."
@@ -599,24 +614,7 @@ IDE integration from ordinary Claude sessions and ordinary Emacs vterms."
 The app-server acknowledges submission immediately; the ordinary
 `contextCompaction' item and turn lifecycle report actual completion."
   (interactive)
-  (let* ((session (codex-ide-slash-command--current-session))
-         (thread-id (codex-ide-session-thread-id session)))
-    (unless (and (stringp thread-id)
-                 (not (string-empty-p thread-id)))
-      (user-error "No active Codex thread"))
-    (when (codex-ide-session-current-turn-id session)
-      (user-error "A turn is active; /compact would replace it"))
-    (unless (process-live-p (codex-ide-session-process session))
-      (user-error "The Codex app-server is not running"))
-    (codex-ide--request-async
-     session
-     "thread/compact/start"
-     `((threadId . ,thread-id))
-     (lambda (_result error)
-       (if error
-           (message "Codex compaction request failed: %s"
-                    (or (alist-get 'message error) error))
-         (message "Codex compaction started"))))))
+  (metsatron/idle-compaction-trigger-current))
 
 (after! codex-ide
   (add-to-list

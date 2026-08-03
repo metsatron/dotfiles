@@ -1,0 +1,398 @@
+#+TITLE: Claude Code idle-compaction supervisor tests
+#+DESCRIPTION: Focused PTY, lifecycle, snapshot, and cancellation tests
+#+PROPERTY: header-args :mkdirp yes :comments both
+
+* Tests
+
+These tests launch the generated =claude-warm= against a deliberately small
+fake Claude executable.  The fake is still attached to the supervisor's real
+PTY, so the tests exercise byte proxying, terminal submission, lifecycle IPC,
+transcript invalidation, and cleanup without contacting the Claude service.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-claude-warm.py :shebang "#!/usr/bin/env python3" :comments no
+"""Black-box tests for the claude-warm PTY supervisor."""
+
+from __future__ import annotations
+
+import json
+import fcntl
+import os
+import pty
+import pathlib
+import select
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import time
+import unittest
+
+
+HERE = pathlib.Path(__file__).resolve()
+REPO = HERE.parents[5]
+WARM = REPO / "all/.local/bin/claude-warm"
+HOOK = REPO / "all/.local/bin/claude-hook-idle-event"
+STATUSLINE = REPO / "all/.local/bin/claude-statusline"
+
+
+FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import fcntl
+import os
+import select
+import signal
+import struct
+import sys
+import termios
+
+
+def report_size(_signum=None, _frame=None):
+    try:
+        raw = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, columns = struct.unpack("HH", raw[:4])
+        os.write(1, (f"SIZE:{rows}x{columns}\n").encode())
+    except OSError:
+        pass
+
+
+def main():
+    os.write(1, (f"ARGS:{sys.argv[1:]!r}\n").encode())
+    report_size()
+    signal.signal(signal.SIGWINCH, report_size)
+    if "--exit-status=7" in sys.argv:
+        return 7
+    while True:
+        readable, _, _ = select.select([0], [], [], 0.1)
+        if not readable:
+            continue
+        data = os.read(0, 65536)
+        if not data:
+            return 0
+        os.write(1, (f"INPUT:{data!r}\n").encode())
+        if b"/compact" in data:
+            os.write(1, b"COMPACT_RECEIVED\n")
+
+
+raise SystemExit(main())
+'''
+
+
+def wait_until(predicate, timeout=5.0, message="condition did not become true"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+class Session:
+    """One supervised fake Claude process and its private runtime directory."""
+
+    def __init__(self, delay=10, ttl=60, extra_args=(), terminal=False):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
+        self.fake = self.root / "fake-claude"
+        self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
+        self.fake.chmod(0o700)
+        self.transcript = self.root / "transcript.jsonl"
+        self.transcript.write_text("", encoding="utf-8")
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "XDG_RUNTIME_DIR": str(self.root),
+                "CLAUDE_IDLE_REAL_EXECUTABLE": str(self.fake),
+                "CLAUDE_IDLE_COMPACT_SECONDS": str(delay),
+                "CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS": str(ttl),
+                "CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS": "30",
+                "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS": "1",
+                "CLAUDE_IDLE_CACHE_PROFILE": "long",
+                "CLAUDE_IDLE_COMPACTION_DEBUG": "1",
+            }
+        )
+        self.parent_master = None
+        if terminal:
+            self.parent_master, parent_slave = pty.openpty()
+            self.process = subprocess.Popen(
+                [str(WARM), *extra_args],
+                stdin=parent_slave,
+                stdout=parent_slave,
+                stderr=parent_slave,
+                env=environment,
+            )
+            os.close(parent_slave)
+            self.output_fd = self.parent_master
+        else:
+            self.process = subprocess.Popen(
+                [str(WARM), *extra_args],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            assert self.process.stdout is not None
+            self.output_fd = self.process.stdout.fileno()
+        os.set_blocking(self.output_fd, False)
+        self.output = bytearray()
+        self.state_path = wait_until(self._find_state, message="state file missing")
+        self.channel = self.state_path.parent.name
+        self.socket_path = self.state_path.parent / "control.sock"
+        self.session_id = "fixture-session"
+
+    def _find_state(self):
+        paths = list((self.root / "claude-idle-compaction").glob("claude-*/state.json"))
+        return paths[0] if paths else None
+
+    def read_state(self):
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def output_contains(self, needle):
+        if isinstance(needle, str):
+            needle = needle.encode()
+        while True:
+            ready, _, _ = select.select([self.output_fd], [], [], 0)
+            if not ready:
+                break
+            data = os.read(self.output_fd, 65536)
+            if not data:
+                break
+            self.output.extend(data)
+        return needle in self.output
+
+    def wait_output(self, needle, timeout=5):
+        try:
+            wait_until(lambda: self.output_contains(needle), timeout, f"missing output {needle!r}")
+        except AssertionError as error:
+            raise AssertionError(
+                f"{error}; state={self.read_state()!r}; output={bytes(self.output)!r}"
+            ) from error
+
+    def ipc(self, message):
+        message = dict(message)
+        message.setdefault("kind", "event")
+        message.setdefault("channel", self.channel)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(str(self.socket_path))
+            connection.sendall((json.dumps(message) + "\n").encode())
+            return json.loads(connection.recv(65536).decode())
+
+    def event(self, event, **fields):
+        message = {"event": event, "session_id": self.session_id, **fields}
+        return self.ipc(message)
+
+    def status(self, tokens=80000, session_id=None, timestamp=None):
+        payload = {
+            "channel": self.channel,
+            "session_id": session_id or self.session_id,
+            "current_input_context_tokens": tokens,
+            "update_timestamp": timestamp if timestamp is not None else time.time(),
+        }
+        path = self.state_path.parent / "status.json"
+        temporary = path.with_name(".status-test.tmp")
+        temporary.write_text(json.dumps(payload), encoding="utf-8")
+        temporary.replace(path)
+
+    def control(self, command, **fields):
+        return self.ipc({"kind": "control", "command": command, **fields})
+
+    def submit_local_byte(self, data=b"x"):
+        if self.parent_master is not None:
+            os.write(self.parent_master, data)
+        else:
+            assert self.process.stdin is not None
+            self.process.stdin.write(data)
+            self.process.stdin.flush()
+
+    def set_size(self, rows, columns):
+        assert self.parent_master is not None
+        fcntl.ioctl(self.parent_master, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, columns, 0, 0))
+
+    def stop_and_bind(self):
+        self.event("session-start", transcript_path=str(self.transcript))
+        self.status()
+        self.event("stop", stop_hook_active=False)
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.event("session-end")
+            except (OSError, ConnectionError, json.JSONDecodeError):
+                pass
+            if self.process.stdin is not None:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+            elif self.parent_master is not None:
+                self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.send_signal(signal.SIGTERM)
+                self.process.wait(timeout=5)
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        if self.parent_master is not None:
+            os.close(self.parent_master)
+            self.parent_master = None
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class ClaudeWarmTests(unittest.TestCase):
+    def setUp(self):
+        self.sessions = []
+
+    def tearDown(self):
+        for session in reversed(self.sessions):
+            session.close()
+
+    def make_session(self, **kwargs):
+        session = Session(**kwargs)
+        self.sessions.append(session)
+        return session
+
+    def test_arguments_and_full_pty_submission(self):
+        session = self.make_session(delay=0, extra_args=("--resume", "fixture", "--model", "test"))
+        session.wait_output("ARGS:['--resume', 'fixture', '--model', 'test']")
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        self.assertEqual(session.read_state()["compacting"], True)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+
+    def test_resize_signal_reaches_child(self):
+        session = self.make_session(terminal=True)
+        session.wait_output("SIZE:")
+        session.set_size(55, 123)
+        session.process.send_signal(signal.SIGWINCH)
+        # The supervisor owns the child PTY.  The changed size must reach the
+        # fake child through its SIGWINCH handler.
+        session.wait_output("SIZE:55x123")
+
+    def test_local_keystroke_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.submit_local_byte(b"draft")
+        try:
+            wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "user-input")
+        except AssertionError as error:
+            raise AssertionError(f"{error}; state={session.read_state()!r}; output={bytes(session.output)!r}") from error
+        time.sleep(1.3)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_transcript_append_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.transcript.write_text("remote-channel-entry\n", encoding="utf-8")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "transcript-activity")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_channel_prompt_event_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.event("user-prompt-submit")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "prompt-submit")
+        time.sleep(1.3)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_stale_snapshot_and_session_mismatch_block(self):
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        session.status(timestamp=time.time() - 120)
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-snapshot-stale")
+        session.status(session_id="replacement-session")
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-session-mismatch")
+
+    def test_below_threshold_and_expired_ttl_do_not_inject(self):
+        session = self.make_session(delay=30, ttl=1)
+        session.stop_and_bind()
+        session.status(tokens=69999)
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "below-token-threshold")
+        time.sleep(1.2)
+        session.status(tokens=80000)
+        session.control("trigger")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "cache-already-cold")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_profile_change_rearms_with_new_delay(self):
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        before = session.read_state()["timer_deadline"]
+        session.control("profile", profile="short")
+        after = session.read_state()
+        self.assertEqual(after["cache_profile"], "short")
+        self.assertNotEqual(after["timer_deadline"], before)
+
+    def test_hook_and_statusline_route_to_owner(self):
+        session = self.make_session(delay=30)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CLAUDE_IDLE_OWNER": "pty-supervisor",
+                "CLAUDE_IDLE_CHANNEL": session.channel,
+                "CLAUDE_IDLE_CONTROL_SOCKET": str(session.socket_path),
+                "CLAUDE_IDLE_RUNTIME_DIR": str(session.state_path.parent),
+            }
+        )
+        start = {
+            "hook_event_name": "SessionStart",
+            "session_id": session.session_id,
+            "transcript_path": str(session.transcript),
+        }
+        subprocess.run(
+            [str(HOOK)], input=json.dumps(start).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        status = {
+            "session_id": session.session_id,
+            "context_window": {"total_input_tokens": 80000},
+        }
+        subprocess.run(
+            [str(STATUSLINE)], input=json.dumps(status).encode(), env=environment,
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        wait_until(lambda: session.read_state() and session.read_state()["session_id"] == session.session_id)
+        snapshot = json.loads((session.state_path.parent / "status.json").read_text())
+        self.assertEqual(snapshot["current_input_context_tokens"], 80000)
+
+    def test_two_sessions_are_isolated(self):
+        first = self.make_session(delay=0)
+        second = self.make_session(delay=30)
+        self.assertNotEqual(first.channel, second.channel)
+        first.stop_and_bind()
+        first.wait_output("COMPACT_RECEIVED")
+        self.assertFalse(second.read_state()["dirty"])
+        second.stop_and_bind()
+        second.submit_local_byte(b"x")
+        time.sleep(0.2)
+        self.assertFalse(second.output_contains("COMPACT_RECEIVED"))
+
+    def test_exit_status_and_runtime_cleanup(self):
+        session = self.make_session(extra_args=("--exit-status=7",))
+        session.wait_output("ARGS:")
+        session.process.wait(timeout=5)
+        self.assertEqual(session.process.returncode, 7)
+        runtime = session.root
+        session.close()
+        self.assertFalse(runtime.exists())
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+#+END_SRC
