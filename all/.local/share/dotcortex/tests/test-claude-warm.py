@@ -1,15 +1,4 @@
-#+TITLE: Claude Code idle-compaction supervisor tests
-#+DESCRIPTION: Focused PTY, lifecycle, snapshot, and cancellation tests
-#+PROPERTY: header-args :mkdirp yes :comments both
-
-* Tests
-
-These tests launch the generated =claude-warm= against a deliberately small
-fake Claude executable.  The fake is still attached to the supervisor's real
-PTY, so the tests exercise byte proxying, terminal submission, lifecycle IPC,
-transcript invalidation, and cleanup without contacting the Claude service.
-
-#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-claude-warm.py :shebang "#!/usr/bin/env python3" :comments no
+#!/usr/bin/env python3
 """Black-box tests for the claude-warm PTY supervisor."""
 
 from __future__ import annotations
@@ -642,4 +631,3 @@ class ClaudeWarmTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
-#+END_SRC
