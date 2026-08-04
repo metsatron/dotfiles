@@ -162,6 +162,11 @@
    (task 'stow:x230 "Safe stow X230 overlays (all linux debian x230)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian x230' make safe-stow")))
 
+   (task 'stow:cortex
+         "Apply the X230-shaped public layer to the T1700 Cortex sanctuary"
+         (lambda ()
+           (sh "set -euo pipefail; host=$(hostname -s 2>/dev/null || hostname); case \"$host\" in kikin-kushi|ThinkPad-T1700|t1700) ;; *) echo 'stow:cortex must run on Kikin-Kushi/T1700' >&2; exit 2 ;; esac; root=\"${DOTCORTEX_ROOT:-$HOME/DotCortex}\"; guest=\"${SANCTUARY_CORTEX_GUEST_HOME:-}\"; case \"$HOME\" in */.local/share/dotcortex/guests/sanctuary-cortex/home) guest=\"${guest:-$HOME}\" ;; *) guest=\"${guest:-$HOME/.local/share/dotcortex/guests/sanctuary-cortex/home}\" ;; esac; private=\"${SANCTUARY_CORTEX_PRIVATE_ROOT:-$HOME/HelmCortex/NEXUS/sanctuaries/sanctuary-cortex}\"; helper=\"$root/linux/.local/bin/sanctuary-cortex-stow\"; [ -x \"$helper\" ] || { echo \"stow:cortex: missing sanctuary helper: $helper\" >&2; exit 1; }; DOTCORTEX_ROOT=\"$root\" SANCTUARY_CORTEX_GUEST_HOME=\"$guest\" SANCTUARY_CORTEX_PRIVATE_ROOT=\"$private\" bash \"$helper\"")))
+
    (task 'stow:t480s "Safe stow T480s overlays (all linux debian devuan t480s)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t480s' make safe-stow")))
 
@@ -199,6 +204,11 @@
    (task 'desktop:heal "Restart desktop components for the current DE"
          (lambda ()
            (sh "HELPER=\"$HOME/.local/bin/desktop-heal\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/linux/.local/bin/desktop-heal\"; \"$HELPER\"")))
+
+   (task 'xfce:refresh
+         "Refresh the live XFCE desktop daemons in the Cortex session"
+         (lambda ()
+           (sh "set -euo pipefail; case \"$HOME\" in */.local/share/dotcortex/guests/sanctuary-cortex/home) ;; *) echo 'xfce:refresh must run inside the Cortex guest session' >&2; exit 2 ;; esac; helper=\"$HOME/.local/bin/xfce4-refresh\"; [ -x \"$helper\" ] || helper=\"$HOME/DotCortex/x230/.local/bin/xfce4-refresh\"; [ -x \"$helper\" ] || { echo \"xfce:refresh: missing helper: $helper\" >&2; exit 1; }; bash \"$helper\"")))
 
    (task 'redstone:refresh
          "Project current DotCortex config into the running Redstone 9X room and reload it"
