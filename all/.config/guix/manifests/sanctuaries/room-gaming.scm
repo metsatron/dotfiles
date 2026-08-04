@@ -892,6 +892,7 @@ demo.  Press q or Escape to quit.")
    "rofi"     ; Windows-95 Run/launcher dialogs (stock rofi, fixed-geometry theme)
    "clipmenu" "clipnotify" "xsel" ; clipboard history and X11 clipboard backend
    "gtk+"     ; GTK schemas, including org.gtk.Settings.FileChooser
+   "gtk-engines" ; GTK2 Redmond95 fallback engine; Windows-95's active pixmap theme remains upstream-owned
    "pluma"    ; MATE text editor for Redstone native apps
    "audacious" ; Winamp-skin-capable audio player
    "pnmixer"  ; lightweight system tray volume applet

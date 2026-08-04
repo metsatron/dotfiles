@@ -30,8 +30,19 @@
 ;; room WITHOUT the shield wired into its launcher, the leak returns — keep the
 ;; two together. See redstone-9x-state-digest.md.
 ;; Apply: make guix-sanctuary-godzilla-xs
-(specifications->manifest
- '(
+(use-modules (gnu packages)
+             (local packages fbneo-libretro)
+             (local packages px68k-libretro)
+             (local packages np2kai)
+             (local packages tsugaru))
+
+(packages->manifest
+ (cons* libretro-px68k
+        libretro-fbneo
+        retropie-np2kai
+        retropie-tsugaru
+        (map specification->package
+             '(
    ;; XFCE session, window manager, and configuration subsystem
    "xfce4-session"
    "xfwm4"
@@ -139,5 +150,5 @@
    "font-ipa"
    "font-ipa-ex"
    "fcitx5"
-   ))
+   ))))
 ;; sanctuary-godzilla-xs:1 ends here
