@@ -7,10 +7,10 @@ Primary emulators absent from active Guix and nonguix:
 
 | System | Primary | Status | Declared next route |
 |---|---|---|---|
-| X68 BUS | XEiJ (`xeij`) | blocked | local Guix package or tracked native upstream build using OpenJDK; media roots `~/RetroPie/bios/x68000/`, `~/RetroPie/roms/x68000/` |
-| DRIVE A: PC-98 | NP2Kai (`np2kai`) | blocked | local Guix package or tracked native upstream build; media roots `~/RetroPie/bios/pc98/`, `~/RetroPie/roms/pc98/` |
+| X68 BUS | XEiJ (`xeij`) | blocked; PX68k libretro test route available | local XEiJ Guix package or tracked native upstream build using OpenJDK; current launch route is `retroarch -L px68k_libretro.so`; media roots `~/RetroPie/bios/x68000/keropi/`, `~/RetroPie/roms/x68000/` |
+| DRIVE A: PC-98 | NP2Kai (`np2kai`) | available in the dedicated Godzilla profile, with room-retropie fallback | local Guix package already built from the pinned NP2kai source; media roots `~/RetroPie/bios/pc98/`, `~/RetroPie/roms/pc98/` |
 | DRIVE B: PC-88 | QUASI88 (`quasi88`) | blocked | local Guix package or tracked native upstream build; media roots `~/RetroPie/bios/pc88/`, `~/RetroPie/roms/pc88/` |
-| FM TOWNS | Tsugaru (`tsugaru`) | blocked | local Guix package or tracked native upstream build; media roots `~/RetroPie/bios/fmtowns/`, `~/RetroPie/roms/fmtowns/`, `~/RetroPie/roms/scummvm/` |
+| FM TOWNS | Tsugaru (`Tsugaru_CUI`) | available in the dedicated Godzilla profile, with room-retropie fallback | local Guix package already built from the pinned TOWNSEMU source; media roots `~/RetroPie/bios/fmtowns/`, `~/RetroPie/roms/fmtowns/`, `~/RetroPie/roms/scummvm/` |
 
 These are not replaced by RetroArch, DOSBox Staging, MAME, or ScummVM.  Fallback
 Wine routes are title-specific only and require user-owned installers under
