@@ -1,0 +1,726 @@
+#!/bin/bash
+# [[file:../../../sanctuary-godzilla-xs.org::*Godzilla XS-86000 library, state, and menu foundation][Godzilla XS-86000 library, state, and menu foundation:6]]
+# Inventory, launch, and manually materialize the Godzilla XS-86000 application
+# surface.  The shared RetroPie tree is read-only media; only the catalogue
+# ledger and generated desktop files are written under the sanctuary guest home.
+set -euo pipefail
+
+MODE="${1:-inventory}"
+shift || true
+
+DATA_HOME="${XDG_DATA_HOME:-${HOME}/.local/share}"
+RETROPIE_CONFIGURED="${RETROPIE_ROOT:-}"
+if [[ -n "${RETROPIE_CONFIGURED}" && -d "${RETROPIE_CONFIGURED}/roms" ]]; then
+  RETROPIE="${RETROPIE_CONFIGURED}"
+elif [[ -d /run/dotcortex/retropie/roms ]]; then
+  # The sanctuary launcher declares this bind at /run/dotcortex/retropie.
+  # Prefer it even when a stale guest-home symlink or an old desktop entry
+  # still refers to $HOME/RetroPie.
+  RETROPIE=/run/dotcortex/retropie
+elif [[ -n "${RETROPIE_CONFIGURED}" ]]; then
+  RETROPIE="${RETROPIE_CONFIGURED}"
+else
+  RETROPIE="${HOME}/RetroPie"
+fi
+EMULATIONSTATION_GAMELISTS="${EMULATIONSTATION_GAMELIST_ROOT:-${RETROPIE}/stow/.emulationstation/gamelists}"
+X68_ROOT="${RETROPIE}/roms/x68000"
+PC98_ROOT="${RETROPIE}/roms/pc98"
+PC88_ROOT="${RETROPIE}/roms/pc88"
+FMTOWNS_ROOT="${RETROPIE}/roms/fmtowns"
+SCUMMVM_ROOT="${RETROPIE}/roms/scummvm"
+ARCADE_ROOT="${RETROPIE}/roms/arcade"
+CPS1_ROOT="${RETROPIE}/roms/cps1"
+CPS2_ROOT="${RETROPIE}/roms/cps2"
+CPS3_ROOT="${RETROPIE}/roms/cps3"
+NEOGEO_ROOT="${RETROPIE}/roms/neogeo"
+APP_CMD="${HOME}/.local/bin/sanctuary-godzilla-xs-apps"
+GAMEMODE_RUNNER="${HOME}/.local/bin/sanctuary-gamemode-run"
+GENERATED_PREFIX="godzilla-xs-generated-"
+APPLICATIONS_DIR="${DATA_HOME}/applications"
+LEDGER="${DATA_HOME}/godzilla-xs/catalogue.tsv"
+PX68K_WINDOW_CONFIG="${HOME}/.config/retroarch/px68k-window.cfg"
+PX68K_PROFILE_DIR="${HOME}/.config/retroarch"
+FBNEO_CONFIG="${HOME}/.config/retroarch/fbneo-arcade.cfg"
+
+GODZILLA_PROFILE="${GODZILLA_XS_PROFILE:-${HOME}/.guix-extra-profiles/sanctuary-godzilla-xs/sanctuary-godzilla-xs}"
+RETROPIE_PROFILE="${GODZILLA_XS_RETROPIE_PROFILE:-${HOME}/.guix-extra-profiles/room-retropie/room-retropie}"
+
+# Playlist members are represented by their playlist entry.  Keep the raw
+# disk image out of the generated catalogue when an SX-Window playlist already
+# exposes it; otherwise the same game appears once as a playlist and again as
+# a directly launchable disk.  PLAYLIST_TITLES also handles alternate-format
+# duplicates such as a standalone HDF beside its multi-disk M3U.
+declare -A PLAYLIST_MEMBERS=()
+declare -A PLAYLIST_TITLES=()
+declare -A MEDIA_TITLES=()
+declare -A MEDIA_DETAILS=()
+declare -A MEDIA_KEYS=()
+declare -A METADATA_FILES_SEEN=()
+
+usage() {
+  cat <<'EOF'
+sanctuary-godzilla-xs-apps - Godzilla XS-86000 application catalogue
+
+Usage:
+  sanctuary-godzilla-xs-apps inventory
+  sanctuary-godzilla-xs-apps refresh
+  sanctuary-godzilla-xs-apps check
+  PX68K profiles for X68000 launches: baseline, threaded, no-vsync, no-audio-sync
+  sanctuary-godzilla-xs-apps browse <x68000|pc98|pc88|fmtowns|scummvm|arcade|cps1|cps2|cps3|neogeo>
+  sanctuary-godzilla-xs-apps launch <x68000|pc98|fmtowns|scummvm|mame|cps1|cps2|cps3|neogeo> [--media PATH]
+
+CPS and Neo Geo launch through the declarative FBNeo core.  Individual ROM
+archives stay catalogue-only until they pass the FBNeo DAT/runtime audit; the
+archive browsers and direct --media route remain available for testing.
+
+`refresh` is the deliberate manual menu materializer.  It never modifies the
+shared RetroPie tree and removes only desktop files carrying its own prefix.
+EOF
+}
+
+profile_bin() {
+  local name="$1"
+  if [[ -x "${GODZILLA_PROFILE}/bin/${name}" ]]; then
+    printf '%s\n' "${GODZILLA_PROFILE}/bin/${name}"
+  elif [[ -x "${RETROPIE_PROFILE}/bin/${name}" ]]; then
+    printf '%s\n' "${RETROPIE_PROFILE}/bin/${name}"
+  else
+    return 1
+  fi
+}
+
+profile_core() {
+  local name="$1"
+  if [[ -f "${GODZILLA_PROFILE}/lib/libretro/${name}_libretro.so" ]]; then
+    printf '%s\n' "${GODZILLA_PROFILE}/lib/libretro/${name}_libretro.so"
+  elif [[ -f "${RETROPIE_PROFILE}/lib/libretro/${name}_libretro.so" ]]; then
+    printf '%s\n' "${RETROPIE_PROFILE}/lib/libretro/${name}_libretro.so"
+  else
+    return 1
+  fi
+}
+
+x68000_bios_ready() {
+  local bios_root="${RETROPIE}/bios/x68000/keropi"
+  [[ -d "${bios_root}" ]] || return 1
+  [[ -f "${bios_root}/iplrom.dat" || \
+     -f "${bios_root}/iplrom30.dat" || \
+     -f "${bios_root}/iplromco.dat" || \
+     -f "${bios_root}/iplromxv.dat" ]] || return 1
+  [[ -f "${bios_root}/cgrom.dat" || -f "${bios_root}/cgrom.tmp" ]]
+}
+
+media_path() {
+  local candidate resolved root
+  candidate="$1"
+  resolved="$(realpath -e -- "${candidate}" 2>/dev/null || true)"
+  # Older generated entries used the logical guest-home path.  Resolve those
+  # against the live bind when the guest-home link is absent or stale.
+  if [[ -z "${resolved}" && "${candidate}" == "${HOME}/RetroPie/"* && -d "${RETROPIE}/roms" ]]; then
+    resolved="$(realpath -e -- "${RETROPIE}/${candidate#"${HOME}/RetroPie/"}" 2>/dev/null || true)"
+  fi
+  root="$(realpath -e -- "${RETROPIE}" 2>/dev/null || true)"
+  [[ -n "${resolved}" && -n "${root}" ]] || {
+    echo "godzilla-xs-apps: media does not exist: ${candidate}" >&2
+    return 1
+  }
+  case "${resolved}" in
+    "${root}/roms/"*) printf '%s\n' "${resolved}" ;;
+    *) echo "godzilla-xs-apps: media is outside RetroPie rom roots: ${candidate}" >&2; return 1 ;;
+  esac
+}
+
+media_count() {
+  local root="$1"
+  [[ -d "${root}" ]] || { printf '0'; return; }
+  find "${root}" -maxdepth 1 -type f -print 2>/dev/null | wc -l | tr -d ' '
+}
+
+media_archive_count() {
+  local root="$1"
+  [[ -d "${root}" ]] || { printf '0'; return; }
+  find "${root}" -maxdepth 1 -type f \( -iname '*.zip' -o -iname '*.7z' \) -print 2>/dev/null | wc -l | tr -d ' '
+}
+
+slug() {
+  local value
+  value="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')"
+  [[ -n "${value}" ]] || value=untitled
+  printf '%s' "${value}"
+}
+
+media_key() {
+  local title
+  title="$(basename -- "$1")"
+  title="${title%.*}"
+  title="${title//%/ percent}"
+  # The SX-Window dump uses both `Hiryu` and `Hiryuu` for Strider.  Treat
+  # that romaji spelling variant as one catalogue identity so the playable
+  # three-disk M3U suppresses the misleading standalone HDF entry.
+  title="${title//Hiryuu/Hiryu}"
+  title="${title//hiryuu/hiryu}"
+  slug "${title}"
+}
+
+load_media_keys() {
+  local bus root file ext
+  for bus in cps1 cps2 cps3 neogeo; do
+    root="$(bus_root "${bus}")"
+    [[ -d "${root}" ]] || continue
+    while IFS= read -r -d '' file; do
+      ext="${file##*.}"
+      case "${bus}:${ext,,}" in
+        cps1:zip|cps1:7z|cps2:zip|cps2:7z|cps3:zip|cps3:7z|neogeo:zip|neogeo:7z)
+          MEDIA_KEYS["${bus}:$(media_key "${file}")"]=1 ;;
+      esac
+    done < <(find "${root}" -maxdepth 1 -type f -print0 2>/dev/null | sort -z)
+  done
+}
+
+xml_unescape() {
+  printf '%s' "$1" | sed \
+    -e 's/&amp;/\&/g' \
+    -e 's/&quot;/"/g' \
+    -e 's/&apos;/\x27/g' \
+    -e 's/&lt;/</g' \
+    -e 's/&gt;/>/g'
+}
+
+load_emulationstation_file() {
+  local file="$1" relative_path metadata_name genre developer publisher releasedate bus key detail
+  [[ -f "${file}" ]] || return 0
+  file="$(realpath -e -- "${file}" 2>/dev/null || true)"
+  [[ -n "${file}" && -z "${METADATA_FILES_SEEN["${file}"]+present}" ]] || return 0
+  METADATA_FILES_SEEN["${file}"]=1
+  while IFS=$'\t' read -r relative_path metadata_name genre developer publisher releasedate players; do
+    [[ -n "${relative_path}" && -n "${metadata_name}" ]] || continue
+    relative_path="$(xml_unescape "${relative_path}")"
+    metadata_name="$(xml_unescape "${metadata_name}")"
+    genre="$(xml_unescape "${genre}")"
+    developer="$(xml_unescape "${developer}")"
+    publisher="$(xml_unescape "${publisher}")"
+    releasedate="$(xml_unescape "${releasedate}")"
+    players="$(xml_unescape "${players}")"
+    detail=""
+    [[ -n "${genre}" ]] && detail="${genre}"
+    [[ -n "${developer}" ]] && detail="${detail:+${detail}; }${developer}"
+    [[ -n "${publisher}" && "${publisher}" != "${developer}" ]] && detail="${detail:+${detail}; }${publisher}"
+    [[ -n "${releasedate}" ]] && detail="${detail:+${detail}; }${releasedate:0:4}"
+    [[ -n "${players}" ]] && detail="${detail:+${detail}; }${players} players"
+    for bus in cps1 cps2 cps3 neogeo; do
+      key="${bus}:$(media_key "${relative_path}")"
+      [[ -n "${MEDIA_KEYS["${key}"]+present}" ]] || continue
+      [[ -n "${MEDIA_TITLES["${key}"]+present}" ]] && continue
+      MEDIA_TITLES["${key}"]="${metadata_name}"
+      MEDIA_DETAILS["${key}"]="${detail}"
+    done
+  done < <(awk '
+    function field(line, tag, value) {
+      value = line
+      sub(".*<" tag ">", "", value)
+      sub("</" tag ">.*", "", value)
+      return value
+    }
+    /<path>/ { path = field($0, "path") }
+    /<name>/ { name = field($0, "name") }
+    /<genre>/ { genre = field($0, "genre") }
+    /<developer>/ { developer = field($0, "developer") }
+    /<publisher>/ { publisher = field($0, "publisher") }
+    /<releasedate>/ { releasedate = field($0, "releasedate") }
+    /<players>/ { players = field($0, "players") }
+    /<\/game>/ {
+      if (path != "") print path "\t" name "\t" genre "\t" developer "\t" publisher "\t" releasedate "\t" players
+      path = name = genre = developer = publisher = releasedate = players = ""
+    }
+  ' "${file}")
+}
+
+load_emulationstation_metadata() {
+  local file
+  [[ -d "${EMULATIONSTATION_GAMELISTS}" ]] || return 0
+  # Prefer the system's own list, then the other CPS/Neo Geo lists, then the
+  # common arcade lists.  This keeps a bus-specific regional title authoritative
+  # while still recovering cross-listed entries such as Pang! 3.
+  for file in \
+    "${EMULATIONSTATION_GAMELISTS}/cps1/gamelist.xml" \
+    "${EMULATIONSTATION_GAMELISTS}/cps2/gamelist.xml" \
+    "${EMULATIONSTATION_GAMELISTS}/cps3/gamelist.xml" \
+    "${EMULATIONSTATION_GAMELISTS}/neogeo/gamelist.xml" \
+    "${EMULATIONSTATION_GAMELISTS}/fba/gamelist.xml" \
+    "${EMULATIONSTATION_GAMELISTS}/arcade/gamelist.xml"; do
+    load_emulationstation_file "${file}"
+  done
+}
+
+desktop_quote() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  value="${value//%/%%}"
+  printf '"%s"' "${value}"
+}
+
+write_desktop() {
+  local id="$1" name="$2" comment="$3" exec_line="$4" icon="$5" category="$6" terminal="$7"
+  local destination="${APPLICATIONS_DIR}/${GENERATED_PREFIX}${id}.desktop"
+  local temporary main_category
+  case "${category}" in
+    X-GodzillaX68*|X-GodzillaPC98*|X-GodzillaPC88*|X-GodzillaFMTowns*|X-GodzillaArcade|X-GodzillaFBNeo|X-GodzillaCPS1|X-GodzillaCPS2|X-GodzillaCPS3|X-GodzillaNeoGeo|X-GodzillaMedia|X-GodzillaXS)
+      main_category=Game ;;
+    X-GodzillaRomLab)
+      main_category=Utility ;;
+    X-GodzillaSoundModules)
+      main_category=AudioVideo ;;
+    *)
+      main_category=Utility ;;
+  esac
+  category="${main_category};${category}"
+  temporary="$(mktemp "${destination}.tmp.XXXXXX")"
+  {
+    printf '# DotCortex generated Godzilla XS catalogue entry; do not edit.\n'
+    printf '[Desktop Entry]\nType=Application\nName=%s\nComment=%s\n' "${name}" "${comment}"
+    printf 'Exec=%s\nIcon=%s\nTerminal=%s\nCategories=%s;\nStartupNotify=true\n' "${exec_line}" "${icon}" "${terminal}" "${category}"
+  } >"${temporary}"
+  mv -f -- "${temporary}" "${destination}"
+}
+
+media_category() {
+  local bus="$1" role="$2"
+  case "${bus}:${role}" in
+    x68000:runtime) printf '%s' X-GodzillaX68Runtime ;;
+    x68000:library) printf '%s' X-GodzillaX68Library ;;
+    x68000:playlist) printf '%s' X-GodzillaX68Multi ;;
+    x68000:disk) printf '%s' X-GodzillaX68Disk ;;
+    pc98:runtime) printf '%s' X-GodzillaPC98Runtime ;;
+    pc98:library) printf '%s' X-GodzillaPC98Library ;;
+    pc98:disk) printf '%s' X-GodzillaPC98Disk ;;
+    pc88:library) printf '%s' X-GodzillaPC88Library ;;
+    pc88:disk) printf '%s' X-GodzillaPC88Disk ;;
+    fmtowns:runtime) printf '%s' X-GodzillaFMTownsRuntime ;;
+    fmtowns:library) printf '%s' X-GodzillaFMTownsLibrary ;;
+    cps1:runtime|cps1:library|cps1:game) printf '%s' X-GodzillaCPS1 ;;
+    cps2:runtime|cps2:library|cps2:game) printf '%s' X-GodzillaCPS2 ;;
+    cps3:runtime|cps3:library|cps3:game) printf '%s' X-GodzillaCPS3 ;;
+    neogeo:runtime|neogeo:library|neogeo:game) printf '%s' X-GodzillaNeoGeo ;;
+    *) printf '%s' X-GodzillaXS ;;
+  esac
+}
+
+record() {
+  local kind="$1" status="$2" name="$3" backend="$4" path="${5:-}"
+  printf '%s\t%s\t%s\t%s\t%s\n' "${kind}" "${status}" "${name}" "${backend}" "${path}"
+  if [[ "${MODE}" == refresh ]]; then
+    printf '%s\t%s\t%s\t%s\t%s\n' "${kind}" "${status}" "${name}" "${backend}" "${path}" >>"${LEDGER}"
+  fi
+}
+
+backend_status() {
+  local bus="$1"
+  case "${bus}" in
+    x68000)
+      [[ -n "$(profile_bin retroarch 2>/dev/null || true)" ]] && profile_core px68k >/dev/null 2>&1 && x68000_bios_ready && printf 'runnable' || printf 'unavailable' ;;
+    pc98) [[ -n "$(profile_bin np2kai 2>/dev/null || true)" ]] && printf 'runnable' || printf 'unavailable' ;;
+    pc88) printf 'catalogue-only' ;;
+    fmtowns) [[ -n "$(profile_bin Tsugaru_CUI 2>/dev/null || true)" ]] && printf 'runnable' || printf 'unavailable' ;;
+    cps1|cps2|cps3|neogeo)
+      [[ -n "$(profile_bin retroarch 2>/dev/null || true)" ]] && profile_core fbneo >/dev/null 2>&1 && printf 'runnable' || printf 'unavailable' ;;
+    *) printf 'catalogue-only' ;;
+  esac
+}
+
+bus_root() {
+  case "$1" in
+    retropie) printf '%s' "${RETROPIE}";;
+    x68000) printf '%s' "${X68_ROOT}";;
+    pc98) printf '%s' "${PC98_ROOT}";;
+    pc88) printf '%s' "${PC88_ROOT}";;
+    fmtowns) printf '%s' "${FMTOWNS_ROOT}";;
+    scummvm) printf '%s' "${SCUMMVM_ROOT}";;
+    arcade) printf '%s' "${ARCADE_ROOT}";;
+    cps1) printf '%s' "${CPS1_ROOT}";;
+    cps2) printf '%s' "${CPS2_ROOT}";;
+    cps3) printf '%s' "${CPS3_ROOT}";;
+    neogeo) printf '%s' "${NEOGEO_ROOT}";;
+    *) return 1;;
+  esac
+}
+
+browse() {
+  local bus="$1" root
+  root="$(bus_root "${bus}")"
+  [[ -d "${root}" ]] || { echo "godzilla-xs-apps: media root is absent: ${root}" >&2; return 1; }
+  exec thunar "${root}"
+}
+
+mame_launch() {
+  local bus="$1" media="${2:-}" root mame game
+  root="$(bus_root "${bus}")"
+  root="$(realpath -e -- "${root}" 2>/dev/null || true)"
+  [[ -n "${root}" && -d "${root}" ]] || { echo "godzilla-xs-apps: media root is absent: ${root}" >&2; return 1; }
+  mame="$(profile_bin mame)"
+  if [[ -n "${media}" ]]; then
+    case "${media}" in
+      "${root}"/*) ;;
+      *) echo "godzilla-xs-apps: ${bus} media is outside its declared archive: ${media}" >&2; return 1;;
+    esac
+    game="$(basename -- "${media}")"
+    game="${game%.*}"
+    exec "${GAMEMODE_RUNNER}" "${mame}" -rompath "${root}" "${game}"
+  fi
+  exec "${GAMEMODE_RUNNER}" "${mame}" -rompath "${root}"
+}
+
+fbneo_launch() {
+  local bus="$1" media="${2:-}" root retroarch core runtime_config
+  root="$(realpath -e -- "$(bus_root "${bus}")" 2>/dev/null || true)"
+  [[ -n "${root}" && -d "${root}" ]] || {
+    echo "godzilla-xs-apps: media root is absent: ${root}" >&2
+    return 1
+  }
+  retroarch="$(profile_bin retroarch)"
+  core="$(profile_core fbneo)"
+  if [[ -n "${media}" ]]; then
+    case "${media}" in
+      "${root}"/*) ;;
+      *) echo "godzilla-xs-apps: ${bus} media is outside its declared archive: ${media}" >&2; return 1;;
+    esac
+  fi
+  local -a retroarch_args=("${retroarch}" -L "${core}")
+  if [[ -f "${FBNEO_CONFIG}" ]]; then
+    retroarch_args+=(--appendconfig "${FBNEO_CONFIG}")
+  fi
+  runtime_config="${TMPDIR:-/tmp}/godzilla-xs-fbneo-${bus}.cfg"
+  printf 'joypad_autoconfig_dir = "%s"\n' "${HOME}/.config/retroarch/autoconfig" >"${runtime_config}"
+  retroarch_args+=(--appendconfig "${runtime_config}")
+  if [[ -n "${media}" ]]; then
+    LIBRETRO_SYSTEM_DIRECTORY="${RETROPIE}/bios" exec "${GAMEMODE_RUNNER}" "${retroarch_args[@]}" "${media}"
+  fi
+  # A bus desktop entry is a content picker.  A contentless RetroArch
+  # invocation exits immediately; --menu keeps the FBNeo branch open so the
+  # user can choose an archive from RetroArch's Load Content screen.
+  retroarch_args+=(--menu)
+  LIBRETRO_SYSTEM_DIRECTORY="${RETROPIE}/bios" exec "${GAMEMODE_RUNNER}" "${retroarch_args[@]}"
+}
+
+px68k_profile_config() {
+  local profile="${1:-normal}" config
+  case "${profile}" in
+    normal) return 0 ;;
+    baseline|threaded|no-vsync|no-audio-sync) ;;
+    *)
+      echo "godzilla-xs-apps: unknown PX68K profile: ${profile}" >&2
+      echo "  Choose: baseline, threaded, no-vsync, no-audio-sync" >&2
+      return 2
+      ;;
+  esac
+  config="${PX68K_PROFILE_DIR}/px68k-test-${profile}.cfg"
+  [[ -f "${config}" ]] || {
+    echo "godzilla-xs-apps: PX68K profile is not installed: ${config}" >&2
+    return 1
+  }
+  printf '%s\n' "${config}"
+}
+
+px68k_test_media() {
+  find "${X68_ROOT}" -maxdepth 1 -type f -iname '*strider*.m3u' -print -quit 2>/dev/null || true
+}
+
+launch() {
+  local bus="$1" media="" profile=normal profile_config=""
+  shift
+  while (( $# )); do
+    case "$1" in
+      --media)
+        [[ $# -ge 2 ]] || { echo 'godzilla-xs-apps: --media requires a path' >&2; return 2; }
+        media_path "$2" >/dev/null
+        media="$(media_path "$2")"
+        shift 2
+        ;;
+      --profile)
+        [[ $# -ge 2 ]] || { echo 'godzilla-xs-apps: --profile requires a name' >&2; return 2; }
+        profile="$2"
+        shift 2
+        ;;
+      *)
+        echo "godzilla-xs-apps: unknown launch option: $1" >&2
+        return 2
+        ;;
+    esac
+  done
+  case "${bus}" in
+    x68000)
+      local retroarch core
+      retroarch="$(profile_bin retroarch)"
+      core="$(profile_core px68k)"
+      [[ -n "${media}" ]] || { echo 'godzilla-xs-apps: choose an X68000 image from the catalogue.' >&2; return 2; }
+      if ! x68000_bios_ready; then
+        echo "godzilla-xs-apps: PX68k needs X68000 BIOS files under ${RETROPIE}/bios/x68000/keropi/." >&2
+        echo "  Supply one IPL ROM (iplrom.dat, iplrom30.dat, iplromco.dat, or iplromxv.dat)" >&2
+        echo "  plus cgrom.dat or cgrom.tmp; add legally obtained files and try again." >&2
+        return 1
+      fi
+      local -a retroarch_args=("${retroarch}" -L "${core}")
+      if [[ -f "${PX68K_WINDOW_CONFIG}" ]]; then
+        retroarch_args+=(--appendconfig "${PX68K_WINDOW_CONFIG}")
+      fi
+      if ! profile_config="$(px68k_profile_config "${profile}")"; then
+        return 1
+      fi
+      if [[ -n "${profile_config}" ]]; then
+        retroarch_args+=(--appendconfig "${profile_config}")
+        echo "godzilla-xs-apps: PX68K profile=${profile} (FPS overlay enabled)" >&2
+      fi
+      LIBRETRO_SYSTEM_DIRECTORY="${RETROPIE}/bios/x68000" exec "${GAMEMODE_RUNNER}" "${retroarch_args[@]}" "${media}" ;;
+    pc98)
+      local np2kai
+      np2kai="$(profile_bin np2kai)"
+      [[ -n "${media}" ]] || { echo 'godzilla-xs-apps: choose a PC-98 disk image from the catalogue.' >&2; return 2; }
+      exec "${GAMEMODE_RUNNER}" "${np2kai}" "${media}" ;;
+    fmtowns)
+      local tsugaru
+      tsugaru="$(profile_bin Tsugaru_CUI)"
+      [[ -n "${media}" ]] || { echo 'godzilla-xs-apps: FM Towns media is not present yet.' >&2; return 2; }
+      exec "${GAMEMODE_RUNNER}" "${tsugaru}" "${media}" ;;
+    scummvm) exec "${GAMEMODE_RUNNER}" "$(profile_bin scummvm)" --path "${SCUMMVM_ROOT}" ;;
+    mame) mame_launch arcade ;;
+    cps1|cps2|cps3|neogeo) fbneo_launch "${bus}" "${media}" ;;
+    *) echo "godzilla-xs-apps: unknown launch bus: ${bus}" >&2; return 2;;
+  esac
+}
+
+emit_runtime_entries() {
+  local status app icon test_media profile profile_label
+  status="$(backend_status x68000)"
+  record runtime "${status}" 'X68000 Emulator (PX68k)' x68000
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop x68000-emulator 'X68000 Emulator (PX68k)' 'Launch the verified PX68k RetroArch core' \
+      "$(desktop_quote "${APP_CMD}") launch x68000" applications-games X-GodzillaX68Runtime true
+    write_desktop x68000-library 'X68000 Library' 'Browse shared Sharp X68000 media' \
+      "$(desktop_quote "${APP_CMD}") browse x68000" system-file-manager X-GodzillaX68Library false
+    test_media="$(px68k_test_media)"
+    if [[ -n "${test_media}" ]]; then
+      for profile in baseline threaded no-vsync no-audio-sync; do
+        case "${profile}" in
+          baseline) profile_label='Baseline' ;;
+          threaded) profile_label='Threaded Video' ;;
+          no-vsync) profile_label='Threaded + VSync Off' ;;
+          no-audio-sync) profile_label='Threaded + Audio Sync Off' ;;
+        esac
+        write_desktop "x68000-performance-${profile}" "PX68K ${profile_label} (Strider)" \
+          "Repeatable PX68K timing test using the verified Strider playlist" \
+          "$(desktop_quote "${APP_CMD}") launch x68000 --profile ${profile} --media $(desktop_quote "${test_media}")" \
+          applications-games X-GodzillaX68Performance false
+      done
+    fi
+  fi
+
+  status="$(backend_status pc98)"
+  record runtime "${status}" 'PC-98 Emulator (NP2kai)' pc98
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop pc98-emulator 'PC-98 Emulator (NP2kai)' 'Launch the verified NP2kai PC-98 backend' \
+      "$(desktop_quote "${APP_CMD}") launch pc98" applications-games X-GodzillaPC98Runtime true
+    write_desktop pc98-library 'PC-98 Library' 'Browse shared PC-98 disk images' \
+      "$(desktop_quote "${APP_CMD}") browse pc98" system-file-manager X-GodzillaPC98Library false
+  fi
+
+  status="$(backend_status pc88)"
+  record runtime "${status}" 'PC-88 Emulator (QUASI88 pending)' pc88
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop pc88-library 'PC-88 Library' 'Browse PC-88 media; QUASI88 is not installed' \
+      "$(desktop_quote "${APP_CMD}") browse pc88" system-file-manager X-GodzillaPC88Library false
+  fi
+
+  status="$(backend_status fmtowns)"
+  record runtime "${status}" 'FM Towns Emulator (Tsugaru)' fmtowns
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop fmtowns-emulator 'FM Towns Emulator (Tsugaru)' 'Launch Tsugaru when FM Towns media is present' \
+      "$(desktop_quote "${APP_CMD}") launch fmtowns" applications-games X-GodzillaFMTownsRuntime true
+    write_desktop fmtowns-library 'FM Towns Library' 'Browse shared FM Towns media' \
+      "$(desktop_quote "${APP_CMD}") browse fmtowns" system-file-manager X-GodzillaFMTownsLibrary false
+  fi
+
+  status="$(backend_status fbneo)"
+  record runtime "${status}" 'FinalBurn Neo Core (CPS / Neo Geo)' fbneo
+
+  local cps_bus cps_label cps_category
+  for cps_bus in cps1 cps2 cps3; do
+    case "${cps_bus}" in
+      cps1) cps_label='CPS 1' ;;
+      cps2) cps_label='CPS 2' ;;
+      cps3) cps_label='CPS 3' ;;
+    esac
+    cps_category="X-Godzilla${cps_bus^^}"
+    status="$(backend_status "${cps_bus}")"
+    record runtime "${status}" "${cps_label} FBNeo Expansion Bus" "${cps_bus}"
+    if [[ "${MODE}" == refresh ]]; then
+      write_desktop "${cps_bus}-library" "${cps_label} FBNeo Archive" "Browse the declared ${cps_label} archive; ROMs require the current FBNeo set" \
+        "$(desktop_quote "${APP_CMD}") browse ${cps_bus}" system-file-manager "${cps_category}" false
+      if [[ "${status}" == runnable ]]; then
+        write_desktop "${cps_bus}-fbneo" "${cps_label} FBNeo Content Menu" "Open the ${cps_label} FBNeo content menu" \
+          "$(desktop_quote "${APP_CMD}") launch ${cps_bus}" applications-games "${cps_category}" false
+      fi
+    fi
+  done
+
+  status="$(backend_status neogeo)"
+  record runtime "${status}" 'Neo Geo FBNeo Arcade Bus' neogeo
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop neogeo-library 'Neo Geo FBNeo Archive' 'Browse the declared Neo Geo archive; ROMs require the current FBNeo set' \
+      "$(desktop_quote "${APP_CMD}") browse neogeo" system-file-manager X-GodzillaNeoGeo false
+    if [[ "${status}" == runnable ]]; then
+      write_desktop neogeo-fbneo 'Neo Geo FBNeo Content Menu' 'Open the Neo Geo FBNeo content menu' \
+        "$(desktop_quote "${APP_CMD}") launch neogeo" applications-games X-GodzillaNeoGeo false
+    fi
+  fi
+
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop scummvm 'ScummVM Adventures' 'Browse the shared ScummVM collection' \
+      "$(desktop_quote "${APP_CMD}") launch scummvm" applications-games X-GodzillaMedia false
+    write_desktop mame 'MAME Arcade Library' 'Open the MAME arcade catalogue' \
+      "$(desktop_quote "${APP_CMD}") launch mame" applications-games X-GodzillaArcade true
+  fi
+}
+
+emit_media_entry() {
+  local bus="$1" role="$2" file="$3" status backend title fingerprint id category comment metadata_key
+  backend="$(backend_status "${bus}")"
+  status="${backend}"
+  # FBNeo's active DAT is independent of MAME.  A ZIP's presence is therefore
+  # not enough to call a game verified.  Keep the ledger honest, but expose
+  # every curated archive as a direct launcher when the FBNeo core exists; the
+  # core performs the authoritative content audit at launch time.
+  case "${bus}" in cps1|cps2|cps3|neogeo) status=catalogue-only ;; esac
+  title="$(basename "${file}")"
+  title="${title%.*}"
+  metadata_key="${bus}:$(media_key "${file}")"
+  [[ -n "${MEDIA_TITLES["${metadata_key}"]+present}" ]] && title="${MEDIA_TITLES["${metadata_key}"]}"
+  # Do not stream ROM archives over the shared NFS bind just to create a
+  # generated-entry ID.  Size and mtime are sufficient to invalidate a menu
+  # entry when the curated archive changes and keep refresh responsive.
+  fingerprint="$(stat -c '%s-%Y' -- "${file}")"
+  id="${bus}-$(slug "${title}")-${fingerprint}"
+  category="$(media_category "${bus}" "${role}")"
+  comment="Launch ${bus} media"
+  case "${bus}" in
+    cps1|cps2|cps3|neogeo) comment="Launch ${bus} archive through FBNeo; the core validates the current set" ;;
+  esac
+  [[ -n "${MEDIA_DETAILS["${metadata_key}"]:-}" ]] && comment="${comment}; ${MEDIA_DETAILS["${metadata_key}"]}"
+  record game "${status}" "${title}" "${bus}" "${file}"
+  if [[ "${MODE}" == refresh && ( "${backend}" == runnable || ( "${bus}" == x68000 && "${status}" == unavailable ) ) ]]; then
+    write_desktop "${id}" "${title}" "${comment}" \
+      "$(desktop_quote "${APP_CMD}") launch ${bus} --media $(desktop_quote "${file}")" applications-games "${category}" false
+  fi
+}
+
+scan_media() {
+  local bus="$1" root="$2" file ext resolved key
+  [[ -d "${root}" ]] || return 0
+  if [[ "${bus}" == x68000 ]]; then
+    while IFS= read -r -d '' file; do
+      key="$(media_key "${file}")"
+      PLAYLIST_TITLES["${key}"]=1
+      while IFS= read -r member || [[ -n "${member}" ]]; do
+        member="${member%$'\r'}"
+        [[ -n "${member}" && "${member}" != \#* ]] || continue
+        resolved="$(realpath -e -- "$(dirname "${file}")/${member}" 2>/dev/null || true)"
+        [[ -n "${resolved}" ]] && PLAYLIST_MEMBERS["${resolved}"]=1
+      done < "${file}"
+    done < <(find "${root}" -maxdepth 1 -type f -iname '*.m3u' -print0 | sort -z)
+  fi
+  while IFS= read -r -d '' file; do
+    ext="${file##*.}"
+    if [[ "${bus}" == x68000 && "${ext,,}" != m3u ]]; then
+      resolved="$(realpath -e -- "${file}" 2>/dev/null || true)"
+      [[ -n "${resolved}" && -n "${PLAYLIST_MEMBERS["${resolved}"]+present}" ]] && continue
+      key="$(media_key "${file}")"
+      [[ -n "${PLAYLIST_TITLES["${key}"]+present}" ]] && continue
+    fi
+    case "${bus}:${ext,,}" in
+      x68000:m3u|x68000:dim|x68000:img|x68000:d88|x68000:88d|x68000:hdm|x68000:dup|x68000:2hd|x68000:xdf|x68000:hdf|x68000:cmd|x68000:zip|x68000:7z)
+        [[ "${ext,,}" == m3u ]] && emit_media_entry x68000 playlist "${file}" || emit_media_entry x68000 disk "${file}";;
+      pc98:hdi|pc98:fdi|pc98:hdm|pc98:d88|pc98:2hd|pc98:zip|pc98:7z)
+        emit_media_entry pc98 disk "${file}";;
+      pc88:d88|pc88:88d|pc88:2hd|pc88:hdm|pc88:zip|pc88:7z)
+        emit_media_entry pc88 disk "${file}";;
+      cps1:zip|cps1:7z|cps2:zip|cps2:7z|cps3:zip|cps3:7z)
+        emit_media_entry "${bus}" game "${file}";;
+      neogeo:zip|neogeo:7z)
+        emit_media_entry neogeo game "${file}";;
+    esac
+  done < <(find "${root}" -maxdepth 1 -type f -print0 | sort -z)
+}
+
+emit_accessories() {
+  local binary name category icon
+  if [[ "${MODE}" == refresh ]]; then
+    write_desktop retro-pie-library 'RetroPie Media Root' 'Browse the shared durable media tree' \
+      "$(desktop_quote "${APP_CMD}") browse retropie" system-file-manager X-GodzillaXS false
+    for binary in imhex ghex gimp mtpaint ristretto audacity audacious qjackctl qsynth; do
+      command -v "${binary}" >/dev/null 2>&1 || continue
+      name="${binary^}"
+      category=X-GodzillaRomLab
+      [[ "${binary}" == audacious || "${binary}" == qsynth || "${binary}" == qjackctl ]] && category=X-GodzillaSoundModules
+      write_desktop "accessory-${binary}" "${name}" "Godzilla XS accessory: ${name}" \
+        "$(desktop_quote "$(command -v "${binary}")")" applications-accessories "${category}" false
+    done
+    write_desktop archive-tools 'Archive and Patch Tools' 'Open a terminal with the ROM lab inventory' \
+      "$(desktop_quote "${APP_CMD}") inventory" utilities-terminal X-GodzillaRomLab true
+  fi
+}
+
+inventory_or_refresh() {
+  if [[ "${MODE}" == refresh ]]; then
+    mkdir -p "${APPLICATIONS_DIR}" "$(dirname "${LEDGER}")"
+    rm -f -- "${APPLICATIONS_DIR}/${GENERATED_PREFIX}"*.desktop
+    : >"${LEDGER}"
+    printf 'kind\tstatus\tname\tbackend\tpath\n' >>"${LEDGER}"
+  fi
+  printf 'kind\tstatus\tname\tbackend\tpath\n'
+  emit_runtime_entries
+  load_media_keys
+  load_emulationstation_metadata
+  scan_media x68000 "${X68_ROOT}"
+  scan_media pc98 "${PC98_ROOT}"
+  scan_media pc88 "${PC88_ROOT}"
+  scan_media cps1 "${CPS1_ROOT}"
+  scan_media cps2 "${CPS2_ROOT}"
+  scan_media cps3 "${CPS3_ROOT}"
+  scan_media neogeo "${NEOGEO_ROOT}"
+  record media ready 'X68000 media files' x68000 "$(media_count "${X68_ROOT}")"
+  record media ready 'PC-98 media files' pc98 "$(media_count "${PC98_ROOT}")"
+  record media ready 'PC-88 media files' pc88 "$(media_count "${PC88_ROOT}")"
+  record media ready 'FM Towns media files' fmtowns "$(media_count "${FMTOWNS_ROOT}")"
+  record media ready 'ScummVM media files' scummvm "$(media_count "${SCUMMVM_ROOT}")"
+  record media ready 'Arcade media files' arcade "$(media_count "${ARCADE_ROOT}")"
+  record media ready 'CPS 1 ROM archives' cps1 "$(media_archive_count "${CPS1_ROOT}")"
+  record media ready 'CPS 2 ROM archives' cps2 "$(media_archive_count "${CPS2_ROOT}")"
+  record media ready 'CPS 3 ROM archives' cps3 "$(media_archive_count "${CPS3_ROOT}")"
+  record media ready 'Neo Geo ROM archives' neogeo "$(media_archive_count "${NEOGEO_ROOT}")"
+  emit_accessories
+  if [[ "${MODE}" == refresh ]]; then
+    update-desktop-database "${APPLICATIONS_DIR}" >/dev/null 2>&1 || true
+    echo "Godzilla XS catalogue refreshed: ${LEDGER}" >&2
+  fi
+}
+
+check() {
+  local result=0 desktop
+  inventory_or_refresh >/dev/null
+  if [[ -d "${APPLICATIONS_DIR}" && -x "$(command -v desktop-file-validate 2>/dev/null || true)" ]]; then
+    while IFS= read -r -d '' desktop; do
+      desktop-file-validate "${desktop}" || result=1
+    done < <(find "${APPLICATIONS_DIR}" -maxdepth 1 -type f -name "${GENERATED_PREFIX}*.desktop" -print0)
+  fi
+  return "${result}"
+}
+
+case "${MODE}" in
+  -h|--help|help) usage;;
+  inventory) inventory_or_refresh;;
+  refresh|menu) MODE=refresh; inventory_or_refresh;;
+  check) check;;
+  browse) browse "${1:?browse requires a bus}";;
+  launch) launch "${1:?launch requires a bus}" "${@:2}";;
+  *) usage >&2; exit 2;;
+esac
+# Godzilla XS-86000 library, state, and menu foundation:6 ends here
