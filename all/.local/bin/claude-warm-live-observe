@@ -1,0 +1,525 @@
+#!/usr/bin/env python3
+"""Observe one accelerated Claude idle-compaction acceptance run.
+
+This command is deliberately read-only.  It discovers a newly-created
+supervised Telegram session, reads its state, status snapshot, and safe guard
+log, and reports the real lifecycle.  The Claude PTY is never opened and the
+supervisor control socket is never contacted.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import math
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import time
+from typing import Any
+
+
+CHANNEL_RE = re.compile(r"^claude-[0-9a-f]{32}$")
+NUMERIC_TIMESTAMP_RE = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?$")
+FORMER_SNAPSHOT_MAX_AGE_SECONDS = 120.0
+
+
+def runtime_root() -> pathlib.Path:
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        raise RuntimeError("XDG_RUNTIME_DIR is not set")
+    return pathlib.Path(value) / "claude-idle-compaction"
+
+
+def control_command() -> pathlib.Path:
+    sibling = pathlib.Path(__file__).resolve().parent / "claude-warmctl"
+    if sibling.is_file():
+        return sibling
+    found = shutil.which("claude-warmctl")
+    if found:
+        return pathlib.Path(found)
+    raise RuntimeError("claude-warmctl is not available beside the observer")
+
+
+def parse_records(text: str) -> list[dict[str, Any]]:
+    """Accept the installed JSONL list shape and a future JSON array shape."""
+    stripped = text.strip()
+    if not stripped or stripped == "no supervised Claude sessions":
+        return []
+    try:
+        value = json.loads(stripped)
+    except json.JSONDecodeError:
+        value = None
+    if isinstance(value, dict):
+        return [value] if isinstance(value.get("channel"), str) else []
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(item, dict) and isinstance(item.get("channel"), str):
+            records.append(item)
+    return records
+
+
+def list_sessions(command: pathlib.Path) -> list[dict[str, Any]]:
+    result = subprocess.run(
+        [str(command), "list"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=5,
+    )
+    return parse_records(result.stdout)
+
+
+def valid_channel(value: Any) -> bool:
+    return isinstance(value, str) and CHANNEL_RE.fullmatch(value) is not None
+
+
+def read_state(root: pathlib.Path, channel: str) -> dict[str, Any] | None:
+    if not valid_channel(channel):
+        return None
+    path = root / channel / "state.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def process_present(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and pathlib.Path(f"/proc/{value}").exists()
+
+
+def supervisor_environment(pid: Any) -> dict[str, str]:
+    """Read only the five safe accelerated-test settings from the owner PID."""
+    if not process_present(pid):
+        return {}
+    wanted = {
+        "CLAUDE_IDLE_CACHE_PROFILE",
+        "CLAUDE_IDLE_COMPACT_SECONDS",
+        "CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS",
+        "CLAUDE_IDLE_COMPACT_MIN_TOKENS",
+        "CLAUDE_IDLE_COMPACTION_DEBUG",
+    }
+    try:
+        entries = pathlib.Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return {}
+    values: dict[str, str] = {}
+    for entry in entries:
+        key, separator, value = entry.partition(b"=")
+        if separator and key.decode("utf-8", "replace") in wanted:
+            values[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return values
+
+
+def is_telegram_state(state: dict[str, Any]) -> bool:
+    watched = state.get("watched_servers")
+    if not isinstance(watched, list):
+        return False
+    return any("telegram" in str(item).lower() for item in watched)
+
+
+def timestamp_epoch(value: Any) -> tuple[float, str] | None:
+    """Parse the status wrapper's numeric or ISO timestamp without shell arithmetic."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        number = float(value)
+        kind = "integer"
+    elif isinstance(value, float):
+        number = value
+        kind = "float"
+    elif isinstance(value, str):
+        text = value.strip()
+        if NUMERIC_TIMESTAMP_RE.fullmatch(text):
+            try:
+                number = float(text)
+            except ValueError:
+                return None
+            kind = "numeric-string"
+        else:
+            try:
+                parsed = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            number = parsed.timestamp()
+            kind = "iso8601"
+    else:
+        return None
+    if not math.isfinite(number):
+        return None
+    return number, kind
+
+
+def read_status(root: pathlib.Path, state: dict[str, Any]) -> tuple[dict[str, Any], float, str, int] | None:
+    channel = state.get("channel")
+    session_id = state.get("session_id")
+    if not valid_channel(channel) or not isinstance(session_id, str) or not session_id:
+        return None
+    path = root / channel / "status.json"
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict):
+        return None
+    if value.get("channel") != channel or value.get("session_id") != session_id:
+        return None
+    tokens = value.get("current_input_context_tokens")
+    if not isinstance(tokens, int) or isinstance(tokens, bool) or tokens < 0:
+        return None
+    timestamp = timestamp_epoch(value.get("update_timestamp"))
+    if timestamp is None:
+        return None
+    return value, timestamp[0], timestamp[1], tokens
+
+
+def read_guard(path: pathlib.Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict) and isinstance(value.get("event"), str):
+            records.append(value)
+    return records
+
+
+def event_count(events: list[dict[str, Any]], name: str, purpose: str | None = None) -> int:
+    return sum(
+        1
+        for event in events
+        if event.get("event") == name and (purpose is None or event.get("purpose") == purpose)
+    )
+
+
+def event_timestamp(event: dict[str, Any]) -> float | None:
+    parsed = timestamp_epoch(event.get("timestamp"))
+    return parsed[0] if parsed else None
+
+
+def sleep_poll(deadline: float, interval: float = 0.5) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining > 0:
+        time.sleep(min(interval, remaining))
+
+
+def state_summary(state: dict[str, Any] | None) -> dict[str, Any]:
+    if not state:
+        return {}
+    return {
+        "channel": state.get("channel"),
+        "supervisor_pid": state.get("supervisor_pid"),
+        "claude_pid": state.get("pid"),
+        "session_id": state.get("session_id"),
+        "cache_profile": state.get("cache_profile"),
+        "current_input_context_tokens": state.get("current_input_context_tokens"),
+        "dirty": state.get("dirty"),
+        "compacting": state.get("compacting"),
+        "timer_deadline": state.get("timer_deadline"),
+        "timer_kind": state.get("timer_kind"),
+        "last_injection_result": state.get("last_injection_result"),
+        "last_cancellation_reason": state.get("last_cancellation_reason"),
+        "last_gate_rejection_reason": state.get("last_gate_rejection_reason"),
+    }
+
+
+def print_summary(summary: dict[str, Any]) -> None:
+    print("claude-warm-live-observe summary")
+    for key, value in summary.items():
+        print(f"{key}={json.dumps(value, sort_keys=True)}")
+
+
+def run(arguments: argparse.Namespace) -> int:
+    root = runtime_root()
+    command = control_command()
+    baseline = {record.get("channel") for record in list_sessions(command) if valid_channel(record.get("channel"))}
+    print("observer-ready: launch the one disposable accelerated session now")
+    print("observer-action=read-only-state-and-log-polling")
+    sys.stdout.flush()
+
+    deadline = time.monotonic() + arguments.discovery_timeout
+    channel: str | None = None
+    state: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        for record in list_sessions(command):
+            candidate = record.get("channel")
+            if not valid_channel(candidate) or candidate in baseline:
+                continue
+            fresh = read_state(root, candidate)
+            if not fresh or not process_present(fresh.get("supervisor_pid")) or not process_present(fresh.get("pid")):
+                continue
+            if is_telegram_state(fresh):
+                channel = candidate
+                state = fresh
+                break
+        if channel:
+            break
+        sleep_poll(deadline)
+    if not channel or not state:
+        print_summary({"result": "FAIL", "failure_reason": "new-live-telegram-channel-not-discovered"})
+        return 1
+
+    expected_environment = {
+        "CLAUDE_IDLE_CACHE_PROFILE": "long",
+        "CLAUDE_IDLE_COMPACT_SECONDS": str(int(arguments.expected_delay)),
+        "CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS": str(int(arguments.expected_ttl)),
+        "CLAUDE_IDLE_COMPACT_MIN_TOKENS": str(arguments.expected_threshold),
+        "CLAUDE_IDLE_COMPACTION_DEBUG": "1",
+    }
+    configured_environment = supervisor_environment(state.get("supervisor_pid"))
+    if configured_environment != expected_environment:
+        print_summary(
+            {
+                "result": "FAIL",
+                "failure_reason": "accelerated-supervisor-environment-mismatch",
+                "expected_environment": expected_environment,
+                "configured_environment": configured_environment,
+                **state_summary(state),
+            }
+        )
+        return 1
+
+    guard_path_value = state.get("channel_guard_log")
+    if not isinstance(guard_path_value, str):
+        print_summary({"result": "FAIL", "failure_reason": "guard-log-path-missing", **state_summary(state)})
+        return 1
+    guard_path = pathlib.Path(guard_path_value)
+    last_status: tuple[float, str, int] | None = None
+    failure_reason: str | None = None
+    snapshot_age: float | None = None
+    compact_request: dict[str, Any] | None = None
+    arm_deadline = time.monotonic() + arguments.arm_timeout
+
+    def observe() -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        nonlocal state, last_status
+        current = read_state(root, channel) or {}
+        status = read_status(root, current)
+        if status is not None:
+            _, timestamp, kind, tokens = status
+            last_status = (timestamp, kind, tokens)
+        state = current
+        return current, read_guard(guard_path)
+
+    while time.monotonic() < arm_deadline:
+        state, events = observe()
+        arms = [event for event in events if event.get("event") == "armed" and event.get("kind") == "compact"]
+        failures = [
+            event
+            for event in events
+            if event.get("event") == "gate-refused" and event.get("purpose") == "compact"
+        ]
+        if len(arms) > 1:
+            failure_reason = "duplicate-compact-timers"
+            break
+        if failures:
+            failure_reason = f"gate-refused:{failures[-1].get('reason', 'unknown')}"
+            break
+        if arms and state.get("timer_kind") == "compact" and state.get("timer_deadline") is not None:
+            armed_delay = arms[-1].get("delay")
+            try:
+                delay_matches = abs(float(armed_delay) - arguments.expected_delay) < 0.1
+            except (TypeError, ValueError):
+                delay_matches = False
+            if not delay_matches:
+                failure_reason = "unexpected-compact-delay"
+                break
+            if state.get("cache_profile") != "long":
+                failure_reason = "unexpected-cache-profile"
+                break
+            if last_status is not None and last_status[2] >= arguments.expected_threshold:
+                break
+        if not process_present(state.get("supervisor_pid")) or not process_present(state.get("pid")):
+            failure_reason = "supervisor-or-claude-exited-before-arm"
+            break
+        sleep_poll(arm_deadline)
+    else:
+        failure_reason = "compact-timer-not-armed-before-timeout"
+
+    if failure_reason is None:
+        compact_deadline = time.monotonic() + arguments.compaction_timeout
+        while time.monotonic() < compact_deadline:
+            state, events = observe()
+            arms = [event for event in events if event.get("event") == "armed" and event.get("kind") == "compact"]
+            requests = [
+                event
+                for event in events
+                if event.get("event") == "compaction-requested"
+            ]
+            attempts = [
+                event
+                for event in events
+                if event.get("event") == "injection-attempted" and event.get("purpose") == "compact"
+            ]
+            stale = [
+                event
+                for event in events
+                if event.get("reason") == "status-snapshot-stale"
+            ]
+            if len(arms) > 1:
+                failure_reason = "duplicate-compact-timers"
+                break
+            if stale:
+                failure_reason = "status-snapshot-stale-rejection"
+                break
+            gate_failures = [
+                event
+                for event in events
+                if event.get("event") == "gate-refused" and event.get("purpose") == "compact"
+            ]
+            if gate_failures:
+                failure_reason = f"gate-refused:{gate_failures[-1].get('reason', 'unknown')}"
+                break
+            if state.get("last_state_transition") == "injection-failed" or state.get("last_injection_result") == "failed":
+                failure_reason = "compaction-injection-failed"
+                break
+            if len(requests) > 1 or len(attempts) > 1:
+                failure_reason = "duplicate-compaction-injection"
+                break
+            if requests and compact_request is None:
+                compact_request = requests[0]
+                if last_status is None:
+                    failure_reason = "no-valid-status-snapshot-at-callback"
+                    break
+                request_time = event_timestamp(compact_request)
+                if request_time is None:
+                    failure_reason = "invalid-compaction-request-timestamp"
+                    break
+                snapshot_age = request_time - last_status[0]
+                if snapshot_age <= arguments.former_snapshot_max_age:
+                    failure_reason = "snapshot-was-not-older-than-regression-limit"
+                    break
+            completed = [event for event in events if event.get("event") == "compaction-completed"]
+            if completed:
+                if len(completed) != 1:
+                    failure_reason = "duplicate-compaction-completions"
+                    break
+                break
+            if not process_present(state.get("supervisor_pid")) or not process_present(state.get("pid")):
+                failure_reason = "supervisor-or-claude-exited-before-compaction-completed"
+                break
+            sleep_poll(compact_deadline)
+        else:
+            failure_reason = "compaction-completion-timeout"
+
+    quiet_deadline = time.monotonic() + arguments.quiet_seconds if failure_reason is None else time.monotonic()
+    while failure_reason is None and time.monotonic() < quiet_deadline:
+        state, events = observe()
+        arms = [event for event in events if event.get("event") == "armed" and event.get("kind") == "compact"]
+        if len(arms) != 1:
+            failure_reason = "idle-compaction-rearmed-after-completion"
+            break
+        sleep_poll(quiet_deadline)
+
+    state = read_state(root, channel) or state
+    events = read_guard(guard_path)
+    arms = [event for event in events if event.get("event") == "armed" and event.get("kind") == "compact"]
+    attempts = [
+        event
+        for event in events
+        if event.get("event") == "injection-attempted" and event.get("purpose") == "compact"
+    ]
+    requests = [event for event in events if event.get("event") == "compaction-requested"]
+    completed = [event for event in events if event.get("event") == "compaction-completed"]
+    stale = [event for event in events if event.get("reason") == "status-snapshot-stale"]
+    terminal_untouched = True
+    success = (
+        failure_reason is None
+        and len(arms) == 1
+        and len(attempts) == 1
+        and len(requests) == 1
+        and len(completed) == 1
+        and not stale
+        and state.get("dirty") is False
+        and state.get("compacting") is False
+        and state.get("timer_deadline") is None
+        and state.get("timer_kind") is None
+        and state.get("last_injection_result") == "succeeded"
+        and process_present(state.get("supervisor_pid"))
+        and process_present(state.get("pid"))
+    )
+    if not success and failure_reason is None:
+        failure_reason = "final-state-assertion-failed"
+    summary = {
+        "result": "PASS" if success else "FAIL",
+        "failure_reason": failure_reason,
+        "channel": channel,
+        "session_id": state.get("session_id"),
+        "supervisor_pid": state.get("supervisor_pid"),
+        "claude_pid": state.get("pid"),
+        "status_snapshot_type": last_status[1] if last_status else None,
+        "snapshot_age_at_callback_seconds": round(snapshot_age, 3) if snapshot_age is not None else None,
+        "compact_timers_armed": len(arms),
+        "injection_attempts": len(attempts),
+        "compaction_requests": len(requests),
+        "completed_compactions": len(completed),
+        "stale_snapshot_rejections": len(stale),
+        "final_dirty": state.get("dirty"),
+        "final_compacting": state.get("compacting"),
+        "final_timer_deadline": state.get("timer_deadline"),
+        "final_timer_kind": state.get("timer_kind"),
+        "final_injection_result": state.get("last_injection_result"),
+        "last_cancellation_reason": state.get("last_cancellation_reason"),
+        "last_gate_rejection_reason": state.get("last_gate_rejection_reason"),
+        "terminal_manipulation": "none",
+        "supervisor_live_at_observation_end": process_present(state.get("supervisor_pid")),
+        "claude_live_at_observation_end": process_present(state.get("pid")),
+        "expected_delay_seconds": arguments.expected_delay,
+        "expected_presumed_ttl_seconds": arguments.expected_ttl,
+        "expected_token_threshold": arguments.expected_threshold,
+        "accelerated_supervisor_environment_match": configured_environment == expected_environment,
+    }
+    print_summary(summary)
+    return 0 if success else 1
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Build the observer CLI parser, including the regression-report bound."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--discovery-timeout", type=float, default=1200.0)
+    parser.add_argument("--arm-timeout", type=float, default=180.0)
+    parser.add_argument("--compaction-timeout", type=float, default=420.0)
+    parser.add_argument("--quiet-seconds", type=float, default=12.0)
+    parser.add_argument("--expected-delay", type=float, default=140.0)
+    parser.add_argument("--expected-ttl", type=float, default=300.0)
+    parser.add_argument("--expected-threshold", type=int, default=1)
+    parser.add_argument(
+        "--former-snapshot-max-age",
+        type=float,
+        default=FORMER_SNAPSHOT_MAX_AGE_SECONDS,
+        help="Require the callback snapshot to be older than this regression bound.",
+    )
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    try:
+        return run(parser.parse_args())
+    except KeyboardInterrupt:
+        print_summary({"result": "FAIL", "failure_reason": "observer-interrupted", "terminal_manipulation": "none"})
+        return 130
+    except (OSError, RuntimeError, subprocess.SubprocessError) as error:
+        print_summary({"result": "FAIL", "failure_reason": f"observer-error:{error}", "terminal_manipulation": "none"})
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
