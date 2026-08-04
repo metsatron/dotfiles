@@ -66,6 +66,14 @@ def env_int(name: str, default: int, minimum: int = 0) -> int:
         return default
 
 
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    """Read a bounded floating-point configuration value from the environment."""
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
 def channel_arguments(argv: list[str]) -> list[str]:
     """Return channel specifications without changing the child argv."""
     specifications: list[str] = []
@@ -188,9 +196,17 @@ TTL_SECONDS = {
     "short": env_int("CLAUDE_IDLE_COMPACT_SHORT_CACHE_TTL_SECONDS", 5 * 60),
 }
 MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
-STATUS_MAX_AGE = env_int("CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS", 120, 1)
+SNAPSHOT_STOP_SKEW_SECONDS = env_float(
+    "CLAUDE_IDLE_COMPACT_STATUS_STOP_SKEW_SECONDS", 2.0, 0.0
+)
+TRANSCRIPT_QUIESCENCE_SECONDS = env_float(
+    "CLAUDE_IDLE_COMPACT_TRANSCRIPT_QUIESCENCE_SECONDS", 0.75, 0.05
+)
 TRANSCRIPT_POLL_SECONDS = env_int(
     "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS", 2, 1
+)
+INPUT_ESCAPE_TIMEOUT_SECONDS = env_float(
+    "CLAUDE_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS", 0.05, 0.01
 )
 CHANNEL_ATTACH_WAIT_SECONDS = env_int(
     "CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS", 30, 0
@@ -205,12 +221,22 @@ DEBUG_LOG_MAX_BYTES = env_int(
     "CLAUDE_IDLE_CHANNEL_DEBUG_MAX_BYTES", 2 * 1024 * 1024, 65536
 )
 DEBUG = os.environ.get("CLAUDE_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
+TERMINAL_CLEANUP_BYTES = (
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
+    b"\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1049l"
+    b"\x1b[?2004l\x1b[?25h\x1b[0m"
+)
 
 
-def log(message: str) -> None:
-    """Write concise supervisor diagnostics without prompts or message data."""
+def append_debug(path: pathlib.Path, message: str) -> None:
+    """Append one prompt-free diagnostic to the session's private debug file."""
     if DEBUG:
-        print(f"[claude-warm] {message}", file=sys.stderr, flush=True)
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{now():.6f} {message}\n")
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
 
 
 def short_id(value: object) -> str:
@@ -227,6 +253,201 @@ def now() -> float:
 def monotonic() -> float:
     """Return monotonic seconds used only for local retry/poll scheduling."""
     return time.monotonic()
+
+
+class TerminalInputClassifier:
+    """Classify raw outer-terminal input without suppressing any forwarded byte."""
+
+    PASTE_START = b"\x1b[200~"
+    PASTE_END = b"\x1b[201~"
+    C1_PASTE_START = b"\x9b200~"
+    C1_PASTE_END = b"\x9b201~"
+
+    def __init__(self, escape_timeout: float = INPUT_ESCAPE_TIMEOUT_SECONDS):
+        self.escape_timeout = escape_timeout
+        self.buffer = bytearray()
+        self.in_bracketed_paste = False
+        self.paste_end_marker: bytes | None = None
+        self.pending_since: float | None = None
+
+    @staticmethod
+    def _event(kind: str, length: int, human: bool) -> tuple[str, int, bool]:
+        return kind, length, human
+
+    @staticmethod
+    def _suffix_prefix_length(value: bytes, marker: bytes) -> int:
+        maximum = min(len(value), len(marker) - 1)
+        for length in range(maximum, 0, -1):
+            if value[-length:] == marker[:length]:
+                return length
+        return 0
+
+    def _drain_paste(self, events: list[tuple[str, int, bool]]) -> bool:
+        marker = self.paste_end_marker or self.PASTE_END
+        raw = bytes(self.buffer)
+        marker_index = raw.find(marker)
+        if marker_index >= 0:
+            if marker_index:
+                events.append(self._event("bracketed-paste-payload", marker_index, True))
+                del self.buffer[:marker_index]
+            del self.buffer[: len(marker)]
+            events.append(self._event("bracketed-paste-end", len(marker), False))
+            self.in_bracketed_paste = False
+            self.paste_end_marker = None
+            return True
+        suffix = self._suffix_prefix_length(raw, marker)
+        payload_length = len(raw) - suffix
+        if payload_length:
+            events.append(self._event("bracketed-paste-payload", payload_length, True))
+            del self.buffer[:payload_length]
+            return True
+        return False
+
+    def _classify_csi(self, sequence: bytes, prefix_length: int) -> tuple[str, bool]:
+        body = sequence[prefix_length:-1]
+        final = sequence[-1:]
+        if sequence in {self.PASTE_START, self.C1_PASTE_START}:
+            self.in_bracketed_paste = True
+            self.paste_end_marker = self.PASTE_END if sequence == self.PASTE_START else self.C1_PASTE_END
+            return "bracketed-paste-start", False
+        if sequence in {self.PASTE_END, self.C1_PASTE_END}:
+            self.in_bracketed_paste = False
+            self.paste_end_marker = None
+            return "bracketed-paste-end", False
+        if final in {b"M", b"m"} and body.startswith(b"<"):
+            return "sgr-mouse-report", False
+        if not body and final in {b"I", b"O"}:
+            return "focus-report", False
+        if final == b"R" and re.fullmatch(rb"\d+;\d+", body):
+            return "cursor-position-report", False
+        if final == b"n":
+            return "device-status-report", False
+        if final == b"c" and (not body or body[:1] in {b"?", b">", b"!", b"="}):
+            return "device-attribute-report", False
+        if final == b"y" and body.startswith(b"?"):
+            return "terminal-negotiation", False
+        if final == b"t" and re.fullmatch(rb"[0-9;]+", body):
+            return "terminal-negotiation", False
+        if final == b"u":
+            return "keyboard-csi-u", True
+        return "keyboard-csi" if final else "unknown-input", True
+
+    def _drain(self) -> list[tuple[str, int, bool]]:
+        events: list[tuple[str, int, bool]] = []
+        while self.buffer:
+            if self.in_bracketed_paste:
+                if not self._drain_paste(events):
+                    break
+                continue
+            first = self.buffer[0]
+            if first not in {0x1B, 0x9B, 0x9D, 0x90, 0x98, 0x9E, 0x9F}:
+                protocol_markers = [
+                    marker
+                    for marker in (0x1B, 0x9B, 0x9D, 0x90, 0x98, 0x9E, 0x9F)
+                    if marker in self.buffer
+                ]
+                length = min(self.buffer.index(marker) for marker in protocol_markers) if protocol_markers else len(self.buffer)
+                del self.buffer[:length]
+                events.append(self._event("keyboard-input", length, True))
+                continue
+            if first == 0x9B:
+                prefix_length = 1
+                if len(self.buffer) < 2:
+                    break
+                final_index = next(
+                    (index for index, value in enumerate(self.buffer[1:], 1) if 0x40 <= value <= 0x7E),
+                    None,
+                )
+                if final_index is None:
+                    break
+                sequence = bytes(self.buffer[: final_index + 1])
+                kind, human = self._classify_csi(sequence, prefix_length)
+                del self.buffer[: final_index + 1]
+                events.append(self._event(kind, len(sequence), human))
+                continue
+            if len(self.buffer) < 2:
+                break
+            if self.buffer[:2] == b"\x1b[":
+                if len(self.buffer) == 2:
+                    break
+                if self.buffer[2:3] == b"M":
+                    if len(self.buffer) < 6:
+                        break
+                    del self.buffer[:6]
+                    events.append(self._event("legacy-mouse-report", 6, False))
+                    continue
+                final_index = next(
+                    (index for index, value in enumerate(self.buffer[2:], 2) if 0x40 <= value <= 0x7E),
+                    None,
+                )
+                if final_index is None:
+                    break
+                sequence = bytes(self.buffer[: final_index + 1])
+                kind, human = self._classify_csi(sequence, 2)
+                del self.buffer[: final_index + 1]
+                events.append(self._event(kind, len(sequence), human))
+                continue
+            if bytes(self.buffer[:2]) in {b"\x1b]", b"\x1bP", b"\x1b^", b"\x1b_"}:
+                bell = self.buffer.find(b"\x07") if self.buffer[1] == 0x5D else -1
+                string_terminator = self.buffer.find(b"\x1b\\")
+                terminators = [value for value in (bell, string_terminator) if value >= 0]
+                if not terminators:
+                    break
+                terminator = min(terminators)
+                length = terminator + (1 if bell == terminator else 2)
+                del self.buffer[:length]
+                events.append(self._event("terminal-negotiation", length, False))
+                continue
+            if self.buffer[0] == 0x9D:
+                terminator = self.buffer.find(b"\x07")
+                if terminator < 0:
+                    break
+                length = terminator + 1
+                del self.buffer[:length]
+                events.append(self._event("terminal-negotiation", length, False))
+                continue
+            if self.buffer[0] in {0x90, 0x98, 0x9E, 0x9F}:
+                terminator = self.buffer.find(b"\x9c")
+                if terminator < 0:
+                    break
+                length = terminator + 1
+                del self.buffer[:length]
+                events.append(self._event("terminal-negotiation", length, False))
+                continue
+            if self.buffer[:2] == b"\x1bO":
+                if len(self.buffer) < 3:
+                    break
+                del self.buffer[:3]
+                events.append(self._event("keyboard-ss3", 3, True))
+                continue
+            del self.buffer[:2]
+            events.append(self._event("unknown-input", 2, True))
+        return events
+
+    def feed(self, data: bytes) -> list[tuple[str, int, bool]]:
+        if not data:
+            return []
+        self.buffer.extend(data)
+        if self.pending_since is None and self.buffer and self.buffer[0] in {0x1B, 0x9B, 0x9D, 0x90, 0x98, 0x9E, 0x9F}:
+            self.pending_since = monotonic()
+        events = self._drain()
+        if self.buffer and self.pending_since is None:
+            self.pending_since = monotonic()
+        if not self.buffer:
+            self.pending_since = None
+        return events
+
+    def flush_expired(self) -> list[tuple[str, int, bool]]:
+        if not self.buffer or self.pending_since is None:
+            return []
+        if monotonic() - self.pending_since < self.escape_timeout:
+            return []
+        length = len(self.buffer)
+        self.buffer.clear()
+        self.pending_since = None
+        self.in_bracketed_paste = False
+        self.paste_end_marker = None
+        return [self._event("unknown-input", length, True)]
 
 
 def atomic_json(path: pathlib.Path, payload: dict) -> None:
@@ -437,6 +658,8 @@ class Supervisor:
         self.transcript_offset = 0
         self.transcript_partial = b""
         self.transcript_activity_at: float | None = None
+        self.transcript_quiescence_at: float | None = None
+        self.transcript_quiescence_deadline: float | None = None
         self.inotify: Inotify | None = None
         self.status = "starting"
         self.enabled = True
@@ -446,15 +669,24 @@ class Supervisor:
         self.compaction_ignore_next_stop = False
         self.current_tokens: int | None = None
         self.status_timestamp: float | None = None
+        self.completed_turn_epoch = 0
+        self.status_snapshot_epoch: int | None = None
         self.last_normal_stop: float | None = None
         self.last_local_input: float | None = None
+        self.last_local_input_classification: str | None = None
+        self.last_terminal_input_log_at = 0.0
+        self.last_terminal_input_log_key: str | None = None
         self.last_lifecycle_activity: float | None = None
+        self.input_classifier = TerminalInputClassifier()
         self.cache_profile_requested = os.environ.get("CLAUDE_IDLE_CACHE_PROFILE", "auto")
         self.cache_profile = effective_profile(self.cache_profile_requested)
         self.timer_deadline: float | None = None
         self.timer_kind: str | None = None
         self.timer_generation = 0
         self.last_cancellation_reason: str | None = None
+        self.last_gate_rejection_reason: str | None = None
+        self.last_injection_result: str | None = None
+        self.last_state_transition = "supervisor-started"
         self.last_channel_activity: float | None = None
         self.last_channel_event: str | None = None
         self.last_channel_death: float | None = None
@@ -494,6 +726,7 @@ class Supervisor:
         return {
             "channel": self.channel,
             "pid": self.pid,
+            "supervisor_pid": os.getpid(),
             "pty_master_owned": self.master_fd is not None,
             "pty_master_fd": self.master_fd,
             "pty_child_terminal": self.child_tty,
@@ -518,17 +751,26 @@ class Supervisor:
             "status": self.status,
             "current_input_context_tokens": self.current_tokens,
             "status_snapshot_timestamp": self.status_timestamp,
+            "completed_turn_epoch": self.completed_turn_epoch,
+            "status_snapshot_epoch": self.status_snapshot_epoch,
             "dirty": self.dirty,
             "compacting": self.compacting,
             "compaction_ignore_next_stop": self.compaction_ignore_next_stop,
             "last_normal_stop": self.last_normal_stop,
+            "transcript_quiescence_at": self.transcript_quiescence_at,
+            "transcript_quiescence_deadline": self.transcript_quiescence_deadline,
             "last_local_input": self.last_local_input,
+            "last_local_input_classification": self.last_local_input_classification,
             "last_lifecycle_activity": self.last_lifecycle_activity,
             "cache_profile": self.cache_profile,
             "cache_profile_requested": self.cache_profile_requested,
             "timer_deadline": self.timer_deadline,
             "timer_kind": self.timer_kind,
+            "timer_generation": self.timer_generation,
             "last_cancellation_reason": self.last_cancellation_reason,
+            "last_gate_rejection_reason": self.last_gate_rejection_reason,
+            "last_injection_result": self.last_injection_result,
+            "last_state_transition": self.last_state_transition,
             "last_channel_activity": self.last_channel_activity,
             "last_channel_event": self.last_channel_event,
             "last_channel_death": self.last_channel_death,
@@ -550,15 +792,16 @@ class Supervisor:
                 stream.write(json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n")
             os.chmod(self.guard_log_path, 0o600)
         except OSError as error:
-            log(f"channel-log-write-failed channel={short_id(self.channel)} error={error}")
+            self._debug(f"channel-log-write-failed channel={short_id(self.channel)} error={error}")
+
+    def _debug(self, message: str) -> None:
+        """Write debug output only to this session's private file."""
+        append_debug(self.debug_log_path, message)
 
     def _notice(self, message: str) -> None:
-        """Emit a fixed, prompt-free diagnostic on the user's terminal."""
-        try:
-            sys.stderr.write(f"\r\n[claude-warm channel {short_id(self.channel)}] {message}\r\n")
-            sys.stderr.flush()
-        except OSError:
-            pass
+        """Record a fixed diagnostic without writing into the foreground TUI."""
+        self._debug(f"notice channel={short_id(self.channel)} message={message}")
+        self._guard_log("notice", message=message)
 
     def _bound_debug_log(self) -> None:
         """Keep the optional Claude debug capture bounded for long-running bots."""
@@ -582,15 +825,17 @@ class Supervisor:
         try:
             atomic_json(self.state_path, self.state())
         except OSError as error:
-            log(f"state-write-failed channel={short_id(self.channel)} error={error}")
+            self._debug(f"state-write-failed channel={short_id(self.channel)} error={error}")
 
     def cancel(self, reason: str) -> None:
         """Invalidate the one-shot timer and retain the cancellation reason."""
         self.timer_deadline = None
         self.timer_kind = None
+        self.transcript_quiescence_deadline = None
         self.timer_generation += 1
         self.last_cancellation_reason = reason
-        log(f"cancelled:{reason} channel={short_id(self.channel)}")
+        self.last_state_transition = f"cancelled:{reason}"
+        self._debug(f"cancelled:{reason} channel={short_id(self.channel)}")
         self._guard_log("cancelled", reason=reason)
         self._write_state()
 
@@ -604,13 +849,15 @@ class Supervisor:
             and self.last_normal_stop
             and child_alive(self.pid)
             and self.timer_deadline is None
+            and self.transcript_quiescence_deadline is None
             and not self.recovery_pending
         ):
             return
         self.timer_generation += 1
         self.timer_deadline = self.last_normal_stop + IDLE_SECONDS[self.cache_profile]
         self.timer_kind = "compact"
-        log(
+        self.last_state_transition = "armed"
+        self._debug(
             f"armed channel={short_id(self.channel)} profile={self.cache_profile} "
             f"delay={IDLE_SECONDS[self.cache_profile]}"
         )
@@ -619,6 +866,48 @@ class Supervisor:
             kind="compact",
             profile=self.cache_profile,
             delay=IDLE_SECONDS[self.cache_profile],
+        )
+        self._write_state()
+
+    def _begin_transcript_quiescence(self) -> None:
+        """Allow the completed turn's final transcript records to settle."""
+        self.transcript_quiescence_at = None
+        self.transcript_quiescence_deadline = now() + TRANSCRIPT_QUIESCENCE_SECONDS
+        self.last_state_transition = "transcript-quiescence-wait"
+        self._guard_log(
+            "transcript-quiescence-wait",
+            seconds=TRANSCRIPT_QUIESCENCE_SECONDS,
+            completed_turn_epoch=self.completed_turn_epoch,
+        )
+        self._write_state()
+
+    def _complete_transcript_quiescence(self) -> None:
+        """Establish a stable idle point and then arm the compaction timer."""
+        if self.transcript_quiescence_deadline is None:
+            return
+        self.transcript_quiescence_deadline = None
+        self.transcript_quiescence_at = now()
+        self.last_state_transition = "transcript-quiescent"
+        self._guard_log(
+            "transcript-quiescent",
+            completed_turn_epoch=self.completed_turn_epoch,
+        )
+        if self.recovery_pending:
+            self._arm_recovery()
+        else:
+            self.arm()
+        self._write_state()
+
+    def _record_completed_turn_flush(self) -> None:
+        """Extend quiescence for an assistant record belonging to the Stop turn."""
+        if self.transcript_quiescence_deadline is None:
+            return
+        self.transcript_quiescence_deadline = now() + TRANSCRIPT_QUIESCENCE_SECONDS
+        self.transcript_quiescence_at = None
+        self.last_state_transition = "transcript-final-flush"
+        self._guard_log(
+            "transcript-final-flush",
+            completed_turn_epoch=self.completed_turn_epoch,
         )
         self._write_state()
 
@@ -654,7 +943,7 @@ class Supervisor:
             self.selector.register(self.inotify.fd, selectors.EVENT_READ, "inotify")
         except Exception:
             self.inotify = None
-            log(f"transcript-watcher=fallback channel={short_id(self.channel)}")
+            self._debug(f"transcript-watcher=fallback channel={short_id(self.channel)}")
         self._write_state()
 
     def _reset_transcript_cursor(self) -> None:
@@ -686,7 +975,9 @@ class Supervisor:
         self.compaction_ignore_next_stop = True
         self.dirty = True
         self.last_cancellation_reason = "compaction-failed"
-        log(
+        self.last_injection_result = "failed"
+        self.last_state_transition = "compaction-failed"
+        self._debug(
             f"compaction-failed channel={short_id(self.channel)} reason={reason}"
         )
         self._guard_log("compaction-failed", reason=reason)
@@ -844,10 +1135,10 @@ class Supervisor:
                 continue
             if not isinstance(entry, dict):
                 continue
-            if self.last_normal_stop:
-                entry_timestamp = transcript_entry_timestamp(entry)
-                if entry_timestamp is not None and entry_timestamp <= self.last_normal_stop:
-                    continue
+            # The cursor was reset to the transcript end at Stop, so every
+            # complete line read here was appended after that lifecycle
+            # boundary.  Do not discard same-second user/channel records
+            # merely because Claude's embedded timestamp is coarse.
             if entry.get("type") == "attachment" and isinstance(entry.get("attachment"), dict):
                 self._handle_attachment_delta(entry["attachment"])
                 continue
@@ -861,6 +1152,16 @@ class Supervisor:
                     self._compaction_failed("transcript-rejected")
                 continue
             if self.last_normal_stop:
+                if (
+                    self.transcript_quiescence_deadline is not None
+                    and entry.get("type") == "assistant"
+                ):
+                    # Claude 2.1.220 can flush the completed assistant record
+                    # after Stop.  It belongs to this completed-turn epoch;
+                    # only a later assistant record, after quiescence, is
+                    # renewed work.
+                    self._record_completed_turn_flush()
+                    continue
                 if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
                     continue
                 current = now()
@@ -892,7 +1193,7 @@ class Supervisor:
             # critical there.
             if is_terminal:
                 raise
-            log("stdin-not-pollable")
+            self._debug("stdin-not-pollable")
         if is_terminal:
             self._resize()
 
@@ -910,6 +1211,16 @@ class Supervisor:
             except OSError:
                 pass
             self.stdin_flags = None
+
+    def _cleanup_terminal_modes(self) -> None:
+        """Reset modes owned by the full-screen child only after it has ended."""
+        if not os.isatty(sys.stdout.fileno()):
+            return
+        try:
+            write_all(sys.stdout.fileno(), TERMINAL_CLEANUP_BYTES)
+            sys.stdout.flush()
+        except OSError:
+            pass
 
     def _resize(self) -> None:
         """Propagate the caller's current window size to the Claude PTY."""
@@ -1046,7 +1357,7 @@ class Supervisor:
         return [*self.argv, "--debug-file", str(self.debug_log_path)]
 
     def _read_snapshot(self) -> tuple[dict | None, str | None]:
-        """Read and validate a fresh status-line snapshot."""
+        """Read a session-bound snapshot valid for the governed Stop epoch."""
         try:
             with self.snapshot_path.open(encoding="utf-8") as stream:
                 payload = json.load(stream)
@@ -1064,10 +1375,14 @@ class Supervisor:
             return None, "status-token-invalid"
         if not isinstance(timestamp, (int, float)):
             return None, "status-timestamp-invalid"
-        if now() - float(timestamp) > STATUS_MAX_AGE:
-            return None, "status-snapshot-stale"
+        if (
+            self.last_normal_stop
+            and float(timestamp) + SNAPSHOT_STOP_SKEW_SECONDS < self.last_normal_stop
+        ):
+            return None, "status-snapshot-before-stop"
         self.current_tokens = tokens
         self.status_timestamp = float(timestamp)
+        self.status_snapshot_epoch = self.completed_turn_epoch
         return payload, None
 
     def _gate_reason(self, purpose: str = "compact") -> str | None:
@@ -1095,6 +1410,8 @@ class Supervisor:
                 return "channel-recovery-pending"
             if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
                 return "transcript-activity"
+            if self.transcript_quiescence_deadline is not None:
+                return "transcript-not-quiescent"
         elif purpose == "recovery":
             if not self.recovery_pending:
                 return "no-channel-recovery"
@@ -1197,20 +1514,31 @@ class Supervisor:
     ) -> bool:
         """Run the final gate and inject one validated command through the PTY."""
         if expected_generation is not None and expected_generation != self.timer_generation:
+            self.last_gate_rejection_reason = "stale-timer"
+            self.last_state_transition = "gate-refused:stale-timer"
+            self._guard_log("gate-refused", purpose=purpose, reason="stale-timer")
+            self._write_state()
             return False
         reason = self._gate_reason(purpose)
         if reason:
             self.last_cancellation_reason = reason
-            log(f"cancelled:{reason} channel={short_id(self.channel)}")
+            self.last_gate_rejection_reason = reason
+            self.last_state_transition = f"gate-refused:{reason}"
+            self._debug(f"cancelled:{reason} channel={short_id(self.channel)}")
             self._guard_log("gate-refused", purpose=purpose, reason=reason)
             self._write_state()
             return False
         if not validate_inject_command(command, self.watched_servers, self.recovery_command):
             self.last_cancellation_reason = "inject-command-refused"
+            self.last_gate_rejection_reason = "inject-command-refused"
+            self.last_state_transition = "gate-refused:inject-command-refused"
             self._guard_log("inject-refused", purpose=purpose)
             self._write_state()
             return False
         self.status = "active"
+        self.last_gate_rejection_reason = None
+        self.last_injection_result = "pending"
+        self.last_state_transition = "injection-attempted"
         self.timer_deadline = None
         self.timer_kind = None
         self.timer_generation += 1
@@ -1226,6 +1554,8 @@ class Supervisor:
             self.last_cancellation_reason = "channel-recovery-requested"
         else:
             self.last_cancellation_reason = "manual-injection-requested"
+        self._guard_log("injection-attempted", purpose=purpose)
+        self._write_state()
         try:
             if self.master_fd is None:
                 raise OSError(errno.EIO, "PTY master unavailable")
@@ -1236,17 +1566,23 @@ class Supervisor:
                 self.compaction_requested_at = None
                 self.dirty = True
                 self.last_cancellation_reason = "compaction-injection-failed"
-                log(f"compaction-failed channel={short_id(self.channel)} error={error}")
+                self.last_injection_result = "failed"
+                self.last_state_transition = "injection-failed"
+                self._debug(f"compaction-failed channel={short_id(self.channel)} error={error}")
             elif purpose == "recovery":
                 self.recovery_awaiting = False
                 self.recovery_command_inflight = False
                 self.recovery_expected_stop = False
                 self.status = "idle"
                 self.last_cancellation_reason = "channel-recovery-injection-failed"
-                log(f"channel-recovery-failed channel={short_id(self.channel)} error={error}")
+                self.last_injection_result = "failed"
+                self.last_state_transition = "injection-failed"
+                self._debug(f"channel-recovery-failed channel={short_id(self.channel)} error={error}")
             else:
                 self.status = "idle"
                 self.last_cancellation_reason = "manual-injection-failed"
+                self.last_injection_result = "failed"
+                self.last_state_transition = "injection-failed"
             self._write_state()
             return False
         if purpose == "recovery":
@@ -1255,7 +1591,9 @@ class Supervisor:
             self.timer_deadline = now() + CHANNEL_RECOVERY_CONFIRM_SECONDS
             self._guard_log("channel-recovery-requested", command=command)
         elif purpose == "compact":
-            log(f"compaction-requested channel={short_id(self.channel)}")
+            self.last_injection_result = "requested"
+            self.last_state_transition = "compaction-requested"
+            self._debug(f"compaction-requested channel={short_id(self.channel)}")
             self._guard_log("compaction-requested")
         else:
             self._guard_log("manual-injection-requested", command=command)
@@ -1271,7 +1609,8 @@ class Supervisor:
         if event not in EVENTS or not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
             return {"ok": False, "error": "invalid-event"}
         if event == "session-start":
-            if self.session_id and self.session_id != session_id:
+            new_session = self.session_id != session_id
+            if self.session_id and new_session:
                 self.cancel("session-replaced")
                 self.dirty = False
                 self.recovery_pending = False
@@ -1287,6 +1626,11 @@ class Supervisor:
                     monotonic() + CHANNEL_ATTACH_WAIT_SECONDS if self.watched_servers else None
                 )
             self.session_id = session_id
+            if new_session:
+                self.completed_turn_epoch = 0
+                self.status_snapshot_epoch = None
+                self.transcript_quiescence_at = None
+                self.transcript_quiescence_deadline = None
             self._set_transcript(message.get("transcript_path"))
             self.status = "starting"
             self.last_lifecycle_activity = now()
@@ -1333,16 +1677,15 @@ class Supervisor:
                 return {"ok": True, "ignored": "duplicate-stop"}
             self.status = "idle"
             self.dirty = True
+            self.completed_turn_epoch += 1
+            self.status_snapshot_epoch = None
             self.last_normal_stop = current
             self.last_lifecycle_activity = current
             self.last_local_input = None
             self.transcript_activity_at = None
             self._reset_transcript_cursor()
             self.cancel("new-normal-turn")
-            if self.recovery_pending:
-                self._arm_recovery()
-            else:
-                self.arm()
+            self._begin_transcript_quiescence()
             return {"ok": True}
         if event == "user-prompt-submit":
             self.status = "active"
@@ -1365,10 +1708,15 @@ class Supervisor:
             self.compaction_ignore_next_stop = False
             self.current_tokens = None
             self.status_timestamp = None
+            self.status_snapshot_epoch = None
+            self.transcript_quiescence_deadline = None
+            self.transcript_quiescence_at = current
+            self.last_injection_result = "succeeded"
             self.last_lifecycle_activity = current
             self._reset_transcript_cursor()
             self.cancel("compaction-completed")
-            log(f"compaction-completed channel={short_id(self.channel)}")
+            self.last_state_transition = "compaction-completed"
+            self._debug(f"compaction-completed channel={short_id(self.channel)}")
             self._guard_log("compaction-completed")
         elif event == "session-end":
             self.status = "ended"
@@ -1376,8 +1724,12 @@ class Supervisor:
             self._abort_recovery("session-end")
             self.cancel("session-end")
         elif event == "stop-failure":
+            was_compacting = self.compacting
             if self.compacting:
                 self._compaction_failed("stop-failure")
+            if was_compacting:
+                self.last_injection_result = "failed"
+                self.last_state_transition = "stop-failure"
             self.status = "error"
             self.last_lifecycle_activity = current
             self._abort_recovery("stop-failure")
@@ -1455,12 +1807,72 @@ class Supervisor:
                 response = self._handle_control(message)
             connection.sendall((json.dumps(response, separators=(",", ":")) + "\n").encode())
         except (OSError, ValueError, UnicodeError) as error:
-            log(f"ipc-error channel={short_id(self.channel)} error={error}")
+            self._debug(f"ipc-error channel={short_id(self.channel)} error={error}")
         finally:
             connection.close()
 
+    def _record_input_observations(
+        self,
+        observations: list[tuple[str, int, bool]],
+        forwarded: bool = True,
+    ) -> None:
+        """Record safe input classifications and cancel once for real human input."""
+        if not observations:
+            return
+        summary: dict[str, int] = {}
+        human = False
+        total = 0
+        for kind, length, is_human in observations:
+            summary[kind] = summary.get(kind, 0) + length
+            total += length
+            human = human or is_human
+        pending = (
+            self.timer_deadline is not None
+            or self.transcript_quiescence_deadline is not None
+            or self.recovery_pending
+        )
+        log_key = json.dumps(sorted(summary.items()), separators=(",", ":"))
+        log_now = monotonic()
+        should_log = human and pending
+        if not should_log and (
+            log_key != self.last_terminal_input_log_key
+            or log_now - self.last_terminal_input_log_at >= 5.0
+        ):
+            should_log = True
+        if should_log:
+            self.last_terminal_input_log_at = log_now
+            self.last_terminal_input_log_key = log_key
+            self._guard_log(
+                "terminal-input",
+                bytes=total,
+                classifications=summary,
+                forwarded=forwarded,
+                human_activity=human,
+            )
+            self._debug(
+                f"terminal-input bytes={total} classifications={log_key} "
+                f"forwarded={str(forwarded).lower()} human_activity={str(human).lower()}"
+            )
+        if not human:
+            return
+        self.last_local_input = now()
+        self.last_local_input_classification = ",".join(sorted(summary))
+        if not pending:
+            self._write_state()
+            return
+        if self.recovery_pending:
+            self._abort_recovery("user-input")
+        elif self.last_normal_stop and self.last_local_input > self.last_normal_stop:
+            self.cancel("user-input")
+        else:
+            self._write_state()
+
+    def _flush_input_classifier(self) -> None:
+        """Resolve a lone or incomplete escape after the bounded sequence window."""
+        self._record_input_observations(self.input_classifier.flush_expired())
+
     def _read_stdin(self) -> None:
-        """Proxy local terminal input and cancel work on every post-Stop byte."""
+        """Proxy every byte while distinguishing terminal protocol from human input."""
         try:
             data = os.read(sys.stdin.fileno(), 65536)
         except (OSError, BlockingIOError):
@@ -1477,16 +1889,19 @@ class Supervisor:
             except Exception:
                 pass
             return
-        self.last_local_input = now()
-        if self.recovery_pending:
-            self._abort_recovery("user-input")
-        elif self.last_normal_stop and self.last_local_input > self.last_normal_stop:
-            self.cancel("user-input")
+        forwarded = False
         if self.master_fd is not None:
             try:
                 write_all(self.master_fd, data)
+                forwarded = True
             except OSError:
                 self.shutdown_requested = True
+        try:
+            observations = self.input_classifier.feed(data)
+        except Exception:
+            self._debug("terminal-input-classifier-error")
+            observations = [("unknown-input", len(data), True)]
+        self._record_input_observations(observations, forwarded=forwarded)
         self._write_state()
 
     def _read_master(self) -> bool:
@@ -1545,6 +1960,12 @@ class Supervisor:
             while master_open:
                 child_exited = self._child_has_exited()
                 self._check_channel_attach()
+                self._flush_input_classifier()
+                if (
+                    self.transcript_quiescence_deadline is not None
+                    and now() >= self.transcript_quiescence_deadline
+                ):
+                    self._complete_transcript_quiescence()
                 if self.timer_deadline is not None and now() >= self.timer_deadline:
                     generation = self.timer_generation
                     kind = self.timer_kind
@@ -1572,6 +1993,11 @@ class Supervisor:
                 timeout = 1.0
                 if self.timer_deadline is not None:
                     timeout = max(0.0, min(timeout, self.timer_deadline - now()))
+                if self.transcript_quiescence_deadline is not None:
+                    timeout = max(
+                        0.0,
+                        min(timeout, self.transcript_quiescence_deadline - now()),
+                    )
                 timeout = min(timeout, max(0.0, self.next_transcript_poll - monotonic()))
                 events = self.selector.select(timeout)
                 for key, _mask in events:
@@ -1597,6 +2023,7 @@ class Supervisor:
                     self.child_status = 1 << 8
             return os.waitstatus_to_exitcode(self.child_status or 0)
         finally:
+            self._cleanup_terminal_modes()
             self._restore_terminal()
             self.cleanup()
 
@@ -1709,7 +2136,9 @@ def main(argv: list[str]) -> int:
         print("Runs the real Claude CLI through a full PTY supervisor.")
         print("Environment: CLAUDE_IDLE_CACHE_PROFILE, CLAUDE_IDLE_COMPACTION_DEBUG,")
         print("CLAUDE_IDLE_COMPACT_SECONDS, CLAUDE_SHORT_CACHE_IDLE_COMPACT_SECONDS,")
-        print("CLAUDE_IDLE_COMPACT_MIN_TOKENS, CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS,")
+        print("CLAUDE_IDLE_COMPACT_MIN_TOKENS, CLAUDE_IDLE_COMPACT_STATUS_STOP_SKEW_SECONDS,")
+        print("CLAUDE_IDLE_COMPACT_TRANSCRIPT_QUIESCENCE_SECONDS,")
+        print("CLAUDE_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS,")
         print("CLAUDE_IDLE_WATCHED_SERVERS, CLAUDE_IDLE_RECONNECT_SERVER,")
         print("CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS, CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS")
         print("Use claude-warmctl for per-session state and controls.")

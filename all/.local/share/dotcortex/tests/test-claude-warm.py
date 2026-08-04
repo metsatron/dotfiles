@@ -3,8 +3,13 @@
 
 from __future__ import annotations
 
+import ast
+import contextlib
+import io
 import json
 import fcntl
+import importlib.machinery
+import importlib.util
 import os
 import pty
 import pathlib
@@ -19,11 +24,13 @@ import tempfile
 import termios
 import time
 import unittest
+from unittest import mock
 
 
 HERE = pathlib.Path(__file__).resolve()
 REPO = HERE.parents[5]
 WARM = REPO / "all/.local/bin/claude-warm"
+OBSERVER = REPO / "all/.local/bin/claude-warm-live-observe"
 HOOK = REPO / "all/.local/bin/claude-hook-idle-event"
 STATUSLINE = REPO / "all/.local/bin/claude-statusline"
 
@@ -51,6 +58,8 @@ def report_size(_signum=None, _frame=None):
 def main():
     os.write(1, (f"ARGS:{sys.argv[1:]!r}\n").encode())
     report_size()
+    if "--emit-terminal-modes" in sys.argv:
+        os.write(1, b"\x1b[?1000h\x1b[?1004h\x1b[?1049h")
     signal.signal(signal.SIGWINCH, report_size)
     channel_child = None
     if "--spawn-channel-process" in sys.argv:
@@ -118,7 +127,8 @@ class Session:
                 "CLAUDE_IDLE_REAL_EXECUTABLE": str(self.fake),
                 "CLAUDE_IDLE_COMPACT_SECONDS": str(delay),
                 "CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS": str(ttl),
-                "CLAUDE_IDLE_COMPACT_STATUS_MAX_AGE_SECONDS": "30",
+                "CLAUDE_IDLE_COMPACT_STATUS_STOP_SKEW_SECONDS": "2",
+                "CLAUDE_IDLE_COMPACT_TRANSCRIPT_QUIESCENCE_SECONDS": "0.1",
                 "CLAUDE_IDLE_COMPACT_TRANSCRIPT_POLL_SECONDS": "1",
                 "CLAUDE_IDLE_CACHE_PROFILE": "long",
                 "CLAUDE_IDLE_COMPACTION_DEBUG": "1",
@@ -133,8 +143,13 @@ class Session:
             if spawn_channel:
                 extra_args = (*extra_args, "--spawn-channel-process")
         self.parent_master = None
+        self.outer_tty_fd = None
+        self.outer_tty_baseline = None
+        self.outer_tty_after = None
         if terminal:
             self.parent_master, parent_slave = pty.openpty()
+            self.outer_tty_fd = os.dup(parent_slave)
+            self.outer_tty_baseline = termios.tcgetattr(self.outer_tty_fd)
             self.process = subprocess.Popen(
                 [str(WARM), *extra_args],
                 stdin=parent_slave,
@@ -170,6 +185,20 @@ class Session:
             return json.loads(self.state_path.read_text(encoding="utf-8"))
         except (FileNotFoundError, json.JSONDecodeError):
             return None
+
+    def guard_events(self):
+        path = self.root / "state" / "claude-idle-compaction" / f"{self.channel}.channel-guard.log"
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        events = []
+        for line in lines:
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        return events
 
     def output_contains(self, needle):
         if isinstance(needle, str):
@@ -238,10 +267,16 @@ class Session:
         fcntl.ioctl(self.parent_master, termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, columns, 0, 0))
 
-    def stop_and_bind(self):
+    def stop_and_bind(self, wait_quiescence=True):
         self.event("session-start", transcript_path=str(self.transcript))
         self.status()
         self.event("stop", stop_hook_active=False)
+        if wait_quiescence:
+            wait_until(
+                lambda: self.read_state()
+                and self.read_state().get("transcript_quiescence_deadline") is None,
+                message="transcript quiescence was not established",
+            )
 
     def close(self):
         if self.process.poll() is None:
@@ -269,8 +304,16 @@ class Session:
         if self.process.stdout is not None:
             self.process.stdout.close()
         if self.parent_master is not None:
+            self.output_contains(b"")
+            try:
+                self.outer_tty_after = termios.tcgetattr(self.outer_tty_fd)
+            except OSError:
+                self.outer_tty_after = None
             os.close(self.parent_master)
             self.parent_master = None
+        if self.outer_tty_fd is not None:
+            os.close(self.outer_tty_fd)
+            self.outer_tty_fd = None
         shutil.rmtree(self.root, ignore_errors=True)
 
 
@@ -295,6 +338,30 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertEqual(session.read_state()["compacting"], True)
         session.event("post-compact")
         wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+        self.assertEqual(
+            bytes(session.output).count(b"INPUT:b'/compact\\n'"),
+            1,
+        )
+        state = session.read_state()
+        self.assertIsNone(state["timer_deadline"])
+        self.assertEqual(state["last_injection_result"], "succeeded")
+        self.assertEqual(state["last_state_transition"], "compaction-completed")
+
+    def test_later_normal_turn_arms_a_fresh_timer(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED", timeout=3)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+        session.status(tokens=80000)
+        session.event("user-prompt-submit")
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["timer_deadline"] is not None,
+            message="later normal turn did not arm a fresh timer",
+        )
+        self.assertTrue(session.read_state()["dirty"])
 
     def test_rejected_compaction_clears_transient_flag_without_rearm(self):
         session = self.make_session(delay=0)
@@ -350,15 +417,214 @@ class ClaudeWarmTests(unittest.TestCase):
         time.sleep(1.3)
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
+    def test_terminal_protocol_traffic_does_not_cancel_timer(self):
+        session = self.make_session(delay=2, terminal=True, channel=True)
+        session.wait_output("ARGS:")
+        session.wait_output("SIZE:")
+        session.stop_and_bind()
+        protocol = (
+            b"\x1b[<35;10;20M",
+            b"\x1b[<35;11;21m",
+            b"\x1b[M" + bytes((35, 10, 20)),
+            b"\x1b[I",
+            b"\x1b[O",
+            b"\x1b[12;34R",
+            b"\x1b[6n",
+            b"\x1b[?1;2c",
+            b"\x1b[>0;95;0c",
+            b"\x1b]10;rgb:ffff/ffff/ffff\x07",
+        )
+        for sequence in protocol:
+            session.submit_local_byte(sequence)
+        session.submit_local_byte(b"\x1b[<35;10;")
+        session.submit_local_byte(b"20M")
+        session.set_size(55, 123)
+        session.process.send_signal(signal.SIGWINCH)
+        wait_until(
+            lambda: {
+                kind
+                for event in session.guard_events()
+                if event.get("event") == "terminal-input"
+                for kind in event.get("classifications", {})
+            }
+            >= {
+                "sgr-mouse-report",
+                "focus-report",
+                "cursor-position-report",
+                "device-status-report",
+                "device-attribute-report",
+            },
+            message="terminal protocol bytes were not classified",
+        )
+        self.assertEqual(session.read_state().get("timer_kind"), "compact")
+        self.assertNotEqual(session.read_state()["last_cancellation_reason"], "user-input")
+        self.assertFalse(
+            any(
+                event.get("reason") == "user-input"
+                for event in session.guard_events()
+                if event.get("event") == "cancelled"
+            )
+        )
+        terminal_events = [
+            event for event in session.guard_events() if event.get("event") == "terminal-input"
+        ]
+        classifications = {
+            kind
+            for event in terminal_events
+            for kind in event.get("classifications", {})
+        }
+        self.assertIn("sgr-mouse-report", classifications)
+        self.assertIn("focus-report", classifications)
+        self.assertIn("cursor-position-report", classifications)
+        self.assertIn("device-status-report", classifications)
+        self.assertIn("device-attribute-report", classifications)
+        debug_path = pathlib.Path(session.read_state()["channel_debug_log"])
+        self.assertNotIn("35;10;20", debug_path.read_text(encoding="utf-8"))
+        self.assertNotIn(b"[claude-warm]", bytes(session.output))
+
+    def test_bracketed_paste_framing_is_protocol_but_payload_cancels_once(self):
+        session = self.make_session(delay=2, channel=True)
+        session.stop_and_bind()
+        session.submit_local_byte(b"\x1b[200")
+        session.submit_local_byte(b"~")
+        session.submit_local_byte(b"\x1b[201")
+        session.submit_local_byte(b"~")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state().get("timer_kind") == "compact",
+            message="bracketed-paste framing cancelled the timer",
+        )
+        session.submit_local_byte(b"\x1b[200~pasted text\x1b[201~")
+        wait_until(
+            lambda: sum(
+                event.get("reason") == "user-input"
+                for event in session.guard_events()
+                if event.get("event") == "cancelled"
+            ) == 1,
+            message="bracketed-paste payload did not cancel once",
+        )
+        session.submit_local_byte(b"more pasted text")
+        time.sleep(0.1)
+        self.assertEqual(
+            sum(
+                event.get("reason") == "user-input"
+                for event in session.guard_events()
+                if event.get("event") == "cancelled"
+            ),
+            1,
+        )
+
+    def test_keyboard_variants_cancel_once(self):
+        keyboard_inputs = (
+            b"x",
+            "é".encode("utf-8"),
+            b"\x7f",
+            b"\r",
+            b"\x1b",
+            b"\x1b[A",
+            b"\x1b[3~",
+            b"\x1b[97;1u",
+            b"\x1b[57361;1;9u",
+        )
+        for payload in keyboard_inputs:
+            session = self.make_session(delay=30, channel=True)
+            session.stop_and_bind()
+            session.submit_local_byte(payload)
+            wait_until(
+                lambda: sum(
+                    event.get("reason") == "user-input"
+                    for event in session.guard_events()
+                    if event.get("event") == "cancelled"
+                ) == 1,
+                message=f"keyboard input was not classified as human: {payload!r}",
+            )
+            session.submit_local_byte(payload)
+            time.sleep(0.1)
+            self.assertEqual(
+                sum(
+                    event.get("reason") == "user-input"
+                    for event in session.guard_events()
+                    if event.get("event") == "cancelled"
+                ),
+                1,
+            )
+
+    def test_claude_output_and_resize_do_not_count_as_input(self):
+        session = self.make_session(
+            delay=2,
+            terminal=True,
+            channel=True,
+            extra_args=("--emit-terminal-modes",),
+        )
+        session.wait_output("ARGS:")
+        session.stop_and_bind()
+        session.set_size(48, 111)
+        session.process.send_signal(signal.SIGWINCH)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state().get("timer_kind") == "compact",
+            message="Claude output or resize cancelled the timer",
+        )
+        self.assertNotIn(b"[claude-warm]", bytes(session.output))
+
+    def test_terminal_state_is_restored_after_supervisor_exit(self):
+        session = self.make_session(terminal=True, extra_args=("--emit-terminal-modes",))
+        baseline = session.outer_tty_baseline
+        session.wait_output("ARGS:")
+        session.close()
+        self.assertEqual(session.outer_tty_after, baseline)
+        self.assertIn(b"\x1b[?1000l", bytes(session.output))
+        self.assertIn(b"\x1b[?1004l", bytes(session.output))
+        self.assertIn(b"\x1b[?1049l", bytes(session.output))
+
+    def test_unicode_and_paste_bytes_proxy_through_pty(self):
+        session = self.make_session(terminal=True)
+        session.wait_output("ARGS:")
+        session.submit_local_byte("héllo pasted\nsecond line\n".encode("utf-8"))
+        first_chunk = b"INPUT:b'h\\xc3\\xa9llo pasted\\n'"
+        second_chunk = b"INPUT:b'second line\\n'"
+        wait_until(
+            lambda: session.output_contains("")
+            and first_chunk in bytes(session.output)
+            and second_chunk in bytes(session.output),
+            message="Unicode/paste bytes did not reach the fake PTY child",
+        )
+
     def test_transcript_append_cancels(self):
         session = self.make_session(delay=1)
         session.stop_and_bind()
         # The production transcript is JSONL; a complete non-attachment entry
         # represents remote/channel activity without putting message content in
         # the supervisor log.
-        session.append_transcript({"type": "message"})
+        session.append_transcript(
+            {
+                "type": "user",
+                "timestamp": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 1)
+                ),
+            }
+        )
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "transcript-activity")
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_final_assistant_flush_does_not_cancel_idle_timer(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind(wait_quiescence=False)
+        session.append_transcript(
+            {
+                "type": "assistant",
+                "timestamp": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() + 1)
+                ),
+            }
+        )
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["timer_deadline"] is not None,
+            message="final assistant flush cancelled the timer",
+        )
+        self.assertNotEqual(session.read_state()["last_cancellation_reason"], "transcript-activity")
+        session.wait_output("COMPACT_RECEIVED", timeout=3)
 
     def test_stop_bookkeeping_does_not_cancel_idle_timer(self):
         session = self.make_session(delay=1)
@@ -369,16 +635,28 @@ class ClaudeWarmTests(unittest.TestCase):
         session.append_transcript({"type": "mode"})
         session.append_transcript({"type": "permission-mode"})
         session.append_transcript({"type": "ai-title"})
-        session.append_transcript(
-            {"type": "user", "timestamp": time.strftime(
-                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 1)
-            )}
-        )
         time.sleep(0.2)
         state = session.read_state()
         self.assertIsNotNone(state["timer_deadline"])
         self.assertNotEqual(state["last_cancellation_reason"], "transcript-activity")
         session.wait_output("COMPACT_RECEIVED", timeout=3)
+
+    def test_new_user_record_cancels_even_with_coarse_timestamp(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind(wait_quiescence=False)
+        session.append_transcript(
+            {
+                "type": "user",
+                "timestamp": time.strftime(
+                    "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 1)
+                ),
+            }
+        )
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_cancellation_reason"] == "transcript-activity"
+        )
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
     def test_channel_prompt_event_cancels(self):
         session = self.make_session(delay=1)
@@ -388,15 +666,91 @@ class ClaudeWarmTests(unittest.TestCase):
         time.sleep(1.3)
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
-    def test_stale_snapshot_and_session_mismatch_block(self):
+    def test_snapshot_before_turn_and_session_mismatch_block(self):
         session = self.make_session(delay=30)
         session.stop_and_bind()
         session.status(timestamp=time.time() - 120)
         session.control("trigger")
-        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-snapshot-stale")
+        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-snapshot-before-stop")
         session.status(session_id="replacement-session")
         session.control("trigger")
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "status-session-mismatch")
+
+    def test_end_of_turn_snapshot_remains_valid_after_idle_delay(self):
+        loader = importlib.machinery.SourceFileLoader("claude_warm_fixture", str(WARM))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        root = pathlib.Path(tempfile.mkdtemp(prefix="cw-snapshot", dir="/tmp"))
+        try:
+            snapshot = root / "status.json"
+            snapshot.write_text(
+                json.dumps(
+                    {
+                        "channel": "claude-" + "a" * 32,
+                        "session_id": "fixture-session",
+                        "current_input_context_tokens": 210000,
+                        "update_timestamp": 1000.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            supervisor = object.__new__(module.Supervisor)
+            supervisor.snapshot_path = snapshot
+            supervisor.channel = "claude-" + "a" * 32
+            supervisor.session_id = "fixture-session"
+            supervisor.last_normal_stop = 1000.0
+            supervisor.completed_turn_epoch = 4
+            supervisor.current_tokens = None
+            supervisor.status_timestamp = None
+            supervisor.status_snapshot_epoch = None
+            with mock.patch.object(module, "now", return_value=4600.0):
+                payload, error = supervisor._read_snapshot()
+            self.assertIsNone(error)
+            self.assertEqual(payload["current_input_context_tokens"], 210000)
+            self.assertEqual(supervisor.status_snapshot_epoch, 4)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_production_defaults_and_resolver_rejects_wrapper(self):
+        loader = importlib.machinery.SourceFileLoader("claude_warm_defaults", str(WARM))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertEqual(module.IDLE_SECONDS["long"], 55 * 60)
+        self.assertEqual(module.TTL_SECONDS["long"], 60 * 60)
+        self.assertEqual(module.MIN_TOKENS, 70000)
+        root = pathlib.Path(tempfile.mkdtemp(prefix="cw-resolver", dir="/tmp"))
+        try:
+            with mock.patch.dict(
+                os.environ,
+                {"CLAUDE_IDLE_REAL_EXECUTABLE": str(WARM)},
+                clear=False,
+            ), mock.patch.object(module.shutil, "which", return_value=str(WARM)), mock.patch.object(
+                module.pathlib.Path, "home", return_value=root
+            ):
+                with self.assertRaises(RuntimeError):
+                    module.resolve_claude()
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_canonical_fable_telegram_launcher_delegates_to_supervisor(self):
+        launcher = pathlib.Path(
+            os.environ.get(
+                "CLAUDE_IDLE_FABLE_LAUNCHER",
+                str(pathlib.Path.home() / "HelmCortex/FORGE/bin/claude-fable"),
+            )
+        )
+        if not launcher.is_file():
+            self.skipTest("the machine-local Fable launcher is not present")
+        source = launcher.read_text(encoding="utf-8")
+        self.assertIn("Usage: claude-fable [--telegram]", source)
+        self.assertIn("claude-warm --model", source)
+        self.assertIn("--channels plugin:telegram@claude-plugins-official", source)
 
     def test_below_threshold_and_expired_ttl_do_not_inject(self):
         session = self.make_session(delay=30, ttl=1)
@@ -404,6 +758,7 @@ class ClaudeWarmTests(unittest.TestCase):
         session.status(tokens=69999)
         session.control("trigger")
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "below-token-threshold")
+        self.assertEqual(session.read_state()["last_gate_rejection_reason"], "below-token-threshold")
         time.sleep(1.2)
         session.status(tokens=80000)
         session.control("trigger")
@@ -700,6 +1055,129 @@ class ClaudeWarmTests(unittest.TestCase):
         runtime = session.root
         session.close()
         self.assertFalse(runtime.exists())
+
+    def test_observation_harness_never_controls_an_interactive_supervisor(self):
+        """The live acceptance observer must remain state/log read-only."""
+        self.assertTrue(OBSERVER.is_file())
+        source = OBSERVER.read_text(encoding="utf-8")
+        tree = compile(source, str(OBSERVER), "exec", ast.PyCF_ONLY_AST)
+        calls = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        self.assertNotIn("kill", calls)
+        self.assertNotIn("send_signal", calls)
+        self.assertNotIn("write", calls)
+        self.assertNotIn('"inject"', source)
+        self.assertNotIn('"trigger"', source)
+        self.assertNotIn('"cancel"', source)
+        self.assertNotIn("thread/compact/start", source)
+        self.assertNotIn("SIGSTOP", source)
+        self.assertNotIn("SIGCONT", source)
+
+    def test_observation_harness_parses_list_shapes_and_snapshot_timestamps(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "claude_warm_live_observe", str(OBSERVER)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        channel = "claude-" + "a" * 32
+        records = [{"channel": channel}, {"channel": "claude-" + "b" * 32}]
+        self.assertEqual(module.parse_records(json.dumps(records)), records)
+        self.assertEqual(module.parse_records("\n".join(json.dumps(item) for item in records)), records)
+        self.assertEqual(module.timestamp_epoch(1700000000)[1], "integer")
+        self.assertEqual(module.timestamp_epoch(1700000000.5)[1], "float")
+        self.assertEqual(module.timestamp_epoch("1700000000.5")[1], "numeric-string")
+        self.assertEqual(module.timestamp_epoch("2026-08-03T05:00:00Z")[1], "iso8601")
+
+    def test_observer_success_report_accepts_an_aged_snapshot(self):
+        """The completed-compaction report path keeps its regression bound defined."""
+        loader = importlib.machinery.SourceFileLoader(
+            "claude_warm_live_observe_success", str(OBSERVER)
+        )
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        channel = "claude-" + "c" * 32
+        base = {
+            "channel": channel,
+            "supervisor_pid": 101,
+            "pid": 102,
+            "session_id": "observer-fixture-session",
+            "cache_profile": "long",
+            "watched_servers": ["plugin:telegram"],
+            "current_input_context_tokens": 80000,
+            "dirty": True,
+            "compacting": False,
+            "timer_deadline": 240.0,
+            "timer_kind": "compact",
+            "last_injection_result": None,
+        }
+        armed = dict(base)
+        completed = {
+            **base,
+            "dirty": False,
+            "compacting": False,
+            "timer_deadline": None,
+            "timer_kind": None,
+            "last_injection_result": "succeeded",
+        }
+        events = [
+            {"event": "armed", "kind": "compact", "delay": 140, "timestamp": 100.0},
+            {"event": "injection-attempted", "purpose": "compact", "timestamp": 250.0},
+            {"event": "compaction-requested", "timestamp": 250.0},
+            {"event": "compaction-completed", "timestamp": 251.0},
+        ]
+        root = pathlib.Path(tempfile.mkdtemp(prefix="observer-success-"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        guard = root / "guard.log"
+        guard.write_text("\n".join(json.dumps(event) for event in events) + "\n", encoding="utf-8")
+        base["channel_guard_log"] = str(guard)
+        states = iter([base, armed, completed, completed])
+        sessions = iter([
+            [{"channel": "claude-" + "d" * 32}],
+            [{"channel": channel}],
+        ])
+        arguments = module.build_parser().parse_args([
+            "--discovery-timeout", "1",
+            "--arm-timeout", "1",
+            "--compaction-timeout", "1",
+            "--quiet-seconds", "0",
+        ])
+        self.assertEqual(arguments.former_snapshot_max_age, 120.0)
+        with (
+            mock.patch.object(module, "runtime_root", return_value=root),
+            mock.patch.object(module, "control_command", return_value=root / "fake-warmctl"),
+            mock.patch.object(module, "list_sessions", side_effect=lambda _command: next(sessions)),
+            mock.patch.object(module, "read_state", side_effect=lambda _root, _channel: next(states)),
+            mock.patch.object(module, "process_present", return_value=True),
+            mock.patch.object(module, "supervisor_environment", return_value={
+                "CLAUDE_IDLE_CACHE_PROFILE": "long",
+                "CLAUDE_IDLE_COMPACT_SECONDS": "140",
+                "CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS": "300",
+                "CLAUDE_IDLE_COMPACT_MIN_TOKENS": "1",
+                "CLAUDE_IDLE_COMPACTION_DEBUG": "1",
+            }),
+            mock.patch.object(module, "read_status", return_value=(
+                {"channel": channel, "session_id": "observer-fixture-session"},
+                0.0,
+                "integer",
+                80000,
+            )),
+            mock.patch.object(module, "read_guard", return_value=events),
+        ):
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                result = module.run(arguments)
+        self.assertEqual(result, 0, output.getvalue())
+        self.assertIn('result="PASS"', output.getvalue())
+        self.assertIn('snapshot_age_at_callback_seconds=250.0', output.getvalue())
 
     def test_signal_propagation_and_runtime_cleanup(self):
         session = self.make_session()
