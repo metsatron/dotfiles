@@ -1,7 +1,75 @@
 ;; Virtual Habitat — sanctuary-cortex Guix profile
 ;; Apply with sanctuary-cortex-guix-apply.
-(specifications->manifest
- '(
+(use-modules (gnu packages)
+             (gnu packages gettext)
+             (gnu packages gtk)
+             (gnu packages xfce)
+             (guix gexp)
+             (guix packages)
+             (guix utils))
+
+;; Guix's stock appmenu-gtk-module build sees GTK and libwnck, but not the
+;; XFCE development interfaces, so its auto-detection omits the XFCE panel
+;; applet. Build the same pinned source with both integrations enabled and
+;; keep the panel descriptor, module, and registrar in the sanctuary profile.
+(define appmenu-gtk-module-xfce
+  (package
+    (inherit appmenu-gtk-module)
+    (name "appmenu-gtk-module-xfce")
+    (arguments
+     (substitute-keyword-arguments (package-arguments appmenu-gtk-module)
+       ((#:configure-flags flags #~'())
+        #~(cons* "-Dxfce=enabled"
+                 "-Dappmenu-gtk-module=enabled"
+                 "-Dappmenu-gtk-module:gtk=3"
+                 #$flags))
+       ((#:phases phases)
+        #~(modify-phases #$phases
+            ;; The pinned 0.7.6 checkout lists nb twice in po/LINGUAS;
+            ;; Meson rejects the resulting duplicate .mo target.
+            (add-after 'unpack 'deduplicate-linguas
+              (lambda _
+                (substitute* "po/LINGUAS"
+                  ((" nn nb nr ") " nn nr "))))
+            ;; Upstream uses the consuming panel's prefix/libdir, which is an
+            ;; immutable input store path in Guix. Keep the plugin and its
+            ;; descriptor inside this profile instead.
+            (add-after 'deduplicate-linguas 'use-profile-install-paths
+              (lambda _
+                (substitute*
+                    '("applets/meson.build" "data/meson.build")
+                  (("xp.get_pkgconfig_variable\\('libdir'\\)")
+                   "join_paths(prefix, get_option('libdir'))")
+                  (("xp.get_pkgconfig_variable\\('prefix'\\)")
+                   "prefix"))))
+            ;; The private Cortex boot helper resolves the registrar through
+            ;; PATH. The upstream install keeps it in libexec, so expose a
+            ;; profile-local command without moving the real service binary.
+            (add-after 'install 'expose-registrar-command
+              (lambda* (#:key outputs #:allow-other-keys)
+                (let ((out (assoc-ref outputs "out")))
+                  (mkdir-p (string-append out "/bin"))
+                  (symlink
+                   (string-append out "/libexec/vala-panel/appmenu-registrar")
+                   (string-append out "/bin/appmenu-registrar")))))
+            (replace 'fix-install-gtk-module
+              (lambda* (#:key outputs #:allow-other-keys)
+                (let ((out (assoc-ref outputs "out")))
+                  (substitute*
+                      "subprojects/appmenu-gtk-module/src/gtk-3.0/meson.build"
+                    (("gtk3.get_pkgconfig_variable\\('libdir'\\)")
+                     (string-append "'" out "/lib'"))))))))))
+    (inputs
+     (modify-inputs (package-inputs appmenu-gtk-module)
+       (append libxfce4ui xfce4-panel xfconf)))
+    (native-inputs
+     (modify-inputs (package-native-inputs appmenu-gtk-module)
+       (append gettext-minimal)))))
+
+(packages->manifest
+ (cons appmenu-gtk-module-xfce
+       (map specification->package
+            '(
    ;; XFCE session, window manager, panels, and settings
    "xfce4-session"
    "xfwm4"
@@ -48,4 +116,4 @@
    "xdpyinfo"
    "xrandr"
    "xterm"
-   ))
+   ))))
