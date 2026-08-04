@@ -4,26 +4,28 @@
 
 # [[file:../../../sanctuary-godzilla-xs.org::*Declarative XFCE state apply][Declarative XFCE state apply:1]]
 # Restore the captured sanctuary-godzilla-xs XFCE desktop state into the writable guest
-# home.  Existing state is backed up; uncaptured drift is preserved by default.
+# home.  Existing state is backed up; canonical state wins by default.
 set -euo pipefail
 
 usage() {
   cat <<'EOF'
 sanctuary-godzilla-xs-config-apply - restore declared XFCE desktop state
 
-Usage: sanctuary-godzilla-xs-config-apply [--force]
+Usage: sanctuary-godzilla-xs-config-apply [--preserve|--force]
        sanctuary-godzilla-xs-config-apply -h | --help
 
-Without --force, preserves an existing guest desktop that differs from
-sanctuary-godzilla-xs-state.org and exits successfully so launch can continue.  --force
-is an explicit restore and still writes a timestamped backup before changing
-the guest home.
+By default, restores sanctuary-godzilla-xs-state.org and writes a timestamped backup
+before changing the guest home.  --preserve keeps an uncaptured divergent desktop
+intact and exits successfully.  --force is retained as a compatibility alias for the
+default canonical restore.
 EOF
 }
 
 FORCE=0
+PRESERVE=0
 case "${1:-}" in
   "") ;;
+  --preserve) PRESERVE=1 ;;
   --force) FORCE=1 ;;
   -h|--help) usage; exit 0 ;;
   *) usage >&2; exit 2 ;;
@@ -68,7 +70,7 @@ has_managed_state=0
 [[ -e "${PANEL_LIVE}" || -L "${PANEL_LIVE}" ]] && has_managed_state=1
 [[ -e "${DESKTOP_LIVE}" || -L "${DESKTOP_LIVE}" ]] && has_managed_state=1
 
-if (( FORCE == 0 && has_managed_state == 1 )); then
+if (( PRESERVE == 1 && has_managed_state == 1 )); then
   set +e
   "${CAPTURE}"
   capture_status=$?
@@ -77,7 +79,7 @@ if (( FORCE == 0 && has_managed_state == 1 )); then
     echo "sanctuary-godzilla-xs-config-apply: preserving uncaptured desktop changes" >&2
     echo "  Launch will continue without overwriting the live desktop." >&2
     echo "  Promote later (after closing SX): sanctuary-godzilla-xs-capture --apply" >&2
-    echo "  Discard explicitly: sanctuary-godzilla-xs-config-apply --force" >&2
+    echo "  Apply canonical state: sanctuary-godzilla-xs-config-apply --force" >&2
     exit 0
   elif (( capture_status != 0 )); then
     echo "sanctuary-godzilla-xs-config-apply: capture preflight failed" >&2
@@ -120,13 +122,24 @@ prepare_writable_dir "${XFCONF_LIVE}"
 prepare_writable_dir "${PANEL_LIVE}"
 prepare_writable_dir "${DESKTOP_LIVE}"
 
+materialize_text() {
+  local source="$1" destination="$2" temporary
+  temporary="$(mktemp "${STATE_DIR}/materialize.XXXXXX")"
+  GUEST_HOME="${GUEST_HOME}" perl -pe 's/\@GUEST_HOME\@/$ENV{GUEST_HOME}/g' "${source}" > "${temporary}"
+  install -Dm0644 "${temporary}" "${destination}"
+  rm -f -- "${temporary}"
+}
+
 mkdir -p "${DECLARED}/panel" "${DECLARED}/desktop"
 rsync -a --delete "${DECLARED}/panel/" "${PANEL_LIVE}/"
 rsync -a --delete "${DECLARED}/desktop/" "${DESKTOP_LIVE}/"
+while IFS= read -r -d '' materialized; do
+  materialize_text "${materialized}" "${materialized}"
+done < <(find "${PANEL_LIVE}" "${DESKTOP_LIVE}" -type f -print0)
 
 is_excluded_channel() {
   case "$1" in
-    xfce4-session.xml|xfce4-notifyd.xml|displays.xml|xfce4-power-manager.xml|keyboards.xml) return 0 ;;
+    xfce4-notifyd.xml|displays.xml|xfce4-power-manager.xml|keyboards.xml) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -141,8 +154,8 @@ done < <(find "${XFCONF_LIVE}" -maxdepth 1 -type f -name '*.xml' -print0)
 
 if [[ -f "${APPLIED_MANIFEST}" ]]; then
   while IFS=$'\t' read -r kind live_rel declared_rel; do
-    [[ "${kind}" == asset ]] || continue
-    if ! awk -F '\t' -v rel="${live_rel}" '$1 == "asset" && $2 == rel { found=1 } END { exit !found }' "${MANIFEST}"; then
+    [[ "${kind}" == asset || "${kind}" == asset-file || "${kind}" == theme-asset ]] || continue
+    if ! awk -F '\t' -v rel="${live_rel}" '($1 == "asset" || $1 == "asset-file" || $1 == "theme-asset") && $2 == rel { found=1 } END { exit !found }' "${MANIFEST}"; then
       case "${live_rel}" in Pictures/*) rm -f -- "${GUEST_HOME}/${live_rel}" ;; esac
     fi
   done < "${APPLIED_MANIFEST}"
@@ -152,7 +165,7 @@ while IFS=$'\t' read -r kind live_rel declared_rel; do
   [[ -n "${kind}" && -n "${live_rel}" && -n "${declared_rel}" ]] || continue
   case "${kind}:${live_rel}" in
     text:xfconf/*)
-      install -Dm0644 "${DECLARED}/${declared_rel}" "${GUEST_HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/${live_rel#xfconf/}"
+      materialize_text "${DECLARED}/${declared_rel}" "${GUEST_HOME}/.config/xfce4/xfconf/xfce-perchannel-xml/${live_rel#xfconf/}"
       ;;
     text:panel/*|text:desktop/*)
       # Already materialized by the directory rsync above.
@@ -162,6 +175,47 @@ while IFS=$'\t' read -r kind live_rel declared_rel; do
       base64 --decode "${DECLARED}/${declared_rel}" > "${GUEST_HOME}/${live_rel}.new"
       chmod 0644 "${GUEST_HOME}/${live_rel}.new"
       mv -f "${GUEST_HOME}/${live_rel}.new" "${GUEST_HOME}/${live_rel}"
+      ;;
+    asset-file:Pictures/*)
+      case "${declared_rel}" in
+        assets/*) ;;
+        *)
+          echo "sanctuary-godzilla-xs-config-apply: unsafe asset source: ${declared_rel}" >&2
+          exit 1
+          ;;
+      esac
+      asset_source="${DECLARED}/${declared_rel}"
+      [[ -f "${asset_source}" ]] || {
+        echo "sanctuary-godzilla-xs-config-apply: declared asset missing: ${asset_source}" >&2
+        exit 1
+      }
+      mkdir -p "$(dirname "${GUEST_HOME}/${live_rel}")"
+      install -m0644 "${asset_source}" "${GUEST_HOME}/${live_rel}.new"
+      mv -f "${GUEST_HOME}/${live_rel}.new" "${GUEST_HOME}/${live_rel}"
+      ;;
+    theme-asset:.themes/*)
+      case "${declared_rel}" in
+        linux/.themes/*) ;;
+        *)
+          echo "sanctuary-godzilla-xs-config-apply: unsafe theme asset source: ${declared_rel}" >&2
+          exit 1
+          ;;
+      esac
+      theme_asset_source="${REPO}/${declared_rel}"
+      theme_asset_live="${GUEST_HOME}/${live_rel}"
+      [[ -f "${theme_asset_source}" ]] || {
+        echo "sanctuary-godzilla-xs-config-apply: declared theme asset missing: ${theme_asset_source}" >&2
+        exit 1
+      }
+      [[ -f "${theme_asset_live}" ]] || {
+        echo "sanctuary-godzilla-xs-config-apply: theme asset is not visible in guest: ${theme_asset_live}" >&2
+        echo "  Ensure the host theme collection is projected before applying XFCE state." >&2
+        exit 1
+      }
+      cmp -s "${theme_asset_source}" "${theme_asset_live}" || {
+        echo "sanctuary-godzilla-xs-config-apply: theme asset differs from repo: ${theme_asset_live}" >&2
+        exit 1
+      }
       ;;
     *)
       echo "sanctuary-godzilla-xs-config-apply: unsafe manifest entry: ${kind} ${live_rel}" >&2
