@@ -55,8 +55,6 @@ flatpak-bridge:
 | $(HOME)/.local/bin/flatpak-pcsx2-config-bridge || echo "⚠ pcsx2 bridge skipped"
 | @chmod +x $(HOME)/.local/bin/flatpak-ungoogled-chromium-profile-bridge 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-ungoogled-chromium-profile-bridge || echo "⚠ chromium bridge skipped"
-| @chmod +x $(HOME)/.local/bin/flatpak-telegram-bridge 2>/dev/null || true
-| $(HOME)/.local/bin/flatpak-telegram-bridge || echo "⚠ telegram bridge skipped"
 | @chmod +x $(HOME)/.local/bin/flatpak-logseq-bridge 2>/dev/null || true
 | $(HOME)/.local/bin/flatpak-logseq-bridge || echo "⚠ logseq bridge skipped"
 

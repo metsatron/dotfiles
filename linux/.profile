@@ -27,7 +27,7 @@ if [ -d "$HOME/.local/bin" ] ; then
 fi
 
 # set PATH so it includes user's private bin if it exists
-if [ -d "$HOME/.cargo/bin" ] ; then
+if [ "${DOTCORTEX_SANCTUARY_GUEST:-0}" != 1 ] && [ -d "$HOME/.cargo/bin" ] ; then
     PATH="$HOME/.cargo/bin:$PATH"
 fi
 
@@ -39,4 +39,6 @@ fi
 export aquaria_data_path=~/.config/aquaria
 export qt_qpa_platformtheme=gtk2
 export MOZ_X11_EGL=1
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+if [ "${DOTCORTEX_SANCTUARY_GUEST:-0}" != 1 ]; then
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
