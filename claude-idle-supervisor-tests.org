@@ -33,6 +33,7 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
 import unittest
 from unittest import mock
@@ -98,6 +99,28 @@ def main():
 
 raise SystemExit(main())
 '''
+
+
+# Captured Kikin metadata shape for the delayed 2026-08-04 production record.
+# Content and all identifiers are deliberately redacted; the classifier only
+# needs the public record type/subtype and lifecycle metadata shape.
+AWAY_SUMMARY_FIXTURE = {
+    "content": "<redacted>",
+    "cwd": "<redacted>",
+    "entrypoint": "cli",
+    "gitBranch": "<redacted>",
+    "isMeta": False,
+    "isSidechain": False,
+    "parentUuid": "<redacted>",
+    "sessionId": "<redacted>",
+    "slug": "<redacted>",
+    "subtype": "away_summary",
+    "timestamp": "2026-08-04T03:11:40.142Z",
+    "type": "system",
+    "userType": "external",
+    "uuid": "<redacted>",
+    "version": "2.1.220",
+}
 
 
 def wait_until(predicate, timeout=5.0, message="condition did not become true"):
@@ -331,6 +354,10 @@ class Session:
 class ClaudeWarmTests(unittest.TestCase):
     def setUp(self):
         self.sessions = []
+        loader = importlib.machinery.SourceFileLoader("claude_warm_test_module", str(WARM))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.module = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.module)
 
     def tearDown(self):
         for session in reversed(self.sessions):
@@ -340,6 +367,97 @@ class ClaudeWarmTests(unittest.TestCase):
         session = Session(**kwargs)
         self.sessions.append(session)
         return session
+
+    def test_herdr_registration_uses_supported_pane_contract(self):
+        """The PTY owner reports logical identity and releases it cleanly."""
+        root = pathlib.Path(tempfile.mkdtemp(prefix="cw-herdr-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        socket_path = root / "herdr.sock"
+        requests = []
+        stop = threading.Event()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(socket_path))
+        server.listen(8)
+        server.setblocking(False)
+
+        def serve():
+            while not stop.is_set():
+                ready, _, _ = select.select([server], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    if stop.is_set():
+                        return
+                    raise
+                with connection:
+                    payload = connection.recv(8192).splitlines()[0]
+                    requests.append(json.loads(payload.decode("utf-8")))
+                    connection.sendall(b'{"result":{}}\n')
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(server.close)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SOCKET_PATH": str(socket_path),
+                "HERDR_PANE_ID": "w4:pP",
+                "CLAUDE_WARM_HERDR_AGENT": "Fable",
+            },
+            clear=False,
+        ):
+            reporter = self.module.HerdrReporter()
+            reporter.child_pid = 12345
+            reporter.report("working", "fixture-session", "/tmp/fixture.jsonl")
+            reporter.report("idle", "fixture-session", "/tmp/fixture.jsonl")
+            reporter.release()
+        wait_until(lambda: len(requests) >= 7, message="Herdr requests were not received")
+        methods = [request["method"] for request in requests]
+        self.assertIn("pane.report_agent_session", methods)
+        self.assertIn("pane.report_agent", methods)
+        self.assertIn("pane.report_metadata", methods)
+        self.assertEqual(methods[-1], "pane.release_agent")
+        for request in requests:
+            params = request["params"]
+            self.assertEqual(params["pane_id"], "w4:pP")
+            self.assertEqual(params["source"], "claude-warm")
+            self.assertEqual(params["agent"], "Fable")
+        metadata = next(
+            request["params"]
+            for request in requests
+            if request["method"] == "pane.report_metadata"
+        )
+        self.assertEqual(metadata["display_agent"], "Fable")
+        self.assertEqual(metadata["tokens"]["claude_pid"], "12345")
+        self.assertEqual(metadata["tokens"]["pty_owner"], "claude-warm")
+
+    def test_herdr_identity_labels_are_preserved_by_all_wrappers(self):
+        wrappers = {
+            "Opus": pathlib.Path.home() / "HelmCortex/FORGE/bin/claude-opus",
+            "Fable": pathlib.Path.home() / "HelmCortex/FORGE/bin/claude-fable",
+            "Auryn": pathlib.Path.home() / "HelmCortex/FORGE/bin/claude-auryn",
+        }
+        for label, wrapper in wrappers.items():
+            if not wrapper.is_file():
+                self.skipTest(f"wrapper is not present: {wrapper}")
+            source = wrapper.read_text(encoding="utf-8")
+            self.assertIn(f"CLAUDE_WARM_HERDR_AGENT={label}", source)
+            self.assertIn("claude-warm", source)
+
+    def test_herdr_reporter_is_inert_outside_herdr(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERDR_ENV": "0", "CLAUDE_WARM_HERDR_AGENT": "Fable"},
+            clear=False,
+        ):
+            reporter = self.module.HerdrReporter()
+            self.assertFalse(reporter.enabled)
+            reporter.report("working", "fixture-session", "/tmp/fixture.jsonl")
+            reporter.release()
 
     def test_arguments_and_full_pty_submission(self):
         session = self.make_session(delay=0, extra_args=("--resume", "fixture", "--model", "test"))
@@ -586,7 +704,7 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertEqual(session.outer_tty_after, baseline)
         self.assertIn(b"\x1b[?1000l", bytes(session.output))
         self.assertIn(b"\x1b[?1004l", bytes(session.output))
-        self.assertIn(b"\x1b[?1049l", bytes(session.output))
+        self.assertNotIn(b"\x1b[?1049l", bytes(session.output))
 
     def test_unicode_and_paste_bytes_proxy_through_pty(self):
         session = self.make_session(terminal=True)
@@ -616,6 +734,127 @@ class ClaudeWarmTests(unittest.TestCase):
             }
         )
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "transcript-activity")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_delayed_away_summary_does_not_cancel_or_move_deadline(self):
+        """The exact delayed recap record is not a new user/channel turn."""
+        session = self.make_session(delay=3300, ttl=3600, channel=True)
+        session.stop_and_bind()
+        armed = session.read_state()
+        deadline = armed["timer_deadline"]
+        self.assertEqual(armed["timer_kind"], "compact")
+        self.assertEqual(armed["cache_profile"], "long")
+        self.assertAlmostEqual(
+            deadline - armed["last_normal_stop"], 3300.0, places=2
+        )
+        simulated_delayed_record_at = armed["last_normal_stop"] + 185.644
+        self.assertLess(simulated_delayed_record_at, deadline)
+        session.append_transcript(AWAY_SUMMARY_FIXTURE)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_transcript_classification"] == "internal-recap"
+        )
+        state = session.read_state()
+        self.assertEqual(state["timer_kind"], "compact")
+        self.assertAlmostEqual(state["timer_deadline"], deadline, places=3)
+        self.assertFalse(state["transcript_gate_blocked"])
+        self.assertEqual(
+            len(
+                [
+                    event
+                    for event in session.guard_events()
+                    if event.get("event") == "armed" and event.get("kind") == "compact"
+                ]
+            ),
+            1,
+        )
+        self.assertFalse(
+            any(
+                event.get("reason") == "transcript-activity"
+                for event in session.guard_events()
+                if event.get("event") == "cancelled"
+            )
+        )
+        away_events = [
+            event
+            for event in session.guard_events()
+            if event.get("event") == "transcript-record-ignored"
+            and event.get("record_type") == "system"
+            and event.get("record_subtype") == "away_summary"
+        ]
+        self.assertEqual(len(away_events), 1)
+        self.assertEqual(away_events[0]["classification"], "internal-recap")
+
+    def test_former_140_second_acceptance_predates_delayed_summary(self):
+        """The old accelerated test fired before the observed +185.644s recap."""
+        self.assertLess(140.0, 185.644)
+        session = self.make_session(delay=0, ttl=300)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED", timeout=3)
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'/compact\\n'"), 1)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+        session.append_transcript(AWAY_SUMMARY_FIXTURE)
+        time.sleep(0.2)
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'/compact\\n'"), 1)
+        self.assertFalse(session.read_state()["compacting"])
+
+    def test_internal_transcript_records_do_not_cancel_or_slide_deadline(self):
+        session = self.make_session(delay=5)
+        session.stop_and_bind()
+        deadline = session.read_state()["timer_deadline"]
+        records = [
+            AWAY_SUMMARY_FIXTURE,
+            {"type": "system", "subtype": "channel_send_failure"},
+            {"type": "system", "subtype": "channel_send_retry"},
+            {"type": "progress"},
+            {"type": "status"},
+            {"type": "queue-operation"},
+            {"type": "file-history-snapshot"},
+            {"type": "summary"},
+            {"type": "user", "isMeta": True, "isSidechain": False},
+            {"type": "assistant"},
+        ]
+        for record in records:
+            session.append_transcript(record)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_transcript_classification"] == "assistant-output"
+        )
+        state = session.read_state()
+        self.assertEqual(state["timer_kind"], "compact")
+        self.assertAlmostEqual(state["timer_deadline"], deadline, places=3)
+        self.assertFalse(state["transcript_gate_blocked"])
+        self.assertNotEqual(state["last_cancellation_reason"], "transcript-activity")
+
+    def test_split_and_malformed_transcript_records_block_only_the_final_gate(self):
+        session = self.make_session(delay=5)
+        session.stop_and_bind()
+        deadline = session.read_state()["timer_deadline"]
+        encoded = json.dumps(AWAY_SUMMARY_FIXTURE).encode()
+        with session.transcript.open("ab") as stream:
+            stream.write(encoded[: len(encoded) // 2])
+        time.sleep(0.2)
+        state = session.read_state()
+        self.assertIsNone(state["last_transcript_classification"])
+        self.assertEqual(state["timer_deadline"], deadline)
+        with session.transcript.open("ab") as stream:
+            stream.write(encoded[len(encoded) // 2 :] + b"\n")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_transcript_classification"] == "internal-recap"
+        )
+        with session.transcript.open("a", encoding="utf-8") as stream:
+            stream.write("{malformed-json}\n[]\n")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["transcript_gate_blocked"]
+        )
+        state = session.read_state()
+        self.assertEqual(state["timer_deadline"], deadline)
+        result = session.control("trigger")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"]["last_gate_rejection_reason"], "transcript-uncertain")
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
     def test_final_assistant_flush_does_not_cancel_idle_timer(self):
@@ -658,6 +897,7 @@ class ClaudeWarmTests(unittest.TestCase):
         session.append_transcript(
             {
                 "type": "user",
+                "channel": "telegram",
                 "timestamp": time.strftime(
                     "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(time.time() - 1)
                 ),
@@ -963,7 +1203,8 @@ class ClaudeWarmTests(unittest.TestCase):
         )
         time.sleep(1.2)
         self.assertFalse(session.read_state()["channel_recovery_pending"])
-        self.assertIsNone(session.read_state()["timer_deadline"])
+        self.assertEqual(session.read_state()["timer_kind"], "compact")
+        self.assertIsNotNone(session.read_state()["timer_deadline"])
         self.assertFalse(session.output_contains("/mcp reconnect"))
 
     def test_channel_recovery_confirmation_does_not_rearm_on_command_stop(self):
@@ -1122,7 +1363,7 @@ class ClaudeWarmTests(unittest.TestCase):
             "pid": 102,
             "session_id": "observer-fixture-session",
             "cache_profile": "long",
-            "watched_servers": ["plugin:telegram"],
+            "watched_servers": [],
             "current_input_context_tokens": 80000,
             "dirty": True,
             "compacting": False,
@@ -1141,6 +1382,13 @@ class ClaudeWarmTests(unittest.TestCase):
         }
         events = [
             {"event": "armed", "kind": "compact", "delay": 140, "timestamp": 100.0},
+            {
+                "event": "transcript-record-ignored",
+                "classification": "internal-recap",
+                "record_type": "system",
+                "record_subtype": "away_summary",
+                "timestamp": 185.644,
+            },
             {"event": "injection-attempted", "purpose": "compact", "timestamp": 250.0},
             {"event": "compaction-requested", "timestamp": 250.0},
             {"event": "compaction-completed", "timestamp": 251.0},
@@ -1189,6 +1437,9 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertEqual(result, 0, output.getvalue())
         self.assertIn('result="PASS"', output.getvalue())
         self.assertIn('snapshot_age_at_callback_seconds=250.0', output.getvalue())
+        self.assertIn('away_summary_observed=1', output.getvalue())
+        self.assertIn('away_summary_classification="internal-recap"', output.getvalue())
+        self.assertIn('away_summary_timer_preserved=true', output.getvalue())
 
     def test_signal_propagation_and_runtime_cleanup(self):
         session = self.make_session()
