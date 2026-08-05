@@ -33,12 +33,14 @@
 (use-modules (gnu packages)
              (local packages fbneo-libretro)
              (local packages px68k-libretro)
+             (local packages quasi88-libretro)
              (local packages np2kai)
              (local packages tsugaru))
 
 (packages->manifest
  (cons* libretro-px68k
         libretro-fbneo
+        libretro-quasi88
         retropie-np2kai
         retropie-tsugaru
         (map specification->package
