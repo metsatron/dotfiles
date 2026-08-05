@@ -50,10 +50,45 @@ INJECT_RE = re.compile(r"^/mcp reconnect ([A-Za-z0-9_.:-]{1,128})$")
 CHANNEL_DEATH_MARKER = "removedNames"
 CHANNEL_ATTACH_MARKER = "addedNames"
 EXPECTED_COMPLETION_SYSTEM_SUBTYPES = frozenset(
-    {"stop_hook_summary", "turn_duration"}
+    {"stop_hook_summary", "turn_duration", "away_summary"}
 )
 EXPECTED_COMPLETION_TRANSCRIPT_TYPES = frozenset(
     {"last-prompt", "mode", "permission-mode", "ai-title"}
+)
+TRANSCRIPT_INTERNAL_SYSTEM_SUBTYPES = frozenset(
+    {
+        "stop_hook_summary",
+        "turn_duration",
+        "away_summary",
+        "local_command",
+        "hook_progress",
+        "hook_result",
+        "progress",
+        "status",
+        "queue",
+        "queue-operation",
+        "file-history-snapshot",
+        "summary",
+        "recap",
+        "channel_send_failure",
+        "channel_send_retry",
+        "channel_send_error",
+    }
+)
+TRANSCRIPT_INTERNAL_TYPES = frozenset(
+    {
+        "last-prompt",
+        "mode",
+        "permission-mode",
+        "ai-title",
+        "progress",
+        "status",
+        "queue",
+        "queue-operation",
+        "file-history-snapshot",
+        "summary",
+        "recap",
+    }
 )
 COMPACTION_FAILURE_MARKER = "not enough messages"
 
@@ -176,6 +211,31 @@ def expected_completion_transcript_entry(entry: dict) -> bool:
     )
 
 
+def transcript_entry_classification(entry: object) -> str:
+    """Classify one JSONL record without retaining or exposing its contents."""
+    if not isinstance(entry, dict):
+        return "unknown"
+    entry_type = entry.get("type")
+    if entry_type == "user":
+        if entry.get("isMeta") is True or entry.get("isSidechain") is True:
+            return "internal-user-metadata"
+        return "user-turn"
+    if entry_type == "assistant":
+        return "assistant-output"
+    if entry_type == "attachment":
+        return "internal-attachment"
+    if isinstance(entry_type, str) and entry_type in TRANSCRIPT_INTERNAL_TYPES:
+        return "internal-" + str(entry_type).replace("_", "-")
+    if entry_type == "system":
+        subtype = entry.get("subtype")
+        if isinstance(subtype, str) and subtype in EXPECTED_COMPLETION_SYSTEM_SUBTYPES:
+            return "internal-recap" if subtype == "away_summary" else "internal-completion"
+        if isinstance(subtype, str) and subtype in TRANSCRIPT_INTERNAL_SYSTEM_SUBTYPES:
+            return "internal-system"
+        return "unknown"
+    return "unknown"
+
+
 def transcript_entry_timestamp(entry: dict) -> float | None:
     """Return an installed Claude JSONL timestamp without retaining content."""
     value = entry.get("timestamp")
@@ -223,7 +283,7 @@ DEBUG_LOG_MAX_BYTES = env_int(
 DEBUG = os.environ.get("CLAUDE_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
 TERMINAL_CLEANUP_BYTES = (
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
-    b"\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1049l"
+    b"\x1b[?1005l\x1b[?1006l\x1b[?1015l"
     b"\x1b[?2004l\x1b[?25h\x1b[0m"
 )
 
@@ -253,6 +313,164 @@ def now() -> float:
 def monotonic() -> float:
     """Return monotonic seconds used only for local retry/poll scheduling."""
     return time.monotonic()
+
+
+HERDR_SOURCE = "claude-warm"
+HERDR_PANE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+HERDR_AGENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 .:_-]{0,63}$")
+HERDR_HEARTBEAT_SECONDS = env_float(
+    "CLAUDE_WARM_HERDR_HEARTBEAT_SECONDS", 30.0, 5.0
+)
+HERDR_REGISTRATION_TTL_MS = env_int(
+    "CLAUDE_WARM_HERDR_REGISTRATION_TTL_MS", 120000, 1000
+)
+
+
+class HerdrReporter:
+    """Report one supervisor-owned Claude session through Herdr's pane API."""
+
+    def __init__(self) -> None:
+        socket_path = os.environ.get("HERDR_SOCKET_PATH", "")
+        pane_id = os.environ.get("HERDR_PANE_ID", "")
+        agent = os.environ.get("CLAUDE_WARM_HERDR_AGENT", "") or "Claude Code"
+        self.socket_path = pathlib.Path(socket_path) if socket_path else None
+        self.pane_id = pane_id if HERDR_PANE_RE.fullmatch(pane_id) else None
+        self.agent = agent if HERDR_AGENT_RE.fullmatch(agent) else None
+        self.enabled = (
+            os.environ.get("HERDR_ENV") == "1"
+            and self.socket_path is not None
+            and self.socket_path.is_absolute()
+            and len(str(self.socket_path)) < 100
+            and self.pane_id is not None
+            and self.agent is not None
+        )
+        self.source = HERDR_SOURCE
+        self.sequence = 0
+        self.registered = False
+        self.last_report_at: float | None = None
+        self.last_report_state: str | None = None
+        self.last_error: str | None = None
+        self.next_heartbeat = 0.0
+        self.child_pid: int | None = None
+
+    def state(self) -> dict[str, object]:
+        """Return prompt-free Herdr ownership state for the supervisor state file."""
+        return {
+            "herdr_enabled": self.enabled,
+            "herdr_pane_id": self.pane_id,
+            "herdr_agent": self.agent,
+            "herdr_source": self.source,
+            "herdr_registered": self.registered,
+            "herdr_last_report_at": self.last_report_at,
+            "herdr_last_report_state": self.last_report_state,
+            "herdr_last_error": self.last_error,
+            "herdr_child_pid": self.child_pid,
+        }
+
+    @staticmethod
+    def _valid_session_id(value: object) -> str | None:
+        if isinstance(value, str) and SESSION_RE.fullmatch(value):
+            return value
+        return None
+
+    @staticmethod
+    def _valid_session_path(value: object) -> str | None:
+        if not isinstance(value, str) or not value or len(value) > 4096:
+            return None
+        path = pathlib.Path(value)
+        return str(path) if path.is_absolute() else None
+
+    def _send(self, method: str, params: dict[str, object]) -> bool:
+        """Send one bounded JSON-RPC request to the inherited Herdr socket."""
+        if not self.enabled or self.socket_path is None:
+            return False
+        self.sequence += 1
+        request = {
+            "id": f"{self.source}:{self.sequence}",
+            "method": method,
+            "params": params,
+        }
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.5)
+                connection.connect(str(self.socket_path))
+                connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+                response = connection.recv(4096)
+            if response:
+                decoded = json.loads(response.decode("utf-8"))
+                if isinstance(decoded, dict) and decoded.get("error"):
+                    error = decoded["error"]
+                    code = error.get("code") if isinstance(error, dict) else "request-failed"
+                    self.last_error = str(code)[:96]
+                    return False
+            return True
+        except (OSError, ValueError, UnicodeError) as error:
+            self.last_error = type(error).__name__
+            return False
+
+    def report(
+        self,
+        state: str,
+        session_id: object = None,
+        session_path: object = None,
+    ) -> None:
+        """Publish state, session identity, display label, and bounded PID metadata."""
+        if not self.enabled or state not in {"idle", "working", "blocked", "done", "unknown"}:
+            return
+        safe_session_id = self._valid_session_id(session_id)
+        safe_session_path = self._valid_session_path(session_path)
+        base = {
+            "pane_id": self.pane_id,
+            "source": self.source,
+            "agent": self.agent,
+        }
+        if safe_session_id:
+            base["agent_session_id"] = safe_session_id
+        if safe_session_path:
+            base["agent_session_path"] = safe_session_path
+        if safe_session_id:
+            self._send("pane.report_agent_session", dict(base))
+        report = dict(base)
+        report["state"] = state
+        self._send("pane.report_agent", report)
+        tokens = {
+            "supervisor_pid": str(os.getpid()),
+            "pty_owner": "claude-warm",
+        }
+        if isinstance(self.child_pid, int) and self.child_pid > 0:
+            tokens["claude_pid"] = str(self.child_pid)
+        metadata = {
+            "pane_id": self.pane_id,
+            "source": self.source,
+            "agent": self.agent,
+            "display_agent": self.agent,
+            "tokens": tokens,
+            "ttl_ms": HERDR_REGISTRATION_TTL_MS,
+        }
+        success = self._send("pane.report_metadata", metadata)
+        self.registered = success or self.registered
+        self.last_report_at = now()
+        self.last_report_state = state
+        self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
+
+    def heartbeat(self, state: str, session_id: object = None, session_path: object = None) -> None:
+        """Refresh the bounded Herdr registration while the supervisor is alive."""
+        if self.enabled and monotonic() >= self.next_heartbeat:
+            self.report(state, session_id, session_path)
+
+    def release(self) -> None:
+        """Remove this supervisor's Herdr registration on every orderly exit."""
+        if not self.enabled or self.socket_path is None:
+            return
+        params = {
+            "pane_id": self.pane_id,
+            "source": self.source,
+            "agent": self.agent,
+        }
+        if self._send("pane.release_agent", params):
+            self.registered = False
+        self.last_report_state = "released"
+        self.last_report_at = now()
 
 
 class TerminalInputClassifier:
@@ -660,6 +878,9 @@ class Supervisor:
         self.transcript_activity_at: float | None = None
         self.transcript_quiescence_at: float | None = None
         self.transcript_quiescence_deadline: float | None = None
+        self.transcript_gate_blocked = False
+        self.transcript_gate_blocked_at: float | None = None
+        self.last_transcript_classification: str | None = None
         self.inotify: Inotify | None = None
         self.status = "starting"
         self.enabled = True
@@ -710,6 +931,7 @@ class Supervisor:
         self.shutdown_requested = False
         self.child_exited_at: float | None = None
         self.next_transcript_poll = monotonic() + TRANSCRIPT_POLL_SECONDS
+        self.herdr = HerdrReporter()
         self._guard_log("supervisor-started")
         self._write_state()
 
@@ -759,6 +981,9 @@ class Supervisor:
             "last_normal_stop": self.last_normal_stop,
             "transcript_quiescence_at": self.transcript_quiescence_at,
             "transcript_quiescence_deadline": self.transcript_quiescence_deadline,
+            "transcript_gate_blocked": self.transcript_gate_blocked,
+            "transcript_gate_blocked_at": self.transcript_gate_blocked_at,
+            "last_transcript_classification": self.last_transcript_classification,
             "last_local_input": self.last_local_input,
             "last_local_input_classification": self.last_local_input_classification,
             "last_lifecycle_activity": self.last_lifecycle_activity,
@@ -774,6 +999,7 @@ class Supervisor:
             "last_channel_activity": self.last_channel_activity,
             "last_channel_event": self.last_channel_event,
             "last_channel_death": self.last_channel_death,
+            **self.herdr.state(),
         }
 
     def _guard_log(self, event: str, **fields: object) -> None:
@@ -826,6 +1052,15 @@ class Supervisor:
             atomic_json(self.state_path, self.state())
         except OSError as error:
             self._debug(f"state-write-failed channel={short_id(self.channel)} error={error}")
+
+    def _report_herdr(self, state: str) -> None:
+        """Publish the current lifecycle state to the inherited Herdr pane."""
+        self.herdr.report(
+            state,
+            self.session_id,
+            str(self.transcript_path) if self.transcript_path else None,
+        )
+        self._write_state()
 
     def cancel(self, reason: str) -> None:
         """Invalidate the one-shot timer and retain the cancellation reason."""
@@ -909,6 +1144,35 @@ class Supervisor:
             "transcript-final-flush",
             completed_turn_epoch=self.completed_turn_epoch,
         )
+        self._write_state()
+
+    def _record_transcript_observation(
+        self,
+        classification: str,
+        *,
+        gate_blocked: bool = False,
+        record_type: str | None = None,
+        record_subtype: str | None = None,
+    ) -> None:
+        """Persist a prompt-free transcript classification and gate uncertainty."""
+        self.last_transcript_classification = classification
+        fields: dict[str, object] = {
+            "classification": classification,
+            "action": "gate-blocked" if gate_blocked else "no-cancellation",
+        }
+        # These are bounded schema labels only; never persist transcript
+        # content, identifiers, or message metadata in the guard log.
+        if isinstance(record_type, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", record_type):
+            fields["record_type"] = record_type
+        if isinstance(record_subtype, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", record_subtype):
+            fields["record_subtype"] = record_subtype
+        if gate_blocked:
+            self.transcript_gate_blocked = True
+            self.transcript_gate_blocked_at = now()
+            self.last_state_transition = "transcript-uncertain"
+            self._guard_log("transcript-record-unknown", **fields)
+        else:
+            self._guard_log("transcript-record-ignored", **fields)
         self._write_state()
 
     def _arm_recovery(self, delay: int | None = None) -> None:
@@ -1093,8 +1357,6 @@ class Supervisor:
             self._guard_log("channel-attached-marker", servers=watched_added)
             if self.recovery_pending and self.recovery_awaiting:
                 self._complete_channel_recovery("attachment-added")
-            elif self.last_normal_stop and not self.compacting:
-                self.cancel("channel-activity")
         if watched_removed:
             if self.recovery_pending:
                 self._guard_log("channel-death-duplicate", servers=watched_removed)
@@ -1131,9 +1393,10 @@ class Supervisor:
             try:
                 entry = json.loads(raw_line.decode("utf-8"))
             except (UnicodeError, ValueError):
-                self._guard_log("transcript-line-unparseable")
+                self._record_transcript_observation("malformed-json", gate_blocked=True)
                 continue
             if not isinstance(entry, dict):
+                self._record_transcript_observation("unknown", gate_blocked=True)
                 continue
             # The cursor was reset to the transcript end at Stop, so every
             # complete line read here was appended after that lifecycle
@@ -1141,8 +1404,7 @@ class Supervisor:
             # merely because Claude's embedded timestamp is coarse.
             if entry.get("type") == "attachment" and isinstance(entry.get("attachment"), dict):
                 self._handle_attachment_delta(entry["attachment"])
-                continue
-            if expected_completion_transcript_entry(entry):
+                self._record_transcript_observation("internal-attachment")
                 continue
             # A compacting session is expected to append system/boundary lines.
             # PostCompact clears the governor state; these lines must not look
@@ -1150,18 +1412,26 @@ class Supervisor:
             if self.compacting:
                 if self._is_failed_compaction_entry(entry):
                     self._compaction_failed("transcript-rejected")
+                self._record_transcript_observation("compaction-transcript")
+                continue
+            classification = transcript_entry_classification(entry)
+            if (
+                classification == "assistant-output"
+                and self.transcript_quiescence_deadline is not None
+            ):
+                # Claude 2.1.220 can flush the completed assistant record
+                # after Stop.  It belongs to this completed-turn epoch; only
+                # a later human/channel turn is renewed activity.
+                self._record_completed_turn_flush()
+            self._record_transcript_observation(
+                classification,
+                gate_blocked=classification == "unknown",
+                record_type=entry.get("type"),
+                record_subtype=entry.get("subtype"),
+            )
+            if classification != "user-turn":
                 continue
             if self.last_normal_stop:
-                if (
-                    self.transcript_quiescence_deadline is not None
-                    and entry.get("type") == "assistant"
-                ):
-                    # Claude 2.1.220 can flush the completed assistant record
-                    # after Stop.  It belongs to this completed-turn epoch;
-                    # only a later assistant record, after quiescence, is
-                    # renewed work.
-                    self._record_completed_turn_flush()
-                    continue
                 if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
                     continue
                 current = now()
@@ -1282,6 +1552,8 @@ class Supervisor:
         self.selector.register(master_fd, selectors.EVENT_READ, "master")
         self._install_signals()
         self._install_terminal()
+        self.herdr.child_pid = pid
+        self._report_herdr("working")
         self._write_state()
 
     def _read_child_tty(self) -> str | None:
@@ -1410,6 +1682,8 @@ class Supervisor:
                 return "channel-recovery-pending"
             if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
                 return "transcript-activity"
+            if self.transcript_gate_blocked:
+                return "transcript-uncertain"
             if self.transcript_quiescence_deadline is not None:
                 return "transcript-not-quiescent"
         elif purpose == "recovery":
@@ -1631,9 +1905,13 @@ class Supervisor:
                 self.status_snapshot_epoch = None
                 self.transcript_quiescence_at = None
                 self.transcript_quiescence_deadline = None
+                self.transcript_gate_blocked = False
+                self.transcript_gate_blocked_at = None
+                self.last_transcript_classification = None
             self._set_transcript(message.get("transcript_path"))
             self.status = "starting"
             self.last_lifecycle_activity = now()
+            self._report_herdr("working")
             self._guard_log("session-bound")
             self._write_state()
             return {"ok": True}
@@ -1683,9 +1961,13 @@ class Supervisor:
             self.last_lifecycle_activity = current
             self.last_local_input = None
             self.transcript_activity_at = None
+            self.transcript_gate_blocked = False
+            self.transcript_gate_blocked_at = None
+            self.last_transcript_classification = None
             self._reset_transcript_cursor()
             self.cancel("new-normal-turn")
             self._begin_transcript_quiescence()
+            self._report_herdr("idle")
             return {"ok": True}
         if event == "user-prompt-submit":
             self.status = "active"
@@ -1711,6 +1993,9 @@ class Supervisor:
             self.status_snapshot_epoch = None
             self.transcript_quiescence_deadline = None
             self.transcript_quiescence_at = current
+            self.transcript_gate_blocked = False
+            self.transcript_gate_blocked_at = None
+            self.last_transcript_classification = None
             self.last_injection_result = "succeeded"
             self.last_lifecycle_activity = current
             self._reset_transcript_cursor()
@@ -1723,6 +2008,7 @@ class Supervisor:
             self.last_lifecycle_activity = current
             self._abort_recovery("session-end")
             self.cancel("session-end")
+            self.herdr.release()
         elif event == "stop-failure":
             was_compacting = self.compacting
             if self.compacting:
@@ -1743,6 +2029,12 @@ class Supervisor:
                 self._guard_log("recovery-command-activity")
             else:
                 self.cancel("session-activity")
+        if event == "post-compact":
+            self._report_herdr("idle")
+        elif event == "stop-failure":
+            self._report_herdr("blocked")
+        elif event in {"user-prompt-submit", "session-activity"}:
+            self._report_herdr("working")
         self._write_state()
         return {"ok": True}
 
@@ -1937,17 +2229,32 @@ class Supervisor:
             self.child_exited_at = now()
             self.status = "exited"
             self.cancel("process-exit")
+            self.herdr.report("done", self.session_id, str(self.transcript_path) if self.transcript_path else None)
             self._guard_log("process-exit", exit_code=os.waitstatus_to_exitcode(status))
             return True
         return False
 
+    def _herdr_state(self) -> str:
+        """Map the private supervisor lifecycle to Herdr's supported states."""
+        if self.status in {"starting", "active"}:
+            return "working"
+        if self.status == "idle":
+            return "idle"
+        if self.status in {"error", "blocked"}:
+            return "blocked"
+        if self.status in {"exited", "ended"}:
+            return "done"
+        return "unknown"
+
     def _handle_inotify(self) -> None:
-        """Cancel work when the watched transcript changes after Stop."""
+        """Classify complete transcript records after a watcher notification."""
         if not self.inotify:
             return
         for mask, name in self.inotify.read():
             if mask & Inotify.IN_Q_OVERFLOW:
-                self.cancel("transcript-watcher-overflow")
+                self._record_transcript_observation(
+                    "watcher-overflow", gate_blocked=True
+                )
                 self._record_transcript_activity()
             elif self.transcript_path and name == self.transcript_path.name:
                 self._record_transcript_activity()
@@ -1959,6 +2266,11 @@ class Supervisor:
         try:
             while master_open:
                 child_exited = self._child_has_exited()
+                self.herdr.heartbeat(
+                    self._herdr_state(),
+                    self.session_id,
+                    str(self.transcript_path) if self.transcript_path else None,
+                )
                 self._check_channel_attach()
                 self._flush_input_classifier()
                 if (
@@ -2029,6 +2341,7 @@ class Supervisor:
 
     def cleanup(self) -> None:
         """Close PTY/IPC resources and remove only this session's runtime directory."""
+        self.herdr.release()
         try:
             self.selector.close()
         except Exception:
@@ -2141,6 +2454,8 @@ def main(argv: list[str]) -> int:
         print("CLAUDE_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS,")
         print("CLAUDE_IDLE_WATCHED_SERVERS, CLAUDE_IDLE_RECONNECT_SERVER,")
         print("CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS, CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS")
+        print("CLAUDE_WARM_HERDR_AGENT, CLAUDE_WARM_HERDR_HEARTBEAT_SECONDS,")
+        print("CLAUDE_WARM_HERDR_REGISTRATION_TTL_MS")
         print("Use claude-warmctl for per-session state and controls.")
         return 0
     try:
