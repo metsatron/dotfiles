@@ -80,7 +80,9 @@ fi
 export NVM_DIR="$HOME/.config/nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+if [ "${DOTCORTEX_SANCTUARY_GUEST:-0}" != 1 ]; then
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
 
 # --- kitty shell integration (no-op outside kitty) ---
 if [ -n "${KITTY_INSTALLATION_DIR:-}" ] && [ -n "${KITTY_SHELL_INTEGRATION:-}" ]; then
