@@ -2,7 +2,7 @@
 """Observe one accelerated Claude idle-compaction acceptance run.
 
 This command is deliberately read-only.  It discovers a newly-created
-supervised Telegram session, reads its state, status snapshot, and safe guard
+supervised Claude session, reads its state, status snapshot, and safe guard
 log, and reports the real lifecycle.  The Claude PTY is never opened and the
 supervisor control socket is never contacted.
 """
@@ -120,13 +120,6 @@ def supervisor_environment(pid: Any) -> dict[str, str]:
         if separator and key.decode("utf-8", "replace") in wanted:
             values[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
     return values
-
-
-def is_telegram_state(state: dict[str, Any]) -> bool:
-    watched = state.get("watched_servers")
-    if not isinstance(watched, list):
-        return False
-    return any("telegram" in str(item).lower() for item in watched)
 
 
 def timestamp_epoch(value: Any) -> tuple[float, str] | None:
@@ -266,15 +259,14 @@ def run(arguments: argparse.Namespace) -> int:
             fresh = read_state(root, candidate)
             if not fresh or not process_present(fresh.get("supervisor_pid")) or not process_present(fresh.get("pid")):
                 continue
-            if is_telegram_state(fresh):
-                channel = candidate
-                state = fresh
-                break
+            channel = candidate
+            state = fresh
+            break
         if channel:
             break
         sleep_poll(deadline)
     if not channel or not state:
-        print_summary({"result": "FAIL", "failure_reason": "new-live-telegram-channel-not-discovered"})
+        print_summary({"result": "FAIL", "failure_reason": "new-live-supervised-session-not-discovered"})
         return 1
 
     expected_environment = {
@@ -306,6 +298,7 @@ def run(arguments: argparse.Namespace) -> int:
     failure_reason: str | None = None
     snapshot_age: float | None = None
     compact_request: dict[str, Any] | None = None
+    armed_deadline: float | None = None
     arm_deadline = time.monotonic() + arguments.arm_timeout
 
     def observe() -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -333,6 +326,12 @@ def run(arguments: argparse.Namespace) -> int:
             failure_reason = f"gate-refused:{failures[-1].get('reason', 'unknown')}"
             break
         if arms and state.get("timer_kind") == "compact" and state.get("timer_deadline") is not None:
+            if armed_deadline is None:
+                try:
+                    armed_deadline = float(state["timer_deadline"])
+                except (TypeError, ValueError):
+                    failure_reason = "invalid-compact-timer-deadline"
+                    break
             armed_delay = arms[-1].get("delay")
             try:
                 delay_matches = abs(float(armed_delay) - arguments.expected_delay) < 0.1
@@ -439,6 +438,24 @@ def run(arguments: argparse.Namespace) -> int:
     requests = [event for event in events if event.get("event") == "compaction-requested"]
     completed = [event for event in events if event.get("event") == "compaction-completed"]
     stale = [event for event in events if event.get("reason") == "status-snapshot-stale"]
+    away_summary_events = [
+        event
+        for event in events
+        if event.get("event") == "transcript-record-ignored"
+        and event.get("record_type") == "system"
+        and event.get("record_subtype") == "away_summary"
+    ]
+    transcript_cancellations = [
+        event
+        for event in events
+        if event.get("event") == "cancelled"
+        and event.get("reason") == "transcript-activity"
+    ]
+    away_summary_timer_preserved = bool(
+        away_summary_events
+        and armed_deadline is not None
+        and not transcript_cancellations
+    )
     terminal_untouched = True
     success = (
         failure_reason is None
@@ -452,6 +469,7 @@ def run(arguments: argparse.Namespace) -> int:
         and state.get("timer_deadline") is None
         and state.get("timer_kind") is None
         and state.get("last_injection_result") == "succeeded"
+        and away_summary_timer_preserved
         and process_present(state.get("supervisor_pid"))
         and process_present(state.get("pid"))
     )
@@ -466,6 +484,12 @@ def run(arguments: argparse.Namespace) -> int:
         "claude_pid": state.get("pid"),
         "status_snapshot_type": last_status[1] if last_status else None,
         "snapshot_age_at_callback_seconds": round(snapshot_age, 3) if snapshot_age is not None else None,
+        "original_timer_deadline": armed_deadline,
+        "away_summary_observed": len(away_summary_events),
+        "away_summary_classification": (
+            away_summary_events[-1].get("classification") if away_summary_events else None
+        ),
+        "away_summary_timer_preserved": away_summary_timer_preserved,
         "compact_timers_armed": len(arms),
         "injection_attempts": len(attempts),
         "compaction_requests": len(requests),
