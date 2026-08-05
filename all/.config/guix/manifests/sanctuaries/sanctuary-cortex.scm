@@ -67,9 +67,10 @@
        (append gettext-minimal)))))
 
 (packages->manifest
- (cons appmenu-gtk-module-xfce
-       (map specification->package
-            '(
+ (cons* appmenu-gtk-module-xfce
+        (list (specification->package "transmission") "gui")
+        (map specification->package
+             '(
    ;; XFCE session, window manager, panels, and settings
    "xfce4-session"
    "xfwm4"
@@ -146,4 +147,46 @@
    "xdpyinfo"
    "xrandr"
    "xterm"
+   ;; --- XFCE panel plugins (X230 catalogue) ---
+   ;; docklike and windowck are not packaged in Guix.
+   "xfce4-cpugraph-plugin"
+   "xfce4-systemload-plugin"
+   "xfce4-verve-plugin"
+   "xfce4-weather-plugin"
+   ;; --- Audio / Media ---
+   "pavucontrol"
+   "ffmpeg"
+   "vlc"
+   "audacity"
+   "sox"
+   "flac"
+   "shntool"
+   "cuetools"
+   ;; --- Desktop applications (Guix equivalents of the nala desktop lane) ---
+   ;; transmission is handled above via (list pkg "gui") — GTK4 in Guix,
+   ;; no Qt build available.  GTK4 apps cannot export to the global menu.
+   "pluma"
+   "mate-calc"
+   "mate-utils"
+   "gthumb"
+   "meld"
+   "grsync"
+   "seahorse"
+   "yad"
+   "zenity"
+   ;; --- CLI tools (X230 nala surface) ---
+   "mc"
+   "vim"
+   "screen"
+   "trash-cli"
+   "xdotool"
+   "xmlstarlet"
+   "dialog"
+   "lynx"
+   "plocate"
+   "wmctrl"
+   ;; --- Fonts ---
+   ;; powerline/nerd fonts are not packaged in Guix; handled by font injection.
+   "font-google-noto-emoji"
+   "font-dejavu"
    ))))
