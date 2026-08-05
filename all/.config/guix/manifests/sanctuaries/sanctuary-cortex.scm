@@ -113,6 +113,36 @@
    "rsync"
    "git"
    "jq"
+   ;; Verified Guix equivalents for the shared Nala/apt CLI surface.  The
+   ;; host-only Nala executable itself stays outside the guest; these are the
+   ;; portable tools that the X230 shell expects to find in Cortex.
+   "curl"
+   "wget"
+   "make"
+   "python"
+   "tree"
+   "htop"
+   "btop"
+   "ranger"
+   "chafa"
+   "moreutils"
+   "ncurses"
+   "lsof"
+   "less"
+   "which"
+   "procps"
+   "unzip"
+   "zip"
+   "openssh"
+   "xclip"
+   ;; Guest-native replacements for host cargo binaries.  The host builds
+   ;; request /lib64/ld-linux-x86-64.so.2, which is not present in Distrobox.
+   "ripgrep"
+   "fd"
+   "bat"
+   "eza"
+   ;; Keep the channel-pinned Guix CLI available inside Cortex terminals.
+   "guix"
    "xdpyinfo"
    "xrandr"
    "xterm"
