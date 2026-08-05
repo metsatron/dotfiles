@@ -184,7 +184,7 @@ alias glib-compile-schemas='hostenv glib-compile-schemas'
 alias claude-sonnet='CLAUDE_WARM_HERDR_AGENT=Sonnet claude-warm --model claude-sonnet-4-6 --advisor claude-opus-5'
 alias cch='CLAUDE_WARM_HERDR_AGENT=Haiku claude-warm --model claude-haiku-4-5'
 alias ccs='claude-sonnet'
-alias cco='claude-warm --model claude-opus-4-6 --advisor claude-opus-5'
+alias cco='claude-opus'
 
 # ttyd web terminal server
 alias ttyd-serve='ttyd --writable --port 7681 zsh'
