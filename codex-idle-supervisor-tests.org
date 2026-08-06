@@ -1,0 +1,644 @@
+#+TITLE: Codex idle-compaction supervisor tests
+#+DESCRIPTION: Focused PTY, lifecycle, gate, and event handler tests
+#+PROPERTY: header-args :mkdirp yes :comments both
+
+* Tests
+
+These tests launch the generated =codex-warm= against a deliberately small
+fake Codex executable.  The fake is still attached to the supervisor's real
+PTY, so the tests exercise byte proxying, terminal submission, lifecycle IPC,
+and cleanup without contacting the Codex service.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-codex-warm.py :shebang "#!/usr/bin/env python3" :comments no
+"""Black-box tests for the codex-warm PTY supervisor."""
+
+from __future__ import annotations
+
+import fcntl
+import importlib.machinery
+import importlib.util
+import json
+import os
+import pathlib
+import pty
+import select
+import shutil
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import tempfile
+import termios
+import threading
+import time
+import unittest
+from unittest import mock
+
+
+HERE = pathlib.Path(__file__).resolve()
+REPO = HERE.parents[5]
+WARM = REPO / "all/.local/bin/codex-warm"
+HOOK = REPO / "all/.local/bin/codex-hook-idle-event"
+
+
+FAKE_CODEX = r'''#!/usr/bin/env python3
+import fcntl
+import os
+import select
+import signal
+import struct
+import sys
+import termios
+
+
+def report_size(_signum=None, _frame=None):
+    try:
+        raw = fcntl.ioctl(0, termios.TIOCGWINSZ, b"\0" * 8)
+        rows, columns = struct.unpack("HH", raw[:4])
+        os.write(1, (f"SIZE:{rows}x{columns}\n").encode())
+    except OSError:
+        pass
+
+
+def main():
+    os.write(1, (f"ARGS:{sys.argv[1:]!r}\n").encode())
+    report_size()
+    if "--emit-terminal-modes" in sys.argv:
+        os.write(1, b"\x1b[?1000h\x1b[?1004h\x1b[?1049h")
+    signal.signal(signal.SIGWINCH, report_size)
+    if "--exit-status=7" in sys.argv:
+        return 7
+    try:
+        while True:
+            readable, _, _ = select.select([0], [], [], 0.1)
+            if not readable:
+                continue
+            data = os.read(0, 65536)
+            if not data:
+                return 0
+            os.write(1, (f"INPUT:{data!r}\n").encode())
+            if b"/compact" in data:
+                os.write(1, b"COMPACT_RECEIVED\n")
+    except KeyboardInterrupt:
+        return 0
+
+
+raise SystemExit(main())
+'''
+
+
+def wait_until(predicate, timeout=5.0, message="condition did not become true"):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.02)
+    raise AssertionError(message)
+
+
+class Session:
+    """One supervised fake Codex process and its private runtime directory."""
+
+    def __init__(
+        self,
+        delay=10,
+        ttl=60,
+        extra_args=(),
+        terminal=False,
+    ):
+        self.root = pathlib.Path(tempfile.mkdtemp(prefix="cxw", dir="/tmp"))
+        self.fake = self.root / "fake-codex"
+        self.fake.write_text(FAKE_CODEX, encoding="utf-8")
+        self.fake.chmod(0o700)
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "XDG_RUNTIME_DIR": str(self.root),
+                "CODEX_IDLE_REAL_EXECUTABLE": str(self.fake),
+                "CODEX_IDLE_COMPACT_SECONDS": str(delay),
+                "CODEX_IDLE_COMPACT_TTL_SECONDS": str(ttl),
+                "CODEX_IDLE_COMPACTION_DEBUG": "1",
+                "XDG_STATE_HOME": str(self.root / "state"),
+            }
+        )
+        self.parent_master = None
+        self.outer_tty_fd = None
+        self.outer_tty_baseline = None
+        self.outer_tty_after = None
+        if terminal:
+            self.parent_master, parent_slave = pty.openpty()
+            self.outer_tty_fd = os.dup(parent_slave)
+            self.outer_tty_baseline = termios.tcgetattr(self.outer_tty_fd)
+            self.process = subprocess.Popen(
+                [str(WARM), *extra_args],
+                stdin=parent_slave,
+                stdout=parent_slave,
+                stderr=parent_slave,
+                env=environment,
+            )
+            os.close(parent_slave)
+            self.output_fd = self.parent_master
+        else:
+            self.process = subprocess.Popen(
+                [str(WARM), *extra_args],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=environment,
+            )
+            assert self.process.stdout is not None
+            self.output_fd = self.process.stdout.fileno()
+        os.set_blocking(self.output_fd, False)
+        self.output = bytearray()
+        self.state_path = wait_until(self._find_state, message="state file missing")
+        self.channel = self.state_path.parent.name
+        self.socket_path = self.state_path.parent / "control.sock"
+        self.session_id = "fixture-session"
+
+    def _find_state(self):
+        paths = list((self.root / "codex-idle-compaction").glob("codex-*/state.json"))
+        return paths[0] if paths else None
+
+    def read_state(self):
+        try:
+            return json.loads(self.state_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def output_contains(self, needle):
+        if isinstance(needle, str):
+            needle = needle.encode()
+        while True:
+            ready, _, _ = select.select([self.output_fd], [], [], 0)
+            if not ready:
+                break
+            data = os.read(self.output_fd, 65536)
+            if not data:
+                break
+            self.output.extend(data)
+        return needle in self.output
+
+    def wait_output(self, needle, timeout=5):
+        try:
+            wait_until(lambda: self.output_contains(needle), timeout, f"missing output {needle!r}")
+        except AssertionError as error:
+            raise AssertionError(
+                f"{error}; state={self.read_state()!r}; output={bytes(self.output)!r}"
+            ) from error
+
+    def ipc(self, message):
+        message = dict(message)
+        message.setdefault("kind", "event")
+        message.setdefault("channel", self.channel)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+            connection.settimeout(2)
+            connection.connect(str(self.socket_path))
+            connection.sendall((json.dumps(message) + "\n").encode())
+            return json.loads(connection.recv(65536).decode())
+
+    def event(self, event, **fields):
+        message = {"event": event, "session_id": self.session_id, **fields}
+        return self.ipc(message)
+
+    def control(self, command, **fields):
+        return self.ipc({"kind": "control", "command": command, **fields})
+
+    def submit_local_byte(self, data=b"x"):
+        if self.parent_master is not None:
+            os.write(self.parent_master, data)
+        else:
+            assert self.process.stdin is not None
+            self.process.stdin.write(data)
+            self.process.stdin.flush()
+
+    def set_size(self, rows, columns):
+        assert self.parent_master is not None
+        fcntl.ioctl(self.parent_master, termios.TIOCSWINSZ,
+                    struct.pack("HHHH", rows, columns, 0, 0))
+
+    def stop_and_bind(self):
+        self.event("session-start")
+        self.event("stop", stop_hook_active=False)
+
+    def close(self):
+        if self.process.poll() is None:
+            try:
+                self.event("session-end")
+            except (OSError, ConnectionError, json.JSONDecodeError):
+                pass
+            if self.process.stdin is not None:
+                try:
+                    self.process.stdin.close()
+                except OSError:
+                    pass
+            elif self.parent_master is not None:
+                self.process.send_signal(signal.SIGTERM)
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.send_signal(signal.SIGTERM)
+                self.process.wait(timeout=5)
+        if self.process.stdin is not None:
+            try:
+                self.process.stdin.close()
+            except OSError:
+                pass
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        if self.parent_master is not None:
+            self.output_contains(b"")
+            try:
+                self.outer_tty_after = termios.tcgetattr(self.outer_tty_fd)
+            except OSError:
+                self.outer_tty_after = None
+            os.close(self.parent_master)
+            self.parent_master = None
+        if self.outer_tty_fd is not None:
+            os.close(self.outer_tty_fd)
+            self.outer_tty_fd = None
+        shutil.rmtree(self.root, ignore_errors=True)
+
+
+class CodexWarmTests(unittest.TestCase):
+    def setUp(self):
+        self.sessions = []
+        loader = importlib.machinery.SourceFileLoader("codex_warm_test_module", str(WARM))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.module = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.module)
+
+    def tearDown(self):
+        for session in reversed(self.sessions):
+            session.close()
+
+    def make_session(self, **kwargs):
+        session = Session(**kwargs)
+        self.sessions.append(session)
+        return session
+
+    # -- Gate logic --
+
+    def test_gate_skips_token_check_when_tokens_unknown(self):
+        """The None-token MVP path must not block compaction."""
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.enabled = True
+        supervisor.status = "idle"
+        supervisor.compacting = False
+        supervisor.session_id = "test-session"
+        supervisor.last_normal_stop = time.time() - 5
+        supervisor.last_lifecycle_activity = None
+        supervisor.last_local_input = None
+        supervisor.current_tokens = None
+        supervisor.dirty = True
+        supervisor.pid = os.getpid()
+        supervisor.master_fd = 0
+        supervisor.child_tty = None
+        with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
+            reason = supervisor._gate_reason("compact")
+        self.assertIsNone(reason)
+
+    def test_gate_rejects_when_tokens_below_threshold(self):
+        """Known low token count must block compaction."""
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.enabled = True
+        supervisor.status = "idle"
+        supervisor.compacting = False
+        supervisor.session_id = "test-session"
+        supervisor.last_normal_stop = time.time() - 5
+        supervisor.last_lifecycle_activity = None
+        supervisor.last_local_input = None
+        supervisor.current_tokens = 5000
+        supervisor.dirty = True
+        supervisor.pid = os.getpid()
+        supervisor.master_fd = 0
+        supervisor.child_tty = None
+        with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
+            reason = supervisor._gate_reason("compact")
+        self.assertEqual(reason, "below-token-threshold")
+
+    def test_gate_passes_when_tokens_above_threshold(self):
+        """Known sufficient token count must pass gate."""
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.enabled = True
+        supervisor.status = "idle"
+        supervisor.compacting = False
+        supervisor.session_id = "test-session"
+        supervisor.last_normal_stop = time.time() - 5
+        supervisor.last_lifecycle_activity = None
+        supervisor.last_local_input = None
+        supervisor.current_tokens = 100000
+        supervisor.dirty = True
+        supervisor.pid = os.getpid()
+        supervisor.master_fd = 0
+        supervisor.child_tty = None
+        with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
+            reason = supervisor._gate_reason("compact")
+        self.assertIsNone(reason)
+
+    def test_gate_rejects_cold_cache(self):
+        """Compaction after TTL expiry is pointless."""
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.enabled = True
+        supervisor.status = "idle"
+        supervisor.compacting = False
+        supervisor.session_id = "test-session"
+        supervisor.last_normal_stop = time.time() - 99999
+        supervisor.last_lifecycle_activity = None
+        supervisor.last_local_input = None
+        supervisor.current_tokens = None
+        supervisor.dirty = True
+        supervisor.pid = os.getpid()
+        supervisor.master_fd = 0
+        supervisor.child_tty = None
+        with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
+            reason = supervisor._gate_reason("compact")
+        self.assertEqual(reason, "cache-already-cold")
+
+    def test_gate_rejects_clean_session(self):
+        """No dirty turns means nothing to compact."""
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.enabled = True
+        supervisor.status = "idle"
+        supervisor.compacting = False
+        supervisor.session_id = "test-session"
+        supervisor.last_normal_stop = time.time() - 5
+        supervisor.last_lifecycle_activity = None
+        supervisor.last_local_input = None
+        supervisor.current_tokens = None
+        supervisor.dirty = False
+        supervisor.pid = os.getpid()
+        supervisor.master_fd = 0
+        supervisor.child_tty = None
+        with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
+            reason = supervisor._gate_reason("compact")
+        self.assertEqual(reason, "clean")
+
+    # -- Full PTY submission --
+
+    def test_arguments_and_full_pty_submission(self):
+        session = self.make_session(delay=0, extra_args=("--model", "test"))
+        session.wait_output("ARGS:['--model', 'test']")
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        self.assertEqual(session.read_state()["compacting"], True)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+        state = session.read_state()
+        self.assertIsNone(state["timer_deadline"])
+        self.assertEqual(state["last_injection_result"], "succeeded")
+        self.assertEqual(state["last_state_transition"], "compaction-completed")
+
+    def test_later_normal_turn_arms_a_fresh_timer(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED", timeout=3)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+        session.event("user-prompt-submit")
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["timer_deadline"] is not None,
+            message="later normal turn did not arm a fresh timer",
+        )
+        self.assertTrue(session.read_state()["dirty"])
+
+    # -- Event handler --
+
+    def test_stop_failure_clears_compacting_and_preserves_dirty(self):
+        session = self.make_session(delay=0)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        session.event("stop-failure")
+        wait_until(
+            lambda: session.read_state()
+            and not session.read_state()["compacting"]
+            and session.read_state()["status"] == "error"
+        )
+        self.assertTrue(session.read_state()["dirty"])
+
+    def test_session_end_releases(self):
+        session = self.make_session(delay=10)
+        session.stop_and_bind()
+        result = session.event("session-end")
+        self.assertTrue(result["ok"])
+        state = session.read_state()
+        self.assertEqual(state["status"], "ended")
+
+    def test_duplicate_stop_is_ignored(self):
+        session = self.make_session(delay=10)
+        session.stop_and_bind()
+        result = session.event("stop", stop_hook_active=False)
+        self.assertEqual(result.get("ignored"), "duplicate-stop")
+
+    def test_session_replacement_resets_state(self):
+        session = self.make_session(delay=10)
+        session.event("session-start")
+        session.event("stop", stop_hook_active=False)
+        session.session_id = "replacement-session"
+        result = session.event("session-start")
+        self.assertTrue(result["ok"])
+        state = session.read_state()
+        self.assertEqual(state["session_id"], "replacement-session")
+        self.assertFalse(state["dirty"])
+
+    def test_stop_with_hook_active_is_ignored(self):
+        session = self.make_session(delay=10)
+        session.event("session-start")
+        result = session.event("stop", stop_hook_active=True)
+        self.assertEqual(result.get("ignored"), "stop-hook-active")
+
+    # -- Input cancellation --
+
+    def test_local_keystroke_cancels(self):
+        session = self.make_session(delay=1)
+        session.stop_and_bind()
+        session.submit_local_byte(b"draft")
+        try:
+            wait_until(
+                lambda: session.read_state()
+                and session.read_state()["last_cancellation_reason"] == "user-input"
+            )
+        except AssertionError as error:
+            raise AssertionError(
+                f"{error}; state={session.read_state()!r}; output={bytes(session.output)!r}"
+            ) from error
+        time.sleep(1.3)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    # -- Terminal resize --
+
+    def test_resize_signal_reaches_child(self):
+        session = self.make_session(terminal=True)
+        session.wait_output("SIZE:")
+        session.set_size(55, 123)
+        session.process.send_signal(signal.SIGWINCH)
+        session.wait_output("SIZE:55x123")
+
+    # -- Control interface --
+
+    def test_control_state(self):
+        session = self.make_session(delay=10)
+        session.stop_and_bind()
+        result = session.control("state")
+        self.assertTrue(result["ok"])
+        self.assertIn("channel", result["state"])
+        self.assertEqual(result["state"]["channel"], session.channel)
+
+    def test_control_disable_enable(self):
+        session = self.make_session(delay=10)
+        session.stop_and_bind()
+        session.control("disable")
+        state = session.read_state()
+        self.assertIsNone(state["timer_deadline"])
+        session.control("enable")
+        state = session.read_state()
+        self.assertTrue(state.get("timer_deadline") is not None or state["last_cancellation_reason"] == "session-disabled")
+
+    def test_control_trigger(self):
+        session = self.make_session(delay=999)
+        session.stop_and_bind()
+        result = session.control("trigger")
+        self.assertTrue(result["ok"])
+        session.wait_output("COMPACT_RECEIVED")
+
+    def test_control_inject_only_compact_allowed(self):
+        session = self.make_session(delay=999)
+        session.stop_and_bind()
+        result = session.control("inject", text="/help")
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "inject-command-refused")
+
+    # -- Herdr integration --
+
+    def test_herdr_reporter_is_inert_outside_herdr(self):
+        with mock.patch.dict(
+            os.environ,
+            {"HERDR_ENV": "0", "CODEX_WARM_HERDR_AGENT": "Luna"},
+            clear=False,
+        ):
+            reporter = self.module.HerdrReporter()
+            self.assertFalse(reporter.enabled)
+
+    def test_herdr_registration_uses_codex_source(self):
+        root = pathlib.Path(tempfile.mkdtemp(prefix="cxw-herdr-", dir="/tmp"))
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        socket_path = root / "herdr.sock"
+        requests = []
+        stop = threading.Event()
+        server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        server.bind(str(socket_path))
+        server.listen(8)
+        server.setblocking(False)
+
+        def serve():
+            while not stop.is_set():
+                ready, _, _ = select.select([server], [], [], 0.05)
+                if not ready:
+                    continue
+                try:
+                    connection, _ = server.accept()
+                except OSError:
+                    if stop.is_set():
+                        return
+                    raise
+                with connection:
+                    payload = connection.recv(8192).splitlines()[0]
+                    requests.append(json.loads(payload.decode("utf-8")))
+                    connection.sendall(b'{"result":{}}\n')
+
+        thread = threading.Thread(target=serve, daemon=True)
+        thread.start()
+        self.addCleanup(stop.set)
+        self.addCleanup(server.close)
+        with mock.patch.dict(
+            os.environ,
+            {
+                "HERDR_ENV": "1",
+                "HERDR_SOCKET_PATH": str(socket_path),
+                "HERDR_PANE_ID": "w4:pP",
+                "CODEX_WARM_HERDR_AGENT": "Luna",
+            },
+            clear=False,
+        ):
+            reporter = self.module.HerdrReporter()
+            reporter.child_pid = 12345
+            reporter.report("working", "fixture-session")
+            reporter.report("idle", "fixture-session")
+            reporter.release()
+        wait_until(lambda: len(requests) >= 7, message="Herdr requests were not received")
+        methods = [request["method"] for request in requests]
+        self.assertIn("pane.report_agent_session", methods)
+        self.assertIn("pane.report_agent", methods)
+        self.assertIn("pane.report_metadata", methods)
+        self.assertEqual(methods[-1], "pane.release_agent")
+        for request in requests:
+            params = request["params"]
+            self.assertEqual(params["pane_id"], "w4:pP")
+            self.assertEqual(params["source"], "codex-warm")
+            self.assertEqual(params["agent"], "Luna")
+        metadata = next(
+            request["params"]
+            for request in requests
+            if request["method"] == "pane.report_metadata"
+        )
+        self.assertEqual(metadata["display_agent"], "Luna")
+        self.assertEqual(metadata["tokens"]["codex_pid"], "12345")
+        self.assertEqual(metadata["tokens"]["pty_owner"], "codex-warm")
+
+    # -- Input classifier --
+
+    def test_input_classifier_keyboard(self):
+        classifier = self.module.TerminalInputClassifier()
+        events = classifier.feed(b"hello")
+        self.assertEqual(len(events), 1)
+        kind, length, human = events[0]
+        self.assertEqual(kind, "keyboard-input")
+        self.assertEqual(length, 5)
+        self.assertTrue(human)
+
+    def test_input_classifier_bracketed_paste(self):
+        classifier = self.module.TerminalInputClassifier()
+        events = classifier.feed(b"\x1b[200~")
+        kinds = [kind for kind, _, _ in events]
+        self.assertIn("bracketed-paste-start", kinds)
+        events2 = classifier.feed(b"pasted text\x1b[201~")
+        kinds2 = [kind for kind, _, _ in events2]
+        self.assertIn("bracketed-paste-payload", kinds2)
+        self.assertIn("bracketed-paste-end", kinds2)
+
+    def test_input_classifier_escape_sequence(self):
+        classifier = self.module.TerminalInputClassifier()
+        events = classifier.feed(b"\x1b[A")
+        self.assertEqual(len(events), 1)
+        kind, length, human = events[0]
+        self.assertEqual(kind, "escape-sequence")
+        self.assertFalse(human)
+
+    # -- Exit code forwarding --
+
+    def test_exit_code_forwarded(self):
+        session = self.make_session(extra_args=("--exit-status=7",))
+        session.wait_output("ARGS:")
+        session.process.wait(timeout=5)
+        self.assertEqual(session.process.returncode, 7)
+
+    # -- Help output --
+
+    def test_help_flag(self):
+        result = subprocess.run(
+            [str(WARM), "--help"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("codex-warm", result.stdout)
+        self.assertIn("CODEX_IDLE_COMPACT_SECONDS", result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
