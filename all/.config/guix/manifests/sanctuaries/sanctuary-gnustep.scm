@@ -22,7 +22,10 @@
    ;; No gcc-objc in Guix → the runtime is clang + libobjc2 (ng-gnu-gnu combo).
    "clang-toolchain" ; Objective-C compiler for the ng runtime
    "libobjc2"       ; GNUstep ObjC2 runtime (2.2.1)
+   "autoconf"       ; Emacs' Git checkout generates configure via autogen.sh
+   "texinfo"        ; Emacs configure requires makeinfo for the manual tree
    "make"           ; GNU make (gnustep-make is built from source, 2.9.3)
+   "ncurses"        ; Emacs configure and terminal support need tputs
    "pkg-config"
    "tar" "gzip"     ; install steps (manpage compression) need them in-guest
    "libffi"         ; NSInvocation / DO forwarding
