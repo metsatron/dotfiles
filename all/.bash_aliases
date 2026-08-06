@@ -52,6 +52,9 @@ alias gr='git rm'
 alias clone='git clone'
 # Fleet multiplexer picker (tmux + Zellij)
 alias mux='mux-session'
+# Reattach when the enclosing terminal crashes mid-session and HERDR_ENV is
+# still set in the new shell (herdr would otherwise refuse as "nested").
+alias herdr-restore='HERDR_ENV=0 herdr'
 alias ..='cd ..'
 alias ...='cd ../..'
 alias update='sudo apt update && sudo apt upgrade'
@@ -181,10 +184,17 @@ alias glib-compile-schemas='hostenv glib-compile-schemas'
 # HelmCortex root, --telegram channel support); an alias shadows PATH in
 # interactive zsh and would strand --telegram at the claude CLI. The any-dir
 # advised shortcut lives on as cco.
-alias claude-sonnet='CLAUDE_WARM_HERDR_AGENT=Sonnet claude-warm --model claude-sonnet-4-6 --advisor claude-opus-5'
+alias claude-sonnet='CLAUDE_WARM_HERDR_AGENT=Sonnet claude-warm --model claude-sonnet-4-6 --advisor claude-opus-5 --reasoning-effort xhigh'
 alias cch='CLAUDE_WARM_HERDR_AGENT=Haiku claude-warm --model claude-haiku-4-5'
 alias ccs='claude-sonnet'
-alias cco='claude-warm --model claude-opus-4-6 --advisor claude-opus-5'
+alias cco='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --reasoning-effort xhigh'
+
+# Codex model shortcuts — PTY-supervised through codex-warm (idle-compaction
+# governor). NOTE: no codex-astra alias here — that name belongs to the
+# canonical HelmCortex/FORGE/bin/codex-astra launcher (HelmAstra brain dir,
+# --telegram channel support planned).
+alias codex-luna='CODEX_WARM_HERDR_AGENT=Luna codex-warm --model gpt-5.6-luna --reasoning-effort extra-high'
+alias cxl='codex-luna'
 
 # ttyd web terminal server
 alias ttyd-serve='ttyd --writable --port 7681 zsh'
