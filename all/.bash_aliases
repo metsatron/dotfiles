@@ -191,11 +191,23 @@ alias cco='claude-warm --model claude-opus-4-8 --advisor claude-opus-5 --effort 
 alias cco46='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --effort xhigh'
 
 # Codex model shortcuts — PTY-supervised through codex-warm (idle-compaction
-# governor). NOTE: no codex-helmastra alias here — that name belongs to the
-# canonical HelmCortex/FORGE/bin/codex-helmastra launcher (HelmAstra brain dir,
+# governor). Codex 0.147.0 has no native --yolo alias: the explicit dangerous
+# flag bypasses both approvals and sandboxing. Keep workspace-write/no-approval
+# as the normal path, and make --yolo an intentional wrapper-only selector.
+# NOTE: no codex-helmastra alias here — that name belongs to the canonical
+# HelmCortex/FORGE/bin/codex-helmastra launcher (HelmAstra brain dir,
 # --telegram channel support planned).
-alias codex-luna='CODEX_WARM_HERDR_AGENT=Luna codex-warm --model gpt-5.6-luna --sandbox workspace-write --ask-for-approval on-request'
-alias cxl='codex-luna'
+codex_luna() {
+  local codex_mode=(--sandbox workspace-write --ask-for-approval never)
+  if [[ "${1:-}" == "--yolo" ]]; then
+    codex_mode=(--dangerously-bypass-approvals-and-sandbox)
+    shift
+  fi
+  CODEX_WARM_HERDR_AGENT=Luna codex-warm \
+    --model gpt-5.6-luna "${codex_mode[@]}" "$@"
+}
+alias codex-luna='codex_luna'
+alias cxl='codex_luna'
 
 # ttyd web terminal server
 alias ttyd-serve='ttyd --writable --port 7681 zsh'
