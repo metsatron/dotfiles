@@ -11,6 +11,15 @@ The default values match the Emacs governor heuristic: 27 minutes idle before co
 
 This is a standalone adaptation of =claude-warm='s architecture. It reuses the patterns (PTY supervisor, lifecycle socket, idle timer, compaction gate, Herdr integration) but is its own file. The two supervisors diverge in: channel prefix (=codex-= vs =claude-=), environment namespace (=CODEX_IDLE_*= vs =CLAUDE_IDLE_*=), Herdr agent label, absence of transcript inotify, absence of cache profiles, and absence of channel guard.
 
+Herdr identity is registered from the supervisor, but Codex lifecycle hooks do not
+own Herdr state. The supervisor's PTY proxy copies every child byte unchanged to
+the outer pane and a small screen-stream classifier mirrors the installed Codex
+detector's visible spinner, prompt, and blocker evidence. That adapter is only a
+fallback for Herdr's process detector: it is driven by PTY output, never by the
+Codex lifecycle socket or hook events. This matters because Herdr sees the outer
+Python supervisor as the foreground process while the nested Codex child owns the
+inner PTY.
+
 * codex-warm script
 #+BEGIN_SRC python :tangle all/.local/bin/codex-warm :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755) :comments no
 """PTY-owning Codex launcher and per-session idle-compaction supervisor."""
@@ -110,6 +119,7 @@ HERDR_HEARTBEAT_SECONDS = env_float(
 HERDR_REGISTRATION_TTL_MS = env_int(
     "CODEX_WARM_HERDR_REGISTRATION_TTL_MS", 120000, 1000
 )
+HERDR_SCREEN_BYTES = 128 * 1024
 
 
 def append_debug(path: pathlib.Path, message: str) -> None:
@@ -291,8 +301,88 @@ class TerminalInputClassifier:
         return [self._event("unknown-input", length, True)]
 
 
+class CodexScreenClassifier:
+    """Classify visible Codex PTY output without consuming or rewriting it."""
+
+    SPINNER_RE = re.compile(r"(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)")
+    OSC_TITLE_RE = re.compile(
+        r"\x1b\](?:0|1|2);(.*?)(?:\x07|\x1b\\)", re.DOTALL
+    )
+    ANSI_RE = re.compile(
+        r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])"
+    )
+    STRONG_BLOCKERS = (
+        "press enter to confirm or esc to cancel",
+        "enter to submit answer",
+        "enter to submit all",
+        "allow command?",
+    )
+
+    def __init__(self) -> None:
+        self.raw = bytearray()
+        self.osc_title = ""
+        self.state: str | None = None
+
+    def reset(self) -> None:
+        self.raw.clear()
+        self.osc_title = ""
+        self.state = None
+
+    def _visible_text(self) -> str:
+        text = self.ANSI_RE.sub("", bytes(self.raw).decode("utf-8", "replace"))
+        return "".join(character for character in text if character in "\n\r\t" or ord(character) >= 0x20)
+
+    def _classify(self, visible: str) -> str:
+        title = self.osc_title
+        if "Action Required" in title:
+            return "blocked"
+        if self.SPINNER_RE.search(title):
+            return "working"
+
+        recent = visible[-HERDR_SCREEN_BYTES:]
+        lowered = recent.lower()
+        if any(marker in lowered for marker in self.STRONG_BLOCKERS):
+            return "blocked"
+        if "[y/n]" in lowered or "yes (y)" in lowered:
+            return "blocked"
+        if (
+            "do you want to" in lowered
+            and ("yes" in lowered or "❯" in recent)
+        ) or (
+            "would you like to" in lowered
+            and ("yes" in lowered or "❯" in recent)
+        ):
+            return "blocked"
+
+        lines = [line.strip() for line in recent.splitlines() if line.strip()]
+        bottom = "\n".join(lines[-3:])
+        if (
+            re.search(r"^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$", bottom, re.MULTILINE)
+            and "■ Conversation interrupted" not in bottom
+        ):
+            return "working"
+        if title.strip():
+            return "idle"
+        return "unknown"
+
+    def feed(self, data: bytes) -> str | None:
+        if not data:
+            return None
+        self.raw.extend(data)
+        if len(self.raw) > HERDR_SCREEN_BYTES:
+            del self.raw[:-HERDR_SCREEN_BYTES]
+        titles = list(self.OSC_TITLE_RE.finditer(bytes(self.raw).decode("utf-8", "replace")))
+        if titles:
+            self.osc_title = titles[-1].group(1)
+        state = self._classify(self._visible_text())
+        if state == self.state:
+            return None
+        self.state = state
+        return state
+
+
 class HerdrReporter:
-    """Report one supervisor-owned Codex session through Herdr's pane API."""
+    """Register identity and optionally report PTY-derived state through Herdr."""
 
     def __init__(self) -> None:
         socket_path = os.environ.get("HERDR_SOCKET_PATH", "")
@@ -317,6 +407,7 @@ class HerdrReporter:
         self.last_error: str | None = None
         self.next_heartbeat = 0.0
         self.child_pid: int | None = None
+        self.agent_session_id: str | None = None
 
     def state(self) -> dict[str, object]:
         return {
@@ -329,6 +420,7 @@ class HerdrReporter:
             "herdr_last_report_state": self.last_report_state,
             "herdr_last_error": self.last_error,
             "herdr_child_pid": self.child_pid,
+            "herdr_agent_session_id": self.agent_session_id,
         }
 
     @staticmethod
@@ -364,33 +456,25 @@ class HerdrReporter:
             self.last_error = type(error).__name__
             return False
 
-    def report(
-        self,
-        state: str,
-        session_id: object = None,
-    ) -> None:
-        if not self.enabled or state not in {"idle", "working", "blocked", "done", "unknown"}:
-            return
-        wire_state = "idle" if state == "done" else state
-        safe_session_id = self._valid_session_id(session_id)
+    def _base(self, session_id: object = None) -> dict[str, object]:
         base = {
             "pane_id": self.pane_id,
             "source": self.source,
             "agent": self.agent,
         }
+        safe_session_id = self._valid_session_id(session_id)
         if safe_session_id:
             base["agent_session_id"] = safe_session_id
-            self._send("pane.report_agent_session", dict(base))
-        report = dict(base)
-        report["state"] = wire_state
-        self._send("pane.report_agent", report)
+        return base
+
+    def _metadata(self) -> dict[str, object]:
         tokens = {
             "supervisor_pid": str(os.getpid()),
             "pty_owner": "codex-warm",
         }
         if isinstance(self.child_pid, int) and self.child_pid > 0:
             tokens["codex_pid"] = str(self.child_pid)
-        metadata = {
+        return {
             "pane_id": self.pane_id,
             "source": self.source,
             "agent": self.agent,
@@ -398,15 +482,39 @@ class HerdrReporter:
             "tokens": tokens,
             "ttl_ms": HERDR_REGISTRATION_TTL_MS,
         }
-        success = self._send("pane.report_metadata", metadata)
+
+    def register(self, session_id: object = None) -> None:
+        """Refresh identity/metadata; this path never sends a state update."""
+        if not self.enabled:
+            return
+        safe_session_id = self._valid_session_id(session_id)
+        base = self._base(safe_session_id)
+        if safe_session_id and safe_session_id != self.agent_session_id:
+            self._send("pane.report_agent_session", dict(base))
+            self.agent_session_id = safe_session_id
+        success = self._send("pane.report_metadata", self._metadata())
         self.registered = success or self.registered
         self.last_report_at = now()
-        self.last_report_state = state
         self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
 
-    def heartbeat(self, state: str, session_id: object = None) -> None:
+    def report_state(self, state: str, session_id: object = None) -> None:
+        """Report only a state derived from PTY output, never from a hook event."""
+        if not self.enabled or state not in {"idle", "working", "blocked", "unknown"}:
+            return
+        self.register(session_id)
+        report = self._base(session_id)
+        report["state"] = state
+        self._send("pane.report_agent", report)
+        self.last_report_state = state
+        self.last_report_at = now()
+        self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
+
+    def heartbeat(self, state: str | None = None, session_id: object = None) -> None:
         if self.enabled and monotonic() >= self.next_heartbeat:
-            self.report(state, session_id)
+            if state in {"idle", "working", "blocked", "unknown"}:
+                self.report_state(state, session_id)
+            else:
+                self.register(session_id)
 
     def release(self) -> None:
         if not self.enabled or self.socket_path is None:
@@ -473,6 +581,8 @@ class Supervisor:
         self.shutdown_requested = False
         self.child_exited_at: float | None = None
         self.herdr = HerdrReporter()
+        self.screen_classifier = CodexScreenClassifier()
+        self.screen_state: str | None = None
         self._write_state()
 
     def state(self) -> dict:
@@ -501,6 +611,7 @@ class Supervisor:
             "last_injection_result": self.last_injection_result,
             "last_state_transition": self.last_state_transition,
             "debug_log": str(self.debug_log_path),
+            "herdr_screen_state": self.screen_state,
             **self.herdr.state(),
         }
 
@@ -513,8 +624,13 @@ class Supervisor:
         except OSError as error:
             self._debug(f"state-write-failed channel={short_id(self.channel)} error={error}")
 
-    def _report_herdr(self, state: str) -> None:
-        self.herdr.report(state, self.session_id)
+    def _register_herdr(self) -> None:
+        self.herdr.register(self.session_id)
+        self._write_state()
+
+    def _report_screen_state(self, state: str) -> None:
+        self.screen_state = state
+        self.herdr.report_state(state, self.session_id)
         self._write_state()
 
     def _bound_debug_log(self) -> None:
@@ -670,7 +786,7 @@ class Supervisor:
         self._install_signals()
         self._install_terminal()
         self.herdr.child_pid = pid
-        self._report_herdr("working")
+        self._register_herdr()
         self._write_state()
 
     def _read_child_tty(self) -> str | None:
@@ -805,8 +921,10 @@ class Supervisor:
                 self.compaction_ignore_next_stop = False
             self.session_id = session_id
             self.status = "starting"
+            self.screen_classifier.reset()
+            self.screen_state = None
             self.last_lifecycle_activity = now()
-            self._report_herdr("idle")
+            self._register_herdr()
             self._write_state()
             return {"ok": True}
         if self.session_id != session_id:
@@ -839,7 +957,6 @@ class Supervisor:
             self.last_local_input = None
             self.cancel("new-normal-turn")
             self.arm()
-            self._report_herdr("idle")
             return {"ok": True}
         if event == "user-prompt-submit":
             self.status = "active"
@@ -875,12 +992,6 @@ class Supervisor:
             self.status = "active"
             self.last_lifecycle_activity = current
             self.cancel("session-activity")
-        if event == "post-compact":
-            self._report_herdr("idle")
-        elif event == "stop-failure":
-            self._report_herdr("blocked")
-        elif event in {"user-prompt-submit", "session-activity"}:
-            self._report_herdr("working")
         self._write_state()
         return {"ok": True}
 
@@ -996,11 +1107,14 @@ class Supervisor:
             return True
         if not data:
             return False
+        state = self.screen_classifier.feed(data)
         try:
             write_all(sys.stdout.fileno(), data)
             sys.stdout.flush()
         except OSError:
             self.shutdown_requested = True
+        if state is not None:
+            self._report_screen_state(state)
         return True
 
     def _child_has_exited(self) -> bool:
@@ -1016,22 +1130,8 @@ class Supervisor:
             self.child_exited_at = now()
             self.status = "exited"
             self.cancel("process-exit")
-            self.herdr.report("done", self.session_id)
             return True
         return False
-
-    def _herdr_state(self) -> str:
-        if self.status == "active":
-            return "working"
-        if self.status == "starting":
-            return "idle"
-        if self.status == "idle":
-            return "idle"
-        if self.status in {"error", "blocked"}:
-            return "blocked"
-        if self.status in {"exited", "ended"}:
-            return "idle"
-        return "unknown"
 
     def run(self) -> int:
         self.launch()
@@ -1040,7 +1140,7 @@ class Supervisor:
         try:
             while master_open:
                 child_exited = self._child_has_exited()
-                self.herdr.heartbeat(self._herdr_state(), self.session_id)
+                self.herdr.heartbeat(self.screen_state, self.session_id)
                 self._flush_input_classifier()
                 if self.timer_deadline is not None and now() >= self.timer_deadline:
                     generation = self.timer_generation
