@@ -194,7 +194,7 @@ alias cco46='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --effor
 # governor). NOTE: no codex-helmastra alias here — that name belongs to the
 # canonical HelmCortex/FORGE/bin/codex-helmastra launcher (HelmAstra brain dir,
 # --telegram channel support planned).
-alias codex-luna='CODEX_WARM_HERDR_AGENT=Luna codex-warm --model gpt-5.6-luna'
+alias codex-luna='CODEX_WARM_HERDR_AGENT=Luna codex-warm --model gpt-5.6-luna --sandbox workspace-write --ask-for-approval on-request'
 alias cxl='codex-luna'
 
 # ttyd web terminal server
