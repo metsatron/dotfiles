@@ -183,13 +183,12 @@ alias glib-compile-schemas='hostenv glib-compile-schemas'
 # HelmCortex/FORGE/bin/claude-opus launcher (identity session in the
 # HelmCortex root, --telegram channel support); an alias shadows PATH in
 # interactive zsh and would strand --telegram at the claude CLI. The any-dir
-# advised shortcut lives on as cco.
+# advised shortcut lives on as cco (now 4.8).
 alias claude-sonnet='CLAUDE_WARM_HERDR_AGENT=Sonnet claude-warm --model claude-sonnet-4-6 --advisor claude-opus-5 --effort xhigh'
 alias cch='CLAUDE_WARM_HERDR_AGENT=Haiku claude-warm --model claude-haiku-4-5'
 alias ccs='claude-sonnet'
-alias cco='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --effort xhigh'
-alias claude-opus-48='CLAUDE_WARM_HERDR_AGENT=Opus claude-warm --model claude-opus-4-8 --effort xhigh'
-alias cco8='claude-opus-48'
+alias cco='claude-warm --model claude-opus-4-8 --advisor claude-opus-5 --effort xhigh'
+alias cco46='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --effort xhigh'
 
 # Codex model shortcuts — PTY-supervised through codex-warm (idle-compaction
 # governor). NOTE: no codex-helmastra alias here — that name belongs to the
