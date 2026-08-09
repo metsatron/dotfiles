@@ -11,8 +11,17 @@ if [ -n "${LD_PRELOAD:-}" ] && [[ "$LD_PRELOAD" == *libgtk3-nocsd.so.0* ]]; then
   fi
 fi
 
-# Core PATH entries
-export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/local/sbin:$PATH"
+# Core PATH entries.  Cortex gets guest-native replacements for the host
+# cargo tools, so detect it before adding ~/.cargo/bin to PATH.
+case "${HOME:-}" in
+  */.local/share/dotcortex/guests/sanctuary-cortex/home)
+    export DOTCORTEX_SANCTUARY_GUEST=1
+    export PATH="$HOME/.local/bin:/usr/local/bin:/usr/local/sbin:$PATH"
+    ;;
+  *)
+    export PATH="$HOME/.local/bin:$HOME/.cargo/bin:/usr/local/bin:/usr/local/sbin:$PATH"
+    ;;
+esac
 
 # Homebrew / Linuxbrew
 if [ -d "/home/linuxbrew/.linuxbrew/bin" ]; then

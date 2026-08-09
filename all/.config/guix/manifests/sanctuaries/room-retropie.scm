@@ -41,6 +41,7 @@
              (local packages tyrquake-libretro)           ; local source build: Quake 1 core
              (local packages fbneo-libretro)               ; local source build: CPS / Neo Geo bus
              (local packages px68k-libretro)             ; local: X68000 libretro core
+             (local packages quasi88-libretro)           ; local: PC-88 (QUASI88 libretro core)
              (local packages np2kai)                     ; local: PC-98 (NP2kai/sdlnp21kai)
              (local packages tsugaru))                   ; local: FM-TOWNS (Tsugaru_CUI)
 
@@ -94,6 +95,7 @@
        libretro-tyrquake
        libretro-fbneo
        libretro-px68k
+       libretro-quasi88
        retropie-np2kai
        retropie-tsugaru))
 ;; room-retropie:1 ends here

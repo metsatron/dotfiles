@@ -16,6 +16,11 @@
  '(
    ;; --- Editors ---
    "emacs"
+   ;; Vanilla classic-sanctuary Emacs layer.  The init is projected only into
+   ;; non-Qtile sanctuary homes; these packages are harmless in the shared
+   ;; profile and keep the same Org/Evil surface available in every classic room.
+   "emacs-evil" "emacs-org-modern" "emacs-valign"
+   "emacs-org-appear" "emacs-org-download" "emacs-htmlize"
    "emacs-vterm" "libvterm"
    "emacs-fzf"   "fzf" "fzf-tab"
    "emacs-zoxide" "zoxide"

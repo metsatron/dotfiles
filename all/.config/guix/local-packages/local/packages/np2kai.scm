@@ -87,6 +87,38 @@
                  " -Wno-error=implicit-function-declaration"
                  " -Wno-error=int-conversion")))
              #t))
+         (add-before 'build 'configure-godzilla-xs-sdl2-frontend
+           (lambda _
+             ;; The nested Xephyr room is currently driven through llvmpipe,
+             ;; so keep NP2kai at a fixed integer 2x window scale and use
+             ;; nearest-neighbour filtering for crisp PC-98 pixels.  The
+             ;; emulator keeps its 640x400 logical surface; only the native
+             ;; SDL window is doubled.  This also applies after mode changes.
+             (substitute* "sdl2/scrnmng.c"
+               (("typedef struct \\{")
+                (string-append
+                 "#define NP2_WINDOW_SCALE 2\n\n"
+                 "typedef struct {"))
+               (("scrnmng\\.height, scrnmng\\.width, 0\\)")
+                "scrnmng.height * NP2_WINDOW_SCALE, scrnmng.width * NP2_WINDOW_SCALE, 0)")
+               (("scrnmng\\.width, scrnmng\\.height, 0\\)")
+                "scrnmng.width * NP2_WINDOW_SCALE, scrnmng.height * NP2_WINDOW_SCALE, 0)")
+               (("SDL_SetWindowSize\\(s_window, scrnmng\\.height, width\\)")
+                "SDL_SetWindowSize(s_window, scrnmng.height * NP2_WINDOW_SCALE, width * NP2_WINDOW_SCALE)")
+               (("SDL_SetWindowSize\\(s_window, width, scrnmng\\.height\\)")
+                "SDL_SetWindowSize(s_window, width * NP2_WINDOW_SCALE, scrnmng.height * NP2_WINDOW_SCALE)")
+               (("SDL_SetWindowSize\\(s_window, height, scrnmng\\.width\\)")
+                "SDL_SetWindowSize(s_window, height * NP2_WINDOW_SCALE, scrnmng.width * NP2_WINDOW_SCALE)")
+               (("SDL_SetWindowSize\\(s_window, scrnmng\\.width, height\\)")
+                "SDL_SetWindowSize(s_window, scrnmng.width * NP2_WINDOW_SCALE, height * NP2_WINDOW_SCALE)")
+               (("s_renderer = SDL_CreateRenderer\\(s_window, -1, 0\\);")
+                (string-append
+                 "SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, \"0\");\n\t"
+                 "s_renderer = SDL_CreateRenderer(s_window, -1, 0);")))
+             (substitute* "sdl2/sysmenu.str"
+               (("[ \\t]*\\{str_exit,[ \\t]+NULL,[ \\t]+MID_EXIT,[ \\t]+MENU_DELETED\\}\\}")
+                "{str_exit, NULL, MID_EXIT, 0}}"))
+             #t))
          (replace 'build
            (lambda _
              ;; gcc-toolchain provides gcc/g++ but no bare `cc` alias here.
@@ -102,12 +134,12 @@
     (native-inputs (list pkg-config))
     (inputs (list sdl2 sdl2-mixer sdl2-ttf))
     (supported-systems '("x86_64-linux"))
-    (synopsis "PC-98 emulator — Neko Project II kai (NP2kai)")
+    (synopsis "PC-98 emulator — Neko Project II kai (NP2kai), integer 2x SDL2 frontend")
     (description
      "NP2kai is the actively-maintained Neko Project II kai lineage of the
 NEC PC-9800 series emulator, continuing NP21/W revision merges.  Produces the
-np2kai SDL2 frontend.  PC-98 BIOS files must be supplied separately — none
-are bundled.")
+np2kai SDL2 frontend with a fixed integer 2x nearest-neighbour display scale.
+PC-98 BIOS files must be supplied separately — none are bundled.")
     (home-page "https://github.com/AZO234/NP2kai")
     (license license:expat)))
 ;; retropie-np2kai (PC-98, from source):1 ends here
