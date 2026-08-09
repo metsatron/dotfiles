@@ -186,7 +186,9 @@
    "plocate"
    "wmctrl"
    ;; --- Fonts ---
-   ;; powerline/nerd fonts are not packaged in Guix; handled by font injection.
+   "font-nerd-symbols"
+   "font-nerd-fira-code"
+   "font-nerd-jetbrains-mono"
    "font-google-noto-emoji"
    "font-dejavu"
    ))))

@@ -1,0 +1,202 @@
+#!/bin/bash
+# [[file:../../../sanctuary-cortex.org::*Private migration bridges][Private migration bridges:6]]
+set -euo pipefail
+
+if [[ -z "${SANCTUARY_HOST_HOME:-}" ]]; then
+  case "$HOME" in
+    */.local/share/dotcortex/guests/*/home)
+      echo "sanctuary-cortex-flatpak-bridge: SANCTUARY_HOST_HOME is required inside a guest" >&2
+      exit 2
+      ;;
+    *) SANCTUARY_HOST_HOME="$HOME" ;;
+  esac
+fi
+
+HOST_HOME="$SANCTUARY_HOST_HOME"
+GUEST_HOME="${SANCTUARY_CORTEX_GUEST_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/dotcortex/guests/sanctuary-cortex/home}"
+STORE="$HOST_HOME/.local/share/flatpak/app"
+DEST="$GUEST_HOME/.local/share/applications"
+WRAPPER="$GUEST_HOME/.local/bin/sanctuary-flatpak-run"
+
+[[ -d "$STORE" ]] || {
+  echo "sanctuary-cortex-flatpak-bridge: host Flatpak store is absent: $STORE" >&2
+  exit 0
+}
+[[ -x "$WRAPPER" ]] || {
+  echo "sanctuary-cortex-flatpak-bridge: missing sanctuary runner: $WRAPPER" >&2
+  exit 1
+}
+
+mkdir -p "$DEST"
+
+# Remove only entries emitted by this bridge. Private XFCE state and public
+# launchers are left untouched, so a Flatpak uninstall cannot erase unrelated
+# application menu entries.
+while IFS= read -r -d '' stale; do
+  if grep -q '^X-Sanctuary-Flatpak=true$' "$stale" 2>/dev/null; then
+    rm -f "$stale"
+  fi
+done < <(find "$DEST" -maxdepth 1 -type f -name 'sanctuary-flatpak-*.desktop' -print0)
+
+trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+mapfile -t desktop_files < <(
+  find -L "$STORE" -type f -path '*/active/export/share/applications/*.desktop' -print \
+    | sort
+)
+
+for source in "${desktop_files[@]}"; do
+  relative="${source#"$STORE"/}"
+  app_id="${relative%%/*}"
+  [[ "$app_id" != "$relative" && -n "$app_id" ]] || continue
+  basename="${source##*/}"
+  target="$DEST/sanctuary-flatpak-${app_id}-${basename}"
+  temporary="$(mktemp "$DEST/.sanctuary-flatpak.XXXXXX.desktop")"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    case "$line" in
+      '[Desktop Entry]')
+        printf '%s\n' "$line" >> "$temporary"
+        printf 'X-Sanctuary-Flatpak=true\n' >> "$temporary"
+        ;;
+      Exec=*)
+        payload="${line#Exec=}"
+        if [[ "$payload" == *"$app_id"* && "$payload" == *'flatpak run'* ]]; then
+          before="${payload%%"$app_id"*}"
+          after="${payload#*"$app_id"}"
+          options="${before#*flatpak run}"
+          options="$(trim "$options")"
+          after="$(trim "$after")"
+          printf 'Exec=%s %s' "$WRAPPER" "$app_id" >> "$temporary"
+          [[ -n "$options" ]] && printf ' %s' "$options" >> "$temporary"
+          [[ -n "$after" ]] && printf ' -- %s' "$after" >> "$temporary"
+          printf '\n' >> "$temporary"
+        else
+          printf 'Exec=%s %s -- %%U\n' "$WRAPPER" "$app_id" >> "$temporary"
+        fi
+        ;;
+      TryExec=*)
+        # The payload's /usr/bin/flatpak path is host-specific and not a
+        # valid executable test inside the guest.
+        ;;
+      *)
+        printf '%s\n' "$line" >> "$temporary"
+        ;;
+    esac
+  done < "$source"
+
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$temporary"
+  fi
+  mv -f "$temporary" "$target"
+done
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database "$DEST" >/dev/null 2>&1 || true
+fi
+
+# Keep links opened by other Cortex applications on the same profile route.
+# The migrated X230 defaults list may still name xfce4-web-browser or the old
+# firedragon-x230 shim; an XDG user override must win over that captured list.
+CORTEX_FIREDRAGON_DESKTOP="sanctuary-flatpak-org.garudalinux.firedragon-org.garudalinux.firedragon.desktop"
+MIMEAPPS="$GUEST_HOME/.config/mimeapps.list"
+mkdir -p "$(dirname "$MIMEAPPS")"
+MIMEAPPS_TMP="$(mktemp "${MIMEAPPS}.XXXXXX")"
+awk -v desktop="$CORTEX_FIREDRAGON_DESKTOP" '
+  function emit_defaults() {
+    print "x-scheme-handler/http=" desktop
+    print "x-scheme-handler/https=" desktop
+    emitted = 1
+  }
+  /^\[Default Applications\]$/ {
+    print
+    in_defaults = 1
+    found_defaults = 1
+    emit_defaults()
+    next
+  }
+  /^\[/ {
+    if (in_defaults && !emitted) emit_defaults()
+    in_defaults = 0
+  }
+  in_defaults && /^x-scheme-handler\/(http|https)=/ { next }
+  { print }
+  END {
+    if (!found_defaults) {
+      print "[Default Applications]"
+      emit_defaults()
+    }
+  }
+' "$MIMEAPPS" 2>/dev/null > "$MIMEAPPS_TMP" || {
+  printf '[Default Applications]\nx-scheme-handler/http=%s\nx-scheme-handler/https=%s\n' \
+    "$CORTEX_FIREDRAGON_DESKTOP" "$CORTEX_FIREDRAGON_DESKTOP" > "$MIMEAPPS_TMP"
+}
+if [[ ! -e "$MIMEAPPS" ]] || ! cmp -s "$MIMEAPPS_TMP" "$MIMEAPPS"; then
+  if [[ -s "$MIMEAPPS" ]]; then
+    mime_backup="${MIMEAPPS}.before-cortex-flatpak.$(date +%Y%m%d-%H%M%S)"
+    cp -a "$MIMEAPPS" "$mime_backup"
+  fi
+  mkdir -p "$(dirname "$MIMEAPPS")"
+  mv -f "$MIMEAPPS_TMP" "$MIMEAPPS"
+else
+  rm -f "$MIMEAPPS_TMP"
+fi
+
+# The X230 panel captures launcher desktop files under ~/.config/xfce4/panel,
+# not under the normal XDG application directory.  The panel therefore keeps
+# the original raw Flatpak Exec= even after the application-menu bridge has
+# projected sanctuary entries.  Rewrite only FireDragon panel launchers so
+# clicks from the migrated panel use the same guest profile as the menu.
+PANEL_ROOT="$GUEST_HOME/.config/xfce4/panel"
+panel_projected=0
+if [[ -d "$PANEL_ROOT" ]]; then
+  while IFS= read -r -d '' panel_source; do
+    grep -q '^X-Flatpak=org.garudalinux.firedragon$' "$panel_source" || continue
+    panel_temporary="$(mktemp "$(dirname "$panel_source")/.cortex-fd.XXXXXX.desktop")"
+    panel_rewritten=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      case "$line" in
+        Exec=*)
+          payload="${line#Exec=}"
+          if [[ "$payload" == *"org.garudalinux.firedragon"* && "$payload" == *'flatpak run'* ]]; then
+            before="${payload%%org.garudalinux.firedragon*}"
+            after="${payload#*org.garudalinux.firedragon}"
+            options="${before#*flatpak run}"
+            options="$(trim "$options")"
+            after="$(trim "$after")"
+            printf 'Exec=%s org.garudalinux.firedragon' "$WRAPPER" >> "$panel_temporary"
+            [[ -n "$options" ]] && printf ' %s' "$options" >> "$panel_temporary"
+            [[ -n "$after" ]] && printf ' -- %s' "$after" >> "$panel_temporary"
+            printf '\n' >> "$panel_temporary"
+            panel_rewritten=1
+          else
+            printf '%s\n' "$line" >> "$panel_temporary"
+          fi
+          ;;
+        *) printf '%s\n' "$line" >> "$panel_temporary" ;;
+      esac
+    done < "$panel_source"
+    if [[ "$panel_rewritten" -eq 1 ]]; then
+      if command -v desktop-file-validate >/dev/null 2>&1; then
+        desktop-file-validate "$panel_temporary"
+      fi
+      panel_backup="${panel_source}.before-cortex-flatpak.$(date +%Y%m%d-%H%M%S)"
+      cp -a "$panel_source" "$panel_backup"
+      mv -f "$panel_temporary" "$panel_source"
+      panel_projected=$((panel_projected + 1))
+    else
+      rm -f "$panel_temporary"
+    fi
+  done < <(find "$PANEL_ROOT" -type f -path '*/launcher-*/*.desktop' -print0)
+fi
+
+printf 'sanctuary-cortex-flatpak-bridge: projected %d desktop files into %s\n' \
+  "${#desktop_files[@]}" "$DEST"
+printf 'sanctuary-cortex-flatpak-bridge: rewrote %d FireDragon panel launchers\n' \
+  "$panel_projected"
+# Private migration bridges:6 ends here
