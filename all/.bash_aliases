@@ -192,13 +192,14 @@ alias cco46='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --effor
 
 # Codex model shortcuts — PTY-supervised through codex-warm (idle-compaction
 # governor). Codex 0.147.0 has no native --yolo alias: the explicit dangerous
-# flag bypasses both approvals and sandboxing. Keep workspace-write/no-approval
-# as the normal path, and make --yolo an intentional wrapper-only selector.
+# flag bypasses both approvals and sandboxing. The normal path inherits the
+# narrow dotcortex-workspace permission profile installed by codex-config-apply;
+# make --yolo an intentional wrapper-only selector.
 # NOTE: no codex-helmastra alias here — that name belongs to the canonical
 # HelmCortex/FORGE/bin/codex-helmastra launcher (HelmAstra brain dir,
 # --telegram channel support planned).
 codex_luna() {
-  local codex_mode=(--sandbox workspace-write --ask-for-approval never)
+  local codex_mode=(--ask-for-approval never)
   if [[ "${1:-}" == "--yolo" ]]; then
     codex_mode=(--dangerously-bypass-approvals-and-sandbox)
     shift
@@ -211,9 +212,9 @@ alias cxl='codex_luna'
 
 # GPT-5.6-Sol shortcut. Reasoning effort is config-only in Codex, so pin both
 # ordinary turns and plan mode to high here while retaining the same safe
-# workspace-write/no-approval default as codex-luna.
+# permission-profile/no-approval default as codex-luna.
 codex_sol() {
-  local codex_mode=(--sandbox workspace-write --ask-for-approval never)
+  local codex_mode=(--ask-for-approval never)
   local codex_reasoning=(--config model_reasoning_effort=high --config plan_mode_reasoning_effort=high)
   if [[ "${1:-}" == "--yolo" ]]; then
     codex_mode=(--dangerously-bypass-approvals-and-sandbox)
