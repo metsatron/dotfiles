@@ -1,0 +1,606 @@
+#!/usr/bin/env python3
+"""Validate DotCortex peer envelopes and probe Herdr in an isolated lab."""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import json
+import os
+import pathlib
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+SCHEMA_NAME = "dotcortex.peer.v1"
+KINDS = {"task", "reply", "delivery", "status", "control"}
+IDENTITY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+LAB_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
+LEASE_SCOPES = {"checkout-write", "upstream-integration"}
+
+
+def emit(payload: object) -> None:
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def canonical_uuid(value: object, field: str, errors: list[str]) -> bool:
+    if not isinstance(value, str):
+        errors.append(f"{field} must be a UUID string")
+        return False
+    try:
+        parsed = uuid.UUID(value)
+    except (ValueError, AttributeError):
+        errors.append(f"{field} is not a valid UUID")
+        return False
+    if str(parsed) != value:
+        errors.append(f"{field} must use canonical lowercase UUID form")
+        return False
+    return True
+
+
+def mapping(value: object, field: str, errors: list[str]) -> dict[str, object]:
+    if not isinstance(value, dict):
+        errors.append(f"{field} must be an object")
+        return {}
+    return value
+
+
+def validate_peer(value: object, field: str, errors: list[str]) -> None:
+    peer = mapping(value, field, errors)
+    required = {"peer_id", "host_id", "provider", "session_id"}
+    missing = sorted(required - set(peer))
+    if missing:
+        errors.append(f"{field} is missing: {', '.join(missing)}")
+        return
+    extras = sorted(set(peer) - required)
+    if extras:
+        errors.append(f"{field} has unsupported fields: {', '.join(extras)}")
+    for key in ("host_id", "provider", "session_id"):
+        component = peer.get(key)
+        if not isinstance(component, str) or not IDENTITY_RE.fullmatch(component):
+            errors.append(f"{field}.{key} is not a safe identity component")
+    expected = "/".join(
+        str(peer.get(key, "")) for key in ("host_id", "provider", "session_id")
+    )
+    if peer.get("peer_id") != expected:
+        errors.append(f"{field}.peer_id must equal host_id/provider/session_id")
+
+
+def validate_timestamp(value: object, errors: list[str]) -> None:
+    if not isinstance(value, str):
+        errors.append("created_at must be a timestamp string")
+        return
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        errors.append("created_at is not an ISO-8601 timestamp")
+        return
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        errors.append("created_at must include a timezone")
+
+
+def validate_envelope(envelope: object) -> list[str]:
+    errors: list[str] = []
+    root = mapping(envelope, "envelope", errors)
+    required = {
+        "schema",
+        "message_id",
+        "kind",
+        "created_at",
+        "from",
+        "to",
+        "in_reply_to",
+        "workspace",
+        "authority",
+        "payload",
+    }
+    optional = {"lease"}
+    missing = sorted(required - set(root))
+    if missing:
+        errors.append(f"envelope is missing: {', '.join(missing)}")
+    extras = sorted(set(root) - required - optional)
+    if extras:
+        errors.append(f"envelope has unsupported fields: {', '.join(extras)}")
+
+    if root.get("schema") != SCHEMA_NAME:
+        errors.append(f"schema must be {SCHEMA_NAME}")
+    canonical_uuid(root.get("message_id"), "message_id", errors)
+    kind = root.get("kind")
+    if kind not in KINDS:
+        errors.append(f"kind must be one of: {', '.join(sorted(KINDS))}")
+    validate_timestamp(root.get("created_at"), errors)
+    validate_peer(root.get("from"), "from", errors)
+    validate_peer(root.get("to"), "to", errors)
+
+    in_reply_to = root.get("in_reply_to")
+    if kind in {"reply", "delivery"}:
+        canonical_uuid(in_reply_to, "in_reply_to", errors)
+    elif in_reply_to is not None:
+        canonical_uuid(in_reply_to, "in_reply_to", errors)
+
+    workspace = mapping(root.get("workspace"), "workspace", errors)
+    workspace_required = {"repo", "repo_root", "checkout_id", "access"}
+    workspace_missing = sorted(workspace_required - set(workspace))
+    if workspace_missing:
+        errors.append(f"workspace is missing: {', '.join(workspace_missing)}")
+    workspace_extras = sorted(set(workspace) - workspace_required)
+    if workspace_extras:
+        errors.append(
+            f"workspace has unsupported fields: {', '.join(workspace_extras)}"
+        )
+    for key in ("repo", "repo_root", "checkout_id"):
+        if not isinstance(workspace.get(key), str) or not workspace.get(key):
+            errors.append(f"workspace.{key} must be a non-empty string")
+    access = workspace.get("access")
+    if access not in {"read", "write"}:
+        errors.append("workspace.access must be read or write")
+
+    authority = mapping(root.get("authority"), "authority", errors)
+    authority_required = {
+        "origin",
+        "user_authority",
+        "allow_git",
+        "allow_push",
+        "allow_pull",
+        "allow_destructive",
+    }
+    authority_missing = sorted(authority_required - set(authority))
+    if authority_missing:
+        errors.append(f"authority is missing: {', '.join(authority_missing)}")
+    authority_extras = sorted(set(authority) - authority_required)
+    if authority_extras:
+        errors.append(
+            f"authority has unsupported fields: {', '.join(authority_extras)}"
+        )
+    if authority.get("origin") != "peer":
+        errors.append("authority.origin must be peer")
+    if authority.get("user_authority") is not False:
+        errors.append("authority.user_authority must be false")
+    if authority.get("allow_destructive") is not False:
+        errors.append("authority.allow_destructive must be false")
+    for key in ("allow_git", "allow_push", "allow_pull"):
+        if not isinstance(authority.get(key), bool):
+            errors.append(f"authority.{key} must be boolean")
+
+    lease_value = root.get("lease")
+    scopes: set[str] = set()
+    if lease_value is not None:
+        lease = mapping(lease_value, "lease", errors)
+        lease_required = {"lease_id", "scopes"}
+        lease_missing = sorted(lease_required - set(lease))
+        if lease_missing:
+            errors.append(f"lease is missing: {', '.join(lease_missing)}")
+        lease_extras = sorted(set(lease) - lease_required)
+        if lease_extras:
+            errors.append(f"lease has unsupported fields: {', '.join(lease_extras)}")
+        canonical_uuid(lease.get("lease_id"), "lease.lease_id", errors)
+        raw_scopes = lease.get("scopes")
+        if not isinstance(raw_scopes, list) or not raw_scopes:
+            errors.append("lease.scopes must be a non-empty array")
+        else:
+            if any(not isinstance(scope, str) for scope in raw_scopes):
+                errors.append("lease.scopes entries must be strings")
+            scopes = {scope for scope in raw_scopes if isinstance(scope, str)}
+            if len(scopes) != len(raw_scopes):
+                errors.append("lease.scopes must not contain duplicates")
+            unknown_scopes = sorted(scopes - LEASE_SCOPES)
+            if unknown_scopes:
+                errors.append(
+                    f"lease.scopes contains unsupported values: {', '.join(unknown_scopes)}"
+                )
+
+    if access == "write" and "checkout-write" not in scopes:
+        errors.append("write access requires a checkout-write lease")
+    wants_upstream = authority.get("allow_push") is True or authority.get("allow_pull") is True
+    if wants_upstream:
+        if authority.get("allow_git") is not True:
+            errors.append("push or pull authority requires allow_git=true")
+        if "upstream-integration" not in scopes:
+            errors.append("push or pull authority requires an upstream-integration lease")
+
+    payload = mapping(root.get("payload"), "payload", errors)
+    payload_required = {"type", "body"}
+    payload_missing = sorted(payload_required - set(payload))
+    if payload_missing:
+        errors.append(f"payload is missing: {', '.join(payload_missing)}")
+    payload_extras = sorted(set(payload) - payload_required - {"task_handoff"})
+    if payload_extras:
+        errors.append(f"payload has unsupported fields: {', '.join(payload_extras)}")
+    payload_type = payload.get("type")
+    if payload_type not in {"message", "task_handoff"}:
+        errors.append("payload.type must be message or task_handoff")
+    if not isinstance(payload.get("body"), str):
+        errors.append("payload.body must be a string")
+    if payload_type == "task_handoff" and not isinstance(payload.get("task_handoff"), dict):
+        errors.append("task_handoff payload requires payload.task_handoff object")
+    if access == "write" and payload_type != "task_handoff":
+        errors.append("write access requires a task_handoff payload")
+
+    return errors
+
+
+def valid_fixture() -> dict[str, object]:
+    return {
+        "schema": SCHEMA_NAME,
+        "message_id": "11111111-1111-4111-8111-111111111111",
+        "kind": "task",
+        "created_at": "2026-08-09T00:00:00Z",
+        "from": {
+            "peer_id": "host-a/codex/session-a",
+            "host_id": "host-a",
+            "provider": "codex",
+            "session_id": "session-a",
+        },
+        "to": {
+            "peer_id": "host-b/claude/session-b",
+            "host_id": "host-b",
+            "provider": "claude",
+            "session_id": "session-b",
+        },
+        "in_reply_to": None,
+        "workspace": {
+            "repo": "fixture",
+            "repo_root": "/tmp/fixture",
+            "checkout_id": "host-b:fixture",
+            "access": "read",
+        },
+        "authority": {
+            "origin": "peer",
+            "user_authority": False,
+            "allow_git": False,
+            "allow_push": False,
+            "allow_pull": False,
+            "allow_destructive": False,
+        },
+        "lease": None,
+        "payload": {"type": "message", "body": "Read-only fixture."},
+    }
+
+
+def command_validate(path: str) -> int:
+    if path == "-":
+        envelope = json.load(sys.stdin)
+    else:
+        with open(path, encoding="utf-8") as handle:
+            envelope = json.load(handle)
+    errors = validate_envelope(envelope)
+    emit({"schema": SCHEMA_NAME, "valid": not errors, "errors": errors})
+    return 0 if not errors else 1
+
+
+def command_selftest() -> int:
+    tests: list[dict[str, object]] = []
+
+    def expect(name: str, envelope: dict[str, object], wanted: str | None) -> None:
+        errors = validate_envelope(envelope)
+        passed = not errors if wanted is None else any(wanted in error for error in errors)
+        tests.append({"name": name, "passed": passed, "errors": errors})
+
+    base = valid_fixture()
+    expect("valid-read-task", base, None)
+
+    bad_authority = copy.deepcopy(base)
+    bad_authority["authority"]["user_authority"] = True
+    expect("reject-user-authority", bad_authority, "user_authority must be false")
+
+    reply = copy.deepcopy(base)
+    reply["kind"] = "reply"
+    expect("reply-needs-correlation", reply, "in_reply_to must be a UUID string")
+
+    write_without_lease = copy.deepcopy(base)
+    write_without_lease["workspace"]["access"] = "write"
+    write_without_lease["payload"] = {
+        "type": "task_handoff",
+        "body": "Fixture write task.",
+        "task_handoff": {},
+    }
+    expect(
+        "write-needs-checkout-lease",
+        write_without_lease,
+        "write access requires a checkout-write lease",
+    )
+
+    push_without_lease = copy.deepcopy(base)
+    push_without_lease["authority"]["allow_git"] = True
+    push_without_lease["authority"]["allow_push"] = True
+    expect(
+        "push-needs-upstream-lease",
+        push_without_lease,
+        "upstream-integration lease",
+    )
+
+    mismatched_peer = copy.deepcopy(base)
+    mismatched_peer["to"]["peer_id"] = "wrong/claude/session-b"
+    expect(
+        "peer-id-is-structural",
+        mismatched_peer,
+        "peer_id must equal host_id/provider/session_id",
+    )
+
+    passed = all(test["passed"] for test in tests)
+    emit({"schema": "agent-peer-lab.selftest.v1", "passed": passed, "tests": tests})
+    return 0 if passed else 1
+
+
+def run_command(
+    argv: list[str],
+    *,
+    env: dict[str, str] | None = None,
+    timeout: float = 10,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        argv,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def herdr_capabilities(herdr: str) -> dict[str, object]:
+    version_result = run_command([herdr, "--version"])
+    version_text = (version_result.stdout + version_result.stderr).strip()
+    version_match = re.search(r"\b([0-9]+\.[0-9]+\.[0-9]+)\b", version_text)
+
+    agent_result = run_command([herdr, "agent"])
+    agent_help = agent_result.stdout + agent_result.stderr
+    capabilities = {
+        "agent_start": "herdr agent start" in agent_help,
+        "agent_wait": "herdr agent wait" in agent_help,
+        "agent_send": "herdr agent send" in agent_help,
+        "agent_prompt": "herdr agent prompt" in agent_help,
+    }
+    if capabilities["agent_prompt"]:
+        lane = "atomic-prompt"
+    elif capabilities["agent_send"]:
+        lane = "literal-send-only"
+    else:
+        lane = "unsupported"
+
+    client_result = run_command([herdr, "status", "client", "--json"])
+    client_payload: object = None
+    if client_result.returncode == 0:
+        try:
+            client_payload = json.loads(client_result.stdout)
+        except json.JSONDecodeError:
+            client_payload = None
+
+    return {
+        "available": True,
+        "path": herdr,
+        "version": version_match.group(1) if version_match else None,
+        "version_output": version_text,
+        "lane": lane,
+        "capabilities": capabilities,
+        "client_status": client_payload,
+    }
+
+
+def command_preflight() -> int:
+    herdr = shutil.which("herdr")
+    if not herdr:
+        emit(
+            {
+                "schema": "agent-peer-lab.preflight.v1",
+                "passed": False,
+                "herdr": {"available": False},
+            }
+        )
+        return 1
+    details = herdr_capabilities(herdr)
+    capabilities = details["capabilities"]
+    passed = bool(
+        capabilities["agent_start"]
+        and capabilities["agent_wait"]
+        and (capabilities["agent_prompt"] or capabilities["agent_send"])
+    )
+    emit(
+        {
+            "schema": "agent-peer-lab.preflight.v1",
+            "passed": passed,
+            "production_delivery_ready": details["lane"] == "atomic-prompt",
+            "herdr": details,
+        }
+    )
+    return 0 if passed else 1
+
+
+def isolated_environment(root: pathlib.Path) -> dict[str, str]:
+    home = root / "home"
+    config = root / "config"
+    cache = root / "cache"
+    data = root / "data"
+    state = root / "state"
+    runtime = root / "run"
+    for directory in (home, config, cache, data, state, runtime):
+        directory.mkdir(parents=True, exist_ok=True)
+    runtime.chmod(0o700)
+    return {
+        "HOME": str(home),
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "SHELL": "/bin/sh",
+        "TERM": os.environ.get("TERM", "xterm-256color"),
+        "LANG": os.environ.get("LANG", "C.UTF-8"),
+        "XDG_CONFIG_HOME": str(config),
+        "XDG_CACHE_HOME": str(cache),
+        "XDG_DATA_HOME": str(data),
+        "XDG_STATE_HOME": str(state),
+        "XDG_RUNTIME_DIR": str(runtime),
+        "NO_COLOR": "1",
+    }
+
+
+def parse_json_output(result: subprocess.CompletedProcess[str], label: str) -> object:
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"{label} failed: {detail}")
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise RuntimeError(f"{label} returned invalid JSON") from error
+
+
+def snapshot_counts(payload: object) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        return {}
+    result = payload.get("result")
+    if not isinstance(result, dict):
+        result = payload
+    counts: dict[str, int] = {}
+    for key in ("workspaces", "tabs", "panes", "agents"):
+        value = result.get(key)
+        if isinstance(value, list):
+            counts[key] = len(value)
+    return counts
+
+
+def command_isolated_herdr(name: str, timeout: float) -> int:
+    if not LAB_NAME_RE.fullmatch(name):
+        emit(
+            {
+                "schema": "agent-peer-lab.isolated-herdr.v1",
+                "passed": False,
+                "error": "session name must match [a-z][a-z0-9_-]{0,31}",
+            }
+        )
+        return 2
+    herdr = shutil.which("herdr")
+    if not herdr:
+        emit(
+            {
+                "schema": "agent-peer-lab.isolated-herdr.v1",
+                "passed": False,
+                "error": "herdr is not available",
+            }
+        )
+        return 1
+
+    with tempfile.TemporaryDirectory(prefix="agent-peer-lab-", dir="/tmp") as temp:
+        root = pathlib.Path(temp)
+        env = isolated_environment(root)
+        stdout_path = root / "server.stdout"
+        stderr_path = root / "server.stderr"
+        server: subprocess.Popen[str] | None = None
+        summary: dict[str, object] = {
+            "schema": "agent-peer-lab.isolated-herdr.v1",
+            "session": name,
+            "isolated": True,
+            "prompt_submitted": False,
+            "agent_started": False,
+        }
+        try:
+            with stdout_path.open("w", encoding="utf-8") as stdout_handle, stderr_path.open(
+                "w", encoding="utf-8"
+            ) as stderr_handle:
+                server = subprocess.Popen(
+                    [herdr, "--session", name, "server"],
+                    env=env,
+                    text=True,
+                    stdout=stdout_handle,
+                    stderr=stderr_handle,
+                    start_new_session=True,
+                )
+
+            deadline = time.monotonic() + timeout
+            status_result: subprocess.CompletedProcess[str] | None = None
+            while time.monotonic() < deadline:
+                if server.poll() is not None:
+                    break
+                status_result = run_command(
+                    [herdr, "--session", name, "status", "server", "--json"],
+                    env=env,
+                    timeout=2,
+                )
+                if status_result.returncode == 0:
+                    break
+                time.sleep(0.1)
+
+            if status_result is None or status_result.returncode != 0:
+                stderr_tail = stderr_path.read_text(encoding="utf-8", errors="replace")[-2000:]
+                raise RuntimeError(f"isolated Herdr server did not become ready: {stderr_tail}")
+
+            status_payload = parse_json_output(status_result, "isolated status")
+            sessions_payload = parse_json_output(
+                run_command([herdr, "session", "list", "--json"], env=env),
+                "isolated session list",
+            )
+            snapshot_payload = parse_json_output(
+                run_command([herdr, "--session", name, "api", "snapshot"], env=env),
+                "isolated snapshot",
+            )
+            summary.update(
+                {
+                    "passed": True,
+                    "server_status": status_payload,
+                    "session_registry": sessions_payload,
+                    "snapshot_counts": snapshot_counts(snapshot_payload),
+                }
+            )
+            emit(summary)
+            return 0
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            summary.update({"passed": False, "error": str(error)})
+            emit(summary)
+            return 1
+        finally:
+            if server is not None and server.poll() is None:
+                try:
+                    run_command(
+                        [herdr, "--session", name, "server", "stop"],
+                        env=env,
+                        timeout=3,
+                    )
+                except subprocess.TimeoutExpired:
+                    pass
+                try:
+                    server.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    server.terminate()
+                    try:
+                        server.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        server.kill()
+                        server.wait(timeout=2)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Validate peer envelopes and test Herdr isolation safely."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    validate_parser = subparsers.add_parser("validate")
+    validate_parser.add_argument("path", help="JSON envelope path, or - for stdin")
+    subparsers.add_parser("selftest")
+    subparsers.add_parser("preflight")
+
+    isolated_parser = subparsers.add_parser("isolated-herdr")
+    isolated_parser.add_argument("--session", default="agent-peer-lab")
+    isolated_parser.add_argument("--timeout", type=float, default=8.0)
+
+    args = parser.parse_args()
+    try:
+        if args.command == "validate":
+            return command_validate(args.path)
+        if args.command == "selftest":
+            return command_selftest()
+        if args.command == "preflight":
+            return command_preflight()
+        if args.command == "isolated-herdr":
+            return command_isolated_herdr(args.session, args.timeout)
+    except (OSError, json.JSONDecodeError) as error:
+        emit({"schema": "agent-peer-lab.error.v1", "error": str(error)})
+        return 1
+    parser.error("unknown command")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
