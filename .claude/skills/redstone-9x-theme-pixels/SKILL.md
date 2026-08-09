@@ -17,7 +17,7 @@ An isolated Xvfb/host render — even with the guest's exact `icewm-gradients` b
 
 Before testing ANY edit to an existing theme dir:
 1. `GH=/home/metsatron/.local/share/dotcortex/guests/sanctuary-redstone-9x/home`
-2. `rm -rf "$GH/.icewm/themes/<Theme>"`  (guest copy only — never the DotCortex source)
+2. `rm -rf "$GH/.icewm/themes/<Theme>"`  (guest copy only — never the DotCortex source). The SAME law covers `$GH/.themes/<Theme>` (GTK themes) and the guest icon-theme dirs under `$GH/.local/share/` — a GTK or icon edit that skips the guest rm "verifies" a change that never shipped, exactly like the IceWM case (burned 2026-08-08). Open question, logged the same night: painted marker pixels in a guest theme dir vanished without a refresh — something re-projects guest theme dirs we believed were gap-fill-only; do not trust guest-side edits to persist across scheme applies.
 3. `cd ~/DotCortex && loom redstone:refresh`
 4. **Confirm deployment** by grepping the guest file for your exact edit BEFORE you capture: `grep -m1 'yourEditPattern' "$GH/.icewm/themes/<Theme>/frameATL.xpm"`. If it is not there, nothing you capture is about your change.
 

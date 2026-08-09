@@ -44,7 +44,7 @@ processes.  This source does not replace the =claude= executable globally.
 
 Herdr 0.7.4 / protocol 16 evidence (verified on ThinkPad-T480s 2026-08-04):
 the supported pane contract is =pane.report_agent= (pane_id, source, agent,
-state, optional agent_session_id/path), =pane.report_agent_session=,
+state, optional agent_session_id), =pane.report_agent_session=,
 =pane.report_metadata= (display_agent, tokens, ttl_ms), and
 =pane.release_agent=.  The =agent= field accepts the logical labels Opus,
 Fable, and Auryn.  Herdr's installed Claude hook hard-codes =claude= and was
@@ -53,6 +53,13 @@ the inherited =HERDR_SOCKET_PATH= after spawning Claude.  The reporter uses
 =source= =claude-warm=, the inherited =HERDR_PANE_ID=, the real Claude child
 PID in metadata, and a bounded heartbeat/TTL; no PTY bytes or prompt data pass
 through this API.
+
+Herdr's native detector does not see through the outer =claude-warm= process on
+the installed Claude path, so the supervisor mirrors only visible state from
+the PTY output it already proxies.  The screen adapter recognizes Claude's
+prompt, working, and confirmation/cancellation markers conservatively; it
+never rewrites or suppresses output.  Lifecycle hooks remain responsible only
+for the private compaction state machine and session identity refresh.
 
 The supervisor's stdin path forwards every byte unchanged but uses a stateful
 escape parser for governor activity.  SGR/legacy mouse, focus, cursor-position,
@@ -437,7 +444,7 @@ HERDR_REGISTRATION_TTL_MS = env_int(
 
 
 class HerdrReporter:
-    """Report one supervisor-owned Claude session through Herdr's pane API."""
+    """Register identity and report PTY-derived state through Herdr's pane API."""
 
     def __init__(self) -> None:
         socket_path = os.environ.get("HERDR_SOCKET_PATH", "")
@@ -462,6 +469,7 @@ class HerdrReporter:
         self.last_error: str | None = None
         self.next_heartbeat = 0.0
         self.child_pid: int | None = None
+        self.agent_session_id: str | None = None
 
     def state(self) -> dict[str, object]:
         """Return prompt-free Herdr ownership state for the supervisor state file."""
@@ -475,6 +483,7 @@ class HerdrReporter:
             "herdr_last_report_state": self.last_report_state,
             "herdr_last_error": self.last_error,
             "herdr_child_pid": self.child_pid,
+            "herdr_agent_session_id": self.agent_session_id,
         }
 
     @staticmethod
@@ -482,13 +491,6 @@ class HerdrReporter:
         if isinstance(value, str) and SESSION_RE.fullmatch(value):
             return value
         return None
-
-    @staticmethod
-    def _valid_session_path(value: object) -> str | None:
-        if not isinstance(value, str) or not value or len(value) > 4096:
-            return None
-        path = pathlib.Path(value)
-        return str(path) if path.is_absolute() else None
 
     def _send(self, method: str, params: dict[str, object]) -> bool:
         """Send one bounded JSON-RPC request to the inherited Herdr socket."""
@@ -518,17 +520,9 @@ class HerdrReporter:
             self.last_error = type(error).__name__
             return False
 
-    def report(
-        self,
-        state: str,
-        session_id: object = None,
-        session_path: object = None,
-    ) -> None:
-        """Publish state, session identity, display label, and bounded PID metadata."""
-        if not self.enabled or state not in {"idle", "working", "blocked", "done", "unknown"}:
-            return
+    def _base(self, session_id: object = None) -> dict[str, object]:
+        """Return validated Herdr identity fields, including resumed session ID."""
         safe_session_id = self._valid_session_id(session_id)
-        safe_session_path = self._valid_session_path(session_path)
         base = {
             "pane_id": self.pane_id,
             "source": self.source,
@@ -536,20 +530,17 @@ class HerdrReporter:
         }
         if safe_session_id:
             base["agent_session_id"] = safe_session_id
-        if safe_session_path:
-            base["agent_session_path"] = safe_session_path
-        if safe_session_id:
-            self._send("pane.report_agent_session", dict(base))
-        report = dict(base)
-        report["state"] = state
-        self._send("pane.report_agent", report)
+        return base
+
+    def _metadata(self) -> dict[str, object]:
+        """Return display identity and bounded supervisor/child PID metadata."""
         tokens = {
             "supervisor_pid": str(os.getpid()),
             "pty_owner": "claude-warm",
         }
         if isinstance(self.child_pid, int) and self.child_pid > 0:
             tokens["claude_pid"] = str(self.child_pid)
-        metadata = {
+        return {
             "pane_id": self.pane_id,
             "source": self.source,
             "agent": self.agent,
@@ -557,16 +548,40 @@ class HerdrReporter:
             "tokens": tokens,
             "ttl_ms": HERDR_REGISTRATION_TTL_MS,
         }
-        success = self._send("pane.report_metadata", metadata)
+
+    def register(self, session_id: object = None) -> None:
+        """Refresh identity and metadata without sending a visible state."""
+        if not self.enabled:
+            return
+        safe_session_id = self._valid_session_id(session_id)
+        base = self._base(safe_session_id)
+        if safe_session_id and safe_session_id != self.agent_session_id:
+            self._send("pane.report_agent_session", dict(base))
+            self.agent_session_id = safe_session_id
+        success = self._send("pane.report_metadata", self._metadata())
         self.registered = success or self.registered
         self.last_report_at = now()
-        self.last_report_state = state
         self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
 
-    def heartbeat(self, state: str, session_id: object = None, session_path: object = None) -> None:
-        """Refresh the bounded Herdr registration while the supervisor is alive."""
+    def report_state(self, state: str, session_id: object = None) -> None:
+        """Report only a state derived from PTY output, never from a hook event."""
+        if not self.enabled or state not in {"idle", "working", "blocked", "unknown"}:
+            return
+        self.register(session_id)
+        report = self._base(session_id)
+        report["state"] = state
+        self._send("pane.report_agent", report)
+        self.last_report_state = state
+        self.last_report_at = now()
+        self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
+
+    def heartbeat(self, state: str | None = None, session_id: object = None) -> None:
+        """Refresh metadata, optionally repeating the last PTY-derived state."""
         if self.enabled and monotonic() >= self.next_heartbeat:
-            self.report(state, session_id, session_path)
+            if state in {"idle", "working", "blocked", "unknown"}:
+                self.report_state(state, session_id)
+            else:
+                self.register(session_id)
 
     def release(self) -> None:
         """Remove this supervisor's Herdr registration on every orderly exit."""
@@ -581,6 +596,99 @@ class HerdrReporter:
             self.registered = False
         self.last_report_state = "released"
         self.last_report_at = now()
+
+
+HERDR_SCREEN_BYTES = 128 * 1024
+
+
+class ClaudeScreenClassifier:
+    """Classify visible Claude PTY output without consuming or rewriting it."""
+
+    OSC_TITLE_RE = re.compile(
+        r"\x1b\](?:0|1|2);(.*?)(?:\x07|\x1b\\)", re.DOTALL
+    )
+    ANSI_RE = re.compile(
+        r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])"
+    )
+    WORKING_RE = re.compile(
+        r"^[✻✳✽✶✷]\s+Working(?:…|\.\.\.)?(?:\s|$)", re.MULTILINE
+    )
+    PROMPT_RE = re.compile(r"^\s*❯(?:\s.*)?$", re.MULTILINE)
+    STRONG_BLOCKERS = (
+        "enter to confirm",
+        "enter to select",
+        "enter to submit",
+        "esc to cancel",
+        "do you want to proceed?",
+        "would you like to proceed?",
+        "allow command?",
+    )
+
+    def __init__(self) -> None:
+        self.raw = bytearray()
+        self.osc_title = ""
+        self.state: str | None = None
+
+    def reset(self) -> None:
+        """Forget the previous screen when Claude binds a new session."""
+        self.raw.clear()
+        self.osc_title = ""
+        self.state = None
+
+    def _visible_text(self) -> str:
+        text = self.ANSI_RE.sub("", bytes(self.raw).decode("utf-8", "replace"))
+        return "".join(
+            character
+            for character in text
+            if character in "\n\r\t" or ord(character) >= 0x20
+        )
+
+    def _classify(self, visible: str) -> str:
+        recent = visible[-HERDR_SCREEN_BYTES:]
+        lowered = recent.lower()
+        lines = [line.rstrip() for line in recent.splitlines() if line.strip()]
+        bottom = "\n".join(lines[-8:])
+        blocker_positions = [
+            lowered.rfind(marker)
+            for marker in self.STRONG_BLOCKERS
+            if marker in lowered
+        ]
+        last_blocker = max(blocker_positions, default=-1)
+        working_matches = list(self.WORKING_RE.finditer(recent))
+        last_working = working_matches[-1].start() if working_matches else -1
+        prompt_matches = list(self.PROMPT_RE.finditer(recent))
+        last_prompt = prompt_matches[-1].start() if prompt_matches else -1
+        # The PTY stream is not a full terminal emulator.  Treat the newest
+        # strong cue as authoritative so a later prompt can clear an older
+        # approval screen after Claude redraws it with erase/cursor bytes.
+        if last_blocker >= 0 and last_blocker >= max(last_working, last_prompt):
+            return "blocked"
+        if last_working >= 0 and (
+            last_working >= last_prompt
+            or (last_prompt < 0 and (
+            "esc to interrupt" in lowered and "working" in lowered
+            ))
+        ):
+            return "working"
+        if last_prompt >= 0 and self.PROMPT_RE.search(bottom):
+            return "idle"
+        return "unknown"
+
+    def feed(self, data: bytes) -> str | None:
+        """Consume a bounded copy for classification and return state changes."""
+        if not data:
+            return None
+        self.raw.extend(data)
+        if len(self.raw) > HERDR_SCREEN_BYTES:
+            del self.raw[:-HERDR_SCREEN_BYTES]
+        titles = list(self.OSC_TITLE_RE.finditer(bytes(self.raw).decode("utf-8", "replace")))
+        if titles:
+            self.osc_title = titles[-1].group(1)
+        state = self._classify(self._visible_text())
+        if state == self.state:
+            return None
+        self.state = state
+        return state
 
 
 class TerminalInputClassifier:
@@ -1042,6 +1150,8 @@ class Supervisor:
         self.child_exited_at: float | None = None
         self.next_transcript_poll = monotonic() + TRANSCRIPT_POLL_SECONDS
         self.herdr = HerdrReporter()
+        self.screen_classifier = ClaudeScreenClassifier()
+        self.screen_state: str | None = None
         self._guard_log("supervisor-started")
         self._write_state()
 
@@ -1109,6 +1219,7 @@ class Supervisor:
             "last_channel_activity": self.last_channel_activity,
             "last_channel_event": self.last_channel_event,
             "last_channel_death": self.last_channel_death,
+            "herdr_screen_state": self.screen_state,
             **self.herdr.state(),
         }
 
@@ -1163,13 +1274,15 @@ class Supervisor:
         except OSError as error:
             self._debug(f"state-write-failed channel={short_id(self.channel)} error={error}")
 
-    def _report_herdr(self, state: str) -> None:
-        """Publish the current lifecycle state to the inherited Herdr pane."""
-        self.herdr.report(
-            state,
-            self.session_id,
-            str(self.transcript_path) if self.transcript_path else None,
-        )
+    def _register_herdr(self) -> None:
+        """Refresh Herdr identity without allowing lifecycle hooks to set state."""
+        self.herdr.register(self.session_id)
+        self._write_state()
+
+    def _report_screen_state(self, state: str) -> None:
+        """Mirror a state classified from the proxied Claude screen."""
+        self.screen_state = state
+        self.herdr.report_state(state, self.session_id)
         self._write_state()
 
     def cancel(self, reason: str) -> None:
@@ -1663,7 +1776,7 @@ class Supervisor:
         self._install_signals()
         self._install_terminal()
         self.herdr.child_pid = pid
-        self._report_herdr("working")
+        self._register_herdr()
         self._write_state()
 
     def _read_child_tty(self) -> str | None:
@@ -2020,8 +2133,10 @@ class Supervisor:
                 self.last_transcript_classification = None
             self._set_transcript(message.get("transcript_path"))
             self.status = "starting"
+            self.screen_classifier.reset()
+            self.screen_state = None
             self.last_lifecycle_activity = now()
-            self._report_herdr("working")
+            self._register_herdr()
             self._guard_log("session-bound")
             self._write_state()
             return {"ok": True}
@@ -2077,7 +2192,6 @@ class Supervisor:
             self._reset_transcript_cursor()
             self.cancel("new-normal-turn")
             self._begin_transcript_quiescence()
-            self._report_herdr("idle")
             return {"ok": True}
         if event == "user-prompt-submit":
             self.status = "active"
@@ -2139,12 +2253,6 @@ class Supervisor:
                 self._guard_log("recovery-command-activity")
             else:
                 self.cancel("session-activity")
-        if event == "post-compact":
-            self._report_herdr("idle")
-        elif event == "stop-failure":
-            self._report_herdr("blocked")
-        elif event in {"user-prompt-submit", "session-activity"}:
-            self._report_herdr("working")
         self._write_state()
         return {"ok": True}
 
@@ -2318,11 +2426,14 @@ class Supervisor:
             return True
         if not data:
             return False
+        state = self.screen_classifier.feed(data)
         try:
             write_all(sys.stdout.fileno(), data)
             sys.stdout.flush()
         except OSError:
             self.shutdown_requested = True
+        if state is not None:
+            self._report_screen_state(state)
         return True
 
     def _child_has_exited(self) -> bool:
@@ -2339,22 +2450,9 @@ class Supervisor:
             self.child_exited_at = now()
             self.status = "exited"
             self.cancel("process-exit")
-            self.herdr.report("done", self.session_id, str(self.transcript_path) if self.transcript_path else None)
             self._guard_log("process-exit", exit_code=os.waitstatus_to_exitcode(status))
             return True
         return False
-
-    def _herdr_state(self) -> str:
-        """Map the private supervisor lifecycle to Herdr's supported states."""
-        if self.status in {"starting", "active"}:
-            return "working"
-        if self.status == "idle":
-            return "idle"
-        if self.status in {"error", "blocked"}:
-            return "blocked"
-        if self.status in {"exited", "ended"}:
-            return "done"
-        return "unknown"
 
     def _handle_inotify(self) -> None:
         """Classify complete transcript records after a watcher notification."""
@@ -2376,11 +2474,7 @@ class Supervisor:
         try:
             while master_open:
                 child_exited = self._child_has_exited()
-                self.herdr.heartbeat(
-                    self._herdr_state(),
-                    self.session_id,
-                    str(self.transcript_path) if self.transcript_path else None,
-                )
+                self.herdr.heartbeat(self.screen_state, self.session_id)
                 self._check_channel_attach()
                 self._flush_input_classifier()
                 if (

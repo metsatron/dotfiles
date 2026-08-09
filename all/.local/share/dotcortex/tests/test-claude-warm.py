@@ -401,8 +401,9 @@ class ClaudeWarmTests(unittest.TestCase):
         ):
             reporter = self.module.HerdrReporter()
             reporter.child_pid = 12345
-            reporter.report("working", "fixture-session", "/tmp/fixture.jsonl")
-            reporter.report("idle", "fixture-session", "/tmp/fixture.jsonl")
+            reporter.register("fixture-session")
+            reporter.report_state("working", "fixture-session")
+            reporter.report_state("idle", "fixture-session")
             reporter.release()
         wait_until(lambda: len(requests) >= 7, message="Herdr requests were not received")
         methods = [request["method"] for request in requests]
@@ -410,6 +411,7 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertIn("pane.report_agent", methods)
         self.assertIn("pane.report_metadata", methods)
         self.assertEqual(methods[-1], "pane.release_agent")
+        self.assertNotIn("pane.report_agent", methods[:2])
         for request in requests:
             params = request["params"]
             self.assertEqual(params["pane_id"], "w4:pP")
@@ -445,8 +447,33 @@ class ClaudeWarmTests(unittest.TestCase):
         ):
             reporter = self.module.HerdrReporter()
             self.assertFalse(reporter.enabled)
-            reporter.report("working", "fixture-session", "/tmp/fixture.jsonl")
+            reporter.register("fixture-session")
+            reporter.report_state("working", "fixture-session")
             reporter.release()
+
+    def test_claude_screen_classifier_mirrors_visible_detector_evidence(self):
+        classifier = self.module.ClaudeScreenClassifier()
+        self.assertEqual(classifier.feed(b"\x1b]0;Claude Code\x07"), "unknown")
+        self.assertEqual(classifier.feed("\x1b[2K  ❯\n".encode()), "idle")
+        self.assertEqual(
+            classifier.feed("✻ Working… (esc to interrupt)\n".encode()),
+            "working",
+        )
+        self.assertEqual(
+            classifier.feed(
+                "Do you want to proceed?\n❯ 1. Yes\n  2. No\nEsc to cancel\n".encode()
+            ),
+            "blocked",
+        )
+        self.assertEqual(
+            classifier.feed("\x1b[2K────────────────\n❯\n".encode()),
+            "idle",
+        )
+        classifier.reset()
+        self.assertEqual(
+            classifier.feed("✻ Crunched for 16m 38s\n\n❯\n".encode()),
+            "idle",
+        )
 
     def test_arguments_and_full_pty_submission(self):
         session = self.make_session(delay=0, extra_args=("--resume", "fixture", "--model", "test"))

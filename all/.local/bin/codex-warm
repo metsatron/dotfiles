@@ -1,0 +1,1281 @@
+#!/usr/bin/env python3
+"""PTY-owning Codex launcher and per-session idle-compaction supervisor."""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import pty
+import re
+import selectors
+import shutil
+import signal
+import socket
+import struct
+import sys
+import termios
+import time
+import tty
+import uuid
+
+
+CHANNEL_RE = re.compile(r"^codex-[0-9a-f]{32}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
+EVENTS = {
+    "session-start",
+    "stop",
+    "user-prompt-submit",
+    "post-compact",
+    "session-activity",
+    "stop-failure",
+    "session-end",
+}
+CONTROL_COMMANDS = {
+    "state",
+    "show",
+    "enable",
+    "disable",
+    "cancel",
+    "trigger",
+    "inject",
+}
+
+
+def env_int(name: str, default: int, minimum: int = 0) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float, minimum: float = 0.0) -> float:
+    try:
+        return max(minimum, float(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+def short_id(value: object) -> str:
+    text = str(value or "unknown")
+    return text if len(text) <= 12 else text[:8] + "…"
+
+
+def now() -> float:
+    return time.time()
+
+
+def monotonic() -> float:
+    return time.monotonic()
+
+
+IDLE_SECONDS = env_int("CODEX_IDLE_COMPACT_SECONDS", 27 * 60)
+TTL_SECONDS = env_int("CODEX_IDLE_COMPACT_TTL_SECONDS", 30 * 60)
+MIN_TOKENS = env_int("CODEX_IDLE_COMPACT_MIN_TOKENS", 70000)
+INPUT_ESCAPE_TIMEOUT_SECONDS = env_float(
+    "CODEX_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS", 0.05, 0.01
+)
+DEBUG_LOG_MAX_BYTES = env_int(
+    "CODEX_IDLE_DEBUG_MAX_BYTES", 2 * 1024 * 1024, 65536
+)
+DEBUG = os.environ.get("CODEX_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
+TERMINAL_CLEANUP_BYTES = (
+    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
+    b"\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+    b"\x1b[?2004l\x1b[?25h\x1b[0m"
+)
+
+HERDR_SOURCE = "codex-warm"
+HERDR_PANE_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,96}$")
+HERDR_AGENT_RE = re.compile(r"^[A-Za-z][A-Za-z0-9 .:_-]{0,63}$")
+HERDR_HEARTBEAT_SECONDS = env_float(
+    "CODEX_WARM_HERDR_HEARTBEAT_SECONDS", 30.0, 5.0
+)
+HERDR_REGISTRATION_TTL_MS = env_int(
+    "CODEX_WARM_HERDR_REGISTRATION_TTL_MS", 120000, 1000
+)
+HERDR_SCREEN_BYTES = 128 * 1024
+
+
+def append_debug(path: pathlib.Path, message: str) -> None:
+    if DEBUG:
+        try:
+            with path.open("a", encoding="utf-8") as stream:
+                stream.write(f"{now():.6f} {message}\n")
+            os.chmod(path, 0o600)
+        except OSError:
+            pass
+
+
+def atomic_json(path: pathlib.Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.tmp.{os.getpid()}")
+    data = json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def safe_mkdir(path: pathlib.Path) -> None:
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+
+
+def persistent_state_root() -> pathlib.Path:
+    base = os.environ.get("XDG_STATE_HOME") or str(pathlib.Path.home() / ".local/state")
+    root = pathlib.Path(base) / "codex-idle-compaction"
+    safe_mkdir(root)
+    return root
+
+
+def runtime_root() -> pathlib.Path:
+    value = os.environ.get("XDG_RUNTIME_DIR")
+    if not value:
+        raise RuntimeError("XDG_RUNTIME_DIR is required for supervised Codex sessions")
+    root = pathlib.Path(value) / "codex-idle-compaction"
+    safe_mkdir(root)
+    return root
+
+
+def resolve_codex() -> str:
+    explicit = os.environ.get("CODEX_IDLE_REAL_EXECUTABLE")
+    candidates = [explicit] if explicit else []
+    found = shutil.which("codex")
+    if found:
+        candidates.append(found)
+    candidates.extend(
+        [
+            str(pathlib.Path.home() / ".local/bin/codex"),
+            str(pathlib.Path.home() / ".npm-global/bin/codex"),
+            str(pathlib.Path.home() / ".cargo/bin/codex"),
+        ]
+    )
+    wrapper = pathlib.Path(__file__).resolve()
+    for candidate in candidates:
+        if not candidate:
+            continue
+        path = pathlib.Path(candidate).expanduser()
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved == wrapper or not resolved.is_file() or not os.access(resolved, os.X_OK):
+            continue
+        if resolved.name in {"codex-warm", "codex-warmctl"}:
+            continue
+        return str(resolved)
+    raise RuntimeError("real Codex executable not found; set CODEX_IDLE_REAL_EXECUTABLE")
+
+
+def child_alive(pid: int | None) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+
+
+def write_all(fd: int, data: bytes) -> None:
+    offset = 0
+    while offset < len(data):
+        try:
+            written = os.write(fd, data[offset:])
+        except InterruptedError:
+            continue
+        except BlockingIOError:
+            time.sleep(0.002)
+            continue
+        if written <= 0:
+            raise OSError(errno.EIO, "PTY write returned zero bytes")
+        offset += written
+
+
+class TerminalInputClassifier:
+    """Classify raw outer-terminal input without suppressing any forwarded byte."""
+
+    PASTE_START = b"\x1b[200~"
+    PASTE_END = b"\x1b[201~"
+
+    def __init__(self, escape_timeout: float = INPUT_ESCAPE_TIMEOUT_SECONDS):
+        self.escape_timeout = escape_timeout
+        self.buffer = bytearray()
+        self.in_bracketed_paste = False
+        self.pending_since: float | None = None
+
+    @staticmethod
+    def _event(kind: str, length: int, human: bool) -> tuple[str, int, bool]:
+        return kind, length, human
+
+    def feed(self, data: bytes) -> list[tuple[str, int, bool]]:
+        if not data:
+            return []
+        self.buffer.extend(data)
+        events: list[tuple[str, int, bool]] = []
+        if self.in_bracketed_paste:
+            end = bytes(self.buffer).find(self.PASTE_END)
+            if end >= 0:
+                if end:
+                    events.append(self._event("bracketed-paste-payload", end, True))
+                events.append(self._event("bracketed-paste-end", len(self.PASTE_END), False))
+                del self.buffer[: end + len(self.PASTE_END)]
+                self.in_bracketed_paste = False
+            else:
+                events.append(self._event("bracketed-paste-payload", len(self.buffer), True))
+                self.buffer.clear()
+            self.pending_since = None if not self.buffer else monotonic()
+            return events
+        raw = bytes(self.buffer)
+        paste_start = raw.find(self.PASTE_START)
+        if paste_start >= 0:
+            if paste_start:
+                events.append(self._event("keyboard-input", paste_start, True))
+            events.append(self._event("bracketed-paste-start", len(self.PASTE_START), False))
+            del self.buffer[: paste_start + len(self.PASTE_START)]
+            self.in_bracketed_paste = True
+            self.pending_since = None if not self.buffer else monotonic()
+            return events
+        esc_pos = raw.find(0x1B)
+        if esc_pos < 0:
+            length = len(self.buffer)
+            self.buffer.clear()
+            self.pending_since = None
+            events.append(self._event("keyboard-input", length, True))
+            return events
+        if esc_pos > 0:
+            events.append(self._event("keyboard-input", esc_pos, True))
+            del self.buffer[:esc_pos]
+        if len(self.buffer) >= 2:
+            length = len(self.buffer)
+            self.buffer.clear()
+            self.pending_since = None
+            events.append(self._event("escape-sequence", length, False))
+        else:
+            if self.pending_since is None:
+                self.pending_since = monotonic()
+        return events
+
+    def flush_expired(self) -> list[tuple[str, int, bool]]:
+        if not self.buffer or self.pending_since is None:
+            return []
+        if monotonic() - self.pending_since < self.escape_timeout:
+            return []
+        length = len(self.buffer)
+        self.buffer.clear()
+        self.pending_since = None
+        self.in_bracketed_paste = False
+        return [self._event("unknown-input", length, True)]
+
+
+class CodexScreenClassifier:
+    """Classify visible Codex PTY output without consuming or rewriting it."""
+
+    SPINNER_RE = re.compile(r"(?:^| )[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏](?: |$)")
+    OSC_TITLE_RE = re.compile(
+        r"\x1b\](?:0|1|2);(.*?)(?:\x07|\x1b\\)", re.DOTALL
+    )
+    ANSI_RE = re.compile(
+        r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-_])"
+    )
+    STRONG_BLOCKERS = (
+        "press enter to confirm or esc to cancel",
+        "enter to submit answer",
+        "enter to submit all",
+        "allow command?",
+    )
+
+    def __init__(self) -> None:
+        self.raw = bytearray()
+        self.osc_title = ""
+        self.state: str | None = None
+
+    def reset(self) -> None:
+        self.raw.clear()
+        self.osc_title = ""
+        self.state = None
+
+    def _visible_text(self) -> str:
+        text = self.ANSI_RE.sub("", bytes(self.raw).decode("utf-8", "replace"))
+        return "".join(character for character in text if character in "\n\r\t" or ord(character) >= 0x20)
+
+    def _classify(self, visible: str) -> str:
+        title = self.osc_title
+        if "Action Required" in title:
+            return "blocked"
+        if self.SPINNER_RE.search(title):
+            return "working"
+
+        recent = visible[-HERDR_SCREEN_BYTES:]
+        lowered = recent.lower()
+        if any(marker in lowered for marker in self.STRONG_BLOCKERS):
+            return "blocked"
+        if "[y/n]" in lowered or "yes (y)" in lowered:
+            return "blocked"
+        if (
+            "do you want to" in lowered
+            and ("yes" in lowered or "❯" in recent)
+        ) or (
+            "would you like to" in lowered
+            and ("yes" in lowered or "❯" in recent)
+        ):
+            return "blocked"
+
+        lines = [line.strip() for line in recent.splitlines() if line.strip()]
+        bottom = "\n".join(lines[-3:])
+        if (
+            re.search(r"^[•◦]\s+Working \([^)]*esc to interrupt\)(?: · .*)?$", bottom, re.MULTILINE)
+            and "■ Conversation interrupted" not in bottom
+        ):
+            return "working"
+        if title.strip():
+            return "idle"
+        return "unknown"
+
+    def feed(self, data: bytes) -> str | None:
+        if not data:
+            return None
+        self.raw.extend(data)
+        if len(self.raw) > HERDR_SCREEN_BYTES:
+            del self.raw[:-HERDR_SCREEN_BYTES]
+        titles = list(self.OSC_TITLE_RE.finditer(bytes(self.raw).decode("utf-8", "replace")))
+        if titles:
+            self.osc_title = titles[-1].group(1)
+        state = self._classify(self._visible_text())
+        if state == self.state:
+            return None
+        self.state = state
+        return state
+
+
+class HerdrReporter:
+    """Register identity and optionally report PTY-derived state through Herdr."""
+
+    def __init__(self) -> None:
+        socket_path = os.environ.get("HERDR_SOCKET_PATH", "")
+        pane_id = os.environ.get("HERDR_PANE_ID", "")
+        agent = os.environ.get("CODEX_WARM_HERDR_AGENT", "") or "Codex"
+        self.socket_path = pathlib.Path(socket_path) if socket_path else None
+        self.pane_id = pane_id if HERDR_PANE_RE.fullmatch(pane_id) else None
+        self.agent = agent if HERDR_AGENT_RE.fullmatch(agent) else None
+        self.enabled = (
+            os.environ.get("HERDR_ENV") == "1"
+            and self.socket_path is not None
+            and self.socket_path.is_absolute()
+            and len(str(self.socket_path)) < 100
+            and self.pane_id is not None
+            and self.agent is not None
+        )
+        self.source = HERDR_SOURCE
+        self.sequence = 0
+        self.registered = False
+        self.last_report_at: float | None = None
+        self.last_report_state: str | None = None
+        self.last_error: str | None = None
+        self.next_heartbeat = 0.0
+        self.child_pid: int | None = None
+        self.agent_session_id: str | None = None
+
+    def state(self) -> dict[str, object]:
+        return {
+            "herdr_enabled": self.enabled,
+            "herdr_pane_id": self.pane_id,
+            "herdr_agent": self.agent,
+            "herdr_source": self.source,
+            "herdr_registered": self.registered,
+            "herdr_last_report_at": self.last_report_at,
+            "herdr_last_report_state": self.last_report_state,
+            "herdr_last_error": self.last_error,
+            "herdr_child_pid": self.child_pid,
+            "herdr_agent_session_id": self.agent_session_id,
+        }
+
+    @staticmethod
+    def _valid_session_id(value: object) -> str | None:
+        if isinstance(value, str) and SESSION_RE.fullmatch(value):
+            return value
+        return None
+
+    def _send(self, method: str, params: dict[str, object]) -> bool:
+        if not self.enabled or self.socket_path is None:
+            return False
+        self.sequence += 1
+        request = {
+            "id": f"{self.source}:{self.sequence}",
+            "method": method,
+            "params": params,
+        }
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+                connection.settimeout(0.5)
+                connection.connect(str(self.socket_path))
+                connection.sendall((json.dumps(request, separators=(",", ":")) + "\n").encode())
+                response = connection.recv(4096)
+            if response:
+                decoded = json.loads(response.decode("utf-8"))
+                if isinstance(decoded, dict) and decoded.get("error"):
+                    error = decoded["error"]
+                    code = error.get("code") if isinstance(error, dict) else "request-failed"
+                    self.last_error = str(code)[:96]
+                    return False
+            return True
+        except (OSError, ValueError, UnicodeError) as error:
+            self.last_error = type(error).__name__
+            return False
+
+    def _base(self, session_id: object = None) -> dict[str, object]:
+        base = {
+            "pane_id": self.pane_id,
+            "source": self.source,
+            "agent": self.agent,
+        }
+        safe_session_id = self._valid_session_id(session_id)
+        if safe_session_id:
+            base["agent_session_id"] = safe_session_id
+        return base
+
+    def _metadata(self) -> dict[str, object]:
+        tokens = {
+            "supervisor_pid": str(os.getpid()),
+            "pty_owner": "codex-warm",
+        }
+        if isinstance(self.child_pid, int) and self.child_pid > 0:
+            tokens["codex_pid"] = str(self.child_pid)
+        return {
+            "pane_id": self.pane_id,
+            "source": self.source,
+            "agent": self.agent,
+            "display_agent": self.agent,
+            "tokens": tokens,
+            "ttl_ms": HERDR_REGISTRATION_TTL_MS,
+        }
+
+    def register(self, session_id: object = None) -> None:
+        """Refresh identity/metadata; this path never sends a state update."""
+        if not self.enabled:
+            return
+        safe_session_id = self._valid_session_id(session_id)
+        base = self._base(safe_session_id)
+        if safe_session_id and safe_session_id != self.agent_session_id:
+            self._send("pane.report_agent_session", dict(base))
+            self.agent_session_id = safe_session_id
+        success = self._send("pane.report_metadata", self._metadata())
+        self.registered = success or self.registered
+        self.last_report_at = now()
+        self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
+
+    def report_state(self, state: str, session_id: object = None) -> None:
+        """Report only a state derived from PTY output, never from a hook event."""
+        if not self.enabled or state not in {"idle", "working", "blocked", "unknown"}:
+            return
+        self.register(session_id)
+        report = self._base(session_id)
+        report["state"] = state
+        self._send("pane.report_agent", report)
+        self.last_report_state = state
+        self.last_report_at = now()
+        self.next_heartbeat = monotonic() + HERDR_HEARTBEAT_SECONDS
+
+    def heartbeat(self, state: str | None = None, session_id: object = None) -> None:
+        if self.enabled and monotonic() >= self.next_heartbeat:
+            if state in {"idle", "working", "blocked", "unknown"}:
+                self.report_state(state, session_id)
+            else:
+                self.register(session_id)
+
+    def release(self) -> None:
+        if not self.enabled or self.socket_path is None:
+            return
+        params = {
+            "pane_id": self.pane_id,
+            "source": self.source,
+            "agent": self.agent,
+        }
+        if self._send("pane.release_agent", params):
+            self.registered = False
+        self.last_report_state = "released"
+        self.last_report_at = now()
+
+
+class Supervisor:
+    """Own one Codex PTY, lifecycle socket, state file, and idle timer."""
+
+    def __init__(self, argv: list[str], executable: str):
+        self.argv = argv
+        self.executable = executable
+        self.channel = "codex-" + uuid.uuid4().hex
+        self.root = runtime_root()
+        self.session_dir = self.root / self.channel
+        safe_mkdir(self.session_dir)
+        self.state_root = persistent_state_root()
+        self.debug_log_path = self.state_root / f"{self.channel}.codex-debug.log"
+        self.socket_path = self.session_dir / "control.sock"
+        self.state_path = self.session_dir / "state.json"
+        self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socket.bind(str(self.socket_path))
+        os.chmod(self.socket_path, 0o600)
+        self.socket.listen(8)
+        self.socket.setblocking(False)
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(self.socket, selectors.EVENT_READ, "server")
+        self.pid: int | None = None
+        self.master_fd: int | None = None
+        self.child_tty: str | None = None
+        self.child_status: int | None = None
+        self.stdin_eof = False
+        self.terminal_attributes = None
+        self.stdin_flags: int | None = None
+        self.session_id: str | None = None
+        self.status = "starting"
+        self.enabled = True
+        self.dirty = False
+        self.compacting = False
+        self.compaction_requested_at: float | None = None
+        self.compaction_ignore_next_stop = False
+        self.current_tokens: int | None = None
+        self.last_normal_stop: float | None = None
+        self.last_local_input: float | None = None
+        self.last_local_input_classification: str | None = None
+        self.last_lifecycle_activity: float | None = None
+        self.input_classifier = TerminalInputClassifier()
+        self.timer_deadline: float | None = None
+        self.timer_kind: str | None = None
+        self.timer_generation = 0
+        self.last_cancellation_reason: str | None = None
+        self.last_gate_rejection_reason: str | None = None
+        self.last_injection_result: str | None = None
+        self.last_state_transition = "supervisor-started"
+        self.shutdown_requested = False
+        self.child_exited_at: float | None = None
+        self.herdr = HerdrReporter()
+        self.screen_classifier = CodexScreenClassifier()
+        self.screen_state: str | None = None
+        self._write_state()
+
+    def state(self) -> dict:
+        return {
+            "channel": self.channel,
+            "pid": self.pid,
+            "supervisor_pid": os.getpid(),
+            "pty_master_owned": self.master_fd is not None,
+            "pty_child_terminal": self.child_tty,
+            "control_socket": str(self.socket_path),
+            "session_id": self.session_id,
+            "status": self.status,
+            "current_input_context_tokens": self.current_tokens,
+            "dirty": self.dirty,
+            "compacting": self.compacting,
+            "compaction_ignore_next_stop": self.compaction_ignore_next_stop,
+            "last_normal_stop": self.last_normal_stop,
+            "last_local_input": self.last_local_input,
+            "last_local_input_classification": self.last_local_input_classification,
+            "last_lifecycle_activity": self.last_lifecycle_activity,
+            "timer_deadline": self.timer_deadline,
+            "timer_kind": self.timer_kind,
+            "timer_generation": self.timer_generation,
+            "last_cancellation_reason": self.last_cancellation_reason,
+            "last_gate_rejection_reason": self.last_gate_rejection_reason,
+            "last_injection_result": self.last_injection_result,
+            "last_state_transition": self.last_state_transition,
+            "debug_log": str(self.debug_log_path),
+            "herdr_screen_state": self.screen_state,
+            **self.herdr.state(),
+        }
+
+    def _debug(self, message: str) -> None:
+        append_debug(self.debug_log_path, message)
+
+    def _write_state(self) -> None:
+        try:
+            atomic_json(self.state_path, self.state())
+        except OSError as error:
+            self._debug(f"state-write-failed channel={short_id(self.channel)} error={error}")
+
+    def _register_herdr(self) -> None:
+        self.herdr.register(self.session_id)
+        self._write_state()
+
+    def _report_screen_state(self, state: str) -> None:
+        self.screen_state = state
+        self.herdr.report_state(state, self.session_id)
+        self._write_state()
+
+    def _bound_debug_log(self) -> None:
+        try:
+            size = self.debug_log_path.stat().st_size
+            if size <= DEBUG_LOG_MAX_BYTES:
+                return
+            with self.debug_log_path.open("rb") as stream:
+                stream.seek(-DEBUG_LOG_MAX_BYTES, os.SEEK_END)
+                tail = stream.read()
+            with self.debug_log_path.open("wb") as stream:
+                stream.write(tail)
+        except OSError:
+            pass
+
+    def cancel(self, reason: str) -> None:
+        self.timer_deadline = None
+        self.timer_kind = None
+        self.timer_generation += 1
+        self.last_cancellation_reason = reason
+        self.last_state_transition = f"cancelled:{reason}"
+        self._debug(f"cancelled:{reason} channel={short_id(self.channel)}")
+        self._write_state()
+
+    def arm(self) -> None:
+        if not (
+            self.enabled
+            and self.dirty
+            and self.status == "idle"
+            and not self.compacting
+            and self.last_normal_stop
+            and child_alive(self.pid)
+            and self.timer_deadline is None
+        ):
+            return
+        self.timer_generation += 1
+        self.timer_deadline = self.last_normal_stop + IDLE_SECONDS
+        self.timer_kind = "compact"
+        self.last_state_transition = "armed"
+        self._debug(
+            f"armed channel={short_id(self.channel)} "
+            f"delay={IDLE_SECONDS}"
+        )
+        self._write_state()
+
+    def _compaction_failed(self, reason: str) -> None:
+        if not self.compacting:
+            return
+        self.compacting = False
+        self.compaction_requested_at = None
+        self.compaction_ignore_next_stop = True
+        self.dirty = True
+        self.last_cancellation_reason = "compaction-failed"
+        self.last_injection_result = "failed"
+        self.last_state_transition = "compaction-failed"
+        self._debug(
+            f"compaction-failed channel={short_id(self.channel)} reason={reason}"
+        )
+        self._write_state()
+
+    def _install_terminal(self) -> None:
+        fd = sys.stdin.fileno()
+        is_terminal = os.isatty(fd)
+        self.stdin_flags = fcntl.fcntl(fd, fcntl.F_GETFL)
+        if is_terminal:
+            self.terminal_attributes = termios.tcgetattr(fd)
+            tty.setraw(fd)
+        os.set_blocking(fd, False)
+        try:
+            self.selector.register(sys.stdin, selectors.EVENT_READ, "stdin")
+        except OSError:
+            if is_terminal:
+                raise
+            self._debug("stdin-not-pollable")
+        if is_terminal:
+            self._resize()
+
+    def _restore_terminal(self) -> None:
+        if self.terminal_attributes is not None:
+            try:
+                termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.terminal_attributes)
+            except OSError:
+                pass
+            self.terminal_attributes = None
+        if self.stdin_flags is not None:
+            try:
+                fcntl.fcntl(sys.stdin.fileno(), fcntl.F_SETFL, self.stdin_flags)
+            except OSError:
+                pass
+            self.stdin_flags = None
+
+    def _cleanup_terminal_modes(self) -> None:
+        if not os.isatty(sys.stdout.fileno()):
+            return
+        try:
+            write_all(sys.stdout.fileno(), TERMINAL_CLEANUP_BYTES)
+            sys.stdout.flush()
+        except OSError:
+            pass
+
+    def _resize(self) -> None:
+        if self.master_fd is None or not os.isatty(sys.stdout.fileno()):
+            return
+        try:
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            winsize = struct.pack("HHHH", size.lines, size.columns, 0, 0)
+            fcntl.ioctl(self.master_fd, termios.TIOCSWINSZ, winsize)
+            if self.pid and child_alive(self.pid):
+                os.kill(self.pid, signal.SIGWINCH)
+        except OSError:
+            pass
+
+    def _forward_signal(self, signum: int, _frame: object) -> None:
+        if self.pid and child_alive(self.pid):
+            try:
+                os.killpg(self.pid, signum)
+            except OSError:
+                try:
+                    os.kill(self.pid, signum)
+                except OSError:
+                    pass
+        if signum in {signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT}:
+            self.shutdown_requested = True
+
+    def _install_signals(self) -> None:
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+            signal.signal(signum, self._forward_signal)
+        signal.signal(signal.SIGWINCH, lambda _signum, _frame: self._resize())
+
+    def launch(self) -> None:
+        environment = os.environ.copy()
+        environment.update(
+            {
+                "CODEX_IDLE_CHANNEL": self.channel,
+                "CODEX_IDLE_OWNER": "pty-supervisor",
+                "CODEX_IDLE_CONTROL_SOCKET": str(self.socket_path),
+                "CODEX_IDLE_RUNTIME_DIR": str(self.session_dir),
+                "CODEX_IDLE_SUPERVISOR_PID": str(os.getpid()),
+            }
+        )
+        pid, master_fd = pty.fork()
+        if pid == 0:
+            try:
+                os.execvpe(self.executable, [self.executable, *self.argv], environment)
+            except BaseException as error:
+                print(f"codex-warm: failed to exec Codex: {error}", file=sys.stderr)
+                os._exit(127)
+        self.pid = pid
+        self.master_fd = master_fd
+        os.set_blocking(master_fd, False)
+        self.child_tty = self._read_child_tty()
+        self.selector.register(master_fd, selectors.EVENT_READ, "master")
+        self._install_signals()
+        self._install_terminal()
+        self.herdr.child_pid = pid
+        self._register_herdr()
+        self._write_state()
+
+    def _read_child_tty(self) -> str | None:
+        if not self.pid:
+            return None
+        try:
+            candidate = os.readlink(f"/proc/{self.pid}/fd/0")
+            return candidate if candidate.startswith("/dev/") else None
+        except OSError:
+            return None
+
+    def _pty_still_owned(self) -> bool:
+        if not self.pid or self.master_fd is None or not child_alive(self.pid):
+            return False
+        if self.child_tty is None:
+            self.child_tty = self._read_child_tty()
+        try:
+            return (
+                os.getpgid(self.pid) == self.pid
+                and self.child_tty is not None
+                and os.readlink(f"/proc/{self.pid}/fd/0") == self.child_tty
+            )
+        except OSError:
+            return False
+
+    def _gate_reason(self, purpose: str = "compact") -> str | None:
+        if not self.enabled:
+            return "session-disabled"
+        if self.status != "idle":
+            return "session-active"
+        if self.compacting:
+            return "already-compacting"
+        if not self._pty_still_owned():
+            return "pty-or-process-gone"
+        if not self.session_id or not SESSION_RE.fullmatch(self.session_id):
+            return "session-unbound"
+        if not self.last_normal_stop:
+            return "no-normal-stop"
+        if self.last_lifecycle_activity and self.last_lifecycle_activity > self.last_normal_stop:
+            return "lifecycle-activity"
+        if self.last_local_input and self.last_local_input > self.last_normal_stop:
+            return "user-input"
+        if purpose == "compact":
+            if not self.dirty:
+                return "clean"
+            if now() - self.last_normal_stop >= TTL_SECONDS:
+                return "cache-already-cold"
+            if self.current_tokens is not None and self.current_tokens < MIN_TOKENS:
+                return "below-token-threshold"
+        elif purpose != "manual":
+            return "unknown-injection-purpose"
+        return None
+
+    def attempt(
+        self,
+        expected_generation: int | None = None,
+        command: str = "/compact",
+        purpose: str = "compact",
+    ) -> bool:
+        if expected_generation is not None and expected_generation != self.timer_generation:
+            self.last_gate_rejection_reason = "stale-timer"
+            self.last_state_transition = "gate-refused:stale-timer"
+            self._write_state()
+            return False
+        reason = self._gate_reason(purpose)
+        if reason:
+            self.last_cancellation_reason = reason
+            self.last_gate_rejection_reason = reason
+            self.last_state_transition = f"gate-refused:{reason}"
+            self._debug(f"cancelled:{reason} channel={short_id(self.channel)}")
+            self._write_state()
+            return False
+        if command not in {"/compact"}:
+            self.last_gate_rejection_reason = "inject-command-refused"
+            self._write_state()
+            return False
+        self.status = "active"
+        self.last_gate_rejection_reason = None
+        self.last_injection_result = "pending"
+        self.last_state_transition = "injection-attempted"
+        self.timer_deadline = None
+        self.timer_kind = None
+        self.timer_generation += 1
+        if purpose == "compact":
+            self.compacting = True
+            self.compaction_requested_at = now()
+            self.compaction_ignore_next_stop = False
+            self.last_cancellation_reason = "compaction-requested"
+        else:
+            self.last_cancellation_reason = "manual-injection-requested"
+        self._write_state()
+        try:
+            if self.master_fd is None:
+                raise OSError(errno.EIO, "PTY master unavailable")
+            write_all(self.master_fd, (command + "\r").encode("utf-8"))
+        except OSError as error:
+            if purpose == "compact":
+                self.compacting = False
+                self.compaction_requested_at = None
+                self.dirty = True
+                self.last_cancellation_reason = "compaction-injection-failed"
+                self.last_injection_result = "failed"
+                self.last_state_transition = "injection-failed"
+                self._debug(f"compaction-failed channel={short_id(self.channel)} error={error}")
+            else:
+                self.status = "idle"
+                self.last_cancellation_reason = "manual-injection-failed"
+                self.last_injection_result = "failed"
+                self.last_state_transition = "injection-failed"
+            self._write_state()
+            return False
+        if purpose == "compact":
+            self.last_injection_result = "requested"
+            self.last_state_transition = "compaction-requested"
+            self._debug(f"compaction-requested channel={short_id(self.channel)}")
+        self._write_state()
+        return True
+
+    def _handle_event(self, message: dict) -> dict:
+        if message.get("kind") != "event" or message.get("channel") != self.channel:
+            return {"ok": False, "error": "invalid-event-owner"}
+        event = message.get("event")
+        session_id = message.get("session_id")
+        if event not in EVENTS or not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
+            return {"ok": False, "error": "invalid-event"}
+        if event == "session-start":
+            new_session = self.session_id != session_id
+            if self.session_id and new_session:
+                self.cancel("session-replaced")
+                self.dirty = False
+                self.compaction_requested_at = None
+                self.compaction_ignore_next_stop = False
+            self.session_id = session_id
+            self.status = "starting"
+            self.screen_classifier.reset()
+            self.screen_state = None
+            self.last_lifecycle_activity = now()
+            self._register_herdr()
+            self._write_state()
+            return {"ok": True}
+        if self.session_id != session_id:
+            return {"ok": False, "error": "session-mismatch"}
+        current = now()
+        if event == "stop":
+            if message.get("stop_hook_active") is not False:
+                return {"ok": True, "ignored": "stop-hook-active"}
+            if self.compaction_ignore_next_stop:
+                self.compaction_ignore_next_stop = False
+                self.status = "idle"
+                self.last_lifecycle_activity = current
+                self.cancel("compaction-failed-stop")
+                return {"ok": True, "ignored": "compaction-failed-stop"}
+            if self.compacting:
+                self.status = "idle"
+                self.cancel("compaction-stop")
+                return {"ok": True, "ignored": "compaction-stop"}
+            if (
+                self.last_normal_stop
+                and self.status == "idle"
+                and self.dirty
+                and current - self.last_normal_stop < 0.5
+            ):
+                return {"ok": True, "ignored": "duplicate-stop"}
+            self.status = "idle"
+            self.dirty = True
+            self.last_normal_stop = current
+            self.last_lifecycle_activity = current
+            self.last_local_input = None
+            self.cancel("new-normal-turn")
+            self.arm()
+            return {"ok": True}
+        if event == "user-prompt-submit":
+            self.status = "active"
+            self.last_lifecycle_activity = current
+            self.compaction_ignore_next_stop = False
+            self.cancel("prompt-submit")
+        elif event == "post-compact":
+            self.status = "idle"
+            self.dirty = False
+            self.compacting = False
+            self.compaction_requested_at = None
+            self.compaction_ignore_next_stop = False
+            self.current_tokens = None
+            self.last_injection_result = "succeeded"
+            self.last_lifecycle_activity = current
+            self.cancel("compaction-completed")
+            self.last_state_transition = "compaction-completed"
+            self._debug(f"compaction-completed channel={short_id(self.channel)}")
+        elif event == "session-end":
+            self.status = "ended"
+            self.last_lifecycle_activity = current
+            self.cancel("session-end")
+            self.herdr.release()
+        elif event == "stop-failure":
+            if self.compacting:
+                self._compaction_failed("stop-failure")
+                self.last_injection_result = "failed"
+                self.last_state_transition = "stop-failure"
+            self.status = "error"
+            self.last_lifecycle_activity = current
+            self.cancel("stop-failure")
+        else:
+            self.status = "active"
+            self.last_lifecycle_activity = current
+            self.cancel("session-activity")
+        self._write_state()
+        return {"ok": True}
+
+    def _handle_control(self, message: dict) -> dict:
+        if message.get("kind") != "control":
+            return {"ok": False, "error": "invalid-control"}
+        if message.get("channel") != self.channel:
+            return {"ok": False, "error": "invalid-control-owner"}
+        command = message.get("command")
+        if command not in CONTROL_COMMANDS:
+            return {"ok": False, "error": "unknown-control"}
+        if command == "state":
+            return {"ok": True, "state": self.state()}
+        if command == "enable":
+            self.enabled = True
+            self.arm()
+        elif command == "disable":
+            self.enabled = False
+            self.cancel("session-disabled")
+        elif command == "cancel":
+            self.cancel("manual-cancel")
+        elif command == "trigger":
+            success = self.attempt()
+            self._write_state()
+            return {"ok": success, "state": self.state()}
+        elif command == "inject":
+            text = message.get("text")
+            if text != "/compact":
+                return {"ok": False, "error": "inject-command-refused", "state": self.state()}
+            success = self.attempt(command=text, purpose="compact")
+            self._write_state()
+            return {"ok": success, "state": self.state()}
+        self._write_state()
+        return {"ok": True, "state": self.state()}
+
+    def _serve_one(self, connection: socket.socket) -> None:
+        try:
+            connection.settimeout(1.0)
+            data = connection.recv(65536)
+            if not data:
+                return
+            message = json.loads(data.split(b"\n", 1)[0].decode("utf-8"))
+            if not isinstance(message, dict):
+                response = {"ok": False, "error": "invalid-json"}
+            elif message.get("kind") == "event":
+                response = self._handle_event(message)
+            else:
+                response = self._handle_control(message)
+            connection.sendall((json.dumps(response, separators=(",", ":")) + "\n").encode())
+        except (OSError, ValueError, UnicodeError) as error:
+            self._debug(f"ipc-error channel={short_id(self.channel)} error={error}")
+        finally:
+            connection.close()
+
+    def _record_input_observations(
+        self,
+        observations: list[tuple[str, int, bool]],
+    ) -> None:
+        if not observations:
+            return
+        human = any(is_human for _, _, is_human in observations)
+        if not human:
+            return
+        self.last_local_input = now()
+        self.last_local_input_classification = ",".join(
+            sorted({kind for kind, _, is_human in observations if is_human})
+        )
+        if self.timer_deadline is not None and self.last_normal_stop and self.last_local_input > self.last_normal_stop:
+            self.cancel("user-input")
+        else:
+            self._write_state()
+
+    def _flush_input_classifier(self) -> None:
+        self._record_input_observations(self.input_classifier.flush_expired())
+
+    def _read_stdin(self) -> None:
+        try:
+            data = os.read(sys.stdin.fileno(), 65536)
+        except (OSError, BlockingIOError):
+            return
+        if not data:
+            self.stdin_eof = True
+            if self.master_fd is not None:
+                try:
+                    write_all(self.master_fd, b"\x04")
+                except OSError:
+                    pass
+            try:
+                self.selector.unregister(sys.stdin)
+            except Exception:
+                pass
+            return
+        if self.master_fd is not None:
+            try:
+                write_all(self.master_fd, data)
+            except OSError:
+                self.shutdown_requested = True
+        try:
+            observations = self.input_classifier.feed(data)
+        except Exception:
+            self._debug("terminal-input-classifier-error")
+            observations = [("unknown-input", len(data), True)]
+        self._record_input_observations(observations)
+
+    def _read_master(self) -> bool:
+        if self.master_fd is None:
+            return False
+        try:
+            data = os.read(self.master_fd, 65536)
+        except OSError as error:
+            if error.errno in {errno.EIO, errno.EBADF}:
+                return False
+            return True
+        if not data:
+            return False
+        state = self.screen_classifier.feed(data)
+        try:
+            write_all(sys.stdout.fileno(), data)
+            sys.stdout.flush()
+        except OSError:
+            self.shutdown_requested = True
+        if state is not None:
+            self._report_screen_state(state)
+        return True
+
+    def _child_has_exited(self) -> bool:
+        if self.child_status is not None or not self.pid:
+            return self.child_status is not None
+        try:
+            waited_pid, status = os.waitpid(self.pid, os.WNOHANG)
+        except ChildProcessError:
+            self.child_status = 1 << 8
+            return True
+        if waited_pid == self.pid:
+            self.child_status = status
+            self.child_exited_at = now()
+            self.status = "exited"
+            self.cancel("process-exit")
+            return True
+        return False
+
+    def run(self) -> int:
+        self.launch()
+        master_open = True
+        next_debug_bound = monotonic() + 5
+        try:
+            while master_open:
+                child_exited = self._child_has_exited()
+                self.herdr.heartbeat(self.screen_state, self.session_id)
+                self._flush_input_classifier()
+                if self.timer_deadline is not None and now() >= self.timer_deadline:
+                    generation = self.timer_generation
+                    kind = self.timer_kind
+                    self.timer_deadline = None
+                    self.timer_kind = None
+                    if kind == "compact":
+                        self.attempt(generation)
+                if monotonic() >= next_debug_bound:
+                    next_debug_bound = monotonic() + 5
+                    self._bound_debug_log()
+                if child_exited:
+                    master_open = self._read_master()
+                    if not master_open:
+                        break
+                timeout = 1.0
+                if self.timer_deadline is not None:
+                    timeout = max(0.0, min(timeout, self.timer_deadline - now()))
+                events = self.selector.select(timeout)
+                for key, _mask in events:
+                    if key.data == "server":
+                        try:
+                            connection, _ = self.socket.accept()
+                            self._serve_one(connection)
+                        except BlockingIOError:
+                            pass
+                    elif key.data == "master":
+                        master_open = self._read_master()
+                    elif key.data == "stdin":
+                        self._read_stdin()
+                if self.shutdown_requested and self.pid and child_alive(self.pid):
+                    self._forward_signal(signal.SIGHUP, None)
+            self._child_has_exited()
+            if self.child_status is None and self.pid:
+                try:
+                    _, self.child_status = os.waitpid(self.pid, 0)
+                except ChildProcessError:
+                    self.child_status = 1 << 8
+            return os.waitstatus_to_exitcode(self.child_status or 0)
+        finally:
+            self._cleanup_terminal_modes()
+            self._restore_terminal()
+            self.cleanup()
+
+    def cleanup(self) -> None:
+        self.herdr.release()
+        try:
+            self.selector.close()
+        except Exception:
+            pass
+        if self.master_fd is not None:
+            try:
+                os.close(self.master_fd)
+            except OSError:
+                pass
+            self.master_fd = None
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+        try:
+            shutil.rmtree(self.session_dir)
+        except OSError:
+            pass
+
+
+def control_socket(channel: str) -> pathlib.Path:
+    if not CHANNEL_RE.fullmatch(channel):
+        raise RuntimeError("invalid Codex idle-compaction channel")
+    return runtime_root() / channel / "control.sock"
+
+
+def send_control(channel: str, command: str, **fields: object) -> dict:
+    path = control_socket(channel)
+    message = {"kind": "control", "channel": channel, "command": command, **fields}
+    connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        connection.settimeout(2.0)
+        connection.connect(str(path))
+        connection.sendall((json.dumps(message, separators=(",", ":")) + "\n").encode())
+        data = connection.recv(65536)
+        return json.loads(data.decode("utf-8"))
+    finally:
+        connection.close()
+
+
+def list_sessions() -> int:
+    root = runtime_root()
+    found = False
+    for state_path in sorted(root.glob("codex-*/state.json")):
+        found = True
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        state["live"] = child_alive(state.get("pid"))
+        print(json.dumps(state, sort_keys=True))
+    if not found:
+        print("no supervised Codex sessions")
+    return 0
+
+
+def control_main(argv: list[str]) -> int:
+    if not argv or argv[0] in {"-h", "--help"}:
+        print("usage: codex-warmctl list | show CHANNEL | enable CHANNEL | disable CHANNEL")
+        print("       codex-warmctl cancel CHANNEL | trigger CHANNEL")
+        print("       codex-warmctl inject CHANNEL /compact")
+        return 0
+    command = argv[0]
+    if command == "list":
+        return list_sessions()
+    if command not in CONTROL_COMMANDS:
+        print(f"unknown control command: {command}", file=sys.stderr)
+        return 2
+    if len(argv) < 2:
+        print(f"{command} requires CHANNEL", file=sys.stderr)
+        return 2
+    channel = argv[1]
+    fields: dict[str, object] = {}
+    if command == "inject":
+        if len(argv) < 3:
+            print("inject requires /compact", file=sys.stderr)
+            return 2
+        fields = {"text": " ".join(argv[2:])}
+    try:
+        response = send_control(channel, "state" if command == "show" else command, **fields)
+    except (OSError, RuntimeError, ValueError) as error:
+        print(f"control failed: {error}", file=sys.stderr)
+        return 1
+    print(json.dumps(response, indent=2, sort_keys=True))
+    return 0 if response.get("ok") else 1
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == "--control":
+        return control_main(argv[1:])
+    if argv and argv[0] in {"-h", "--help"}:
+        print("usage: codex-warm [CODEX OPTIONS...]", file=sys.stdout)
+        print("Runs the real Codex CLI through a full PTY supervisor.")
+        print("Environment: CODEX_IDLE_COMPACTION_DEBUG,")
+        print("CODEX_IDLE_COMPACT_SECONDS, CODEX_IDLE_COMPACT_TTL_SECONDS,")
+        print("CODEX_IDLE_COMPACT_MIN_TOKENS,")
+        print("CODEX_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS,")
+        print("CODEX_WARM_HERDR_AGENT, CODEX_WARM_HERDR_HEARTBEAT_SECONDS,")
+        print("CODEX_WARM_HERDR_REGISTRATION_TTL_MS")
+        print("Use codex-warmctl for per-session state and controls.")
+        return 0
+    try:
+        supervisor = Supervisor(argv, resolve_codex())
+        return supervisor.run()
+    except (OSError, RuntimeError) as error:
+        print(f"codex-warm: {error}", file=sys.stderr)
+        return 69
+
+
+def shell_exit_code(status: int) -> int:
+    return 128 - status if status < 0 else status
+
+
+if __name__ == "__main__":
+    raise SystemExit(shell_exit_code(main(sys.argv[1:])))
