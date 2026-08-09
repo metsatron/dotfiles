@@ -2,7 +2,8 @@
 # Launcher — sanctuary-redstone-nt-launch
 
 # Runs the shared Redstone projection, then manages the Xpra display lifecycle.
-# Subcommands: =start-full= (projection + display), =stop=, =status=.
+# Subcommands: =preflight= (read-only readiness gate), =start-full= (projection +
+# display), =health= (stable runtime report), =stop=, and =status=.
 
 # The =--start-child= invocation uses =env -i= to strip the host daemon environment,
 # preventing API key leaks into =podman exec --env== arguments (see
@@ -18,7 +19,9 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 sanctuary-redstone-nt-launch - Redstone NT Enterprise Server (Xpra + IceWM)
 
 Usage:
+  sanctuary-redstone-nt-launch preflight    Check readiness without changing state
   sanctuary-redstone-nt-launch start-full   Run projection, start Xpra display
+  sanctuary-redstone-nt-launch health       Report container, display, and desktop health
   sanctuary-redstone-nt-launch stop         Stop the Xpra display
   sanctuary-redstone-nt-launch status       Show Xpra session status
   sanctuary-redstone-nt-launch -h|--help    This help
@@ -50,19 +53,189 @@ RETROPIE_HOST_ROOT="${HOME}/RetroPie"
 RETROPIE_CONTAINER_ROOT="/run/dotcortex/retropie"
 GAMES_CONTAINER_ROOT="/run/dotcortex/games"
 REPO_ROOT="${DOTCORTEX_ROOT:-${HOME}/DotCortex}"
+GAMING_INOTIFY_APPLY="${REPO_ROOT}/linux/.local/bin/sanctuary-gaming-inotify-apply"
+RETROPIE_STOW="${REPO_ROOT}/linux/.local/bin/sanctuary-retropie-stow"
 
 export REDSTONE_PRODUCT="Mineshaft Redstone NT Enterprise Server"
 
 SESSION="${HOME}/.local/bin/sanctuary-redstone-nt-session"
+XAUTHORITY_FILE="${REDSTONE_NT_XAUTHORITY:-${XAUTHORITY:-${HOME}/.Xauthority}}"
 
-command -v xpra >/dev/null 2>&1 || { echo "${SANCTUARY}: xpra is required on the host" >&2; exit 127; }
+xpra_live() {
+  command -v xpra >/dev/null 2>&1 \
+    && xpra list 2>/dev/null | grep -Fq "LIVE session at ${DISPLAY_NUM}"
+}
+
+container_state() {
+  if ! command -v podman >/dev/null 2>&1; then
+    printf '%s\n' unavailable
+  elif ! podman container exists "${SANCTUARY}" 2>/dev/null; then
+    printf '%s\n' missing
+  else
+    podman inspect --format '{{.State.Status}}' "${SANCTUARY}" 2>/dev/null \
+      || printf '%s\n' unknown
+  fi
+}
+
+process_on_display() {
+  local name="$1" pid
+  while read -r pid; do
+    [[ -r "/proc/${pid}/environ" ]] || continue
+    if tr '\0' '\n' < "/proc/${pid}/environ" 2>/dev/null \
+        | grep -Fxq "DISPLAY=${DISPLAY_NUM}"; then
+      return 0
+    fi
+  done < <(pgrep -x "${name}" 2>/dev/null || true)
+  return 1
+}
+
+preflight() {
+  local failures=0 profile profile_path socket display_id owner
+
+  _pass() { printf 'PASS  %s\n' "$1"; }
+  _fail() { printf 'FAIL  %s\n' "$1" >&2; failures=$((failures + 1)); }
+
+  for tool in xpra podman distrobox sanctuary-trash-shield sanctuary-retropie-bind-ensure; do
+    if command -v "${tool}" >/dev/null 2>&1; then
+      _pass "command available: ${tool}"
+    else
+      _fail "command missing: ${tool}"
+    fi
+  done
+
+  if [[ "${DISPLAY_NUM}" =~ ^:[0-9]+$ ]]; then
+    _pass "display identifier: ${DISPLAY_NUM}"
+  else
+    _fail "invalid display identifier: ${DISPLAY_NUM}"
+  fi
+
+  [[ "${DESKTOP}" == icewm ]] \
+    && _pass "desktop supported: ${DESKTOP}" \
+    || _fail "unsupported desktop: ${DESKTOP}"
+  [[ -r "${REPO_ROOT}/linux/.local/bin/redstone-project-common" ]] \
+    && _pass "shared projector available" \
+    || _fail "shared projector missing"
+  [[ -x "${SESSION}" ]] \
+    && _pass "session helper executable" \
+    || _fail "session helper unavailable: ${SESSION}"
+  [[ -r "${XAUTHORITY_FILE}" ]] \
+    && _pass "Xauthority readable: ${XAUTHORITY_FILE}" \
+    || _fail "Xauthority unavailable: ${XAUTHORITY_FILE}"
+
+  if [[ -d "${GUEST_HOME}" ]]; then
+    owner="$(stat -c '%u' "${GUEST_HOME}" 2>/dev/null || true)"
+    [[ "${owner}" == "$(id -u)" ]] \
+      && _pass "guest home owned by $(id -un)" \
+      || _fail "guest home ownership mismatch: ${GUEST_HOME}"
+    if find "${GUEST_HOME}" -xdev ! -user "$(id -un)" -print -quit 2>/dev/null | grep -q .; then
+      _fail "guest home contains files owned by another user"
+    else
+      _pass "guest home ownership tree is clean"
+    fi
+  else
+    _fail "guest home missing: ${GUEST_HOME}"
+  fi
+
+  for profile in desktop-common room-gaming room-windows-compat; do
+    profile_path="${GUIX_PROFILES}/${profile}/${profile}/etc/profile"
+    [[ -r "${profile_path}" ]] \
+      && _pass "Guix profile available: ${profile}" \
+      || _fail "Guix profile missing: ${profile}"
+  done
+
+  [[ -d "${RETROPIE_HOST_ROOT}/roms/ports" ]] \
+    && _pass "RetroPie ports tree available" \
+    || _fail "RetroPie ports tree unavailable: ${RETROPIE_HOST_ROOT}/roms/ports"
+
+  if command -v podman >/dev/null 2>&1 \
+      && podman container exists "${SANCTUARY}" 2>/dev/null; then
+    _pass "container exists: ${SANCTUARY}"
+  else
+    _fail "container missing: ${SANCTUARY}"
+  fi
+
+  display_id="${DISPLAY_NUM#:}"
+  socket="/tmp/.X11-unix/X${display_id}"
+  if [[ -S "${socket}" ]] && ! xpra_live; then
+    _fail "display socket is occupied outside the expected Xpra session: ${socket}"
+  elif xpra_live; then
+    _pass "Xpra display already live: ${DISPLAY_NUM}"
+  else
+    _pass "Xpra display available: ${DISPLAY_NUM}"
+  fi
+
+  if (( failures > 0 )); then
+    printf '%s: preflight failed (%d check%s)\n' \
+      "${SANCTUARY}" "${failures}" "$([[ ${failures} -eq 1 ]] || printf s)" >&2
+    return 1
+  fi
+  printf '%s: preflight passed\n' "${SANCTUARY}"
+}
+
+health() {
+  local container xpra_state icewm_state ownership projection product overall
+  local build_file="${GUEST_HOME}/.local/share/redstone-9x/build.ini"
+
+  container="$(container_state)"
+  if xpra_live; then xpra_state=live; else xpra_state=stopped; fi
+  if process_on_display icewm-session || process_on_display icewm; then
+    icewm_state=running
+  else
+    icewm_state=stopped
+  fi
+  if [[ -d "${GUEST_HOME}" ]] \
+      && ! find "${GUEST_HOME}" -xdev ! -user "$(id -un)" -print -quit 2>/dev/null | grep -q .; then
+    ownership=clean
+  else
+    ownership=foreign
+  fi
+  if [[ -f "${GUEST_HOME}/.icewm/menu" && -x "${GUEST_HOME}/.local/bin/redstone-9x-flatpak-session" ]]; then
+    projection=present
+  else
+    projection=missing
+  fi
+  product="$(sed -n 's/^product=//p' "${build_file}" 2>/dev/null | head -n 1 || true)"
+  [[ -n "${product}" ]] || product=missing
+
+  if [[ "${container}" == running && "${xpra_state}" == live \
+        && "${icewm_state}" == running && "${ownership}" == clean \
+        && "${projection}" == present && "${product}" == "${REDSTONE_PRODUCT}" ]]; then
+    overall=healthy
+  else
+    overall=degraded
+  fi
+
+  printf 'sanctuary=%s\n' "${SANCTUARY}"
+  printf 'container=%s\n' "${container}"
+  printf 'display=%s\n' "${DISPLAY_NUM}"
+  printf 'xpra=%s\n' "${xpra_state}"
+  printf 'icewm=%s\n' "${icewm_state}"
+  printf 'ownership=%s\n' "${ownership}"
+  printf 'projection=%s\n' "${projection}"
+  printf 'product=%s\n' "${product}"
+  printf 'overall=%s\n' "${overall}"
+
+  [[ "${overall}" == healthy ]]
+}
 
 start_full() {
+  preflight
+
   # ── Shared Redstone projection ──
   . "${REPO_ROOT}/linux/.local/bin/redstone-project-common"
 
+  [[ -x "${GAMING_INOTIFY_APPLY}" ]] || {
+    echo "${SANCTUARY}: ERROR — gaming inotify helper missing: ${GAMING_INOTIFY_APPLY}" >&2
+    exit 1
+  }
+  "${GAMING_INOTIFY_APPLY}"
   redstone_preflight_guix_profiles
   prepare_retropie_tree
+  [[ -x "${RETROPIE_STOW}" ]] || {
+    echo "${SANCTUARY}: ERROR — RetroPie projection helper missing: ${RETROPIE_STOW}" >&2
+    exit 1
+  }
+  SANCTUARY_GUEST_HOME="${GUEST_HOME}" "${RETROPIE_STOW}" --mapping openra-content --apply
   redstone_check_desktop_prereqs
 
   redstone_project
@@ -70,7 +243,7 @@ start_full() {
   sanctuary-trash-shield "${SANCTUARY}" "${HOME}"
 
   # If display is already live, projection is refreshed but display stays.
-  if xpra list 2>/dev/null | grep -Fq "LIVE session at ${DISPLAY_NUM}"; then
+  if xpra_live; then
     echo "${SANCTUARY}: display ${DISPLAY_NUM} already running — projection refreshed"
     return 0
   fi
@@ -99,9 +272,19 @@ start_full() {
 }
 
 case "${1:-}" in
+  preflight) preflight ;;
   start-full) start_full ;;
-  stop) xpra stop "${DISPLAY_NUM}" 2>/dev/null || true ;;
-  status) xpra list ;;
-  *) echo "Usage: sanctuary-redstone-nt-launch start-full|stop|status" >&2; exit 2 ;;
+  health) health ;;
+  stop)
+    command -v xpra >/dev/null 2>&1 \
+      || { echo "${SANCTUARY}: xpra is required on the host" >&2; exit 127; }
+    xpra stop "${DISPLAY_NUM}" 2>/dev/null || true
+    ;;
+  status)
+    command -v xpra >/dev/null 2>&1 \
+      || { echo "${SANCTUARY}: xpra is required on the host" >&2; exit 127; }
+    xpra list
+    ;;
+  *) echo "Usage: sanctuary-redstone-nt-launch preflight|start-full|health|stop|status" >&2; exit 2 ;;
 esac
 # Launcher — sanctuary-redstone-nt-launch:1 ends here
