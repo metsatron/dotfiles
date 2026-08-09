@@ -192,36 +192,44 @@ alias cco46='claude-warm --model claude-opus-4-6 --advisor claude-opus-5 --effor
 
 # Codex model shortcuts — PTY-supervised through codex-warm (idle-compaction
 # governor). Codex 0.147.0 has no native --yolo alias: the explicit dangerous
-# flag bypasses both approvals and sandboxing. The normal path inherits the
-# narrow dotcortex-workspace permission profile installed by codex-config-apply;
-# make --yolo an intentional wrapper-only selector.
+# flag bypasses both approvals and sandboxing. The normal path uses
+# workspace-write with approval prompts; make --yolo an intentional
+# wrapper-only selector.
 # NOTE: no codex-helmastra alias here — that name belongs to the canonical
 # HelmCortex/FORGE/bin/codex-helmastra launcher (HelmAstra brain dir,
 # --telegram channel support planned).
 codex_luna() {
-  local codex_mode=(--ask-for-approval never)
+  local codex_mode=(--ask-for-approval on-request)
+  local codex_tui_keymap=(
+    --config 'tui.keymap.composer.submit=["enter"]'
+    --config 'tui.keymap.editor.insert_newline=["ctrl-j"]'
+  )
   if [[ "${1:-}" == "--yolo" ]]; then
     codex_mode=(--dangerously-bypass-approvals-and-sandbox)
     shift
   fi
   CODEX_WARM_HERDR_AGENT=Luna codex-warm \
-    --model gpt-5.6-luna "${codex_mode[@]}" "$@"
+    "${codex_tui_keymap[@]}" --model gpt-5.6-luna "${codex_mode[@]}" "$@"
 }
 alias codex-luna='codex_luna'
 alias cxl='codex_luna'
 
 # GPT-5.6-Sol shortcut. Reasoning effort is config-only in Codex, so pin both
-# ordinary turns and plan mode to high here while retaining the same safe
-# permission-profile/no-approval default as codex-luna.
+# ordinary turns and plan mode to high here while retaining the same
+# permission-profile/on-request default as codex-luna.
 codex_sol() {
-  local codex_mode=(--ask-for-approval never)
+  local codex_mode=(--ask-for-approval on-request)
+  local codex_tui_keymap=(
+    --config 'tui.keymap.composer.submit=["enter"]'
+    --config 'tui.keymap.editor.insert_newline=["ctrl-j"]'
+  )
   local codex_reasoning=(--config model_reasoning_effort=high --config plan_mode_reasoning_effort=high)
   if [[ "${1:-}" == "--yolo" ]]; then
     codex_mode=(--dangerously-bypass-approvals-and-sandbox)
     shift
   fi
   CODEX_WARM_HERDR_AGENT=Sol codex-warm \
-    --model gpt-5.6-sol "${codex_reasoning[@]}" "${codex_mode[@]}" "$@"
+    "${codex_tui_keymap[@]}" --model gpt-5.6-sol "${codex_reasoning[@]}" "${codex_mode[@]}" "$@"
 }
 alias codex-sol='codex_sol'
 alias cxs='codex_sol'
