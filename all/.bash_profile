@@ -18,4 +18,6 @@ fi
 
 # Add any login-specific commands here
 
-[ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+if [ "${DOTCORTEX_SANCTUARY_GUEST:-0}" != 1 ]; then
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi

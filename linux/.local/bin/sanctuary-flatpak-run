@@ -303,22 +303,86 @@ for arg in "$@"; do
 done
 
 if [[ "${app_id}" = "org.garudalinux.firedragon" ]]; then
-  firedragon_profile="${HOME}/.firedragon/flatpak-migrate"
-  if [[ ! -d "${firedragon_profile}" ]]; then
-    echo "sanctuary-flatpak-run: missing FireDragon profile: ${firedragon_profile}" >&2
+  firedragon_profile_link="${SANCTUARY_CORTEX_PROFILE_LINK:-${HOME}/.config/sanctuary/cortex-firefox-profile}"
+  if [[ ! -d "${firedragon_profile_link}" ]]; then
+    echo "sanctuary-flatpak-run: missing FireDragon profile: ${firedragon_profile_link}" >&2
+    exit 1
+  fi
+  # Flatpak keeps the parent .firedragon directory persistent. Passing the
+  # child symlink as a filesystem mount then collides with that persistent
+  # mount in bubblewrap, so use the resolved private HelmCortex path for both
+  # the mount and the browser profile argument.
+  firedragon_profile="$(readlink -f "${firedragon_profile_link}" 2>/dev/null || true)"
+  if [[ -z "${firedragon_profile}" || ! -d "${firedragon_profile}" ]]; then
+    echo "sanctuary-flatpak-run: resolved FireDragon profile is unavailable: ${firedragon_profile_link}" >&2
     exit 1
   fi
   run_args+=("--filesystem=${firedragon_profile}")
-  firedragon_profile_real="$(readlink -f "${firedragon_profile}" 2>/dev/null || true)"
-  if [[ -n "${firedragon_profile_real}" && "${firedragon_profile_real}" != "${firedragon_profile}" ]]; then
-    run_args+=("--filesystem=${firedragon_profile_real}")
-  fi
   has_profile_arg=0
   for arg in "${app_args[@]}"; do
     [[ "${arg}" = "--profile" || "${arg}" = --profile=* ]] && has_profile_arg=1
   done
   if [[ "${has_profile_arg}" -eq 0 ]]; then
     app_args=("--profile" "${firedragon_profile}" "${app_args[@]}")
+  fi
+fi
+
+# The Cortex Obsidian entry opens the private HelmCortex vault from a path
+# projected into the guest home.  The container can traverse that symlink, but
+# Flatpak's `home` permission does not follow it into the host-backed target.
+# Expose only this exact vault to official Obsidian in sanctuary-cortex; keep
+# other sanctuary Flatpaks on their existing narrower filesystem contract.
+if [[ "${app_id}" = "md.obsidian.Obsidian" &&
+      "${redstone_home}" = */.local/share/dotcortex/guests/sanctuary-cortex/home ]]; then
+  obsidian_vault="${SANCTUARY_CORTEX_OBSIDIAN_VAULT:-${HOME}/HelmCortex}"
+  if [[ ! -d "${obsidian_vault}" ]]; then
+    echo "sanctuary-flatpak-run: Cortex Obsidian vault is unavailable: ${obsidian_vault}" >&2
+    exit 1
+  fi
+  run_args+=("--filesystem=${obsidian_vault}")
+
+  # The nested Flatpak cannot mount the host document portal's FUSE tree, so
+  # its folder picker falls back to Quick Start.  Open the registered private
+  # vault directly instead.  Preserve an explicit vault selector for CLI,
+  # URI, and test invocations that already provide one.
+  has_vault_arg=0
+  for arg in "${app_args[@]}"; do
+    case "${arg}" in
+      --vault|--vault=*|vault=*) has_vault_arg=1 ;;
+    esac
+  done
+  if [[ "${has_vault_arg}" -eq 0 ]]; then
+    app_args+=(--vault HelmCortex)
+  fi
+
+  # The full Cortex desktop has its own private D-Bus session. Its
+  # xdg-desktop-portal is present there, but the document portal's FUSE mount
+  # belongs to the live Xpra app session on :100. Obsidian's folder picker
+  # therefore returns to Quick Start unless this app talks to the bus that
+  # owns org.freedesktop.portal.Documents. Keep DISPLAY=:101 unchanged so
+  # the window remains in the full Cortex desktop.
+  cortex_portal_bus_file="${SANCTUARY_CORTEX_PORTAL_BUS_FILE:-/run/user/1000/xpra/100/dbus.env}"
+  if [[ -r "${cortex_portal_bus_file}" ]]; then
+    # Xpra records the app-session bus in a stable, guest-visible file.  Do not
+    # inspect /proc here: the sanctuary's proc view hides host process
+    # environments even though the shared Xpra runtime directory is readable.
+    candidate_bus="$(sed -n 's/^DBUS_SESSION_BUS_ADDRESS=//p' \
+      "${cortex_portal_bus_file}" | head -n 1)"
+    if [[ -n "${candidate_bus}" ]]; then
+      portal_names_ok=0
+      if command -v gdbus >/dev/null 2>&1 &&
+         DBUS_SESSION_BUS_ADDRESS="${candidate_bus}" \
+           gdbus call --session --dest org.freedesktop.DBus \
+             --object-path /org/freedesktop/DBus \
+             --method org.freedesktop.DBus.ListNames 2>/dev/null |
+           grep -Fq 'org.freedesktop.portal.Documents'; then
+        portal_names_ok=1
+      fi
+      if [[ "${portal_names_ok}" -eq 1 ]]; then
+        export DBUS_SESSION_BUS_ADDRESS="${candidate_bus}"
+        run_args+=("--env=DBUS_SESSION_BUS_ADDRESS=${candidate_bus}")
+      fi
+    fi
   fi
 fi
 
@@ -330,6 +394,44 @@ fi
 if [[ "${app_id}" = "md.obsidian.Obsidian" || \
       "${app_id}" = "com.tiagopires.ObsidianRedstone" ]]; then
   run_args+=("--env=ZYPAK_ZYGOTE_STRATEGY_SPAWN=0")
+fi
+
+# KeePassXC in sanctuary-cortex: the password database lives inside HelmCortex,
+# which is a symlink inside the guest home pointing to the host-backed real path.
+# Flatpak's `home` and `host` permissions do not follow host-backed symlinks
+# through the nested sandbox — identical root cause to the Obsidian vault case
+# above.  Expose the resolved HelmCortex path explicitly so the database is
+# reachable.
+#
+# D-Bus / document portal: the sanctuary-cortex container ships no XDG portal
+# D-Bus services, so the XFCE session bus carries no xdg-document-portal.
+# Flatpak's portal lookup returns ServiceUnknown and skips the bind-mount
+# gracefully.  D-Bus is kept live so KeePassXC can register its menu window
+# with com.canonical.AppMenu.Registrar (xfce4-appmenu-plugin reads this name
+# to populate the global menu; unsetting DBUS_SESSION_BUS_ADDRESS was the
+# previous approach and is what killed the global menu).  Pre-create the
+# per-app portal directory as a belt-and-suspenders guard in case bwrap
+# evaluates the path before the service-not-found reply lands.
+if [[ "${app_id}" = "org.keepassxc.KeePassXC" &&
+      "${HOME}" = */.local/share/dotcortex/guests/sanctuary-cortex/home ]]; then
+  keepass_root="${SANCTUARY_CORTEX_KEEPASS_ROOT:-${HOME}/HelmCortex}"
+  keepass_resolved="$(readlink -f "${keepass_root}" 2>/dev/null || true)"
+  [[ -d "${keepass_resolved}" ]] && run_args+=("--filesystem=${keepass_resolved}")
+  mkdir -p "/run/user/$(id -u)/doc/by-app/org.keepassxc.KeePassXC" 2>/dev/null || true
+  # Kvantum Qt theming. Requires org.kde.KStyle.Kvantum//5.15-25.08 to be
+  # installed (flatpak install flathub org.kde.KStyle.Kvantum//5.15-25.08).
+  # Falls back silently to Fusion if the extension is absent.  The global
+  # Flatpak override (all/.local/share/flatpak/overrides/org.keepassxc.KeePassXC)
+  # also sets QT_STYLE_OVERRIDE=kvantum, covering direct flatpak-run launches.
+  run_args+=("--env=QT_STYLE_OVERRIDE=kvantum")
+  # KeePassXC's ApplicationTheme=classic calls QApplication::setStyle("Fusion"),
+  # which overrides QT_STYLE_OVERRIDE before the app loop runs.  Patch to "system"
+  # so the Kvantum style override takes effect.  KeeShare keys live in the same
+  # ini, so we patch in-place rather than shipping a template.
+  kpxc_ini="${HOME}/.var/app/org.keepassxc.KeePassXC/config/keepassxc/keepassxc.ini"
+  if [ -f "${kpxc_ini}" ]; then
+    sed -i 's/^ApplicationTheme=classic$/ApplicationTheme=system/' "${kpxc_ini}"
+  fi
 fi
 
 # Every repo-backed sanctuary Flatpak is declared at user scope.  Pin the run
