@@ -117,52 +117,105 @@ apply_codex_stow_hook
 
 mkdir -p "$(dirname "$config")"
 
-# Codex's workspace-write sandbox only makes the invocation cwd writable. The
-# companion pins cwd to the Claude session workspace (e.g. DotCortex), so the
-# HelmCortex NFS mount is read-only under Landlock and every HelmCortex build
-# fails. Declare HelmCortex as an additional writable root. Landlock resolves
-# realpaths, so the actual mount path must be listed, not just the ~ symlink.
+# Codex permission profiles supersede the legacy sandbox_workspace_write table.
+# Extend :workspace so .git and .agents retain their built-in protection, then
+# reopen only DotCortex's project-local .codex tree.  That narrow exception lets
+# Codex tangle its own harness-specific skills without granting broad filesystem
+# access.  Existing HelmCortex roots remain additional workspaces when present.
 [ -f "$config" ] || : >"$config"
-if ! grep -q '^\[sandbox_workspace_write\]' "$config"; then
-  {
-    printf '\n[sandbox_workspace_write]\n'
-    printf 'writable_roots = ["%s", "%s"]\n' "$HOME/HelmCortex" "$HOME/mnt/x230/HelmCortex"
-  } >>"$config"
-  echo "codex-config-apply: added sandbox_workspace_write writable_roots (HelmCortex)"
+profile_name=dotcortex-workspace
+dotcortex_root="${DOTCORTEX_ROOT:-$HOME/DotCortex}"
+if resolved_root="$(timeout 2 realpath "$dotcortex_root" 2>/dev/null)"; then
+  dotcortex_root="$resolved_root"
 fi
 
-if [ ! -f "$config" ]; then
-  {
-    printf '[tui]\n'
-    printf '%s\n' "$desired"
-  } >"$config"
-  chmod 600 "$config"
-  echo "codex-config-apply: created $config"
-  exit 0
-fi
+profile_roots=()
+for candidate in "$HOME/HelmCortex" "$HOME/mnt/x230/HelmCortex"; do
+  timeout 2 test -d "$candidate" 2>/dev/null || continue
+  resolved_root="$(timeout 2 realpath "$candidate" 2>/dev/null)" || continue
+  duplicate=0
+  for existing_root in "${profile_roots[@]}"; do
+    if [ "$existing_root" = "$resolved_root" ]; then
+      duplicate=1
+      break
+    fi
+  done
+  [ "$duplicate" -eq 1 ] || profile_roots+=("$resolved_root")
+done
+unset candidate duplicate existing_root resolved_root
 
+toml_quote() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  printf '"%s"' "$value"
+}
+
+body="$(mktemp)"
 tmp="$(mktemp)"
-awk -v desired="$desired" '
+trap 'rm -f "$body" "$tmp"' EXIT
+
+awk -v desired="$desired" -v profile="$profile_name" '
   BEGIN {
     in_tui = 0
     seen_tui = 0
     wrote_status = 0
+    section = ""
+    skip_section = 0
+    pending_blanks = 0
+  }
+
+  function is_profile_section(line, prefix) {
+    prefix = "[permissions." profile
+    return index(line, prefix "]") == 1 || index(line, prefix ".") == 1
+  }
+
+  function flush_blanks(i) {
+    for (i = 0; i < pending_blanks; i++) {
+      print ""
+    }
+    pending_blanks = 0
   }
 
   /^\[[^]]+\]$/ {
     if (in_tui && !wrote_status) {
+      flush_blanks()
       print desired
       wrote_status = 1
     }
+
+    in_tui = 0
+    if ($0 == "[sandbox_workspace_write]" || is_profile_section($0)) {
+      section = $0
+      skip_section = 1
+      pending_blanks = 0
+      next
+    }
+
+    skip_section = 0
+    section = $0
     in_tui = ($0 == "[tui]")
     if (in_tui) {
       seen_tui = 1
     }
+    flush_blanks()
     print
     next
   }
 
+  skip_section { next }
+
+  /^[[:space:]]*$/ {
+    pending_blanks++
+    next
+  }
+
+  section == "" && /^[[:space:]]*(default_permissions|sandbox_mode)[[:space:]]*=/ {
+    next
+  }
+
   in_tui && /^[[:space:]]*status_line[[:space:]]*=/ {
+    flush_blanks()
     if (!wrote_status) {
       print desired
       wrote_status = 1
@@ -170,29 +223,57 @@ awk -v desired="$desired" '
     next
   }
 
-  { print }
+  {
+    flush_blanks()
+    print
+  }
 
   END {
     if (!seen_tui) {
+      flush_blanks()
       print ""
       print "[tui]"
       print desired
     } else if (in_tui && !wrote_status) {
+      flush_blanks()
       print desired
     }
   }
-' "$config" >"$tmp"
+' "$config" >"$body"
+
+{
+  printf 'default_permissions = "%s"\n' "$profile_name"
+  cat "$body"
+  printf '\n[permissions.%s]\n' "$profile_name"
+  printf 'description = "Workspace editing with DotCortex Codex skill authoring."\n'
+  printf 'extends = ":workspace"\n'
+
+  if [ "${#profile_roots[@]}" -gt 0 ]; then
+    printf '\n[permissions.%s.workspace_roots]\n' "$profile_name"
+    for existing_root in "${profile_roots[@]}"; do
+      printf '%s = true\n' "$(toml_quote "$existing_root")"
+    done
+  fi
+
+  printf '\n[permissions.%s.filesystem]\n' "$profile_name"
+  printf '%s = "write"\n' "$(toml_quote "$dotcortex_root/.codex")"
+} >"$tmp"
 
 if cmp -s "$tmp" "$config"; then
-  rm -f "$tmp"
+  rm -f "$body" "$tmp"
+  trap - EXIT
   echo "codex-config-apply: already current"
   exit 0
 fi
 
 backup="${config}.backup-$(date +%Y%m%d-%H%M%S)"
+if [ -e "$backup" ]; then
+  backup="${backup}.$$"
+fi
 cp -a "$config" "$backup"
 cat "$tmp" >"$config"
-rm -f "$tmp"
+rm -f "$body" "$tmp"
+trap - EXIT
 chmod 600 "$config"
 echo "codex-config-apply: updated $config"
 echo "codex-config-apply: backup $backup"
