@@ -3,10 +3,12 @@
 
 # The host broker is intentionally a separate executable. It has no guest projection and
 # does not run in the room's mount namespace. State lives under the host user's runtime
-# directory; the only guest-visible result is a relative path below the dedicated media
-# root. The root installer is the explicit privilege gate: it installs the narrow polkit
-# rule and makes the UDisks user media root shared so the sanctuary's =rslave= bind can
-# receive future mount events.
+# directory; the guest-visible result is a relative path below the dedicated media root.
+# UDisks still owns a real read-only loop mount on the host, but rootless Podman does not
+# reliably propagate a later child mount through the bind. The broker therefore stages the
+# mounted tree as ordinary read-only files beneath that already-visible root. The root
+# installer remains the explicit privilege gate: it installs the narrow polkit rule and
+# prepares the host media roots.
 
 
 # [[file:../../../sanctuary-redstone-9x-fvwm95.org::*Dynamic menus — recent Documents + Desktop folder][Dynamic menus — recent Documents + Desktop folder:25]]
@@ -21,6 +23,8 @@ MEDIA_HOST_ROOT="${REDSTONE_MEDIA_HOST_ROOT:-/run/media/${USER:-$(id -un)}}"
 MEDIA_HOST_ROOT="${MEDIA_HOST_ROOT%/}"
 MEDIA_UDISKS_ROOT="${REDSTONE_MEDIA_UDISKS_ROOT:-/media/${USER:-$(id -un)}}"
 MEDIA_UDISKS_ROOT="${MEDIA_UDISKS_ROOT%/}"
+MEDIA_PROJECTION_ROOT="${REDSTONE_MEDIA_PROJECTION_ROOT:-${MEDIA_HOST_ROOT}/.redstone-9x-projection}"
+MEDIA_OPENRA_ALIAS="${REDSTONE_MEDIA_OPENRA_ALIAS:-${MEDIA_HOST_ROOT}/openra}"
 STATE_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/redstone-9x-disc"
 
 die() {
@@ -28,9 +32,47 @@ die() {
   exit 1
 }
 
+case "${MEDIA_PROJECTION_ROOT}" in
+  "${MEDIA_HOST_ROOT}"/*) ;;
+  *) die "projection root must be beneath media root: ${MEDIA_PROJECTION_ROOT}" ;;
+esac
+case "${MEDIA_OPENRA_ALIAS}" in
+  "${MEDIA_HOST_ROOT}"/*) ;;
+  *) die "OpenRA alias must be beneath media root: ${MEDIA_OPENRA_ALIAS}" ;;
+esac
+
 clear_state() {
-  rm -f "${STATE_DIR}/loop" "${STATE_DIR}/mount" "${STATE_DIR}/relative" "${STATE_DIR}/iso"
+  rm -f "${STATE_DIR}/loop" "${STATE_DIR}/mount" "${STATE_DIR}/relative" "${STATE_DIR}/projection" "${STATE_DIR}/iso"
   rmdir "${STATE_DIR}" 2>/dev/null || true
+}
+
+remove_projection() {
+  projection="$1"
+  case "${projection}" in
+    "${MEDIA_PROJECTION_ROOT}"/*)
+      if [ -L "${MEDIA_OPENRA_ALIAS}" ] &&
+         [ "$(readlink "${MEDIA_OPENRA_ALIAS}" 2>/dev/null || true)" = "${projection}" ]; then
+        rm -f -- "${MEDIA_OPENRA_ALIAS}"
+      fi
+      # ISO9660 directories are read-only (555), so make this broker-owned
+      # staging copy removable before deleting it on eject or retry.
+      chmod -R u+w -- "${projection}" 2>/dev/null || true
+      rm -rf -- "${projection}"
+      ;;
+    *) die "unsafe projection path: ${projection}" ;;
+  esac
+}
+
+install_openra_alias() {
+  projection="$1"
+  if [ -e "${MEDIA_OPENRA_ALIAS}" ] || [ -L "${MEDIA_OPENRA_ALIAS}" ]; then
+    if [ -L "${MEDIA_OPENRA_ALIAS}" ] &&
+       [ "$(readlink "${MEDIA_OPENRA_ALIAS}" 2>/dev/null || true)" = "${projection}" ]; then
+      return 0
+    fi
+    die "OpenRA media alias already exists: ${MEDIA_OPENRA_ALIAS}"
+  fi
+  ln -s -- "${projection}" "${MEDIA_OPENRA_ALIAS}"
 }
 
 loop_is_mounted() {
@@ -42,12 +84,16 @@ loop_is_mounted() {
 eject_current() {
   [ -s "${STATE_DIR}/loop" ] || { clear_state; return 0; }
   loop="$(cat "${STATE_DIR}/loop")"
+  projection="$(cat "${STATE_DIR}/projection" 2>/dev/null || true)"
   if loop_is_mounted; then
     "${UDISKSCTL}" unmount --no-user-interaction --block-device "${loop}" >/dev/null \
       || die "could not unmount ${loop}"
   fi
   "${UDISKSCTL}" loop-delete --no-user-interaction --block-device "${loop}" >/dev/null \
     || die "could not delete ${loop}"
+  if [ -n "${projection}" ]; then
+    remove_projection "${projection}"
+  fi
   clear_state
 }
 
@@ -89,16 +135,37 @@ insert_iso() {
   case "${relative}" in
     ""|/*|../*|*/../*|.|..) die "unsafe relative mount path: ${relative}" ;;
   esac
+  projection="${MEDIA_PROJECTION_ROOT}/${relative}"
+  mkdir -p "${MEDIA_PROJECTION_ROOT}"
+  [ ! -e "${projection}" ] || remove_projection "${projection}"
+  mkdir -p "${projection}"
+  if ! cp -a "${mount_path}"/. "${projection}"/; then
+    remove_projection "${projection}"
+    "${UDISKSCTL}" unmount --no-user-interaction --block-device "${loop}" >/dev/null 2>&1 || true
+    "${UDISKSCTL}" loop-delete --no-user-interaction --block-device "${loop}" >/dev/null 2>&1 || true
+    clear_state
+    die "could not stage mounted media under ${MEDIA_PROJECTION_ROOT}"
+  fi
+  if ! install_openra_alias "${projection}"; then
+    remove_projection "${projection}"
+    "${UDISKSCTL}" unmount --no-user-interaction --block-device "${loop}" >/dev/null 2>&1 || true
+    "${UDISKSCTL}" loop-delete --no-user-interaction --block-device "${loop}" >/dev/null 2>&1 || true
+    clear_state
+    die "could not expose mounted media at ${MEDIA_OPENRA_ALIAS}"
+  fi
+  projected_relative=".redstone-9x-projection/${relative}"
   printf '%s\n' "${mount_path}" > "${STATE_DIR}/mount"
-  printf '%s\n' "${relative}" > "${STATE_DIR}/relative"
-  printf '%s\n' "${relative}"
+  printf '%s\n' "${projection}" > "${STATE_DIR}/projection"
+  printf '%s\n' "${projected_relative}" > "${STATE_DIR}/relative"
+  printf '%s\n' "${projected_relative}"
 }
 
 status_current() {
   [ -s "${STATE_DIR}/loop" ] || { printf '%s\n' empty; return 0; }
   loop="$(cat "${STATE_DIR}/loop")"
   relative="$(cat "${STATE_DIR}/relative" 2>/dev/null || true)"
-  if [ -n "${relative}" ] && "${FINDMNT}" --raw --noheadings --source "${loop}" >/dev/null 2>&1; then
+  projection="$(cat "${STATE_DIR}/projection" 2>/dev/null || true)"
+  if [ -n "${relative}" ] && [ -d "${projection}" ] && "${FINDMNT}" --raw --noheadings --source "${loop}" >/dev/null 2>&1; then
     printf '%s\n' "${relative}"
   else
     printf '%s\n' empty
