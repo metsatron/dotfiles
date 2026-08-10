@@ -1301,6 +1301,18 @@ def agent_identity_values(agent: dict[str, object]) -> set[str]:
     return values
 
 
+# Herdr reports the *label* it detected (model or product name), not the provider
+# the endpoint registry speaks. A Claude session may surface as "Fable", "Opus",
+# "Sonnet" or "Claude Code"; a Codex one as "Luna" or "Sol". Delivery must not
+# fail on that vocabulary gap (2026-08-10 pilot: 'fable' vs expected 'claude'),
+# so the match runs against a per-provider alias set, with the warm-wrapper
+# pty_owner token ("claude-warm"/"codex-warm") as an equally valid signal.
+PROVIDER_LABEL_ALIASES: dict[str, tuple[str, ...]] = {
+    "claude": ("claude", "fable", "opus", "sonnet", "haiku"),
+    "codex": ("codex", "luna", "sol", "terra", "gpt"),
+}
+
+
 def resolve_herdr_agent(endpoint: dict[str, object]) -> dict[str, object]:
     target = str(endpoint["herdr_target"])
     snapshot = snapshot_for_session(str(endpoint["herdr_session"]))
@@ -1313,13 +1325,15 @@ def resolve_herdr_agent(endpoint: dict[str, object]) -> dict[str, object]:
     agent = matches[0]
     observed_provider = str(agent.get("agent") or "").lower()
     expected_provider = str(endpoint["provider"]).lower()
-    if observed_provider and expected_provider not in observed_provider:
+    tokens = agent.get("tokens")
+    pty_owner = str(tokens.get("pty_owner") or "").lower() if isinstance(tokens, dict) else ""
+    aliases = PROVIDER_LABEL_ALIASES.get(expected_provider, (expected_provider,))
+    label_matches = any(alias in observed_provider for alias in aliases)
+    pty_matches = pty_owner.startswith(expected_provider)
+    if observed_provider and not (label_matches or pty_matches):
         raise PeerError(
             f"Herdr target provider is {observed_provider!r}, expected {expected_provider!r}"
         )
-    status = str(agent.get("agent_status") or "unknown")
-    if status == "unknown":
-        raise PeerError("Herdr target state is unknown; refusing blind prompt injection")
     pane_id = agent.get("pane_id")
     if not isinstance(pane_id, str) or not pane_id:
         raise PeerError("Herdr target has no stable pane ID")
@@ -1348,11 +1362,34 @@ def prompt_for(envelope: dict[str, object]) -> str:
     return "\n".join(header)
 
 
+def delivery_ready_timeout_ms() -> str:
+    return os.environ.get("AGENT_PEER_DELIVERY_READY_TIMEOUT_MS", "20000")
+
+
 def deliver_herdr(
     envelope: dict[str, object], endpoint: dict[str, object]
 ) -> dict[str, object]:
     agent = resolve_herdr_agent(endpoint)
     pane_id = str(agent["pane_id"])
+    # Ready-state gate (2026-08-10 pilot defect): injecting into a pane that is
+    # not at an idle prompt — startup dialog, permission prompt, mid-turn — is
+    # silently swallowed while the receipt still reads "delivered". A known-busy
+    # status (working/blocked) polls for idle within a bounded window and then
+    # fails the delivery honestly, leaving the envelope readable in the store.
+    # "unknown" is NOT busy — it is absent telemetry (a claude-warm/codex-warm
+    # pane between heartbeats never reports otherwise), so a window that ends
+    # still-unknown delivers anyway and records ready_state "unknown" in the
+    # receipt rather than blackholing every warm pane.
+    status = str(agent.get("agent_status") or "unknown")
+    deadline = time.monotonic() + int(delivery_ready_timeout_ms()) / 1000.0
+    while status != "idle" and time.monotonic() < deadline:
+        time.sleep(2)
+        agent = resolve_herdr_agent(endpoint)
+        status = str(agent.get("agent_status") or "unknown")
+    if status not in {"idle", "unknown"}:
+        raise PeerError(
+            f"Herdr target is {status!r} and did not reach idle within the ready gate; delivery aborted"
+        )
     result = run(
         [
             herdr_binary(),
@@ -1372,6 +1409,7 @@ def deliver_herdr(
         "herdr_session": endpoint["herdr_session"],
         "pane_id": pane_id,
         "agent_status_at_delivery": agent.get("agent_status"),
+        "ready_state": status,
     }
 
 
@@ -1925,12 +1963,32 @@ def command_reply(args: argparse.Namespace) -> int:
     assert isinstance(workspace, dict)
     if args.from_peer != original_to.get("peer_id"):
         raise PeerError("reply sender must be the original destination peer")
+    # The reply's workspace must validate against the DESTINATION endpoint's
+    # repo_root, not the inbound envelope's (2026-08-10 pilot defect: echoing
+    # the original workspace made reply structurally impossible for any
+    # coordinator/worker pair registered on different repo roots). Resolve the
+    # destination's registered root when it is known locally; fall back to the
+    # original workspace only for destinations this host has no endpoint for.
+    reply_repo = str(workspace["repo"])
+    reply_repo_root = str(workspace["repo_root"])
+    reply_checkout_id = str(workspace["checkout_id"])
+    registry = read_registry()
+    endpoints = registry.get("endpoints")
+    destination_endpoint = (
+        endpoints.get(str(original_from["peer_id"])) if isinstance(endpoints, dict) else None
+    )
+    if isinstance(destination_endpoint, dict) and destination_endpoint.get("repo_root"):
+        destination_root = str(destination_endpoint["repo_root"])
+        if destination_root != reply_repo_root:
+            reply_repo_root = destination_root
+            reply_repo = pathlib.Path(destination_root).name
+            reply_checkout_id = f"{original_from.get('host_id')}:{reply_repo}"
     reply_envelope = compose_envelope(
         from_peer=args.from_peer,
         to_peer=str(original_from["peer_id"]),
-        repo=str(workspace["repo"]),
-        repo_root=str(workspace["repo_root"]),
-        checkout_id=str(workspace["checkout_id"]),
+        repo=reply_repo,
+        repo_root=reply_repo_root,
+        checkout_id=reply_checkout_id,
         access="read",
         body=body,
         handoff=None,
