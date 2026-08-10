@@ -84,6 +84,12 @@ def registry_path() -> pathlib.Path:
     configured = os.environ.get("AGENT_PEER_REGISTRY_FILE")
     if configured:
         return pathlib.Path(configured).expanduser()
+    # Mètsàtron's ruling 2026-08-11: the registry JSON lives beside the ledger
+    # under ~/HelmCortex/ROOTS/, not in ~/.config — same residency rule as
+    # state_root(). XDG config remains the fallback for hosts without DotRoot.
+    dotroot = pathlib.Path.home() / "HelmCortex" / "ROOTS" / "DotRoot"
+    if dotroot.is_dir():
+        return dotroot / "agent-peer" / "peers.json"
     config_home = pathlib.Path(
         os.environ.get("XDG_CONFIG_HOME", str(pathlib.Path.home() / ".config"))
     )
@@ -259,6 +265,9 @@ def command_peer_start(
     agent_name: str,
     cwd: str,
     command: list[str],
+    workspace: str | None = None,
+    tab: str | None = None,
+    intro_file: str | None = None,
 ) -> int:
     validate_component(herdr_session, "herdr_session")
     validate_component(agent_name, "agent_name")
@@ -267,7 +276,50 @@ def command_peer_start(
         raise PeerError("peer cwd must be an existing directory")
     if not command:
         raise PeerError("peer-start requires an explicit command after --")
+    if workspace and tab:
+        raise PeerError("peer-start takes --workspace or --tab, not both")
+    intro_body: str | None = None
+    if intro_file:
+        intro_body = pathlib.Path(intro_file).expanduser().read_text(encoding="utf-8").strip()
+        if not intro_body:
+            raise PeerError("intro file is empty")
     snapshot_for_session(herdr_session)
+    # Placement ruling (Mètsàtron, 2026-08-11): never land a worker as a
+    # horizontal split beside someone else's session. --tab splits DOWN in that
+    # tab; --workspace opens a new tab in the named space; with neither, a new
+    # workspace labelled after the agent is created so the worker has a space
+    # of its own.
+    placement: list[str]
+    created_workspace: str | None = None
+    if tab:
+        placement = ["--tab", tab, "--split", "down"]
+    elif workspace:
+        placement = ["--workspace", workspace]
+    else:
+        created = run(
+            [
+                herdr_binary(),
+                "--session",
+                herdr_session,
+                "workspace",
+                "create",
+                "--cwd",
+                str(root),
+                "--label",
+                agent_name,
+                "--no-focus",
+            ],
+            timeout=60,
+        )
+        if created.returncode != 0:
+            detail = (created.stderr or created.stdout).strip()
+            raise PeerError(f"Herdr could not create a workspace for the peer: {detail}")
+        try:
+            payload = json.loads(created.stdout)
+            created_workspace = str(payload["result"]["workspace"]["workspace_id"])
+        except (json.JSONDecodeError, KeyError, TypeError) as error:
+            raise PeerError("Herdr workspace create returned an unsupported shape") from error
+        placement = ["--workspace", created_workspace]
     result = run(
         [
             herdr_binary(),
@@ -278,6 +330,7 @@ def command_peer_start(
             agent_name,
             "--cwd",
             str(root),
+            *placement,
             "--no-focus",
             "--",
             *command,
@@ -287,17 +340,60 @@ def command_peer_start(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise PeerError(f"Herdr could not start the peer: {detail}")
+    intro_delivery: dict[str, object] | None = None
+    if intro_body:
+        intro_delivery = inject_peer_intro(herdr_session, agent_name, intro_body)
     emit(
         {
             "started": True,
             "herdr_session": herdr_session,
             "agent_name": agent_name,
             "cwd": str(root),
+            "workspace": created_workspace or workspace,
+            "tab": tab,
+            "intro": intro_delivery,
             "next": "run agent-peer inventory, then register the exact endpoint",
             "herdr_output": result.stdout.strip() or None,
         }
     )
     return 0
+
+
+def inject_peer_intro(
+    herdr_session: str, agent_name: str, intro_body: str
+) -> dict[str, object]:
+    # A freshly started peer has no context establishing its role, so a later
+    # peer envelope — which rightly self-declares zero authority — reads as
+    # untrusted noise and a well-behaved agent refuses it (2026-08-11
+    # warm-probe finding). The intro prompt is the coordinator's own launch
+    # instruction, injected once the pane looks ready; it is what makes the
+    # session a registered worker rather than a stranger.
+    deadline = time.monotonic() + int(delivery_ready_timeout_ms()) / 1000.0
+    pane_id = ""
+    status = "unknown"
+    while time.monotonic() < deadline:
+        time.sleep(2)
+        try:
+            snapshot = snapshot_for_session(herdr_session)
+        except PeerError:
+            continue
+        agents = [
+            item
+            for item in snapshot["agents"]
+            if isinstance(item, dict) and agent_name in agent_identity_values(item)
+        ]
+        if len(agents) != 1:
+            continue
+        pane_id = str(agents[0].get("pane_id") or "")
+        status = str(agents[0].get("agent_status") or "unknown")
+        if status == "idle":
+            break
+    if not pane_id:
+        return {"delivered": False, "reason": "peer pane never appeared in the snapshot"}
+    run([herdr_binary(), "--session", herdr_session, "pane", "run", pane_id, intro_body])
+    time.sleep(1)
+    run([herdr_binary(), "--session", herdr_session, "pane", "send-keys", pane_id, "Enter"])
+    return {"delivered": True, "pane_id": pane_id, "ready_state": status}
 
 
 def run(
@@ -471,6 +567,22 @@ def deliver_herdr(
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise PeerError(f"Herdr rejected the prompt: {detail}")
+    # Warm-wrapper PTYs (claude-warm/codex-warm) can absorb a multi-line pane-run
+    # injection as a bracketed paste, leaving the prompt filled but unsubmitted
+    # (2026-08-11 warm-probe finding). A follow-up Enter is harmless at an empty
+    # prompt and submits a swallowed one; best-effort, never fails the delivery.
+    time.sleep(1)
+    run(
+        [
+            herdr_binary(),
+            "--session",
+            str(endpoint["herdr_session"]),
+            "pane",
+            "send-keys",
+            pane_id,
+            "Enter",
+        ]
+    )
     return {
         "adapter": "herdr-pane-run",
         "herdr_session": endpoint["herdr_session"],
@@ -1204,6 +1316,9 @@ def command_selftest() -> int:
                 "'terminal_id':'term-1','pane_id':'pane-1','name':'peer',"
                 "'agent':'codex','agent_status':'idle','agent_session':"
                 "{'value':'session-b'}}]}}}))\n"
+                "elif 'workspace' in args and 'create' in args:\n"
+                " print(json.dumps({'result': {'workspace':"
+                " {'workspace_id': 'ws-lab'}}}))\n"
                 "elif 'agent' in args and 'start' in args:\n"
                 " pathlib.Path(os.environ['AGENT_PEER_TEST_CAPTURE']).write_text("
                 "json.dumps(args), encoding='utf-8')\n"
@@ -1331,13 +1446,15 @@ def command_selftest() -> int:
             check(
                 "explicit-persistent-peer-start",
                 start_code == 0
-                and start_argv[-8:]
+                and start_argv[-10:]
                 == [
                     "agent",
                     "start",
                     "codex",
                     "--cwd",
                     str(checkout),
+                    "--workspace",
+                    "ws-lab",
                     "--no-focus",
                     "--",
                     "codex",
@@ -1440,6 +1557,9 @@ def build_parser() -> argparse.ArgumentParser:
     peer_start.add_argument("--herdr-session", required=True)
     peer_start.add_argument("--agent-name", required=True)
     peer_start.add_argument("--cwd", required=True)
+    peer_start.add_argument("--workspace")
+    peer_start.add_argument("--tab")
+    peer_start.add_argument("--intro-file")
     peer_start.add_argument("peer_command", nargs=argparse.REMAINDER)
 
     send = sub.add_parser("send")
@@ -1508,7 +1628,13 @@ def main() -> int:
             if command and command[0] == "--":
                 command = command[1:]
             return command_peer_start(
-                args.herdr_session, args.agent_name, args.cwd, command
+                args.herdr_session,
+                args.agent_name,
+                args.cwd,
+                command,
+                workspace=args.workspace,
+                tab=args.tab,
+                intro_file=args.intro_file,
             )
         if args.command == "send":
             return command_send(args)
