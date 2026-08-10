@@ -107,7 +107,7 @@ guix-sanctuary-cde: guix-desktop-common
 
 guix-sanctuary-godzilla-xs: guix-desktop-common
 | mkdir -p $(EXTRA)/sanctuary-godzilla-xs
-| $(GUIX) package -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-godzilla-xs.scm -p $(EXTRA)/sanctuary-godzilla-xs/sanctuary-godzilla-xs
+| $(GUIX) package -L $(LOCAL_PKGS) -m $(GUIX_HOME)/manifests/sanctuaries/sanctuary-godzilla-xs.scm -p $(EXTRA)/sanctuary-godzilla-xs/sanctuary-godzilla-xs
 
 guix-sanctuary-mide: guix-desktop-common
 | mkdir -p $(EXTRA)/sanctuary-mide

@@ -22,6 +22,7 @@
    "moreutils"
    "borg"            ; helmcortex-borg multi-endpoint backup
    "inotify-tools"   ; helmcortex-borg watch verb (inotifywait)
+   "croc"            ; encrypted peer-to-peer file transfer
    "flatpak"
    ;; distrobox: DELIBERATELY ABSENT — lives in the nala/system lane (ruling 3c51cfb4d, re-sealed 2026-07-12).
    ;; The Guix build wraps a store-path podman that mis-resolves rootless storage to /var/lib/containers,
