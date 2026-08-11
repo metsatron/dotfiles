@@ -1,0 +1,132 @@
+#+TITLE: Redstone 9X — Clippy fork build
+#+DESCRIPTION: Clippy fork submodule, patch lineage, and the electron-forge build/staging pipeline
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+
+* Ownership split
+
+Split out of =sanctuary-redstone-9x-fvwm95.org= (module budget) as its own
+module: this file owns the Clippy *character/application* integration —
+fork sourcing, patch lineage, build, and staging. It owns no documentation.
+=sanctuary-docs.org= owns the Fleet Library (docsets + the FTS5 help
+corpus + the read-only =dotcortex-help-query= interface); Clippy consumes
+that read-only, spawned per query from its own IPC layer. Zeal owns no AI
+state.
+
+The fork lives as a git submodule at =linux/.local/src/clippy= (registered
+in =submodules.org=, "follow =redstone= branch"), a private mirror at
+=gitlab.com:metsatron/clippy=. Two remotes inside the submodule: =origin=
+(the private GitLab mirror the =redstone= branch actually lives on) and
+=upstream= (=felixrieseberg/clippy= on GitHub, for future rebases). The
+=redstone= branch is upstream's =main= (pinned 2026-08-11,
+=edb47a46c1f0d9b36436e8537013dc91e8ade89f=) plus three patch commits:
+
+1. =help: add Help Library IPC channel + main-process query bridge= —
+   =src/ipc-messages.ts= (four new channel constants) and a new
+   =src/main/help.ts= that spawns =dotcortex-help-query= as a child
+   process and parses its JSON stdout. =HELP_OPEN_IN_ZEAL= is stubbed —
+   the custom-URI handoff through Zeal/QtWebEngine needs its own live PoC
+   before it does anything (Pass 2).
+2. =help: expose Help Library through preload + typed renderer bridge= —
+   =src/renderer/preload.ts= + =src/renderer/clippyApi.tsx=, plus the
+   shared =HelpSearchResult=/=HelpChunk=/=HelpContext= types added to
+   =src/types/interfaces.ts= (same convention as =ChatWithMessages= etc.).
+3. =help: ground Chat.tsx prompts in the Help Library (Library Mode)= —
+   the actual retrieval hook: before =promptStreaming()=, fetch
+   =helpGetContext(message)= and prepend it as a hidden context block if
+   the corpus returned anything. The displayed/stored chat message is
+   always the user's raw text; only the ephemeral model input changes.
+   Retrieval failure (corpus missing, query CLI absent) degrades silently
+   to the plain prompt.
+
+Renderer changes (commit 3) stay separable from the IPC layer (commits
+1–2) on purpose — the future per-scheme reskin layer (CSS chrome only) is
+renderer-only work that lands on top of commit 3's lineage without
+touching =help.ts= or the IPC surface at all.
+
+* Build & staging
+
+Host-side only — Clippy is bridged into the guest via
+=redstone-9x-host-gtk= (see =redstone-9x-clippy= in
+=sanctuary-redstone-9x-fvwm95.org=), so this build runs on the host, not in
+any distrobox guest. =electron-forge package= (not =make=: =make= wraps the
+packaged output into distributable installers we don't need; =package=
+alone produces the plain unpacked =out/Clippy-linux-x64/= directory that
+=redstone-9x-clippy= already expects) targeting linux/x64 explicitly, since
+this always builds for the host it runs on regardless of what triggered it.
+
+Staging is version-suffixed with a stable symlink — same convention as
+=Azahar-latest.AppImage= elsewhere in =~/Applications=: build into
+=Clippy-linux-x64-<short-sha>=, then atomically retarget the
+=Clippy-linux-x64= symlink =redstone-9x-clippy= actually launches. A
+process that already has the old binary mapped keeps running fine after
+the symlink moves (the open inode survives); nothing needs to be killed or
+restarted for a rebuild to take effect on next launch.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/redstone-9x-clippy-build :shebang "#!/bin/bash" :tangle-mode (identity #o755)
+# redstone-9x-clippy-build — build the Clippy fork and stage it for
+# redstone-9x-clippy. Host-side; never run inside a distrobox guest.
+set -euo pipefail
+
+SUBMODULE="${REDSTONE_CLIPPY_SRC:-$HOME/DotCortex/linux/.local/src/clippy}"
+DEST_ROOT="${REDSTONE_CLIPPY_APPS:-$HOME/Applications}"
+
+if [[ ! -e "${SUBMODULE}/.git" ]]; then
+  echo "redstone-9x-clippy-build: submodule not checked out: ${SUBMODULE}" >&2
+  echo "  run: git -C ~/DotCortex submodule update --init linux/.local/src/clippy" >&2
+  exit 1
+fi
+
+cd "${SUBMODULE}"
+
+branch="$(git rev-parse --abbrev-ref HEAD)"
+if [[ "${branch}" != "redstone" ]]; then
+  echo "redstone-9x-clippy-build: submodule is on '${branch}', expected 'redstone'" >&2
+  exit 1
+fi
+
+sha="$(git rev-parse --short HEAD)"
+
+if ! command -v npm >/dev/null 2>&1; then
+  echo "redstone-9x-clippy-build: npm not on PATH (Guix core profile not applied?)" >&2
+  exit 1
+fi
+
+echo "redstone-9x-clippy-build: npm install (${SUBMODULE})"
+npm install --no-audit --no-fund
+
+echo "redstone-9x-clippy-build: electron-forge package (linux/x64, ${sha})"
+npx electron-forge package --platform=linux --arch=x64
+
+OUT_DIR="${SUBMODULE}/out/Clippy-linux-x64"
+if [[ ! -d "${OUT_DIR}" ]]; then
+  echo "redstone-9x-clippy-build: expected output missing: ${OUT_DIR}" >&2
+  exit 1
+fi
+
+mkdir -p "${DEST_ROOT}"
+VERSIONED="${DEST_ROOT}/Clippy-linux-x64-${sha}"
+TMP="${VERSIONED}.building"
+rm -rf "${TMP}"
+cp -a "${OUT_DIR}" "${TMP}"
+rm -rf "${VERSIONED}"
+mv "${TMP}" "${VERSIONED}"
+
+# Atomic retarget: redstone-9x-clippy always launches through this stable
+# name, never a versioned one. `ln -sfn` only replaces LINKNAME if it is
+# already a symlink (or absent) -- if a real directory ever sits at
+# Clippy-linux-x64 (e.g. a hand-staged payload predating this script),
+# `ln -sfn` silently nests the new symlink INSIDE it instead of replacing
+# it, leaving the stable name still resolving to the stale binary. Refuse
+# loudly rather than repeat that.
+STABLE="${DEST_ROOT}/Clippy-linux-x64"
+if [[ -e "${STABLE}" && ! -L "${STABLE}" ]]; then
+  echo "redstone-9x-clippy-build: ${STABLE} exists and is not a symlink -- refusing to nest the new build inside it. Move or remove it by hand first." >&2
+  exit 1
+fi
+ln -sfn "${VERSIONED}" "${STABLE}"
+
+echo "redstone-9x-clippy-build: staged ${VERSIONED} -> ${DEST_ROOT}/Clippy-linux-x64"
+#+END_SRC
