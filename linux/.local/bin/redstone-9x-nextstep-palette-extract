@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""Extract the Redstone NeXTSTEP campaign's source palette table.
+
+The input families are checked-in DotCortex assets, not live guest state:
+OneStepBack GTK CSS supplies six named colour roles, while QTStep Xfwm4 XPMs
+provide dominant active/inactive title, border, and accent colours.  The
+default output is stable, sorted JSON suitable for review and inclusion in the
+canonical ``sanctuary-redstone-9x-schemes.org`` data block.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import re
+from pathlib import Path
+
+
+ONE_STEP_ROLES = (
+    "white_color",
+    "lighter_color",
+    "base_color",
+    "darker_color",
+    "black_color",
+    "scale_color",
+)
+CSS_COLOR = re.compile(r"^@define-color\s+([A-Za-z0-9_-]+)\s+([^;]+);", re.MULTILINE)
+HEX = re.compile(r"^#[0-9A-Fa-f]{6}$")
+XPM_HEADER = re.compile(r'^\s*"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"')
+XPM_COLOR = re.compile(r'^\s*"(.*?)"(?:,)?\s*$')
+
+
+def slug(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def resolve_css(value: str, values: dict[str, str], trail: tuple[str, ...] = ()) -> str:
+    value = value.strip()
+    if HEX.fullmatch(value):
+        return value.lower()
+    if value.startswith("@"):
+        key = value[1:]
+        if key in trail:
+            raise ValueError(f"cyclic GTK colour reference: {' -> '.join(trail + (key,))}")
+        if key not in values:
+            raise ValueError(f"unresolved GTK colour reference: @{key}")
+        return resolve_css(values[key], values, trail + (key,))
+    raise ValueError(f"non-literal GTK colour expression: {value}")
+
+
+def parse_one_step(path: Path) -> dict[str, str]:
+    values = {name: value for name, value in CSS_COLOR.findall(path.read_text(encoding="utf-8"))}
+    missing = [name for name in ONE_STEP_ROLES if name not in values]
+    if missing:
+        raise ValueError(f"{path}: missing GTK roles: {', '.join(missing)}")
+    return {name: resolve_css(values[name], values) for name in ONE_STEP_ROLES}
+
+
+def parse_xpm(path: Path) -> collections.Counter[str]:
+    lines = path.read_text(encoding="latin-1").splitlines()
+    header_index = next((i for i, line in enumerate(lines) if XPM_HEADER.match(line)), None)
+    if header_index is None:
+        raise ValueError(f"{path}: missing XPM header")
+    match = XPM_HEADER.match(lines[header_index])
+    assert match is not None
+    _, _, color_count, chars_per_pixel = (int(part) for part in match.groups())
+    if chars_per_pixel != 1:
+        raise ValueError(f"{path}: unsupported chars-per-pixel {chars_per_pixel}")
+
+    palette: dict[str, str | None] = {}
+    for line in lines[header_index + 1 : header_index + 1 + color_count]:
+        match = XPM_COLOR.match(line)
+        if not match:
+            raise ValueError(f"{path}: malformed XPM colour row: {line}")
+        row = match.group(1)
+        symbol = row[0]
+        color_match = re.search(r"\bc\s+([^\s]+)", row)
+        if not color_match:
+            raise ValueError(f"{path}: XPM colour row has no c field: {line}")
+        color = color_match.group(1)
+        palette[symbol] = None if color.lower() == "none" else color.lower()
+
+    pixels = lines[header_index + 1 + color_count :]
+    counts: collections.Counter[str] = collections.Counter()
+    for line in pixels:
+        match = XPM_COLOR.match(line)
+        if not match:
+            continue
+        for symbol in match.group(1):
+            color = palette.get(symbol)
+            if color and HEX.fullmatch(color):
+                counts[color] += 1
+    if not counts:
+        raise ValueError(f"{path}: no literal pixel colours found")
+    return counts
+
+
+def dominant(path: Path, excluded: set[str] | None = None, accent: bool = False) -> str:
+    counts = parse_xpm(path)
+    excluded = excluded or set()
+    ranked = counts.most_common()
+    if accent:
+        for color, _ in ranked:
+            if color in excluded:
+                continue
+            red, green, blue = (int(color[index : index + 2], 16) for index in (1, 3, 5))
+            if max(red, green, blue) - min(red, green, blue) >= 24:
+                return color
+    for color, _ in ranked:
+        if color not in excluded:
+            return color
+    return ranked[0][0]
+
+
+def extract(repo: Path) -> dict[str, dict[str, dict[str, str]]]:
+    themes = repo / "linux/.themes"
+    one_step: dict[str, dict[str, str]] = {}
+    for path in sorted(themes.glob("OneStepBack*/gtk-3.0/gtk.css")):
+        one_step[slug(path.parent.parent.name.removeprefix("OneStepBack")) or "base"] = parse_one_step(path)
+    if len(one_step) != 7:
+        raise ValueError(f"expected 7 OneStepBack palettes, found {len(one_step)}")
+
+    qt_step: dict[str, dict[str, str]] = {}
+    for directory in sorted(themes.glob("QTStep*19p")):
+        xfwm = directory / "xfwm4"
+        active = dominant(xfwm / "title-1-active.xpm")
+        inactive = dominant(xfwm / "title-1-inactive.xpm", {active})
+        border = dominant(xfwm / "left-active.xpm", {active, inactive})
+        accent = dominant(xfwm / "maximize-prelight.xpm", {active, inactive, border}, accent=True)
+        qt_step[slug(directory.name.removesuffix("19p"))] = {
+            "active_title": active,
+            "inactive_title": inactive,
+            "border": border,
+            "accent": accent,
+        }
+    if len(qt_step) != 20:
+        raise ValueError(f"expected 20 QTStep palettes, found {len(qt_step)}")
+    return {"one_step_back": one_step, "qt_step": qt_step}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo-root", default=str(Path.home() / "DotCortex"))
+    args = parser.parse_args()
+    data = extract(Path(args.repo_root).expanduser().resolve())
+    print(json.dumps(data, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
