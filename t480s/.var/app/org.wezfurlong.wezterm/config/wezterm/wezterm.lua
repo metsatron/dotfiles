@@ -200,16 +200,42 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, cfg, hover, max_width)
 end)
 
 local act = wezterm.action
+config.enable_kitty_keyboard = true
+config.disable_default_key_bindings = true
 config.keys = {
+  {key='Delete', action=act.SendString(string.char(27) .. '[3~')},
+  {key='c', mods='CTRL|SHIFT', action=act.CopyTo 'Clipboard'},
+  {key='v', mods='CTRL|SHIFT', action=act.PasteFrom 'Clipboard'},
+  {key='UpArrow', mods='CTRL|SHIFT', action=act.ScrollByLine(-1)},
+  {key='DownArrow', mods='CTRL|SHIFT', action=act.ScrollByLine(1)},
+  {key='PageUp', mods='CTRL|SHIFT', action=act.ScrollByPage(-1)},
+  {key='PageDown', mods='CTRL|SHIFT', action=act.ScrollByPage(1)},
+  {key='Home', mods='CTRL|SHIFT', action=act.ScrollToTop},
+  {key='End', mods='CTRL|SHIFT', action=act.ScrollToBottom},
+  {key='Enter', mods='CTRL|SHIFT', action=act.SpawnWindow},
+  {key='w', mods='CTRL|SHIFT', action=act.CloseCurrentPane { confirm = false }},
+  {key='[', mods='CTRL|SHIFT', action=act.ActivatePaneDirection 'Prev'},
+  {key=']', mods='CTRL|SHIFT', action=act.ActivatePaneDirection 'Next'},
   {key='t', mods='CTRL|SHIFT', action=act.SpawnTab('CurrentPaneDomain')},
-  {key='[', mods='CTRL|SHIFT', action=act.ActivateTabRelative(-1)},
-  {key=']', mods='CTRL|SHIFT', action=act.ActivateTabRelative(1)},
-  {key='S', mods='CTRL|SHIFT', action=wezterm.action_callback(function(window, _)
-    local o = window:get_config_overrides() or {}
-    if o.enable_scroll_bar == nil then o.enable_scroll_bar = true end
-    o.enable_scroll_bar = not o.enable_scroll_bar
-    window:set_config_overrides(o)
-  end)},
+  {key='q', mods='CTRL|SHIFT', action=act.CloseCurrentTab { confirm = false }},
+  {key='PageUp', mods='CTRL', action=act.ActivateTabRelative(-1)},
+  {key='PageDown', mods='CTRL', action=act.ActivateTabRelative(1)},
+  {key='LeftArrow', mods='CTRL|SHIFT', action=act.MoveTabRelative(-1)},
+  {key='RightArrow', mods='CTRL|SHIFT', action=act.MoveTabRelative(1)},
+  {key='1', mods='CTRL|SHIFT', action=act.ActivateTab(0)},
+  {key='2', mods='CTRL|SHIFT', action=act.ActivateTab(1)},
+  {key='3', mods='CTRL|SHIFT', action=act.ActivateTab(2)},
+  {key='4', mods='CTRL|SHIFT', action=act.ActivateTab(3)},
+  {key='5', mods='CTRL|SHIFT', action=act.ActivateTab(4)},
+  {key='6', mods='CTRL|SHIFT', action=act.ActivateTab(5)},
+  {key='7', mods='CTRL|SHIFT', action=act.ActivateTab(6)},
+  {key='8', mods='CTRL|SHIFT', action=act.ActivateTab(7)},
+  {key='9', mods='CTRL|SHIFT', action=act.ActivateTab(8)},
+  {key='=', mods='CTRL', action=act.IncreaseFontSize},
+  {key='-', mods='CTRL', action=act.DecreaseFontSize},
+  {key='0', mods='CTRL|SHIFT', action=act.ResetFontSize},
+  {key='l', mods='CTRL|SHIFT', action=act.Nop},
+  {key='o', mods='CTRL|SHIFT', action=act.SpawnCommandInNewTab { domain = 'CurrentPaneDomain', args = {'obsidian-tab'} }},
   {key='Enter', mods='SHIFT', action=wezterm.action.SendString('\n')},
 }
 config.bold_brightens_ansi_colors = false
