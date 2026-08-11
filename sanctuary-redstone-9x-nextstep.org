@@ -32,6 +32,470 @@ raise SystemExit(
 )
 #+END_SRC
 
+* Trial-gate border representative
+
+The retired =redstone-9x-nextstep-build= name remains a guard forever.  This
+new builder is deliberately single-skew: one invocation emits one requested
+theme, and the coordinator must invoke it separately for the representative
+and its recolour witness.  It reads the salvaged palette table and the
+QTStepWMakerDefault xfwm4 assets, maps the donor's actual XPM colours into the
+selected palette row, and emits only the two named Trial directories when
+called twice.  No icons, schemes, menus, GTK themes, or other lanes are
+touched.
+
+The donor measures are part of the generator contract: title tiles are 23x19
+or 4x19, the title height is 19, side strips are 1x23, corner strips are
+1x19, and caption buttons are 19x19.  IceWM receives a three-pixel flat frame
+made by repeating the donor's measured border pixel; this is the explicit
+trial border requested by the recovery law, not a colour invented by the
+converter.  The donor's 13 non-transparent colours are all mapped to a
+palette-table role.  A previously unknown donor colour is retained only as a
+flagged donor fallback in the run log.
+
+#+BEGIN_SRC python :tangle linux/.local/bin/redstone-9x-nextstep-borders-build :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Build exactly one palette-responsive NeXTSTEP IceWM border trial."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import re
+import shutil
+from pathlib import Path
+
+
+DONOR_RELATIVE = Path("linux/.themes/QTStepWMakerDefault19p/xfwm4")
+PALETTE_RELATIVE = Path("linux/.config/redstone-9x/nextstep-palettes.json")
+TOSH_DEFAULT_RELATIVE = Path("linux/.icewm/themes/Tosh/default.theme")
+OUTPUTS = {
+    "base": "NeXTSTEP-Trial-OneStepBack-Base",
+    "darkadobe": "NeXTSTEP-Trial-DarkAdobe",
+}
+REQUIRED_PALETTE_KEYS = (
+    "base_color", "black_color", "darker_color", "lighter_color",
+    "scale_color", "white_color",
+)
+XPM_HEADER = re.compile(r'^\s*"(\d+)\s+(\d+)\s+(\d+)\s+(\d+)"')
+COLOUR_LINE = re.compile(r'\bc\s+(.+?)\s*$')
+HEX = re.compile(r'^#[0-9a-fA-F]{6}$')
+
+
+class Xpm:
+    def __init__(self, width: int, height: int, colours: dict[str, str | None],
+                 pixels: list[str]) -> None:
+        self.width = width
+        self.height = height
+        self.colours = colours
+        self.pixels = pixels
+
+
+def quoted(line: str) -> str:
+    start = line.find('"')
+    end = line.rfind('"')
+    if start < 0 or end <= start:
+        raise ValueError(f"not an XPM string: {line!r}")
+    return line[start + 1:end]
+
+
+def read_xpm(path: Path) -> Xpm:
+    lines = path.read_text(encoding="latin-1").splitlines()
+    header_index = next(
+        (index for index, line in enumerate(lines) if XPM_HEADER.match(line)),
+        None,
+    )
+    if header_index is None:
+        raise ValueError(f"XPM header missing: {path}")
+    match = XPM_HEADER.match(lines[header_index])
+    assert match is not None
+    width, height, colour_count, cpp = map(int, match.groups())
+    if cpp != 1:
+        raise ValueError(f"unsupported XPM chars-per-pixel in {path}: {cpp}")
+    colours: dict[str, str | None] = {}
+    for line in lines[header_index + 1:header_index + 1 + colour_count]:
+        value = quoted(line)
+        symbol = value[:cpp]
+        colour_match = COLOUR_LINE.search(value[cpp:])
+        if colour_match is None:
+            raise ValueError(f"XPM colour missing in {path}: {line}")
+        colour = colour_match.group(1).split()[0]
+        if colour.lower() == "none":
+            colours[symbol] = None
+        elif HEX.fullmatch(colour):
+            colours[symbol] = colour.upper()
+        else:
+            raise ValueError(f"unsupported XPM colour in {path}: {colour}")
+    pixel_start = header_index + 1 + colour_count
+    pixels = [quoted(line) for line in lines[pixel_start:pixel_start + height]]
+    if len(pixels) != height or any(len(row) != width for row in pixels):
+        raise ValueError(f"incomplete XPM pixels: {path}")
+    if any(symbol not in colours for row in pixels for symbol in row):
+        raise ValueError(f"XPM pixel refers to an undeclared colour: {path}")
+    return Xpm(width, height, colours, pixels)
+
+
+def write_xpm(path: Path, colours: list[str | None], pixels: list[list[str | None]]) -> None:
+    unique = list(dict.fromkeys(colours))
+    symbols = ".+@#$%&*=-;:!?ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+    if None in unique:
+        symbols = " " + symbols
+    if len(unique) > len(symbols):
+        raise ValueError(f"too many output colours for {path}: {len(unique)}")
+    symbol_for = {colour: symbols[index] for index, colour in enumerate(unique)}
+    width = len(pixels[0])
+    height = len(pixels)
+    lines = [
+        "/* XPM */",
+        f"static char *{path.stem.replace('-', '_')}_xpm[] = {{",
+        f'"{width} {height} {len(unique)} 1",',
+    ]
+    for colour in unique:
+        symbol = symbol_for[colour]
+        encoded = "None" if colour is None else colour
+        lines.append(f'"{symbol} c {encoded}",')
+    for row in pixels[:-1]:
+        lines.append('"' + "".join(symbol_for[colour] for colour in row) + '",')
+    lines.append('"' + "".join(symbol_for[colour] for colour in pixels[-1]) + '"};')
+    path.write_text("\n".join(lines) + "\n", encoding="latin-1")
+
+
+def rgb_luma(colour: str) -> int:
+    red, green, blue = (int(colour[index:index + 2], 16) for index in (1, 3, 5))
+    return (299 * red + 587 * green + 114 * blue) // 1000
+
+
+def ice_colour(colour: str) -> str:
+    return f"rgb:{colour[1:3]}/{colour[3:5]}/{colour[5:7]}"
+
+
+def palette_row(data: dict, skew: str) -> dict[str, str]:
+    raw = data.get("one_step_back", {}).get(skew)
+    if not isinstance(raw, dict):
+        raise SystemExit(f"palette row is missing or ambiguous: one_step_back.{skew}")
+    missing = [key for key in REQUIRED_PALETTE_KEYS if key not in raw]
+    if missing:
+        raise SystemExit(f"palette row one_step_back.{skew} is missing: {', '.join(missing)}")
+    row = {key: str(raw[key]).lower() for key in REQUIRED_PALETTE_KEYS}
+    for key, value in row.items():
+        if not HEX.fullmatch(value):
+            raise SystemExit(f"palette row one_step_back.{skew} has invalid {key}: {value}")
+    row.update({
+        # WMakerDefault's focused body is a dark slab.  The differing
+        # darker_color role is the deliberate palette-responsive title face.
+        "active_title": row["darker_color"],
+        "inactive_title": row["base_color"],
+        "bright": row["lighter_color"] if skew == "darkadobe" else row["white_color"],
+    })
+    return row
+
+
+def donor_colour_map(row: dict[str, str]) -> dict[str, str]:
+    return {
+        "#000000": row["black_color"],
+        "#040004": row["black_color"],
+        "#384246": row["base_color"],
+        "#0D171B": row["darker_color"],
+        "#434D51": row["scale_color"],
+        "#FFFFFF": row["bright"],
+        "#AEAAAE": row["base_color"],
+        "#8D979B": row["lighter_color"],
+        "#837F83": row["darker_color"],
+        "#595559": row["darker_color"],
+        "#4D575B": row["darker_color"],
+        "#ACAAAC": row["lighter_color"],
+        # This single source accent occurs in title-2-active.xpm; it is
+        # donor-derived and is made responsive through the palette accent.
+        "#40A740": row["scale_color"],
+    }
+
+
+def recolour_xpm(source: Path, row: dict[str, str], state: str, context: str,
+                 fallbacks: set[tuple[str, str]]) -> tuple[int, int, list[list[str | None]]]:
+    image = read_xpm(source)
+    mapping = donor_colour_map(row)
+    body_symbol: str | None = None
+    if context == "title":
+        interior = [
+            symbol for line in image.pixels[2:-2] for symbol in line
+            if image.colours[symbol] is not None
+        ]
+        body_symbol = collections.Counter(interior).most_common(1)[0][0]
+    output: list[list[str | None]] = []
+    for line in image.pixels:
+        output_line: list[str | None] = []
+        for symbol in line:
+            old = image.colours[symbol]
+            if old is None:
+                output_line.append(None)
+                continue
+            if context == "title" and symbol == body_symbol:
+                new = row["active_title"] if state == "active" else row["inactive_title"]
+            else:
+                new = mapping.get(old.upper())
+                if new is None:
+                    fallbacks.add((source.name, old.upper()))
+                    new = old.upper()
+            output_line.append(new)
+        output.append(output_line)
+    return image.width, image.height, output
+
+
+def write_recoloured(source: Path, destination: Path, row: dict[str, str], state: str,
+                     context: str, fallbacks: set[tuple[str, str]]) -> None:
+    width, height, pixels = recolour_xpm(source, row, state, context, fallbacks)
+    write_xpm(destination, [colour for line in pixels for colour in line], pixels)
+    if (width, height) != (len(pixels[0]), len(pixels)):
+        raise AssertionError(f"XPM size changed during recolour: {source}")
+
+
+def write_solid(path: Path, width: int, height: int, colour: str) -> None:
+    pixels = [[colour] * width for _ in range(height)]
+    write_xpm(path, [colour], pixels)
+
+
+def title_sources() -> dict[str, str]:
+    return {
+        "B": "title-5", "T": "title-3", "S": "title-1",
+        "L": "title-1", "R": "title-5", "M": "title-2", "P": "title-4",
+    }
+
+
+def write_titles(donor: Path, output: Path, row: dict[str, str],
+                 fallbacks: set[tuple[str, str]]) -> None:
+    for state, suffix in (("active", "A"), ("inactive", "I")):
+        for stem, donor_stem in title_sources().items():
+            source = donor / f"{donor_stem}-{state}.xpm"
+            write_recoloured(source, output / f"title{suffix}{stem}.xpm", row,
+                             state, "title", fallbacks)
+
+
+def write_frames(output: Path, row: dict[str, str]) -> None:
+    border = row["black_color"]
+    for suffix in ("A", "I"):
+        for prefix in ("frame", "dframe"):
+            for stem in ("T", "B"):
+                write_solid(output / f"{prefix}{suffix}{stem}.xpm", 1, 3, border)
+            for stem in ("L", "R"):
+                write_solid(output / f"{prefix}{suffix}{stem}.xpm", 3, 1, border)
+            for stem in ("TL", "TR", "BL", "BR"):
+                write_solid(output / f"{prefix}{suffix}{stem}.xpm", 3, 3, border)
+
+
+def write_buttons(donor: Path, output: Path, row: dict[str, str],
+                  fallbacks: set[tuple[str, str]]) -> None:
+    sources = {
+        "close": "close", "minimize": "hide", "maximize": "maximize",
+        "restore": "maximize-toggled", "rollup": "shade",
+        "rolldown": "shade-toggled", "menuButton": "menu",
+    }
+    for state, suffix in (("active", "A"), ("inactive", "I")):
+        for target, source_stem in sources.items():
+            normal = read_xpm(donor / f"{source_stem}-{state}.xpm")
+            pressed = read_xpm(donor / f"{source_stem}-pressed.xpm")
+            normal_path = donor / f"{source_stem}-{state}.xpm"
+            pressed_path = donor / f"{source_stem}-pressed.xpm"
+            _, _, top = recolour_xpm(normal_path, row, state, "button", fallbacks)
+            _, _, bottom = recolour_xpm(pressed_path, row, state, "button", fallbacks)
+            if (normal.width, normal.height) != (19, 19) or (pressed.width, pressed.height) != (19, 19):
+                raise SystemExit(f"caption button geometry changed in donor: {source_stem}")
+            write_xpm(output / f"{target}{suffix}.xpm", [
+                colour for line in top + bottom for colour in line
+            ], top + bottom)
+
+
+def tosh_colour_keys(path: Path) -> list[str]:
+    keys = []
+    for line in path.read_text(encoding="latin-1").splitlines():
+        match = re.match(r"^(Color[A-Za-z0-9]+)=", line)
+        if match:
+            keys.append(match.group(1))
+    if not keys:
+        raise SystemExit(f"Tosh Color* checklist is empty: {path}")
+    return keys
+
+
+def contrast(row: dict[str, str], background: str) -> str:
+    return row["black_color"] if rgb_luma(background) >= 128 else row["white_color"]
+
+
+def colour_values(row: dict[str, str]) -> dict[str, str]:
+    face = row["base_color"]
+    active = row["active_title"]
+    light = row["lighter_color"]
+    dark = row["darker_color"]
+    black = row["black_color"]
+    accent = row["scale_color"]
+    face_text = contrast(row, face)
+    active_text = contrast(row, active)
+    accent_text = contrast(row, accent)
+    return {
+        "ColorDialog": face,
+        "ColorActiveBorder": black,
+        "ColorNormalBorder": black,
+        "ColorNormalTitleButton": face,
+        "ColorNormalTitleButtonText": face_text,
+        "ColorNormalButton": face,
+        "ColorNormalButtonText": face_text,
+        "ColorActiveButton": accent,
+        "ColorActiveButtonText": accent_text,
+        "ColorActiveTitleBar": active,
+        "ColorNormalTitleBar": row["inactive_title"],
+        "ColorActiveTitleBarText": active_text,
+        "ColorNormalTitleBarText": face_text,
+        "ColorNormalMinimizedWindow": face,
+        "ColorNormalMinimizedWindowText": face_text,
+        "ColorActiveMinimizedWindow": accent,
+        "ColorActiveMinimizedWindowText": accent_text,
+        "ColorNormalMenu": face,
+        "ColorActiveMenuItem": accent,
+        "ColorActiveMenuItemText": accent_text,
+        "ColorNormalMenuItemText": face_text,
+        "ColorDisabledMenuItemText": dark,
+        "ColorMoveSizeStatus": face,
+        "ColorMoveSizeStatusText": face_text,
+        "ColorQuickSwitch": face,
+        "ColorQuickSwitchText": face_text,
+        "ColorDefaultTaskBar": face,
+        "ColorNormalTaskBarApp": face,
+        "ColorNormalTaskBarAppText": face_text,
+        "ColorActiveTaskBarApp": accent,
+        "ColorActiveTaskBarAppText": accent_text,
+        "ColorMinimizedTaskBarApp": face,
+        "ColorMinimizedTaskBarAppText": face_text,
+        "ColorInvisibleTaskBarApp": dark,
+        "ColorInvisibleTaskBarAppText": face_text,
+        "ColorScrollBar": face,
+        "ColorScrollBarArrow": light,
+        "ColorScrollBarSlider": dark,
+        "ColorListBox": face,
+        "ColorListBoxText": face_text,
+        "ColorListBoxSelection": accent,
+        "ColorListBoxSelectionText": accent_text,
+        "ColorToolTip": light,
+        "ColorToolTipText": contrast(row, light),
+        "ColorClock": face,
+        "ColorClockText": face_text,
+        "ColorApm": face,
+        "ColorApmText": face_text,
+        "ColorLabel": face,
+        "ColorLabelText": face_text,
+        "ColorInput": face,
+        "ColorInputText": face_text,
+        "ColorInputSelection": accent,
+        "ColorInputSelectionText": accent_text,
+    }
+
+
+def write_default(path: Path, row: dict[str, str], skew: str, donor: Path,
+                  tosh_keys: list[str]) -> None:
+    colours = colour_values(row)
+    missing = [key for key in tosh_keys if key not in colours]
+    if missing:
+        raise SystemExit(f"default.theme key derivation missing Tosh keys: {missing}")
+    extra = sorted(set(colours) - set(tosh_keys))
+    if extra:
+        raise SystemExit(f"default.theme has unreviewed extra Color* keys: {extra}")
+    lines = [
+        "# Generated by redstone-9x-nextstep-borders-build; do not hand-edit.",
+        f'ThemeDescription="NeXTSTEP Trial - {OUTPUTS[skew]}"',
+        'ThemeAuthor="DotCortex; QTStepWMakerDefault xfwm4 donor"',
+        "Look=pixmap",
+        'Gradients=""',
+        "TitleBarCentered=0",
+        'TitleButtonsLeft="s"',
+        'TitleButtonsRight="ximr"',
+        'TitleButtonsSupported="xmirhs"',
+        "ShowMenuButtonIcon=0",
+        # 19 is read from title/button XPMs; 3 is the declared trial frame.
+        "TitleBarHeight=19",
+        "BorderSizeX=3",
+        "BorderSizeY=3",
+        "CornerSizeX=3",
+        "CornerSizeY=3",
+        "DlgBorderSizeX=3",
+        "DlgBorderSizeY=3",
+        "ButtonX=19",
+        "ButtonY=19",
+    ]
+    lines.extend(f'{key}="{ice_colour(colours[key])}"' for key in tosh_keys)
+    path.write_text("\n".join(lines) + "\n", encoding="latin-1")
+
+
+def build(repo: Path, skew: str) -> Path:
+    palette_path = repo / PALETTE_RELATIVE
+    donor = repo / DONOR_RELATIVE
+    tosh = repo / TOSH_DEFAULT_RELATIVE
+    if not palette_path.is_file():
+        raise SystemExit(f"palette table missing: {palette_path}")
+    if not donor.is_dir():
+        raise SystemExit(f"QTStep xfwm4 donor missing: {donor}")
+    if not tosh.is_file():
+        raise SystemExit(f"Tosh key checklist missing: {tosh}")
+    row = palette_row(json.loads(palette_path.read_text(encoding="utf-8")), skew)
+    donor_title = read_xpm(donor / "title-1-active.xpm")
+    donor_side = read_xpm(donor / "left-active.xpm")
+    donor_corner = read_xpm(donor / "top-left-active.xpm")
+    donor_button = read_xpm(donor / "close-active.xpm")
+    if donor_title.height != 19 or donor_button.width != 19 or donor_button.height != 19:
+        raise SystemExit("donor TitleBarHeight/button geometry is not the measured 19px contract")
+    if donor_side.width != 1 or donor_side.height != 23 or donor_corner.width != 1 or donor_corner.height != 19:
+        raise SystemExit("donor border-strip geometry changed; refuse to guess")
+    donor_border = donor_side.colours[donor_side.pixels[0][0]]
+    if donor_border is None:
+        raise SystemExit("donor border pixel is transparent")
+    output = repo / "linux/.icewm/themes" / OUTPUTS[skew]
+    if output.exists() or output.is_symlink():
+        if output.is_symlink() or not output.is_dir():
+            output.unlink()
+        else:
+            shutil.rmtree(output)
+    output.mkdir(parents=True)
+    fallbacks: set[tuple[str, str]] = set()
+    write_titles(donor, output, row, fallbacks)
+    write_frames(output, row)
+    write_buttons(donor, output, row, fallbacks)
+    tosh_keys = tosh_colour_keys(tosh)
+    write_default(output / "default.theme", row, skew, donor, tosh_keys)
+    (output / "PROVENANCE").write_text(
+        "NeXTSTEP/OpenStep trial border representative\n"
+        f"Palette row: one_step_back.{skew}\n"
+        f"xfwm4 donor: {DONOR_RELATIVE}\n"
+        "Donor measures: title 19px; title-1 23x19; title-2 4x19; "
+        "side 1x23; corner 1x19; buttons 19x19\n"
+        "IceWM trial frame: 3px, repeated from donor border pixel\n"
+        "Colour law: all donor colours map to palette roles; no icons or schemes\n"
+        "Builder: redstone-9x-nextstep-borders-build\n",
+        encoding="utf-8",
+    )
+    print(f"skew={skew}")
+    print(f"palette=one_step_back.{skew}")
+    print(f"active_title_dominant={row['active_title']}")
+    print(f"inactive_title_body={row['inactive_title']}")
+    print(f"donor_border={donor_border} donor_side={donor_side.width}x{donor_side.height}")
+    print("metrics=TitleBarHeight:19 Button:19x19 TrialBorder:3")
+    print(f"theme={output} files={sum(1 for path in output.iterdir() if path.is_file())}")
+    if fallbacks:
+        print("donor_fallbacks=" + ",".join(f"{name}:{colour}" for name, colour in sorted(fallbacks)))
+    else:
+        print("donor_fallbacks=none")
+    return output
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--repo-root", default=None)
+    parser.add_argument("--skew", choices=sorted(OUTPUTS), required=True)
+    args = parser.parse_args()
+    script_root = Path(__file__).resolve().parents[3]
+    repo = Path(args.repo_root).expanduser().resolve() if args.repo_root else script_root
+    build(repo, args.skew)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
 * Dockapp lifecycle
 
 The manager records exact PIDs with their display and never kills by name.
