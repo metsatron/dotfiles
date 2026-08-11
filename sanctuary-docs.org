@@ -226,6 +226,319 @@ if __name__ == "__main__":
     main()
 #+END_SRC
 
+* Help corpus
+
+Zeal's =docSet.dsidx= is deliberately thin — =name=, =type=, =path=, nothing
+else — which is perfect for Zeal navigation but useless for "what does this
+page actually say". Clippy needs a full-text companion index, generated from
+the docsets =dotcortex-docset-gen= already rendered — never independently
+from the man sources — so Zeal and Clippy always inhabit exactly the same
+library. SQLite FTS5, no embeddings: this corpus is highly lexical (command
+names, option flags, error strings), and FTS gives deterministic, fast
+retrieval for free.
+
+Chunk boundary is the mandoc section, not the whole page: mandoc's HTML
+output wraps every =.Sh=/=.Ss= in =<section class="Sh|Ss">= around an
+=<h1|h2 id="ANCHOR">= heading (verified live against a rendered page, not
+assumed from the CSS rule alone). A leaf-scoped stack parser gives one chunk
+per leaf section — a page with subsections yields one chunk per subsection
+plus one for the parent section's own lead-in text — so citations in Pass 2
+can point at the actual subsection, not just the page.
+
+The corpus lives at =$XDG_DATA_HOME/dotcortex/help/help-corpus.sqlite= —
+same non-committed, host-local footing as the docsets shelf. Incremental via
+content hash stored per =(docset, path)= in the =documents= table itself, no
+separate manifest file: unchanged pages are skipped on rebuild, changed
+pages have their chunks and FTS rows replaced, and documents whose docset or
+dsidx entry vanished are pruned. A first cold build over the full fleet
+shelf (tens of thousands of pages) runs a few minutes; every rebuild after
+that only pays for what actually changed.
+
+#+BEGIN_SRC python :tangle all/.local/bin/dotcortex-help-corpus-build :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Build the Help Corpus (FTS5) from already-rendered Zeal docsets.
+
+Consumes docSet.dsidx + Documents/*.html from every *.docset under
+--docsets-dir (the exact artefacts dotcortex-docset-gen already produced),
+never the original man sources -- Zeal and Clippy inhabit the same library.
+
+Usage:
+  dotcortex-help-corpus-build --docsets-dir DIR --out help-corpus.sqlite
+"""
+import argparse, hashlib, sqlite3, sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+
+class SectionChunker(HTMLParser):
+    """Splits mandoc's <section class="Sh|Ss"><h1|h2 id=...>...</section>
+    tree into one chunk per leaf section. Text seen while a child section
+    is open never reaches the parent's buffer (stack scoping), so a
+    section with subsections yields one chunk per subsection plus one
+    chunk for the parent's own lead-in text."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.stack = []          # list of dict(anchor, heading, buf=[])
+        self.chunks = []         # finished chunks
+        self.heading_depth = None  # tag name ('h1'/'h2') currently capturing heading text
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        cls = d.get("class", "")
+        if tag == "section" and cls in ("Sh", "Ss"):
+            self.stack.append({"anchor": d.get("id", ""), "heading": "", "buf": []})
+        elif tag in ("h1", "h2") and cls in ("Sh", "Ss") and self.stack:
+            self.heading_depth = tag
+
+    def handle_endtag(self, tag):
+        if tag in ("h1", "h2") and self.heading_depth == tag:
+            self.heading_depth = None
+        elif tag == "section" and self.stack:
+            top = self.stack.pop()
+            body = "".join(top["buf"]).strip()
+            if body:
+                self.chunks.append((top["anchor"], top["heading"].strip(), body))
+
+    def handle_data(self, data):
+        if not self.stack:
+            return
+        if self.heading_depth:
+            self.stack[-1]["heading"] += data
+        else:
+            self.stack[-1]["buf"].append(data)
+
+
+def chunk_html(html: str):
+    p = SectionChunker()
+    p.feed(html)
+    if p.chunks:
+        return p.chunks
+    # Fallback: no Sh/Ss sections found (unusual/degenerate page) -- one
+    # whole-page chunk so nothing silently vanishes from the corpus.
+    text = HTMLTextDump()
+    text.feed(html)
+    body = text.get_text().strip()
+    return [("", "", body)] if body else []
+
+
+class HTMLTextDump(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._parts = []
+
+    def handle_data(self, data):
+        self._parts.append(data)
+
+    def get_text(self):
+        return "".join(self._parts)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--docsets-dir", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    docsets_dir = Path(args.docsets_dir)
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    con = sqlite3.connect(out)
+    # Derived/rebuildable index: trade durability for build speed. A crash
+    # mid-build just means the next `loom docs:build` rebuilds it.
+    con.executescript("PRAGMA synchronous=OFF; PRAGMA journal_mode=MEMORY;")
+    con.executescript("""
+    CREATE TABLE IF NOT EXISTS documents(
+      id INTEGER PRIMARY KEY,
+      docset TEXT NOT NULL,
+      name TEXT NOT NULL,
+      type TEXT NOT NULL,
+      path TEXT NOT NULL,
+      source_hash TEXT NOT NULL,
+      UNIQUE(docset, path)
+    );
+    CREATE TABLE IF NOT EXISTS chunks(
+      id INTEGER PRIMARY KEY,
+      document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+      anchor TEXT NOT NULL,
+      heading TEXT NOT NULL,
+      body TEXT NOT NULL
+    );
+    CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+      title, heading, body, chunk_id UNINDEXED, tokenize='porter unicode61'
+    );
+    """)
+
+    seen_docsets = set()
+    live_keys = set()
+    docs_seen = chunks_seen = rendered = skipped = 0
+
+    for docset_dir in sorted(docsets_dir.glob("*.docset")):
+        dsidx = docset_dir / "Contents/Resources/docSet.dsidx"
+        docs_root = docset_dir / "Contents/Resources/Documents"
+        if not dsidx.is_file():
+            continue
+        docset_name = docset_dir.stem
+        seen_docsets.add(docset_name)
+        idx = sqlite3.connect(f"file:{dsidx}?mode=ro", uri=True)
+        for name, typ, path in idx.execute("SELECT name, type, path FROM searchIndex"):
+            live_keys.add((docset_name, path))
+            html_path = docs_root / path
+            if not html_path.is_file():
+                continue
+            raw = html_path.read_bytes()
+            digest = hashlib.sha1(raw).hexdigest()
+            row = con.execute(
+                "SELECT id, source_hash FROM documents WHERE docset=? AND path=?",
+                (docset_name, path)).fetchone()
+            docs_seen += 1
+            if row and row[1] == digest:
+                skipped += 1
+                continue
+            html = raw.decode("utf-8", errors="replace")
+            chunks = chunk_html(html)
+            if row:
+                doc_id = row[0]
+                con.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))
+                con.execute("DELETE FROM chunks_fts WHERE chunk_id IN "
+                            "(SELECT id FROM chunks WHERE document_id=?)", (doc_id,))
+                con.execute("UPDATE documents SET name=?, type=?, source_hash=? WHERE id=?",
+                            (name, typ, digest, doc_id))
+            else:
+                cur = con.execute(
+                    "INSERT INTO documents(docset,name,type,path,source_hash) VALUES (?,?,?,?,?)",
+                    (docset_name, name, typ, path, digest))
+                doc_id = cur.lastrowid
+            for anchor, heading, body in chunks:
+                cur = con.execute(
+                    "INSERT INTO chunks(document_id,anchor,heading,body) VALUES (?,?,?,?)",
+                    (doc_id, anchor, heading, body))
+                con.execute(
+                    "INSERT INTO chunks_fts(title,heading,body,chunk_id) VALUES (?,?,?,?)",
+                    (name, heading, body, cur.lastrowid))
+                chunks_seen += 1
+            rendered += 1
+
+    # Prune documents (and their chunks/fts rows, via ON DELETE CASCADE +
+    # explicit fts cleanup) for docsets that vanished or pages no longer
+    # present in their dsidx.
+    stale = []
+    for doc_id, docset, path in con.execute("SELECT id, docset, path FROM documents"):
+        if docset not in seen_docsets or (docset, path) not in live_keys:
+            stale.append(doc_id)
+    for doc_id in stale:
+        con.execute("DELETE FROM chunks_fts WHERE chunk_id IN "
+                    "(SELECT id FROM chunks WHERE document_id=?)", (doc_id,))
+        con.execute("DELETE FROM chunks WHERE document_id=?", (doc_id,))
+        con.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+
+    con.commit()
+    con.close()
+    print(f"help-corpus: {docs_seen} pages scanned ({rendered} (re)chunked, "
+          f"{skipped} cached, {len(stale)} pruned), {chunks_seen} chunks written -> {out}")
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
+
+Read-only query interface. This is the one seam Clippy is allowed to touch —
+spawned per query as a child process from Electron's main process (never an
+in-process sqlite reader in the fork itself, which would blur the "Clippy
+owns no documentation" ownership split), reading the corpus with
+=mode=ro= so a query can never mutate the library.
+
+#+BEGIN_SRC python :tangle all/.local/bin/dotcortex-help-query :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Read-only query interface over the Help Corpus (help-corpus.sqlite).
+
+Never opens the corpus for write -- Clippy consumes the Fleet Library
+read-only. Designed to be spawned per-query from Electron's main process
+and parsed as JSON on stdout (never in-process sqlite in the renderer/main).
+
+Usage:
+  dotcortex-help-query search "<query>" [--docset NAME] [--limit N] [--corpus PATH]
+  dotcortex-help-query read <chunk-id> [--corpus PATH]
+"""
+import argparse, json, sqlite3, sys
+from pathlib import Path
+
+DEFAULT_CORPUS = Path.home() / ".local/share/dotcortex/help/help-corpus.sqlite"
+
+
+def open_ro(path: Path) -> sqlite3.Connection:
+    if not path.is_file():
+        print(json.dumps({"error": f"corpus not found: {path}"}), file=sys.stdout)
+        sys.exit(1)
+    return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+
+def cmd_search(con, query, docset, limit):
+    sql = """
+    SELECT d.docset, d.name, d.type, d.path, c.id, c.anchor, c.heading,
+           snippet(chunks_fts, 2, '[', ']', '...', 24) AS snip,
+           bm25(chunks_fts) AS score
+    FROM chunks_fts
+    JOIN chunks c ON c.id = chunks_fts.chunk_id
+    JOIN documents d ON d.id = c.document_id
+    WHERE chunks_fts MATCH ?
+    """
+    params = [query]
+    if docset:
+        sql += " AND d.docset = ?"
+        params.append(docset)
+    sql += " ORDER BY score LIMIT ?"
+    params.append(limit)
+    rows = con.execute(sql, params).fetchall()
+    return [
+        {"docset": r[0], "name": r[1], "type": r[2], "path": r[3],
+         "chunk_id": r[4], "anchor": r[5], "heading": r[6], "snippet": r[7]}
+        for r in rows
+    ]
+
+
+def cmd_read(con, chunk_id):
+    row = con.execute("""
+        SELECT d.docset, d.name, d.type, d.path, c.anchor, c.heading, c.body
+        FROM chunks c JOIN documents d ON d.id = c.document_id
+        WHERE c.id = ?
+    """, (chunk_id,)).fetchone()
+    if not row:
+        return None
+    return {"docset": row[0], "name": row[1], "type": row[2], "path": row[3],
+            "anchor": row[4], "heading": row[5], "body": row[6]}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--corpus", default=str(DEFAULT_CORPUS))
+    sub = ap.add_subparsers(dest="verb", required=True)
+
+    sp = sub.add_parser("search")
+    sp.add_argument("query")
+    sp.add_argument("--docset")
+    sp.add_argument("--limit", type=int, default=8)
+
+    rp = sub.add_parser("read")
+    rp.add_argument("chunk_id", type=int)
+
+    args = ap.parse_args()
+    con = open_ro(Path(args.corpus))
+
+    if args.verb == "search":
+        result = cmd_search(con, args.query, args.docset, args.limit)
+    else:
+        result = cmd_read(con, args.chunk_id)
+        if result is None:
+            print(json.dumps({"error": f"no such chunk: {args.chunk_id}"}))
+            sys.exit(1)
+
+    print(json.dumps(result))
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
+
 * Guest profile map
 
 Every guest home symlinks the machine's single Guix Package Commons (=~/.guix-extra-profiles=), so "the guest's profiles" cannot be discovered from the filesystem — a naive walk yields the identical union corpus for every guest. This SSV declares which profiles each guest actually activates (mirroring its launcher's preflight list). Guests not listed here fall back to =core=, =desktop-common=, and a profile named after the guest itself, which matches the Phase 1A/1B sanctuary convention.
@@ -322,6 +635,15 @@ if [ -d "$GUESTS" ]; then
     # prune dangling symlinks from renamed/removed docsets
     find "$zdir" -maxdepth 1 -xtype l -delete
   done
+fi
+
+# --- Lane 3: help corpus (FTS5, consumes the shelf just rendered above) -----
+# Host-local: Clippy runs as a host-side Electron process (redstone-9x-clippy
+# bridges it in via redstone-9x-host-gtk), so it reads this file directly --
+# no /run/host bridging needed, unlike the binary launch path itself.
+CORPUS_GEN="$HOME/.local/bin/dotcortex-help-corpus-build"
+if [ -x "$CORPUS_GEN" ]; then
+  "$CORPUS_GEN" --docsets-dir "$OUT" --out "$DATA/dotcortex/help/help-corpus.sqlite"
 fi
 
 echo "docs-build: shelf at $OUT"
