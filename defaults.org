@@ -44,7 +44,7 @@ Flatpak runner directly so it can never recurse through =xdg-open=.
 
 #+BEGIN_SRC conf :tangle linux/.local/share/applications/capture-lane-obsidian.desktop :comments no
 [Desktop Entry]
-Name=Obsidian (Capture Lane)
+Name=Obsidian — Current Sanctuary Vault
 Comment=Route Obsidian Web Clipper requests to this sanctuary's selected vault
 Exec=capture-lane obsidian-uri %u
 Terminal=false
@@ -127,6 +127,7 @@ load_row() {
   local sanctuary="$1" manifest row
   CAPTURE_LANE_MACHINE="$(detect_machine)"
   manifest="$(find_manifest)"
+  CAPTURE_LANE_MANIFEST_PATH="${manifest}"
   row="$(awk -v machine="${CAPTURE_LANE_MACHINE}" -v sanctuary="${sanctuary}" '
     $0 !~ /^[[:space:]]*#/ && NF >= 10 && $1 == machine && $2 == sanctuary { print; exit }
   ' "${manifest}")"
@@ -228,21 +229,93 @@ apply_kde_name() {
 }
 
 mime_backup_done=0
+backup_mimeapps() {
+  local mimeapps backup
+  mimeapps="${config_home}/mimeapps.list"
+  [[ "${mime_backup_done}" -eq 0 && -e "${mimeapps}" ]] || return 0
+  backup="${mimeapps}.backup-$(date +%Y%m%d-%H%M%S)"
+  cp -a -- "${mimeapps}" "${backup}"
+  printf 'capture-lane: preserved MIME defaults at %s\n' "${backup}" >&2
+  mime_backup_done=1
+}
+
 apply_mime_default() {
-  local mime="$1" desktop="$2" current backup mimeapps
+  local mime="$1" desktop="$2" current
   current="$(xdg-mime query default "${mime}" 2>/dev/null || true)"
   [[ "${current}" == "${desktop}" ]] && return 0
-  mimeapps="${config_home}/mimeapps.list"
-  if [[ "${mime_backup_done}" -eq 0 && -e "${mimeapps}" ]]; then
-    backup="${mimeapps}.backup-$(date +%Y%m%d-%H%M%S)"
-    cp -a -- "${mimeapps}" "${backup}"
-    printf 'capture-lane: preserved MIME defaults at %s\n' "${backup}" >&2
-    mime_backup_done=1
-  fi
+  backup_mimeapps
   xdg-mime default "${desktop}" "${mime}"
   current="$(xdg-mime query default "${mime}" 2>/dev/null || true)"
   [[ "${current}" == "${desktop}" ]] \
     || die "failed to assert ${mime} -> ${desktop}; got ${current:-unset}"
+}
+
+raw_obsidian_desktops() {
+  awk '
+    $0 !~ /^[[:space:]]*#/ && NF >= 4 {
+      app=$4
+      ids[app ".desktop"]=1
+      ids["sanctuary-flatpak-" app "-" app ".desktop"]=1
+    }
+    END { for (id in ids) print id }
+  ' "${CAPTURE_LANE_MANIFEST_PATH}" | sort
+}
+
+removed_obsidian_associations() {
+  local mimeapps="${config_home}/mimeapps.list"
+  awk -F= '
+    /^\[Removed Associations\]$/ { in_removed=1; next }
+    /^\[/ { in_removed=0 }
+    in_removed && $1 == "x-scheme-handler/obsidian" {
+      sub(/^[^=]*=/, "")
+      print
+      exit
+    }
+  ' "${mimeapps}" 2>/dev/null || true
+}
+
+apply_obsidian_mime_exclusions() {
+  local mimeapps current desired combined temporary
+  mimeapps="${config_home}/mimeapps.list"
+  current="$(removed_obsidian_associations)"
+  desired="$(raw_obsidian_desktops | awk '{ printf "%s;", $0 }')"
+  combined="$({ printf '%s' "${current}"; printf '%s' "${desired}"; } \
+    | tr ';' '\n' \
+    | awk 'NF && !seen[$0]++ { printf "%s;", $0 }')"
+  [[ "${current}" == "${combined}" ]] && return 0
+
+  backup_mimeapps
+  temporary="$(mktemp "${mimeapps}.XXXXXX")"
+  awk -v key='x-scheme-handler/obsidian' -v desired="${combined}" '
+    BEGIN { in_removed=0; found_section=0; wrote=0 }
+    /^\[Removed Associations\]$/ {
+      in_removed=1
+      found_section=1
+      print
+      next
+    }
+    /^\[/ {
+      if (in_removed && !wrote) { print key "=" desired; wrote=1 }
+      in_removed=0
+      print
+      next
+    }
+    in_removed && index($0, key "=") == 1 {
+      if (!wrote) { print key "=" desired; wrote=1 }
+      next
+    }
+    { print }
+    END {
+      if (in_removed && !wrote) print key "=" desired
+      if (!found_section) {
+        print ""
+        print "[Removed Associations]"
+        print key "=" desired
+      }
+    }
+  ' "${mimeapps}" > "${temporary}"
+  chmod --reference="${mimeapps}" "${temporary}"
+  mv -f "${temporary}" "${mimeapps}"
 }
 
 apply_lane() {
@@ -264,6 +337,7 @@ apply_lane() {
   fi
   command -v xdg-mime >/dev/null 2>&1 || die 'xdg-mime is required to assert capture routing'
   apply_mime_default x-scheme-handler/obsidian capture-lane-obsidian.desktop
+  apply_obsidian_mime_exclusions
   apply_mime_default x-scheme-handler/http "${CAPTURE_LANE_BROWSER_DESKTOP}"
   apply_mime_default x-scheme-handler/https "${CAPTURE_LANE_BROWSER_DESKTOP}"
   apply_kde_name
@@ -357,7 +431,7 @@ launch_obsidian() {
 }
 
 health_lane() {
-  local sanctuary="${1:-}" expected actual
+  local sanctuary="${1:-}" expected actual removed missing=0 desktop
   [[ -n "${sanctuary}" ]] || sanctuary="$(detect_sanctuary)"
   load_row "${sanctuary}"
   printf 'lane:       %s/%s (%s)\n' "${CAPTURE_LANE_MACHINE}" "${CAPTURE_LANE_ID}" "${CAPTURE_LANE_SANCTUARY}"
@@ -378,6 +452,12 @@ health_lane() {
         "$([[ "${actual}" == "${_desktop}" ]] && echo ok || echo expected-${_desktop})"
     done
   fi
+  removed=";$(removed_obsidian_associations);"
+  while IFS= read -r desktop; do
+    [[ "${removed}" == *";${desktop};"* ]] || missing=$((missing + 1))
+  done < <(raw_obsidian_desktops)
+  printf 'chooser:    Obsidian — Current Sanctuary Vault [%s]\n' \
+    "$([[ "${missing}" -eq 0 ]] && echo exclusive || echo "${missing}-raw-handlers-visible")"
 }
 
 command="${1:-}"
