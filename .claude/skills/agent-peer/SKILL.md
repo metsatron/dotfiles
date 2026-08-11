@@ -40,14 +40,24 @@ session. Never put hostnames, addresses, credentials, or ports into DotCortex.
 
 To start a new persistent coworker in an already-running named Herdr session,
 use an explicit cwd and argv, then inventory and register the exact observed
-session identity. This command never creates a Git worktree:
+session identity. This command never creates a Git worktree.
+
+Worker-launch law (sealed 2026-08-11): never launch a worker as a bare
+`codex` or `claude` — a bare launch inherits the operator's CLI defaults
+(model AND permission mode), which is how a pilot worker came up on the wrong
+model in manual mode. Always pin the model explicitly in the peer-start argv,
+prefer the warm wrappers (`codex-warm`/`claude-warm`), and pass an intro file
+so the worker knows its role before envelopes arrive. Claude workers
+additionally pin `--permission-mode auto` (the ruled worker posture —
+`acceptEdits` still blocks every Bash call and is useless headless):
 
 ```bash
 agent-peer peer-start \
   --herdr-session HERDR_SESSION \
   --agent-name codex \
   --cwd /verified/repo/root \
-  -- codex
+  --intro-file /path/to/worker-role.md \
+  -- codex-warm --model gpt-5.6-luna -c model_reasoning_effort=high
 
 agent-peer inventory --session HERDR_SESSION
 ```
