@@ -31,6 +31,7 @@ SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 SAFE_REMOTE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._@:-]{0,254}$")
 SAFE_COMMAND = re.compile(r"^[/A-Za-z0-9][A-Za-z0-9._/-]{0,511}$")
 WRITE_SCOPES = {"checkout-write", "upstream-integration"}
+DELIVERY_MODES = {"pane", "store"}
 MAX_MESSAGE_BYTES = 131072
 
 
@@ -235,6 +236,7 @@ def command_endpoint_set(
     herdr_target: str,
     repo_root: str,
     accept_from: list[str],
+    delivery: str,
 ) -> int:
     host_id, provider, session_id = parse_peer_id(peer_id)
     registry = read_registry()
@@ -250,6 +252,8 @@ def command_endpoint_set(
         raise PeerError("at least one exact --accept-from peer is required")
     for sender in accept_from:
         parse_peer_id(sender)
+    if delivery not in DELIVERY_MODES:
+        raise PeerError("delivery must be pane or store")
     endpoint = {
         "provider": provider,
         "session_id": session_id,
@@ -257,6 +261,7 @@ def command_endpoint_set(
         "herdr_target": herdr_target,
         "repo_root": str(root),
         "accept_from": sorted(set(accept_from)),
+        "delivery": delivery,
     }
     endpoints = registry["endpoints"]
     assert isinstance(endpoints, dict)
@@ -538,6 +543,11 @@ def delivery_ready_timeout_ms() -> str:
 def deliver_herdr(
     envelope: dict[str, object], endpoint: dict[str, object]
 ) -> dict[str, object]:
+    delivery = endpoint.get("delivery", "pane")
+    if delivery not in DELIVERY_MODES:
+        raise PeerError("endpoint delivery must be pane or store")
+    if delivery == "store":
+        return {"adapter": "store-only"}
     agent = resolve_herdr_agent(endpoint)
     pane_id = str(agent["pane_id"])
     # Ready-state gate (2026-08-10 pilot defect): injecting into a pane that is
@@ -905,7 +915,7 @@ def receive_envelope(envelope: object) -> dict[str, object]:
         existing = read_record("inbox", message_id)
         if existing:
             state = str(existing.get("state"))
-            if state == "delivered":
+            if state in {"delivered", "stored"}:
                 prior = existing.get("receipt")
                 if isinstance(prior, dict):
                     duplicate = dict(prior)
@@ -920,10 +930,11 @@ def receive_envelope(envelope: object) -> dict[str, object]:
 
     try:
         delivery = deliver_herdr(validated, endpoint)
-        result = receipt(validated, "delivered", delivery=delivery, duplicate=False)
+        state = "stored" if delivery.get("adapter") == "store-only" else "delivered"
+        result = receipt(validated, state, delivery=delivery, duplicate=False)
         lock = ledger_lock()
         try:
-            write_record("inbox", validated, "delivered", receipt=result)
+            write_record("inbox", validated, state, receipt=result)
         finally:
             lock.close()
         return result
@@ -1309,6 +1320,7 @@ def command_selftest() -> int:
                 "AGENT_PEER_HERDR_BIN",
                 "AGENT_PEER_SSH_BIN",
                 "AGENT_PEER_TEST_CAPTURE",
+                "AGENT_PEER_TEST_CALLS",
             )
         }
         try:
@@ -1320,6 +1332,11 @@ def command_selftest() -> int:
                 "#!/usr/bin/env python3\n"
                 "import json, os, pathlib, sys\n"
                 "args = sys.argv[1:]\n"
+                "call_log = os.environ.get('AGENT_PEER_TEST_CALLS')\n"
+                "if call_log:\n"
+                " calls = json.loads(pathlib.Path(call_log).read_text(encoding='utf-8'))\n"
+                " calls.append(args)\n"
+                " pathlib.Path(call_log).write_text(json.dumps(calls), encoding='utf-8')\n"
                 "if args[-2:] == ['api', 'snapshot']:\n"
                 " print(json.dumps({'result': {'snapshot': {'agents': [{"
                 "'terminal_id':'term-1','pane_id':'pane-1','name':'peer',"
@@ -1378,8 +1395,38 @@ def command_selftest() -> int:
                 if len(captured) >= 2
                 else False,
             )
+            calls = root / "calls.json"
+            calls.write_text("[]", encoding="utf-8")
+            os.environ["AGENT_PEER_TEST_CALLS"] = str(calls)
             duplicate = receive_envelope(envelope)
             check("idempotent-receive", duplicate.get("duplicate") is True)
+            registry["endpoints"]["host-b/codex/session-b"]["delivery"] = "store"
+            write_registry(registry)
+            store_envelope = compose_envelope(
+                from_peer="host-a/claude/session-a",
+                to_peer="host-b/codex/session-b",
+                repo="fixture",
+                repo_root=str(root),
+                checkout_id="host-b:fixture-store",
+                access="read",
+                body="Store-only fixture.",
+                handoff=None,
+                allow_git=False,
+                allow_push=False,
+                allow_pull=False,
+                lease_id=None,
+            )
+            before_store_calls = json.loads(calls.read_text(encoding="utf-8"))
+            store_result = receive_envelope(store_envelope)
+            after_store_calls = json.loads(calls.read_text(encoding="utf-8"))
+            check(
+                "store-only-receipt",
+                store_result.get("state") == "stored"
+                and store_result.get("delivery", {}).get("adapter") == "store-only",
+            )
+            check("store-only-no-herdr-pane-call", after_store_calls == before_store_calls)
+            registry["endpoints"]["host-b/codex/session-b"]["delivery"] = "pane"
+            write_registry(registry)
             bad = json.loads(json.dumps(envelope))
             bad["message_id"] = str(uuid.uuid4())
             bad["authority"]["user_authority"] = True
@@ -1561,6 +1608,7 @@ def build_parser() -> argparse.ArgumentParser:
     endpoint.add_argument("--herdr-target", required=True)
     endpoint.add_argument("--repo-root", required=True)
     endpoint.add_argument("--accept-from", action="append", default=[])
+    endpoint.add_argument("--delivery", choices=tuple(sorted(DELIVERY_MODES)), default="pane")
 
     peer_start = sub.add_parser("peer-start")
     peer_start.add_argument("--herdr-session", required=True)
@@ -1631,6 +1679,7 @@ def main() -> int:
                 args.herdr_target,
                 args.repo_root,
                 args.accept_from,
+                args.delivery,
             )
         if args.command == "peer-start":
             command = list(args.peer_command)
