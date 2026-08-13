@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""Verify a private NeXTSTEP-Complete build and its direct graft precedence."""
+from __future__ import annotations
+
+import argparse
+import binascii
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import struct
+import subprocess
+import tempfile
+import zlib
+from pathlib import Path
+
+PNG = b"\x89PNG\r\n\x1a\n"
+SMALL = (16, 22, 24, 32, 48)
+
+
+def sha(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def png(path: Path, expected: int) -> None:
+    data = path.read_bytes()
+    if not data.startswith(PNG):
+        raise ValueError(f"not PNG: {path}")
+    pos, dims, compressed, iend = 8, None, bytearray(), False
+    while pos < len(data):
+        if pos + 12 > len(data):
+            raise ValueError(f"truncated PNG: {path}")
+        length = struct.unpack_from(">I", data, pos)[0]
+        kind, end = data[pos + 4:pos + 8], pos + 8 + length
+        if end + 4 > len(data):
+            raise ValueError(f"PNG chunk out of bounds: {path}")
+        payload = data[pos + 8:end]
+        if (binascii.crc32(kind + payload) & 0xffffffff) != struct.unpack_from(">I", data, end)[0]:
+            raise ValueError(f"bad PNG CRC: {path}")
+        if kind == b"IHDR":
+            dims = struct.unpack_from(">II", payload)
+            if struct.unpack_from(">IIBBBBB", payload)[2:] != (8, 6, 0, 0, 0):
+                raise ValueError(f"not non-interlaced RGBA8: {path}")
+        elif kind == b"IDAT":
+            compressed.extend(payload)
+        elif kind == b"IEND":
+            if payload or end + 4 != len(data):
+                raise ValueError(f"IEND boundary invalid: {path}")
+            iend = True
+        pos = end + 4
+    if dims != (expected, expected) or not compressed or not iend:
+        raise ValueError(f"PNG structure/dimension failure: {path}: {dims}")
+    zlib.decompress(bytes(compressed))
+
+
+def direct(theme: Path, context: str, name: str, size: int) -> Path | None:
+    path = theme / f"{size}x{size}" / context / f"{name}.png"
+    return path if path.exists() else None
+
+
+def parse_graft_names(path: Path) -> list[str]:
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r'^NAMES="(.*?)"\nSIZES=', text, re.MULTILINE | re.DOTALL)
+    if not match:
+        raise ValueError("cannot parse graft NAMES")
+    return match.group(1).split()
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--policy", type=Path, required=True)
+    parser.add_argument("--repo-root", type=Path, required=True)
+    parser.add_argument("--graft-script", type=Path, required=True)
+    args = parser.parse_args()
+    root, repo = args.output_root.resolve(), args.repo_root.resolve()
+    theme = root / "NeXTSTEP-Complete"
+    manifest = json.loads((root / "build-manifest.json").read_text(encoding="utf-8"))
+    policy = json.loads(args.policy.read_text(encoding="utf-8"))
+    counts = manifest["counts"]
+    expected = {"openstep_format_members": 758, "openstep_stems": 380,
+                "openstep_pairs": 378, "openstep_equal_pairs": 339,
+                "openstep_different_pairs": 39, "openstep_xpm_transparent": 359,
+                "openstep_xpm_opaque": 21, "nextspirit_containers": 28}
+    for key, value in expected.items():
+        if counts.get(key) != value:
+            raise ValueError(f"count {key}={counts.get(key)} != {value}")
+    if counts.get("openstep_xpm_cpp2", 0) < 1:
+        raise ValueError("no cpp=2 XPM was parsed")
+    if len(policy["aliases"]) != 41:
+        raise ValueError("policy does not contain exactly 41 binding role assertions")
+    formats = manifest["openstep_formats"]
+    if len(formats) != 758 or len({(r["member"], r["sha256"]) for r in formats}) != 758:
+        raise ValueError("OpenStep format-member identity is not one-to-one")
+    if any(not re.fullmatch(r"[0-9a-f]{64}", record["sha256"]) for record in formats):
+        raise ValueError("invalid OpenStep member checksum")
+    if not any(r["format"] == "xpm" and r["cpp"] == 2 and r["none_declared"] for r in formats):
+        raise ValueError("cpp=2 plus None transparency parsing was not exercised")
+    ids = [record["private_id"] for record in manifest["aliases"]]
+    names = [(record["context"], record["name"]) for record in manifest["aliases"]]
+    if len(names) != len(set(names)):
+        raise ValueError("alias collision")
+    if manifest["precedence"] != ["direct-nextspirit", "direct-openstep", "inherited-NeXTSTEP",
+                                  "Irixium", "Chicago95", "BeOS-r5-Icons", "hicolor"]:
+        raise ValueError("precedence chain changed")
+
+    declared = set(manifest["directories"])
+    actual = {str(path.relative_to(theme)) for path in theme.glob("*x*/*") if path.is_dir()}
+    if declared != actual:
+        raise ValueError(f"index directory mismatch: declared={declared ^ actual}")
+    index = (theme / "index.theme").read_text(encoding="utf-8")
+    if "Inherits=NeXTSTEP" not in index or f"Directories={','.join(sorted(declared))}" not in index:
+        raise ValueError("index.theme inheritance/directory contract failed")
+    for path in theme.rglob("*.png"):
+        if path.is_symlink():
+            if not path.resolve().is_file() or theme not in path.resolve().parents:
+                raise ValueError(f"broken or escaping alias: {path}")
+        size = int(path.relative_to(theme).parts[0].split("x", 1)[0])
+        png(path.resolve(), size)
+
+    assertion_rows = []
+    for entry in policy["aliases"]:
+        context, name = entry["role"].split("/", 1)
+        record = next((r for r in manifest["aliases"] if r["context"] == context and r["name"] == name), None)
+        if record is None or record["donor"] != entry["donor"] or record["source"] != entry["source"]:
+            raise ValueError(f"binding role mismatch: {entry['role']}")
+        hashes = []
+        for size in SMALL:
+            path = direct(theme, context, name, size)
+            if path is None or not path.is_symlink():
+                raise ValueError(f"role is not direct at {size}: {entry['role']}")
+            hashes.append(sha(path.resolve()))
+        assertion_rows.append((entry["role"], entry["donor"], entry["source"], hashes[0]))
+
+    copied_open = root / "source-material/openstep"
+    for record in formats:
+        source = copied_open / record["member"]
+        if not source.is_file() or sha(source) != record["sha256"]:
+            raise ValueError(f"OpenStep source preservation failure: {record['member']}")
+    copied_spirit = root / "source-material/nextspirit"
+    spirits = manifest["nextspirit_containers"]
+    if len(spirits) != 28 or not (copied_spirit / "README.txt").is_file():
+        raise ValueError("NeXTSpirit complete-set/README preservation failure")
+    for record in spirits:
+        source = copied_spirit / record["container"]
+        if not source.is_file() or sha(source) != record["sha256"]:
+            raise ValueError(f"NeXTSpirit container preservation failure: {record['container']}")
+        private_id = "nextspirit-" + re.sub(r"[^a-z0-9]+", "-", record["stem"].lower()).strip("-")
+        if sha(theme / f"256x256/private/{private_id}.png") != record["ic08_sha256"]:
+            raise ValueError(f"ic08 native identity mismatch: {record['stem']}")
+        if sha(theme / f"512x512/private/{private_id}.png") != record["ic09_sha256"]:
+            raise ValueError(f"ic09 native identity mismatch: {record['stem']}")
+
+    graft_names = parse_graft_names(args.graft_script)
+    public = repo / "linux/.local/share/icons/NeXTSTEP"
+    before_pairs = sum((public / f"{size}x{size}/{context}/{name}.png").is_file()
+                       for name in graft_names for size in SMALL
+                       for context in ("apps", "places", "actions", "devices", "mimes", "mimetypes", "status", "categories"))
+    after_direct_names = {name for name in graft_names if any(
+        direct(theme, context, name, size) for context in ("apps", "places", "actions", "devices", "mimes", "mimetypes", "status", "categories") for size in SMALL)}
+    after_direct_pairs = sum(any(direct(theme, context, name, size) for context in
+                                 ("apps", "places", "actions", "devices", "mimes", "mimetypes", "status", "categories"))
+                             for name in graft_names for size in SMALL)
+    representatives = {
+        "folder": "openstep", "user-home": "openstep", "user-trash": "nextspirit",
+        "utilities-terminal": "nextspirit", "internet-web-browser": "nextspirit",
+        "network-workgroup": "nextspirit", "network-server": "nextspirit",
+    }
+    with tempfile.TemporaryDirectory(prefix="nextstep-graft-check-") as temp:
+        destination = Path(temp) / "icons"
+        roots = f"{root}:{repo / 'linux/.local/share/icons'}"
+        subprocess.run([str(args.graft_script), roots, str(destination), "NeXTSTEP-Complete"], check=True)
+        for name, donor in representatives.items():
+            record = next(r for r in manifest["aliases"] if r["name"] == name)
+            if record["donor"] != donor:
+                raise ValueError(f"representative donor mismatch: {name}")
+            for size in SMALL:
+                grafted = destination / f"{name}_{size}x{size}.png"
+                source = next(direct(theme, context, name, size) for context in
+                              ("apps", "places", "actions", "devices", "mimes", "mimetypes", "status", "categories")
+                              if direct(theme, context, name, size))
+                if not grafted.is_file() or sha(grafted) != sha(source.resolve()):
+                    raise ValueError(f"graft did not select direct donor: {name}@{size}")
+
+    print("VERDICT: PASS")
+    print("COUNTS " + json.dumps(counts, sort_keys=True))
+    print(f"ASSERTIONS {len(assertion_rows)}/41")
+    for role, donor, source, digest in assertion_rows:
+        print(f"EXPECT {role} {donor} {source} {digest}")
+    print(f"GRAFT before_direct_pairs={before_pairs} after_direct_pairs={after_direct_pairs} "
+          f"after_direct_names={len(after_direct_names)}")
+    print("PRECEDENCE " + " -> ".join(manifest["precedence"]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
