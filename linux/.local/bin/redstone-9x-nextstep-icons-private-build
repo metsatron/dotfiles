@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""Build the provenance-safe private NeXTSTEP-Complete XDG icon overlay."""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib.util
+import json
+import os
+import re
+import shutil
+import subprocess
+import tarfile
+import tempfile
+from pathlib import Path
+
+OPENSTEP_SHA = "eded687882a76c88eb4e84a0f307539c0dde8cb5666e4773b6418764137bb89a"
+SPIRIT_SHA = "f981c43f116e3bd1fb13b6192cf0c6bb850dc4f6dd22f78e24ae2b9aef71ccca"
+SMALL = (16, 22, 24, 32, 48)
+SPIRIT_SIZES = (16, 22, 24, 32, 48, 128, 256, 512)
+SAFE_THEME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+XPM_STRING = re.compile(r'^\s*"(.*)"(?:,|};)?\s*$')
+
+
+def sha(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def stable(prefix: str, stem: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", stem.lower()).strip("-")
+    if not slug:
+        raise ValueError(f"empty stable name for {stem!r}")
+    return prefix + slug
+
+
+def run(command: list[str], *, stdout=None) -> subprocess.CompletedProcess:
+    return subprocess.run(command, check=True, stdout=stdout, stderr=subprocess.PIPE)
+
+
+def find_convert(explicit: str | None) -> str:
+    if explicit:
+        path = Path(explicit).expanduser().resolve()
+        if path.is_file() and os.access(path, os.X_OK):
+            return str(path)
+        raise SystemExit(f"ImageMagick convert is not executable: {path}")
+    found = shutil.which("convert")
+    if found:
+        return found
+    candidates = sorted(Path("/gnu/store").glob("*-imagemagick-*/bin/convert"))
+    if candidates:
+        return str(candidates[-1])
+    raise SystemExit("ImageMagick convert not found; pass --convert")
+
+
+def convert_png(convert: str, source: Path, target: Path, size: int | None, nearest: bool) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = [convert, str(source), "-alpha", "on"]
+    if size is not None:
+        command += ["-filter", "point" if nearest else "Lanczos", "-resize", f"{size}x{size}!"]
+    command.append(f"PNG32:{target}")
+    run(command)
+
+
+def rgba(convert: str, source: Path) -> tuple[tuple[int, int], bytes]:
+    dims = run([convert, str(source), "-format", "%w %h", "info:"], stdout=subprocess.PIPE)
+    width, height = (int(part) for part in dims.stdout.decode("ascii").split())
+    raw = run([convert, str(source), "-alpha", "on", "-depth", "8", "rgba:-"],
+              stdout=subprocess.PIPE).stdout
+    if len(raw) != width * height * 4:
+        raise ValueError(f"normalized RGBA length mismatch for {source}")
+    return (width, height), raw
+
+
+def parse_xpm(path: Path) -> dict[str, object]:
+    strings = []
+    for line in path.read_text(encoding="latin-1").splitlines():
+        match = XPM_STRING.match(line)
+        if match:
+            strings.append(match.group(1))
+    if not strings:
+        raise ValueError(f"missing XPM strings: {path}")
+    width, height, colours, cpp = (int(part) for part in strings[0].split()[:4])
+    if cpp < 1 or len(strings) < 1 + colours + height:
+        raise ValueError(f"invalid XPM header/body: {path}")
+    palette: dict[str, str] = {}
+    for row in strings[1:1 + colours]:
+        key = row[:cpp]
+        match = re.search(r"(?:^|\s)c\s+([^\s]+)", row[cpp:], re.IGNORECASE)
+        if not match:
+            raise ValueError(f"XPM colour row has no c field: {path}: {row!r}")
+        palette[key] = match.group(1)
+    pixels = strings[1 + colours:1 + colours + height]
+    if any(len(row) != width * cpp for row in pixels):
+        raise ValueError(f"XPM row width mismatch: {path}")
+    used = {row[x:x + cpp] for row in pixels for x in range(0, len(row), cpp)}
+    missing = sorted(used - palette.keys())
+    if missing:
+        raise ValueError(f"XPM uses undefined symbols: {path}: {missing!r}")
+    transparent = any(palette[key].lower() == "none" for key in used)
+    return {"width": width, "height": height, "colours": colours, "cpp": cpp,
+            "transparent": transparent, "none_declared": any(v.lower() == "none" for v in palette.values())}
+
+
+def safe_extract(archive: Path, destination: Path) -> None:
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = bundle.getmembers()
+        for member in members:
+            pure = Path(member.name)
+            if pure.is_absolute() or ".." in pure.parts or member.issym() or member.islnk():
+                raise ValueError(f"unsafe archive member: {member.name}")
+        bundle.extractall(destination, members=members, filter="data")
+
+
+def link_alias(theme: Path, size: int, context: str, name: str, private_id: str) -> None:
+    directory = theme / f"{size}x{size}" / context
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"{name}.png"
+    relative = Path("..") / "private" / f"{private_id}.png"
+    if target.exists() or target.is_symlink():
+        if not target.is_symlink() or os.readlink(target) != str(relative):
+            raise ValueError(f"alias collision: {target}")
+        return
+    target.symlink_to(relative)
+
+
+def load_decoder(path: Path):
+    spec = importlib.util.spec_from_file_location("redstone_icns2png", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"cannot load decoder: {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def write_index(theme: Path, directories: list[str]) -> None:
+    lines = ["[Icon Theme]", "Name=NeXTSTEP-Complete", "Comment=Private complete NeXTSpirit and OpenStep overlay",
+             "Inherits=NeXTSTEP", f"Directories={','.join(directories)}", ""]
+    contexts = {"apps": "Applications", "places": "Places", "devices": "Devices",
+                "categories": "Categories", "private": "Applications"}
+    for directory in directories:
+        size_text, context = directory.split("/", 1)
+        size = int(size_text.split("x", 1)[0])
+        lines += [f"[{directory}]", f"Size={size}", "Type=Fixed",
+                  f"Context={contexts[context]}", ""]
+    (theme / "index.theme").write_text("\n".join(lines), encoding="utf-8")
+
+
+def build(args: argparse.Namespace) -> dict[str, object]:
+    openstep = args.openstep_archive.expanduser().resolve()
+    spirit = args.nextspirit_dmg.expanduser().resolve()
+    output = args.output_root.expanduser().resolve()
+    policy_path = args.manifest.expanduser().resolve()
+    decoder_path = args.decoder.expanduser().resolve()
+    repo = args.repo_root.expanduser().resolve()
+    if not SAFE_THEME.fullmatch(args.theme) or args.theme != "NeXTSTEP-Complete":
+        raise SystemExit("private theme must be the safe identity NeXTSTEP-Complete")
+    for candidate in (openstep, spirit, policy_path, decoder_path):
+        if not candidate.is_file():
+            raise SystemExit(f"required input missing: {candidate}")
+    if repo == output or repo in output.parents or output == Path.home() or output == Path("/"):
+        raise SystemExit(f"refusing public or broad output root: {output}")
+    if sha(openstep) != OPENSTEP_SHA or sha(spirit) != SPIRIT_SHA:
+        raise SystemExit("donor archive SHA-256 mismatch")
+    policy = json.loads(policy_path.read_text(encoding="utf-8"))
+    if policy["theme"] != {"name": args.theme, "inherits": "NeXTSTEP"}:
+        raise SystemExit("policy theme identity mismatch")
+    convert = find_convert(args.convert)
+    seven = shutil.which("7z")
+    if not seven:
+        raise SystemExit("7z is required to extract the private DMG")
+    decoder = load_decoder(decoder_path)
+
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if output.exists() and not (output / ".redstone-nextstep-private-output").is_file():
+        raise SystemExit(f"refusing unmanaged existing output root: {output}")
+    with tempfile.TemporaryDirectory(prefix=".nextstep-complete-", dir=output.parent) as temp_name:
+        built = Path(temp_name) / "output"
+        theme = built / args.theme
+        work = Path(temp_name) / "work"
+        theme.mkdir(parents=True)
+        work.mkdir()
+        safe_extract(openstep, work / "openstep")
+        run([seven, "x", "-y", f"-o{work / 'spirit'}", str(spirit)])
+        open_root = work / "openstep" / "openstepicons-1.1"
+        xpm_dir, tiff_dir = open_root / "icons.xpm", open_root / "icons.tiff"
+        spirit_files = sorted((p for p in (work / "spirit").rglob("*.icns")
+                               if ":" not in p.name), key=lambda p: p.name.casefold())
+        xpm_files = sorted(xpm_dir.glob("*.xpm"), key=lambda p: p.stem.casefold())
+        tiff_files = sorted(tiff_dir.glob("*.tiff"), key=lambda p: p.stem.casefold())
+        if (len(xpm_files), len(tiff_files), len(spirit_files)) != (380, 378, 28):
+            raise ValueError(f"inventory mismatch: XPM={len(xpm_files)} TIFF={len(tiff_files)} ICNS={len(spirit_files)}")
+
+        source_store = built / "source-material"
+        shutil.copytree(xpm_dir, source_store / "openstep" / "icons.xpm")
+        shutil.copytree(tiff_dir, source_store / "openstep" / "icons.tiff")
+        for doc in sorted(p for p in open_root.iterdir() if p.is_file()):
+            shutil.copy2(doc, source_store / "openstep" / doc.name)
+        (source_store / "nextspirit").mkdir(parents=True)
+        next_readmes = [p for p in (work / "spirit").rglob("README.txt") if ":" not in p.name]
+        if len(next_readmes) != 1:
+            raise ValueError(f"expected one NeXTSpirit README, found {len(next_readmes)}")
+        shutil.copy2(next_readmes[0], source_store / "nextspirit" / "README.txt")
+        for source in spirit_files:
+            shutil.copy2(source, source_store / "nextspirit" / source.name)
+
+        format_records, pair_records, open_primary = [], [], {}
+        xpm_cpp2 = xpm_transparent = equal_pairs = different_pairs = 0
+        tiff_by_stem = {p.stem: p for p in tiff_files}
+        open_ids = [stable("openstep-", path.stem) for path in xpm_files]
+        if len(set(open_ids)) != 380:
+            raise ValueError("OpenStep stable-name collision")
+        for xpm, base_id in zip(xpm_files, open_ids):
+            info = parse_xpm(xpm)
+            xpm_cpp2 += int(info["cpp"] == 2)
+            xpm_transparent += int(bool(info["transparent"]))
+            format_records.append({"donor": "openstep", "stem": xpm.stem, "format": "xpm",
+                                   "member": f"icons.xpm/{xpm.name}", "sha256": sha(xpm), **info})
+            tiff = tiff_by_stem.get(xpm.stem)
+            xpm_dims, xpm_rgba = rgba(convert, xpm)
+            equivalent = None
+            if tiff:
+                tiff_dims, tiff_rgba = rgba(convert, tiff)
+                equivalent = xpm_dims == tiff_dims and xpm_rgba == tiff_rgba
+                equal_pairs += int(equivalent); different_pairs += int(not equivalent)
+                format_records.append({"donor": "openstep", "stem": xpm.stem, "format": "tiff",
+                                       "member": f"icons.tiff/{tiff.name}", "sha256": sha(tiff),
+                                       "width": tiff_dims[0], "height": tiff_dims[1], "equivalent_to_xpm": equivalent})
+            pair_records.append({"stem": xpm.stem, "paired": tiff is not None, "equivalent": equivalent})
+            sources = [(xpm, f"{base_id}-xpm" if equivalent is False else base_id)]
+            if equivalent is False and tiff is not None:
+                sources.append((tiff, f"{base_id}-tiff"))
+            open_primary[xpm.stem] = sources[0][1]
+            for source, private_id in sources:
+                native = xpm_dims[0]
+                for size in SMALL:
+                    if size > native:
+                        continue
+                    convert_png(convert, source, theme / f"{size}x{size}/private/{private_id}.png",
+                                None if size == native else size, True)
+            if equivalent is False:
+                # Keep a stable logical identity while preserving both qualified renderings.
+                for size in SMALL:
+                    primary = theme / f"{size}x{size}/private/{open_primary[xpm.stem]}.png"
+                    if primary.is_file():
+                        logical = theme / f"{size}x{size}/private/{base_id}.png"
+                        logical.symlink_to(f"{open_primary[xpm.stem]}.png")
+
+        spirit_records, spirit_ids, spirit_map = [], [], {}
+        decoded_dir = work / "decoded"
+        for source in spirit_files:
+            stem = source.stem
+            private_id = stable("nextspirit-", stem)
+            spirit_ids.append(private_id); spirit_map[stem] = private_id
+            report = decoder.decode(source, decoded_dir / private_id, private_id)
+            elements = report["container"]["elements"]
+            spirit_records.append({"donor": "nextspirit", "stem": stem, "container": source.name,
+                                   "sha256": sha(source), "elements": elements,
+                                   "ic08_sha256": sha(decoded_dir / private_id / f"{private_id}-256.png"),
+                                   "ic09_sha256": sha(decoded_dir / private_id / f"{private_id}-512.png")})
+            for size in SPIRIT_SIZES:
+                native_source = decoded_dir / private_id / f"{private_id}-{size}.png"
+                if native_source.is_file():
+                    target = theme / f"{size}x{size}/private/{private_id}.png"
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(native_source, target)
+                elif size in (22, 24, 48):
+                    convert_png(convert, decoded_dir / private_id / f"{private_id}-512.png",
+                                theme / f"{size}x{size}/private/{private_id}.png", size, False)
+                else:
+                    raise ValueError(f"missing native NeXTSpirit tier {size}: {stem}")
+        if len(set(spirit_ids)) != 28:
+            raise ValueError("NeXTSpirit stable-name collision")
+
+        alias_records = []
+        for entry in policy["aliases"] + policy.get("extra_aliases", []):
+            context = entry.get("context") or entry["role"].split("/", 1)[0]
+            donor, stem = entry["donor"], entry["source"]
+            private_id = spirit_map[stem] if donor == "nextspirit" else open_primary[stem]
+            sizes = SPIRIT_SIZES if donor == "nextspirit" else SMALL
+            for name in entry["names"]:
+                for size in sizes:
+                    source_file = theme / f"{size}x{size}/private/{private_id}.png"
+                    if source_file.is_file() or source_file.is_symlink():
+                        link_alias(theme, size, context, name, private_id)
+                alias_records.append({"context": context, "name": name, "donor": donor,
+                                      "source": stem, "private_id": private_id,
+                                      "role": entry.get("role"), "priority": entry.get("priority", 1)})
+
+        directories = sorted(str(path.relative_to(theme)) for path in theme.glob("*x*/*") if path.is_dir())
+        write_index(theme, directories)
+        summary = {
+            "schema": 1, "theme": args.theme, "inherits": ["NeXTSTEP"],
+            "archives": {"openstep": {"filename": openstep.name, "sha256": sha(openstep)},
+                         "nextspirit": {"filename": spirit.name, "sha256": sha(spirit)}},
+            "counts": {"openstep_format_members": len(format_records), "openstep_stems": len(xpm_files),
+                       "openstep_pairs": len(tiff_files), "openstep_equal_pairs": equal_pairs,
+                       "openstep_different_pairs": different_pairs, "openstep_xpm_transparent": xpm_transparent,
+                       "openstep_xpm_opaque": len(xpm_files) - xpm_transparent, "openstep_xpm_cpp2": xpm_cpp2,
+                       "nextspirit_containers": len(spirit_records), "aliases": len(alias_records)},
+            "openstep_formats": format_records, "openstep_pairs": pair_records,
+            "nextspirit_containers": spirit_records, "aliases": alias_records,
+            "precedence": policy["precedence"], "directories": directories,
+        }
+        (built / "build-manifest.json").write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        (built / ".redstone-nextstep-private-output").write_text("NeXTSTEP-Complete private output\n", encoding="utf-8")
+        if output.exists():
+            shutil.rmtree(output)
+        built.rename(output)
+    return summary
+
+
+def main() -> int:
+    home = Path.home()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--openstep-archive", type=Path, required=True)
+    parser.add_argument("--nextspirit-dmg", type=Path, required=True)
+    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--theme", default="NeXTSTEP-Complete")
+    parser.add_argument("--repo-root", type=Path, default=home / "DotCortex")
+    parser.add_argument("--manifest", type=Path, default=home / ".config/redstone-9x/nextstep-private-icon-aliases.json")
+    parser.add_argument("--decoder", type=Path, default=home / ".local/libexec/redstone-9x/icns2png.py")
+    parser.add_argument("--convert")
+    args = parser.parse_args()
+    result = build(args)
+    print(json.dumps(result["counts"], sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
