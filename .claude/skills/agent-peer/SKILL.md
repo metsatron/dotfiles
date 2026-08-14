@@ -45,11 +45,17 @@ session identity. This command never creates a Git worktree.
 Worker-launch law (sealed 2026-08-11): never launch a worker as a bare
 `codex` or `claude` — a bare launch inherits the operator's CLI defaults
 (model AND permission mode), which is how a pilot worker came up on the wrong
-model in manual mode. Always pin the model explicitly in the peer-start argv,
-prefer the warm wrappers (`codex-warm`/`claude-warm`), and pass an intro file
-so the worker knows its role before envelopes arrive. Claude workers
-additionally pin `--permission-mode auto` (the ruled worker posture —
-`acceptEdits` still blocks every Bash call and is useless headless):
+model in manual mode. Always pin the model explicitly in the peer-start argv
+and pass an intro file so the worker knows its role before envelopes arrive.
+Claude workers additionally pin `--permission-mode auto` (the ruled worker
+posture — `acceptEdits` still blocks every Bash call and is useless headless).
+On Herdr 0.7.4 prefer the warm wrappers (`codex-warm`/`claude-warm`); on Herdr
+0.8.0+ `agent start` launches only the canonical executable for its kind, so a
+warm wrapper cannot be argv[0] — peer-start maps it to the canonical kind,
+passes the remaining pinned argv through, and reports the substitution in its
+output (2026-08-14 Honey bring-up). peer-start probes the resident Herdr and
+speaks the right dialect automatically; `--tab`/`--workspace` placement is
+0.7.4-only for now.
 
 ```bash
 agent-peer peer-start \
@@ -60,6 +66,16 @@ agent-peer peer-start \
   -- codex-warm --model gpt-5.6-luna -c model_reasoning_effort=high
 
 agent-peer inventory --session HERDR_SESSION
+```
+
+Cross-zone federation (2026-08-14): a destination's `--repo-root` names a path
+on the DESTINATION machine and is no longer resolved locally for a foreign
+host. For client-zone hosts whose reverse route is a forced-command pipe (or
+absent), drain their stuck replies from the trusted side over the existing
+forward route — repeated pulls are dedup-safe:
+
+```bash
+agent-peer pull CLIENT_HOST_ID
 ```
 
 ## Send a read-only message
