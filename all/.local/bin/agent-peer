@@ -295,18 +295,22 @@ def command_peer_start(
         if not intro_body:
             raise PeerError("intro file is empty")
     snapshot_for_session(herdr_session)
-    # Placement ruling (Mètsàtron, 2026-08-11): never land a worker as a
-    # horizontal split beside someone else's session. --tab splits DOWN in that
-    # tab; --workspace opens a new tab in the named space; with neither, a new
-    # workspace labelled after the agent is created so the worker has a space
-    # of its own.
-    placement: list[str]
+    start_style = herdr_start_style()
     created_workspace: str | None = None
-    if tab:
-        placement = ["--tab", tab, "--split", "down"]
-    elif workspace:
-        placement = ["--workspace", workspace]
-    else:
+    warm_note: str | None = None
+    if start_style == "pane":
+        # Herdr 0.8.0 dialect (2026-08-14 Honey bring-up): a worker needs an
+        # existing pane at a shell prompt, so the default lane creates a fresh
+        # labelled workspace (unfocused by default on 0.8.0 — --no-focus is
+        # gone, --focus is the opt-in) and anchors `agent start` to its root
+        # pane. The 2026-08-11 placement ruling still holds: the worker gets a
+        # space of its own; explicit --tab/--workspace placement has no proven
+        # pane-style recipe yet and refuses loudly rather than guessing.
+        if tab or workspace:
+            raise PeerError(
+                "herdr>=0.8 pane-style peer-start supports only the default "
+                "new-workspace placement for now; omit --tab/--workspace"
+            )
         created = run(
             [
                 herdr_binary(),
@@ -318,7 +322,6 @@ def command_peer_start(
                 str(root),
                 "--label",
                 agent_name,
-                "--no-focus",
             ],
             timeout=60,
         )
@@ -328,26 +331,88 @@ def command_peer_start(
         try:
             payload = json.loads(created.stdout)
             created_workspace = str(payload["result"]["workspace"]["workspace_id"])
+            root_pane = str(payload["result"]["root_pane"]["pane_id"])
         except (json.JSONDecodeError, KeyError, TypeError) as error:
             raise PeerError("Herdr workspace create returned an unsupported shape") from error
-        placement = ["--workspace", created_workspace]
-    result = run(
-        [
-            herdr_binary(),
-            "--session",
-            herdr_session,
-            "agent",
-            "start",
-            agent_name,
-            "--cwd",
-            str(root),
-            *placement,
-            "--no-focus",
-            "--",
-            *command,
-        ],
-        timeout=60,
-    )
+        kind = herdr_agent_kind(command[0])
+        agent_args = command[1:]
+        if pathlib.PurePosixPath(command[0]).name != kind:
+            warm_note = (
+                f"herdr>=0.8 launches the canonical {kind!r} executable; "
+                f"{command[0]!r} cannot wrap it under agent start"
+            )
+        result = run(
+            [
+                herdr_binary(),
+                "--session",
+                herdr_session,
+                "agent",
+                "start",
+                agent_name,
+                "--kind",
+                kind,
+                "--pane",
+                root_pane,
+                "--timeout",
+                "60000",
+                "--",
+                *agent_args,
+            ],
+            timeout=90,
+        )
+    else:
+        # Placement ruling (Mètsàtron, 2026-08-11): never land a worker as a
+        # horizontal split beside someone else's session. --tab splits DOWN in
+        # that tab; --workspace opens a new tab in the named space; with
+        # neither, a new workspace labelled after the agent is created so the
+        # worker has a space of its own.
+        placement: list[str]
+        if tab:
+            placement = ["--tab", tab, "--split", "down"]
+        elif workspace:
+            placement = ["--workspace", workspace]
+        else:
+            created = run(
+                [
+                    herdr_binary(),
+                    "--session",
+                    herdr_session,
+                    "workspace",
+                    "create",
+                    "--cwd",
+                    str(root),
+                    "--label",
+                    agent_name,
+                    "--no-focus",
+                ],
+                timeout=60,
+            )
+            if created.returncode != 0:
+                detail = (created.stderr or created.stdout).strip()
+                raise PeerError(f"Herdr could not create a workspace for the peer: {detail}")
+            try:
+                payload = json.loads(created.stdout)
+                created_workspace = str(payload["result"]["workspace"]["workspace_id"])
+            except (json.JSONDecodeError, KeyError, TypeError) as error:
+                raise PeerError("Herdr workspace create returned an unsupported shape") from error
+            placement = ["--workspace", created_workspace]
+        result = run(
+            [
+                herdr_binary(),
+                "--session",
+                herdr_session,
+                "agent",
+                "start",
+                agent_name,
+                "--cwd",
+                str(root),
+                *placement,
+                "--no-focus",
+                "--",
+                *command,
+            ],
+            timeout=60,
+        )
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise PeerError(f"Herdr could not start the peer: {detail}")
@@ -362,6 +427,8 @@ def command_peer_start(
             "cwd": str(root),
             "workspace": created_workspace or workspace,
             "tab": tab,
+            "start_style": start_style,
+            "warm_note": warm_note,
             "intro": intro_delivery,
             "next": "run agent-peer inventory, then register the exact endpoint",
             "herdr_output": result.stdout.strip() or None,
@@ -401,10 +468,36 @@ def inject_peer_intro(
             break
     if not pane_id:
         return {"delivered": False, "reason": "peer pane never appeared in the snapshot"}
+    if herdr_prompt_style() == "agent-prompt":
+        # Herdr 0.8.0: agent prompt --wait submits properly on its own — no
+        # bracketed-paste swallowing, no trailing-Enter workaround needed
+        # (verified live on the Honey worker, 2026-08-14).
+        submitted = run(
+            [
+                herdr_binary(),
+                "--session",
+                herdr_session,
+                "agent",
+                "prompt",
+                agent_name,
+                intro_body,
+                "--wait",
+            ],
+            timeout=180,
+        )
+        if submitted.returncode != 0:
+            detail = (submitted.stderr or submitted.stdout).strip()
+            return {"delivered": False, "reason": f"agent prompt failed: {detail}"}
+        return {
+            "delivered": True,
+            "adapter": "herdr-agent-prompt",
+            "pane_id": pane_id,
+            "ready_state": status,
+        }
     run([herdr_binary(), "--session", herdr_session, "pane", "run", pane_id, intro_body])
     time.sleep(1)
     run([herdr_binary(), "--session", herdr_session, "pane", "send-keys", pane_id, "Enter"])
-    return {"delivered": True, "pane_id": pane_id, "ready_state": status}
+    return {"delivered": True, "adapter": "herdr-pane-run", "pane_id": pane_id, "ready_state": status}
 
 
 def run(
@@ -434,6 +527,64 @@ def herdr_binary() -> str:
     if not binary:
         raise PeerError("herdr is not available")
     return binary
+
+
+# Herdr 0.8.0 (protocol 19) reshaped `agent start` (pane-anchored --kind/--pane)
+# and replaced `pane run`/`pane send-keys` with `agent prompt --wait` /
+# `agent send-keys` (2026-08-14 Honey bring-up). Capability is probed from the
+# resident binary's own --help so mixed-version fleets keep working; the env
+# overrides exist for tests and deliberate pins. Probe failure or an
+# unrecognized surface falls back to the legacy 0.7.4 dialect — the known-good
+# default, never a guess at the new one.
+def herdr_start_style() -> str:
+    configured = os.environ.get("AGENT_PEER_HERDR_STYLE")
+    if configured in {"pane", "cwd"}:
+        return configured
+    try:
+        probe = run([herdr_binary(), "agent", "start", "--help"], timeout=15)
+    except PeerError:
+        return "cwd"
+    text = f"{probe.stdout}\n{probe.stderr}"
+    return "pane" if "--pane" in text else "cwd"
+
+
+def herdr_prompt_style() -> str:
+    configured = os.environ.get("AGENT_PEER_HERDR_PROMPT")
+    if configured in {"agent-prompt", "pane-run"}:
+        return configured
+    try:
+        probe = run([herdr_binary(), "agent", "prompt", "--help"], timeout=15)
+    except PeerError:
+        return "pane-run"
+    text = f"{probe.stdout}\n{probe.stderr}"
+    return "agent-prompt" if probe.returncode == 0 and "--wait" in text else "pane-run"
+
+
+# Herdr 0.8.0 `agent start` launches the canonical executable for a supported
+# --kind; a wrapper (claude-warm/codex-warm) cannot be argv[0] there. The warm
+# wrappers therefore map to their canonical kind and the remaining argv rides
+# through as agent arguments; peer-start reports the substitution honestly.
+HERDR_AGENT_KINDS = {
+    "claude": "claude",
+    "claude-warm": "claude",
+    "codex": "codex",
+    "codex-warm": "codex",
+    "hermes": "hermes",
+    "pi": "pi",
+    "gemini": "gemini",
+    "opencode": "opencode",
+}
+
+
+def herdr_agent_kind(executable: str) -> str:
+    basename = pathlib.PurePosixPath(executable).name
+    kind = HERDR_AGENT_KINDS.get(basename)
+    if not kind:
+        supported = ", ".join(sorted(set(HERDR_AGENT_KINDS)))
+        raise PeerError(
+            f"cannot map {basename!r} to a Herdr agent kind; supported: {supported}"
+        )
+    return kind
 
 
 def ssh_binary() -> str:
@@ -572,6 +723,36 @@ def deliver_herdr(
         raise PeerError(
             f"Herdr target is {status!r} and did not reach idle within the ready gate; delivery aborted"
         )
+    agent_name = str(agent.get("name") or "")
+    if herdr_prompt_style() == "agent-prompt" and agent_name:
+        # Herdr 0.8.0 first-class submission (2026-08-14): agent prompt targets
+        # the agent by name and submits cleanly, so the bracketed-paste Enter
+        # workaround below is unnecessary on this dialect. Missing agent name
+        # in the snapshot falls through to the legacy pane lane.
+        result = run(
+            [
+                herdr_binary(),
+                "--session",
+                str(endpoint["herdr_session"]),
+                "agent",
+                "prompt",
+                agent_name,
+                prompt_for(envelope),
+                "--wait",
+            ],
+            timeout=180,
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            raise PeerError(f"Herdr rejected the prompt: {detail}")
+        return {
+            "adapter": "herdr-agent-prompt",
+            "herdr_session": endpoint["herdr_session"],
+            "pane_id": pane_id,
+            "agent_name": agent_name,
+            "agent_status_at_delivery": agent.get("agent_status"),
+            "ready_state": status,
+        }
     result = run(
         [
             herdr_binary(),
@@ -1054,7 +1235,25 @@ def compose_envelope(
     kind: str = "task",
     in_reply_to: str | None = None,
 ) -> dict[str, object]:
-    root = pathlib.Path(repo_root).expanduser().resolve(strict=True)
+    # Cross-zone fix (2026-08-14, first Honey peerbridge envelope): the
+    # workspace repo_root names a path on the DESTINATION machine. Same-host
+    # sends still strict-resolve it locally, and same-user fleet sends keep
+    # working because the shared-NFS paths exist on both ends — but a
+    # cross-zone sender (Honey -> t480s) has no such path, and resolving it
+    # locally aborted the send. For a foreign destination the sender validates
+    # shape only; the receive gate strict-resolves on the machine where the
+    # path is real.
+    from_host = from_peer.split("/", 1)[0]
+    to_host = to_peer.split("/", 1)[0]
+    if to_host == from_host:
+        root: object = pathlib.Path(repo_root).expanduser().resolve(strict=True)
+    else:
+        candidate = pathlib.PurePosixPath(repo_root)
+        if not candidate.is_absolute():
+            raise PeerError(
+                "cross-host repo_root must be an absolute path on the destination machine"
+            )
+        root = candidate
     scopes: set[str] = set()
     if access == "write":
         scopes.add("checkout-write")
@@ -1154,6 +1353,93 @@ def command_send(args: argparse.Namespace) -> int:
     )
     result = send_envelope(envelope)
     emit({"envelope": envelope, "receipt": result})
+    return 0
+
+
+def command_outbound_pending(dest_host: str) -> int:
+    # Pull-relay half A (2026-08-14): emit this host's transport-failed
+    # outbound envelopes destined for dest_host, one JSON object per line, so
+    # the destination can drain them over ITS OWN forward SSH route. Runs on
+    # the client-zone machine; prints envelopes only — no state mutation, no
+    # authority. receive() on the puller dedups by message_id, so repeated
+    # drains are harmless.
+    validate_component(dest_host, "dest_host")
+    read_registry()
+    directory = state_root() / "outbox"
+    if directory.is_dir():
+        for path in sorted(directory.glob("*.json")):
+            try:
+                record = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(record, dict) or record.get("state") != "failed":
+                continue
+            envelope = record.get("envelope")
+            if not isinstance(envelope, dict):
+                continue
+            destination = envelope.get("to")
+            if isinstance(destination, dict) and destination.get("host_id") == dest_host:
+                print(json.dumps(envelope, ensure_ascii=True))
+    return 0
+
+
+def command_pull(host_id: str) -> int:
+    # Pull-relay half B (2026-08-14): the trusted side reaches out over its
+    # existing forward SSH route, asks the remote agent-peer for envelopes
+    # stuck addressed to us, and feeds each through the LOCAL receive gate —
+    # every authority, accept_from, workspace, and lease check applies exactly
+    # as if the envelope had arrived by push. This is how a client zone
+    # (Honey) replies without holding any credential toward the fleet beyond
+    # the forced-command receive pipe — or with none at all.
+    registry = read_registry()
+    routes = registry["routes"]
+    assert isinstance(routes, dict)
+    route = routes.get(host_id)
+    if not isinstance(route, dict) or route.get("transport") != "ssh":
+        raise PeerError(f"no SSH route is registered for host {host_id}")
+    target = route.get("target")
+    if not isinstance(target, str) or not SAFE_REMOTE.fullmatch(target) or target.startswith("-"):
+        raise PeerError("registered SSH target is unsafe")
+    remote_command = os.environ.get("AGENT_PEER_REMOTE_COMMAND", "agent-peer")
+    if not SAFE_COMMAND.fullmatch(remote_command):
+        raise PeerError("AGENT_PEER_REMOTE_COMMAND is unsafe")
+    result = run(
+        [
+            ssh_binary(),
+            "--",
+            target,
+            remote_command,
+            "outbound-pending",
+            str(registry["local_host_id"]),
+        ],
+        timeout=60,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise PeerError(f"remote outbound-pending failed: {detail}")
+    pulled: list[dict[str, object]] = []
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            envelope = json.loads(line)
+        except json.JSONDecodeError:
+            pulled.append({"state": "unparseable", "raw_prefix": line[:80]})
+            continue
+        message_id = envelope.get("message_id") if isinstance(envelope, dict) else None
+        try:
+            receipt = receive_envelope(envelope)
+            pulled.append(
+                {
+                    "message_id": message_id,
+                    "state": receipt.get("state"),
+                    "duplicate": receipt.get("duplicate", False),
+                }
+            )
+        except PeerError as error:
+            pulled.append({"message_id": message_id, "state": "rejected", "error": str(error)})
+    emit({"host": host_id, "count": len(pulled), "pulled": pulled})
     return 0
 
 
@@ -1329,6 +1615,8 @@ def command_selftest() -> int:
                 "AGENT_PEER_REGISTRY_FILE",
                 "AGENT_PEER_STATE_DIR",
                 "AGENT_PEER_HERDR_BIN",
+                "AGENT_PEER_HERDR_STYLE",
+                "AGENT_PEER_HERDR_PROMPT",
                 "AGENT_PEER_SSH_BIN",
                 "AGENT_PEER_TEST_CAPTURE",
                 "AGENT_PEER_TEST_CALLS",
@@ -1355,7 +1643,8 @@ def command_selftest() -> int:
                 "{'value':'session-b'}}]}}}))\n"
                 "elif 'workspace' in args and 'create' in args:\n"
                 " print(json.dumps({'result': {'workspace':"
-                " {'workspace_id': 'ws-lab'}}}))\n"
+                " {'workspace_id': 'ws-lab'},"
+                " 'root_pane': {'pane_id': 'pane-lab'}}}))\n"
                 "elif 'agent' in args and 'start' in args:\n"
                 " pathlib.Path(os.environ['AGENT_PEER_TEST_CAPTURE']).write_text("
                 "json.dumps(args), encoding='utf-8')\n"
@@ -1369,6 +1658,11 @@ def command_selftest() -> int:
             )
             fake.chmod(0o755)
             os.environ["AGENT_PEER_HERDR_BIN"] = str(fake)
+            # Pin the herdr dialect so the legacy assertions stay deterministic
+            # regardless of which real herdr is installed; the pane-style test
+            # below flips these deliberately and restores them.
+            os.environ["AGENT_PEER_HERDR_STYLE"] = "cwd"
+            os.environ["AGENT_PEER_HERDR_PROMPT"] = "pane-run"
             os.environ["AGENT_PEER_TEST_CAPTURE"] = str(capture)
             registry = blank_registry("host-b")
             registry["routes"] = {"host-b": {"transport": "local"}}
@@ -1527,6 +1821,37 @@ def command_selftest() -> int:
                     "codex",
                 ],
             )
+            os.environ["AGENT_PEER_HERDR_STYLE"] = "pane"
+            with contextlib.redirect_stdout(io.StringIO()):
+                pane_code = command_peer_start(
+                    "peer-lab",
+                    "worker-pane",
+                    str(checkout),
+                    ["claude-warm", "--model", "claude-sonnet-5", "--permission-mode", "auto"],
+                )
+            pane_argv = json.loads(capture.read_text(encoding="utf-8"))
+            check(
+                "pane-style-peer-start",
+                pane_code == 0
+                and pane_argv[-14:]
+                == [
+                    "agent",
+                    "start",
+                    "worker-pane",
+                    "--kind",
+                    "claude",
+                    "--pane",
+                    "pane-lab",
+                    "--timeout",
+                    "60000",
+                    "--",
+                    "--model",
+                    "claude-sonnet-5",
+                    "--permission-mode",
+                    "auto",
+                ],
+            )
+            os.environ["AGENT_PEER_HERDR_STYLE"] = "cwd"
             mismatched_handoff = json.loads(json.dumps(handoff))
             mismatched_handoff["constraints"]["allow_git"] = "none"
             try:
@@ -1584,6 +1909,66 @@ def command_selftest() -> int:
             )
             remote_result = send_envelope(remote_envelope)
             check("ssh-noisy-receipt", remote_result.get("state") == "delivered")
+
+            # Cross-zone compose (2026-08-14 Honey finding): a foreign
+            # destination's repo_root need not exist on the sending machine.
+            foreign = compose_envelope(
+                from_peer="host-a/claude/session-a",
+                to_peer="host-zz/claude/far-away",
+                repo="fixture",
+                repo_root="/definitely/not/present/locally",
+                checkout_id="host-zz:fixture",
+                access="read",
+                body="Cross-zone compose fixture.",
+                handoff=None,
+                allow_git=False,
+                allow_push=False,
+                allow_pull=False,
+                lease_id=None,
+            )
+            check(
+                "cross-zone-compose",
+                foreign["workspace"]["repo_root"] == "/definitely/not/present/locally",
+            )
+            lock = ledger_lock()
+            try:
+                write_record("outbox", foreign, "failed", error="transport fixture")
+            finally:
+                lock.close()
+            pending_io = io.StringIO()
+            with contextlib.redirect_stdout(pending_io):
+                pending_code = command_outbound_pending("host-zz")
+            check(
+                "outbound-pending-lists-failed",
+                pending_code == 0 and str(foreign["message_id"]) in pending_io.getvalue(),
+            )
+            pull_source = json.loads(json.dumps(remote_envelope))
+            pull_source["message_id"] = str(uuid.uuid4())
+            pull_source["from"], pull_source["to"] = pull_source["to"], pull_source["from"]
+            pull_file = root / "pull-envelope.json"
+            pull_file.write_text(json.dumps(pull_source), encoding="utf-8")
+            fake_pull_ssh = root / "ssh-pull"
+            fake_pull_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                "if 'outbound-pending' in sys.argv:\n"
+                f" print(pathlib.Path({str(pull_file)!r}).read_text(encoding='utf-8'))\n"
+                "else:\n"
+                " raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            fake_pull_ssh.chmod(0o755)
+            os.environ["AGENT_PEER_SSH_BIN"] = str(fake_pull_ssh)
+            pull_io = io.StringIO()
+            with contextlib.redirect_stdout(pull_io):
+                pull_code = command_pull("host-b")
+            pull_report = json.loads(pull_io.getvalue())
+            check(
+                "pull-drains-remote-outbox",
+                pull_code == 0
+                and pull_report.get("count") == 1
+                and pull_report["pulled"][0].get("message_id") == pull_source["message_id"],
+            )
         finally:
             for key, value in old_env.items():
                 if value is None:
@@ -1659,6 +2044,10 @@ def build_parser() -> argparse.ArgumentParser:
     show.add_argument("message_id")
     sub.add_parser("status")
     sub.add_parser("selftest")
+    pending = sub.add_parser("outbound-pending")
+    pending.add_argument("dest_host")
+    pull = sub.add_parser("pull")
+    pull.add_argument("host_id")
 
     lease = sub.add_parser("lease-acquire")
     lease.add_argument(
@@ -1723,6 +2112,10 @@ def main() -> int:
             return command_status()
         if args.command == "selftest":
             return command_selftest()
+        if args.command == "outbound-pending":
+            return command_outbound_pending(args.dest_host)
+        if args.command == "pull":
+            return command_pull(args.host_id)
         if args.command == "lease-acquire":
             return command_lease_acquire(
                 args.scope, args.checkout_id, args.holder, args.ttl
