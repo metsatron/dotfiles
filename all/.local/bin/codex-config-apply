@@ -2,13 +2,15 @@
 # Codex live config apply
 # Codex keeps credentials, state, marketplace cache paths, and machine-local
 # project trust entries under =~/.codex=. DotCortex should not own that whole
-# tree. This helper patches only the declarative TUI status-line list, the
-# single DotCortex stow-target hook, and the minimal =codex-warm= lifecycle hooks
-# in the live private config. The hook source itself is public and tangled from
-# =agents-hooks.org=; only the private =~/.codex/hooks.json= registration is
-# applied here. Herdr's installed Codex session hook is deliberately removed:
-# identity and PTY-derived state belong to =codex-warm=, while these hooks only
-# notify its internal compaction state machine.
+# tree. This helper patches only the declarative TUI status-line list, the two
+# local HelmCortex MCP startup timeouts, the single DotCortex stow-target hook,
+# the workspace profile's network permission required by local async MCP stdio,
+# and the minimal =codex-warm= lifecycle hooks in the live private config. The
+# hook source itself is public and tangled from =agents-hooks.org=; only the
+# private =~/.codex/hooks.json= registration is applied here. Herdr's installed
+# Codex session hook is deliberately removed: identity and PTY-derived state
+# belong to =codex-warm=, while these hooks only notify its internal compaction
+# state machine.
 
 # Codex's =PreToolUse= hook sees Bash and unified =exec_command= calls. It runs
 # the same target guard as Claude Code and =safe-stow=, so a mismatched
@@ -47,9 +49,18 @@ apply_codex_stow_hook() {
 
   local idle_hook="${CODEX_IDLE_HOOK:-$HOME/.local/bin/codex-hook-idle-event}"
   [ -x "$idle_hook" ] || idle_hook="$HOME/DotCortex/all/.local/bin/codex-hook-idle-event"
+  local recall_hook="${CODEX_RECALL_HOOK:-$HOME/.local/bin/codex-hook-recall-context}"
+  [ -x "$recall_hook" ] || recall_hook="$HOME/DotCortex/all/.local/bin/codex-hook-recall-context"
 
-  jq --arg command "$guard_command" --arg idle_hook "$idle_hook" '
+  jq --arg command "$guard_command" --arg idle_hook "$idle_hook" --arg recall_hook "$recall_hook" '
     .hooks = (.hooks // {}) |
+    .hooks |= with_entries(
+      .value = [
+        .value[]?
+        | .hooks = [(.hooks[]? | select((.command // "") != $recall_hook))]
+        | select((.hooks | length) > 0)
+      ]
+    ) |
     # Remove the separate Herdr Codex lifecycle/session registration.  The
     # supervisor registers identity and derives visible state from PTY output;
     # this private hook must not compete with that ownership boundary.
@@ -82,19 +93,26 @@ apply_codex_stow_hook() {
     end |
 
     # Minimal lifecycle hooks for codex-warm internal idle-compaction state
-    def ensure_idle_hook($event; $idle_hook):
+    def ensure_idle_hook($event; $idle_hook; $timeout):
       .hooks[$event] = (.hooks[$event] // []) |
       if any(.hooks[$event][]?; any(.hooks[]?; .type == "command" and .command == $idle_hook))
-      then .
-      else .hooks[$event] += [{"hooks": [{"type": "command", "command": $idle_hook, "timeout": 5}]}]
+      then .hooks[$event] |= map(
+        .hooks |= map(
+          if .type == "command" and .command == $idle_hook
+          then .timeout = $timeout
+          else .
+          end
+        )
+      )
+      else .hooks[$event] += [{"hooks": [{"type": "command", "command": $idle_hook, "timeout": $timeout}]}]
       end;
 
-    ensure_idle_hook("Stop"; $idle_hook) |
-    ensure_idle_hook("PostCompact"; $idle_hook) |
-    ensure_idle_hook("UserPromptSubmit"; $idle_hook) |
-    ensure_idle_hook("PreCompact"; $idle_hook) |
-    ensure_idle_hook("SessionEnd"; $idle_hook) |
-    ensure_idle_hook("SessionStart"; $idle_hook)
+    ensure_idle_hook("Stop"; $idle_hook; 5) |
+    ensure_idle_hook("PostCompact"; $idle_hook; 5) |
+    ensure_idle_hook("UserPromptSubmit"; $idle_hook; 5) |
+    ensure_idle_hook("PreCompact"; $idle_hook; 5) |
+    ensure_idle_hook("SessionEnd"; $idle_hook; 3) |
+    ensure_idle_hook("SessionStart"; $idle_hook; 5)
   ' "$hooks_input" >"$hooks_new"
 
   if cmp -s "$hooks_new" "$hooks_config" 2>/dev/null; then
@@ -155,11 +173,13 @@ body="$(mktemp)"
 tmp="$(mktemp)"
 trap 'rm -f "$body" "$tmp"' EXIT
 
-awk -v desired="$desired" -v profile="$profile_name" '
+awk -v desired="$desired" -v profile="$profile_name" -v mcp_timeout="startup_timeout_sec = 60" '
   BEGIN {
     in_tui = 0
     seen_tui = 0
     wrote_status = 0
+    in_slow_mcp = 0
+    wrote_mcp_timeout = 0
     section = ""
     skip_section = 0
     pending_blanks = 0
@@ -183,8 +203,13 @@ awk -v desired="$desired" -v profile="$profile_name" '
       print desired
       wrote_status = 1
     }
+    if (in_slow_mcp && !wrote_mcp_timeout) {
+      print mcp_timeout
+      wrote_mcp_timeout = 1
+    }
 
     in_tui = 0
+    in_slow_mcp = 0
     if ($0 == "[sandbox_workspace_write]" || is_profile_section($0)) {
       section = $0
       skip_section = 1
@@ -195,6 +220,8 @@ awk -v desired="$desired" -v profile="$profile_name" '
     skip_section = 0
     section = $0
     in_tui = ($0 == "[tui]")
+    in_slow_mcp = ($0 == "[mcp_servers.recall]" || $0 == "[mcp_servers.timeark]")
+    wrote_mcp_timeout = 0
     if (in_tui) {
       seen_tui = 1
     }
@@ -223,6 +250,15 @@ awk -v desired="$desired" -v profile="$profile_name" '
     next
   }
 
+  in_slow_mcp && /^[[:space:]]*startup_timeout_sec[[:space:]]*=/ {
+    flush_blanks()
+    if (!wrote_mcp_timeout) {
+      print mcp_timeout
+      wrote_mcp_timeout = 1
+    }
+    next
+  }
+
   {
     flush_blanks()
     print
@@ -237,6 +273,9 @@ awk -v desired="$desired" -v profile="$profile_name" '
     } else if (in_tui && !wrote_status) {
       flush_blanks()
       print desired
+    }
+    if (in_slow_mcp && !wrote_mcp_timeout) {
+      print mcp_timeout
     }
   }
 ' "$config" >"$body"
@@ -254,6 +293,9 @@ awk -v desired="$desired" -v profile="$profile_name" '
       printf '%s = true\n' "$(toml_quote "$existing_root")"
     done
   fi
+
+  printf '\n[permissions.%s.network]\n' "$profile_name"
+  printf 'enabled = true\n'
 
   printf '\n[permissions.%s.filesystem]\n' "$profile_name"
   printf '%s = "write"\n' "$(toml_quote "$dotcortex_root/.codex")"

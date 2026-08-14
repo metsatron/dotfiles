@@ -174,6 +174,10 @@
    "seahorse"
    "yad"
    "zenity"
+   ;; Phone/desktop integration.  The daemon is activated on Cortex's private
+   ;; XFCE D-Bus session; its identity and pairing state therefore remain in
+   ;; the sanctuary guest home rather than leaking into the host session.
+   "kdeconnect"
    ;; --- CLI tools (X230 nala surface) ---
    "mc"
    "vim"

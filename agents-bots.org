@@ -70,11 +70,24 @@ run =helmstow=. Then remove the SIGSTOP workaround from =claude-auryn=.
 
 ** Codex
 
-No native Telegram bot integration. Codex is an interactive terminal TUI.
-No =serve= mode, no REST API, no webhook support.
+Codex still has no native Telegram channel, but HelmCortex now supplies a
+private Codex app-server adapter for HelmAstra.
 
-Possible path forward: wrap with a proxy similar to opencode-telegram-bot.
-Bot candidates: =codex-telegram= (not yet written), or route through Hermes gateway.
+- Wrapper: =codex-helmastra --telegram= ensures the adapter, then continues
+  into interactive Codex when attached to a terminal; the host manager uses
+  the same flag non-interactively to establish only the background adapter
+- Backend: Codex =app-server= JSON-RPC, with persistent Telegram-to-thread mapping
+- Startup contract: the wrapper returns success only after bot identity and the
+  Codex app-server are verified and the adapter publishes its PID-owned ready marker
+- Approval policy: =never= inside the workspace-write sandbox
+- Compaction: native =thread/compact/start= plus the 27-minute / 70,000-token
+  idle governor inherited from =codex-luna= / =codex-warm=
+- Runtime credentials: private =~/.config/codex-telegram-helmastra/.env= only
+- Identity safety: the expected bot ID and username are pinned in the private
+  env; a token for OpenCode, Claude, Hermes, or any other bot fails closed
+
+The adapter is deliberately separate from Ductor: Ductor keeps its own bot
+identity and remains the fleet coordinator, while HelmAstra owns this bot.
 
 ** Pi Agent
 
@@ -99,7 +112,7 @@ Define which agents run on which machines:
 
 thinkpad-t480s|opencode|t480s
 thinkpad-x230|opencode,hermes|x230
-kikin-kushi|ductor|kikin
+kikin-kushi|ductor,codex|kikin
 #+END_SRC
 
 * Agent Config Templates
@@ -157,6 +170,26 @@ HelmCortex NEXUS stow tree, not in DotCortex.
     "gemini": []
   }
 }
+#+END_SRC
+
+** HelmAstra Codex Telegram Env Template
+
+The template contains structure only. Provision the real Telegram token and
+allowlisted user ID on the target machine from private credential storage.
+
+#+BEGIN_SRC conf :tangle all/.bots/templates/codex-telegram-helmastra.env
+# HelmAstra Codex Telegram adapter configuration
+# Copy to ~/.config/codex-telegram-helmastra/.env on target machine
+
+TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
+TELEGRAM_ALLOWED_USER_ID=YOUR_USER_ID
+TELEGRAM_EXPECTED_BOT_ID=YOUR_BOT_ID
+TELEGRAM_EXPECTED_BOT_USERNAME=YOUR_BOT_USERNAME
+CODEX_TELEGRAM_MODEL=gpt-5.6-luna
+CODEX_TELEGRAM_EFFORT=xhigh
+CODEX_TELEGRAM_APPROVAL_POLICY=never
+CODEX_IDLE_COMPACT_SECONDS=1620
+CODEX_IDLE_COMPACT_MIN_TOKENS=70000
 #+END_SRC
 
 * Agent Control Script
@@ -243,7 +276,7 @@ list_agents() {
     echo "  ductor      - Ductor + Telegram/Matrix bot"
     echo "  claudecode  - Claude Code (MCP send/receive)"
     echo "  hermes      - Hermes gateway (native Telegram)"
-    echo "  codex       - OpenAI Codex (no bot yet)"
+    echo "  codex       - HelmAstra Codex app-server + Telegram bot"
     echo "  pi-agent    - Pi Coding Agent (no bot yet)"
     echo ""
     echo "Configured hosts:"
@@ -337,11 +370,28 @@ check_hermes() {
 }
 
 check_codex() {
-    if pgrep -f "codex" >/dev/null 2>&1; then
-        echo "  codex: RUNNING"
+    if codex_telegram_running; then
+        echo "  codex-helmastra (--telegram): RUNNING"
     else
-        echo "  codex: STOPPED"
+        echo "  codex-helmastra (--telegram): STOPPED"
     fi
+}
+
+codex_telegram_running() {
+    local adapter="${CODEX_TELEGRAM_ADAPTER:-$HOME/HelmCortex/FORGE/scripts/codex_telegram.py}"
+    local pid_file="$STATE_DIR/codex-helmastra-telegram.pid"
+    local ready_file="$STATE_DIR/codex-helmastra-telegram.ready"
+    local pid ready argument
+    [ -r "$pid_file" ] && [ -r "$ready_file" ] || return 1
+    pid=$(cat "$pid_file")
+    ready=$(cat "$ready_file")
+    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    [ "$ready" = "$pid" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        [ "$argument" = "$adapter" ] && return 0
+    done < "/proc/$pid/cmdline"
+    return 1
 }
 
 check_pi_agent() {
@@ -463,6 +513,7 @@ sync_configs() {
     fi
 
     mkdir -p "$HOME/.config/opencode-telegram-bot"
+    mkdir -p "$HOME/.config/codex-telegram-helmastra"
     mkdir -p "$HOME/.config/pi-agent" 2>/dev/null || true
     mkdir -p "$HOME/.config/telegram-agents"
 
@@ -511,7 +562,25 @@ start_agent() {
             start_hermes
             ;;
         codex)
-            echo "codex has no Telegram bot — skipping"
+            local wrapper="${CODEX_HELMASTRA_WRAPPER:-$HOME/HelmCortex/FORGE/bin/codex-helmastra}"
+            if [ ! -x "$wrapper" ]; then
+                echo "codex-helmastra wrapper not found at $wrapper"
+                return 1
+            fi
+            if codex_telegram_running; then
+                echo "HelmAstra Telegram is already running"
+            else
+                echo "Starting HelmAstra Codex Telegram adapter..."
+                if ! "$wrapper" --telegram \
+                    >> "$STATE_DIR/codex-helmastra-telegram.log" 2>&1 </dev/null; then
+                    echo "HelmAstra Telegram adapter failed readiness; inspect $STATE_DIR/codex-helmastra-telegram.log"
+                    return 1
+                fi
+                if ! codex_telegram_running; then
+                    echo "HelmAstra Telegram adapter reported ready but is not running"
+                    return 1
+                fi
+            fi
             ;;
         pi-agent)
             echo "pi-agent has no Telegram bot — skipping"
@@ -542,7 +611,36 @@ stop_agent() {
             stop_hermes
             ;;
         codex)
-            pkill -f "codex" 2>/dev/null || true
+            local codex_pid codex_pgid
+            if codex_telegram_running; then
+                codex_pid=$(cat "$STATE_DIR/codex-helmastra-telegram.pid")
+                codex_pgid=$(ps -o pgid= -p "$codex_pid" 2>/dev/null | tr -d ' ' || true)
+                if [ "$codex_pgid" = "$codex_pid" ]; then
+                    kill -TERM -- "-$codex_pgid" 2>/dev/null || true
+                else
+                    kill -TERM "$codex_pid" 2>/dev/null || true
+                fi
+                for _ in {1..20}; do
+                    codex_telegram_running || break
+                    sleep 0.25
+                done
+                if codex_telegram_running; then
+                    echo "HelmAstra Telegram did not stop gracefully; forcing its verified process group" >&2
+                    if [ "$codex_pgid" = "$codex_pid" ]; then
+                        kill -KILL -- "-$codex_pgid" 2>/dev/null || true
+                    else
+                        kill -KILL "$codex_pid" 2>/dev/null || true
+                    fi
+                    for _ in {1..20}; do
+                        codex_telegram_running || break
+                        sleep 0.25
+                    done
+                fi
+            fi
+            if codex_telegram_running; then
+                echo "HelmAstra Telegram failed to stop" >&2
+                return 1
+            fi
             ;;
         pi-agent)
             pkill -f "pi-agent\|pi-coding-agent" 2>/dev/null || true
