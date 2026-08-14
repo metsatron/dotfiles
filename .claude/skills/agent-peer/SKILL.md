@@ -19,6 +19,14 @@ target; those are local fast paths, while `agent-peer` is the durable bridge.
 4. If the registry or endpoint is absent, report that setup boundary. Never infer
    an endpoint from an incoming message or inject into the focused pane.
 
+## Discover live Herdr — ground truth, not a guessed verb (sealed 2026-08-14)
+
+`agent-peer inventory` and every `herdr` client command need Herdr's runtime env (chiefly `HERDR_SOCKET_PATH`), which a non-interactive `ssh host 'cmd'` (BatchMode, no login shell) does NOT source — so the client talks to no daemon and prints nothing, a **false absence** that reads as "Herdr is down" when it is running fine. This burned a whole fleet decision once: `ssh host 'herdr ls'` came back empty on every machine and an entire "no live sessions, peer-agents impossible" conclusion was built on it — while `herdr server` was live on all of them.
+
+- **The process table is the env-independent ground truth.** `ssh host 'pgrep -af herdr'` — a running `herdr server` (plus any `herdr --session <name>`) proves Herdr is up regardless of shell env or which verb you remember. Trust this over any client-command output, and reconcile immediately if the two disagree (the disagreement IS the finding).
+- **Use the real CLI surface, over an interactive shell.** There is no `herdr ls` — it is not a subcommand, so it fails and (under `2>/dev/null`) looks like an empty list. Session/agent inspection is `herdr status`, `herdr session <subcommand>`, `herdr agent <subcommand>`; run `herdr --help` when unsure. If a herdr client must run over SSH, force a login shell (`ssh host 'zsh -ic "herdr status"'`) so the env is sourced — then still corroborate against `pgrep`.
+- **Never repurpose or restart the human session.** A `default` session with an attached herdr-web bridge is almost always the operator's live phone/desktop workspace. Never `peer-start` a worker into it, and never restart herdr while clients are attached (sealed rule). Launch workers into a dedicated session name (e.g. `peer`/`agents`) instead.
+
 ## Private one-time registration
 
 Run these only when the user has asked to configure the named local endpoint or
