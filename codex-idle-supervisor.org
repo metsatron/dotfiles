@@ -104,6 +104,9 @@ DEBUG_LOG_MAX_BYTES = env_int(
     "CODEX_IDLE_DEBUG_MAX_BYTES", 2 * 1024 * 1024, 65536
 )
 DEBUG = os.environ.get("CODEX_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
+COMPACTION_TIMEOUT_SECONDS = env_float(
+    "CODEX_IDLE_COMPACTION_TIMEOUT_SECONDS", 5 * 60, 1.0
+)
 TERMINAL_CLEANUP_BYTES = (
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
     b"\x1b[?1005l\x1b[?1006l\x1b[?1015l"
@@ -691,6 +694,45 @@ class Supervisor:
         )
         self._write_state()
 
+    def _recover_compaction(self, reason: str) -> None:
+        """Clear a missing PostCompact and re-arm from a safe idle point."""
+        if not self.compacting:
+            return
+        self._compaction_failed(reason)
+        current = now()
+        self.status = "idle"
+        self.last_normal_stop = current
+        self.last_lifecycle_activity = current
+        self.last_local_input = None
+        # The failure is already being handled at the Stop/timeout boundary;
+        # do not consume the next genuine turn's Stop hook as a late failure.
+        self.compaction_ignore_next_stop = False
+        self.cancel("compaction-recovered")
+        self.arm()
+        self.last_state_transition = "compaction-recovered"
+        self._debug(
+            f"compaction-recovered channel={short_id(self.channel)} reason={reason}"
+        )
+        self._write_state()
+
+    def _check_compaction_timeout(self) -> None:
+        if not self.compacting or not self.compaction_requested_at:
+            return
+        if now() - self.compaction_requested_at < COMPACTION_TIMEOUT_SECONDS:
+            return
+        # A visible spinner means Codex may still be compacting. Keep the
+        # request pending and let its lifecycle hooks finish rather than
+        # injecting a second command into an active TUI turn.
+        if self.screen_state == "working":
+            self.compaction_requested_at = now()
+            self.last_state_transition = "compaction-timeout-working"
+            self._debug(
+                f"compaction-timeout-working channel={short_id(self.channel)}"
+            )
+            self._write_state()
+            return
+        self._recover_compaction("timeout")
+
     def _install_terminal(self) -> None:
         fd = sys.stdin.fileno()
         is_terminal = os.isatty(fd)
@@ -936,12 +978,15 @@ class Supervisor:
             if self.compaction_ignore_next_stop:
                 self.compaction_ignore_next_stop = False
                 self.status = "idle"
+                self.dirty = True
+                self.last_normal_stop = current
                 self.last_lifecycle_activity = current
+                self.last_local_input = None
                 self.cancel("compaction-failed-stop")
+                self.arm()
                 return {"ok": True, "ignored": "compaction-failed-stop"}
             if self.compacting:
-                self.status = "idle"
-                self.cancel("compaction-stop")
+                self._recover_compaction("stop")
                 return {"ok": True, "ignored": "compaction-stop"}
             if (
                 self.last_normal_stop
@@ -1142,6 +1187,7 @@ class Supervisor:
                 child_exited = self._child_has_exited()
                 self.herdr.heartbeat(self.screen_state, self.session_id)
                 self._flush_input_classifier()
+                self._check_compaction_timeout()
                 if self.timer_deadline is not None and now() >= self.timer_deadline:
                     generation = self.timer_generation
                     kind = self.timer_kind
@@ -1283,6 +1329,7 @@ def main(argv: list[str]) -> int:
         print("Environment: CODEX_IDLE_COMPACTION_DEBUG,")
         print("CODEX_IDLE_COMPACT_SECONDS, CODEX_IDLE_COMPACT_TTL_SECONDS,")
         print("CODEX_IDLE_COMPACT_MIN_TOKENS,")
+        print("CODEX_IDLE_COMPACTION_TIMEOUT_SECONDS,")
         print("CODEX_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS,")
         print("CODEX_WARM_HERDR_AGENT, CODEX_WARM_HERDR_HEARTBEAT_SECONDS,")
         print("CODEX_WARM_HERDR_REGISTRATION_TTL_MS")
