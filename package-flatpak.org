@@ -318,6 +318,13 @@ run_args=()
 if [[ -n "${DISPLAY:-}" ]]; then
   run_args+=("--socket=x11" "--env=DISPLAY=${DISPLAY}")
 fi
+# An Xpra display needs both its X11 socket and the matching MIT-MAGIC-COOKIE.
+# The host home is visible in the Distrobox, but the nested Flatpak sandbox is
+# not allowed to read the authority file unless this exact path is granted.
+# Keep the grant read-only and narrow: never expose the host Xauthority tree.
+if [[ -n "${XAUTHORITY:-}" && -r "${XAUTHORITY}" ]]; then
+  run_args+=("--env=XAUTHORITY=${XAUTHORITY}" "--filesystem=${XAUTHORITY}:ro")
+fi
 for root_name in Games RetroPie Applications; do
   add_shared_root_args "$root_name"
 done
@@ -404,6 +411,14 @@ flatpak_args=()
 app_args=()
 before_separator=1
 for arg in "$@"; do
+  # Flatpak desktop files commonly spell the default app command as
+  # --command=. Passing that empty value through to `flatpak run` makes
+  # bubblewrap try to exec an empty filename. The default command is already
+  # selected by the application ID, so omit only the empty form and preserve
+  # real --command=/path values.
+  if [[ "$arg" = "--command=" ]]; then
+    continue
+  fi
   if [[ "$arg" = "--" && "$before_separator" -eq 1 ]]; then
     before_separator=0
     continue
@@ -414,6 +429,40 @@ for arg in "$@"; do
     app_args+=("$arg")
   fi
 done
+
+# Obsidian's Terminal plugin runs inside the Flatpak but its interactive shell
+# belongs to the sanctuary guest home.  Expose only the fleet wrapper file and
+# grant only flatpak-spawn's host-launch bus name.  The lane registry supplies
+# the matching vault, so Cortex, Redstone 9X, and Redstone NT all converge the
+# same plugin profile without embedding machine-specific paths here.
+if [[ "${app_id}" = "md.obsidian.Obsidian" || \
+      "${app_id}" = "com.tiagopires.ObsidianRedstone" ]]; then
+  obsidian_terminal_wrapper="${HOME}/.local/bin/obsidian-host-zsh"
+  if [[ -x "${obsidian_terminal_wrapper}" ]]; then
+    run_args+=(
+      "--filesystem=${obsidian_terminal_wrapper}:ro"
+      "--talk-name=org.freedesktop.Flatpak"
+    )
+  fi
+
+  obsidian_lane_env="${XDG_CONFIG_HOME}/dotcortex/capture-lane.env"
+  obsidian_terminal_bridge="${HOME}/.local/bin/flatpak-obsidian-terminal-bridge"
+  if [[ -r "${obsidian_lane_env}" && -x "${obsidian_terminal_bridge}" ]]; then
+    # shellcheck disable=SC1090
+    . "${obsidian_lane_env}"
+    if [[ "${CAPTURE_LANE_OBSIDIAN_APP_ID:-}" = "${app_id}" &&
+          -d "${CAPTURE_LANE_VAULT_PATH:-}" ]]; then
+      if ! OBSIDIAN_APP_ID="${app_id}" \
+          OBSIDIAN_VAULT="${CAPTURE_LANE_VAULT_PATH}" \
+          OBSIDIAN_HOST_ZSH="${obsidian_terminal_wrapper}" \
+          GUIX_ZSH="${HOME}/.guix-extra-profiles/core/core/bin/zsh" \
+          FLATPAK_BIN="${flatpak_bin}" \
+          "${obsidian_terminal_bridge}"; then
+        echo "sanctuary-flatpak-run: Obsidian terminal bridge did not converge" >&2
+      fi
+    fi
+  fi
+fi
 
 if [[ "${app_id}" = "org.garudalinux.firedragon" ]]; then
   firedragon_profile_link="${SANCTUARY_CORTEX_PROFILE_LINK:-${HOME}/.config/sanctuary/cortex-firefox-profile}"
@@ -455,13 +504,15 @@ if [[ "${app_id}" = "md.obsidian.Obsidian" &&
   run_args+=("--filesystem=${obsidian_vault}")
 
   # The nested Flatpak cannot mount the host document portal's FUSE tree, so
-  # its folder picker falls back to Quick Start.  Open the registered private
-  # vault directly instead.  Preserve an explicit vault selector for CLI,
-  # URI, and test invocations that already provide one.
+  # its folder picker falls back to Quick Start.  A bare menu launch therefore
+  # opens the registered private vault directly.  An obsidian:// URI is already
+  # a complete transport envelope whose vault= query selects the vault; never
+  # combine it with the CLI --vault selector, because Obsidian interprets the
+  # mixed forms as a second vault/session launch.
   has_vault_arg=0
   for arg in "${app_args[@]}"; do
     case "${arg}" in
-      --vault|--vault=*|vault=*) has_vault_arg=1 ;;
+      --vault|--vault=*|vault=*|obsidian://*) has_vault_arg=1 ;;
     esac
   done
   if [[ "${has_vault_arg}" -eq 0 ]]; then
@@ -547,10 +598,35 @@ if [[ "${app_id}" = "org.keepassxc.KeePassXC" &&
   fi
 fi
 
+if [[ "${app_id}" = "com.snes9x.Snes9x" ]]; then
+  # Snes9X is a non-Lutris Flatpak running on the sanctuary-private bus. Give
+  # it the same GTK3 theme and icon search roots as the Redstone desktop. The
+  # GTK settings file alone is not enough: Flatpak otherwise hides the guest
+  # theme and icon directories and falls back to Adwaita.
+  snes9x_theme="$(sed -n 's/^gtk-theme-name=//p' \
+    "${HOME}/.config/gtk-3.0/settings.ini" 2>/dev/null | head -n 1)"
+  snes9x_icons="$(sed -n 's/^gtk-icon-theme-name=//p' \
+    "${HOME}/.config/gtk-3.0/settings.ini" 2>/dev/null | head -n 1)"
+  run_args+=(
+    "--filesystem=${HOME}/.config/gtk-3.0:ro"
+    "--filesystem=${HOME}/.themes:ro"
+    "--filesystem=${HOME}/.local/share/icons:ro"
+    "--filesystem=${HOME}/.icons:ro"
+    "--env=GTK_CSD=0"
+    "--env=GTK_OVERLAY_SCROLLING=0"
+  )
+  [[ -n "${snes9x_theme}" ]] && run_args+=("--env=GTK_THEME=${snes9x_theme}")
+  [[ -n "${snes9x_icons}" ]] && run_args+=("--env=GTK_ICON_THEME=${snes9x_icons}")
+fi
+
 # Every repo-backed sanctuary Flatpak is declared at user scope.  Pin the run
 # installation too: without --user Flatpak may pair the user app with a system
 # runtime under /run/host, which breaks Electron/Zypak's nested sandbox mounts.
-exec "${flatpak_bin}" run --user "${run_args[@]}" "${flatpak_args[@]}" "${app_id}" "${app_args[@]}"
+flatpak_command=("${flatpak_bin}" run --user "${run_args[@]}" "${flatpak_args[@]}" "${app_id}" "${app_args[@]}")
+if [[ "${app_id}" = "com.snes9x.Snes9x" ]] && command -v gamemoderun >/dev/null 2>&1; then
+  exec gamemoderun "${flatpak_command[@]}"
+fi
+exec "${flatpak_command[@]}"
 #+END_SRC
 
 * Flatpak release bundle manifest
@@ -1550,6 +1626,15 @@ apply_app(){
     printf '%s\n' "$flag"
   done > "/tmp/.fpflags.$app"
 
+  # FireDragon is crossing from the old X230 launcher to the T1700 profile.
+  # Its historical override accumulated host-etc, reserved font paths, and
+  # the old X230 profile mount.  Reset only this app's override so the
+  # declared perms block below becomes authoritative again; other Flatpak
+  # applications and all profile data remain untouched.
+  if [[ "$app" = "org.garudalinux.firedragon" ]]; then
+    "${CLEAN_ENV[@]}" flatpak override --user --reset "$app"
+  fi
+
   # Apply at user scope
   if [ -s "/tmp/.fpflags.$app" ]; then
     mapfile -t FLAGS < "/tmp/.fpflags.$app"
@@ -1899,12 +1984,13 @@ exec /usr/bin/flatpak-spawn --host \
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_ID="md.obsidian.Obsidian"
+APP_ID="${OBSIDIAN_APP_ID:-md.obsidian.Obsidian}"
 VAULT_DIR="${OBSIDIAN_VAULT:-$HOME/HelmCortex}"
 WRAPPER_PATH="${OBSIDIAN_HOST_ZSH:-$HOME/.local/bin/obsidian-host-zsh}"
 REPO_WRAPPER_PATH="$HOME/DotCortex/linux/.local/bin/obsidian-host-zsh"
 HOST_SPAWN_TARGET="${HOST_SPAWN_TARGET:-$HOME/.local/bin/host-spawn}"
 GUIX_ZSH="${GUIX_ZSH:-$HOME/.guix-extra-profiles/core/core/bin/zsh}"
+FLATPAK_BIN="${FLATPAK_BIN:-flatpak}"
 PYTHON_PATH="$VAULT_DIR/CORE/anaconda3/bin/python3"
 PLUGIN_DATA="$VAULT_DIR/.obsidian/plugins/terminal/data.json"
 WORKSPACE_JSON="$VAULT_DIR/.obsidian/workspace.json"
@@ -1952,9 +2038,12 @@ ensure_wrapper
   exit 1
 }
 
-ensure_host_spawn
+case "$HOME" in
+  */.local/share/dotcortex/guests/*/home) ;;
+  *) ensure_host_spawn ;;
+esac
 
-flatpak override --user --talk-name=org.freedesktop.Flatpak "$APP_ID"
+"$FLATPAK_BIN" override --user --talk-name=org.freedesktop.Flatpak "$APP_ID"
 
 [ -f "$PLUGIN_DATA" ] || {
   printf 'skip Obsidian bridge: terminal plugin config not found at %s\n' "$PLUGIN_DATA"
@@ -1962,9 +2051,14 @@ flatpak override --user --talk-name=org.freedesktop.Flatpak "$APP_ID"
 }
 
 python3 - "$PLUGIN_DATA" "$WORKSPACE_JSON" "$WRAPPER_PATH" "$GUIX_ZSH" "$PYTHON_PATH" <<'PY'
+import copy
+import datetime
 import json
+import os
 import pathlib
+import shutil
 import sys
+import tempfile
 
 plugin_data = pathlib.Path(sys.argv[1])
 workspace_json = pathlib.Path(sys.argv[2])
@@ -1978,13 +2072,30 @@ def load_json(path: pathlib.Path):
         return json.load(fh)
 
 
-def dump_json(path: pathlib.Path, data):
-    path.write_text(json.dumps(data, indent=2) + "\n")
+def dump_json(path: pathlib.Path, data, previous):
+    if data == previous:
+        return False
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    backup = path.with_name(f"{path.name}.backup-{stamp}")
+    shutil.copy2(path, backup)
+    mode = path.stat().st_mode
+    rendered = json.dumps(data, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent,
+        prefix=f".{path.name}.", delete=False
+    ) as handle:
+        handle.write(rendered)
+        temporary = pathlib.Path(handle.name)
+    os.chmod(temporary, mode)
+    os.replace(temporary, path)
+    print(f"Updated {path}; backup={backup}")
+    return True
 
 
 desired_profile = {
     "args": [],
     "executable": wrapper,
+    "followTheme": True,
     "name": "Guix zsh (host)",
     "platforms": {"darwin": False, "linux": True},
     "pythonExecutable": python_path,
@@ -1997,8 +2108,12 @@ desired_profile = {
 }
 
 plugin = load_json(plugin_data)
+plugin_previous = copy.deepcopy(plugin)
 profiles = plugin.setdefault("profiles", {})
 profiles["dotcortexHostZsh"] = desired_profile
+plugin["defaultProfile"] = "dotcortexHostZsh"
+plugin["exposeInternalModules"] = True
+plugin["interceptLogging"] = True
 
 for key, profile in list(profiles.items()):
     if not isinstance(profile, dict):
@@ -2015,10 +2130,11 @@ for key, profile in list(profiles.items()):
         updated["platforms"] = profile.get("platforms", desired_profile["platforms"])
         profiles[key] = updated
 
-dump_json(plugin_data, plugin)
+dump_json(plugin_data, plugin, plugin_previous)
 
 if workspace_json.exists():
     workspace = load_json(workspace_json)
+    workspace_previous = copy.deepcopy(workspace)
 
     def visit(node):
         if isinstance(node, dict):
@@ -2038,11 +2154,7 @@ if workspace_json.exists():
                 visit(item)
 
     visit(workspace)
-    dump_json(workspace_json, workspace)
-
-print(f"Updated {plugin_data}")
-if workspace_json.exists():
-    print(f"Updated {workspace_json}")
+    dump_json(workspace_json, workspace, workspace_previous)
 PY
 
 printf 'Obsidian terminal bridge ready for %s\n' "$VAULT_DIR"
@@ -2515,31 +2627,28 @@ exec flatpak run "$APP_ID"
 #+END_SRC
 
 * Desktop launchers
-#+BEGIN_SRC bash :tangle linux/.local/bin/firedragon-x230 :mkdirp yes :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+#+BEGIN_SRC bash :tangle linux/.local/bin/firedragon-t1700 :mkdirp yes :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ -x "$HOME/.local/bin/ssh-agent-ensure" ]; then
-    eval "$("$HOME/.local/bin/ssh-agent-ensure" --print)"
-fi
-
-MOUNT_POINT="$HOME/mnt/x230"
-X230_HOST="${X230_SSH_HOST:-x230}"
-REMOTE_HOME="${X230_REMOTE_HOME:-/home/metsatron}"
-PROFILE_PATH="$MOUNT_POINT/.firedragon/flatpak-migrate"
-
-mkdir -p "$MOUNT_POINT"
+# Preserve the original X230 launcher contract: the client uses its local
+# FireDragon Flatpak, while the browser profile is read from the target
+# machine's NFS-mounted home.  The transport is provisioned by the machine's
+# NFS/autofs configuration; this launcher does not silently substitute a
+# sanctuary or a local profile.
+MOUNT_POINT="${FIREDRAGON_T1700_MOUNT:-$HOME/mnt/t1700}"
+PROFILE_PATH="${FIREDRAGON_T1700_PROFILE:-$MOUNT_POINT/HelmCortex/NEXUS/sanctuaries/sanctuary-cortex/firefox-profile}"
 
 if ! mountpoint -q "$MOUNT_POINT"; then
-    echo "X230 not mounted -- mounting now..."
-    sshfs "$X230_HOST:$REMOTE_HOME" "$MOUNT_POINT" \
-        -o reconnect,ServerAliveInterval=15,ServerAliveCountMax=3,cache=yes,kernel_cache
-    sleep 1
+    echo "T1700 is not mounted at $MOUNT_POINT" >&2
+    echo "Mount the T1700 home over NFS before launching FireDragon." >&2
+    exit 1
 fi
 
-if [ ! -d "$PROFILE_PATH" ]; then
-    echo "ERROR: Profile not accessible at $PROFILE_PATH" >&2
-    echo "Check SSH connectivity and that the path exists on the X230." >&2
+if ! stat -L -- "$PROFILE_PATH" >/dev/null 2>&1 || \
+   [ ! -f "$PROFILE_PATH/prefs.js" ] || [ ! -f "$PROFILE_PATH/places.sqlite" ]; then
+    echo "FireDragon profile is not accessible at $PROFILE_PATH" >&2
+    echo "Check the T1700 HelmCortex export and the NFS mount." >&2
     exit 1
 fi
 
@@ -2556,15 +2665,38 @@ exec /usr/bin/flatpak run \
     "${args[@]}"
 #+END_SRC
 
+#+BEGIN_SRC bash :tangle linux/.local/bin/firedragon-x230 :mkdirp yes :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec "$HOME/.local/bin/firedragon-t1700" "$@"
+
+#+END_SRC
+
 #+BEGIN_SRC conf :tangle linux/.local/share/applications/firedragon-x230.desktop :mkdirp yes :comments no
 [Desktop Entry]
 Version=1.0
-Name=FireDragon X230
-Comment=Launch FireDragon against the mounted X230 profile
+Name=FireDragon X230 compatibility (T1700 target)
+Comment=Hidden compatibility entry; launch the migrated T1700 profile
 Exec=/home/metsatron/.local/bin/firedragon-x230 %u
 Icon=bezilla
 Type=Application
-Keywords=firedragon;browser;x230;sshfs;mounted;
+Keywords=firedragon;browser;t1700;x230;nfs;mounted;
+Terminal=false
+Categories=Network;WebBrowser;
+NoDisplay=true
+StartupNotify=false
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.local/share/applications/firedragon-t1700.desktop :mkdirp yes :comments no
+[Desktop Entry]
+Version=1.0
+Name=FireDragon T1700
+Comment=Launch local FireDragon against the migrated T1700 profile mounted over NFS
+Exec=/home/metsatron/.local/bin/firedragon-t1700 %u
+Icon=bezilla
+Type=Application
+Keywords=firedragon;browser;t1700;nfs;profile;
 Terminal=false
 Categories=Network;WebBrowser;
 MimeType=x-scheme-handler/http;x-scheme-handler/https;
