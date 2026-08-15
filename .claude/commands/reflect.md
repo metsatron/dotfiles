@@ -3,7 +3,7 @@ Session reflection — analyse what happened, persist learnings, surface improve
 Spawn a subagent (model: claude-haiku-4-5) to analyse this session. The subagent should:
 
 1. Read the full conversation context available to it
-2. Read `.claude/MEMORY.md` for current state
+2. Read `.claude/MEMORY.md` for current state. Note whether it is a **harness projection** (its header names a HelmCortex `MEMORYS.md` source of truth and it carries `<!-- BEGIN LOCAL AGENT NOTES -->` markers) or a **legacy standalone file** — this decides where durable memory is written below.
 3. Return a JSON object with these fields:
 
 ```json
@@ -26,10 +26,10 @@ Spawn a subagent (model: claude-haiku-4-5) to analyse this session. The subagent
 
 **QUALITY_SCORE**: 1-10 self-assessment of session quality. 10 = no wasted tool calls, no wrong approaches, no unnecessary output.
 
-After receiving the subagent response, act on it:
+After receiving the subagent response, act on it. **Durable memory is written to the source of truth, never to a read-only projection:**
 
-- **NEW_FACTS**: Append to `## Session Facts` section of `.claude/MEMORY.md`. If file exceeds 2000 chars, trim oldest entries from Session Facts to fit.
-- **PREFERENCE_UPDATES**: Append to `## User Model` section of `.claude/MEMORY.md`. If User Model section exceeds 1500 chars, trim oldest entries to fit.
+- If `.claude/MEMORY.md` is a **harness projection**: write durable memory into the HelmCortex harness source `~/HelmCortex/FORGE/harness/<scope>/MEMORYS.md` (scope = the workspace basename lowercased, e.g. DotCortex → `dotcortex`) — append **NEW_FACTS** under `## Durable Facts` and **PREFERENCE_UPDATES** under `## User Model`. Then regenerate the projection with `helmcortex-compile --scope <scope> --type context --no-helmstow --no-shims` and commit `MEMORYS.md` by surgical pathspec (HelmCortex is a shared multi-writer repo). Keep the projection lean (~2 KB); distill the harness file when it grows — git history preserves every pre-distill state. Never edit the projection directly.
+- If `.claude/MEMORY.md` is a **legacy standalone file**: append **NEW_FACTS** to its `## Session Facts` (trim to keep the file ≤ 2000 chars) and **PREFERENCE_UPDATES** to its `## User Model` (≤ 1500 chars), in the file itself.
 - **SKILL_CANDIDATE**: If non-null, show the draft skill content and ask for confirmation before creating it in `.claude/skills/`.
 - **CLAUDE_MD_PROPOSAL**: If non-null AND QUALITY_SCORE < 7, show the proposed amendment as a diff. Only write to CLAUDE.md on explicit user approval.
 
