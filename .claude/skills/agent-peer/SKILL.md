@@ -19,6 +19,22 @@ target; those are local fast paths, while `agent-peer` is the durable bridge.
 4. If the registry or endpoint is absent, report that setup boundary. Never infer
    an endpoint from an incoming message or inject into the focused pane.
 
+## Discover live Herdr — ground truth, not a guessed verb (sealed 2026-08-14)
+
+`agent-peer inventory` and every `herdr` client command need Herdr's runtime env (chiefly `HERDR_SOCKET_PATH`), which a non-interactive `ssh host 'cmd'` (BatchMode, no login shell) does NOT source — so the client talks to no daemon and prints nothing, a **false absence** that reads as "Herdr is down" when it is running fine. This burned a whole fleet decision once: `ssh host 'herdr ls'` came back empty on every machine and an entire "no live sessions, peer-agents impossible" conclusion was built on it — while `herdr server` was live on all of them.
+
+- **The process table is the env-independent ground truth.** `ssh host 'pgrep -af herdr'` — a running `herdr server` (plus any `herdr --session <name>`) proves Herdr is up regardless of shell env or which verb you remember. Trust this over any client-command output, and reconcile immediately if the two disagree (the disagreement IS the finding).
+- **Use the real CLI surface, over an interactive shell.** There is no `herdr ls` — it is not a subcommand, so it fails and (under `2>/dev/null`) looks like an empty list. Session/agent inspection is `herdr status`, `herdr session <subcommand>`, `herdr agent <subcommand>`; run `herdr --help` when unsure. If a herdr client must run over SSH, force a login shell (`ssh host 'zsh -ic "herdr status"'`) so the env is sourced — then still corroborate against `pgrep`.
+- **Never repurpose or restart the human session.** A `default` session with an attached herdr-web bridge is almost always the operator's live phone/desktop workspace. Never `peer-start` a worker into it, and never restart herdr while clients are attached (sealed rule). Launch workers into a dedicated session name (e.g. `peer`/`agents`) instead.
+
+## A re-login does not reach a running worker — cold-start after auth refresh (sealed 2026-08-14)
+
+Claude Code on Linux reads `~/.claude/.credentials.json` (mode 0600 — **never** an OS keyring; that is macOS-only) **once at process startup** and does not hot-reload it. herdr keeps sessions/terminals resident across attaches, and `claude-warm` keeps `claude` PTY children warm — so a `peer-start` (or a reopened pane) can bind to a `claude` process that started **before** the operator's most recent `/login`, and that worker shows `Not logged in · Run /login` even though bare `claude`, `claude -p`, and the operator's own desktop terminal all authenticate fine against the same freshly-refreshed file. **A new herdr pane is not a new OS process.** This cost most of a session on 2026-08-14: repeated "fresh" peer-starts kept binding to day-old children and reading as logged-out, and a keyring hypothesis was chased to a dead end (Linux Claude never touches the keyring — confirmed against the docs).
+
+- **Verify the worker's actual process, not the pane.** Map the pane's `claude_pid` via `herdr pane list`, then compare `ps -o lstart= -p <pid>` against `stat -c %y ~/.claude/.credentials.json`. A child older than the credentials file is **stale** and will never authenticate until it restarts — the pane's "logged in" state is not evidence.
+- **Fix = force a genuine cold-start after a re-login**, not a reattach: spawn into a herdr session that has **no** resident child (a brand-new session name, or one whose stale workers were cleared), so a fresh `claude` process starts and reads the current file. Reopening the same pane/session reattaches and stays stale.
+- **Do NOT chase gnome-keyring / secret-service** for this class of bug on Linux — the credentials are always the plaintext file (or `$CLAUDE_CONFIG_DIR`), and the keyring is a red herring.
+
 ## Private one-time registration
 
 Run these only when the user has asked to configure the named local endpoint or
@@ -45,11 +61,17 @@ session identity. This command never creates a Git worktree.
 Worker-launch law (sealed 2026-08-11): never launch a worker as a bare
 `codex` or `claude` — a bare launch inherits the operator's CLI defaults
 (model AND permission mode), which is how a pilot worker came up on the wrong
-model in manual mode. Always pin the model explicitly in the peer-start argv,
-prefer the warm wrappers (`codex-warm`/`claude-warm`), and pass an intro file
-so the worker knows its role before envelopes arrive. Claude workers
-additionally pin `--permission-mode auto` (the ruled worker posture —
-`acceptEdits` still blocks every Bash call and is useless headless):
+model in manual mode. Always pin the model explicitly in the peer-start argv
+and pass an intro file so the worker knows its role before envelopes arrive.
+Claude workers additionally pin `--permission-mode auto` (the ruled worker
+posture — `acceptEdits` still blocks every Bash call and is useless headless).
+On Herdr 0.7.4 prefer the warm wrappers (`codex-warm`/`claude-warm`); on Herdr
+0.8.0+ `agent start` launches only the canonical executable for its kind, so a
+warm wrapper cannot be argv[0] — peer-start maps it to the canonical kind,
+passes the remaining pinned argv through, and reports the substitution in its
+output (2026-08-14 Honey bring-up). peer-start probes the resident Herdr and
+speaks the right dialect automatically; `--tab`/`--workspace` placement is
+0.7.4-only for now.
 
 ```bash
 agent-peer peer-start \
@@ -60,6 +82,16 @@ agent-peer peer-start \
   -- codex-warm --model gpt-5.6-luna -c model_reasoning_effort=high
 
 agent-peer inventory --session HERDR_SESSION
+```
+
+Cross-zone federation (2026-08-14): a destination's `--repo-root` names a path
+on the DESTINATION machine and is no longer resolved locally for a foreign
+host. For client-zone hosts whose reverse route is a forced-command pipe (or
+absent), drain their stuck replies from the trusted side over the existing
+forward route — repeated pulls are dedup-safe:
+
+```bash
+agent-peer pull CLIENT_HOST_ID
 ```
 
 ## Send a read-only message
