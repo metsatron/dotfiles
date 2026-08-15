@@ -23,6 +23,18 @@ case "${HOME:-}" in
     ;;
 esac
 
+# XDG_RUNTIME_DIR fallback. pam_elogind normally exports this at login, but on a
+# cold boot the getty login can race ahead of elogind-daemon; pam_elogind is
+# `session optional`, so it silently no-ops and the whole session (and every
+# child shell) runs without XDG_RUNTIME_DIR -- which breaks claude-warm and any
+# other per-user runtime-dir consumer. Fall back to the canonical per-uid path,
+# but only when elogind has actually created it and we own it.
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+  _dc_xdg="/run/user/$(id -u)"
+  [ -d "$_dc_xdg" ] && [ -O "$_dc_xdg" ] && export XDG_RUNTIME_DIR="$_dc_xdg"
+  unset _dc_xdg
+fi
+
 # Homebrew / Linuxbrew
 if [ -d "/home/linuxbrew/.linuxbrew/bin" ]; then
   export HOMEBREW_PREFIX="${HOMEBREW_PREFIX:-/home/linuxbrew/.linuxbrew}"

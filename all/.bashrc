@@ -42,6 +42,16 @@ fi
 [ -f "$HOME/.bash_options" ] && source "$HOME/.bash_options"
 [ -f "$HOME/.bash_aliases" ] && source "$HOME/.bash_aliases"
 [ -f "$HOME/.bash_functions" ] && source "$HOME/.bash_functions"
+# Cargo tools reach PATH here, BEFORE .bash_prompt runs `starship init`. Starship
+# lives only at ~/.cargo/bin/starship, and .bash_exports intentionally omits
+# ~/.cargo/bin (deferring to ~/.cargo/env). Sourced after the prompt, a fresh
+# bash shell's first rc pass never found starship and fell back to plain PS1 --
+# it only appeared on a re-source. zsh already adds ~/.cargo/bin before its
+# prompt (.zshenv), so this mirrors zsh. Idempotent: the .bash_profile pass and
+# .bash_exports dedupe keep this from duplicating PATH entries.
+if [ "${DOTCORTEX_SANCTUARY_GUEST:-0}" != 1 ]; then
+  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+fi
 [ -f "$HOME/.bash_prompt" ] && source "$HOME/.bash_prompt"
 [ -f "$HOME/.bash_fzf" ] && source "$HOME/.bash_fzf"
 
@@ -80,9 +90,7 @@ fi
 export NVM_DIR="$HOME/.config/nvm"
 [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
 [ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
-if [ "${DOTCORTEX_SANCTUARY_GUEST:-0}" != 1 ]; then
-  [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-fi
+# ~/.cargo/env is now sourced earlier (before .bash_prompt) in the module list.
 
 # --- kitty shell integration (no-op outside kitty) ---
 if [ -n "${KITTY_INSTALLATION_DIR:-}" ] && [ -n "${KITTY_SHELL_INTEGRATION:-}" ]; then
