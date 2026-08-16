@@ -25,7 +25,18 @@ zoxide "" all ""
 python "" all ""
 htop "" all ""
 ripgrep "" all ""
+proot-distro "" all ""
+pulseaudio "" all ""
+sox "" all ""
+ffmpeg "" all ""
+termux-api "" all ""
+runit "" all ""
+python-onnxruntime "" all ""
 #+END_SRC
+
+The 2026-08-16 additions are the phone-stack substrate, ruled by the seven-verdict research report (=HelmCortex FORGE/brain/haiku/research/2026-08-16-phone-stack.md=) and the DotCortex-Project implementation strategy: =proot-distro= carries the Debian glibc enclave (Claude Code, agent frameworks), =pulseaudio=+=sox= are the working audio path, =termux-api= bridges Android (mic, notifications), =runit= supervises long-running relays against Android's process killers, and =python-onnxruntime= is Termux's own Bionic-linked ONNX runtime — the piper apply below symlinks it over pip's glibc wheel, which cannot dlopen on Android (rhasspy/piper#814).
+
+Note the manifest applier probes =command -v $pkg=, so library-only packages (=python-onnxruntime=) re-run =pkg install= on every apply — apt no-ops when already installed, so this is noise, not breakage.
 
 * Termux config directory
 #+BEGIN_SRC text :tangle termux/.termux/termux.properties
@@ -118,6 +129,111 @@ awk -v FS='[ \t]+' '
 done
 #+END_SRC
 
+* Piper TTS on the phone (Q1 verdict: NATIVE-ARM64)
+The ruled recipe: piper via pip on Termux's own python, with Termux's Bionic =python-onnxruntime= symlinked over the glibc wheel pip drags in. Idempotent; safe to re-run after piper upgrades (re-asserts the symlink).
+
+#+BEGIN_SRC bash :tangle termux/.local/bin/termux-piper-apply :shebang "#!/data/data/com.termux/files/usr/bin/bash"
+# ~/DotCortex/termux/.local/bin/termux-piper-apply
+set -euo pipefail
+
+echo "== termux piper apply =="
+
+python -c "import onnxruntime" 2>/dev/null || {
+  echo "!! Termux python-onnxruntime not importable — run termux-pkg-apply first"
+  exit 1
+}
+
+pip install --upgrade piper-tts
+
+# pip resolves an onnxruntime wheel linked against glibc; it cannot dlopen on
+# Bionic. Point pip's install at Termux's own native module instead
+# (documented workaround, rhasspy/piper#814).
+SITE="$(python -c 'import site; print(site.getsitepackages()[0])')"
+NATIVE="$(python - <<'PY'
+import onnxruntime, os, sys
+d = os.path.dirname(onnxruntime.__file__)
+print(d)
+PY
+)"
+PIP_ORT="$SITE/onnxruntime"
+if [ -d "$PIP_ORT" ] && [ "$PIP_ORT" != "$NATIVE" ]; then
+  rm -rf "$PIP_ORT"
+  ln -s "$NATIVE" "$PIP_ORT"
+  echo "symlinked Bionic onnxruntime over pip's glibc wheel"
+fi
+
+python -c "from piper import PiperVoice; print('piper importable')"
+echo "Done. Voices download to ~/.local/share/piper on first use (or fetch manually)."
+#+END_SRC
+
+* Speak on the phone (working primitive)
+=termux-tts-say= is the phone's speaking primitive: text on stdin or argv → piper → phone speakers through PulseAudio. Voice model path defaults to the fleet-standard Amy but any =.onnx= piper voice works. This is the substrate the generic =tts-synth=/=tts-play= contract will formalize once the HelmCortex identity membrane lands; until then this one script is the honest whole of it.
+
+#+BEGIN_SRC bash :tangle termux/.local/bin/termux-tts-say :shebang "#!/data/data/com.termux/files/usr/bin/bash"
+# ~/DotCortex/termux/.local/bin/termux-tts-say
+set -euo pipefail
+
+MODEL="${TERMUX_TTS_MODEL:-$HOME/.local/share/piper/en_US-amy-medium.onnx}"
+[ -f "$MODEL" ] || {
+  echo "termux-tts-say: no voice model at $MODEL — set TERMUX_TTS_MODEL or place a piper .onnx there" >&2
+  exit 1
+}
+
+# pulseaudio server: start on demand (Termux has no service manager by default)
+pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=300 2>/dev/null || true
+
+if [ $# -gt 0 ]; then TEXT="$*"; else TEXT="$(cat)"; fi
+printf '%s' "$TEXT" | python -m piper --model "$MODEL" --output_raw 2>/dev/null \
+  | sox -t raw -r 22050 -e signed -b 16 -c 1 - -d 2>/dev/null
+#+END_SRC
+
+* Debian enclave (Q2 verdict: BRIDGE-NEEDED)
+Claude Code and other glibc-native agents cannot run on Bionic; the ruled architecture is Termux as host/control plane plus ONE Debian ARM64 proot-distro enclave as the compatibility bridge. This bootstraps the enclave to the door of =claude= — the login into Anthropic is Mètsàtron's interactive step, never scripted. proot is a ptrace translator, not a container: no PID/network isolation, no systemd inside; supervision stays Termux-side (runit/tmux).
+
+#+BEGIN_SRC bash :tangle termux/.local/bin/termux-enclave-apply :shebang "#!/data/data/com.termux/files/usr/bin/bash"
+# ~/DotCortex/termux/.local/bin/termux-enclave-apply
+set -euo pipefail
+
+echo "== termux enclave apply (debian proot) =="
+command -v proot-distro >/dev/null || { echo "!! proot-distro missing — run termux-pkg-apply"; exit 1; }
+
+proot-distro list 2>/dev/null | grep -q 'debian.*installed' || proot-distro install debian
+
+proot-distro login debian -- bash -lc '
+  set -e
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update -qq
+  apt-get install -y -qq curl git ca-certificates
+  command -v node >/dev/null || {
+    curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
+    apt-get install -y -qq nodejs
+  }
+  command -v claude >/dev/null || npm install -g @anthropic-ai/claude-code
+  echo "enclave ready: node $(node --version), claude $(claude --version 2>/dev/null || echo "installed — run claude login interactively")"
+'
+#+END_SRC
+
+* Android kill-vector check (Q5 requirement)
+Android will kill long-running relays unless defused: the phantom process killer, battery optimization, and Doze. None of these are scriptable from inside unrooted Termux — the phantom killer needs =adb shell settings put global settings_enable_monitor_phantom_procs false= from a trusted PC, and the battery exemption is a Settings-app toggle. This check REPORTS the state honestly so a silent future kill is never a mystery.
+
+#+BEGIN_SRC bash :tangle termux/.local/bin/termux-defuse-check :shebang "#!/data/data/com.termux/files/usr/bin/bash"
+# ~/DotCortex/termux/.local/bin/termux-defuse-check
+set -euo pipefail
+
+echo "== android kill-vector check =="
+if command -v settings >/dev/null 2>&1; then
+  v="$(settings get global settings_enable_monitor_phantom_procs 2>/dev/null || echo unreadable)"
+  echo "phantom process killer: $v (want: false — set via adb from a PC)"
+else
+  echo "phantom process killer: unreadable from Termux — verify via adb: settings get global settings_enable_monitor_phantom_procs"
+fi
+if command -v termux-battery-status >/dev/null 2>&1; then
+  termux-battery-status 2>/dev/null | head -5 || true
+fi
+echo "battery optimization: confirm Termux is set to Unrestricted in Settings > Apps > Termux > Battery"
+echo "wake lock: termux-wake-lock while a relay runs; termux-wake-unlock to release"
+#+END_SRC
+
 * S24 device overlay stub
 #+BEGIN_SRC text :tangle s24/.README
 # S24-specific overrides
@@ -131,7 +247,7 @@ done
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: termux-pkg-apply termux-pkg-health
+.PHONY: termux-pkg-apply termux-pkg-health termux-piper-apply termux-enclave-apply termux-tts-health termux-defuse-check
 
 termux-pkg-apply:
 | @chmod +x $(HOME)/.local/bin/termux-pkg-apply 2>/dev/null || true
@@ -140,4 +256,16 @@ termux-pkg-apply:
 termux-pkg-health:
 | @chmod +x $(HOME)/.local/bin/termux-pkg-health 2>/dev/null || true
 | $(HOME)/.local/bin/termux-pkg-health
+
+termux-piper-apply:
+| $(HOME)/.local/bin/termux-piper-apply
+
+termux-enclave-apply:
+| $(HOME)/.local/bin/termux-enclave-apply
+
+termux-tts-health:
+| @$(HOME)/.local/bin/termux-tts-say "Voice check from the phone stack." || echo "tts not ready — run termux-piper-apply and place a voice model"
+
+termux-defuse-check:
+| $(HOME)/.local/bin/termux-defuse-check
 #+END_SRC
