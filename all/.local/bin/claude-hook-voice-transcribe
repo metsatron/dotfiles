@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# Voice transcript relay
+
+# Auto-transcribes Telegram voice/audio notes and relays the transcript both ways. The official Telegram plugin delivers voice notes as an =attachment_file_id= in the =<channel>= tag without downloading them — without this hook the agent must notice, call =download_attachment=, and transcribe by hand. This hook makes the flow structural, per Mètsàtron's ruling (2026-08-16): the same architecture must hold wherever the agent runs — kikin today, Termux on the phone later — so it lives here in the hooks source, not in any one session's habits.
+
+# Flow: =UserPromptSubmit= fires on the inbound channel message → the hook parses =attachment_kind="voice|audio"= + =attachment_file_id= from the tag attributes (plugin-authored; body text could forge them, but senders are allowlisted and a forged file_id can only reach files this bot already holds) → downloads via the Bot API using the token in =TELEGRAM_STATE_DIR/.env= → runs =whisper-transcribe --model small= (found on PATH or at the HelmCortex FORGE fallback) → injects the transcript as =additionalContext= so the agent reads it as if typed → and for provenance parity with the Hermes agent, replies the transcript into the Telegram chat itself, quoted, threaded to the voice message, so the chat log carries what the machine heard. Idempotent per =file_id= (download, transcript, and chat echo each fire once); every failure degrades to a one-line context note rather than blocking the prompt; the token never appears in any emitted text (exception class names only).
+
+
+# [[file:../../../agents-hooks.org::*Voice transcript relay][Voice transcript relay:1]]
+# ~/DotCortex/all/.local/bin/claude-hook-voice-transcribe
+# UserPromptSubmit hook: Telegram voice/audio -> whisper transcript, injected
+# as context AND echoed back into the chat (quoted, threaded) for provenance.
+set -euo pipefail
+
+if command -v timeout >/dev/null 2>&1; then
+    HOOK_INPUT="$(timeout 0.2 cat 2>/dev/null || true)"
+else
+    HOOK_INPUT=""
+    if IFS= read -r -t 0.2 first_line; then
+        HOOK_INPUT="$first_line"
+        rest="$(cat 2>/dev/null || true)"
+        [ -n "$rest" ] && HOOK_INPUT="${HOOK_INPUT}"$'\n'"${rest}"
+    fi
+fi
+export DOTCORTEX_HOOK_INPUT="$HOOK_INPUT"
+
+python3 - <<'PYEOF'
+import json, os, re, subprocess, sys, urllib.parse, urllib.request
+from shutil import which
+
+raw = os.environ.get('DOTCORTEX_HOOK_INPUT', '')
+try:
+    prompt = json.loads(raw).get('prompt', '') if raw.strip().startswith('{') else raw
+except Exception:
+    prompt = raw
+if 'attachment_file_id=' not in prompt:
+    sys.exit(0)
+kind = re.search(r'attachment_kind="(voice|audio)"', prompt)
+fid = re.search(r'attachment_file_id="([^"]+)"', prompt)
+if not (kind and fid):
+    sys.exit(0)
+file_id = fid.group(1)
+chat_m = re.search(r'chat_id="([^"]+)"', prompt)
+msg_m = re.search(r'message_id="([^"]+)"', prompt)
+
+
+def ctx(text):
+    print(json.dumps({'hookSpecificOutput': {
+        'hookEventName': 'UserPromptSubmit', 'additionalContext': text}}))
+    sys.exit(0)
+
+
+state = os.environ.get('TELEGRAM_STATE_DIR') or os.path.expanduser(
+    '~/.claude/channels/telegram')
+token = None
+try:
+    with open(os.path.join(state, '.env')) as f:
+        for line in f:
+            if line.startswith('TELEGRAM_BOT_TOKEN='):
+                token = line.strip().split('=', 1)[1]
+                break
+except OSError:
+    pass
+if not token:
+    ctx('[voice-transcribe] audio attachment detected but no bot token in '
+        '%s/.env — transcription skipped' % state)
+
+inbox = os.path.join(state, 'inbox')
+os.makedirs(inbox, exist_ok=True)
+api = 'https://api.telegram.org'
+safe_id = re.sub(r'[^A-Za-z0-9_-]', '_', file_id)[:64]
+try:
+    with urllib.request.urlopen(
+            '%s/bot%s/getFile?file_id=%s' % (api, token,
+                                             urllib.parse.quote(file_id)),
+            timeout=30) as r:
+        remote = json.load(r)['result']['file_path']
+    ext = os.path.splitext(remote)[1] or '.oga'
+    audio = os.path.join(inbox, 'voice-%s%s' % (safe_id, ext))
+    if not os.path.exists(audio):
+        with urllib.request.urlopen(
+                '%s/file/bot%s/%s' % (api, token, remote), timeout=120) as r, \
+                open(audio, 'wb') as f:
+            f.write(r.read())
+except Exception as e:
+    ctx('[voice-transcribe] download failed (%s) — attachment %s not '
+        'transcribed; use download_attachment + whisper-transcribe manually'
+        % (e.__class__.__name__, file_id))
+
+transcript_path = audio + '.transcript.md'
+if not os.path.exists(transcript_path):
+    wt = which('whisper-transcribe')
+    if not wt:
+        cand = os.path.expanduser('~/HelmCortex/FORGE/bin/whisper-transcribe')
+        wt = cand if os.access(cand, os.X_OK) else None
+    if not wt:
+        ctx('[voice-transcribe] audio saved at %s but whisper-transcribe is '
+            'not available on this host' % audio)
+    try:
+        subprocess.run([wt, '--model', 'small', '--out', transcript_path,
+                        audio], check=True, timeout=150,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception as e:
+        ctx('[voice-transcribe] whisper failed (%s) — audio saved at %s'
+            % (e.__class__.__name__, audio))
+try:
+    text = open(transcript_path).read()
+except OSError:
+    ctx('[voice-transcribe] transcript file missing after run — audio at %s'
+        % audio)
+# whisper-transcribe writes YAML frontmatter; the relayed quote is speech only
+text = re.sub(r'\A---\n.*?\n---\n', '', text, flags=re.S).strip()
+
+# Provenance echo into the chat itself (once per file_id): the log carries
+# what the machine heard, quoted, threaded to the voice message.
+relay_marker = audio + '.relayed'
+if chat_m and text and not os.path.exists(relay_marker):
+    body = {'chat_id': chat_m.group(1), 'text': '“%s”' % text}
+    if msg_m:
+        body['reply_to_message_id'] = msg_m.group(1)
+    try:
+        req = urllib.request.Request(
+            '%s/bot%s/sendMessage' % (api, token),
+            data=json.dumps(body).encode(),
+            headers={'Content-Type': 'application/json'})
+        urllib.request.urlopen(req, timeout=30).read()
+        open(relay_marker, 'w').close()
+    except Exception:
+        pass  # echo is best-effort; the context injection below still lands
+
+ctx('[voice transcript — auto-whisper, %s]\n%s'
+    % (os.path.basename(audio), text))
+PYEOF
+# Voice transcript relay:1 ends here
