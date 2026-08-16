@@ -3,7 +3,7 @@
 
 # The other half of the voice loop, per Mètsàtron's ruling (2026-08-16): every Telegram reply an agent sends is ALSO spoken aloud through pvox, automatically, with the voice chosen by the agent's identity — no extra agent action, no extra tokens. A =PostToolUse= hook fires on the Telegram plugin's =reply= tool, lifts the already-generated =text= from the tool input, resolves the speaking identity, and fire-and-forgets it to pvox on the speaker host over SSH. The hook returns immediately (playback is fully detached), so replies are never delayed by synthesis.
 
-# Identity resolution, simplest-first: =CLAUDE_WARM_HERDR_AGENT= (set by every claude-* launcher: Fable, Haiku, Auryn, Opus) → the basename suffix of =TELEGRAM_STATE_DIR= (=telegram-fable= → fable) → =Default=. The identity maps onto the pvox agent roster (=pvox agents=); identities without their own pvox voice yet (Fable, Haiku, Opus) speak as =Claude= until Mètsàtron seals dedicated voices in VoxForge. Speaker host defaults to the T480s (the machine with the speakers, per the pvox-over-SSH law: HelmCortex is NFS-shared so pvox runs THERE, never piped raw across SSH); override with =PVOX_REPLY_HOST=, disable per-session with =PVOX_REPLY_OFF=1=. The eventual phone lane just changes the host.
+# Identity resolution, simplest-first: =CLAUDE_WARM_HERDR_AGENT= (set by every claude-* launcher: Fable, Haiku, Auryn, Opus) → the basename suffix of =TELEGRAM_STATE_DIR= (=telegram-fable= → fable) → =Default=. The identity maps onto the pvox agent roster (=pvox agents=); identities without their own pvox voice yet (Fable, Haiku, Opus) speak as =Claude= until Mètsàtron seals dedicated voices in VoxForge. Delivery is split-lane (ruling 2026-08-17, the night the phone earned its voice): synthesis runs on the hook's own machine via pvox (HelmCortex is NFS-shared, so pvox and the conda engines are everywhere), and playback ships as a *headered WAV* to =PVOX_REPLY_HOST= (default =s24= — the phone, always in his pocket), falling back to =PVOX_REPLY_FALLBACK_HOST= (default =t480s=) when the phone is unreachable. The old pvox-over-SSH law forbade piping *raw* PCM across SSH because the player cannot know the rate; WAV carries its header, so that law is honored, not repealed. Disable per-session with =PVOX_REPLY_OFF=1=.
 
 
 # [[file:../../../agents-hooks.org::*Voice reply relay (outbound — pvox speaks what the agent sends)][Voice reply relay (outbound — pvox speaks what the agent sends):1]]
@@ -45,12 +45,32 @@ case "$(printf '%s' "$AGENT" | tr '[:upper:]' '[:lower:]')" in
     *) VOICE="Default" ;;
 esac
 
-HOST="${PVOX_REPLY_HOST:-t480s}"
-# --stream: first sentence plays while the rest renders (kitten daemon
-# chunks by sentence) — a long reply must never buffer whole before speaking
-setsid ssh -o BatchMode=yes -o ConnectTimeout=5 "$HOST" \
-    "XDG_RUNTIME_DIR=/run/user/1000 ~/HelmCortex/FORGE/VoxForge/bin/pvox say $VOICE --stdin --stream" \
-    <<<"$TEXT" >/dev/null 2>&1 &
+# Split lanes (Mètsàtron's ruling 2026-08-17): synth where pvox lives (this
+# machine — HelmCortex is NFS-shared fleet-wide), play wherever he is. The
+# phone is the standing default ("my phone's always with me"); the T480s is
+# the fallback speaker when the phone is unreachable (Doze, no tailnet).
+# Audio travels as headered WAV, never raw PCM — the play side parses the
+# header, so mixed engine sample rates (kitten 24k, piper 22.05k) need no
+# out-of-band rate agreement. Whole-render before play trades first-sentence
+# streaming latency for that robustness; replies are Telegram-sized.
+PLAY_HOST="${PVOX_REPLY_HOST:-s24}"
+FALLBACK_HOST="${PVOX_REPLY_FALLBACK_HOST:-t480s}"
+# Host-agnostic remote play: Termux has sox (+pulse on demand), Guix fleet
+# machines have aplay; flock serializes so rapid replies queue, never stack.
+REMOTE_PLAY='L="${TMPDIR:-/tmp}/pvox-reply-play.lock";
+pgrep pulseaudio >/dev/null 2>&1 || pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true;
+if command -v sox >/dev/null 2>&1; then flock "$L" sox -q -t wav - -d;
+else XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}" flock "$L" aplay -q -; fi'
+
+setsid bash -c '
+    VOICE="$1"; TEXT="$2"; PLAY_HOST="$3"; FALLBACK_HOST="$4"; REMOTE_PLAY="$5"
+    T="$(mktemp)" W="$(mktemp --suffix=.wav)"
+    trap "rm -f \"$T\" \"$W\"" EXIT
+    printf "%s\n" "$TEXT" > "$T"
+    "$HOME/HelmCortex/FORGE/VoxForge/bin/pvox" render --agent "$VOICE" --no-play "$T" "$W" >/dev/null 2>&1 || exit 0
+    ssh -o BatchMode=yes -o ConnectTimeout=5 "$PLAY_HOST" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1 \
+      || ssh -o BatchMode=yes -o ConnectTimeout=5 "$FALLBACK_HOST" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1
+' _ "$VOICE" "$TEXT" "$PLAY_HOST" "$FALLBACK_HOST" "$REMOTE_PLAY" >/dev/null 2>&1 &
 
 exit 0
 # Voice reply relay (outbound — pvox speaks what the agent sends):1 ends here
