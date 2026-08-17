@@ -287,10 +287,35 @@ proot-distro login debian -- bash -lc '
     torch triton $(uv pip list --python "$HOME/kitten-venv/bin/python" 2>/dev/null | awk "/^nvidia-/ {print \$1}") 2>/dev/null || true
   uv cache prune >/dev/null 2>&1 || true
 
-  # one-shot synth: text on stdin, headered WAV on stdout (never raw PCM)
+  # one-shot synth: text on stdin, headered WAV on stdout (never raw PCM).
+  # Sentence-chunked like the fleet daemon (kitten degrades on very long
+  # single inputs); wordless chunks dropped and failed chunks skipped, never
+  # fatal — the same laws the fleet pvox learned 2026-08-17. Markdown
+  # cleanup is NOT here: the caller (fleet hook) cleans via `pvox clean`,
+  # one source of truth.
   cat > "$HOME/kitten-say.py" <<"PY"
-import argparse, io, sys, wave
+import argparse, io, re, sys, wave
 import numpy as np
+
+def chunks(s, maxc=300):
+    parts = re.split(r"(?<=[\.\?\!])\s+", s)
+    out, buf = [], ""
+    for t in parts:
+        t = t.strip()
+        if not t:
+            continue
+        if len(buf) + len(t) + 1 <= maxc:
+            buf = (buf + " " + t).strip() if buf else t
+        else:
+            if buf:
+                out.append(buf)
+            buf = t
+            while len(buf) > maxc:
+                out.append(buf[:maxc])
+                buf = buf[maxc:]
+    if buf:
+        out.append(buf)
+    return [c for c in out if re.search(r"\w", c)]
 
 def main():
     ap = argparse.ArgumentParser()
@@ -302,11 +327,20 @@ def main():
         return
     from kittentts import KittenTTS
     m = KittenTTS("KittenML/kitten-tts-nano-0.8-int8")
-    try:
-        audio = m.generate(text, voice=args.voice, speed=args.speed)
-    except TypeError:
-        audio = m.generate(text, voice=args.voice)
-    pcm = np.clip(audio, -1.0, 1.0)
+    pieces = []
+    for ck in chunks(text):
+        try:
+            try:
+                audio = m.generate(ck, voice=args.voice, speed=args.speed)
+            except TypeError:
+                audio = m.generate(ck, voice=args.voice)
+        except Exception as e:
+            print(f"[kitten-say] chunk skipped ({e}): {ck[:60]!r}", file=sys.stderr)
+            continue
+        pieces.append(np.asarray(audio))
+    if not pieces:
+        return
+    pcm = np.clip(np.concatenate(pieces), -1.0, 1.0)
     pcm16 = (pcm * 32767).astype("<i2").tobytes()
     out = io.BytesIO()
     with wave.open(out, "wb") as w:
@@ -360,9 +394,12 @@ printf '%s' "$TEXT" | proot-distro login debian -- bash -lc \
 if [ -n "${WAV_OUT:-}" ]; then
   echo "$W"
 else
+  # same queue lock as the fleet reply lane so on-device renders and shipped
+  # WAVs serialize instead of stacking; wake lock held for the playback
   pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=300 2>/dev/null || true
-  set -o pipefail
-  sox -q "$W" -d
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null || true
+  flock "${TMPDIR:-/tmp}/pvox-reply-play.lock" sox -q "$W" -d
+  command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null || true
   rm -f "$W"
 fi
 #+END_SRC
