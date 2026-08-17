@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: termux-pkg-apply termux-pkg-health termux-piper-apply termux-enclave-apply termux-tts-health termux-defuse-check termux-rish-apply termux-defuse-apply termux-services-apply
+.PHONY: termux-pkg-apply termux-pkg-health termux-piper-apply termux-enclave-apply termux-tts-health termux-defuse-check termux-rish-apply termux-defuse-apply termux-services-apply termux-kitten-apply
 
 termux-pkg-apply:
 | @chmod +x $(HOME)/.local/bin/termux-pkg-apply 2>/dev/null || true
@@ -32,3 +32,6 @@ termux-defuse-apply:
 
 termux-services-apply:
 | $(HOME)/.local/bin/termux-services-apply
+
+termux-kitten-apply:
+| $(HOME)/.local/bin/termux-kitten-apply
