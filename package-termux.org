@@ -321,23 +321,43 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--voice", default="Bella")
     ap.add_argument("--speed", type=float, default=1.0)
+    ap.add_argument("--stream", action="store_true",
+                    help="raw s16le 24k PCM to stdout per chunk (local pipe to a player with explicit rate flags)")
     args = ap.parse_args()
     text = sys.stdin.read().strip()
     if not text:
         return
     from kittentts import KittenTTS
     m = KittenTTS("KittenML/kitten-tts-nano-0.8-int8")
-    pieces = []
-    for ck in chunks(text):
+
+    def synth(ck):
         try:
             try:
-                audio = m.generate(ck, voice=args.voice, speed=args.speed)
+                return m.generate(ck, voice=args.voice, speed=args.speed)
             except TypeError:
-                audio = m.generate(ck, voice=args.voice)
+                return m.generate(ck, voice=args.voice)
         except Exception as e:
             print(f"[kitten-say] chunk skipped ({e}): {ck[:60]!r}", file=sys.stderr)
-            continue
-        pieces.append(np.asarray(audio))
+            return None
+
+    if args.stream:
+        # streaming: each chunk plays while the next renders — first audio in
+        # seconds instead of after the whole reply (RTF<1, so playback of one
+        # chunk outlasts the render of the next and the lead only grows)
+        for ck in chunks(text):
+            audio = synth(ck)
+            if audio is None:
+                continue
+            pcm = np.clip(np.asarray(audio), -1.0, 1.0)
+            sys.stdout.buffer.write((pcm * 32767).astype("<i2").tobytes())
+            sys.stdout.buffer.flush()
+        return
+
+    pieces = []
+    for ck in chunks(text):
+        audio = synth(ck)
+        if audio is not None:
+            pieces.append(np.asarray(audio))
     if not pieces:
         return
     pcm = np.clip(np.concatenate(pieces), -1.0, 1.0)
@@ -386,21 +406,32 @@ done
 if [ $# -gt 0 ]; then TEXT="$*"; else TEXT="$(cat)"; fi
 [ -n "$TEXT" ] || exit 0
 
-W="${WAV_OUT:-$(mktemp --suffix=.wav)}"
-printf '%s' "$TEXT" | proot-distro login debian -- bash -lc \
-  "\$HOME/kitten-venv/bin/python \$HOME/kitten-say.py --voice '$VOICE' --speed '$SPEED'" > "$W"
-[ -s "$W" ] || { echo "termux-kitten-say: empty render" >&2; rm -f "$W"; exit 1; }
-
 if [ -n "${WAV_OUT:-}" ]; then
+  W="$WAV_OUT"
+  printf '%s' "$TEXT" | proot-distro login debian -- bash -lc \
+    "\$HOME/kitten-venv/bin/python \$HOME/kitten-say.py --voice '$VOICE' --speed '$SPEED'" > "$W"
+  [ -s "$W" ] || { echo "termux-kitten-say: empty render" >&2; rm -f "$W"; exit 1; }
   echo "$W"
 else
-  # same queue lock as the fleet reply lane so on-device renders and shipped
-  # WAVs serialize instead of stacking; wake lock held for the playback
+  # STREAMING play (fix 2026-08-17, "waited over 2 minutes" — the render
+  # queue): each sentence chunk plays while the next renders, so first audio
+  # lands in seconds even on a 2000-char reply. Raw PCM with explicit rate
+  # flags is lawful here — one machine, one pipe, rate stated (the
+  # WAV-with-header law governs transport ACROSS hosts). The queue lock
+  # wraps the WHOLE pipeline: two concurrent says would otherwise interleave
+  # into pulse as overlapping voices, and serializing render+play also stops
+  # concurrent renders fighting for the big cores.
   pulseaudio --check 2>/dev/null || pulseaudio --start --exit-idle-time=300 2>/dev/null || true
   command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock 2>/dev/null || true
-  flock "${TMPDIR:-/tmp}/pvox-reply-play.lock" sox -q "$W" -d
+  exec 9>"${TMPDIR:-/tmp}/pvox-reply-play.lock"
+  flock 9
+  set -o pipefail
+  printf '%s' "$TEXT" | proot-distro login debian -- bash -lc \
+    "\$HOME/kitten-venv/bin/python \$HOME/kitten-say.py --stream --voice '$VOICE' --speed '$SPEED'" \
+    | sox -q -t raw -r 24000 -e signed -b 16 -c 1 - -d
+  RC=$?
   command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null || true
-  rm -f "$W"
+  exit $RC
 fi
 #+END_SRC
 
