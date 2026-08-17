@@ -5,6 +5,8 @@
 
 # Identity resolution, simplest-first: =CLAUDE_WARM_HERDR_AGENT= (set by every claude-* launcher: Fable, Haiku, Auryn, Opus) → the basename suffix of =TELEGRAM_STATE_DIR= (=telegram-fable= → fable) → =Default=. The identity maps onto the pvox agent roster (=pvox agents=); identities without their own pvox voice yet (Fable, Haiku, Opus) speak as =Claude= until Mètsàtron seals dedicated voices in VoxForge. Delivery is split-lane (ruling 2026-08-17, the night the phone earned its voice): synthesis runs on the hook's own machine via pvox (HelmCortex is NFS-shared, so pvox and the conda engines are everywhere), and playback ships as a *headered WAV* to =PVOX_REPLY_HOST= (default =s24= — the phone, always in his pocket), falling back to =PVOX_REPLY_FALLBACK_HOST= (default =t480s=) when the phone is unreachable. The old pvox-over-SSH law forbade piping *raw* PCM across SSH because the player cannot know the rate; WAV carries its header, so that law is honored, not repealed. Disable per-session with =PVOX_REPLY_OFF=1=.
 
+# Delivery is *push-then-play* (fix 2026-08-17, the "stopped halfway" incident): the original design streamed the WAV over SSH straight into =sox='s stdin, which made the entire playback depend on the SSH connection staying alive — when the phone dozed mid-play (screen off, in pocket), the stream stalled and the audio truncated halfway. Now the play host receives the whole WAV into a temp file first, then playback detaches from the SSH session (=nohup=, backgrounded) with a Termux wake-lock held for its duration, so the network matters only during transfer and a doze can no longer cut the voice off. The SSH exit code therefore certifies *delivery*, not playback — the log field says =delivered=, honestly. Every skip and failure path logs one line to =~/.cache/pvox-reply.log= (empty-text skip with stdin byte count, render failure, per-host delivery failure, successful delivery with host + sizes) — the hook's original total silence meant every incident cost a fresh archaeology dig, against the silent-skip law.
+
 
 # [[file:../../../agents-hooks.org::*Voice reply relay (outbound — pvox speaks what the agent sends)][Voice reply relay (outbound — pvox speaks what the agent sends):1]]
 # ~/DotCortex/all/.local/bin/claude-hook-voice-reply
@@ -14,8 +16,15 @@ set -euo pipefail
 
 [ -n "${PVOX_REPLY_OFF:-}" ] && exit 0
 
+LOG="${XDG_CACHE_HOME:-$HOME/.cache}/pvox-reply.log"
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+
+# 3s cap: cat returns on EOF immediately (the harness closes stdin after
+# writing); the timeout only guards a hang. The original 0.2s was tight
+# enough to truncate a large PostToolUse payload under load, and a truncated
+# read fails the JSON parse -> silent skip -> unexplained missing audio.
 if command -v timeout >/dev/null 2>&1; then
-    HOOK_INPUT="$(timeout 0.2 cat 2>/dev/null || true)"
+    HOOK_INPUT="$(timeout 3 cat 2>/dev/null || true)"
 else
     HOOK_INPUT="$(cat 2>/dev/null || true)"
 fi
@@ -29,7 +38,10 @@ try:
 except Exception:
     pass
 ' 2>/dev/null || true)"
-[ -z "$TEXT" ] && exit 0
+if [ -z "$TEXT" ]; then
+    printf '%s SKIP empty-text (stdin %s bytes)\n' "$(date '+%F %T')" "${#HOOK_INPUT}" >> "$LOG" 2>/dev/null || true
+    exit 0
+fi
 
 AGENT="${CLAUDE_WARM_HERDR_AGENT:-}"
 if [ -z "$AGENT" ] && [ -n "${TELEGRAM_STATE_DIR:-}" ]; then
@@ -57,19 +69,40 @@ PLAY_HOST="${PVOX_REPLY_HOST:-s24}"
 FALLBACK_HOST="${PVOX_REPLY_FALLBACK_HOST:-t480s}"
 # Host-agnostic remote play: Termux has sox (+pulse on demand), Guix fleet
 # machines have aplay; flock serializes so rapid replies queue, never stack.
-REMOTE_PLAY='L="${TMPDIR:-/tmp}/pvox-reply-play.lock";
-pgrep pulseaudio >/dev/null 2>&1 || pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true;
-if command -v sox >/dev/null 2>&1; then flock "$L" sox -q -t wav - -d;
-else XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/1000}" flock "$L" aplay -q -; fi'
+# Push-then-play (2026-08-17): receive the WHOLE WAV into a temp file, then
+# detach playback from the ssh session (nohup + &, stdin closed) with a
+# Termux wake-lock held while it plays — a connection drop or phone doze
+# mid-play can no longer truncate the audio. The ssh exit code certifies
+# delivery of the file, not playback.
+REMOTE_PLAY='F="$(mktemp "${TMPDIR:-/tmp}/pvox-reply-XXXXXX.wav")" || exit 1
+cat > "$F" || { rm -f "$F"; exit 1; }
+pgrep pulseaudio >/dev/null 2>&1 || pulseaudio --start --exit-idle-time=-1 >/dev/null 2>&1 || true
+nohup sh -c "
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock >/dev/null 2>&1
+  L=\"\${TMPDIR:-/tmp}/pvox-reply-play.lock\"
+  if command -v sox >/dev/null 2>&1; then flock \"\$L\" sox -q \"$F\" -d
+  else XDG_RUNTIME_DIR=\"\${XDG_RUNTIME_DIR:-/run/user/1000}\" flock \"\$L\" aplay -q \"$F\"; fi
+  command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock >/dev/null 2>&1
+  rm -f \"$F\"
+" </dev/null >/dev/null 2>&1 &'
 
 setsid bash -c '
     VOICE="$1"; TEXT="$2"; PLAY_HOST="$3"; FALLBACK_HOST="$4"; REMOTE_PLAY="$5"
+    LOG="${XDG_CACHE_HOME:-$HOME/.cache}/pvox-reply.log"
     T="$(mktemp)" W="$(mktemp --suffix=.wav)"
     trap "rm -f \"$T\" \"$W\"" EXIT
     printf "%s\n" "$TEXT" > "$T"
-    "$HOME/HelmCortex/FORGE/VoxForge/bin/pvox" render --agent "$VOICE" --no-play "$T" "$W" >/dev/null 2>&1 || exit 0
-    ssh -o BatchMode=yes -o ConnectTimeout=5 "$PLAY_HOST" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1 \
-      || ssh -o BatchMode=yes -o ConnectTimeout=5 "$FALLBACK_HOST" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1
+    if ! "$HOME/HelmCortex/FORGE/VoxForge/bin/pvox" render --agent "$VOICE" --no-play "$T" "$W" >/dev/null 2>&1; then
+        printf "%s voice=%s chars=%s RENDER-FAIL\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" >> "$LOG" 2>/dev/null || true
+        exit 0
+    fi
+    for H in "$PLAY_HOST" "$FALLBACK_HOST"; do
+        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$H" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1; then
+            printf "%s voice=%s chars=%s bytes=%s delivered=%s\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" "$(wc -c < "$W")" "$H" >> "$LOG" 2>/dev/null || true
+            exit 0
+        fi
+        printf "%s voice=%s host=%s DELIVER-FAIL\n" "$(date "+%F %T")" "$VOICE" "$H" >> "$LOG" 2>/dev/null || true
+    done
 ' _ "$VOICE" "$TEXT" "$PLAY_HOST" "$FALLBACK_HOST" "$REMOTE_PLAY" >/dev/null 2>&1 &
 
 exit 0
