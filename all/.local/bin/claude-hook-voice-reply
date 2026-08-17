@@ -7,6 +7,8 @@
 
 # Delivery is *push-then-play* (fix 2026-08-17, the "stopped halfway" incident): the original design streamed the WAV over SSH straight into =sox='s stdin, which made the entire playback depend on the SSH connection staying alive — when the phone dozed mid-play (screen off, in pocket), the stream stalled and the audio truncated halfway. Now the play host receives the whole WAV into a temp file first, then playback detaches from the SSH session (=nohup=, backgrounded) with a Termux wake-lock held for its duration, so the network matters only during transfer and a doze can no longer cut the voice off. The SSH exit code therefore certifies *delivery*, not playback — the log field says =delivered=, honestly. Every skip and failure path logs one line to =~/.cache/pvox-reply.log= (empty-text skip with stdin byte count, render failure, per-host delivery failure, successful delivery with host + sizes) — the hook's original total silence meant every incident cost a fresh archaeology dig, against the silent-skip law.
 
+# Kitten seats render *on the play host itself* (his ruling 2026-08-17: the S24 out-muscles the fleet for small models, Q8-verified ~0.4–0.9 RTF): the hook resolves the seat via =pvox voicespec= and cleans the text via =pvox clean= (both fleet-side — pvox's config and markdown cleaner stay the single source of truth), then ships CLEANED TEXT instead of a WAV to =termux-kitten-say= on the play host, detached with a wake lock, sharing the same play queue lock as the ship lane. The fleet render+ship path remains the lane for non-kitten seats, fallback hosts, and a dead enclave — on-device failure logs =ON-DEVICE-FAIL= and falls through. Kill switch: =PVOX_REPLY_NO_ONDEVICE=1=.
+
 
 # [[file:../../../agents-hooks.org::*Voice reply relay (outbound — pvox speaks what the agent sends)][Voice reply relay (outbound — pvox speaks what the agent sends):1]]
 # ~/DotCortex/all/.local/bin/claude-hook-voice-reply
@@ -89,15 +91,45 @@ nohup sh -c "
 setsid bash -c '
     VOICE="$1"; TEXT="$2"; PLAY_HOST="$3"; FALLBACK_HOST="$4"; REMOTE_PLAY="$5"
     LOG="${XDG_CACHE_HOME:-$HOME/.cache}/pvox-reply.log"
+    PVOX="$HOME/HelmCortex/FORGE/VoxForge/bin/pvox"
+    SSHOPTS="-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3"
+
+    # On-device lane (his ruling 2026-08-17: the phone renders its own
+    # voices — "my phone has more horsepower for rendering on device").
+    # Kitten seats render ON the play host when it carries
+    # termux-kitten-say: cleaned text travels (pvox clean here — one
+    # source of truth for markdown cleanup), is parked in a temp file on
+    # the phone, and render+play detach from the ssh session with a wake
+    # lock (doze cannot truncate; exit code means text delivered + spawn
+    # ok). Fleet render+ship stays the lane for non-kitten seats, other
+    # hosts, and a dead enclave. Kill switch: PVOX_REPLY_NO_ONDEVICE=1.
+    SPEC="$("$PVOX" voicespec "$VOICE" 2>/dev/null || true)"
+    if [ -n "$SPEC" ] && [ -z "${PVOX_REPLY_NO_ONDEVICE:-}" ]; then
+        read -r ENGINE KV KS <<EOF2
+$(printf "%s" "$SPEC" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[\"engine\"], d[\"voice\"], d[\"speed\"])" 2>/dev/null)
+EOF2
+        if [ "$ENGINE" = "kitten" ]; then
+            if printf "%s\n" "$TEXT" | "$PVOX" clean 2>/dev/null | ssh $SSHOPTS "$PLAY_HOST" "
+                command -v termux-kitten-say >/dev/null 2>&1 || exit 9
+                T=\"\$(mktemp)\"; cat > \"\$T\"
+                nohup sh -c \"termux-kitten-say --voice $KV --speed $KS < \$T; rm -f \$T\" </dev/null >/dev/null 2>&1 &
+            " >/dev/null 2>&1; then
+                printf "%s voice=%s chars=%s rendered=on-device:%s (%s@%s)\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" "$PLAY_HOST" "$KV" "$KS" >> "$LOG" 2>/dev/null || true
+                exit 0
+            fi
+            printf "%s voice=%s host=%s ON-DEVICE-FAIL falling back to ship lane\n" "$(date "+%F %T")" "$VOICE" "$PLAY_HOST" >> "$LOG" 2>/dev/null || true
+        fi
+    fi
+
     T="$(mktemp)" W="$(mktemp --suffix=.wav)"
     trap "rm -f \"$T\" \"$W\"" EXIT
     printf "%s\n" "$TEXT" > "$T"
-    if ! "$HOME/HelmCortex/FORGE/VoxForge/bin/pvox" render --agent "$VOICE" --no-play "$T" "$W" >/dev/null 2>&1; then
+    if ! "$PVOX" render --agent "$VOICE" --no-play "$T" "$W" >/dev/null 2>&1; then
         printf "%s voice=%s chars=%s RENDER-FAIL\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" >> "$LOG" 2>/dev/null || true
         exit 0
     fi
     for H in "$PLAY_HOST" "$FALLBACK_HOST"; do
-        if ssh -o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "$H" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1; then
+        if ssh $SSHOPTS "$H" "$REMOTE_PLAY" < "$W" >/dev/null 2>&1; then
             printf "%s voice=%s chars=%s bytes=%s delivered=%s\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" "$(wc -c < "$W")" "$H" >> "$LOG" 2>/dev/null || true
             exit 0
         fi
