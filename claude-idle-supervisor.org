@@ -170,7 +170,7 @@ EXPECTED_COMPLETION_SYSTEM_SUBTYPES = frozenset(
     {"stop_hook_summary", "turn_duration", "away_summary"}
 )
 EXPECTED_COMPLETION_TRANSCRIPT_TYPES = frozenset(
-    {"last-prompt", "mode", "permission-mode", "ai-title"}
+    {"last-prompt", "mode", "permission-mode", "ai-title", "atis-latch"}
 )
 TRANSCRIPT_INTERNAL_SYSTEM_SUBTYPES = frozenset(
     {
@@ -190,6 +190,9 @@ TRANSCRIPT_INTERNAL_SYSTEM_SUBTYPES = frozenset(
         "channel_send_failure",
         "channel_send_retry",
         "channel_send_error",
+        # Compaction writes its boundary marker as a system record; it is
+        # governor-internal bookkeeping, never a human or channel turn.
+        "compact_boundary",
     }
 )
 TRANSCRIPT_INTERNAL_TYPES = frozenset(
@@ -203,6 +206,16 @@ TRANSCRIPT_INTERNAL_TYPES = frozenset(
         "queue",
         "queue-operation",
         "file-history-snapshot",
+        # Claude 2.1.23x completion bookkeeping: atis-latch lands right after
+        # Stop on Fable/Opus turns and file-history-delta accompanies edits.
+        # Left unknown they set the transcript-uncertain gate after every
+        # turn, which vetoes each armed idle compaction at fire time (the
+        # 2026-08-20 overnight no-compact hunt).
+        "atis-latch",
+        "file-history-delta",
+        # Claude's own remote-bridge metadata record (bridgeSessionId/owner
+        # UUIDs) — session plumbing, not conversation content.
+        "bridge-session",
         "summary",
         "recap",
     }
@@ -1089,6 +1102,11 @@ class Supervisor:
         self.stdin_flags: int | None = None
         self.session_id: str | None = None
         self.transcript_path: pathlib.Path | None = None
+        # Pinned at the first transcript bind; session-start events whose
+        # transcript lives in another project directory are foreign (nested
+        # one-shot claudes inheriting this supervisor's control-socket env)
+        # and must never rebind the governor (2026-08-20 overnight no-compact).
+        self.transcript_project_dir: pathlib.Path | None = None
         self.transcript_baseline: tuple[int, int] | None = None
         self.transcript_inode: int | None = None
         self.transcript_offset = 0
@@ -1175,6 +1193,9 @@ class Supervisor:
             "control_socket": str(self.socket_path),
             "session_id": self.session_id,
             "transcript_path": str(self.transcript_path) if self.transcript_path else None,
+            "transcript_project_dir": (
+                str(self.transcript_project_dir) if self.transcript_project_dir else None
+            ),
             "channel_specs": list(self.channel_specs),
             "watched_servers": list(self.watched_servers),
             "channel_health": self.channel_health,
@@ -1415,12 +1436,34 @@ class Supervisor:
         )
         self._write_state()
 
+    def _same_project_transcript(self, value: object) -> bool:
+        """True when a session-start's transcript lives in the bound project.
+
+        Nested one-shot claudes run from another working directory (the
+        classifier cds to /tmp by law), so their transcripts land in another
+        ~/.claude/projects/<slug>/ directory.  A session-start that cannot
+        present a transcript inside the pinned project directory is foreign
+        and must not rebind the governor.  Fails closed on a missing path:
+        every legitimate SessionStart carries transcript_path.
+        """
+        if self.transcript_project_dir is None:
+            return True
+        if not isinstance(value, str) or not value or len(value) > 4096:
+            return False
+        try:
+            parent = pathlib.Path(value).expanduser().parent
+        except (OSError, ValueError):
+            return False
+        return parent == self.transcript_project_dir
+
     def _set_transcript(self, value: object) -> None:
         """Bind and watch a validated Claude transcript path."""
         if not isinstance(value, str) or not value or len(value) > 4096:
             return
         path = pathlib.Path(value).expanduser()
         self.transcript_path = path
+        if self.transcript_project_dir is None:
+            self.transcript_project_dir = path.parent
         self._reset_transcript_cursor()
         if self.inotify:
             self.inotify.close()
@@ -2107,6 +2150,20 @@ class Supervisor:
             return {"ok": False, "error": "invalid-event"}
         if event == "session-start":
             new_session = self.session_id != session_id
+            if new_session and self.session_id and not self._same_project_transcript(
+                message.get("transcript_path")
+            ):
+                # A nested one-shot claude (hook-spawned classifier, bridge
+                # call) inherits this supervisor's control-socket env, so its
+                # own lifecycle hooks arrive here.  Rebinding to it marks the
+                # governor "ended" when the one-shot exits and locks the real
+                # session out as session-mismatch — no idle compaction for the
+                # rest of the session (2026-08-20 overnight no-compact hunt).
+                self._guard_log(
+                    "foreign-session-ignored",
+                    has_transcript=bool(message.get("transcript_path")),
+                )
+                return {"ok": True, "ignored": "foreign-session"}
             if self.session_id and new_session:
                 self.cancel("session-replaced")
                 self.dirty = False
