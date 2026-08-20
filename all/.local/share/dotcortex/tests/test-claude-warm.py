@@ -508,6 +508,39 @@ class ClaudeWarmTests(unittest.TestCase):
         )
         self.assertTrue(session.read_state()["dirty"])
 
+    def test_foreign_project_session_start_does_not_rebind(self):
+        # A nested one-shot claude inherits the supervisor's control-socket
+        # env; its lifecycle hooks arrive here from another project directory
+        # and must not steal the binding or end the governor (the 2026-08-20
+        # overnight no-compact).
+        session = self.make_session(delay=30)
+        session.stop_and_bind()
+        foreign_id = "one-shot-session"
+        foreign_transcript = session.root / "foreign-project" / f"{foreign_id}.jsonl"
+        response = session.event(
+            "session-start",
+            session_id=foreign_id,
+            transcript_path=str(foreign_transcript),
+        )
+        self.assertEqual(response.get("ignored"), "foreign-session")
+        self.assertEqual(session.read_state()["session_id"], session.session_id)
+        response = session.event("session-end", session_id=foreign_id)
+        self.assertEqual(response.get("error"), "session-mismatch")
+        session.status(tokens=80000)
+        session.event("user-prompt-submit")
+        session.event("stop", stop_hook_active=False)
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["timer_deadline"] is not None,
+            message="real session did not arm after a foreign session-start",
+        )
+        self.assertTrue(
+            any(
+                entry.get("event") == "foreign-session-ignored"
+                for entry in session.guard_events()
+            )
+        )
+
     def test_rejected_compaction_clears_transient_flag_without_rearm(self):
         session = self.make_session(delay=0)
         session.stop_and_bind()
