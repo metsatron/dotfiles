@@ -269,6 +269,29 @@ TTL_SECONDS = {
     "short": env_int("CLAUDE_IDLE_COMPACT_SHORT_CACHE_TTL_SECONDS", 5 * 60),
 }
 MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
+COMPACT_RETRY_SECONDS = env_int("CLAUDE_IDLE_COMPACT_RETRY_SECONDS", 5 * 60, 1)
+COMPACT_TIMEOUT_SECONDS = env_int("CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS", 15 * 60, 1)
+PTY_CHECK_ATTEMPTS = 3
+PTY_CHECK_RETRY_SECONDS = 0.05
+# Gate refusals that cannot clear without a new Stop, a control command, or
+# a token-count change.  Every other refusal is transient (a PTY probe
+# hiccup, activity that simply moved the idle window, a stale snapshot) and
+# re-arms the timer instead of leaving the governor dormant.
+DORMANT_GATE_REASONS = frozenset(
+    {
+        "session-disabled",
+        "session-not-running",
+        "already-compacting",
+        "session-unbound",
+        "no-normal-stop",
+        "clean",
+        "channel-recovery-pending",
+        "below-token-threshold",
+        "stale-timer",
+        "inject-command-refused",
+        "unknown-injection-purpose",
+    }
+)
 SNAPSHOT_STOP_SKEW_SECONDS = env_float(
     "CLAUDE_IDLE_COMPACT_STATUS_STOP_SKEW_SECONDS", 2.0, 0.0
 )
@@ -1007,6 +1030,8 @@ class Supervisor:
         self.compacting = False
         self.compaction_requested_at: float | None = None
         self.compaction_ignore_next_stop = False
+        self.rearm_count = 0
+        self.last_rearm_reason: str | None = None
         self.current_tokens: int | None = None
         self.status_timestamp: float | None = None
         self.completed_turn_epoch = 0
@@ -1102,6 +1127,9 @@ class Supervisor:
             "dirty": self.dirty,
             "compacting": self.compacting,
             "compaction_ignore_next_stop": self.compaction_ignore_next_stop,
+            "rearm_count": self.rearm_count,
+            "last_rearm_reason": self.last_rearm_reason,
+            "idle_anchor": self._idle_anchor(),
             "last_normal_stop": self.last_normal_stop,
             "transcript_quiescence_at": self.transcript_quiescence_at,
             "transcript_quiescence_deadline": self.transcript_quiescence_deadline,
@@ -1178,6 +1206,33 @@ class Supervisor:
         except OSError as error:
             self._debug(f"state-write-failed channel={short_id(self.channel)} error={error}")
 
+    def _record_last_session(self, event: str) -> None:
+        """Remember the latest session id outside the runtime dir, so a bot that has
+        exited can still be resumed by name (nurse-joy) after this dir is removed.
+        Written per channel and, when a herdr label names the bot, per label."""
+        if not self.session_id:
+            return
+        payload = {
+            "session_id": self.session_id,
+            "channel": self.channel,
+            "agent": self.herdr.agent,
+            "supervisor_pid": os.getpid(),
+            "pid": self.pid,
+            "cwd": os.getcwd(),
+            "argv": list(self.argv),
+            "event": event,
+            "recorded_at": time.time(),
+        }
+        targets = [self.state_root / f"{self.channel}.last-session.json"]
+        if self.herdr.agent:
+            targets.append(self.state_root / f"last-session.{self.herdr.agent.replace(' ', '-')}.json")
+        for target in targets:
+            try:
+                atomic_json(target, payload)
+                os.chmod(target, 0o600)
+            except OSError as error:
+                self._debug(f"last-session-write-failed channel={short_id(self.channel)} error={error}")
+
     def _register_herdr(self) -> None:
         """Refresh Herdr identity without allowing lifecycle hooks to set state."""
         self.herdr.register(self.session_id)
@@ -1230,6 +1285,94 @@ class Supervisor:
             delay=IDLE_SECONDS[self.cache_profile],
         )
         self._write_state()
+
+    def _idle_anchor(self) -> float | None:
+        """Return the most recent activity of any kind that moves the idle window."""
+        candidates = [
+            value
+            for value in (
+                self.last_normal_stop,
+                self.last_local_input,
+                self.last_lifecycle_activity,
+                self.transcript_activity_at,
+            )
+            if value
+        ]
+        return max(candidates) if candidates else None
+
+    def _idle_window_open(self) -> bool:
+        """True while any activity is younger than the idle threshold."""
+        anchor = self._idle_anchor()
+        return anchor is not None and now() - anchor < IDLE_SECONDS[self.cache_profile]
+
+    def rearm(self, reason: str) -> None:
+        """Re-arm the compaction timer after a transient cancellation or refusal.
+
+        The one-shot timer used to die with its first cancellation and only a
+        new Stop could revive it, so a stray keystroke, a mid-turn hook event,
+        or one failed PTY probe left a session uncompacted all night
+        (2026-08-20/21, Fable and Opus).  Durable rule: the timer fires
+        IDLE_SECONDS after the most recent activity of any kind, and a
+        transient refusal retries after COMPACT_RETRY_SECONDS.  A live turn
+        (status active) is not a reason to stay dormant: an injected /compact
+        queues behind the running turn and never kills a background process.
+        """
+        if not (
+            self.enabled
+            and self.dirty
+            and self.status in {"idle", "active"}
+            and not self.compacting
+            and child_alive(self.pid)
+            and self.timer_deadline is None
+            and not self.recovery_pending
+        ):
+            return
+        anchor = self._idle_anchor()
+        delay = float(COMPACT_RETRY_SECONDS)
+        if anchor is not None:
+            delay = max(delay, anchor + IDLE_SECONDS[self.cache_profile] - now())
+        self.timer_generation += 1
+        self.timer_deadline = now() + delay
+        self.timer_kind = "compact"
+        self.rearm_count += 1
+        self.last_rearm_reason = reason
+        self.last_state_transition = f"rearmed:{reason}"
+        self._debug(
+            f"rearmed channel={short_id(self.channel)} reason={reason} delay={int(delay)}"
+        )
+        self._guard_log(
+            "rearmed",
+            kind="compact",
+            reason=reason,
+            profile=self.cache_profile,
+            delay=int(delay),
+            rearm_count=self.rearm_count,
+        )
+        self._write_state()
+
+    def _defer_for_activity(self, reason: str) -> None:
+        """Move the idle window for repeated activity of one kind.
+
+        The first keystroke or hook event after arming is a documented
+        cancellation (one `cancelled:<reason>' plus one `rearmed').  Every
+        further event of the same kind while that re-armed timer is pending
+        only slides the deadline quietly, so typing a prompt or a tool-heavy
+        turn does not emit a log line per byte.
+        """
+        if (
+            self.timer_deadline is not None
+            and self.timer_kind == "compact"
+            and self.last_rearm_reason == reason
+        ):
+            anchor = self._idle_anchor()
+            if anchor is not None:
+                self.timer_deadline = max(
+                    self.timer_deadline, anchor + IDLE_SECONDS[self.cache_profile]
+                )
+            self._write_state()
+            return
+        self.cancel(reason)
+        self.rearm(reason)
 
     def _begin_transcript_quiescence(self) -> None:
         """Allow the completed turn's final transcript records to settle."""
@@ -1588,6 +1731,7 @@ class Supervisor:
                 self.last_channel_activity = current
                 self.last_channel_event = "transcript"
                 self._abort_recovery("transcript-activity")
+                self.rearm("transcript-activity")
 
     def _record_transcript_activity(self) -> None:
         """Tail the transcript after inotify or fallback-poll notification."""
@@ -1719,20 +1863,45 @@ class Supervisor:
         except OSError:
             return None
 
-    def _pty_still_owned(self) -> bool:
-        """Verify the live child still owns the PTY slave and its process group."""
-        if not self.pid or self.master_fd is None or not child_alive(self.pid):
-            return False
+    def _pty_ownership_failure(self) -> str | None:
+        """Return a bounded label for the first failing ownership condition."""
+        if not self.pid or self.master_fd is None:
+            return "no-child-or-master"
+        if not child_alive(self.pid):
+            return "child-not-alive"
         if self.child_tty is None:
             self.child_tty = self._read_child_tty()
+        if self.child_tty is None:
+            return "child-tty-unknown"
         try:
-            return (
-                os.getpgid(self.pid) == self.pid
-                and self.child_tty is not None
-                and os.readlink(f"/proc/{self.pid}/fd/0") == self.child_tty
+            if os.getpgid(self.pid) != self.pid:
+                return "pgid-mismatch"
+            if os.readlink(f"/proc/{self.pid}/fd/0") != self.child_tty:
+                return "stdin-not-pty"
+        except OSError as error:
+            return f"oserror-{error.errno or 0}"
+        return None
+
+    def _pty_still_owned(self) -> bool:
+        """Verify the live child still owns the PTY slave and its process group.
+
+        One probe is not evidence: on 2026-08-20 a single failed check vetoed
+        the only armed compaction of the night while the child lived on for
+        another twenty hours.  The probe is retried briefly and every failing
+        attempt is logged with the condition that failed.
+        """
+        failure = None
+        for attempt in range(1, PTY_CHECK_ATTEMPTS + 1):
+            failure = self._pty_ownership_failure()
+            if failure is None:
+                return True
+            self._guard_log(
+                "pty-ownership-check-failed", attempt=attempt, detail=failure
             )
-        except OSError:
-            return False
+            if failure == "child-not-alive":
+                break
+            time.sleep(PTY_CHECK_RETRY_SECONDS)
+        return False
 
     def _channel_process_present(self) -> bool:
         """Return whether a watched channel process is a Claude descendant."""
@@ -1810,8 +1979,8 @@ class Supervisor:
         """Return the first failed final eligibility condition, if any."""
         if not self.enabled:
             return "session-disabled"
-        if self.status != "idle":
-            return "session-active"
+        if self.status not in {"idle", "active"}:
+            return "session-not-running"
         if self.compacting:
             return "already-compacting"
         if not self._pty_still_owned():
@@ -1820,16 +1989,33 @@ class Supervisor:
             return "session-unbound"
         if not self.last_normal_stop:
             return "no-normal-stop"
-        if self.last_lifecycle_activity and self.last_lifecycle_activity > self.last_normal_stop:
+        # Activity after the last Stop only blocks while it is younger than
+        # the idle threshold; old activity has had its full idle window.
+        window_open = self._idle_window_open()
+        if self.status == "active" and window_open:
+            return "session-active"
+        if (
+            window_open
+            and self.last_lifecycle_activity
+            and self.last_lifecycle_activity > self.last_normal_stop
+        ):
             return "lifecycle-activity"
-        if self.last_local_input and self.last_local_input > self.last_normal_stop:
+        if (
+            window_open
+            and self.last_local_input
+            and self.last_local_input > self.last_normal_stop
+        ):
             return "user-input"
         if purpose == "compact":
             if not self.dirty:
                 return "clean"
             if self.recovery_pending:
                 return "channel-recovery-pending"
-            if self.transcript_activity_at and self.transcript_activity_at > self.last_normal_stop:
+            if (
+                window_open
+                and self.transcript_activity_at
+                and self.transcript_activity_at > self.last_normal_stop
+            ):
                 return "transcript-activity"
             if self.transcript_gate_blocked:
                 return "transcript-uncertain"
@@ -1850,9 +2036,10 @@ class Supervisor:
                     return "transcript-activity"
         elif purpose != "manual":
             return "unknown-injection-purpose"
-        if now() - self.last_normal_stop >= TTL_SECONDS[self.cache_profile]:
-            if purpose == "compact":
-                return "cache-already-cold"
+        # A cold cache no longer vetoes compaction (ruling 2026-08-21): the
+        # first morning turn pays the cold read either way, and it is better
+        # paid once over a compacted context.  Warm/cold is recorded on the
+        # compaction-requested event instead.
         _, snapshot_error = self._read_snapshot()
         if purpose == "compact" and snapshot_error:
             return snapshot_error
@@ -1948,8 +2135,15 @@ class Supervisor:
             self.last_gate_rejection_reason = reason
             self.last_state_transition = f"gate-refused:{reason}"
             self._debug(f"cancelled:{reason} channel={short_id(self.channel)}")
-            self._guard_log("gate-refused", purpose=purpose, reason=reason)
+            self._guard_log(
+                "gate-refused",
+                purpose=purpose,
+                reason=reason,
+                transient=reason not in DORMANT_GATE_REASONS,
+            )
             self._write_state()
+            if purpose == "compact" and reason not in DORMANT_GATE_REASONS:
+                self.rearm(f"gate-refused:{reason}")
             return False
         if not validate_inject_command(command, self.watched_servers, self.recovery_command):
             self.last_cancellation_reason = "inject-command-refused"
@@ -1958,6 +2152,7 @@ class Supervisor:
             self._guard_log("inject-refused", purpose=purpose)
             self._write_state()
             return False
+        queued_behind_turn = self.status == "active"
         self.status = "active"
         self.last_gate_rejection_reason = None
         self.last_injection_result = "pending"
@@ -2017,7 +2212,16 @@ class Supervisor:
             self.last_injection_result = "requested"
             self.last_state_transition = "compaction-requested"
             self._debug(f"compaction-requested channel={short_id(self.channel)}")
-            self._guard_log("compaction-requested")
+            cache_age = now() - self.last_normal_stop if self.last_normal_stop else None
+            self._guard_log(
+                "compaction-requested",
+                cache=(
+                    "unknown"
+                    if cache_age is None
+                    else ("warm" if cache_age < TTL_SECONDS[self.cache_profile] else "cold")
+                ),
+                queued_behind_turn=queued_behind_turn,
+            )
         else:
             self._guard_log("manual-injection-requested", command=command)
         self._write_state()
@@ -2064,6 +2268,7 @@ class Supervisor:
                 )
             self.session_id = session_id
             if new_session:
+                self._record_last_session("session-bound")
                 self.completed_turn_epoch = 0
                 self.status_snapshot_epoch = None
                 self.transcript_quiescence_at = None
@@ -2192,7 +2397,7 @@ class Supervisor:
             elif self.recovery_pending and self.recovery_expected_stop:
                 self._guard_log("recovery-command-activity")
             else:
-                self.cancel("session-activity")
+                self._defer_for_activity("session-activity")
         self._write_state()
         return {"ok": True}
 
@@ -2313,7 +2518,7 @@ class Supervisor:
         if self.recovery_pending:
             self._abort_recovery("user-input")
         elif self.last_normal_stop and self.last_local_input > self.last_normal_stop:
-            self.cancel("user-input")
+            self._defer_for_activity("user-input")
         else:
             self._write_state()
 
@@ -2422,6 +2627,28 @@ class Supervisor:
                     and now() >= self.transcript_quiescence_deadline
                 ):
                     self._complete_transcript_quiescence()
+                if (
+                    self.compacting
+                    and self.compaction_requested_at
+                    and now() - self.compaction_requested_at >= COMPACT_TIMEOUT_SECONDS
+                ):
+                    # No PostCompact and no rejection marker inside the
+                    # timeout: the injected command was lost (or is queued
+                    # behind a turn that has not ended).  Clear the latch so
+                    # the governor can try again instead of sitting in
+                    # `compacting' forever.  Unlike Claude's explicit
+                    # rejection this does not swallow the next Stop: that
+                    # Stop is the end of a real turn and must arm normally.
+                    self.compacting = False
+                    self.compaction_requested_at = None
+                    self.compaction_ignore_next_stop = False
+                    self.dirty = True
+                    self.last_cancellation_reason = "compaction-timeout"
+                    self.last_injection_result = "failed"
+                    self.last_state_transition = "compaction-timeout"
+                    self._debug(f"compaction-timeout channel={short_id(self.channel)}")
+                    self._guard_log("compaction-failed", reason="timeout")
+                    self.rearm("compaction-timeout")
                 if self.timer_deadline is not None and now() >= self.timer_deadline:
                     generation = self.timer_generation
                     kind = self.timer_kind
@@ -2503,6 +2730,7 @@ class Supervisor:
             self.socket.close()
         except OSError:
             pass
+        self._record_last_session("supervisor-exit")
         try:
             shutil.rmtree(self.session_dir)
         except OSError:
@@ -2594,6 +2822,7 @@ def main(argv: list[str]) -> int:
         print("Environment: CLAUDE_IDLE_CACHE_PROFILE, CLAUDE_IDLE_COMPACTION_DEBUG,")
         print("CLAUDE_IDLE_COMPACT_SECONDS, CLAUDE_SHORT_CACHE_IDLE_COMPACT_SECONDS,")
         print("CLAUDE_IDLE_COMPACT_MIN_TOKENS, CLAUDE_IDLE_COMPACT_STATUS_STOP_SKEW_SECONDS,")
+        print("CLAUDE_IDLE_COMPACT_RETRY_SECONDS, CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS,")
         print("CLAUDE_IDLE_COMPACT_TRANSCRIPT_QUIESCENCE_SECONDS,")
         print("CLAUDE_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS,")
         print("CLAUDE_IDLE_WATCHED_SERVERS, CLAUDE_IDLE_RECONNECT_SERVER,")
