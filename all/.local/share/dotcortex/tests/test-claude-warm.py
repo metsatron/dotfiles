@@ -512,7 +512,26 @@ class ClaudeWarmTests(unittest.TestCase):
         )
         self.assertTrue(session.read_state()["dirty"])
 
-    def test_foreign_project_session_start_does_not_rebind(self):
+    def test_last_session_record_survives_exit(self):
+        # The runtime dir is removed at exit; the label-keyed record under
+        # XDG_STATE_HOME is what nurse-joy resumes a fainted bot from.
+        with mock.patch.dict(os.environ, {"CLAUDE_WARM_HERDR_AGENT": "TestBot"}, clear=False):
+            session = self.make_session(delay=30, channel=True)
+        session.stop_and_bind()
+        record_path = session.root / "state" / "claude-idle-compaction" / "last-session.TestBot.json"
+        wait_until(lambda: record_path.exists(), message="last-session record not written on bind")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record["session_id"], session.session_id)
+        self.assertEqual(record["agent"], "TestBot")
+        self.assertEqual(record["event"], "session-bound")
+        channel_path = session.root / "state" / "claude-idle-compaction" / f"{session.read_state()['channel']}.last-session.json"
+        self.assertTrue(channel_path.exists())
+        session.event("session-end")
+        if session.process.stdin is not None:
+            session.process.stdin.close()
+        session.process.wait(timeout=10)
+        self.assertEqual(json.loads(record_path.read_text(encoding="utf-8"))["event"], "supervisor-exit")
+
         # A nested one-shot claude inherits the supervisor's control-socket
         # env; its lifecycle hooks arrive here from another project directory
         # and must not steal the binding or end the governor (the 2026-08-20
