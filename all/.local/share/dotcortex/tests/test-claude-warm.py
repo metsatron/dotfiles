@@ -136,6 +136,8 @@ class Session:
         recovery_cooldown=0,
         recovery_confirm=1,
         spawn_channel=False,
+        retry=300,
+        compact_timeout=900,
     ):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
         self.fake = self.root / "fake-claude"
@@ -159,6 +161,8 @@ class Session:
                 "CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS": str(attach_wait),
                 "CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS": str(recovery_cooldown),
                 "CLAUDE_IDLE_CHANNEL_RECOVERY_CONFIRM_SECONDS": str(recovery_confirm),
+                "CLAUDE_IDLE_COMPACT_RETRY_SECONDS": str(retry),
+                "CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS": str(compact_timeout),
             }
         )
         if channel:
@@ -512,8 +516,10 @@ class ClaudeWarmTests(unittest.TestCase):
         # A nested one-shot claude inherits the supervisor's control-socket
         # env; its lifecycle hooks arrive here from another project directory
         # and must not steal the binding or end the governor (the 2026-08-20
-        # overnight no-compact).
-        session = self.make_session(delay=30)
+        # overnight no-compact).  channel=True so the guard log exists: the
+        # test only ever passed when it inherited CLAUDE_IDLE_WATCHED_SERVERS
+        # from a supervised parent session.
+        session = self.make_session(delay=30, channel=True)
         session.stop_and_bind()
         foreign_id = "one-shot-session"
         foreign_transcript = session.root / "foreign-project" / f"{foreign_id}.jsonl"
@@ -1052,18 +1058,139 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertIn("claude-warm --model", source)
         self.assertIn("--channels plugin:telegram@claude-plugins-official", source)
 
-    def test_below_threshold_and_expired_ttl_do_not_inject(self):
-        session = self.make_session(delay=30, ttl=1)
+    def test_below_threshold_is_dormant_and_cold_cache_still_compacts(self):
+        session = self.make_session(delay=30, ttl=1, channel=True)
         session.stop_and_bind()
         session.status(tokens=69999)
         session.control("trigger")
         wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "below-token-threshold")
         self.assertEqual(session.read_state()["last_gate_rejection_reason"], "below-token-threshold")
+        refusal = [
+            event for event in session.guard_events()
+            if event.get("event") == "gate-refused"
+            and event.get("reason") == "below-token-threshold"
+        ]
+        self.assertEqual(len(refusal), 1)
+        self.assertFalse(refusal[0]["transient"])
+        self.assertEqual(session.read_state()["rearm_count"], 0)
         time.sleep(1.2)
         session.status(tokens=80000)
+        # Ruling 2026-08-21: an expired warm-cache TTL no longer vetoes the
+        # compaction; it is only recorded on the request.
         session.control("trigger")
-        wait_until(lambda: session.read_state() and session.read_state()["last_cancellation_reason"] == "cache-already-cold")
-        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+        session.wait_output("COMPACT_RECEIVED")
+        requested = [
+            event for event in session.guard_events()
+            if event.get("event") == "compaction-requested"
+        ]
+        self.assertEqual(len(requested), 1)
+        self.assertEqual(requested[0]["cache"], "cold")
+        self.assertFalse(requested[0]["queued_behind_turn"])
+
+    def test_keystroke_rearms_and_compacts_after_idle_window(self):
+        # The 2026-08-20 Opus overnight: one keystroke at 22:33 cancelled the
+        # armed timer and nothing re-armed it until the morning.
+        session = self.make_session(delay=1, retry=1, channel=True)
+        session.stop_and_bind()
+        session.submit_local_byte(b"x")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_rearm_reason"] == "user-input"
+            and session.read_state()["timer_deadline"] is not None,
+            message="keystroke did not re-arm the timer",
+        )
+        self.assertEqual(session.read_state()["last_cancellation_reason"], "user-input")
+        rearmed = [e for e in session.guard_events() if e.get("event") == "rearmed"]
+        self.assertEqual(len(rearmed), 1)
+        self.assertEqual(rearmed[0]["reason"], "user-input")
+        # A second keystroke slides the window quietly: no second cancel/rearm.
+        session.submit_local_byte(b"y")
+        time.sleep(0.2)
+        self.assertEqual(
+            sum(1 for e in session.guard_events() if e.get("event") in {"rearmed", "cancelled"} and e.get("reason") == "user-input"),
+            2,
+        )
+        session.wait_output("COMPACT_RECEIVED", timeout=4)
+        requested = [e for e in session.guard_events() if e.get("event") == "compaction-requested"]
+        self.assertEqual(requested[-1]["cache"], "warm")
+
+    def test_live_turn_does_not_veto_after_idle_window(self):
+        # The 2026-08-20 Fable overnight, generalized: activity cancels once,
+        # re-arms, and a turn that never reaches Stop still gets its /compact
+        # queued behind it once the idle window has passed.
+        session = self.make_session(delay=1, retry=1, channel=True)
+        session.stop_and_bind()
+        session.event("session-activity")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["status"] == "active"
+            and session.read_state()["last_rearm_reason"] == "session-activity",
+            message="mid-turn activity did not re-arm",
+        )
+        # Inside the idle window the gate still refuses, transiently.
+        session.control("trigger")
+        refusals = [
+            e for e in session.guard_events()
+            if e.get("event") == "gate-refused" and e.get("reason") == "session-active"
+        ]
+        self.assertEqual(len(refusals), 1)
+        self.assertTrue(refusals[0]["transient"])
+        self.assertIsNotNone(session.read_state()["timer_deadline"])
+        session.wait_output("COMPACT_RECEIVED", timeout=4)
+        requested = [e for e in session.guard_events() if e.get("event") == "compaction-requested"]
+        self.assertTrue(requested[-1]["queued_behind_turn"])
+        # The running turn's Stop is consumed as the compaction's Stop and
+        # PostCompact closes the cycle as usual.
+        session.event("stop", stop_hook_active=False)
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
+
+    def test_transient_gate_refusal_rearms_but_dormant_does_not(self):
+        session = self.make_session(delay=1, retry=1, channel=True)
+        session.stop_and_bind()
+        # Snapshot missing at fire time is transient: the timer re-arms.
+        (session.state_path.parent / "status.json").unlink()
+        wait_until(
+            lambda: any(
+                e.get("event") == "gate-refused" and e.get("reason") == "status-snapshot-missing"
+                for e in session.guard_events()
+            ),
+            timeout=4,
+        )
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_rearm_reason"] == "gate-refused:status-snapshot-missing"
+            and session.read_state()["timer_deadline"] is not None,
+            message="transient refusal did not re-arm",
+        )
+        session.status(tokens=80000)
+        session.wait_output("COMPACT_RECEIVED", timeout=4)
+
+    def test_compaction_timeout_clears_latch_and_rearms(self):
+        session = self.make_session(delay=0, retry=1, compact_timeout=1, channel=True)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        self.assertTrue(session.read_state()["compacting"])
+        wait_until(
+            lambda: any(
+                e.get("event") == "compaction-failed" and e.get("reason") == "timeout"
+                for e in session.guard_events()
+            ),
+            timeout=4,
+            message="lost compaction was not timed out",
+        )
+        wait_until(lambda: session.read_state() and not session.read_state()["compacting"])
+        self.assertTrue(session.read_state()["dirty"])
+        self.assertEqual(session.read_state()["last_rearm_reason"], "compaction-timeout")
+        wait_until(
+            lambda: session.output_contains(b"COMPACT_RECEIVED")
+            and bytes(session.output).count(b"COMPACT_RECEIVED") >= 2,
+            timeout=5,
+            message="timed-out compaction was not retried",
+        )
+        # The retry's real Stop is not swallowed: PostCompact closes normally.
+        session.event("post-compact")
+        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
 
     def test_profile_change_rearms_with_new_delay(self):
         session = self.make_session(delay=30)
