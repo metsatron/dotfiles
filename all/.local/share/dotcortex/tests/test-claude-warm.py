@@ -589,6 +589,10 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertEqual(bytes(session.output).count(b"COMPACT_RECEIVED"), 1)
 
     def test_stop_failure_clears_compacting_and_preserves_dirty(self):
+        # A stop-failure with a living child must not leave the loop unarmed:
+        # the 2026-08-26 4091 afternoon showed a cancelled compaction waiting
+        # hours for activity.  Contract: compacting cleared, dirty preserved,
+        # status back to idle, and a retry timer re-armed.
         session = self.make_session(delay=0)
         session.stop_and_bind()
         session.wait_output("COMPACT_RECEIVED")
@@ -596,9 +600,12 @@ class ClaudeWarmTests(unittest.TestCase):
         wait_until(
             lambda: session.read_state()
             and not session.read_state()["compacting"]
-            and session.read_state()["status"] == "error"
+            and session.read_state()["status"] == "idle"
+            and session.read_state()["timer_deadline"] is not None
         )
-        self.assertTrue(session.read_state()["dirty"])
+        state = session.read_state()
+        self.assertTrue(state["dirty"])
+        self.assertEqual(state["last_rearm_reason"], "stop-failure-retry")
 
     def test_resize_signal_reaches_child(self):
         session = self.make_session(terminal=True)
