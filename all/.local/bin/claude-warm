@@ -96,6 +96,10 @@ TRANSCRIPT_INTERNAL_TYPES = frozenset(
         # 2026-08-20 overnight no-compact hunt).
         "atis-latch",
         "file-history-delta",
+        # frame-link joined the same bookkeeping family in 2.1.236 (first seen
+        # 2026-08-29 on Fable's channel: 216 unknown-record latches, 555
+        # gate-refused cycles, two no-compact nights before diagnosis).
+        "frame-link",
         # Claude's own remote-bridge metadata record (bridgeSessionId/owner
         # UUIDs) — session plumbing, not conversation content.
         "bridge-session",
@@ -269,6 +273,13 @@ TTL_SECONDS = {
     "short": env_int("CLAUDE_IDLE_COMPACT_SHORT_CACHE_TTL_SECONDS", 5 * 60),
 }
 MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
+# An unknown transcript record fails closed (transcript-uncertain), but the
+# uncertainty must be a bounded caution, never a permanent veto: with the
+# latch unexpired and hook Stops not arriving (dead control socket,
+# 2026-08-30), one unknown record silenced compaction for two nights.  After
+# this many seconds without cancellation evidence the gate self-heals and
+# logs transcript-gate-expired.
+TRANSCRIPT_GATE_MAX_SECONDS = env_int("CLAUDE_IDLE_TRANSCRIPT_GATE_MAX_SECONDS", 60 * 60, 60)
 COMPACT_RETRY_SECONDS = env_int("CLAUDE_IDLE_COMPACT_RETRY_SECONDS", 5 * 60, 1)
 COMPACT_TIMEOUT_SECONDS = env_int("CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS", 15 * 60, 1)
 PTY_CHECK_ATTEMPTS = 3
@@ -999,6 +1010,7 @@ class Supervisor:
         self.socket.setblocking(False)
         self.selector = selectors.DefaultSelector()
         self.selector.register(self.socket, selectors.EVENT_READ, "server")
+        self.next_socket_check = 0.0
         self.pid: int | None = None
         self.master_fd: int | None = None
         self.child_tty: str | None = None
@@ -1444,6 +1456,54 @@ class Supervisor:
         else:
             self._guard_log("transcript-record-ignored", **fields)
         self._write_state()
+
+    def _ensure_control_socket(self) -> None:
+        """Resurrect the control socket if its path vanished from disk.
+
+        elogind removes $XDG_RUNTIME_DIR when the user's last login session
+        ends (observed 2026-08-29 13:20 on kikin-kushi): the listener fd
+        survives in-process but hook clients get ENOENT, so Stops,
+        SessionStarts, and the compaction plumbing all go silent while the
+        governor believes itself healthy — the latch that only a Stop could
+        clear then vetoes compaction forever.  A throttled stat detects the
+        loss; rebinding restores the hook path and the state/snapshot writes
+        that share the directory.  `loginctl enable-linger` prevents the
+        removal at the source; this guard makes the governor self-heal the
+        moment the runtime root returns either way.
+        """
+        current = monotonic()
+        if current < self.next_socket_check:
+            return
+        self.next_socket_check = current + 5.0
+        try:
+            if self.socket_path.is_socket():
+                return
+        except OSError:
+            pass
+        try:
+            self.selector.unregister(self.socket)
+        except (KeyError, ValueError):
+            pass
+        try:
+            self.socket.close()
+        except OSError:
+            pass
+        try:
+            safe_mkdir(self.session_dir)
+            self.socket_path.unlink(missing_ok=True)
+            self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.socket.bind(str(self.socket_path))
+            os.chmod(self.socket_path, 0o600)
+            self.socket.listen(8)
+            self.socket.setblocking(False)
+            self.selector.register(self.socket, selectors.EVENT_READ, "server")
+            self._guard_log("control-socket-rebound")
+            self._write_state()
+        except OSError as error:
+            # The runtime root itself may still be gone (/run/user/<uid> is
+            # root-owned); keep trying every throttle tick and heal the
+            # instant a login or linger recreates it.
+            self._guard_log("control-socket-rebind-failed", error=str(error)[:200])
 
     def _arm_recovery(self, delay: int | None = None) -> None:
         """Arm the shared one-shot timer for one bounded channel recovery step."""
@@ -2018,7 +2078,18 @@ class Supervisor:
             ):
                 return "transcript-activity"
             if self.transcript_gate_blocked:
-                return "transcript-uncertain"
+                blocked_at = self.transcript_gate_blocked_at or now()
+                if now() - blocked_at >= TRANSCRIPT_GATE_MAX_SECONDS:
+                    # Bounded caution, not a permanent veto — see the
+                    # TRANSCRIPT_GATE_MAX_SECONDS rationale.
+                    self.transcript_gate_blocked = False
+                    self.transcript_gate_blocked_at = None
+                    self._guard_log(
+                        "transcript-gate-expired",
+                        blocked_seconds=int(now() - blocked_at),
+                    )
+                else:
+                    return "transcript-uncertain"
             if self.transcript_quiescence_deadline is not None:
                 return "transcript-not-quiescent"
         elif purpose == "recovery":
@@ -2692,6 +2763,7 @@ class Supervisor:
                         min(timeout, self.transcript_quiescence_deadline - now()),
                     )
                 timeout = min(timeout, max(0.0, self.next_transcript_poll - monotonic()))
+                self._ensure_control_socket()
                 events = self.selector.select(timeout)
                 for key, _mask in events:
                     if key.data == "server":
