@@ -821,10 +821,6 @@
          "Dual sync Nextcloud to ZFS pool + ironwolf02"
          (lambda () (sh "backup-nextcloud --auto -y")))
 
-   (task 'backup:helmcortex
-         "Run HelmCortex sacred sync"
-         (lambda () (sh "~/HelmCortex/FORGE/bin/helmcortex-sync")))
-
    (task 'backup:games
          "Mirror ~/Games to ironwolf01"
          (lambda () (sh "backup-games --auto -y")))
@@ -845,7 +841,6 @@
             "sudo $HOME/.local/bin/backup-system -y"
             "$HOME/.local/bin/backup-dotcortex -y"
             "$HOME/.local/bin/backup-nextcloud --auto -y"
-            "~/HelmCortex/FORGE/bin/helmcortex-sync"
             "backup-games --auto -y"
             "backup-retropie --auto -y")))
 
