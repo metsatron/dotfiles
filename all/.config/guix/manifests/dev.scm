@@ -18,12 +18,18 @@
    ;; rather than Guix's 0.16.0 default. Bump only if the build demands it.
    "zig@0.15.2"
    ;; Game Boy assembler/linker toolchain (rgbasm/rgblink/rgbfix) for building
-   ;; the pret disassemblies mirrored in HelmCortex NEXUS/git (pokeyellow,
-   ;; pokecrystal) — the Event Surface animation-codec ROMs. Guix carries
-   ;; 0.7.0 while the disassembly HEADs want 1.0.x; the mirrors are built from
-   ;; their last 0.7-compatible revisions instead (matching disassemblies
-   ;; produce byte-identical ROMs at any revision), so the Guix version is
-   ;; not pinned. Approved by Mètsàtron 2026-08-28 (Telegram msg 1160).
-   "rgbds"
+   ;; the pret disassemblies mirrored in HelmCortex NEXUS/git — the Event
+   ;; Surface animation-codec ROMs and Emulator Bay cartridges. Guix carries
+   ;; only 0.7.0; the disassembly HEADs want 1.0.x, and two of them have NO
+   ;; 0.7-compatible revision at all (pokepinball's history jumps rgbds
+   ;; 0.5.2→0.8 — 0.7's rewritten link-script grammar hangs rgblink on its
+   ;; contents.link; the pokegreen fork was born on 0.9-era pokered). So the
+   ;; profile carries the local source build below (local/packages/rgbds-next,
+   ;; -L wired on the guix-dev target); matching disassemblies emit
+   ;; byte-identical ROMs at any revision, so this only moves the mirrors to
+   ;; HEAD. Supersedes the 0.7-pin ruling of 2026-08-28 (msg 1160).
+   ;; Approved by Mètsàtron 2026-09-01 (Telegram msg 1585, "let's move to the
+   ;; build from source").
+   "rgbds@1.0.3"
    ))
 ;; Guix User profile manifests:2 ends here

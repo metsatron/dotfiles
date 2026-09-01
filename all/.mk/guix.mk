@@ -74,7 +74,7 @@ guix-core: guix-dirs
 
 guix-dev: guix-core
 | mkdir -p $(EXTRA)/dev
-| $(GUIX) package -m $(GUIX_HOME)/manifests/dev.scm -p $(EXTRA)/dev/dev
+| $(GUIX) package -L $(LOCAL_PKGS) -m $(GUIX_HOME)/manifests/dev.scm -p $(EXTRA)/dev/dev
 
 guix-nonguix: guix-dirs
 | mkdir -p $(EXTRA)/nonguix
