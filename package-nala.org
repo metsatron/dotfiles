@@ -271,10 +271,20 @@ For Debian-family apps distributed as GitHub release artifacts instead of apt re
 Columns: REPO, PKG, ASSET_NAME_OR_GLOB, ARCH, SCOPE, EXTRA
 - PKG is the Debian package name from the .deb metadata, not the asset filename.
 - ARCH: =amd64=, =arm64=, =all=, or =any=
-- SCOPE: =shared=, =devuan-only=, =ubuntu-only=, =vendefoul-only=
+- SCOPE: =shared=, =devuan-only=, =ubuntu-only=, =vendefoul-only=, =chatgpt-supported=
+
+The same manifest accepts =direct://URL= for a one-off HTTPS asset, but the
+release helper rejects every non-HTTPS direct URL.  OpenAI's official lane uses
+=signed-deb://BASE= instead: the helper resolves the current =chatgpt= package
+from BASE's signed =dists/stable/InRelease= and SHA-256-checked =Packages=
+metadata, then verifies the .deb against that metadata before installation.
+The pinned repository key is embedded in the helper, so key retrieval is not a
+runtime trust decision.  The support predicate is deliberately narrow: Debian
+13 and Ubuntu 24.04/26.04 only; Devuan is not treated as Debian for this lane.
 
 #+BEGIN_SRC text :tangle debian/.nala/manifest/releases.ssv :padline no :comments none
 # repo package asset_name_or_glob arch scope extra
+signed-deb://https://persistent.oaistatic.com/codex-app-prod/linux/deb chatgpt chatgpt amd64 chatgpt-supported ""
 anomalyco/opencode open-code opencode-desktop-linux-amd64.deb amd64 shared ""
 matt1398/claude-devtools claude-devtools claude-devtools_*_amd64.deb amd64 shared ""
 lakinduakash/linux-wifi-hotspot linux-wifi-hotspot linux-wifi-hotspot_*_amd64.deb amd64 ubuntu-only ""
@@ -485,19 +495,29 @@ fi
 [ -f "$MAN" ] || exit 0
 
 OS_ID="unknown"
-if [ -f /etc/os-release ]; then
+if [ -f "${NALA_OS_RELEASE:-/etc/os-release}" ]; then
   # shellcheck disable=SC1091
-  . /etc/os-release
+  . "${NALA_OS_RELEASE:-/etc/os-release}"
   OS_ID="$ID"
 fi
 IS_DEVUAN=0
-[ -f /etc/devuan_version ] && IS_DEVUAN=1
-ARCH="$(dpkg --print-architecture)"
+[ -f "${NALA_DEVUAN_VERSION_FILE:-/etc/devuan_version}" ] && IS_DEVUAN=1
+ARCH="${NALA_ARCH:-$(dpkg --print-architecture)}"
+
+chatgpt_supported_platform() {
+  [ "$IS_DEVUAN" -eq 0 ] || return 1
+  case "$OS_ID:${VERSION_ID:-}" in
+    debian:13|ubuntu:24.04|ubuntu:26.04) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 scope_matches() {
   local scope="$1"
   case "$scope" in
     shared|"") return 0 ;;
+    unsupported-devuan) return 1 ;;
+    chatgpt-supported) chatgpt_supported_platform ;;
     devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
     ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
     vendefoul-only) [ "$OS_ID" = "vendefoul" ] ;;
@@ -521,6 +541,11 @@ detect_apt() {
     printf '%s\n' apt-get
   fi
 }
+
+if [ "${NALA_SCOPE_PROBE:-0}" = 1 ]; then
+  scope_matches chatgpt-supported
+  exit $?
+fi
 
 gh_latest_json() {
   local repo="$1" url="https://api.github.com/repos/${repo}/releases/latest"
@@ -557,21 +582,48 @@ write_cache_meta() {
 
 install_local_deb() {
   local apt_bin="$1" bundle="$2"
-  local pkg_name
-  pkg_name="$(dpkg-deb --field "$bundle" Package 2>/dev/null || true)"
+  local pkg_name pkg_version installed_status installed_version
+  if ! pkg_name="$(dpkg-deb --field "$bundle" Package 2>/dev/null)" || [ -z "$pkg_name" ]; then
+    echo "  ! cannot extract package name from $(basename "$bundle")" >&2
+    return 1
+  fi
+  if ! pkg_version="$(dpkg-deb --field "$bundle" Version 2>/dev/null)" || [ -z "$pkg_version" ]; then
+    echo "  ! cannot extract package version from $(basename "$bundle")" >&2
+    return 1
+  fi
+  package_is_exactly_installed() {
+    installed_status=""
+    installed_version=""
+    IFS=$'\t' read -r installed_status installed_version < <(dpkg-query -W -f='${Status}\t${Version}\n' "$pkg_name" 2>/dev/null) || return 1
+    [ "$installed_status" = "install ok installed" ] && [ "$installed_version" = "$pkg_version" ]
+  }
   echo "  -> installing $(basename "$bundle") with $apt_bin"
-  sudo DEBIAN_FRONTEND=noninteractive "$apt_bin" install -y "$bundle" || true
+  if ! sudo DEBIAN_FRONTEND=noninteractive "$apt_bin" install -y "$bundle"; then
+    echo "  -> $apt_bin install failed; retrying with dpkg + apt-get -f" >&2
+  fi
   # Nala sometimes returns 0 but silently skips — verify the package is installed
-  if [ -n "$pkg_name" ] && dpkg -l "$pkg_name" 2>/dev/null | grep -q "^ii"; then
+  if package_is_exactly_installed; then
     return 0
   fi
   echo "  -> $apt_bin did not install $pkg_name, retrying with dpkg + apt-get -f"
-  sudo DEBIAN_FRONTEND=noninteractive dpkg -i "$bundle" || true
+  if ! sudo DEBIAN_FRONTEND=noninteractive dpkg -i "$bundle"; then
+    echo "  -> dpkg dependency setup incomplete; running apt-get -f" >&2
+  fi
   sudo DEBIAN_FRONTEND=noninteractive apt-get install -f -y
+  if package_is_exactly_installed; then
+    return 0
+  fi
+  echo "  ! package $pkg_name is not installed at bundle version $pkg_version after dependency repair" >&2
+  return 1
 }
 
+if [ "${NALA_INSTALL_PROBE:-0}" = 1 ]; then
+  install_local_deb "${NALA_TEST_APT_BIN:-apt-get}" "$NALA_TEST_BUNDLE"
+  exit $?
+fi
+
 sync_one() {
-  local apt_bin="$1" repo="$2" pkg="$3" asset_glob="$4" want_arch="$5" scope="$6"
+  local apt_bin="$1" repo="$2" pkg="$3" asset_glob="$4" want_arch="$5" scope="$6" extra="$7"
   local json latest_tag latest_ver asset_name asset_url asset_digest dir bundle tmp old_name cached_digest cached_tag installed
   local bundle_pkg bundle_ver effective_pkg compare_ver
   local asset_entry_name asset_entry_url asset_entry_digest
@@ -586,25 +638,101 @@ sync_one() {
     return 0
   fi
 
-  json="$(gh_latest_json "$repo")"
-  latest_tag="$(jq -r '.tag_name' <<<"$json")"
-  latest_ver="$(normalize_ver "$latest_tag")"
-
-  while IFS=$'\t' read -r asset_entry_name asset_entry_url asset_entry_digest; do
-    case "$asset_entry_name" in
-      $asset_glob)
-        asset_name="$asset_entry_name"
-        asset_url="$asset_entry_url"
-        asset_digest="$asset_entry_digest"
-        break
-        ;;
+  if [ "${NALA_SYNC_PROBE:-0}" = 1 ]; then
+    case " ${NALA_SYNC_FAIL_PKGS:-} " in
+      *" $pkg "*) return 1 ;;
     esac
-  done < <(jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<<"$json")
+    echo "  probed $pkg"
+    return 0
+  fi
+
+  if [[ "$repo" == signed-deb://* ]]; then
+    local repo_base="${repo#signed-deb://}" metadata_parent metadata_tmp keyring packages_rel expected_packages_sha package_stanza package_version package_filename package_digest metadata_exit_trap metadata_cleanup_trap
+    case "$repo_base" in https://*) ;; *) echo "  ! signed Debian repo must use HTTPS: $repo_base" >&2; return 1 ;; esac
+    metadata_parent="${NALA_RELEASE_TMPDIR:-${TMPDIR:-/tmp}}"
+    mkdir -p "$metadata_parent" || { echo "  ! cannot create signed metadata parent: $metadata_parent" >&2; return 1; }
+    metadata_tmp="$(mktemp -d "$metadata_parent/nala-release.XXXXXX")" || { echo "  ! cannot create signed metadata workspace" >&2; return 1; }
+    metadata_exit_trap="$(trap -p EXIT || true)"
+    printf -v metadata_cleanup_trap 'rm -rf -- %q' "$metadata_tmp"
+    trap "$metadata_cleanup_trap" EXIT
+    keyring="$metadata_tmp/openai-repo-keyring.gpg"
+    if ! {
+    printf '%s' 'mQINBGpypFUBEACi1Vvzq9pIpA6lj7chbqELuxJtVuzUzxrasa6ZU0yF4yhq7jf83YkJRHwbezBKeQyzJ5lkX0EhXS8aXxUhMAm3PFpAlwcInfKzmV7atJwvaxIw6RmdGYe9fBWKjTN/SmPIjtyxrTznZY97+TfD1AeGZpLaJ8fsnhrC+HkiN2TACiTocgpehFiP0OWK7mWZeTWnY2scpIYXP1Ro7nQv4KacmY4JacTQ7m/HM0Qej/3olhuEv2CwlMVWw57/oHhmTllfLDQOogFQyIVqaaR98y/Eu6cAabSfcsqAAZ2A8vfHYD27z28JvLO2PZEJd5ThlnX4Zqv0eIpZdBj//8Sl/MSqTshFZ1NDsRoqwdqw284X5MpnOJ4k4Sc2Se8tJxt/nCeibH3dJ504Fb1X/mnOqhCAQ6pVJz4RB5HRlFPSkxVPyag1v1m/7T4vie+OR4eqFQNz6mudrOoMmeVIfyL5fbe4cOr4fk/FyvEE2xMgkFatPqXn7vM9og+zremPCfwRAFpBPyX74VowFY7llcdaj/w8K5T8PzM14Hb3E4ZKizMluKmTvTq9WE1/eSQJLLQqXD5VmtmdUaC/VyE/1ZlIxcA1LWqvEQ327UXREvX/nHsrkKrl956WjzkiHFUTsD1NJ0dMfs+csOt8Furb5jZj+HsMmCm9jLdfz5b/4WKLPbvxIwARAQABtBZDb2RleCBMaW51eCBSZXBvc2l0b3J5iQJRBBMBCgA7FiEEO/oOSui4zBai2bpoSjtKVmxGYOQFAmpypFUCGwMFCwkIBwICIgIGFQoJCAsCBBYCAwECHgcCF4AACgkQSjtKVmxGYORlCQ/9FyikZo8HQcJBP9E/oXVPds/fQnIFB2qJR2z3DrfYEonNt/evSAySkPPq4/mEOjaI0pFlDDGSaps+FTcJFgoVRTasBIF7JJivvjW9ap8iWEbhhVLeIrFLbMLpUcTRntUx7R4fVMJ/1/cGn+NWZmNwS9ORorzSyCH0IAgCw1Xc3ZrjuMbFVjdToMC1TiXXCEmlYpQakmQ3Ay1cH0FHC2BBNn1MNVkJdPhpZIZCdhaMPHfYFpyopg8wFvZ5iIcvlbMgyuy8CPJVRWUcYy2dOhEOGnYJnXRPkE3E1hf8YOHNzRlduH896lT9qcEK2+fpLfrVGoc4zscLZ+Ey+Ko6iQRdVE1j67+wNR3hX8ukue574v1N/xxui575jumSE19lEj1sH4+P4gFHOtTbF0JhKKzLctbga0IAwTPKhnt3qzj1U5Yj/MZSuEVjrLhdRauOuFBXUclgyVf2w/lE85UUOdlcollsYA6Huq7xDamqf8SslZQGre3EI+lhpqJR1cOwDMUzzcl40uTyhrxXXd/bk4QSlhZbwHR25Pnt+ZMtWavlQWS0eDEV8djuXAURCmx5WOqAFB/TJe1mn5EvyWg4VFzrY/NVNOpzgY5+Xp7J28z7f637r712Eu9j4imVcdPigwS+jf/0f81i2o9b82Y26TN8+EtDLCY841MJ1lrjDrX/dno=' | base64 -d | gpg --batch --quiet --dearmor --output "$keyring"
+    }; then
+      echo "  ! cannot construct pinned OpenAI repository keyring" >&2
+      rm -rf -- "$metadata_tmp"
+      [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT
+      return 1
+    fi
+    if ! curl -fsSL "$repo_base/dists/stable/InRelease" -o "$metadata_tmp/InRelease"; then
+      echo "  ! cannot download signed InRelease from $repo_base" >&2
+      rm -rf -- "$metadata_tmp"
+      [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT
+      return 1
+    fi
+    if ! gpgv --keyring "$keyring" "$metadata_tmp/InRelease" >/dev/null; then
+      echo "  ! OpenAI InRelease signature verification failed" >&2
+      rm -rf -- "$metadata_tmp"
+      [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT
+      return 1
+    fi
+    packages_rel="main/binary-$ARCH/Packages"
+    if ! curl -fsSL "$repo_base/dists/stable/$packages_rel" -o "$metadata_tmp/Packages"; then
+      echo "  ! cannot download signed Packages metadata for $ARCH" >&2
+      rm -rf -- "$metadata_tmp"
+      [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT
+      return 1
+    fi
+    expected_packages_sha="$(awk -v path="$packages_rel" '$0 == "SHA256:" {found=1; next} found && $3 == path {print $1; exit}' "$metadata_tmp/InRelease")"
+    [ -n "$expected_packages_sha" ] || { echo "  ! signed InRelease has no SHA-256 for $packages_rel" >&2; rm -rf -- "$metadata_tmp"; [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT; return 1; }
+    if ! printf '%s  %s\n' "$expected_packages_sha" "$metadata_tmp/Packages" | sha256sum -c - >/dev/null; then
+      echo "  ! Packages metadata SHA-256 verification failed" >&2
+      rm -rf -- "$metadata_tmp"
+      [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT
+      return 1
+    fi
+    package_stanza="$(awk -v pkg="$pkg" 'BEGIN{RS=""} $1 == "Package:" && $2 == pkg {print; exit}' "$metadata_tmp/Packages")"
+    package_version="$(awk '$1 == "Version:" {print $2}' <<<"$package_stanza")"
+    package_filename="$(awk '$1 == "Filename:" {print $2}' <<<"$package_stanza")"
+    package_digest="$(awk '$1 == "SHA256:" {print $2}' <<<"$package_stanza")"
+    [ -n "$package_version" ] && [ -n "$package_filename" ] && [ -n "$package_digest" ] || { echo "  ! signed Packages has no complete $pkg stanza" >&2; rm -rf -- "$metadata_tmp"; [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT; return 1; }
+    json='{}'; latest_tag="$package_version"; latest_ver="$package_version"; asset_name="$(basename "$package_filename")"; asset_url="$repo_base/$package_filename"; asset_digest="$package_digest"
+    rm -rf -- "$metadata_tmp"
+    [ -n "$metadata_exit_trap" ] && eval "$metadata_exit_trap" || trap - EXIT
+  elif [[ "$repo" == direct://* ]]; then
+    json='{}'
+    latest_tag="${extra%%,*}"
+    latest_ver="$latest_tag"
+    asset_name="$asset_glob"
+    asset_url="${repo#direct://}"
+    asset_digest="${extra#*,}"
+  else
+    json="$(gh_latest_json "$repo")"
+    latest_tag="$(jq -r '.tag_name' <<<"$json")"
+    latest_ver="$(normalize_ver "$latest_tag")"
+
+    while IFS=$'\t' read -r asset_entry_name asset_entry_url asset_entry_digest; do
+      case "$asset_entry_name" in
+        $asset_glob)
+          asset_name="$asset_entry_name"
+          asset_url="$asset_entry_url"
+          asset_digest="$asset_entry_digest"
+          break
+          ;;
+      esac
+    done < <(jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<<"$json")
+  fi
 
   [ -n "${asset_url:-}" ] || {
     echo "  ! no release asset matching $asset_glob for $repo" >&2
     return 1
   }
+  case "$asset_url" in https://*) ;; *) echo "  ! refusing non-HTTPS asset URL: $asset_url" >&2; return 1 ;; esac
+
+  if [ "${NALA_RELEASE_DIFF_ONLY:-0}" = 1 ]; then
+    echo "  release: pkg=$pkg arch=$want_arch latest=$latest_ver installed=$(installed_version "$pkg" || true)"
+    return 0
+  fi
 
   dir="$(cache_dir "$pkg")"
   mkdir -p "$dir"
@@ -622,6 +750,9 @@ sync_one() {
     || { [ -z "$asset_digest" ] && [ "$cached_tag" != "$latest_tag" ]; }; then
     tmp="$bundle.part"
     curl -fL "$asset_url" -o "$tmp"
+    if [ -n "$asset_digest" ]; then
+      printf '%s  %s\n' "$asset_digest" "$tmp" | sha256sum -c - >/dev/null
+    fi
     mv -f "$tmp" "$bundle"
   fi
 
@@ -650,9 +781,13 @@ sync_one() {
 APT_BIN="$(detect_apt)"
 
 echo "== Syncing release-backed .deb packages =="
+failures=0
 while IFS='|' read -r repo pkg asset_glob want_arch scope _extra; do
   [ -n "$repo" ] || continue
-  sync_one "$APT_BIN" "$repo" "$pkg" "$asset_glob" "$want_arch" "$scope" || true
+  if ! sync_one "$APT_BIN" "$repo" "$pkg" "$asset_glob" "$want_arch" "$scope" "$_extra"; then
+    echo "  ! failed $pkg" >&2
+    failures=$((failures + 1))
+  fi
 done < <(
   awk -v FS='[ \t]+' '
     function dq(s){ return (s == "\"\"" ? "" : s) }
@@ -663,6 +798,144 @@ done < <(
     }
   ' "$MAN"
 )
+if [ "$failures" -ne 0 ]; then
+  echo "nala-release-sync: $failures manifest row(s) failed" >&2
+  exit 1
+fi
+#+END_SRC
+
+* Release helper fixture tests
+#+BEGIN_SRC bash :tangle debian/.local/share/dotcortex/tests/nala-release-platform.sh :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../../../.." && pwd)"
+HELPER="$ROOT/debian/.local/bin/nala-release-sync"
+probe() {
+  local name="$1" expected="$2" os_release="$3" devuan_file="$4"
+  local actual=0
+  NALA_SCOPE_PROBE=1 NALA_OS_RELEASE="$os_release" NALA_DEVUAN_VERSION_FILE="$devuan_file" \
+    NALA_ARCH=amd64 NALA_RELEASES_SSV="$ROOT/debian/.nala/manifest/releases.ssv" \
+    "$HELPER" >/dev/null 2>&1 || actual=$?
+  [ "$actual" -eq "$expected" ] || { echo "scope fixture failed: $name (got $actual, want $expected)" >&2; exit 1; }
+}
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' > "$tmp/ubuntu2404"
+printf '%s\n' 'ID=ubuntu' 'VERSION_ID="26.04"' > "$tmp/ubuntu2604"
+printf '%s\n' 'ID=ubuntu' 'VERSION_ID="22.04"' > "$tmp/ubuntu2204"
+printf '%s\n' 'ID=debian' 'VERSION_ID="13"' > "$tmp/debian13"
+printf '%s\n' 'ID=debian' 'VERSION_ID="12"' > "$tmp/debian12"
+printf '%s\n' 'ID=devuan' 'VERSION_ID="6"' > "$tmp/devuan6"
+touch "$tmp/devuan-version"
+probe ubuntu-24.04 0 "$tmp/ubuntu2404" "$tmp/no-devuan"
+probe ubuntu-26.04 0 "$tmp/ubuntu2604" "$tmp/no-devuan"
+probe debian-13 0 "$tmp/debian13" "$tmp/no-devuan"
+probe ubuntu-22.04 1 "$tmp/ubuntu2204" "$tmp/no-devuan"
+probe debian-12 1 "$tmp/debian12" "$tmp/no-devuan"
+probe devuan-6 1 "$tmp/devuan6" "$tmp/devuan-version"
+
+arm_log="$tmp/arm-routing.log"
+NALA_SYNC_PROBE=1 NALA_RELEASES_SSV="$ROOT/debian/.nala/manifest/releases.ssv" \
+  NALA_OS_RELEASE="$tmp/ubuntu2404" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" \
+  NALA_ARCH=arm64 HOME="$tmp/home" "$HELPER" >"$arm_log" 2>&1
+grep -q 'skip chatgpt (arch=amd64, this=arm64)' "$arm_log"
+if grep -q 'probed chatgpt' "$arm_log"; then
+  echo "arm64 routing processed the amd64 ChatGPT row" >&2
+  exit 1
+fi
+
+test_manifest="$tmp/releases.ssv"
+printf '%s\n' \
+  'first first first.deb amd64 shared ""' \
+  'later later later.deb amd64 shared ""' > "$test_manifest"
+aggregation_log="$tmp/aggregation.log"
+if NALA_SYNC_PROBE=1 NALA_SYNC_FAIL_PKGS=first NALA_RELEASES_SSV="$test_manifest" \
+  NALA_OS_RELEASE="$tmp/ubuntu2404" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" \
+  NALA_ARCH=amd64 HOME="$tmp/home" "$HELPER" >"$aggregation_log" 2>&1; then
+  echo "failure aggregation unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'failed first' "$aggregation_log"
+grep -q 'later' "$aggregation_log"
+grep -q '1 manifest row(s) failed' "$aggregation_log"
+
+stubbin="$tmp/bin"
+mkdir -p "$stubbin" "$tmp/home"
+printf '%s\n' '#!/usr/bin/env bash' 'if [ "${1:-}" = --print-architecture ]; then printf "amd64\n"; exit 0; fi' 'if [ "$1" = -i ]; then printf dpkg-called >> "$NALA_TEST_LOG"; exit 1; fi' 'exit 2' > "$stubbin/dpkg"
+printf '%s\n' '#!/usr/bin/env bash' 'case "${*: -1}" in Package) printf testpkg;; Version) printf 2;; *) exit 2;; esac' > "$stubbin/dpkg-deb"
+printf '%s\n' '#!/usr/bin/env bash' 'if [ -f "$NALA_TEST_STATE" ]; then printf "install ok installed\t%s\n" "$(cat "$NALA_TEST_STATE")"; else exit 1; fi' > "$stubbin/dpkg-query"
+printf '%s\n' '#!/usr/bin/env bash' 'while [[ "${1:-}" == *=* ]]; do export "$1"; shift; done' 'exec "$@"' > "$stubbin/sudo"
+printf '%s\n' '#!/usr/bin/env bash' 'printf apt-called >> "$NALA_TEST_LOG"; exit 1' > "$stubbin/fake-apt"
+printf '%s\n' '#!/usr/bin/env bash' 'printf apt-get-f-called >> "$NALA_TEST_LOG"' '[ "${NALA_TEST_REPAIR:-0}" = 1 ] && printf 2 > "$NALA_TEST_STATE"' 'exit 0' > "$stubbin/apt-get"
+chmod +x "$stubbin"/*
+NALA_INSTALL_PROBE=1 NALA_TEST_APT_BIN="$stubbin/fake-apt" NALA_TEST_BUNDLE="$tmp/fake.deb" \
+  NALA_TEST_LOG="$tmp/install.log" NALA_TEST_STATE="$tmp/install.state" NALA_TEST_REPAIR=1 \
+  NALA_RELEASES_SSV="$ROOT/debian/.nala/manifest/releases.ssv" \
+  HOME="$tmp/home" PATH="$stubbin:$PATH" "$HELPER" >/dev/null
+grep -q apt-called "$tmp/install.log"
+grep -q dpkg-called "$tmp/install.log"
+grep -q apt-get-f-called "$tmp/install.log"
+
+printf 1 > "$tmp/install.state"
+if NALA_INSTALL_PROBE=1 NALA_TEST_APT_BIN="$stubbin/fake-apt" NALA_TEST_BUNDLE="$tmp/fake.deb" \
+  NALA_TEST_LOG="$tmp/install-fail.log" NALA_TEST_STATE="$tmp/install.state" NALA_TEST_REPAIR=0 \
+  NALA_RELEASES_SSV="$ROOT/debian/.nala/manifest/releases.ssv" \
+  HOME="$tmp/home" PATH="$stubbin:$PATH" "$HELPER" >/dev/null 2>&1; then
+  echo "final package-version verification unexpectedly succeeded" >&2
+  exit 1
+fi
+
+signed_manifest="$tmp/signed-releases.ssv"
+printf '%s\n' 'signed-deb://https://fixture.invalid/deb chatgpt chatgpt amd64 chatgpt-supported ""' > "$signed_manifest"
+packages_fixture="$tmp/Packages"
+printf '%s\n' \
+  'Package: chatgpt' \
+  'Version: 99.1' \
+  'Filename: pool/chatgpt_99.1_amd64.deb' \
+  'SHA256: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' > "$packages_fixture"
+packages_sha="$(sha256sum "$packages_fixture" | awk '{print $1}')"
+inrelease_fixture="$tmp/InRelease"
+printf 'SHA256:\n %s %s main/binary-amd64/Packages\n' \
+  "$packages_sha" "$(wc -c < "$packages_fixture")" > "$inrelease_fixture"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'url=""; out=""' \
+  'while [ "$#" -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; https://*) url="$1"; shift;; *) shift;; esac; done' \
+  'case "$url" in */InRelease) cp "$NALA_TEST_INRELEASE" "$out";; */Packages) cp "$NALA_TEST_PACKAGES" "$out";; *) exit 2;; esac' > "$stubbin/curl"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'out=""; while [ "$#" -gt 0 ]; do case "$1" in --output) out="$2"; shift 2;; *) shift;; esac; done' \
+  'cat > "$out"' > "$stubbin/gpg"
+printf '%s\n' '#!/usr/bin/env bash' '[ "${NALA_TEST_GPGV_FAIL:-0}" != 1 ]' > "$stubbin/gpgv"
+chmod +x "$stubbin/curl" "$stubbin/gpg" "$stubbin/gpgv"
+
+metadata_parent="$tmp/metadata"
+mkdir -p "$metadata_parent"
+NALA_RELEASE_DIFF_ONLY=1 NALA_RELEASES_SSV="$signed_manifest" \
+  NALA_OS_RELEASE="$tmp/ubuntu2404" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" NALA_ARCH=amd64 \
+  NALA_RELEASE_TMPDIR="$metadata_parent" NALA_TEST_INRELEASE="$inrelease_fixture" \
+  NALA_TEST_PACKAGES="$packages_fixture" NALA_TEST_STATE="$tmp/no-installed-state" \
+  HOME="$tmp/home" PATH="$stubbin:$PATH" "$HELPER" > "$tmp/signed-success.log"
+grep -q 'latest=99.1' "$tmp/signed-success.log"
+if find "$metadata_parent" -mindepth 1 -print -quit | grep -q .; then
+  echo "signed metadata workspace leaked after success" >&2
+  exit 1
+fi
+
+if NALA_RELEASE_DIFF_ONLY=1 NALA_RELEASES_SSV="$signed_manifest" \
+  NALA_OS_RELEASE="$tmp/ubuntu2404" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" NALA_ARCH=amd64 \
+  NALA_RELEASE_TMPDIR="$metadata_parent" NALA_TEST_INRELEASE="$inrelease_fixture" \
+  NALA_TEST_PACKAGES="$packages_fixture" NALA_TEST_GPGV_FAIL=1 NALA_TEST_STATE="$tmp/no-installed-state" \
+  HOME="$tmp/home" PATH="$stubbin:$PATH" "$HELPER" > "$tmp/signed-failure.log" 2>&1; then
+  echo "bad signed metadata unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q 'signature verification failed' "$tmp/signed-failure.log"
+if find "$metadata_parent" -mindepth 1 -print -quit | grep -q .; then
+  echo "signed metadata workspace leaked after failure" >&2
+  exit 1
+fi
+
+printf '%s\n' 'nala release platform fixtures: ok'
 #+END_SRC
 
 * Apply script
@@ -948,19 +1221,29 @@ MAN="${NALA_RELEASES_SSV:-$HOME/.nala/manifest/releases.ssv}"
 [ -f "$MAN" ] || exit 0
 
 OS_ID="unknown"
-if [ -f /etc/os-release ]; then
+if [ -f "${NALA_OS_RELEASE:-/etc/os-release}" ]; then
   # shellcheck disable=SC1091
-  . /etc/os-release
+  . "${NALA_OS_RELEASE:-/etc/os-release}"
   OS_ID="$ID"
 fi
 IS_DEVUAN=0
-[ -f /etc/devuan_version ] && IS_DEVUAN=1
-ARCH="$(dpkg --print-architecture)"
+[ -f "${NALA_DEVUAN_VERSION_FILE:-/etc/devuan_version}" ] && IS_DEVUAN=1
+ARCH="${NALA_ARCH:-$(dpkg --print-architecture)}"
+
+chatgpt_supported_platform() {
+  [ "$IS_DEVUAN" -eq 0 ] || return 1
+  case "$OS_ID:${VERSION_ID:-}" in
+    debian:13|ubuntu:24.04|ubuntu:26.04) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 
 scope_matches() {
   local scope="$1"
   case "$scope" in
     shared|"") return 0 ;;
+    unsupported-devuan) return 1 ;;
+    chatgpt-supported) chatgpt_supported_platform ;;
     devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
     ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
     vendefoul-only) [ "$OS_ID" = "vendefoul" ] ;;
@@ -995,6 +1278,13 @@ installed_version() {
   dpkg-query -W -f='${Version}\n' "$pkg" 2>/dev/null || true
 }
 
+if grep -q '^signed-deb://' "$MAN"; then
+  SYNC_HELPER="${NALA_RELEASE_SYNC_HELPER:-$HOME/.local/bin/nala-release-sync}"
+  [ -x "$SYNC_HELPER" ] || SYNC_HELPER="$(dirname "$0")/nala-release-sync"
+  NALA_RELEASE_DIFF_ONLY=1 NALA_RELEASES_SSV="$MAN" "$SYNC_HELPER"
+  exit $?
+fi
+
 echo "[release-backed debs]"
 while IFS='|' read -r repo pkg asset_glob want_arch scope _extra; do
   [ -n "$repo" ] || continue
@@ -1009,18 +1299,23 @@ while IFS='|' read -r repo pkg asset_glob want_arch scope _extra; do
     continue
   fi
 
-  json="$(gh_latest_json "$repo")"
-  latest_tag="$(jq -r '.tag_name' <<<"$json")"
-  latest_ver="$(normalize_ver "$latest_tag")"
-  resolved_asset_name=""
-  while IFS=$'\t' read -r asset_entry_name _asset_entry_url _asset_entry_digest; do
-    case "$asset_entry_name" in
-      $asset_glob)
-        resolved_asset_name="$asset_entry_name"
-        break
-        ;;
-    esac
-  done < <(jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<<"$json")
+  if [[ "$repo" == direct://* ]]; then
+    latest_ver="${_extra%%,*}"
+    resolved_asset_name="$asset_glob"
+  else
+    json="$(gh_latest_json "$repo")"
+    latest_tag="$(jq -r '.tag_name' <<<"$json")"
+    latest_ver="$(normalize_ver "$latest_tag")"
+    resolved_asset_name=""
+    while IFS=$'\t' read -r asset_entry_name _asset_entry_url _asset_entry_digest; do
+      case "$asset_entry_name" in
+        $asset_glob)
+          resolved_asset_name="$asset_entry_name"
+          break
+          ;;
+      esac
+    done < <(jq -r '.assets[] | [.name, .browser_download_url, (.digest // "")] | @tsv' <<<"$json")
+  fi
 
   if [ -z "$resolved_asset_name" ]; then
     echo "  ? $pkg (no release asset matching $asset_glob in $repo)"
