@@ -3,11 +3,15 @@
 import base64
 import json
 import os
+import shlex
 import subprocess
 import socket
 import sys
 
 CLASSES = {"hub", "client-fanout-safe", "client-fanout-reconcile"}
+HUB_EXEC_PROTOCOL = "dotcortex-hub-exec-v1"
+MAX_HUB_ENVELOPE = 64 * 1024
+TOOL_DIRS = frozenset({"FORGE/bin", "FORGE/VoxForge/bin", "FORGE/PixelForge/bin"})
 
 
 def fail(message, code):
@@ -61,6 +65,66 @@ def route_stack(tool):
     return ":".join([*stack, tool])
 
 
+def hub_real(tool_dir, tool):
+    if not isinstance(tool_dir, str) or tool_dir not in TOOL_DIRS:
+        fail(f"unadmitted HelmCortex tool directory: {tool_dir!r}", 78)
+    try:
+        valid_tool = (isinstance(tool, str) and bool(tool) and tool not in {".", ".."}
+                      and "/" not in tool and "\\" not in tool and "\x00" not in tool
+                      and len(tool.encode("utf-8")) <= 255)
+    except UnicodeError:
+        valid_tool = False
+    if not valid_tool:
+        fail("invalid HelmCortex tool name", 78)
+    return os.path.join(os.path.expanduser("~/HelmCortex"), tool_dir, tool)
+
+
+def hub_envelope(payload):
+    if not isinstance(payload, dict) or set(payload) != {
+            "protocol", "tool", "tool_dir", "argv", "caller_pwd", "router_stack"}:
+        fail("invalid hub invocation fields", 78)
+    if payload["protocol"] != HUB_EXEC_PROTOCOL:
+        fail("unsupported hub invocation protocol", 78)
+    hub_real(payload["tool_dir"], payload["tool"])
+    if (not isinstance(payload["argv"], list)
+            or not all(isinstance(arg, str) and "\x00" not in arg for arg in payload["argv"])):
+        fail("invalid hub argv", 78)
+    for key in ("caller_pwd", "router_stack"):
+        value = payload[key]
+        if not isinstance(value, str) or not value or "\x00" in value or len(value) > 4096:
+            fail(f"invalid hub {key}", 78)
+    if not os.path.isabs(payload["caller_pwd"]):
+        fail("hub caller_pwd must be absolute", 78)
+    if payload["router_stack"].split(":").count(payload["tool"]) != 1:
+        fail("invalid hub recursion stack", 125)
+    encoded = base64.b64encode(json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        allow_nan=False).encode("ascii")).decode("ascii")
+    if len(encoded) > 4 * ((MAX_HUB_ENVELOPE + 2) // 3):
+        fail("hub invocation exceeds bound", 78)
+    return encoded
+
+
+def receive_hub(encoded):
+    if len(encoded) > 4 * ((MAX_HUB_ENVELOPE + 2) // 3):
+        fail("hub invocation exceeds bound", 78)
+    try:
+        payload = json.loads(base64.b64decode(encoded, validate=True))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        fail(f"invalid hub invocation encoding: {exc}", 78)
+    if hub_envelope(payload) != encoded:
+        fail("noncanonical hub invocation encoding", 78)
+    real = hub_real(payload["tool_dir"], payload["tool"])
+    env = os.environ.copy()
+    env["HX_CALLER_PWD"] = payload["caller_pwd"]
+    env["HX_ROUTER_STACK"] = payload["router_stack"]
+    try:
+        os.chdir(os.path.dirname(real))
+        os.execvpe(real, [real, *payload["argv"]], env)
+    except OSError as exc:
+        fail(f"hub tool {real} could not execute: {exc}", 127)
+
+
 def run_local(real, tool, argv, guarded):
     if guarded:
         guard_local(real)
@@ -94,9 +158,12 @@ def isolate_ssh_stdin():
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--hub-exec":
+        receive_hub(sys.argv[2])
     if len(sys.argv) < 5:
-        fail("usage: hx-router REGISTRY TOOL LOCAL_REAL REMOTE_REAL [ARGV ...]", 64)
-    registry_path, tool, local_real, remote_real, *argv = sys.argv[1:]
+        fail("usage: hx-router REGISTRY TOOL LOCAL_REAL TOOL_DIR [ARGV ...]", 64)
+    registry_path, tool, local_real, tool_dir, *argv = sys.argv[1:]
+    hub_real(tool_dir, tool)
     registry = load(registry_path)
     if registry.get("schema") != "dotcortex.fleet-router.v2":
         fail(f"unsupported registry schema in {registry_path}", 78)
@@ -136,8 +203,8 @@ def main():
         try:
             result = reconcile.dispatch(
                 registry["transport"], tool, argv, source_root,
-                local_real if role == "hub" and machine_key == hub_key else remote_real,
-                stack, role == "hub" and machine_key == hub_key, ssh_executable(),
+                local_real, tool_dir, stack,
+                role == "hub" and machine_key == hub_key, ssh_executable(),
             )
         except reconcile.Refusal as exc:
             fail(str(exc), exc.code)
@@ -153,16 +220,17 @@ def main():
     for key, value in transport.get("ssh_options", {}).items():
         options.extend(["-o", f"{key}={value}"])
     payload = {
-        "real": remote_real,
+        "protocol": HUB_EXEC_PROTOCOL,
+        "tool": tool,
+        "tool_dir": tool_dir,
         "argv": argv,
         "caller_pwd": os.environ.get("HX_CALLER_PWD", os.getcwd()),
         "router_stack": route_stack(tool),
     }
-    encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).decode()
-    code = ("import base64,json,os,sys;d=json.loads(base64.b64decode(sys.argv[2]));"
-            "os.environ[\"HX_CALLER_PWD\"]=d[\"caller_pwd\"];os.environ[\"HX_ROUTER_STACK\"]=d[\"router_stack\"];"
-            "os.chdir(os.path.dirname(d[\"real\"]));os.execvpe(d[\"real\"],[d[\"real\"],*d[\"argv\"]],os.environ)")
-    command = "python3 -c '" + code + "' -- " + encoded
+    encoded = hub_envelope(payload)
+    code = ('import os,sys;real=os.path.expanduser("~/.local/libexec/hx-router");'
+            'os.execv(real,[real,"--hub-exec",sys.argv[1]])')
+    command = "python3 -c " + shlex.quote(code) + " " + shlex.quote(encoded)
     executable = ssh_executable()
     isolate_ssh_stdin()
     os.execv(executable, [executable, *options, alias, command])
