@@ -23,6 +23,7 @@ run_apply() {
   PLANK_DCONF_SOURCE="$DCONF_SOURCE" \
   PLANK_CONFIG_HOME="$tmp/plank" \
   DCONF_BIN="$tmp/bin/dconf" \
+  DBUS_SESSION_BUS_ADDRESS='unix:path=/tmp/dotcortex-test-bus' \
   DCONF_TEST_ARGS="$tmp/dconf.args" \
   DCONF_TEST_INPUT="$tmp/dconf.input" \
   "$HELPER"
@@ -51,6 +52,7 @@ sed "s/, 'trash.dockitem'//" "$DCONF_SOURCE" > "$bad_dconf"
 if HOME="$tmp/home" XDG_CONFIG_HOME="$tmp/bad-config" \
   PLANK_LAUNCHER_MANIFEST="$MANIFEST" PLANK_DCONF_SOURCE="$bad_dconf" \
   PLANK_CONFIG_HOME="$tmp/bad-plank" DCONF_BIN="$tmp/bin/dconf" \
+  DBUS_SESSION_BUS_ADDRESS='unix:path=/tmp/dotcortex-test-bus' \
   DCONF_TEST_ARGS="$tmp/bad.args" DCONF_TEST_INPUT="$tmp/bad.input" \
   "$HELPER" >/dev/null 2>&1; then
   echo 't480s-plank-apply test: mismatched order unexpectedly succeeded' >&2
