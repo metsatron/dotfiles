@@ -54,7 +54,8 @@ class ReconcileTests(unittest.TestCase):
         self.machines = self.base / "machines.json"
         self.machines.write_text(json.dumps({"machines": [{"key": self.config["transport"]["hub_machine_key"],
                                                           "role": "hub", "hostnames": ["fixture-hub"]}]}))
-        self.reporter = self.hub / "real-export"
+        self.reporter = self.hub / "HelmCortex/FORGE/bin/dotcortex-export"
+        self.reporter.parent.mkdir(parents=True)
         self.reporter.write_text('''#!/usr/bin/env python3
 import base64,json,os,sys
 sys.dont_write_bytecode=True
@@ -95,7 +96,7 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
 
     def command(self, argv, tool="dotcortex-export", local=None):
         return [sys.executable, "-B", str(self.caller / ".local/libexec/hx-router"), str(self.registry),
-                tool, str(local or self.base / "NEVER-PROBE-NFS/real"), str(self.reporter), *argv]
+                tool, str(local or self.base / "NEVER-PROBE-NFS/real"), "FORGE/bin", *argv]
 
     def run_router(self, argv, **kwargs):
         return subprocess.run(self.command(argv, **kwargs), input=b"CALLER STDIN MUST SURVIVE\n",
@@ -205,6 +206,17 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
             rc.snapshot(str(self.root), str(self.caller))
         self.assertEqual(caught.exception.code, 78)
 
+    def test_android_mountinfo_admitted_and_unsupported_platform_refused(self):
+        mounts = b"1 0 0:1 / / rw - f2fs none rw\n"
+        with mock.patch.object(rc.sys, "platform", "android"), \
+             mock.patch("builtins.open", return_value=io.BytesIO(mounts)):
+            self.assertEqual(rc.local_root(str(self.root), str(self.caller)), str(self.root))
+        with mock.patch.object(rc.sys, "platform", "unsupported"), \
+             mock.patch("builtins.open", side_effect=AssertionError("mount table consulted")), \
+             self.assertRaises(rc.Refusal) as caught:
+            rc.local_root(str(self.root), str(self.caller))
+        self.assertEqual(caught.exception.code, 78)
+
     def test_integrity_truncation_unknown_and_path_validation(self):
         frame = rc.snapshot(str(self.root), str(self.caller))
         for broken in (frame[:1], frame[:-1], frame + b"junk", frame[:-32] + bytes(32)):
@@ -311,7 +323,7 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
         self.assertEqual(self.run_router([], tool="telegram-export-pipeline").returncode, 78)
 
     def test_receiver_rejects_bad_frame_before_application(self):
-        payload = {"protocol": rc.PROTOCOL, "tool": "dotcortex-export", "real": str(self.reporter),
+        payload = {"protocol": rc.PROTOCOL, "tool": "dotcortex-export", "tool_dir": "FORGE/bin",
                    "argv": ["--source-only"], "caller_pwd": str(self.caller), "router_stack": "dotcortex-export"}
         with mock.patch.object(rc, "run_bounded", side_effect=AssertionError("application executed")), \
              self.assertRaises(rc.Refusal):
@@ -320,6 +332,21 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
              self.assertRaises(rc.Refusal) as caught:
             rc.run_bounded(["fake"], b"")
         self.assertEqual(caught.exception.code, 124)
+
+    def test_receiver_confines_hub_target_to_admitted_relative_directory(self):
+        payload = {"protocol": rc.PROTOCOL, "tool": "dotcortex-export", "tool_dir": "FORGE/bin",
+                   "argv": ["--source-only"], "caller_pwd": str(self.caller),
+                   "router_stack": "dotcortex-export"}
+        with mock.patch.dict(os.environ, {"HOME": str(self.hub)}):
+            self.assertEqual(rc.hub_real(payload["tool_dir"], payload["tool"]), str(self.reporter))
+        for change in (lambda p: p.update(tool_dir="../FORGE/bin"),
+                       lambda p: p.update(tool="../dotcortex-export"),
+                       lambda p: p.update(real=str(self.base / "caller-selected"))):
+            candidate = copy.deepcopy(payload)
+            change(candidate)
+            with self.subTest(candidate=candidate), self.assertRaises(rc.Refusal) as caught:
+                rc.envelope(candidate)
+            self.assertEqual(caught.exception.code, 78)
 
 
 if __name__ == "__main__":
