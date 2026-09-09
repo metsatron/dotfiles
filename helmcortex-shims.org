@@ -192,6 +192,7 @@ REGISTRY="\${HX_ROUTER_REGISTRY:-\$HOME/.config/agent-session/fleet-router.json}
 DIR="\$HOME/HelmCortex/${dir}"
 TOOL="${name}"
 REAL="\$DIR/\$TOOL"
+TOOL_DIR="${dir}"
 
 if ! timeout -k 1 2 test -x "\$ROUTER" 2>/dev/null; then
   echo "hx: router missing or not executable at \$ROUTER" >&2
@@ -202,7 +203,7 @@ if ! timeout -k 1 2 test -r "\$REGISTRY" 2>/dev/null; then
   exit 78
 fi
 export HX_CALLER_PWD="\$PWD"
-exec "\$ROUTER" "\$REGISTRY" "\$TOOL" "\$REAL" "\$HOME/HelmCortex/${dir}/${name}" "\$@"
+exec "\$ROUTER" "\$REGISTRY" "\$TOOL" "\$REAL" "\$TOOL_DIR" "\$@"
 SHIM
   chmod 755 "${new}"
   if [ -f "${target}" ] && cmp -s "${new}" "${target}"; then
@@ -230,16 +231,22 @@ echo "hx-apply: ${added} written, ${kept} unchanged, ${removed} pruned -> ${SHIM
 
 * Router runtime — bounded SSH bridge with exact argv
 
+Generated shims pass the caller-local absolute entrypoint separately from the manifest's relative tool directory. Local-safe and hub-local routes use that caller-local entrypoint. Relayed hub routes accept only =FORGE/bin=, =FORGE/VoxForge/bin=, or =FORGE/PixelForge/bin=, validate the tool as a basename, and reconstruct the executable beneath the receiving account's =~/HelmCortex=. The caller's absolute path and =HX_CALLER_PWD= are provenance only and can never select the hub executable or working directory.
+
 #+BEGIN_SRC python :tangle all/.local/libexec/hx-router :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 """Execute one HX tool according to the generated Fleet Nervous System registry."""
 import base64
 import json
 import os
+import shlex
 import subprocess
 import socket
 import sys
 
 CLASSES = {"hub", "client-fanout-safe", "client-fanout-reconcile"}
+HUB_EXEC_PROTOCOL = "dotcortex-hub-exec-v1"
+MAX_HUB_ENVELOPE = 64 * 1024
+TOOL_DIRS = frozenset({"FORGE/bin", "FORGE/VoxForge/bin", "FORGE/PixelForge/bin"})
 
 
 def fail(message, code):
@@ -293,6 +300,66 @@ def route_stack(tool):
     return ":".join([*stack, tool])
 
 
+def hub_real(tool_dir, tool):
+    if not isinstance(tool_dir, str) or tool_dir not in TOOL_DIRS:
+        fail(f"unadmitted HelmCortex tool directory: {tool_dir!r}", 78)
+    try:
+        valid_tool = (isinstance(tool, str) and bool(tool) and tool not in {".", ".."}
+                      and "/" not in tool and "\\" not in tool and "\x00" not in tool
+                      and len(tool.encode("utf-8")) <= 255)
+    except UnicodeError:
+        valid_tool = False
+    if not valid_tool:
+        fail("invalid HelmCortex tool name", 78)
+    return os.path.join(os.path.expanduser("~/HelmCortex"), tool_dir, tool)
+
+
+def hub_envelope(payload):
+    if not isinstance(payload, dict) or set(payload) != {
+            "protocol", "tool", "tool_dir", "argv", "caller_pwd", "router_stack"}:
+        fail("invalid hub invocation fields", 78)
+    if payload["protocol"] != HUB_EXEC_PROTOCOL:
+        fail("unsupported hub invocation protocol", 78)
+    hub_real(payload["tool_dir"], payload["tool"])
+    if (not isinstance(payload["argv"], list)
+            or not all(isinstance(arg, str) and "\x00" not in arg for arg in payload["argv"])):
+        fail("invalid hub argv", 78)
+    for key in ("caller_pwd", "router_stack"):
+        value = payload[key]
+        if not isinstance(value, str) or not value or "\x00" in value or len(value) > 4096:
+            fail(f"invalid hub {key}", 78)
+    if not os.path.isabs(payload["caller_pwd"]):
+        fail("hub caller_pwd must be absolute", 78)
+    if payload["router_stack"].split(":").count(payload["tool"]) != 1:
+        fail("invalid hub recursion stack", 125)
+    encoded = base64.b64encode(json.dumps(
+        payload, sort_keys=True, ensure_ascii=True, separators=(",", ":"),
+        allow_nan=False).encode("ascii")).decode("ascii")
+    if len(encoded) > 4 * ((MAX_HUB_ENVELOPE + 2) // 3):
+        fail("hub invocation exceeds bound", 78)
+    return encoded
+
+
+def receive_hub(encoded):
+    if len(encoded) > 4 * ((MAX_HUB_ENVELOPE + 2) // 3):
+        fail("hub invocation exceeds bound", 78)
+    try:
+        payload = json.loads(base64.b64decode(encoded, validate=True))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        fail(f"invalid hub invocation encoding: {exc}", 78)
+    if hub_envelope(payload) != encoded:
+        fail("noncanonical hub invocation encoding", 78)
+    real = hub_real(payload["tool_dir"], payload["tool"])
+    env = os.environ.copy()
+    env["HX_CALLER_PWD"] = payload["caller_pwd"]
+    env["HX_ROUTER_STACK"] = payload["router_stack"]
+    try:
+        os.chdir(os.path.dirname(real))
+        os.execvpe(real, [real, *payload["argv"]], env)
+    except OSError as exc:
+        fail(f"hub tool {real} could not execute: {exc}", 127)
+
+
 def run_local(real, tool, argv, guarded):
     if guarded:
         guard_local(real)
@@ -326,9 +393,12 @@ def isolate_ssh_stdin():
 
 
 def main():
+    if len(sys.argv) == 3 and sys.argv[1] == "--hub-exec":
+        receive_hub(sys.argv[2])
     if len(sys.argv) < 5:
-        fail("usage: hx-router REGISTRY TOOL LOCAL_REAL REMOTE_REAL [ARGV ...]", 64)
-    registry_path, tool, local_real, remote_real, *argv = sys.argv[1:]
+        fail("usage: hx-router REGISTRY TOOL LOCAL_REAL TOOL_DIR [ARGV ...]", 64)
+    registry_path, tool, local_real, tool_dir, *argv = sys.argv[1:]
+    hub_real(tool_dir, tool)
     registry = load(registry_path)
     if registry.get("schema") != "dotcortex.fleet-router.v2":
         fail(f"unsupported registry schema in {registry_path}", 78)
@@ -368,8 +438,8 @@ def main():
         try:
             result = reconcile.dispatch(
                 registry["transport"], tool, argv, source_root,
-                local_real if role == "hub" and machine_key == hub_key else remote_real,
-                stack, role == "hub" and machine_key == hub_key, ssh_executable(),
+                local_real, tool_dir, stack,
+                role == "hub" and machine_key == hub_key, ssh_executable(),
             )
         except reconcile.Refusal as exc:
             fail(str(exc), exc.code)
@@ -385,16 +455,17 @@ def main():
     for key, value in transport.get("ssh_options", {}).items():
         options.extend(["-o", f"{key}={value}"])
     payload = {
-        "real": remote_real,
+        "protocol": HUB_EXEC_PROTOCOL,
+        "tool": tool,
+        "tool_dir": tool_dir,
         "argv": argv,
         "caller_pwd": os.environ.get("HX_CALLER_PWD", os.getcwd()),
         "router_stack": route_stack(tool),
     }
-    encoded = base64.b64encode(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).decode()
-    code = ("import base64,json,os,sys;d=json.loads(base64.b64decode(sys.argv[2]));"
-            "os.environ[\"HX_CALLER_PWD\"]=d[\"caller_pwd\"];os.environ[\"HX_ROUTER_STACK\"]=d[\"router_stack\"];"
-            "os.chdir(os.path.dirname(d[\"real\"]));os.execvpe(d[\"real\"],[d[\"real\"],*d[\"argv\"]],os.environ)")
-    command = "python3 -c '" + code + "' -- " + encoded
+    encoded = hub_envelope(payload)
+    code = ('import os,sys;real=os.path.expanduser("~/.local/libexec/hx-router");'
+            'os.execv(real,[real,"--hub-exec",sys.argv[1]])')
+    command = "python3 -c " + shlex.quote(code) + " " + shlex.quote(encoded)
     executable = ssh_executable()
     isolate_ssh_stdin()
     os.execv(executable, [executable, *options, alias, command])
@@ -406,13 +477,13 @@ if __name__ == "__main__":
 
 * Reconcile runtime — caller snapshot and verified framed input
 
-=hx_reconcile.py= is deployed alongside =hx-router= on both endpoints. It uses only local Python standard-library code. Source capture never imports FORGE, checks the real tool target, or reads caller stdin. Linux mount-table admission precedes descriptor-relative, no-follow source opens; unknown/remote filesystems, symlink components and nested mounts are refused. No Git object or index filtering occurs: the selected root's admitted working-tree bytes, including dirty and untracked Org, are authoritative for this request. This is a per-file capture, not an atomic filesystem snapshot; a file that changes during its read fails admission.
+=hx_reconcile.py= is deployed alongside =hx-router= on both endpoints. It uses only local Python standard-library code. Source capture never imports FORGE, checks the real tool target, or reads caller stdin. Linux and Android use kernel mount-table admission before descriptor-relative, no-follow source opens; unknown/remote filesystems, symlink components and nested mounts are refused. No Git object or index filtering occurs: the selected root's admitted working-tree bytes, including dirty and untracked Org, are authoritative for this request. This is a per-file capture, not an atomic filesystem snapshot; a file that changes during its read fails admission.
 
 The public admission contract =dotcortex-operational-root-org-v1= includes immediate, case-sensitive =*.org= names, excluding =README.org=, =CODE_OF_SOVEREIGNTY.org=, =agents.org=, =agents-hooks.org=, =agents-mcp.org=, =loom.org=, =dotcortex.org=, =claude.org=, and =agents-skills*.org=. Files sort by =(name.lower(), name)=. Paths are basenames, never extraction destinations. Protocol v1 limits are 4096 files, 8 MiB/file, 64 MiB content, 1 MiB manifest, 64 KiB invocation envelope, and 600 seconds for transfer/finalization. Invalid input returns 65; usage 2; unsupported policy/protocol/locality 78; timeout 124. Application and SSH exit status and output streams propagate without a fallback or success receipt.
 
 ** Hub receiver contract
 
-The SSH command imports the hub's =~/.local/libexec/hx_reconcile.py= and calls =receive(encoded_envelope)=. The base64 canonical-JSON envelope has exactly =protocol, tool, real, argv, caller_pwd, router_stack=. Protocol is =dotcortex-root-org-v1=; =real= is the absolute real entrypoint supplied by the shim, never the shim again. The receiver validates the entire bounded stdin frame before invoking that entrypoint in its own directory with argv =hub-finalize --snapshot-protocol dotcortex-root-org-v1 -- ORIGINAL_ARGV...= and the exact verified frame on stdin. =HX_CALLER_PWD= and =HX_ROUTER_STACK= are preserved. The source-root argument remains caller provenance; the hub must never resolve it or re-read it. Direct =hub-finalize= and =--logs-only= invocations remain ordinary hub routes with SSH stdin isolated; only the reconcile receiver opts into framed input.
+The SSH command imports the hub's =~/.local/libexec/hx_reconcile.py= and calls =receive(encoded_envelope)=. The base64 canonical-JSON envelope has exactly =protocol, tool, tool_dir, argv, caller_pwd, router_stack=. Protocol is =dotcortex-root-org-v1=; =tool_dir= is one of the three admitted manifest directories. The receiver reconstructs the real entrypoint beneath its own =~/HelmCortex=, validates the entire bounded stdin frame, then invokes that entrypoint in its own directory with argv =hub-finalize --snapshot-protocol dotcortex-root-org-v1 -- ORIGINAL_ARGV...= and the exact verified frame on stdin. Caller absolute paths never choose a hub executable or working directory. =HX_CALLER_PWD= and =HX_ROUTER_STACK= are preserved as provenance. The source-root argument remains caller provenance; the hub must never resolve it or re-read it. Direct =hub-finalize= and =--logs-only= invocations remain ordinary hub routes with SSH stdin isolated; only the reconcile receiver opts into framed input.
 
 Frame bytes are =b"HXRC\x00\x01\n"=, an unsigned 8-byte big-endian manifest length, canonical ASCII JSON (sorted keys, separators comma/colon, =ensure_ascii=True=), concatenated file contents in manifest order, then the raw 32-byte SHA-256 of all preceding frame bytes, followed by EOF. Manifest keys are exactly =protocol, admission, source, files=; =source= is exactly ={host, checkout, mode}= with actual source hostname, absolute lexical checkout path and =working-tree=. Each file is exactly ={path, bytes, sha256}=. Both per-file digests and the frame digest must validate. =decode_frame(stream)= returns =(manifest, [(record, bytes), ...], frame)= for the later private finalizer to consume without any source reread. It must render, lock and publish canonical state in HelmCortex; those private operations are outside this public runtime. Unsupported receiver/finalizer versions must fail before publication. The finalizer's CLI must recognize the exact internal invocation above; this change does not deploy or implement it.
 
@@ -447,6 +518,7 @@ EXCLUDED = frozenset({
 })
 LOCAL_FS = frozenset({"ext2", "ext3", "ext4", "btrfs", "xfs", "zfs", "f2fs",
                       "tmpfs", "ramfs", "overlay", "ubifs"})
+TOOL_DIRS = frozenset({"FORGE/bin", "FORGE/VoxForge/bin", "FORGE/PixelForge/bin"})
 
 
 class Refusal(Exception):
@@ -516,7 +588,8 @@ def local_root(root, cwd):
     selected = os.path.expanduser(root) if root is not None else os.path.expanduser("~/DotCortex")
     require(".." not in selected.split(os.sep), "parent traversal in source-root", 2)
     path = os.path.abspath(os.path.join(cwd, selected))
-    require(sys.platform.startswith("linux"), "source locality admission requires Linux", 78)
+    require(sys.platform.startswith(("linux", "android")),
+            "source locality admission requires Linux or Android", 78)
     # Read kernel metadata, never stat a remote target to determine locality.
     with open("/proc/self/mountinfo", "rb") as stream:
         raw = stream.read(MAX_MANIFEST + 1)
@@ -649,13 +722,14 @@ def decode_frame(stream):
 
 def envelope(payload):
     require(isinstance(payload, dict) and set(payload) ==
-            {"protocol", "tool", "real", "argv", "caller_pwd", "router_stack"}, "invalid invocation fields", 78)
+            {"protocol", "tool", "tool_dir", "argv", "caller_pwd", "router_stack"},
+            "invalid invocation fields", 78)
     require(payload["protocol"] == PROTOCOL, "unsupported invocation protocol", 78)
-    for key in ("tool", "real", "caller_pwd", "router_stack"):
+    for key in ("tool", "tool_dir", "caller_pwd", "router_stack"):
         require(isinstance(payload[key], str) and payload[key] and "\x00" not in payload[key],
                 "invalid invocation identity", 78)
-    require(payload["real"].startswith("/") and payload["caller_pwd"].startswith("/"),
-            "invocation paths must be absolute", 78)
+    hub_real(payload["tool_dir"], payload["tool"])
+    require(payload["caller_pwd"].startswith("/"), "caller_pwd must be absolute", 78)
     require(payload["router_stack"].split(":").count(payload["tool"]) == 1, "invalid recursion stack", 125)
     route, _ = classify(payload["argv"])
     require(route == "client-fanout-reconcile", "receiver requires source invocation", 78)
@@ -674,15 +748,29 @@ def run_bounded(argv, frame, **kwargs):
         raise Refusal(f"reconcile execution failed: {exc}", 127) from exc
 
 
-def finalize(payload, stream):
+def hub_real(tool_dir, tool):
+    require(isinstance(tool_dir, str) and tool_dir in TOOL_DIRS,
+            "unadmitted HelmCortex tool directory", 78)
+    try:
+        valid_tool = (isinstance(tool, str) and bool(tool) and tool not in {".", ".."}
+                      and "/" not in tool and "\\" not in tool and "\x00" not in tool
+                      and len(tool.encode("utf-8")) <= 255)
+    except UnicodeError:
+        valid_tool = False
+    require(valid_tool, "invalid HelmCortex tool name", 78)
+    return os.path.join(os.path.expanduser("~/HelmCortex"), tool_dir, tool)
+
+
+def finalize(payload, stream, local_real=None):
     envelope(payload)
     _, _, frame = decode_frame(stream)
     env = os.environ.copy()
     env["HX_CALLER_PWD"] = payload["caller_pwd"]
     env["HX_ROUTER_STACK"] = payload["router_stack"]
-    return run_bounded([payload["real"], "hub-finalize", "--snapshot-protocol", PROTOCOL,
+    real = local_real if local_real is not None else hub_real(payload["tool_dir"], payload["tool"])
+    return run_bounded([real, "hub-finalize", "--snapshot-protocol", PROTOCOL,
                         "--", *payload["argv"]], frame,
-                       cwd=os.path.dirname(payload["real"]), env=env)
+                       cwd=os.path.dirname(real), env=env)
 
 
 def receive(encoded):
@@ -706,9 +794,9 @@ def receive(encoded):
     raise SystemExit(status)
 
 
-def dispatch(transport, tool, argv, root, real, stack, local, ssh):
+def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, local, ssh):
     caller = os.environ.get("HX_CALLER_PWD", os.getcwd())
-    payload = {"protocol": PROTOCOL, "tool": tool, "real": real, "argv": argv,
+    payload = {"protocol": PROTOCOL, "tool": tool, "tool_dir": tool_dir, "argv": argv,
                "caller_pwd": caller, "router_stack": stack}
     encoded = envelope(payload)
     alias = transport.get("hub_ssh_alias")
@@ -720,7 +808,7 @@ def dispatch(transport, tool, argv, root, real, stack, local, ssh):
     require(options == required and transport.get("kind") == "ssh-exec", "unsupported reconcile transport", 78)
     frame = snapshot(root, caller)
     if local:
-        return finalize(payload, io.BytesIO(frame))
+        return finalize(payload, io.BytesIO(frame), local_real=local_real)
     code = ('import os,sys;sys.dont_write_bytecode=True;'
             'sys.path.insert(0,os.path.expanduser("~/.local/libexec"));'
             'import hx_reconcile;hx_reconcile.receive(sys.argv[1])')
