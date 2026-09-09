@@ -28,6 +28,7 @@ EXCLUDED = frozenset({
 })
 LOCAL_FS = frozenset({"ext2", "ext3", "ext4", "btrfs", "xfs", "zfs", "f2fs",
                       "tmpfs", "ramfs", "overlay", "ubifs"})
+TOOL_DIRS = frozenset({"FORGE/bin", "FORGE/VoxForge/bin", "FORGE/PixelForge/bin"})
 
 
 class Refusal(Exception):
@@ -97,7 +98,8 @@ def local_root(root, cwd):
     selected = os.path.expanduser(root) if root is not None else os.path.expanduser("~/DotCortex")
     require(".." not in selected.split(os.sep), "parent traversal in source-root", 2)
     path = os.path.abspath(os.path.join(cwd, selected))
-    require(sys.platform.startswith("linux"), "source locality admission requires Linux", 78)
+    require(sys.platform.startswith(("linux", "android")),
+            "source locality admission requires Linux or Android", 78)
     # Read kernel metadata, never stat a remote target to determine locality.
     with open("/proc/self/mountinfo", "rb") as stream:
         raw = stream.read(MAX_MANIFEST + 1)
@@ -230,13 +232,14 @@ def decode_frame(stream):
 
 def envelope(payload):
     require(isinstance(payload, dict) and set(payload) ==
-            {"protocol", "tool", "real", "argv", "caller_pwd", "router_stack"}, "invalid invocation fields", 78)
+            {"protocol", "tool", "tool_dir", "argv", "caller_pwd", "router_stack"},
+            "invalid invocation fields", 78)
     require(payload["protocol"] == PROTOCOL, "unsupported invocation protocol", 78)
-    for key in ("tool", "real", "caller_pwd", "router_stack"):
+    for key in ("tool", "tool_dir", "caller_pwd", "router_stack"):
         require(isinstance(payload[key], str) and payload[key] and "\x00" not in payload[key],
                 "invalid invocation identity", 78)
-    require(payload["real"].startswith("/") and payload["caller_pwd"].startswith("/"),
-            "invocation paths must be absolute", 78)
+    hub_real(payload["tool_dir"], payload["tool"])
+    require(payload["caller_pwd"].startswith("/"), "caller_pwd must be absolute", 78)
     require(payload["router_stack"].split(":").count(payload["tool"]) == 1, "invalid recursion stack", 125)
     route, _ = classify(payload["argv"])
     require(route == "client-fanout-reconcile", "receiver requires source invocation", 78)
@@ -255,15 +258,29 @@ def run_bounded(argv, frame, **kwargs):
         raise Refusal(f"reconcile execution failed: {exc}", 127) from exc
 
 
-def finalize(payload, stream):
+def hub_real(tool_dir, tool):
+    require(isinstance(tool_dir, str) and tool_dir in TOOL_DIRS,
+            "unadmitted HelmCortex tool directory", 78)
+    try:
+        valid_tool = (isinstance(tool, str) and bool(tool) and tool not in {".", ".."}
+                      and "/" not in tool and "\\" not in tool and "\x00" not in tool
+                      and len(tool.encode("utf-8")) <= 255)
+    except UnicodeError:
+        valid_tool = False
+    require(valid_tool, "invalid HelmCortex tool name", 78)
+    return os.path.join(os.path.expanduser("~/HelmCortex"), tool_dir, tool)
+
+
+def finalize(payload, stream, local_real=None):
     envelope(payload)
     _, _, frame = decode_frame(stream)
     env = os.environ.copy()
     env["HX_CALLER_PWD"] = payload["caller_pwd"]
     env["HX_ROUTER_STACK"] = payload["router_stack"]
-    return run_bounded([payload["real"], "hub-finalize", "--snapshot-protocol", PROTOCOL,
+    real = local_real if local_real is not None else hub_real(payload["tool_dir"], payload["tool"])
+    return run_bounded([real, "hub-finalize", "--snapshot-protocol", PROTOCOL,
                         "--", *payload["argv"]], frame,
-                       cwd=os.path.dirname(payload["real"]), env=env)
+                       cwd=os.path.dirname(real), env=env)
 
 
 def receive(encoded):
@@ -287,9 +304,9 @@ def receive(encoded):
     raise SystemExit(status)
 
 
-def dispatch(transport, tool, argv, root, real, stack, local, ssh):
+def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, local, ssh):
     caller = os.environ.get("HX_CALLER_PWD", os.getcwd())
-    payload = {"protocol": PROTOCOL, "tool": tool, "real": real, "argv": argv,
+    payload = {"protocol": PROTOCOL, "tool": tool, "tool_dir": tool_dir, "argv": argv,
                "caller_pwd": caller, "router_stack": stack}
     encoded = envelope(payload)
     alias = transport.get("hub_ssh_alias")
@@ -301,7 +318,7 @@ def dispatch(transport, tool, argv, root, real, stack, local, ssh):
     require(options == required and transport.get("kind") == "ssh-exec", "unsupported reconcile transport", 78)
     frame = snapshot(root, caller)
     if local:
-        return finalize(payload, io.BytesIO(frame))
+        return finalize(payload, io.BytesIO(frame), local_real=local_real)
     code = ('import os,sys;sys.dont_write_bytecode=True;'
             'sys.path.insert(0,os.path.expanduser("~/.local/libexec"));'
             'import hx_reconcile;hx_reconcile.receive(sys.argv[1])')
