@@ -170,6 +170,15 @@ safe-stow:
 |     fi; \
 |     ;; \
 | esac
+| case " $(STOW_PKGS) " in \
+|   *" t480s "*) \
+|     HELPER="$(HOME)/.local/bin/t480s-plank-apply"; \
+|     [ -x "$$HELPER" ] || HELPER="$(HOME)/DotCortex/linux/.local/bin/t480s-plank-apply"; \
+|     [ -x "$$HELPER" ] || { echo "safe-stow: missing T480s Plank apply helper: $$HELPER" >&2; exit 1; }; \
+|     echo ">> t480s-plank-apply"; \
+|     "$$HELPER"; \
+|     ;; \
+| esac
 
 preview-stow:
 | cd $(HOME)/DotCortex && stow $(STOW_FLAGS) -n $(STOW_PKGS) || true
