@@ -120,17 +120,16 @@ def local_root(root, cwd):
 
 def open_root(path):
     flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-    fd = os.open("/", flags)
+    parent, name = os.path.split(path)
+    require(os.path.isabs(path) and bool(parent) and name not in {"", ".", ".."},
+            "invalid source-root path", 2)
+    parent_fd = os.open(parent, flags)
     try:
-        for component in path.split("/"):
-            if component:
-                child = os.open(component, flags, dir_fd=fd)
-                os.close(fd)
-                fd = child
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+        observed = os.readlink(f"/proc/self/fd/{parent_fd}")
+        require(observed == parent, "symlink component in source-root")
+        return os.open(name, flags, dir_fd=parent_fd)
+    finally:
+        os.close(parent_fd)
 
 
 def read_source(fd, name):
