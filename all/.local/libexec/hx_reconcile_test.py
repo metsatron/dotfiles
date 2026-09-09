@@ -27,7 +27,7 @@ class ReconcileTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
-        self.caller = self.base / "caller"
+        self.caller = self.base / "data/data/com.termux/files/home"
         self.hub = self.base / "hub"
         self.root = self.caller / "DotCortex"
         self.root.mkdir(parents=True)
@@ -155,6 +155,24 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
         (self.root / "a.org").write_bytes(b"edited after capture")
         self.assertEqual(dict((r["path"], b) for r,b in self.decode(first)[1])["a.org"], b"caller dirty\n")
 
+    def test_termux_capture_succeeds_when_global_root_open_is_denied(self):
+        mounts = b"1 0 0:1 / / rw - f2fs none rw\n"
+        original = rc.os.open
+        opens = []
+        def termux_open(path, *args, **kwargs):
+            opens.append((path, kwargs.get("dir_fd")))
+            if path == "/" and kwargs.get("dir_fd") is None:
+                raise PermissionError(13, "Permission denied", path)
+            return original(path, *args, **kwargs)
+        with mock.patch.object(rc.sys, "platform", "android"), \
+             mock.patch("builtins.open", return_value=io.BytesIO(mounts)), \
+             mock.patch.object(rc.os, "open", side_effect=termux_open):
+            manifest, contents, _ = self.decode(rc.snapshot(str(self.root), str(self.caller)))
+        self.assertIn("/data/data/com.termux/files/home/DotCortex", manifest["source"]["checkout"])
+        self.assertEqual(manifest["source"]["checkout"], str(self.root))
+        self.assertEqual([record["path"] for record, _ in contents], ["a.org", "untracked.org"])
+        self.assertNotIn(("/", None), opens)
+
     def test_source_change_during_read_refused(self):
         original = os.fstat
         calls = 0
@@ -174,6 +192,14 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
         link = self.base / "link"
         link.symlink_to(self.root, target_is_directory=True)
         with self.assertRaises(rc.Refusal): rc.snapshot(str(link), str(self.caller))
+        real = self.base / "real"
+        escaped = real / "parent/DotCortex"
+        escaped.mkdir(parents=True)
+        (escaped / "escape.org").write_bytes(b"ESCAPED")
+        bridge = self.base / "bridge"
+        bridge.symlink_to(real, target_is_directory=True)
+        with self.assertRaisesRegex(rc.Refusal, "symlink component"):
+            rc.snapshot(str(bridge / "parent/DotCortex"), str(self.caller))
         bad = self.root / "bad.org"
         bad.symlink_to(self.hub / "DotCortex/a.org")
         with self.assertRaises(rc.Refusal): rc.snapshot(str(self.root), str(self.caller))
