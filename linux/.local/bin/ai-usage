@@ -55,6 +55,10 @@ ANTIGRAVITY_LOAD_CODE_ASSIST_URL = f"{ANTIGRAVITY_CLOUD_CODE_BASE_URL}/v1interna
 ANTIGRAVITY_USER_AGENT = "antigravity/1.11.3 Darwin/arm64"
 CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+# Native Codex usage endpoint — the same source codexbar reads, hit directly with the
+# ~/.codex/auth.json Bearer token. Lets any Linux box report Codex usage without the
+# macOS-only Homebrew `codexbar` formula. Verified live 2026-09-10.
+CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 # Opt-in remote feeds. Each entry pulls `ai-usage --json --no-remote` from another
 # fleet machine over SSH and folds its panels in under a label (e.g. "Gillean · Codex").
@@ -1027,6 +1031,128 @@ def enrich_codex_reset_credits(
     result = dict(result)
     result["raw"] = raw
     return result
+
+
+def _codex_epoch_to_iso(value: Any) -> str | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+    return None
+
+
+def _codex_window_to_quota(window: Any) -> dict[str, Any] | None:
+    if not isinstance(window, dict):
+        return None
+    pct = window.get("used_percent")
+    if not isinstance(pct, (int, float)) or isinstance(pct, bool):
+        return None
+    quota: dict[str, Any] = {"usedPercent": float(pct)}
+    secs = window.get("limit_window_seconds")
+    if isinstance(secs, (int, float)) and not isinstance(secs, bool) and secs > 0:
+        quota["windowMinutes"] = int(secs) // 60
+    iso = _codex_epoch_to_iso(window.get("reset_at"))
+    if iso:
+        quota["resetsAt"] = iso
+    return quota
+
+
+def build_codex_native_result(spec: ProviderSpec, data: dict[str, Any]) -> dict[str, Any]:
+    rate_limit = data.get("rate_limit") if isinstance(data.get("rate_limit"), dict) else {}
+    windows: list[dict[str, Any]] = []
+    for key in ("primary_window", "secondary_window"):
+        quota = _codex_window_to_quota(rate_limit.get(key))
+        if quota:
+            windows.append(quota)
+    # Order by window length so the short (5h-ish) window renders first, the long
+    # (weekly) window second — matching the codexbar "5h" / "wk" layout regardless of
+    # which slot the API happens to use for a given plan.
+    windows.sort(key=lambda q: q.get("windowMinutes", 1 << 30))
+    usage: dict[str, Any] = {}
+    if len(windows) >= 2:
+        usage["primary"] = windows[0]
+        usage["secondary"] = windows[-1]
+    elif len(windows) == 1:
+        only = windows[0]
+        if only.get("windowMinutes", 0) >= 24 * 60:
+            usage["secondary"] = only  # a lone weekly window belongs in the wk slot
+        else:
+            usage["primary"] = only
+
+    identity: dict[str, Any] = {}
+    plan = data.get("plan_type")
+    if isinstance(plan, str) and plan:
+        identity["plan"] = plan
+    email = data.get("email")
+    if isinstance(email, str) and email:
+        identity["email"] = email
+    if identity:
+        usage["identity"] = identity
+
+    raw: dict[str, Any] = {"provider": "codex", "source": "codex-native", "usage": usage}
+
+    if usage.get("secondary", {}).get("usedPercent") is not None:
+        summary = f"weekly {format_percent(usage['secondary']['usedPercent'])}"
+    elif usage.get("primary", {}).get("usedPercent") is not None:
+        summary = f"{format_percent(usage['primary']['usedPercent'])}"
+    else:
+        summary = "Codex usage"
+    if isinstance(plan, str) and plan:
+        summary += f"; plan={plan}"
+
+    return {
+        "provider": spec.key,
+        "label": spec.label,
+        "state": "ok",
+        "source": "codex-native",
+        "summary": summary,
+        "raw": raw,
+    }
+
+
+def fetch_codex_native(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
+    access_token, account_id = codex_auth_tokens()
+    if not access_token or not account_id:
+        return {
+            "provider": spec.key,
+            "label": spec.label,
+            "state": "missing",
+            "source": "",
+            "summary": "Codex auth tokens unavailable (~/.codex/auth.json).",
+            "raw": None,
+        }
+
+    request = urllib.request.Request(
+        CODEX_USAGE_URL,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "ChatGPT-Account-ID": account_id,
+            "Accept": "application/json",
+            "User-Agent": "DotCortex ai-usage",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        return {
+            "provider": spec.key, "label": spec.label, "state": "error",
+            "source": "codex-native", "summary": f"HTTP {error.code}", "raw": None,
+        }
+    except urllib.error.URLError as error:
+        return {
+            "provider": spec.key, "label": spec.label, "state": "error",
+            "source": "codex-native", "summary": f"request failed: {error.reason}", "raw": None,
+        }
+    except (TimeoutError, ValueError):
+        return {
+            "provider": spec.key, "label": spec.label, "state": "error",
+            "source": "codex-native", "summary": "invalid or timed-out response", "raw": None,
+        }
+    if not isinstance(data, dict) or not isinstance(data.get("rate_limit"), dict):
+        return {
+            "provider": spec.key, "label": spec.label, "state": "error",
+            "source": "codex-native", "summary": "unexpected response shape", "raw": None,
+        }
+    return build_codex_native_result(spec, data)
 
 
 def fetch_codexbar(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
@@ -2114,9 +2240,15 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
 
 def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
     if spec.key == "codex":
-        result = fetch_codexbar(spec, timeout_seconds)
+        # Native ChatGPT usage endpoint first: works on any Linux box straight from
+        # ~/.codex/auth.json, no Homebrew/codexbar, and never triggers codexbar's
+        # brew-bootstrap on a box without it. codexbar stays as the fallback.
+        result = fetch_codex_native(spec, timeout_seconds)
         if result["state"] == "ok":
             return enrich_codex_reset_credits(result, timeout_seconds)
+        fallback = fetch_codexbar(spec, timeout_seconds)
+        if fallback["state"] == "ok":
+            return enrich_codex_reset_credits(fallback, timeout_seconds)
         return result
 
     if spec.key == "gemini":
