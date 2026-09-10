@@ -339,7 +339,7 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
             self.assertEqual(result.stdout, b"")
             self.assertNotIn(b"exact-stderr", result.stderr)
 
-    def test_refuse_unsupported_registry_and_reconcile(self):
+    def test_refuse_unsupported_registry_and_keep_telegram_local(self):
         for transform in (lambda c: c.update(schema="dotcortex.fleet-router.v1"),
                           lambda c: c["tools"]["dotcortex-export"]["reconcile"].update(protocol="future"),
                           lambda c: c["tools"]["dotcortex-export"]["reconcile"].update(extra=True)):
@@ -349,7 +349,10 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
             self.assertEqual(self.run_router([]).returncode, 78)
             self.assertFalse((self.base / "ssh.json").exists())
         self.registry.write_text(json.dumps(self.config))
-        self.assertEqual(self.run_router([], tool="telegram-export-pipeline").returncode, 78)
+        result = self.run_router([], tool="telegram-export-pipeline", local=self.reporter)
+        self.assertEqual(result.returncode, 37, result.stderr)
+        self.assertEqual(result.stderr, b"exact-stderr:\x00\xff\n")
+        self.assertFalse((self.base / "ssh.json").exists())
 
     def test_receiver_rejects_bad_frame_before_application(self):
         payload = {"protocol": rc.PROTOCOL, "tool": "dotcortex-export", "tool_dir": "FORGE/bin",
