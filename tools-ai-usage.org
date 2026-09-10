@@ -39,6 +39,7 @@ import json
 import os
 import re
 import shutil
+import shlex
 import select
 import signal
 import sqlite3
@@ -89,6 +90,14 @@ ANTIGRAVITY_LOAD_CODE_ASSIST_URL = f"{ANTIGRAVITY_CLOUD_CODE_BASE_URL}/v1interna
 ANTIGRAVITY_USER_AGENT = "antigravity/1.11.3 Darwin/arm64"
 CODEX_AUTH_FILE = Path.home() / ".codex" / "auth.json"
 CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits"
+
+# Opt-in remote feeds. Each entry pulls `ai-usage --json --no-remote` from another
+# fleet machine over SSH and folds its panels in under a label (e.g. "Gillean · Codex").
+# Runtime-only config — NEVER commit host names, IPs, or account labels to DotCortex.
+REMOTES_FILE_DEFAULT = Path(
+    os.environ.get("AI_USAGE_REMOTES_FILE", str(Path.home() / ".config" / "ai-usage" / "remotes.json"))
+)
+REMOTE_PROVIDERS_RE = re.compile(r"^[a-z0-9]+(?:,[a-z0-9]+)*$")
 
 NF = {
     "check": "\uf058",
@@ -211,7 +220,10 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
     ),
 )
 
-DEFAULT_PROVIDER_KEYS: tuple[str, ...] = ("codex", "claude", "antigravity", "openrouter")
+# Providers shown by default (no --providers flag). antigravity/openrouter dropped from
+# the default view 2026-09-10 to make room for remote (Gillean) panels; both remain fully
+# available on demand via `--providers antigravity,openrouter`.
+DEFAULT_PROVIDER_KEYS: tuple[str, ...] = ("codex", "claude")
 
 
 def eprint(*args: Any, **kwargs: Any) -> None:
@@ -2428,6 +2440,105 @@ def render_text(results: list[dict[str, Any]]) -> None:
     print(f"{GY}╰{'─' * (width - 2)}╯{R}\n")
 
 
+def _remote_error(label: str, summary: str) -> dict[str, Any]:
+    return {
+        "provider": "remote",
+        "label": label,
+        "state": "error",
+        "source": "ssh",
+        "summary": summary,
+        "raw": None,
+        "remote": label,
+    }
+
+
+def load_remotes(path: Path) -> list[dict[str, Any]]:
+    """Read the runtime remotes file. Missing file = no remotes (not an error)."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        return [_remote_error("remote", f"remotes file unreadable: {exc}")]
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        return [_remote_error("remote", f"remotes file is not valid JSON: {exc}")]
+    entries = data.get("remotes") if isinstance(data, dict) else data
+    if not isinstance(entries, list):
+        return [_remote_error("remote", "remotes file has no 'remotes' list")]
+    return [entry for entry in entries if isinstance(entry, dict)]
+
+
+def fetch_one_remote(entry: dict[str, Any], default_timeout: float) -> list[dict[str, Any]]:
+    """SSH to one fleet host, run `ai-usage --json --no-remote`, and prefix its panels."""
+    target = entry.get("ssh") or entry.get("host")
+    label = str(entry.get("label") or target or "remote")
+    if not target:
+        return [_remote_error(label, "remote entry missing 'ssh'/'host' target")]
+    providers = str(entry.get("providers") or "codex,claude").replace(" ", "").lower()
+    if not REMOTE_PROVIDERS_RE.match(providers):
+        return [_remote_error(label, f"invalid providers spec: {providers!r}")]
+    try:
+        timeout = float(entry.get("timeout", max(default_timeout, 25.0)))
+    except (TypeError, ValueError):
+        timeout = max(default_timeout, 25.0)
+
+    # Login shell so ~/.local/bin (and linuxbrew) are on PATH under non-interactive SSH.
+    inner = f"ai-usage --providers {providers} --json --no-remote"
+    remote_cmd = f"bash -lc {shlex.quote(inner)}"
+    ssh_cmd = [
+        "ssh",
+        "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "PreferredAuthentications=publickey",
+        "-o", f"ConnectTimeout={max(1, int(timeout))}",
+        "-o", "ConnectionAttempts=1",
+        str(target),
+        remote_cmd,
+    ]
+    try:
+        proc = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 5.0,
+        )
+    except subprocess.TimeoutExpired:
+        return [_remote_error(label, f"unreachable (timed out after {timeout:.0f}s)")]
+    except OSError as exc:
+        return [_remote_error(label, f"ssh failed to launch: {exc}")]
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        detail = tail[-1] if tail else f"exit {proc.returncode}"
+        return [_remote_error(label, f"unreachable: {detail}")]
+    try:
+        items = json.loads(proc.stdout)
+    except ValueError:
+        return [_remote_error(label, "remote returned unparseable JSON")]
+    if not isinstance(items, list):
+        return [_remote_error(label, "remote returned unexpected shape")]
+    out: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        merged = dict(item)
+        merged["label"] = f"{label} · {item.get('label', '')}".rstrip(" ·")
+        merged["remote"] = label
+        out.append(merged)
+    return out or [_remote_error(label, "remote returned no panels")]
+
+
+def fetch_remote_results(remotes_file: Path, default_timeout: float) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    for entry in load_remotes(remotes_file):
+        if "__error__" in entry:  # defensive; load_remotes returns _remote_error dicts
+            continue
+        results.extend(fetch_one_remote(entry, default_timeout))
+    return results
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Linux usage wrapper for CodexBar, Fuelcheck, Antigravity, and Gemini CLI."
@@ -2450,6 +2561,16 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=120.0,
         help="Refresh interval in seconds when --watch is enabled.",
+    )
+    parser.add_argument(
+        "--no-remote",
+        action="store_true",
+        help="Skip remote fleet feeds (also set automatically on remote invocations to prevent recursion).",
+    )
+    parser.add_argument(
+        "--remotes-file",
+        default=str(REMOTES_FILE_DEFAULT),
+        help=f"JSON file listing remote fleet feeds (default: {REMOTES_FILE_DEFAULT}).",
     )
     return parser.parse_args()
 
@@ -2551,6 +2672,9 @@ def main() -> int:
     try:
         while True:
             results = collect_results()
+
+            if not args.no_remote:
+                results = results + fetch_remote_results(Path(args.remotes_file), args.timeout)
 
             if args.json:
                 print(json.dumps(results, indent=2, ensure_ascii=True))
