@@ -165,4 +165,22 @@ if find "$metadata_parent" -mindepth 1 -print -quit | grep -q .; then
   exit 1
 fi
 
+excl_ssv="$tmp/host-excludes.ssv"
+printf '%s\n' 'testhost nala first "test exclude"' > "$excl_ssv"
+excl_manifest="$tmp/excl-releases.ssv"
+printf '%s\n' \
+  'first first first.deb amd64 shared ""' \
+  'later later later.deb amd64 shared ""' > "$excl_manifest"
+excl_log="$tmp/host-exclude.log"
+NALA_SYNC_PROBE=1 NALA_RELEASES_SSV="$excl_manifest" \
+  NALA_OS_RELEASE="$tmp/ubuntu2404" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" NALA_ARCH=amd64 \
+  HOST_EXCLUDES="$excl_ssv" HOST_EXCLUDES_HOSTNAME=testhost \
+  "$HELPER" >"$excl_log" 2>&1
+grep -q 'skip first (host-excluded)' "$excl_log"
+if grep -q 'probed first' "$excl_log"; then
+  echo "host-excluded row did not stop the first pkg from being probed" >&2
+  exit 1
+fi
+grep -q 'probed later' "$excl_log"
+
 printf '%s\n' 'nala release platform fixtures: ok'
