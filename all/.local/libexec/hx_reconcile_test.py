@@ -65,9 +65,12 @@ sys.path.insert(0,os.path.expanduser("~/.local/libexec"))
 import hx_reconcile as rc
 raw=sys.stdin.buffer.read()
 out={"argv":sys.argv[1:],"caller_pwd":os.environ.get("HX_CALLER_PWD"),
-     "stack":os.environ.get("HX_ROUTER_STACK"),"stdin":base64.b64encode(raw).decode()}
-if sys.argv[1:4]==["hub-finalize","--snapshot-protocol",rc.PROTOCOL]:
-    manifest,contents,_=rc.decode_frame(__import__("io").BytesIO(raw))
+     "stack":os.environ.get("HX_ROUTER_STACK"),
+     "receiver":os.environ.get("HX_RECONCILE_RECEIVER"),
+     "stdin":base64.b64encode(raw).decode()}
+if sys.argv[1:2]==["hub-finalize"] and sys.argv[2:3]==["--snapshot-protocol"]:
+    protocol=sys.argv[3]
+    manifest,contents,_=rc.decode_frame(__import__("io").BytesIO(raw),protocol)
     out["manifest"]=manifest
     out["contents"]={r["path"]:base64.b64encode(b).decode() for r,b in contents}
 sys.stdout.buffer.write(json.dumps(out,ensure_ascii=True).encode()+b"\\n")
@@ -75,6 +78,19 @@ sys.stderr.buffer.write(b"exact-stderr:\\x00\\xff\\n")
 sys.exit(int(os.environ.get("FIXTURE_APP_STATUS","37")))
 ''')
         self.reporter.chmod(0o755)
+        self.telegram_reporter = self.reporter.with_name("telegram-export-pipeline")
+        shutil.copy2(self.reporter, self.telegram_reporter)
+        telegram = self.caller / "Downloads/Telegram Desktop/ChatExport_fixture"
+        telegram.mkdir(parents=True)
+        (telegram / "messages.html").write_text(
+            '<div class="page_header"><div class="text bold">Fixture chat</div></div>'
+            '<div class="history"><div class="message default" id="message1">x</div></div>')
+        self.telegram_bindings = self.base / "telegram-bindings.json"
+        self.telegram_bindings.write_text(json.dumps({
+            "schema": "helmcortex.telegram-bindings.v1",
+            "bindings": [{"title": "Fixture chat", "namespace": "fixture",
+                          "conversation_id": "chat", "dest_slug": "fixture_chat",
+                          "revisions": {"ChatExport_fixture": 1}}]}))
         self.ssh = self.base / "ssh"
         self.ssh.write_text('''#!/usr/bin/env python3
 import json,os,subprocess,sys
@@ -92,6 +108,7 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
                         HX_ROUTER_HOSTNAME="fixture-client", HELM_ROUTER_MACHINE_REGISTRY=str(self.machines),
                         HX_CALLER_PWD=str(self.caller), HX_ROUTER_STACK="",
                         FIXTURE_SSH_LOG=str(self.base / "ssh.json"), FIXTURE_HUB_HOME=str(self.hub),
+                        HX_TELEGRAM_BINDINGS=str(self.telegram_bindings),
                         PYTHONDONTWRITEBYTECODE="1")
         for key in ("FIXTURE_SSH_STATUS", "FIXTURE_APP_STATUS", "FIXTURE_FRAME_DAMAGE"):
             self.env.pop(key, None)
@@ -339,7 +356,7 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
             self.assertEqual(result.stdout, b"")
             self.assertNotIn(b"exact-stderr", result.stderr)
 
-    def test_refuse_unsupported_registry_and_keep_telegram_local(self):
+    def test_refuse_unsupported_registry_and_route_telegram_snapshot(self):
         for transform in (lambda c: c.update(schema="dotcortex.fleet-router.v1"),
                           lambda c: c["tools"]["dotcortex-export"]["reconcile"].update(protocol="future"),
                           lambda c: c["tools"]["dotcortex-export"]["reconcile"].update(extra=True)):
@@ -352,7 +369,12 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
         result = self.run_router([], tool="telegram-export-pipeline", local=self.reporter)
         self.assertEqual(result.returncode, 37, result.stderr)
         self.assertEqual(result.stderr, b"exact-stderr:\x00\xff\n")
-        self.assertFalse((self.base / "ssh.json").exists())
+        out = json.loads(result.stdout)
+        self.assertEqual(out["argv"], ["hub-finalize", "--snapshot-protocol",
+                                      rc.TELEGRAM_PROTOCOL, "--"])
+        self.assertEqual(out["manifest"]["protocol"], rc.TELEGRAM_PROTOCOL)
+        self.assertEqual(out["receiver"], rc.TELEGRAM_PROTOCOL)
+        self.assertTrue((self.base / "ssh.json").exists())
 
     def test_receiver_rejects_bad_frame_before_application(self):
         payload = {"protocol": rc.PROTOCOL, "tool": "dotcortex-export", "tool_dir": "FORGE/bin",
