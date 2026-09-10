@@ -14,6 +14,8 @@ import sys
 
 PROTOCOL = "dotcortex-root-org-v1"
 ADMISSION = "dotcortex-operational-root-org-v1"
+TELEGRAM_PROTOCOL = "telegram-export-snapshot-v1"
+TELEGRAM_ADMISSION = "telegram-export-tree-v1"
 MAGIC = b"HXRC\x00\x01\n"
 MAX_FILES = 4096
 MAX_FILE = 8 * 1024 * 1024
@@ -21,6 +23,10 @@ MAX_CONTENT = 64 * 1024 * 1024
 MAX_MANIFEST = 1024 * 1024
 MAX_ENVELOPE = 64 * 1024
 MAX_FRAME = len(MAGIC) + 8 + MAX_MANIFEST + MAX_CONTENT + 32
+TELEGRAM_MAX_FILE = 256 * 1024 * 1024
+TELEGRAM_MAX_CONTENT = 512 * 1024 * 1024
+TELEGRAM_MAX_FILES = 8192
+TELEGRAM_MAX_FRAME = len(MAGIC) + 8 + MAX_MANIFEST + TELEGRAM_MAX_CONTENT + 32
 SECONDS = 600
 EXCLUDED = frozenset({
     "README.org", "CODE_OF_SOVEREIGNTY.org", "agents.org", "agents-hooks.org",
@@ -55,14 +61,31 @@ def admitted(name):
 
 
 def check_policy(entry):
-    require(entry == {"class": "client-fanout-reconcile",
-                      "reconcile": {"protocol": PROTOCOL}},
+    require(isinstance(entry, dict) and set(entry) == {"class", "reconcile"}
+            and entry.get("class") == "client-fanout-reconcile"
+            and isinstance(entry.get("reconcile"), dict)
+            and set(entry["reconcile"]) == {"protocol"},
             "unsupported reconcile declaration", 78)
+    protocol = entry["reconcile"]["protocol"]
+    require(protocol in {PROTOCOL, TELEGRAM_PROTOCOL},
+            "unsupported reconcile declaration", 78)
+    return protocol
 
 
-def classify(argv):
+def classify(argv, protocol=PROTOCOL):
     require(isinstance(argv, list) and all(isinstance(a, str) and "\x00" not in a for a in argv),
             "invalid argv", 2)
+    if protocol == TELEGRAM_PROTOCOL:
+        if argv and argv[0] in {"--help", "-h", "--backfill", "--retrofit"}:
+            return "hub", None
+        if argv == ["--list"]:
+            return "client-fanout-reconcile", "list-local"
+        if argv and argv[0] == "hub-finalize":
+            return "hub", None
+        require(not any(arg.startswith("--") for arg in argv),
+                "unsupported Telegram export argument", 2)
+        return "client-fanout-reconcile", list(argv) or None
+    require(protocol == PROTOCOL, "unsupported snapshot protocol", 78)
     flags, root, finalize = set(), None, False
     index = 0
     while index < len(argv):
@@ -181,9 +204,155 @@ def snapshot(root, cwd):
         raise Refusal(f"source capture refused: {exc}") from exc
 
 
-def decode_frame(stream):
-    frame = stream.read(MAX_FRAME + 1)
-    require(len(frame) <= MAX_FRAME, "frame exceeds bound")
+def telegram_bindings():
+    path = os.environ.get(
+        "HX_TELEGRAM_BINDINGS",
+        os.path.expanduser("~/.config/helmcortex/telegram-conversations.json"),
+    )
+    try:
+        with open(path, encoding="utf-8") as stream:
+            value = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise Refusal(f"Telegram conversation bindings unavailable: {exc}", 78) from exc
+    require(isinstance(value, dict) and set(value) == {"schema", "bindings"}
+            and value["schema"] == "helmcortex.telegram-bindings.v1"
+            and isinstance(value["bindings"], list), "invalid Telegram bindings", 78)
+    return value["bindings"]
+
+
+def telegram_title(root_fd):
+    with os.fdopen(os.open("messages.html", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                           dir_fd=root_fd), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        require(stat.S_ISREG(before.st_mode) and before.st_size <= TELEGRAM_MAX_FILE,
+                "invalid or oversized Telegram messages page")
+        content = stream.read(MAX_MANIFEST)
+        after = os.fstat(stream.fileno())
+    require((before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+            (after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+            "Telegram messages page changed while reading title")
+    match = re.search(br'<div class="text bold">\s*(.*?)\s*</div>', content, re.S)
+    require(match is not None, "Telegram export has no conversation title")
+    title = re.sub(br"<[^>]+>", b"", match.group(1)).decode("utf-8").strip()
+    require(bool(title), "Telegram export has empty conversation title")
+    return title
+
+
+def telegram_binding(title, basename, bindings):
+    matches = []
+    for binding in bindings:
+        if not isinstance(binding, dict) or set(binding) != {
+                "title", "namespace", "conversation_id", "dest_slug", "revisions"}:
+            raise Refusal("invalid Telegram binding entry", 78)
+        if binding["title"] == title:
+            matches.append(binding)
+    require(len(matches) == 1, f"Telegram conversation is not uniquely bound: {title!r}", 78)
+    binding = matches[0]
+    for key in ("namespace", "conversation_id", "dest_slug"):
+        require(isinstance(binding[key], str) and binding[key] and "\x00" not in binding[key],
+                "invalid Telegram conversation binding", 78)
+    revisions = binding["revisions"]
+    require(isinstance(revisions, dict), "invalid Telegram revision bindings", 78)
+    revision = revisions.get(basename)
+    require(revision is None or (type(revision) is int and revision >= 0),
+            "invalid Telegram verified revision", 78)
+    return {"namespace": binding["namespace"], "conversation_id": binding["conversation_id"],
+            "dest_slug": binding["dest_slug"], "title": title}, revision
+
+
+def telegram_export_paths(selected, cwd):
+    if selected:
+        paths = [local_root(path, cwd) for path in selected]
+    else:
+        downloads = local_root(os.path.expanduser("~/Downloads"), cwd)
+        paths = []
+        for parent in (downloads, os.path.join(downloads, "Telegram Desktop")):
+            if not os.path.isdir(parent):
+                continue
+            with os.scandir(parent) as entries:
+                for entry in entries:
+                    if entry.name.startswith(("ChatExport_", "DataExport_")):
+                        require(not entry.is_symlink(), "symlinked Telegram export refused")
+                        if entry.is_dir(follow_symlinks=False):
+                            paths.append(os.path.join(parent, entry.name))
+    require(bool(paths), "no source-local Telegram exports found")
+    return sorted(set(paths))
+
+
+def telegram_tree(path):
+    root_fd = open_root(path)
+    try:
+        title = telegram_title(root_fd)
+    finally:
+        os.close(root_fd)
+    files = []
+    total_entries = 0
+    for current, dirs, names, fd in os.fwalk(path, topdown=True, follow_symlinks=False):
+        dirs.sort()
+        names.sort()
+        for name in list(dirs):
+            total_entries += 1
+            require(total_entries <= TELEGRAM_MAX_FILES * 4, "too many Telegram tree entries")
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            require(stat.S_ISDIR(info.st_mode), "non-directory in Telegram tree")
+        for name in names:
+            total_entries += 1
+            require(total_entries <= TELEGRAM_MAX_FILES * 4, "too many Telegram tree entries")
+            info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            require(stat.S_ISREG(info.st_mode), "nonregular Telegram source refused")
+            relative = os.path.relpath(os.path.join(current, name), path)
+            require(".." not in relative.split(os.sep) and not os.path.isabs(relative),
+                    "Telegram source path escaped")
+            with os.fdopen(os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                                   dir_fd=fd), "rb") as stream:
+                before = os.fstat(stream.fileno())
+                require(before.st_size <= TELEGRAM_MAX_FILE, "oversized Telegram source")
+                content = stream.read(TELEGRAM_MAX_FILE + 1)
+                after = os.fstat(stream.fileno())
+            require(len(content) == before.st_size and len(content) <= TELEGRAM_MAX_FILE
+                    and (before.st_size, before.st_mtime_ns, before.st_ctime_ns) ==
+                    (after.st_size, after.st_mtime_ns, after.st_ctime_ns),
+                    "Telegram source changed during capture")
+            files.append((relative, content))
+    require(0 < len(files) <= TELEGRAM_MAX_FILES, "empty or oversized Telegram source")
+    return title, files
+
+
+def telegram_snapshot(selected, cwd):
+    bindings = telegram_bindings()
+    exports = []
+    contents = []
+    total = 0
+    for path in telegram_export_paths(selected, cwd):
+        title, files = telegram_tree(path)
+        identity, revision = telegram_binding(title, os.path.basename(path), bindings)
+        records = []
+        digest = hashlib.sha256()
+        for relative, content in files:
+            total += len(content)
+            require(total <= TELEGRAM_MAX_CONTENT, "Telegram snapshot content exceeds bound")
+            record = {"path": relative, "bytes": len(content),
+                      "sha256": hashlib.sha256(content).hexdigest()}
+            records.append(record)
+            contents.append(content)
+            digest.update(canonical(record))
+            digest.update(content)
+        exports.append({"source_id": os.path.basename(path), "identity": identity,
+                        "revision": revision, "snapshot_sha256": digest.hexdigest(),
+                        "files": records})
+    manifest = {"protocol": TELEGRAM_PROTOCOL, "admission": TELEGRAM_ADMISSION,
+                "source": {"host": socket.gethostname(), "mode": "source-local"},
+                "exports": exports}
+    header = canonical(manifest)
+    require(len(header) <= MAX_MANIFEST, "Telegram snapshot manifest exceeds bound")
+    body = MAGIC + len(header).to_bytes(8, "big") + header + b"".join(contents)
+    return body + hashlib.sha256(body).digest()
+
+
+def decode_frame(stream, protocol=PROTOCOL):
+    limit = TELEGRAM_MAX_FRAME if protocol == TELEGRAM_PROTOCOL else MAX_FRAME
+    frame = stream.read(limit + 1)
+    require(len(frame) <= limit, "frame exceeds bound")
     prefix = len(MAGIC) + 8
     require(len(frame) >= prefix + 32 and frame.startswith(MAGIC), "invalid frame protocol", 78)
     size = int.from_bytes(frame[len(MAGIC):prefix], "big")
@@ -194,6 +363,49 @@ def decode_frame(stream):
         require(canonical(manifest) == header, "manifest is not canonical JSON")
     except (ValueError, UnicodeError, RecursionError) as exc:
         raise Refusal("invalid manifest JSON") from exc
+    if protocol == TELEGRAM_PROTOCOL:
+        require(isinstance(manifest, dict) and set(manifest) == {
+                "protocol", "admission", "source", "exports"}, "unknown Telegram manifest fields")
+        require(manifest["protocol"] == TELEGRAM_PROTOCOL
+                and manifest["admission"] == TELEGRAM_ADMISSION,
+                "unsupported snapshot protocol/admission", 78)
+        source = manifest["source"]
+        require(isinstance(source, dict) and set(source) == {"host", "mode"}
+                and isinstance(source["host"], str) and source["host"]
+                and source["mode"] == "source-local", "invalid Telegram source identity")
+        position, total, contents = prefix + size, 0, []
+        exports = manifest["exports"]
+        require(isinstance(exports, list) and 0 < len(exports) <= TELEGRAM_MAX_FILES,
+                "invalid Telegram export count")
+        for export in exports:
+            require(isinstance(export, dict) and set(export) == {
+                    "source_id", "identity", "revision", "snapshot_sha256", "files"},
+                    "invalid Telegram export")
+            digest = hashlib.sha256()
+            seen = set()
+            for record in export["files"]:
+                require(isinstance(record, dict) and set(record) == {"path", "bytes", "sha256"},
+                        "invalid Telegram file record")
+                name, count = record["path"], record["bytes"]
+                require(isinstance(name, str) and name and not os.path.isabs(name)
+                        and ".." not in name.split("/") and name not in seen,
+                        "unsafe Telegram file path")
+                require(type(count) is int and 0 <= count <= TELEGRAM_MAX_FILE,
+                        "invalid Telegram file size")
+                total += count
+                require(total <= TELEGRAM_MAX_CONTENT and position + count <= len(frame) - 32,
+                        "truncated/oversized Telegram content")
+                content = frame[position:position + count]
+                position += count
+                require(hashlib.sha256(content).hexdigest() == record["sha256"],
+                        "Telegram file integrity failure")
+                digest.update(canonical(record)); digest.update(content)
+                seen.add(name); contents.append((record, content))
+            require(digest.hexdigest() == export["snapshot_sha256"], "Telegram snapshot digest failure")
+        require(position == len(frame) - 32, "trailing/truncated frame content")
+        require(hashlib.sha256(frame[:-32]).digest() == frame[-32:], "frame integrity failure")
+        return manifest, contents, frame
+    require(protocol == PROTOCOL, "unsupported snapshot protocol", 78)
     require(isinstance(manifest, dict) and set(manifest) == {"protocol", "admission", "source", "files"},
             "unknown manifest fields")
     require(manifest["protocol"] == PROTOCOL and manifest["admission"] == ADMISSION,
@@ -233,14 +445,15 @@ def envelope(payload):
     require(isinstance(payload, dict) and set(payload) ==
             {"protocol", "tool", "tool_dir", "argv", "caller_pwd", "router_stack"},
             "invalid invocation fields", 78)
-    require(payload["protocol"] == PROTOCOL, "unsupported invocation protocol", 78)
+    require(payload["protocol"] in {PROTOCOL, TELEGRAM_PROTOCOL},
+            "unsupported invocation protocol", 78)
     for key in ("tool", "tool_dir", "caller_pwd", "router_stack"):
         require(isinstance(payload[key], str) and payload[key] and "\x00" not in payload[key],
                 "invalid invocation identity", 78)
     hub_real(payload["tool_dir"], payload["tool"])
     require(payload["caller_pwd"].startswith("/"), "caller_pwd must be absolute", 78)
     require(payload["router_stack"].split(":").count(payload["tool"]) == 1, "invalid recursion stack", 125)
-    route, _ = classify(payload["argv"])
+    route, _ = classify(payload["argv"], payload["protocol"])
     require(route == "client-fanout-reconcile", "receiver requires source invocation", 78)
     data = canonical(payload)
     require(len(data) <= MAX_ENVELOPE, "invocation exceeds bound", 78)
@@ -272,12 +485,13 @@ def hub_real(tool_dir, tool):
 
 def finalize(payload, stream, local_real=None):
     envelope(payload)
-    _, _, frame = decode_frame(stream)
+    _, _, frame = decode_frame(stream, payload["protocol"])
     env = os.environ.copy()
     env["HX_CALLER_PWD"] = payload["caller_pwd"]
     env["HX_ROUTER_STACK"] = payload["router_stack"]
+    env["HX_RECONCILE_RECEIVER"] = payload["protocol"]
     real = local_real if local_real is not None else hub_real(payload["tool_dir"], payload["tool"])
-    return run_bounded([real, "hub-finalize", "--snapshot-protocol", PROTOCOL,
+    return run_bounded([real, "hub-finalize", "--snapshot-protocol", payload["protocol"],
                         "--", *payload["argv"]], frame,
                        cwd=os.path.dirname(real), env=env)
 
@@ -303,9 +517,13 @@ def receive(encoded):
     raise SystemExit(status)
 
 
-def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, local, ssh):
+def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, protocol, local, ssh):
     caller = os.environ.get("HX_CALLER_PWD", os.getcwd())
-    payload = {"protocol": PROTOCOL, "tool": tool, "tool_dir": tool_dir, "argv": argv,
+    if protocol == TELEGRAM_PROTOCOL and root == "list-local":
+        for path in telegram_export_paths(None, caller):
+            print(f"{os.path.basename(path)}\t{path}")
+        return 0
+    payload = {"protocol": protocol, "tool": tool, "tool_dir": tool_dir, "argv": argv,
                "caller_pwd": caller, "router_stack": stack}
     encoded = envelope(payload)
     alias = transport.get("hub_ssh_alias")
@@ -315,7 +533,7 @@ def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, local, ss
                 "KbdInteractiveAuthentication": "no", "PreferredAuthentications": "publickey",
                 "ConnectTimeout": "10", "ConnectionAttempts": "1"}
     require(options == required and transport.get("kind") == "ssh-exec", "unsupported reconcile transport", 78)
-    frame = snapshot(root, caller)
+    frame = telegram_snapshot(root, caller) if protocol == TELEGRAM_PROTOCOL else snapshot(root, caller)
     if local:
         return finalize(payload, io.BytesIO(frame), local_real=local_real)
     code = ('import os,sys;sys.dont_write_bytecode=True;'
