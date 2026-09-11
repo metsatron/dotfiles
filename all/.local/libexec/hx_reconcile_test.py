@@ -63,6 +63,11 @@ import base64,json,os,sys
 sys.dont_write_bytecode=True
 sys.path.insert(0,os.path.expanduser("~/.local/libexec"))
 import hx_reconcile as rc
+if sys.argv[1:2]==["hub-known-sources"]:
+    sources=json.loads(os.environ.get("FIXTURE_KNOWN_SOURCES","[]"))
+    sys.stdout.write(json.dumps({"schema":"helmcortex.telegram-known-sources.v1",
+                                 "source_host":sys.argv[3],"sources":sorted(set(sources))})+"\\n")
+    sys.exit(0)
 raw=sys.stdin.buffer.read()
 out={"argv":sys.argv[1:],"caller_pwd":os.environ.get("HX_CALLER_PWD"),
      "stack":os.environ.get("HX_ROUTER_STACK"),
@@ -110,7 +115,8 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
                         FIXTURE_SSH_LOG=str(self.base / "ssh.json"), FIXTURE_HUB_HOME=str(self.hub),
                         HX_TELEGRAM_BINDINGS=str(self.telegram_bindings),
                         PYTHONDONTWRITEBYTECODE="1")
-        for key in ("FIXTURE_SSH_STATUS", "FIXTURE_APP_STATUS", "FIXTURE_FRAME_DAMAGE"):
+        for key in ("FIXTURE_SSH_STATUS", "FIXTURE_APP_STATUS", "FIXTURE_FRAME_DAMAGE",
+                    "FIXTURE_KNOWN_SOURCES"):
             self.env.pop(key, None)
 
     def command(self, argv, tool="dotcortex-export", local=None):
@@ -380,6 +386,13 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
         self.assertNotIn("identity", out["manifest"]["exports"][0])
         self.assertEqual(out["receiver"], rc.TELEGRAM_PROTOCOL)
         self.assertTrue((self.base / "ssh.json").exists())
+
+        self.env["FIXTURE_KNOWN_SOURCES"] = json.dumps(["ChatExport_fixture"])
+        result = self.run_router([], tool="telegram-export-pipeline", local=self.reporter)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "complete": True, "pending": [], "receipts": [],
+            "skipped_acknowledged": 1})
 
     def test_receiver_rejects_bad_frame_before_application(self):
         payload = {"protocol": rc.PROTOCOL, "tool": "dotcortex-export", "tool_dir": "FORGE/bin",
