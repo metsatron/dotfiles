@@ -561,12 +561,20 @@ def admitted(name):
 def check_policy(entry):
     require(isinstance(entry, dict) and set(entry) == {"class", "reconcile"}
             and entry.get("class") == "client-fanout-reconcile"
-            and isinstance(entry.get("reconcile"), dict)
-            and set(entry["reconcile"]) == {"protocol"},
+            and isinstance(entry.get("reconcile"), dict),
             "unsupported reconcile declaration", 78)
     protocol = entry["reconcile"]["protocol"]
     require(protocol in {PROTOCOL, TELEGRAM_PROTOCOL},
             "unsupported reconcile declaration", 78)
+    if protocol == TELEGRAM_PROTOCOL:
+        require(set(entry["reconcile"]) == {
+                    "protocol", "legacy_unscoped_source_machine_key"}
+                and isinstance(entry["reconcile"]["legacy_unscoped_source_machine_key"], str)
+                and entry["reconcile"]["legacy_unscoped_source_machine_key"],
+                "unsupported Telegram reconcile declaration", 78)
+    else:
+        require(set(entry["reconcile"]) == {"protocol"},
+                "unsupported reconcile declaration", 78)
     return protocol
 
 
@@ -984,15 +992,86 @@ def receive(encoded):
     raise SystemExit(status)
 
 
+def decode_known_sources(raw, source_host):
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise Refusal("invalid Telegram known-source response", 78) from exc
+    require(isinstance(value, dict) and set(value) ==
+            {"schema", "source_host", "sources"}
+            and value["schema"] == "helmcortex.telegram-known-sources.v1"
+            and value["source_host"] == source_host
+            and isinstance(value["sources"], list)
+            and all(isinstance(item, str) and item and "/" not in item
+                    and "\0" not in item for item in value["sources"])
+            and value["sources"] == sorted(set(value["sources"])),
+            "invalid Telegram known-source response", 78)
+    return set(value["sources"])
+
+
+def receive_known(encoded, source_host):
+    require(isinstance(source_host, str) and source_host and "/" not in source_host
+            and "\\" not in source_host and "\0" not in source_host
+            and len(source_host.encode("utf-8")) <= 255,
+            "invalid Telegram source host", 78)
+    try:
+        payload = json.loads(base64.b64decode(encoded, validate=True))
+    except (ValueError, UnicodeError, RecursionError) as exc:
+        raise Refusal("invalid invocation encoding", 78) from exc
+    require(envelope(payload) == encoded and payload["protocol"] == TELEGRAM_PROTOCOL
+            and payload["argv"] == [], "invalid Telegram source query", 78)
+    env = os.environ.copy()
+    env["HX_RECONCILE_RECEIVER"] = TELEGRAM_PROTOCOL
+    real = hub_real(payload["tool_dir"], payload["tool"])
+    try:
+        result = subprocess.run(
+            [real, "hub-known-sources", "--source-host", source_host],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=SECONDS, env=env,
+            cwd=os.path.dirname(real))
+    except subprocess.TimeoutExpired as exc:
+        raise Refusal("Telegram source query deadline exceeded", 124) from exc
+    if result.stdout:
+        sys.stdout.buffer.write(result.stdout)
+    if result.stderr:
+        sys.stderr.buffer.write(result.stderr)
+    raise SystemExit(result.returncode if result.returncode >= 0 else 128 - result.returncode)
+
+
+def query_known_sources(transport, payload, source_host, local_real, local, ssh):
+    encoded = envelope(payload)
+    env = os.environ.copy()
+    env["HX_RECONCILE_RECEIVER"] = TELEGRAM_PROTOCOL
+    if local:
+        argv = [local_real, "hub-known-sources", "--source-host", source_host]
+    else:
+        code = ('import sys;sys.dont_write_bytecode=True;'
+                'import os;sys.path.insert(0,os.path.expanduser("~/.local/libexec"));'
+                'import hx_reconcile;hx_reconcile.receive_known(sys.argv[1],sys.argv[2])')
+        command = ("python3 -c " + shlex.quote(code) + " " + shlex.quote(encoded)
+                   + " " + shlex.quote(source_host))
+        required = transport["ssh_options"]
+        ssh_options = [item for key, value in required.items()
+                       for item in ("-o", f"{key}={value}")]
+        argv = [ssh, "-T", *ssh_options, transport["hub_ssh_alias"], command]
+    try:
+        result = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                timeout=SECONDS, env=env)
+    except subprocess.TimeoutExpired as exc:
+        raise Refusal("Telegram source query deadline exceeded", 124) from exc
+    if result.returncode != 0:
+        if result.stderr:
+            sys.stderr.buffer.write(result.stderr)
+        raise Refusal("Telegram source query failed",
+                      result.returncode if result.returncode > 0 else 1)
+    return decode_known_sources(result.stdout, source_host)
+
+
 def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, protocol, local, ssh):
     caller = os.environ.get("HX_CALLER_PWD", os.getcwd())
     if protocol == TELEGRAM_PROTOCOL and root == "list-local":
         for path in telegram_export_paths(None, caller):
             print(f"{os.path.basename(path)}\t{path}")
         return 0
-    payload = {"protocol": protocol, "tool": tool, "tool_dir": tool_dir, "argv": argv,
-               "caller_pwd": caller, "router_stack": stack}
-    encoded = envelope(payload)
     alias = transport.get("hub_ssh_alias")
     require(isinstance(alias, str) and alias and not alias.startswith("-"), "invalid hub alias", 78)
     options = transport.get("ssh_options", {})
@@ -1000,6 +1079,26 @@ def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, protocol,
                 "KbdInteractiveAuthentication": "no", "PreferredAuthentications": "publickey",
                 "ConnectTimeout": "10", "ConnectionAttempts": "1"}
     require(options == required and transport.get("kind") == "ssh-exec", "unsupported reconcile transport", 78)
+    payload = {"protocol": protocol, "tool": tool, "tool_dir": tool_dir, "argv": argv,
+               "caller_pwd": caller, "router_stack": stack}
+    if protocol == TELEGRAM_PROTOCOL and root is None:
+        paths = telegram_export_paths(None, caller)
+        source_host = socket.gethostname()
+        known = query_known_sources(
+            transport, payload, source_host, local_real, local, ssh)
+        pending = [path for path in paths if os.path.basename(path) not in known]
+        if not pending:
+            print(json.dumps({"complete": True, "pending": [], "receipts": [],
+                              "skipped_acknowledged": len(paths)}, sort_keys=True))
+            return 0
+        status = 0
+        for path in pending:
+            code = dispatch(transport, tool, argv, [path], local_real, tool_dir,
+                            stack, protocol, local, ssh)
+            if code != 0 and status == 0:
+                status = code
+        return status
+    encoded = envelope(payload)
     frame = telegram_snapshot(root, caller) if protocol == TELEGRAM_PROTOCOL else snapshot(root, caller)
     if local:
         return finalize(payload, io.BytesIO(frame), local_real=local_real)
