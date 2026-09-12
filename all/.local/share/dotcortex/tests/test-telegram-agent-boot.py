@@ -54,9 +54,12 @@ class TelegramAgentBootTest(unittest.TestCase):
         self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
 
     def run_boot(self, *extra: str) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        env["HOME"] = str(self.root)
-        env["TELEGRAM_AGENT_BOOT_NO_LOG"] = "1"
+        env = {
+            "HOME": str(self.root),
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "XDG_STATE_HOME": str(self.root / "xdg-state"),
+            "TELEGRAM_AGENT_BOOT_NO_LOG": "1",
+        }
         return subprocess.run(
             [str(BOOT), "--expected-host", HOST, "--delay", "0", "--retry-seconds", "0",
              "--manager", str(self.manager), "--state-dir", str(self.state), *extra],
@@ -116,6 +119,7 @@ class TelegramAgentBootTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("@reboot", result.stdout)
         self.assertIn("telegram-agent-boot --expected-host " + HOST, result.stdout)
+        self.assertIn("/.guix-extra-profiles/core/core/bin:", result.stdout)
 
     def test_manager_help_is_side_effect_free(self) -> None:
         home = self.root / "help-home"

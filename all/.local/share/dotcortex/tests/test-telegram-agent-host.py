@@ -22,10 +22,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.home = self.root / "home"
         self.state = self.root / "state"
         self.agents = self.root / "agents"
-        self.bin = self.root / "bin"
-        for directory in (self.home, self.state, self.agents, self.bin):
+        self.bin = self.home / ".local/bin"
+        self.forge_bin = self.home / "HelmCortex/FORGE/bin"
+        self.core_bin = self.home / ".guix-extra-profiles/core/core/bin"
+        for directory in (self.home, self.state, self.agents, self.bin, self.forge_bin, self.core_bin):
             directory.mkdir(parents=True)
         self.write_executable("ductor", "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n")
+        self.write_executable("node", "#!/bin/sh\nexit 0\n", directory=self.core_bin)
 
     def tearDown(self) -> None:
         pid_file = self.state / "telegram-agents/ductor-supervise.pid"
@@ -36,21 +39,20 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                 pass
         self.temp.cleanup()
 
-    def write_executable(self, name: str, body: str) -> None:
-        path = self.bin / name
+    def write_executable(self, name: str, body: str, directory: Path | None = None) -> None:
+        path = (directory or self.bin) / name
         path.write_text(body, encoding="utf-8")
         path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
     def environment(self, timeout: int) -> dict[str, str]:
-        env = os.environ.copy()
-        env.update({
+        env = {
             "HOME": str(self.home),
             "XDG_STATE_HOME": str(self.state),
             "DOTCORTEX_AGENTS_DIR": str(self.agents),
-            "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+            "PATH": str(self.bin) + os.pathsep + "/usr/local/bin:/usr/bin:/bin",
             "DUCTOR_HOME_DIR": str(self.root / "ductor-home"),
             "DUCTOR_READY_TIMEOUT": str(timeout),
-        })
+        }
         return env
 
     def run_manager(self, *args: str, timeout: int = 10) -> subprocess.CompletedProcess[str]:
@@ -65,6 +67,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "d=$XDG_STATE_HOME/telegram-agents\nmkdir -p \"$d\"\n"
             "printf '%s\\n' $$ >\"$d/ductor-supervise.pid\"\n"
             "sleep 2\nductor & child=$!\nprintf '%s\\n' $child >\"$d/ductor-child.pid\"\nwait $child\n",
+            directory=self.forge_bin,
         )
         result = self.run_manager("start", "ductor", timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -78,11 +81,24 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "d=$XDG_STATE_HOME/telegram-agents\nmkdir -p \"$d\"\n"
             "printf '%s\\n' $$ >\"$d/ductor-supervise.pid\"\n"
             "trap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            directory=self.forge_bin,
         )
         result = self.run_manager("start", timeout=1)
         self.assertEqual(result.returncode, 1)
         self.assertIn("pi-agent started", result.stdout)
         self.assertIn("Failed to start enabled agent: ductor", result.stderr)
+
+    def test_sanitized_boot_binds_core_node_before_opencode_preflight(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|opencode\n", encoding="utf-8")
+        marker = self.root / "resolved-node"
+        self.write_executable(
+            "opencode-telegram-patch-apply",
+            f"#!/bin/sh\ncommand -v node > {str(marker)!r}\nexit 23\n",
+            directory=self.forge_bin,
+        )
+        result = self.run_manager("start", "opencode", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(marker.read_text().strip(), str(self.core_bin / "node"))
 
 
 if __name__ == "__main__":
