@@ -473,10 +473,28 @@ def stop(args: argparse.Namespace) -> int:
     project = project_path(args.project or state.get("project"))
     host = args.host or str(state.get("host") or DEFAULT_HOST)
     port = port_value(args.port or str(state.get("port") or DEFAULT_PORT))
+    boundary_reasons: list[str] = []
+    if state.get("schema") != "helmcortex.opencode-owner.v2":
+        boundary_reasons.append("schema-mismatch")
+    if state.get("owner") != OWNER:
+        boundary_reasons.append("foreign-owner")
+    if state.get("bot") != BOT:
+        boundary_reasons.append("bot-identity-mismatch")
+    if project != os.path.realpath(DEFAULT_PROJECT):
+        boundary_reasons.append("wrong-project")
+    if host != DEFAULT_HOST or port != DEFAULT_PORT:
+        boundary_reasons.append("wrong-listen-boundary")
+    if boundary_reasons:
+        print(f"refusing stale-state cleanup: {','.join(boundary_reasons)}", file=sys.stderr)
+        return 1
     owned: list[int] = []
     refused = 0
+    stale = 0
     for role in ("poller", "backend"):
         current, reasons = check_record(state, role, project, host, port)
+        if current is None and reasons == [f"{role}-down"]:
+            stale += 1
+            continue
         if reasons:
             refused += 1
             print(f"refusing to stop {role}: {','.join(reasons)}", file=sys.stderr)
@@ -505,7 +523,7 @@ def stop(args: argparse.Namespace) -> int:
             state_path(args.state).unlink()
         except FileNotFoundError:
             pass
-    print(f"opencode: stopped_owned={len(owned)} refused={refused}")
+    print(f"opencode: stopped_owned={len(owned)} stale={stale} refused={refused}")
     return 0 if not remaining and refused == 0 else 1
 
 
@@ -538,6 +556,102 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 
+#+END_SRC
+
+** OpenCode ownership contract tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-opencode-owner.py :comments no
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import time
+import unittest
+
+
+HERE = Path(__file__).resolve()
+OWNER = HERE.parents[3] / "bin" / "opencode-owner"
+PROJECT = "/home/metsatron/HelmCortex"
+
+
+class OpenCodeOwnerTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.state = Path(self.temp.name) / "opencode.json"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_state(self, **overrides: object) -> None:
+        value = {
+            "schema": "helmcortex.opencode-owner.v2",
+            "owner": "telegram-agent-host:opencode",
+            "bot": "opencode",
+            "project": PROJECT,
+            "host": "127.0.0.1",
+            "port": 4096,
+            "backend_pid": 999999991,
+            "poller_pid": 999999992,
+        }
+        value.update(overrides)
+        self.state.write_text(json.dumps(value), encoding="utf-8")
+
+    def stop(self) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(OWNER), "stop", "--state", str(self.state), "--project", PROJECT,
+             "--host", "127.0.0.1", "--port", "4096"],
+            text=True, capture_output=True, timeout=10,
+        )
+
+    def test_exact_dead_preboot_owner_state_is_retired(self) -> None:
+        self.write_state()
+        result = self.stop()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("stale=2", result.stdout)
+        self.assertFalse(self.state.exists())
+
+    def test_foreign_dead_state_is_preserved(self) -> None:
+        self.write_state(owner="someone-else")
+        result = self.stop()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("foreign-owner", result.stderr)
+        self.assertTrue(self.state.exists())
+
+    def test_valid_survivor_is_stopped_while_dead_peer_is_retired(self) -> None:
+        poller = Path(self.temp.name) / "poller"
+        poller.write_text("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n", encoding="utf-8")
+        poller.chmod(poller.stat().st_mode | stat.S_IXUSR)
+        process = subprocess.Popen([str(poller), "start", "--mode", "installed"], cwd=PROJECT)
+        try:
+            time.sleep(0.1)
+            proc = Path("/proc") / str(process.pid)
+            raw_stat = (proc / "stat").read_text(encoding="utf-8")
+            start_ticks = int(raw_stat[raw_stat.rfind(")") + 2 :].split()[19])
+            argv = [part.decode() for part in (proc / "cmdline").read_bytes().split(b"\0") if part]
+            self.write_state(
+                poller_pid=process.pid,
+                poller_start_ticks=start_ticks,
+                poller_cwd=os.path.realpath(PROJECT),
+                poller_argv=argv,
+                poller_entrypoint=str(poller),
+            )
+            result = self.stop()
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("stopped_owned=1 stale=1 refused=0", result.stdout)
+            self.assertFalse(self.state.exists())
+            process.wait(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                process.wait(timeout=5)
+
+
+if __name__ == "__main__":
+    unittest.main()
 #+END_SRC
 * OpenCode survival watchdog
 
@@ -1008,32 +1122,63 @@ fi
 write_receipt() {
   status="$1"
   attempt="$2"
+  outcomes="$3"
   RECEIPT_TMP="$STATE_DIR/receipt.json.tmp.$$"
-  python3 - "$RECEIPT_TMP" "$STATE_DIR/receipt.json" "$CURRENT_HOST" "$status" "$attempt" <<'PY'
+  python3 - "$RECEIPT_TMP" "$STATE_DIR/receipt.json" "$CURRENT_HOST" "$status" "$attempt" "$outcomes" <<'PY'
 import json, os, pathlib, sys, time
-tmp, dest, host, status, attempt = sys.argv[1:]
+tmp, dest, host, status, attempt, outcome_text = sys.argv[1:]
+agents = {}
+for row in outcome_text.split():
+    name, value = row.split("=", 1)
+    agents[name] = value
 path = pathlib.Path(tmp)
-path.write_text(json.dumps({"attempt": int(attempt), "host": host, "schema": "dotcortex.telegram-agent-boot.v1", "status": status, "timestamp": int(time.time())}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+path.write_text(json.dumps({"agents": agents, "attempt": int(attempt), "host": host, "schema": "dotcortex.telegram-agent-boot.v2", "status": status, "timestamp": int(time.time())}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 os.chmod(path, 0o600)
 os.replace(path, dest)
 PY
 }
 
 [ "$DELAY" -eq 0 ] || sleep "$DELAY"
+enabled="$($MANAGER enabled)" || {
+  write_receipt failed 0 ""
+  echo "telegram-agent-boot: cannot enumerate enabled agents" >&2
+  exit 1
+}
+[ -n "$enabled" ] || {
+  write_receipt failed 0 ""
+  echo "telegram-agent-boot: no enabled agents" >&2
+  exit 1
+}
+unresolved="$enabled"
 attempt=1
 while [ "$attempt" -le "$ATTEMPTS" ]; do
   echo "telegram-agent-boot: attempt $attempt/$ATTEMPTS"
-  if "$MANAGER" start; then
-    write_receipt ready "$attempt"
+  next_unresolved=""
+  outcomes=""
+  for agent in $enabled; do
+    case " $unresolved " in
+      *" $agent "*)
+        if "$MANAGER" start "$agent"; then
+          outcomes="$outcomes $agent=ready"
+        else
+          outcomes="$outcomes $agent=failed"
+          next_unresolved="$next_unresolved $agent"
+        fi ;;
+      *) outcomes="$outcomes $agent=ready" ;;
+    esac
+  done
+  unresolved="$next_unresolved"
+  if [ -z "$unresolved" ]; then
+    write_receipt ready "$attempt" "$outcomes"
     echo "telegram-agent-boot: ready"
     exit 0
   fi
-  write_receipt retry "$attempt"
+  write_receipt retry "$attempt" "$outcomes"
   [ "$attempt" -ge "$ATTEMPTS" ] || sleep "$RETRY_SECONDS"
   attempt=$((attempt + 1))
 done
 
-write_receipt failed "$ATTEMPTS"
+write_receipt failed "$ATTEMPTS" "$outcomes"
 echo "telegram-agent-boot: failed after $ATTEMPTS attempts" >&2
 exit 1
 #+END_SRC
@@ -1123,15 +1268,28 @@ class TelegramAgentBootTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def write_manager(self, succeed_after: int) -> None:
+    def write_manager(self, failures: dict[str, int]) -> None:
+        encoded = json.dumps(failures, sort_keys=True)
         self.manager.write_text(
-            "#!/bin/sh\n"
-            f"count_file={str(self.root / 'count')!r}\n"
-            "count=0\n"
-            "[ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n"
-            "count=$((count + 1))\n"
-            "printf '%s\\n' \"$count\" >\"$count_file\"\n"
-            f"[ \"$count\" -ge {succeed_after} ]\n",
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"root = pathlib.Path({str(self.root)!r})\n"
+            f"failures = {encoded!r}\n"
+            "failures = json.loads(failures)\n"
+            "if sys.argv[1:] == ['enabled']:\n"
+            "    print('ductor codex opencode')\n"
+            "    raise SystemExit(0)\n"
+            "if len(sys.argv) != 3 or sys.argv[1] != 'start':\n"
+            "    raise SystemExit(2)\n"
+            "agent = sys.argv[2]\n"
+            "calls = root / 'calls'\n"
+            "with calls.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(agent + '\\n')\n"
+            "count_file = root / ('count-' + agent)\n"
+            "count = int(count_file.read_text()) if count_file.exists() else 0\n"
+            "count += 1\n"
+            "count_file.write_text(str(count))\n"
+            "raise SystemExit(1 if count <= int(failures.get(agent, 0)) else 0)\n",
             encoding="utf-8",
         )
         self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
@@ -1147,22 +1305,26 @@ class TelegramAgentBootTest(unittest.TestCase):
         )
 
     def test_retry_then_ready_receipt(self) -> None:
-        self.write_manager(succeed_after=2)
+        self.write_manager({"ductor": 1})
         result = self.run_boot("--attempts", "3")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.root / "count").read_text().strip(), "2")
+        self.assertEqual((self.root / "calls").read_text().splitlines(), ["ductor", "codex", "opencode", "ductor"])
         receipt = json.loads((self.state / "receipt.json").read_text())
         self.assertEqual((receipt["status"], receipt["attempt"], receipt["host"]), ("ready", 2, HOST.lower()))
+        self.assertEqual(receipt["schema"], "dotcortex.telegram-agent-boot.v2")
+        self.assertEqual(receipt["agents"], {"ductor": "ready", "codex": "ready", "opencode": "ready"})
 
     def test_exhaustion_is_loud_and_durable(self) -> None:
-        self.write_manager(succeed_after=9)
+        self.write_manager({"ductor": 9})
         result = self.run_boot("--attempts", "2")
         self.assertEqual(result.returncode, 1)
         receipt = json.loads((self.state / "receipt.json").read_text())
         self.assertEqual((receipt["status"], receipt["attempt"]), ("failed", 2))
+        self.assertEqual(receipt["agents"], {"ductor": "failed", "codex": "ready", "opencode": "ready"})
+        self.assertEqual((self.root / "calls").read_text().splitlines(), ["ductor", "codex", "opencode", "ductor"])
 
     def test_wrong_host_refuses_before_state_or_manager(self) -> None:
-        self.write_manager(succeed_after=1)
+        self.write_manager({})
         result = subprocess.run(
             [str(BOOT), "--expected-host", "definitely-not-this-host", "--delay", "0",
              "--manager", str(self.manager), "--state-dir", str(self.state)],
@@ -1170,16 +1332,16 @@ class TelegramAgentBootTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 64)
         self.assertFalse(self.state.exists())
-        self.assertFalse((self.root / "count").exists())
+        self.assertFalse((self.root / "calls").exists())
 
     def test_lock_prevents_duplicate_launch(self) -> None:
-        self.write_manager(succeed_after=1)
+        self.write_manager({})
         self.state.mkdir(parents=True)
         with (self.state / "boot.lock").open("w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = self.run_boot("--attempts", "1")
         self.assertEqual(result.returncode, 0)
-        self.assertFalse((self.root / "count").exists())
+        self.assertFalse((self.root / "calls").exists())
 
     def test_help_is_side_effect_free(self) -> None:
         result = subprocess.run([str(BOOT), "--help"], text=True, capture_output=True, timeout=10)
@@ -1206,6 +1368,100 @@ class TelegramAgentBootTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             self.assertIn("Usage:", result.stdout)
             self.assertFalse((home / "state").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
+** Telegram agent manager cold-start tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-telegram-agent-host.py :comments no
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import tempfile
+import time
+import unittest
+
+
+HERE = Path(__file__).resolve()
+MANAGER = HERE.parents[3] / "bin" / "telegram-agent-host"
+HOST = subprocess.check_output(["hostname"], text=True).strip().lower()
+
+
+class TelegramAgentHostColdStartTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        self.state = self.root / "state"
+        self.agents = self.root / "agents"
+        self.bin = self.root / "bin"
+        for directory in (self.home, self.state, self.agents, self.bin):
+            directory.mkdir(parents=True)
+        self.write_executable("ductor", "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n")
+
+    def tearDown(self) -> None:
+        pid_file = self.state / "telegram-agents/ductor-supervise.pid"
+        if pid_file.exists():
+            try:
+                os.killpg(int(pid_file.read_text()), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, ValueError):
+                pass
+        self.temp.cleanup()
+
+    def write_executable(self, name: str, body: str) -> None:
+        path = self.bin / name
+        path.write_text(body, encoding="utf-8")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def environment(self, timeout: int) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(self.home),
+            "XDG_STATE_HOME": str(self.state),
+            "DOTCORTEX_AGENTS_DIR": str(self.agents),
+            "PATH": str(self.bin) + os.pathsep + env.get("PATH", ""),
+            "DUCTOR_HOME_DIR": str(self.root / "ductor-home"),
+            "DUCTOR_READY_TIMEOUT": str(timeout),
+        })
+        return env
+
+    def run_manager(self, *args: str, timeout: int = 10) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(MANAGER), *args], text=True, capture_output=True,
+                              env=self.environment(timeout), timeout=timeout + 5)
+
+    def test_cold_supervisor_waits_for_delayed_child(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|ductor\n", encoding="utf-8")
+        self.write_executable(
+            "ductor-supervise",
+            "#!/bin/sh\n"
+            "d=$XDG_STATE_HOME/telegram-agents\nmkdir -p \"$d\"\n"
+            "printf '%s\\n' $$ >\"$d/ductor-supervise.pid\"\n"
+            "sleep 2\nductor & child=$!\nprintf '%s\\n' $child >\"$d/ductor-child.pid\"\nwait $child\n",
+        )
+        result = self.run_manager("start", "ductor", timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ductor started", result.stdout)
+
+    def test_start_all_attempts_later_agent_after_ductor_failure(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|ductor,pi-agent\n", encoding="utf-8")
+        self.write_executable(
+            "ductor-supervise",
+            "#!/bin/sh\n"
+            "d=$XDG_STATE_HOME/telegram-agents\nmkdir -p \"$d\"\n"
+            "printf '%s\\n' $$ >\"$d/ductor-supervise.pid\"\n"
+            "trap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+        )
+        result = self.run_manager("start", timeout=1)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("pi-agent started", result.stdout)
+        self.assertIn("Failed to start enabled agent: ductor", result.stderr)
 
 
 if __name__ == "__main__":
@@ -1251,10 +1507,11 @@ Usage: telegram-agent-host <command> [agent]
 Commands:
   list              List all known agents
   status            Show which agents are running
+  enabled           Print enabled agents for this host
   enable <agent>    Enable agent on this machine
   disable <agent>   Disable agent on this machine
   sync              Sync configs to this machine from DotCortex
-  start             Start all enabled agents
+  start             Start all enabled agents independently
   stop              Stop all agents
   switch <machine>  Switch to another machine's agents (disables local, enables remote)
   bring             Bring agents to this machine (stop remote, start local)
@@ -1409,6 +1666,18 @@ ductor_running() {
 
 ductor_ready() {
     ductor_running && pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor
+}
+
+wait_ductor_ready() {
+    local timeout="${DUCTOR_READY_TIMEOUT:-90}"
+    local elapsed=0
+    case "$timeout" in ''|*[!0-9]*) echo "Invalid DUCTOR_READY_TIMEOUT: $timeout" >&2; return 1 ;; esac
+    while [ "$elapsed" -lt "$timeout" ]; do
+        ductor_ready && return 0
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    ductor_ready
 }
 
 stop_ductor_owned() {
@@ -1715,17 +1984,17 @@ start_agent() {
                 if ductor_ready; then
                     echo "ductor is already running"
                 elif ductor_running; then
-                    echo "ductor supervisor is running but its child is not ready" >&2
-                    return 1
+                    echo "ductor supervisor is running; waiting for cold-start readiness..."
+                    if ! wait_ductor_ready; then
+                        echo "ductor supervisor remained degraded after ${DUCTOR_READY_TIMEOUT:-90}s" >&2
+                        return 1
+                    fi
+                    echo "ductor started"
                 else
                     echo "Starting ductor (supervised)..."
                     rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
                     nohup setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
-                    for _ in {1..15}; do
-                        ductor_ready && break
-                        sleep 1
-                    done
-                    if ! ductor_ready; then
+                    if ! wait_ductor_ready; then
                         echo "ductor failed supervised readiness" >&2
                         return 1
                     fi
@@ -1855,9 +2124,14 @@ start_all() {
     fi
 
     echo "Starting enabled agents for $host: $agents"
+    local failed=0
     for agent in $agents; do
-        start_agent "$agent"
+        if ! start_agent "$agent"; then
+            echo "Failed to start enabled agent: $agent" >&2
+            failed=1
+        fi
     done
+    return "$failed"
 }
 
 stop_all() {
@@ -1958,6 +2232,7 @@ case "$COMMAND" in
     enable) enable_agent "${1:-}" ;;
     disable) disable_agent "${1:-}" ;;
     sync) sync_configs ;;
+    enabled) get_enabled_agents "$(get_hostname)" ;;
     start)
         if [ -n "${1:-}" ]; then
             start_agent "$1"
