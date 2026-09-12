@@ -31,12 +31,14 @@ exec "$@"
 EOF
 cat >"$tmp/bin/agentify-desktop" <<'EOF'
 #!/usr/bin/env bash
+[[ "$AGENTIFY_DESKTOP_CHROME_BIN" == "$FAKE_CHROME_BIN" ]]
 count=0
 [ -f "$FAKE_LAUNCH_COUNT" ] && count="$(cat "$FAKE_LAUNCH_COUNT")"
 printf '%s\n' "$((count + 1))" >"$FAKE_LAUNCH_COUNT"
 printf '{"ok":true,"pid":%s,"port":43123,"serverId":"fresh-server","startedAt":"2026-09-12T00:00:00Z"}\n' "$FAKE_STATE_PID" >"$AGENTIFY_CORTEX_STATE"
 sleep 1
 EOF
+printf '#!/usr/bin/env bash\nexit 0\n' >"$tmp/bin/fake-chrome"
 chmod 755 "$tmp/bin/"* "$tmp/home/.local/bin/sanctuary-cortex-xpra"
 
 run_launcher() {
@@ -46,6 +48,7 @@ run_launcher() {
   AGENTIFY_CORTEX_CURL_BIN="$tmp/bin/curl" AGENTIFY_CORTEX_GDBUS_BIN="$tmp/bin/gdbus" \
   AGENTIFY_CORTEX_DBUS_RUN_SESSION_BIN="$tmp/bin/dbus-run-session" \
   AGENTIFY_CORTEX_DESKTOP_BIN="$tmp/bin/agentify-desktop" \
+  AGENTIFY_CORTEX_CHROME_BIN="$tmp/bin/fake-chrome" FAKE_CHROME_BIN="$tmp/bin/fake-chrome" \
   FAKE_DBUS_MARKER="$tmp/dbus.marker" FAKE_LAUNCH_COUNT="$tmp/launches" \
   FAKE_STATE_PID="$$" \
   FAKE_DBUS_MODE="$TEST_DBUS_MODE" FAKE_HEALTH_MODE="$TEST_HEALTH_MODE" \
@@ -53,6 +56,7 @@ run_launcher() {
 }
 
 printf '%s\n' 0 >"$tmp/launches"
+[[ "$(HOME="$tmp/home" "$LAUNCHER" --help)" == "Usage: agentify-cortex" ]]
 touch "$tmp/run"
 TEST_DBUS_MODE=bad TEST_HEALTH_MODE=good run_launcher
 [[ "$(cat "$tmp/dbus.marker")" == private ]]
