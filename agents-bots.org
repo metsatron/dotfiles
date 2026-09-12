@@ -940,6 +940,278 @@ else
 fi
 #+END_SRC
 
+* Telegram agent boot owner
+
+The host manager already owns exact enabled-agent selection and readiness.  This
+boot wrapper adds only bounded initial launch, retry, locking, receipts, and log
+retention; it never duplicates agent-specific process ownership.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/telegram-agent-boot :shebang "#!/usr/bin/env bash" :comments no
+set -u
+
+EXPECTED_HOST=""
+DELAY=15
+ATTEMPTS=4
+RETRY_SECONDS=15
+MANAGER="${TELEGRAM_AGENT_MANAGER:-$HOME/.local/bin/telegram-agent-host}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agent-boot"
+NO_LOG="${TELEGRAM_AGENT_BOOT_NO_LOG:-0}"
+
+usage() {
+  echo "Usage: telegram-agent-boot --expected-host HOST [--delay SECONDS] [--attempts COUNT] [--retry-seconds SECONDS] [--manager PATH] [--state-dir PATH]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --expected-host) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --delay) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; DELAY="$2"; shift ;;
+    --attempts) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ATTEMPTS="$2"; shift ;;
+    --retry-seconds) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RETRY_SECONDS="$2"; shift ;;
+    --manager) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; MANAGER="$2"; shift ;;
+    --state-dir) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; STATE_DIR="$2"; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "telegram-agent-boot: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$EXPECTED_HOST" ] || { echo "telegram-agent-boot: --expected-host is required" >&2; exit 2; }
+case "$DELAY:$ATTEMPTS:$RETRY_SECONDS" in
+  *[!0-9:]*|:*|*::*|*:) echo "telegram-agent-boot: delay, attempts and retry seconds must be non-negative integers" >&2; exit 2 ;;
+esac
+[ "$ATTEMPTS" -gt 0 ] || { echo "telegram-agent-boot: attempts must be positive" >&2; exit 2; }
+
+CURRENT_HOST="$(hostname | tr '[:upper:]' '[:lower:]')"
+EXPECTED_HOST="$(printf '%s' "$EXPECTED_HOST" | tr '[:upper:]' '[:lower:]')"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  echo "telegram-agent-boot: refusing host $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  exit 64
+}
+[ -x "$MANAGER" ] || { echo "telegram-agent-boot: manager is not executable: $MANAGER" >&2; exit 69; }
+
+umask 077
+mkdir -p "$STATE_DIR"
+if [ "$NO_LOG" != 1 ]; then
+  LOG="$STATE_DIR/boot.log"
+  if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -ge 10485760 ]; then
+    mv -f "$LOG" "$LOG.1"
+  fi
+  exec >>"$LOG" 2>&1
+fi
+
+exec 9>"$STATE_DIR/boot.lock"
+if ! flock -n 9; then
+  echo "telegram-agent-boot: another boot attempt owns the lock"
+  exit 0
+fi
+
+write_receipt() {
+  status="$1"
+  attempt="$2"
+  RECEIPT_TMP="$STATE_DIR/receipt.json.tmp.$$"
+  python3 - "$RECEIPT_TMP" "$STATE_DIR/receipt.json" "$CURRENT_HOST" "$status" "$attempt" <<'PY'
+import json, os, pathlib, sys, time
+tmp, dest, host, status, attempt = sys.argv[1:]
+path = pathlib.Path(tmp)
+path.write_text(json.dumps({"attempt": int(attempt), "host": host, "schema": "dotcortex.telegram-agent-boot.v1", "status": status, "timestamp": int(time.time())}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+os.chmod(path, 0o600)
+os.replace(path, dest)
+PY
+}
+
+[ "$DELAY" -eq 0 ] || sleep "$DELAY"
+attempt=1
+while [ "$attempt" -le "$ATTEMPTS" ]; do
+  echo "telegram-agent-boot: attempt $attempt/$ATTEMPTS"
+  if "$MANAGER" start; then
+    write_receipt ready "$attempt"
+    echo "telegram-agent-boot: ready"
+    exit 0
+  fi
+  write_receipt retry "$attempt"
+  [ "$attempt" -ge "$ATTEMPTS" ] || sleep "$RETRY_SECONDS"
+  attempt=$((attempt + 1))
+done
+
+write_receipt failed "$ATTEMPTS"
+echo "telegram-agent-boot: failed after $ATTEMPTS attempts" >&2
+exit 1
+#+END_SRC
+
+** Telegram agent boot cron deployment helper
+
+#+BEGIN_SRC bash :tangle all/.local/bin/telegram-agent-boot-cron-apply :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+
+TAG="telegram-agent-boot-cron-apply"
+TARGET="/etc/cron.d/dotcortex-telegram-agent-boot"
+EXPECTED_HOST=""
+DRY=0
+REMOVE=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host) [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --dry-run) DRY=1 ;;
+    --remove) REMOVE=1 ;;
+    -h|--help|help) echo "Usage: $TAG --host EXACT_HOST [--dry-run] [--remove]"; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then echo "remove $TARGET"; else run_priv rm -f "$TARGET"; echo "$TAG: removed $TARGET"; fi
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --host EXACT_HOST is required" >&2; exit 2; }
+[ "$(hostname)" = "$EXPECTED_HOST" ] || { echo "$TAG: refusing installation on $(hostname); expected $EXPECTED_HOST" >&2; exit 1; }
+
+USER_NAME="$(id -un)"
+USER_ID="$(id -u)"
+TARGET_HOME="$HOME"
+BOOT="$TARGET_HOME/.local/bin/telegram-agent-boot"
+[ "$DRY" = 1 ] || [ -x "$BOOT" ] || { echo "$TAG: missing $BOOT; tangle and stow first" >&2; exit 1; }
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex Telegram agent initial boot owner; managed by $TAG.
+@reboot ${USER_NAME} HOME=${TARGET_HOME} PATH=${TARGET_HOME}/.local/bin:${TARGET_HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/${USER_ID} ${BOOT} --expected-host ${EXPECTED_HOST}
+EOF
+
+if [ "$DRY" = 1 ]; then
+  cat "$TMP"
+else
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+  echo "$TAG: installed $TARGET"
+fi
+#+END_SRC
+
+** Telegram agent boot contract tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-telegram-agent-boot.py :comments no
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import unittest
+
+
+HERE = Path(__file__).resolve()
+BOOT = HERE.parents[3] / "bin" / "telegram-agent-boot"
+CRON_APPLY = HERE.parents[3] / "bin" / "telegram-agent-boot-cron-apply"
+MANAGER = HERE.parents[3] / "bin" / "telegram-agent-host"
+HOST = subprocess.check_output(["hostname"], text=True).strip()
+
+
+class TelegramAgentBootTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.state = self.root / "state"
+        self.manager = self.root / "manager"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def write_manager(self, succeed_after: int) -> None:
+        self.manager.write_text(
+            "#!/bin/sh\n"
+            f"count_file={str(self.root / 'count')!r}\n"
+            "count=0\n"
+            "[ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n"
+            "count=$((count + 1))\n"
+            "printf '%s\\n' \"$count\" >\"$count_file\"\n"
+            f"[ \"$count\" -ge {succeed_after} ]\n",
+            encoding="utf-8",
+        )
+        self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
+
+    def run_boot(self, *extra: str) -> subprocess.CompletedProcess[str]:
+        env = os.environ.copy()
+        env["HOME"] = str(self.root)
+        env["TELEGRAM_AGENT_BOOT_NO_LOG"] = "1"
+        return subprocess.run(
+            [str(BOOT), "--expected-host", HOST, "--delay", "0", "--retry-seconds", "0",
+             "--manager", str(self.manager), "--state-dir", str(self.state), *extra],
+            text=True, capture_output=True, env=env, timeout=10,
+        )
+
+    def test_retry_then_ready_receipt(self) -> None:
+        self.write_manager(succeed_after=2)
+        result = self.run_boot("--attempts", "3")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "count").read_text().strip(), "2")
+        receipt = json.loads((self.state / "receipt.json").read_text())
+        self.assertEqual((receipt["status"], receipt["attempt"], receipt["host"]), ("ready", 2, HOST.lower()))
+
+    def test_exhaustion_is_loud_and_durable(self) -> None:
+        self.write_manager(succeed_after=9)
+        result = self.run_boot("--attempts", "2")
+        self.assertEqual(result.returncode, 1)
+        receipt = json.loads((self.state / "receipt.json").read_text())
+        self.assertEqual((receipt["status"], receipt["attempt"]), ("failed", 2))
+
+    def test_wrong_host_refuses_before_state_or_manager(self) -> None:
+        self.write_manager(succeed_after=1)
+        result = subprocess.run(
+            [str(BOOT), "--expected-host", "definitely-not-this-host", "--delay", "0",
+             "--manager", str(self.manager), "--state-dir", str(self.state)],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 64)
+        self.assertFalse(self.state.exists())
+        self.assertFalse((self.root / "count").exists())
+
+    def test_lock_prevents_duplicate_launch(self) -> None:
+        self.write_manager(succeed_after=1)
+        self.state.mkdir(parents=True)
+        with (self.state / "boot.lock").open("w") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            result = self.run_boot("--attempts", "1")
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse((self.root / "count").exists())
+
+    def test_help_is_side_effect_free(self) -> None:
+        result = subprocess.run([str(BOOT), "--help"], text=True, capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("Usage:", result.stdout)
+        self.assertFalse(self.state.exists())
+
+    def test_cron_dry_run_is_exact_and_non_mutating(self) -> None:
+        result = subprocess.run(
+            [str(CRON_APPLY), "--host", HOST, "--dry-run"],
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("@reboot", result.stdout)
+        self.assertIn("telegram-agent-boot --expected-host " + HOST, result.stdout)
+
+    def test_manager_help_is_side_effect_free(self) -> None:
+        home = self.root / "help-home"
+        env = os.environ.copy()
+        env["HOME"] = str(home)
+        env["XDG_STATE_HOME"] = str(home / "state")
+        for flag in ("-h", "--help"):
+            result = subprocess.run([str(MANAGER), flag], text=True, capture_output=True, env=env, timeout=10)
+            self.assertEqual(result.returncode, 0)
+            self.assertIn("Usage:", result.stdout)
+            self.assertFalse((home / "state").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
 * Agent Control Script
 
 
@@ -997,8 +1269,6 @@ Examples:
   telegram-agent-host switch x230
 EOF
 }
-
-mkdir -p "$STATE_DIR"
 
 get_hostname() {
     hostname | tr '[:upper:]' '[:lower:]'
@@ -1675,6 +1945,12 @@ bring_here() {
 
 COMMAND="${1:-}"
 shift || true
+
+case "$COMMAND" in
+    -h|--help|help) usage; exit 0 ;;
+esac
+
+mkdir -p "$STATE_DIR"
 
 case "$COMMAND" in
     list) list_agents ;;
