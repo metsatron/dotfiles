@@ -1,0 +1,312 @@
+#!/usr/bin/env python3
+"""Guard the Kikin OpenCode pair from outside the OpenCode process tree."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+SCHEMA = "dotcortex.opencode-watchdog.v1"
+SAFE_REASONS = frozenset({"backend-down", "poller-down", "api-unreachable"})
+DEFAULT_COOLDOWN = 15 * 60
+DEFAULT_CONFIRM_SECONDS = 120.0
+DEFAULT_ALERT_COOLDOWN = 6 * 60 * 60
+DEFAULT_MAX_FAILURES = 3
+
+
+def read_json(path: pathlib.Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def atomic_json(path: pathlib.Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def log_event(path: pathlib.Path, **fields: object) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"timestamp": time.time(), **fields}, sort_keys=True) + "\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def emit(value: dict, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"OpenCode watchdog: {value.get('status')} ({value.get('reason')})")
+
+
+def host_matches(expected: str) -> bool:
+    try:
+        return pathlib.Path("/etc/hostname").read_text(encoding="utf-8").strip() == expected
+    except OSError:
+        return False
+
+
+def owner_inspect(args: argparse.Namespace) -> tuple[dict | None, int, str]:
+    command = [
+        str(pathlib.Path(args.owner).expanduser()),
+        "inspect",
+        "--state", str(pathlib.Path(args.owner_state).expanduser()),
+        "--project", str(pathlib.Path(args.project).expanduser()),
+        "--host", "127.0.0.1",
+        "--port", str(args.port),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=args.command_timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, 124, type(error).__name__
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError):
+        return None, completed.returncode, "owner-invalid-json"
+    if not isinstance(payload, dict):
+        return None, completed.returncode, "owner-invalid-document"
+    return payload, completed.returncode, completed.stderr.strip()
+
+
+def api_probe(port: int, timeout: float) -> dict:
+    request = Request(f"http://127.0.0.1:{port}/", headers={"Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return {"status": "healthy" if response.status == 200 else "unhealthy", "http_status": response.status}
+    except HTTPError as error:
+        return {"status": "unhealthy", "http_status": error.code, "reason": "api-unreachable"}
+    except (OSError, URLError, TimeoutError) as error:
+        return {"status": "unhealthy", "reason": "api-unreachable", "error": type(error).__name__}
+
+
+def fingerprint(payload: dict, probe: dict) -> str:
+    material = {
+        "reasons": payload.get("reasons", []),
+        "backend": (payload.get("backend") or {}).get("pid"),
+        "poller": (payload.get("poller") or {}).get("pid"),
+        "api": probe.get("reason") or probe.get("http_status"),
+    }
+    return json.dumps(material, sort_keys=True, separators=(",", ":"))
+
+
+def runtime_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    home = pathlib.Path.home()
+    environment["HOME"] = str(home)
+    environment["PATH"] = ":".join(filter(None, [
+        str(home / ".local/bin"),
+        str(home / ".npm-global/bin"),
+        environment.get("PATH", ""),
+    ]))
+    return environment
+
+
+def run_command(command: list[str], args: argparse.Namespace, stream) -> subprocess.CompletedProcess:
+    stream.write(f"command={json.dumps(command)}\n")
+    stream.flush()
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=args.command_timeout,
+            env=args.environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        stream.write(f"error={type(error).__name__}\n")
+        stream.flush()
+        return subprocess.CompletedProcess(command, 124)
+    stream.write(f"returncode={completed.returncode}\n")
+    stream.flush()
+    return completed
+
+
+def worker(args: argparse.Namespace) -> int:
+    state_path = pathlib.Path(args.watchdog_state).expanduser()
+    event_path = state_path.with_name("events.jsonl")
+    log_path = state_path.with_name("recovery.log")
+    manager = str(pathlib.Path(args.manager).expanduser())
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"worker-start={time.time()}\n")
+        stop = run_command([manager, "stop", "opencode"], args, stream)
+        start = run_command([manager, "start", "opencode"], args, stream)
+        payload, inspect_code, detail = owner_inspect(args)
+        probe = api_probe(args.port, args.api_timeout) if payload and payload.get("status") == "running" else {"status": "not-probed"}
+        healthy = inspect_code == 0 and payload is not None and payload.get("status") == "running" and probe.get("status") == "healthy"
+        stream.write(f"worker-result={'success' if healthy else 'failed'}\n")
+    state = read_json(state_path) or {"schema": SCHEMA, "failures": 0}
+    state.update({"last_worker": time.time(), "last_result": "recovered" if healthy else "failed"})
+    state["failures"] = 0 if healthy else int(state.get("failures", 0)) + 1
+    if healthy:
+        state.pop("degraded_since", None)
+        state.pop("degraded_fingerprint", None)
+        state.pop("last_alert", None)
+    atomic_json(state_path, state)
+    log_event(event_path, action="recovery", result=state["last_result"], stop=stop.returncode, start=start.returncode, inspect=detail)
+    return 0 if healthy else 1
+
+
+def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> int:
+    event_path = state_path.with_name("events.jsonl")
+    state = read_json(state_path) or {"schema": SCHEMA, "failures": 0}
+    payload, inspect_code, detail = owner_inspect(args)
+    if payload is None:
+        value = {"schema": SCHEMA, "status": "skip", "reason": detail, "inspect_code": inspect_code}
+        emit(value, args.json)
+        return 0
+
+    probe = api_probe(args.port, args.api_timeout) if payload.get("status") == "running" else {"status": "not-probed"}
+    reasons = set(str(reason) for reason in payload.get("reasons", []))
+    if probe.get("reason") == "api-unreachable":
+        reasons.add("api-unreachable")
+    if not reasons:
+        state.update({"last_healthy": time.time(), "failures": 0})
+        state.pop("degraded_since", None)
+        state.pop("degraded_fingerprint", None)
+        state.pop("last_alert", None)
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        emit({"schema": SCHEMA, "status": "healthy", "reason": "owner-and-api-healthy", "probe": probe}, args.json)
+        return 0
+
+    if not reasons.issubset(SAFE_REASONS) or payload.get("status") == "stopped":
+        emit({"schema": SCHEMA, "status": "skip", "reason": "owner-not-safe-to-restart", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+
+    now = time.time()
+    current_fingerprint = fingerprint(payload, probe)
+    if state.get("degraded_fingerprint") != current_fingerprint:
+        state.update({"degraded_since": now, "degraded_fingerprint": current_fingerprint})
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        emit({"schema": SCHEMA, "status": "suspect", "reason": "confirmation-pending", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+    if now - float(state.get("degraded_since", now)) < args.confirm_seconds:
+        emit({"schema": SCHEMA, "status": "suspect", "reason": "confirmation-pending", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+    if now - float(state.get("last_attempt", 0)) < args.cooldown:
+        emit({"schema": SCHEMA, "status": "skip", "reason": "cooldown", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+    if int(state.get("failures", 0)) >= args.max_failures:
+        if now - float(state.get("last_alert", 0)) < args.alert_cooldown:
+            emit({"schema": SCHEMA, "status": "alert", "reason": "failure-alert-cooldown", "failures": state.get("failures", 0)}, args.json)
+            return 0
+        state["last_alert"] = now
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        emit({"schema": SCHEMA, "status": "alert", "reason": "recovery-failure-threshold", "failures": state.get("failures", 0)}, args.json)
+        return 0
+    if args.dry_run:
+        emit({"schema": SCHEMA, "status": "dry-run", "reason": "would-dispatch-recovery", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+
+    state.update({"last_attempt": now, "last_reason": sorted(reasons)})
+    atomic_json(state_path, state)
+    command = [
+        sys.executable, str(pathlib.Path(__file__).resolve()),
+        "--worker", "--expected-host", args.expected_host,
+        "--owner", args.owner, "--owner-state", args.owner_state,
+        "--manager", args.manager, "--project", args.project,
+        "--port", str(args.port), "--watchdog-state", args.watchdog_state,
+        "--api-timeout", str(args.api_timeout),
+        "--command-timeout", str(args.command_timeout),
+    ]
+    log_path = state_path.with_name("recovery.log")
+    with log_path.open("a", encoding="utf-8") as stream:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=args.environment,
+        )
+    log_event(event_path, action="dispatch", result="dispatched", reasons=sorted(reasons), fingerprint=current_fingerprint)
+    emit({"schema": SCHEMA, "status": "dispatched", "reason": "detached-recovery", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+    return 0
+
+
+def run(args: argparse.Namespace) -> int:
+    if not host_matches(args.expected_host):
+        value = {"schema": SCHEMA, "status": "skip", "reason": "wrong-host", "expected_host": args.expected_host}
+        emit(value, args.json)
+        return 0
+    args.environment = runtime_environment()
+    if args.worker:
+        return worker(args)
+
+    state_path = pathlib.Path(args.watchdog_state).expanduser()
+    if args.dry_run:
+        return assess_and_dispatch(args, state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name("watchdog.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit({"schema": SCHEMA, "status": "skip", "reason": "watchdog-already-running"}, args.json)
+            return 0
+        return assess_and_dispatch(args, state_path)
+
+
+def parser() -> argparse.ArgumentParser:
+    home = pathlib.Path.home()
+    state_home = pathlib.Path(os.environ.get("XDG_STATE_HOME", str(home / ".local/state")))
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--expected-host", required=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--owner", default=str(home / ".local/bin/opencode-owner"))
+    p.add_argument("--owner-state", default=str(state_home / "telegram-agents/opencode.json"))
+    p.add_argument("--manager", default=str(home / ".local/bin/telegram-agent-host"))
+    p.add_argument("--project", default=str(home / "HelmCortex"))
+    p.add_argument("--port", type=int, default=4096)
+    p.add_argument("--watchdog-state", default=str(state_home / "opencode-watchdog/state.json"))
+    p.add_argument("--api-timeout", type=float, default=3.0)
+    p.add_argument("--command-timeout", type=float, default=120.0)
+    p.add_argument("--confirm-seconds", type=float, default=DEFAULT_CONFIRM_SECONDS)
+    p.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN)
+    p.add_argument("--alert-cooldown", type=float, default=DEFAULT_ALERT_COOLDOWN)
+    p.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

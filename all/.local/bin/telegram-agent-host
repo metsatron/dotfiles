@@ -2,6 +2,12 @@
 # Agent Control Script
 
 
+
+
+# [[file:../../../agents-bots.org::*Agent Control Script][Agent Control Script:1]]
+# Agent Control Script
+
+
 # [[file:../../../agents-bots.org::*Agent Control Script][Agent Control Script:1]]
 # ~/DotCortex/all/.local/bin/telegram-agent-host
 # Manage which Telegram agents run on this machine
@@ -14,6 +20,17 @@ HOSTS_FILE="$AGENTS_DIR/hosts.conf"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agents"
 KNOWN_AGENTS="opencode ductor claudecode hermes codex pi-agent"
 DUCTOR_HOME_DIR="${DUCTOR_HOME_DIR:-$HOME/HelmCortex/FORGE/brain/ductor}"
+OPENCODE_PROJECT_ROOT="${OPENCODE_PROJECT_ROOT:-$HOME/HelmCortex}"
+OPENCODE_PORT="${OPENCODE_PORT:-4096}"
+OPENCODE_STATE_FILE="${OPENCODE_STATE_FILE:-$STATE_DIR/opencode.json}"
+OPENCODE_POLLER_BIN="${OPENCODE_POLLER_BIN:-$HOME/.npm-global/bin/opencode-telegram}"
+OPENCODE_TELEGRAM_HOME="${OPENCODE_TELEGRAM_HOME:-$HOME/.config/opencode-telegram-bot}"
+OPENCODE_NODE_OPTIONS="${OPENCODE_NODE_OPTIONS:---dns-result-order=ipv4first --no-network-family-autoselection}"
+OPENCODE_PATCH_APPLIER="${OPENCODE_PATCH_APPLIER:-$HOME/HelmCortex/FORGE/bin/opencode-telegram-patch-apply}"
+export OPENCODE_TELEGRAM_HOME
+OPENCODE_OWNER_HELPER="${OPENCODE_OWNER_HELPER:-${DOTCORTEX_BIN_DIR:-$HOME/DotCortex/all/.local/bin}/opencode-owner}"
+OPENCODE_BACKEND_PID_FILE="$STATE_DIR/opencode-backend.pid"
+OPENCODE_POLLER_PID_FILE="$STATE_DIR/opencode-poller.pid"
 
 usage() {
     cat <<EOF
@@ -96,30 +113,112 @@ list_agents() {
 }
 
 check_opencode() {
-    if pgrep -f "opencode serve" >/dev/null 2>&1; then
-        echo "  opencode serve: RUNNING"
-    else
-        echo "  opencode serve: STOPPED"
+    local status_json status_code
+    if [ ! -x "$OPENCODE_OWNER_HELPER" ]; then
+        echo "opencode: STOPPED (owner helper unavailable)"
+        return 1
     fi
-    if pgrep -f "opencode-telegram" >/dev/null 2>&1; then
-        echo "  opencode-telegram: RUNNING"
-    else
-        echo "  opencode-telegram: STOPPED"
-    fi
+    set +e
+    status_json=$("$OPENCODE_OWNER_HELPER" inspect \
+        --state "$OPENCODE_STATE_FILE" \
+        --project "$OPENCODE_PROJECT_ROOT" \
+        --host 127.0.0.1 --port "$OPENCODE_PORT")
+    status_code=$?
+    set -e
+    python3 - "$status_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(f"opencode: {payload.get('status', 'unknown').upper()}")
+for role in ("backend", "poller"):
+    row = payload.get(role) or {}
+    state = "RUNNING" if row.get("valid") else ("STOPPED" if not row else "INVALID")
+    print(f"  opencode {role}: {state} pid={row.get('pid', '?') if row else '?'}")
+native = payload.get("native_poller") or {}
+session = payload.get("session") or {}
+print(f"  opencode native poller status: {native.get('status', 'unknown')}")
+print(f"  opencode session binding: {session.get('status', 'session-unbound')}")
+print(f"  opencode project: {payload.get('project', 'see owner state')}")
+print(f"  opencode port: {payload.get('host', '127.0.0.1')}:{payload.get('port', '?')}")
+PY
+    return "$status_code"
+}
+
+write_opencode_state() {
+    local backend_pid poller_pid
+    [ -r "$OPENCODE_BACKEND_PID_FILE" ] || return 1
+    backend_pid=$(cat "$OPENCODE_BACKEND_PID_FILE")
+    poller_pid=$(python3 - "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle)
+    print(value.get("pid", ""))
+except (OSError, ValueError, TypeError):
+    print("")
+PY
+    )
+    [ -n "$poller_pid" ] || return 1
+    [ -x "$OPENCODE_OWNER_HELPER" ] || return 1
+    "$OPENCODE_OWNER_HELPER" capture \
+        --state "$OPENCODE_STATE_FILE" \
+        --project "$OPENCODE_PROJECT_ROOT" \
+        --host 127.0.0.1 --port "$OPENCODE_PORT" \
+        --backend-pid "$backend_pid" --poller-pid "$poller_pid" \
+        --poller-entrypoint "$OPENCODE_POLLER_BIN" \
+        --poller-service-state "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" >/dev/null
 }
 
 check_ductor() {
-    if ductor_running; then
+    if ductor_ready; then
         echo "  ductor: RUNNING"
+    elif ductor_running; then
+        echo "  ductor: DEGRADED (supervisor alive, child unavailable)"
     else
         echo "  ductor: STOPPED"
     fi
 }
 
+pid_file_has_command() {
+    local pid_file="$1" expected="$2" pid argument
+    [ -r "$pid_file" ] || return 1
+    IFS= read -r pid < "$pid_file" || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        [ "${argument##*/}" = "$expected" ] && return 0
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
 ductor_running() {
-    # Healthy = the ductor-supervise loop is up (it stays up across the daemon's
-    # own hot-restarts); fall back to a bare daemon for any pre-supervisor launch.
-    pgrep -f "ductor-supervise" >/dev/null 2>&1 || pgrep -f "python.*$HOME/.local/bin/ductor" >/dev/null 2>&1
+    pid_file_has_command "$STATE_DIR/ductor-supervise.pid" ductor-supervise
+}
+
+ductor_ready() {
+    ductor_running && pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor
+}
+
+stop_ductor_owned() {
+    local supervisor_pid child_pid
+    if ductor_running; then
+        IFS= read -r supervisor_pid < "$STATE_DIR/ductor-supervise.pid"
+        kill -TERM "$supervisor_pid"
+        for _ in {1..15}; do
+            [ ! -r "/proc/$supervisor_pid/cmdline" ] && break
+            sleep 1
+        done
+        if [ -r "/proc/$supervisor_pid/cmdline" ]; then
+            echo "ductor supervisor $supervisor_pid did not stop" >&2
+            return 1
+        fi
+    elif pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor; then
+        IFS= read -r child_pid < "$STATE_DIR/ductor-child.pid"
+        kill -TERM "$child_pid"
+    fi
+    rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
 }
 
 hermes_service_unit() {
@@ -213,8 +312,13 @@ check_pi_agent() {
 }
 
 status_cmd() {
+    local requested="${1:-}"
     local host
     host=$(get_hostname)
+    if [ "$requested" = "opencode" ]; then
+        check_opencode
+        return
+    fi
     echo "Host: $host"
     echo "Enabled agents: $(get_enabled_agents "$host")"
     echo ""
@@ -339,28 +443,87 @@ start_agent() {
     validate_agent "$agent"
     case "$agent" in
         opencode)
-            if ! pgrep -f "opencode serve" >/dev/null 2>&1; then
-                echo "Starting opencode serve..."
-                nohup opencode serve > "$STATE_DIR/opencode-serve.log" 2>&1 </dev/null &
-                sleep 2
+            if [ ! -d "$OPENCODE_PROJECT_ROOT" ]; then
+                echo "OpenCode project root not found: $OPENCODE_PROJECT_ROOT" >&2
+                return 1
             fi
-            if ! pgrep -f "opencode-telegram" >/dev/null 2>&1; then
-                echo "Starting opencode-telegram..."
-                nohup ~/.npm-global/bin/opencode-telegram start > "$STATE_DIR/opencode-telegram.log" 2>&1 </dev/null &
-                sleep 3
+            if [ ! -x "$OPENCODE_PATCH_APPLIER" ]; then
+                echo "OpenCode Telegram patch applier not found: $OPENCODE_PATCH_APPLIER" >&2
+                return 1
             fi
+            if ! "$OPENCODE_PATCH_APPLIER"; then
+                echo "OpenCode Telegram package seam is not ready; refusing start" >&2
+                return 1
+            fi
+            if [ -r "$OPENCODE_STATE_FILE" ]; then
+                if check_opencode >/dev/null 2>&1; then
+                    echo "opencode is already running"
+                    return 0
+                fi
+                echo "Existing OpenCode owner state is not healthy; validating and stopping only its owned processes..."
+                "$OPENCODE_OWNER_HELPER" stop --state "$OPENCODE_STATE_FILE" --project "$OPENCODE_PROJECT_ROOT" --host 127.0.0.1 --port "$OPENCODE_PORT" || true
+            fi
+            if command -v ss >/dev/null 2>&1 && ss -Hln "sport = :$OPENCODE_PORT" 2>/dev/null | grep -q .; then
+                echo "Refusing OpenCode start: port $OPENCODE_PORT is already occupied by an unowned listener" >&2
+                return 1
+            fi
+            echo "Starting opencode serve in $OPENCODE_PROJECT_ROOT..."
+            (
+                cd "$OPENCODE_PROJECT_ROOT"
+                exec nohup opencode serve --hostname 127.0.0.1 --port "$OPENCODE_PORT"
+            ) > "$STATE_DIR/opencode-serve.log" 2>&1 </dev/null &
+            printf '%s\n' "$!" > "$OPENCODE_BACKEND_PID_FILE"
+            sleep 2
+            if [ ! -s "$OPENCODE_BACKEND_PID_FILE" ]; then
+                echo "OpenCode backend did not publish an owned PID" >&2
+                return 1
+            fi
+            echo "Starting opencode-telegram in $OPENCODE_PROJECT_ROOT..."
+            if ! (umask 077; cd "$OPENCODE_PROJECT_ROOT" && env NODE_OPTIONS="$OPENCODE_NODE_OPTIONS" "$OPENCODE_POLLER_BIN" start --daemon --mode installed > "$STATE_DIR/opencode-telegram.log" 2>&1 </dev/null); then
+                backend_pid=$(cat "$OPENCODE_BACKEND_PID_FILE")
+                kill -TERM "$backend_pid" 2>/dev/null || true
+                rm -f "$OPENCODE_BACKEND_PID_FILE"
+                echo "OpenCode Telegram daemon failed to start; rolled back owned backend" >&2
+                return 1
+            fi
+            for _ in {1..15}; do
+                [ -s "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" ] && break
+                sleep 1
+            done
+            write_opencode_state || {
+                "$OPENCODE_POLLER_BIN" stop >/dev/null 2>&1 || true
+                backend_pid=$(cat "$OPENCODE_BACKEND_PID_FILE")
+                kill -TERM "$backend_pid" 2>/dev/null || true
+                rm -f "$OPENCODE_BACKEND_PID_FILE" "$OPENCODE_POLLER_PID_FILE"
+                echo "OpenCode backend/poller did not produce a complete owner state" >&2
+                return 1
+            }
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" > "$OPENCODE_POLLER_PID_FILE"
             ;;
         ductor)
             if command -v ductor >/dev/null 2>&1; then
-                if ductor_running; then
+                if ductor_ready; then
                     echo "ductor is already running"
+                elif ductor_running; then
+                    echo "ductor supervisor is running but its child is not ready" >&2
+                    return 1
                 else
                     echo "Starting ductor (supervised)..."
-                    setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
-                    sleep 8
+                    rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
+                    nohup setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
+                    for _ in {1..15}; do
+                        ductor_ready && break
+                        sleep 1
+                    done
+                    if ! ductor_ready; then
+                        echo "ductor failed supervised readiness" >&2
+                        return 1
+                    fi
+                    echo "ductor started"
                 fi
             else
                 echo "ductor not found in PATH"
+                return 1
             fi
             ;;
         claudecode)
@@ -408,15 +571,18 @@ stop_agent() {
     validate_agent "$agent"
     case "$agent" in
         opencode)
-            pkill -f "opencode-telegram" 2>/dev/null || true
-            pkill -f "opencode serve" 2>/dev/null || true
+            if [ -x "$OPENCODE_OWNER_HELPER" ]; then
+                "$OPENCODE_OWNER_HELPER" stop \
+                    --state "$OPENCODE_STATE_FILE" \
+                    --project "$OPENCODE_PROJECT_ROOT" \
+                    --host 127.0.0.1 --port "$OPENCODE_PORT"
+            else
+                echo "OpenCode owner helper unavailable; refusing unscoped stop" >&2
+                return 1
+            fi
             ;;
         ductor)
-            # Kill the supervisor first — its SIGTERM trap stops the daemon child
-            # with no relaunch — then sweep any bare pre-supervisor daemon.
-            pkill -TERM -f "ductor-supervise" 2>/dev/null || true
-            sleep 1
-            pkill -f "python.*$HOME/.local/bin/ductor" 2>/dev/null || true
+            stop_ductor_owned
             ;;
         claudecode)
             pkill -f "claude.*channels.*telegram" 2>/dev/null || true
@@ -519,7 +685,7 @@ switch_to_machine() {
 
     echo "Stopping agents on $target before restart..."
     if [ -n "$target_ssh" ]; then
-        ssh "$target_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'opencode-telegram' 2>/dev/null || true; pkill -f 'opencode serve' 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
+        ssh "$target_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
         sleep 1
     fi
 
@@ -557,7 +723,7 @@ bring_here() {
             other_ssh=$(echo "$host_line" | cut -d'|' -f3)
             if [ -n "$other_ssh" ]; then
                 echo "Stopping agents on $other_host..."
-                ssh "$other_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'opencode-telegram' 2>/dev/null || true; pkill -f 'opencode serve' 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
+                ssh "$other_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
             fi
         fi
     done
@@ -572,7 +738,7 @@ shift || true
 
 case "$COMMAND" in
     list) list_agents ;;
-    status) status_cmd ;;
+    status) status_cmd "${1:-}" ;;
     enable) enable_agent "${1:-}" ;;
     disable) disable_agent "${1:-}" ;;
     sync) sync_configs ;;
@@ -594,4 +760,5 @@ case "$COMMAND" in
     bring) bring_here ;;
     *) usage; exit 1 ;;
 esac
+# Agent Control Script:1 ends here
 # Agent Control Script:1 ends here
