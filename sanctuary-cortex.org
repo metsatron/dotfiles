@@ -1394,38 +1394,83 @@ set -euo pipefail
 
 if [ -x "$HOME/.local/bin/sanctuary-cortex-xpra" ]; then
   DISPLAY_NUM="${SANCTUARY_CORTEX_FULL_DISPLAY:-:101}"
-  if ! xpra list 2>/dev/null | grep -Fq "$DISPLAY_NUM"; then
+  XPRA_BIN="${AGENTIFY_CORTEX_XPRA_BIN:-xpra}"
+  CURL_BIN="${AGENTIFY_CORTEX_CURL_BIN:-curl}"
+  GDBUS_BIN="${AGENTIFY_CORTEX_GDBUS_BIN:-gdbus}"
+  DBUS_RUN_SESSION_BIN="${AGENTIFY_CORTEX_DBUS_RUN_SESSION_BIN:-dbus-run-session}"
+  AGENTIFY_DESKTOP_BIN="${AGENTIFY_CORTEX_DESKTOP_BIN:-$HOME/.local/bin/agentify-desktop}"
+  AGENTIFY_STATE="${AGENTIFY_CORTEX_STATE:-$HOME/.agentify-desktop/state.json}"
+  AGENTIFY_LOCK="${AGENTIFY_CORTEX_LOCK:-$HOME/.agentify-desktop/agentify-cortex.lock}"
+
+  if ! "$XPRA_BIN" list 2>/dev/null | grep -Fq "$DISPLAY_NUM"; then
     "$HOME/.local/bin/sanctuary-cortex-xpra" start-full
   fi
-  # Liveness guard (2026-08-25): probe the control center's own /health, not a
-  # process pattern. =pgrep -f '@agentify/desktop'= false-matched the stdio MCP
-  # bridge processes every live agent session leaves running (=… @agentify/desktop@X
-  # mcp=), so it reported "already running" while the actual GUI was dead, and it
-  # ignored a stale state.json pointing at a dead pid. The control center writes its
-  # port to state.json and serves an unauthenticated /health; probing that fixes both.
-  AGENTIFY_STATE="$HOME/.agentify-desktop/state.json"
-  if [ -f "$AGENTIFY_STATE" ]; then
-    AGENTIFY_PORT="$(grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$AGENTIFY_STATE" 2>/dev/null | grep -oE '[0-9]+' | head -1 || true)"
-    if [ -n "$AGENTIFY_PORT" ] && curl -fs --max-time 3 "http://127.0.0.1:$AGENTIFY_PORT/health" >/dev/null 2>&1; then
-      echo "agentify-cortex: already running on $DISPLAY_NUM (control center healthy on port $AGENTIFY_PORT)"
-      exit 0
-    fi
+
+  mkdir -p "$(dirname -- "$AGENTIFY_STATE")"
+  exec 9>"$AGENTIFY_LOCK"
+  flock 9
+
+  state_is_healthy() {
+    local pid port server_id health
+    [ -s "$AGENTIFY_STATE" ] || return 1
+    pid="$(jq -er '.pid | select(type == "number" and floor == .)' "$AGENTIFY_STATE" 2>/dev/null)" || return 1
+    port="$(jq -er '.port | select(type == "number" and floor == . and . >= 1 and . <= 65535)' "$AGENTIFY_STATE" 2>/dev/null)" || return 1
+    server_id="$(jq -er '.serverId | select(type == "string" and length > 0)' "$AGENTIFY_STATE" 2>/dev/null)" || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    health="$("$CURL_BIN" -fsS --max-time 3 "http://127.0.0.1:$port/health" 2>/dev/null)" || return 1
+    jq -e --arg server_id "$server_id" '.ok == true and .serverId == $server_id' >/dev/null 2>&1 <<<"$health"
+  }
+
+  if state_is_healthy; then
+    echo "agentify-cortex: already running on $DISPLAY_NUM (control center healthy)"
+    exit 0
   fi
+
   XAUTHORITY_FILE="${SANCTUARY_CORTEX_XAUTHORITY:-${XAUTHORITY:-$HOME/.Xauthority}}"
   [[ -r "$XAUTHORITY_FILE" ]] || {
     echo "agentify-cortex: Xauthority file is unavailable: $XAUTHORITY_FILE" >&2
     exit 1
   }
-  mkdir -p "$HOME/.agentify-desktop"
-  LOG="$HOME/.agentify-desktop/agentify-cortex.log"
-  setsid env \
-    DISPLAY="$DISPLAY_NUM" \
-    XAUTHORITY="$XAUTHORITY_FILE" \
-    XDG_DATA_DIRS="$HOME/.guix-extra-profiles/sanctuary-cortex/sanctuary-cortex/share:/usr/share:/usr/local/share" \
-    PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.guix-extra-profiles/core/core/bin:/usr/local/bin:/usr/bin:/bin" \
-    "$HOME/.local/bin/agentify-desktop" >"$LOG" 2>&1 &
-  echo "agentify-cortex: launched on $DISPLAY_NUM (log: $LOG)"
-  exit 0
+  [[ -x "$AGENTIFY_DESKTOP_BIN" ]] || {
+    echo "agentify-cortex: Agentify Desktop launcher is unavailable: $AGENTIFY_DESKTOP_BIN" >&2
+    exit 1
+  }
+
+  LOG="${AGENTIFY_CORTEX_LOG:-$HOME/.agentify-desktop/agentify-cortex.log}"
+  COMMON_ENV=(
+    DISPLAY="$DISPLAY_NUM"
+    XAUTHORITY="$XAUTHORITY_FILE"
+    XDG_DATA_DIRS="$HOME/.guix-extra-profiles/sanctuary-cortex/sanctuary-cortex/share:/usr/share:/usr/local/share"
+    PATH="$HOME/.local/bin:$HOME/.npm-global/bin:$HOME/.guix-extra-profiles/core/core/bin:/usr/local/bin:/usr/bin:/bin"
+  )
+  bus_is_usable() {
+    [ -n "${DBUS_SESSION_BUS_ADDRESS:-}" ] || return 1
+    "$GDBUS_BIN" call --session --dest org.freedesktop.DBus \
+      --object-path /org/freedesktop/DBus --method org.freedesktop.DBus.ListNames \
+      >/dev/null 2>&1
+  }
+
+  if bus_is_usable; then
+    setsid env "${COMMON_ENV[@]}" "$AGENTIFY_DESKTOP_BIN" >"$LOG" 2>&1 &
+  else
+    setsid "$DBUS_RUN_SESSION_BIN" -- env "${COMMON_ENV[@]}" "$AGENTIFY_DESKTOP_BIN" >"$LOG" 2>&1 &
+  fi
+  launch_pid=$!
+
+  for _ in $(seq 1 "${AGENTIFY_CORTEX_START_WAIT:-75}"); do
+    if state_is_healthy; then
+      echo "agentify-cortex: started on $DISPLAY_NUM (control center healthy)"
+      exit 0
+    fi
+    if ! kill -0 "$launch_pid" 2>/dev/null; then
+      echo "agentify-cortex: Agentify Desktop exited before publishing healthy state; see $LOG" >&2
+      exit 1
+    fi
+    sleep 0.2
+  done
+  kill "$launch_pid" 2>/dev/null || true
+  echo "agentify-cortex: timed out waiting for a healthy control center; see $LOG" >&2
+  exit 1
 fi
 
 REMOTE="${SANCTUARY_CORTEX_SSH_ALIAS:-kikin}"
@@ -1444,6 +1489,82 @@ Keywords=agentify;chatgpt;perplexity;mcp;cortex;xpra;t1700;
 Terminal=false
 Categories=Network;
 StartupNotify=false
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/share/dotcortex/tests/agentify-cortex-lifecycle.sh :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "$0")/../../../../.." && pwd)"
+LAUNCHER="$ROOT/linux/.local/bin/agentify-cortex"
+tmp="$(mktemp -d)"
+trap 'if [ -f "$tmp/fake.pid" ]; then kill "$(cat "$tmp/fake.pid")" 2>/dev/null || true; fi; rm -rf -- "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/home/.local/bin"
+touch "$tmp/home/.Xauthority"
+printf '%s\n' ':101' >"$tmp/home/.local/bin/sanctuary-cortex-xpra"
+cat >"$tmp/bin/xpra" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' ':101'
+EOF
+cat >"$tmp/bin/gdbus" <<'EOF'
+#!/usr/bin/env bash
+[[ "$FAKE_DBUS_MODE" == good ]]
+EOF
+cat >"$tmp/bin/curl" <<'EOF'
+#!/usr/bin/env bash
+[[ "$FAKE_HEALTH_MODE" == good ]] || exit 22
+sid="$(jq -r '.serverId' "$AGENTIFY_CORTEX_STATE")"
+printf '{"ok":true,"serverId":"%s"}\n' "$sid"
+EOF
+cat >"$tmp/bin/dbus-run-session" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' private >"$FAKE_DBUS_MARKER"
+shift
+exec "$@"
+EOF
+cat >"$tmp/bin/agentify-desktop" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[ -f "$FAKE_LAUNCH_COUNT" ] && count="$(cat "$FAKE_LAUNCH_COUNT")"
+printf '%s\n' "$((count + 1))" >"$FAKE_LAUNCH_COUNT"
+printf '{"ok":true,"pid":%s,"port":43123,"serverId":"fresh-server","startedAt":"2026-09-12T00:00:00Z"}\n' "$FAKE_STATE_PID" >"$AGENTIFY_CORTEX_STATE"
+sleep 1
+EOF
+chmod 755 "$tmp/bin/"* "$tmp/home/.local/bin/sanctuary-cortex-xpra"
+
+run_launcher() {
+  HOME="$tmp/home" PATH="$tmp/bin:$PATH" \
+  AGENTIFY_CORTEX_STATE="$tmp/state.json" AGENTIFY_CORTEX_LOCK="$tmp/lock" \
+  AGENTIFY_CORTEX_LOG="$tmp/agentify.log" AGENTIFY_CORTEX_XPRA_BIN="$tmp/bin/xpra" \
+  AGENTIFY_CORTEX_CURL_BIN="$tmp/bin/curl" AGENTIFY_CORTEX_GDBUS_BIN="$tmp/bin/gdbus" \
+  AGENTIFY_CORTEX_DBUS_RUN_SESSION_BIN="$tmp/bin/dbus-run-session" \
+  AGENTIFY_CORTEX_DESKTOP_BIN="$tmp/bin/agentify-desktop" \
+  FAKE_DBUS_MARKER="$tmp/dbus.marker" FAKE_LAUNCH_COUNT="$tmp/launches" \
+  FAKE_STATE_PID="$$" \
+  FAKE_DBUS_MODE="$TEST_DBUS_MODE" FAKE_HEALTH_MODE="$TEST_HEALTH_MODE" \
+  "$LAUNCHER"
+}
+
+printf '%s\n' 0 >"$tmp/launches"
+touch "$tmp/run"
+TEST_DBUS_MODE=bad TEST_HEALTH_MODE=good run_launcher
+[[ "$(cat "$tmp/dbus.marker")" == private ]]
+[[ "$(cat "$tmp/launches")" == 1 ]]
+:
+
+printf '%s\n' '{"pid":2147483647,"port":43123,"serverId":"stale","startedAt":"2026-08-25T00:00:00Z"}' >"$tmp/state.json"
+TEST_DBUS_MODE=bad TEST_HEALTH_MODE=good run_launcher
+[[ "$(cat "$tmp/launches")" == 2 ]]
+:
+
+printf '%s\n' "{\"ok\":true,\"pid\":$$,\"port\":43123,\"serverId\":\"healthy\",\"startedAt\":\"2026-09-12T00:00:00Z\"}" >"$tmp/state.json"
+TEST_DBUS_MODE=good TEST_HEALTH_MODE=good run_launcher
+[[ "$(cat "$tmp/launches")" == 2 ]]
+
+printf '%s\n' '{"ok":true,"pid":2147483647,"port":43123,"serverId":"mcp-not-gui","startedAt":"2026-09-12T00:00:00Z"}' >"$tmp/state.json"
+TEST_DBUS_MODE=good TEST_HEALTH_MODE=good run_launcher
+[[ "$(cat "$tmp/launches")" == 3 ]]
+! grep -q 'pgrep' "$LAUNCHER"
+printf '%s\n' 'agentify-cortex lifecycle tests: ok'
 #+END_SRC
 
 * Verification helpers
