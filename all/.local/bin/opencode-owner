@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+# OpenCode ownership helper
+
+
+# [[file:../../../agents-bots.org::*OpenCode ownership helper][OpenCode ownership helper:1]]
+"""Fail-closed lifecycle owner for the isolated Kikin OpenCode pair.
+
+This helper deliberately discovers nothing by process-name search.  The state
+file is an ownership claim, and every operation revalidates PID, Linux start
+ticks, cwd, and argv against that claim before declaring or stopping a process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+OWNER = "telegram-agent-host:opencode"
+BOT = "opencode"
+DEFAULT_PROJECT = "/home/metsatron/HelmCortex"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 4096
+PACKAGE_NAME = "@grinev/opencode-telegram-bot"
+PACKAGE_VERSION = "0.22.5"
+
+
+def json_out(value: object) -> None:
+    print(json.dumps(value, sort_keys=True))
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def pid_info(pid: int) -> dict | None:
+    proc = Path("/proc") / str(pid)
+    try:
+        stat = (proc / "stat").read_text(encoding="utf-8")
+        after_comm = stat[stat.rfind(")") + 2 :].split()
+        start_ticks = int(after_comm[19])
+        argv = [part.decode(errors="replace") for part in (proc / "cmdline").read_bytes().split(b"\0") if part]
+        cwd = os.path.realpath(proc / "cwd")
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+    if not argv:
+        return None
+    return {"pid": pid, "start_ticks": start_ticks, "cwd": cwd, "argv": argv}
+
+
+def state_path(value: str | None) -> Path:
+    return Path(value or os.environ.get("OPENCODE_STATE_FILE", str(Path.home() / ".local/state/telegram-agents/opencode.json")))
+
+
+def project_path(value: str | None) -> str:
+    return os.path.realpath(value or os.environ.get("OPENCODE_PROJECT_ROOT", DEFAULT_PROJECT))
+
+
+def port_value(value: str | None) -> int:
+    return int(value or os.environ.get("OPENCODE_PORT", str(DEFAULT_PORT)))
+
+
+def expected_backend_argv(host: str, port: int) -> list[str]:
+    return ["opencode", "serve", "--hostname", host, "--port", str(port)]
+
+
+def argv_has_backend_contract(argv: list[str], host: str, port: int) -> bool:
+    if len(argv) < 6:
+        return False
+    # The executable may be absolute after a launcher resolves it.  Everything
+    # after it must be the exact serve contract, with no broad substring match.
+    return os.path.basename(argv[0]) == "opencode" and argv[1:] == expected_backend_argv(host, port)[1:]
+
+
+def argv_has_poller_contract(argv: list[str], entrypoint: str | None) -> bool:
+    if not argv or not entrypoint:
+        return False
+    expected = os.path.realpath(entrypoint)
+    for index, item in enumerate(argv):
+        if os.path.realpath(item) == expected:
+            return argv[index + 1 :] == ["start", "--mode", "installed"]
+    return False
+
+
+def check_record(state: dict, role: str, expected_project: str, host: str, port: int) -> tuple[dict | None, list[str]]:
+    pid_key = f"{role}_pid"
+    ticks_key = f"{role}_start_ticks"
+    argv_key = f"{role}_argv"
+    cwd_key = f"{role}_cwd"
+    reasons: list[str] = []
+    try:
+        pid = int(state.get(pid_key))
+    except (TypeError, ValueError):
+        return None, [f"{role}-pid-missing"]
+    current = pid_info(pid)
+    if current is None:
+        return None, [f"{role}-down"]
+    if str(state.get(ticks_key)) != str(current["start_ticks"]):
+        reasons.append(f"{role}-start-ticks-mismatch")
+    if os.path.realpath(str(state.get(cwd_key) or "")) != expected_project or current["cwd"] != expected_project:
+        reasons.append(f"{role}-wrong-cwd")
+    recorded_argv = state.get(argv_key)
+    if not isinstance(recorded_argv, list) or [str(x) for x in recorded_argv] != current["argv"]:
+        reasons.append(f"{role}-argv-mismatch")
+    if role == "backend" and not argv_has_backend_contract(current["argv"], host, port):
+        reasons.append("backend-argv-contract-mismatch")
+    if role == "poller" and not argv_has_poller_contract(current["argv"], state.get("poller_entrypoint")):
+        reasons.append("poller-identity-mismatch")
+    return current, reasons
+
+
+def native_poller_status(entrypoint: str | None) -> dict:
+    if not entrypoint:
+        return {"status": "unavailable", "reason": "poller-entrypoint-unknown"}
+    try:
+        result = subprocess.run(
+            [entrypoint, "status"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "unavailable", "reason": type(exc).__name__}
+    text = (result.stdout + result.stderr).strip()
+    status = "running" if "Service status: running" in text else "stopped" if "Service status: stopped" in text else "unknown"
+    return {"status": status, "exit": result.returncode, "output": text[-500:]}
+
+
+def native_service_state() -> dict | None:
+    home = Path(os.environ.get("OPENCODE_TELEGRAM_HOME", str(Path.home() / ".config/opencode-telegram-bot")))
+    return read_json(home / "run/bot-service.json")
+
+
+def settings_binding(project: str) -> dict:
+    home = Path(os.environ.get("OPENCODE_TELEGRAM_HOME", str(Path.home() / ".config/opencode-telegram-bot")))
+    settings_file = home / "settings.json"
+    settings = read_json(settings_file)
+    if not settings:
+        return {"status": "session-unbound", "source": str(settings_file), "reason": "settings-missing"}
+    current_project = settings.get("currentProject")
+    current_session = settings.get("currentSession")
+    worktree = current_project.get("worktree") if isinstance(current_project, dict) else None
+    session_id = current_session.get("id") if isinstance(current_session, dict) else None
+    directory = current_session.get("directory") if isinstance(current_session, dict) else None
+    if worktree != project or directory != project or not session_id:
+        return {
+            "status": "session-unbound",
+            "source": str(settings_file),
+            "project_worktree": worktree,
+            "session_directory": directory,
+            "reason": "missing-or-project-mismatch",
+        }
+    return {
+        "status": "bound",
+        "source": str(settings_file),
+        "project_worktree": worktree,
+        "session_directory": directory,
+        "session_id": session_id,
+        "session_title": current_session.get("title"),
+    }
+
+
+def inspect(args: argparse.Namespace) -> int:
+    state = read_json(state_path(args.state))
+    result = {"status": "stopped", "backend": None, "poller": None, "reasons": []}
+    if not state:
+        result["reasons"] = ["owner-state-missing"]
+        json_out(result)
+        return 1
+    project = project_path(args.project or state.get("project"))
+    host = args.host or str(state.get("host") or DEFAULT_HOST)
+    port = port_value(args.port or str(state.get("port") or DEFAULT_PORT))
+    backend, backend_reasons = check_record(state, "backend", project, host, port)
+    poller, poller_reasons = check_record(state, "poller", project, host, port)
+    if backend is not None:
+        backend["valid"] = not backend_reasons
+        backend["reasons"] = backend_reasons
+    if poller is not None:
+        poller["valid"] = not poller_reasons
+        poller["reasons"] = poller_reasons
+    result["backend"] = backend
+    result["poller"] = poller
+    result["reasons"] = backend_reasons + poller_reasons
+    if state.get("owner") != OWNER:
+        result["reasons"].append("foreign-owner")
+    if state.get("bot") != BOT:
+        result["reasons"].append("bot-identity-mismatch")
+    if project != os.path.realpath(DEFAULT_PROJECT):
+        result["reasons"].append("wrong-project")
+    if host != DEFAULT_HOST or port != DEFAULT_PORT:
+        result["reasons"].append("wrong-listen-boundary")
+    result["native_poller"] = native_poller_status(state.get("poller_entrypoint"))
+    binding = settings_binding(project)
+    result["session"] = binding
+    if state.get("session_binding") != binding:
+        # Session/project metadata is safe to refresh.  Credentials and package
+        # settings remain outside this owner file.
+        state["session_binding"] = binding
+        path = state_path(args.state)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, path)
+    result["project"] = project
+    result["host"] = host
+    result["port"] = port
+    result["status"] = "running" if not result["reasons"] else "degraded"
+    json_out(result)
+    return 0 if result["status"] == "running" else 1
+
+
+def capture(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    host = args.host or DEFAULT_HOST
+    port = port_value(args.port)
+    backend = pid_info(int(args.backend_pid))
+    poller = pid_info(int(args.poller_pid))
+    if not backend or not poller:
+        print("cannot capture missing backend/poller", file=sys.stderr)
+        return 1
+    if backend["cwd"] != project or not argv_has_backend_contract(backend["argv"], host, port):
+        print("backend does not satisfy exact owner contract", file=sys.stderr)
+        return 1
+    if poller["cwd"] != project or not argv_has_poller_contract(poller["argv"], args.poller_entrypoint):
+        print("poller does not satisfy exact owner contract", file=sys.stderr)
+        return 1
+    service_state = read_json(Path(args.poller_service_state)) if args.poller_service_state else None
+    if args.poller_service_state and (not service_state or int(service_state.get("pid", -1)) != poller["pid"]):
+        print("poller PID is not the package-native daemon PID", file=sys.stderr)
+        return 1
+    binding = settings_binding(project)
+    state = {
+        "schema": "helmcortex.opencode-owner.v2",
+        "owner": OWNER,
+        "bot": BOT,
+        "project": project,
+        "host": host,
+        "port": port,
+        "backend_pid": backend["pid"],
+        "backend_start_ticks": backend["start_ticks"],
+        "backend_cwd": backend["cwd"],
+        "backend_argv": backend["argv"],
+        "poller_pid": poller["pid"],
+        "poller_start_ticks": poller["start_ticks"],
+        "poller_cwd": poller["cwd"],
+        "poller_argv": poller["argv"],
+        "poller_entrypoint": os.path.realpath(args.poller_entrypoint),
+        "poller_package": PACKAGE_NAME,
+        "poller_package_version": PACKAGE_VERSION,
+        "poller_runtime": "daemon" if args.poller_service_state else "unknown",
+        "poller_service_state": args.poller_service_state,
+        "poller_native_status": native_poller_status(args.poller_entrypoint),
+        "session_binding": binding,
+    }
+    path = state_path(args.state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+    json_out(state)
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    state = read_json(state_path(args.state))
+    if not state:
+        print("opencode: STOPPED (owner state absent)")
+        return 0
+    project = project_path(args.project or state.get("project"))
+    host = args.host or str(state.get("host") or DEFAULT_HOST)
+    port = port_value(args.port or str(state.get("port") or DEFAULT_PORT))
+    owned: list[int] = []
+    refused = 0
+    for role in ("poller", "backend"):
+        current, reasons = check_record(state, role, project, host, port)
+        if reasons:
+            refused += 1
+            print(f"refusing to stop {role}: {','.join(reasons)}", file=sys.stderr)
+            continue
+        if current:
+            owned.append(current["pid"])
+    for pid in owned:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while owned and time.monotonic() < deadline:
+        if all(pid_info(pid) is None for pid in owned):
+            break
+        time.sleep(0.1)
+    remaining = [pid for pid in owned if pid_info(pid) is not None]
+    if remaining:
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    if not remaining and refused == 0:
+        try:
+            state_path(args.state).unlink()
+        except FileNotFoundError:
+            pass
+    print(f"opencode: stopped_owned={len(owned)} refused={refused}")
+    return 0 if not remaining and refused == 0 else 1
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("inspect", "stop"):
+        q = sub.add_parser(name)
+        q.add_argument("--state")
+        q.add_argument("--project")
+        q.add_argument("--host")
+        q.add_argument("--port")
+    q = sub.add_parser("capture")
+    q.add_argument("--state")
+    q.add_argument("--project", default=DEFAULT_PROJECT)
+    q.add_argument("--host", default=DEFAULT_HOST)
+    q.add_argument("--port", default=str(DEFAULT_PORT))
+    q.add_argument("--backend-pid", required=True)
+    q.add_argument("--poller-pid", required=True)
+    q.add_argument("--poller-entrypoint", required=True)
+    q.add_argument("--poller-service-state")
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return {"inspect": inspect, "capture": capture, "stop": stop}[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# OpenCode ownership helper:1 ends here

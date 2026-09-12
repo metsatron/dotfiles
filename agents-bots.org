@@ -12,7 +12,7 @@ at a time to avoid duplicate message handling.
 | Bot          | Type            | Status   | Transport                    | Port | Machine |
 |--------------+-----------------+----------+------------------------------+------+---------|
 | Hermes       | gateway (native) | WORKING  | python-telegram-bot webhooks | —    | x230    |
-| OpenCode     | wrapper (npm)   | WORKING  | polling / webhook            | 4096 | x230    |
+| OpenCode     | wrapper (npm)   | WORKING  | targeted polling / webhook | 4096 | kikin   |
 | Ductor       | wrapper (pip)   | PENDING  | Telegram / Matrix            | —    | t480s   |
 | Claude Code  | plugin (channel) | WORKAROUND | --channels plugin inline   | —    | x230    |
 | Codex        | none            | PENDING  | no native bot                | —    | —       |
@@ -38,7 +38,9 @@ npm wrapper that sends tasks to a running =opencode serve= backend.
 - Package: =@grinev/opencode-telegram-bot= (in npm manifest)
 - Config: =~/.config/opencode-telegram-bot/.env=
 - Env vars: =TELEGRAM_BOT_TOKEN=, =TELEGRAM_ALLOWED_USER_ID=, =OPENCODE_API_URL=
-- Start: =opencode serve &= then =opencode-telegram start=
+- Start: from =/home/metsatron/HelmCortex=, =opencode serve &= then =opencode-telegram start=;
+  the owner is explicitly =telegram-agent-host opencode= and records backend,
+  poller, project root, port and session scope for Nurse Joy.
 - Port: 4096 (OpenCode API)
 - Env template: =~/.bots/templates/opencode-telegram.env=
 
@@ -110,9 +112,9 @@ Define which agents run on which machines:
 # ~/DotCortex/all/.bots/hosts.conf
 # FORMAT: hostname|enabled_agents|ssh_host
 
-thinkpad-t480s|opencode|t480s
-thinkpad-x230|opencode,hermes|x230
-kikin-kushi|ductor,codex|kikin
+thinkpad-t480s||t480s
+thinkpad-x230|hermes|x230
+kikin-kushi|ductor,codex,opencode|kikin
 #+END_SRC
 
 * Agent Config Templates
@@ -128,6 +130,10 @@ TELEGRAM_ALLOWED_USER_ID=YOUR_USER_ID
 OPENCODE_API_URL=http://localhost:4096
 OPENCODE_MODEL_PROVIDER=opencode
 OPENCODE_MODEL_ID=big-pickle
+# Optional OpenCode Telegram STT seam (private runtime values).
+# STT_API_URL=YOUR_STT_API_URL
+# STT_API_PROTOCOL=whisper-server
+# STT_API_KEY=YOUR_STT_API_KEY
 BOT_LOCALE=en
 TASK_LIMIT=10
 #+END_SRC
@@ -192,9 +198,757 @@ CODEX_IDLE_COMPACT_SECONDS=1620
 CODEX_IDLE_COMPACT_MIN_TOKENS=70000
 #+END_SRC
 
+* OpenCode ownership helper
+
+#+BEGIN_SRC python :tangle all/.local/bin/opencode-owner :shebang "#!/usr/bin/env python3"
+"""Fail-closed lifecycle owner for the isolated Kikin OpenCode pair.
+
+This helper deliberately discovers nothing by process-name search.  The state
+file is an ownership claim, and every operation revalidates PID, Linux start
+ticks, cwd, and argv against that claim before declaring or stopping a process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+OWNER = "telegram-agent-host:opencode"
+BOT = "opencode"
+DEFAULT_PROJECT = "/home/metsatron/HelmCortex"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 4096
+PACKAGE_NAME = "@grinev/opencode-telegram-bot"
+PACKAGE_VERSION = "0.22.5"
+
+
+def json_out(value: object) -> None:
+    print(json.dumps(value, sort_keys=True))
+
+
+def read_json(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def pid_info(pid: int) -> dict | None:
+    proc = Path("/proc") / str(pid)
+    try:
+        stat = (proc / "stat").read_text(encoding="utf-8")
+        after_comm = stat[stat.rfind(")") + 2 :].split()
+        start_ticks = int(after_comm[19])
+        argv = [part.decode(errors="replace") for part in (proc / "cmdline").read_bytes().split(b"\0") if part]
+        cwd = os.path.realpath(proc / "cwd")
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+    if not argv:
+        return None
+    return {"pid": pid, "start_ticks": start_ticks, "cwd": cwd, "argv": argv}
+
+
+def state_path(value: str | None) -> Path:
+    return Path(value or os.environ.get("OPENCODE_STATE_FILE", str(Path.home() / ".local/state/telegram-agents/opencode.json")))
+
+
+def project_path(value: str | None) -> str:
+    return os.path.realpath(value or os.environ.get("OPENCODE_PROJECT_ROOT", DEFAULT_PROJECT))
+
+
+def port_value(value: str | None) -> int:
+    return int(value or os.environ.get("OPENCODE_PORT", str(DEFAULT_PORT)))
+
+
+def expected_backend_argv(host: str, port: int) -> list[str]:
+    return ["opencode", "serve", "--hostname", host, "--port", str(port)]
+
+
+def argv_has_backend_contract(argv: list[str], host: str, port: int) -> bool:
+    if len(argv) < 6:
+        return False
+    # The executable may be absolute after a launcher resolves it.  Everything
+    # after it must be the exact serve contract, with no broad substring match.
+    return os.path.basename(argv[0]) == "opencode" and argv[1:] == expected_backend_argv(host, port)[1:]
+
+
+def argv_has_poller_contract(argv: list[str], entrypoint: str | None) -> bool:
+    if not argv or not entrypoint:
+        return False
+    expected = os.path.realpath(entrypoint)
+    for index, item in enumerate(argv):
+        if os.path.realpath(item) == expected:
+            return argv[index + 1 :] == ["start", "--mode", "installed"]
+    return False
+
+
+def check_record(state: dict, role: str, expected_project: str, host: str, port: int) -> tuple[dict | None, list[str]]:
+    pid_key = f"{role}_pid"
+    ticks_key = f"{role}_start_ticks"
+    argv_key = f"{role}_argv"
+    cwd_key = f"{role}_cwd"
+    reasons: list[str] = []
+    try:
+        pid = int(state.get(pid_key))
+    except (TypeError, ValueError):
+        return None, [f"{role}-pid-missing"]
+    current = pid_info(pid)
+    if current is None:
+        return None, [f"{role}-down"]
+    if str(state.get(ticks_key)) != str(current["start_ticks"]):
+        reasons.append(f"{role}-start-ticks-mismatch")
+    if os.path.realpath(str(state.get(cwd_key) or "")) != expected_project or current["cwd"] != expected_project:
+        reasons.append(f"{role}-wrong-cwd")
+    recorded_argv = state.get(argv_key)
+    if not isinstance(recorded_argv, list) or [str(x) for x in recorded_argv] != current["argv"]:
+        reasons.append(f"{role}-argv-mismatch")
+    if role == "backend" and not argv_has_backend_contract(current["argv"], host, port):
+        reasons.append("backend-argv-contract-mismatch")
+    if role == "poller" and not argv_has_poller_contract(current["argv"], state.get("poller_entrypoint")):
+        reasons.append("poller-identity-mismatch")
+    return current, reasons
+
+
+def native_poller_status(entrypoint: str | None) -> dict:
+    if not entrypoint:
+        return {"status": "unavailable", "reason": "poller-entrypoint-unknown"}
+    try:
+        result = subprocess.run(
+            [entrypoint, "status"], capture_output=True, text=True, timeout=5, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"status": "unavailable", "reason": type(exc).__name__}
+    text = (result.stdout + result.stderr).strip()
+    status = "running" if "Service status: running" in text else "stopped" if "Service status: stopped" in text else "unknown"
+    return {"status": status, "exit": result.returncode, "output": text[-500:]}
+
+
+def native_service_state() -> dict | None:
+    home = Path(os.environ.get("OPENCODE_TELEGRAM_HOME", str(Path.home() / ".config/opencode-telegram-bot")))
+    return read_json(home / "run/bot-service.json")
+
+
+def settings_binding(project: str) -> dict:
+    home = Path(os.environ.get("OPENCODE_TELEGRAM_HOME", str(Path.home() / ".config/opencode-telegram-bot")))
+    settings_file = home / "settings.json"
+    settings = read_json(settings_file)
+    if not settings:
+        return {"status": "session-unbound", "source": str(settings_file), "reason": "settings-missing"}
+    current_project = settings.get("currentProject")
+    current_session = settings.get("currentSession")
+    worktree = current_project.get("worktree") if isinstance(current_project, dict) else None
+    session_id = current_session.get("id") if isinstance(current_session, dict) else None
+    directory = current_session.get("directory") if isinstance(current_session, dict) else None
+    if worktree != project or directory != project or not session_id:
+        return {
+            "status": "session-unbound",
+            "source": str(settings_file),
+            "project_worktree": worktree,
+            "session_directory": directory,
+            "reason": "missing-or-project-mismatch",
+        }
+    return {
+        "status": "bound",
+        "source": str(settings_file),
+        "project_worktree": worktree,
+        "session_directory": directory,
+        "session_id": session_id,
+        "session_title": current_session.get("title"),
+    }
+
+
+def inspect(args: argparse.Namespace) -> int:
+    state = read_json(state_path(args.state))
+    result = {"status": "stopped", "backend": None, "poller": None, "reasons": []}
+    if not state:
+        result["reasons"] = ["owner-state-missing"]
+        json_out(result)
+        return 1
+    project = project_path(args.project or state.get("project"))
+    host = args.host or str(state.get("host") or DEFAULT_HOST)
+    port = port_value(args.port or str(state.get("port") or DEFAULT_PORT))
+    backend, backend_reasons = check_record(state, "backend", project, host, port)
+    poller, poller_reasons = check_record(state, "poller", project, host, port)
+    if backend is not None:
+        backend["valid"] = not backend_reasons
+        backend["reasons"] = backend_reasons
+    if poller is not None:
+        poller["valid"] = not poller_reasons
+        poller["reasons"] = poller_reasons
+    result["backend"] = backend
+    result["poller"] = poller
+    result["reasons"] = backend_reasons + poller_reasons
+    if state.get("owner") != OWNER:
+        result["reasons"].append("foreign-owner")
+    if state.get("bot") != BOT:
+        result["reasons"].append("bot-identity-mismatch")
+    if project != os.path.realpath(DEFAULT_PROJECT):
+        result["reasons"].append("wrong-project")
+    if host != DEFAULT_HOST or port != DEFAULT_PORT:
+        result["reasons"].append("wrong-listen-boundary")
+    result["native_poller"] = native_poller_status(state.get("poller_entrypoint"))
+    binding = settings_binding(project)
+    result["session"] = binding
+    if state.get("session_binding") != binding:
+        # Session/project metadata is safe to refresh.  Credentials and package
+        # settings remain outside this owner file.
+        state["session_binding"] = binding
+        path = state_path(args.state)
+        temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        temp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+        os.replace(temp, path)
+    result["project"] = project
+    result["host"] = host
+    result["port"] = port
+    result["status"] = "running" if not result["reasons"] else "degraded"
+    json_out(result)
+    return 0 if result["status"] == "running" else 1
+
+
+def capture(args: argparse.Namespace) -> int:
+    project = project_path(args.project)
+    host = args.host or DEFAULT_HOST
+    port = port_value(args.port)
+    backend = pid_info(int(args.backend_pid))
+    poller = pid_info(int(args.poller_pid))
+    if not backend or not poller:
+        print("cannot capture missing backend/poller", file=sys.stderr)
+        return 1
+    if backend["cwd"] != project or not argv_has_backend_contract(backend["argv"], host, port):
+        print("backend does not satisfy exact owner contract", file=sys.stderr)
+        return 1
+    if poller["cwd"] != project or not argv_has_poller_contract(poller["argv"], args.poller_entrypoint):
+        print("poller does not satisfy exact owner contract", file=sys.stderr)
+        return 1
+    service_state = read_json(Path(args.poller_service_state)) if args.poller_service_state else None
+    if args.poller_service_state and (not service_state or int(service_state.get("pid", -1)) != poller["pid"]):
+        print("poller PID is not the package-native daemon PID", file=sys.stderr)
+        return 1
+    binding = settings_binding(project)
+    state = {
+        "schema": "helmcortex.opencode-owner.v2",
+        "owner": OWNER,
+        "bot": BOT,
+        "project": project,
+        "host": host,
+        "port": port,
+        "backend_pid": backend["pid"],
+        "backend_start_ticks": backend["start_ticks"],
+        "backend_cwd": backend["cwd"],
+        "backend_argv": backend["argv"],
+        "poller_pid": poller["pid"],
+        "poller_start_ticks": poller["start_ticks"],
+        "poller_cwd": poller["cwd"],
+        "poller_argv": poller["argv"],
+        "poller_entrypoint": os.path.realpath(args.poller_entrypoint),
+        "poller_package": PACKAGE_NAME,
+        "poller_package_version": PACKAGE_VERSION,
+        "poller_runtime": "daemon" if args.poller_service_state else "unknown",
+        "poller_service_state": args.poller_service_state,
+        "poller_native_status": native_poller_status(args.poller_entrypoint),
+        "session_binding": binding,
+    }
+    path = state_path(args.state)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    temp.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    os.replace(temp, path)
+    json_out(state)
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    state = read_json(state_path(args.state))
+    if not state:
+        print("opencode: STOPPED (owner state absent)")
+        return 0
+    project = project_path(args.project or state.get("project"))
+    host = args.host or str(state.get("host") or DEFAULT_HOST)
+    port = port_value(args.port or str(state.get("port") or DEFAULT_PORT))
+    owned: list[int] = []
+    refused = 0
+    for role in ("poller", "backend"):
+        current, reasons = check_record(state, role, project, host, port)
+        if reasons:
+            refused += 1
+            print(f"refusing to stop {role}: {','.join(reasons)}", file=sys.stderr)
+            continue
+        if current:
+            owned.append(current["pid"])
+    for pid in owned:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    deadline = time.monotonic() + 5
+    while owned and time.monotonic() < deadline:
+        if all(pid_info(pid) is None for pid in owned):
+            break
+        time.sleep(0.1)
+    remaining = [pid for pid in owned if pid_info(pid) is not None]
+    if remaining:
+        for pid in remaining:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    if not remaining and refused == 0:
+        try:
+            state_path(args.state).unlink()
+        except FileNotFoundError:
+            pass
+    print(f"opencode: stopped_owned={len(owned)} refused={refused}")
+    return 0 if not remaining and refused == 0 else 1
+
+
+def parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="command", required=True)
+    for name in ("inspect", "stop"):
+        q = sub.add_parser(name)
+        q.add_argument("--state")
+        q.add_argument("--project")
+        q.add_argument("--host")
+        q.add_argument("--port")
+    q = sub.add_parser("capture")
+    q.add_argument("--state")
+    q.add_argument("--project", default=DEFAULT_PROJECT)
+    q.add_argument("--host", default=DEFAULT_HOST)
+    q.add_argument("--port", default=str(DEFAULT_PORT))
+    q.add_argument("--backend-pid", required=True)
+    q.add_argument("--poller-pid", required=True)
+    q.add_argument("--poller-entrypoint", required=True)
+    q.add_argument("--poller-service-state")
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return {"inspect": inspect, "capture": capture, "stop": stop}[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+#+END_SRC
+* OpenCode survival watchdog
+
+The OpenCode pair is a host-managed headless service on Kikin. This watchdog is
+scheduled outside OpenCode and therefore must never be launched as a synchronous
+child of the session it may need to restart. It checks the versioned owner claim,
+the exact backend and poller identities, and a bounded loopback API probe. It
+only heals an existing owner state whose failure is limited to a missing backend,
+missing poller, or unreachable local API; missing owner state and identity
+mismatches remain operator-visible skips, so an intentional stop is not undone.
+The first observation is persisted and must survive the confirmation interval.
+Recovery is dispatched with a new session and recorded under the private XDG
+state directory. The cron installer is explicit and dry-run capable; tangling
+does not install a privileged schedule.
+
+#+BEGIN_SRC python :tangle all/.local/bin/opencode-watchdog :shebang "#!/usr/bin/env python3" :comments no
+"""Guard the Kikin OpenCode pair from outside the OpenCode process tree."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import pathlib
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+
+SCHEMA = "dotcortex.opencode-watchdog.v1"
+SAFE_REASONS = frozenset({"backend-down", "poller-down", "api-unreachable"})
+DEFAULT_COOLDOWN = 15 * 60
+DEFAULT_CONFIRM_SECONDS = 120.0
+DEFAULT_ALERT_COOLDOWN = 6 * 60 * 60
+DEFAULT_MAX_FAILURES = 3
+
+
+def read_json(path: pathlib.Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def atomic_json(path: pathlib.Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def log_event(path: pathlib.Path, **fields: object) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({"timestamp": time.time(), **fields}, sort_keys=True) + "\n")
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def emit(value: dict, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"OpenCode watchdog: {value.get('status')} ({value.get('reason')})")
+
+
+def host_matches(expected: str) -> bool:
+    try:
+        return pathlib.Path("/etc/hostname").read_text(encoding="utf-8").strip() == expected
+    except OSError:
+        return False
+
+
+def owner_inspect(args: argparse.Namespace) -> tuple[dict | None, int, str]:
+    command = [
+        str(pathlib.Path(args.owner).expanduser()),
+        "inspect",
+        "--state", str(pathlib.Path(args.owner_state).expanduser()),
+        "--project", str(pathlib.Path(args.project).expanduser()),
+        "--host", "127.0.0.1",
+        "--port", str(args.port),
+    ]
+    try:
+        completed = subprocess.run(command, capture_output=True, text=True, timeout=args.command_timeout)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return None, 124, type(error).__name__
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError):
+        return None, completed.returncode, "owner-invalid-json"
+    if not isinstance(payload, dict):
+        return None, completed.returncode, "owner-invalid-document"
+    return payload, completed.returncode, completed.stderr.strip()
+
+
+def api_probe(port: int, timeout: float) -> dict:
+    request = Request(f"http://127.0.0.1:{port}/", headers={"Accept": "application/json"})
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return {"status": "healthy" if response.status == 200 else "unhealthy", "http_status": response.status}
+    except HTTPError as error:
+        return {"status": "unhealthy", "http_status": error.code, "reason": "api-unreachable"}
+    except (OSError, URLError, TimeoutError) as error:
+        return {"status": "unhealthy", "reason": "api-unreachable", "error": type(error).__name__}
+
+
+def fingerprint(payload: dict, probe: dict) -> str:
+    material = {
+        "reasons": payload.get("reasons", []),
+        "backend": (payload.get("backend") or {}).get("pid"),
+        "poller": (payload.get("poller") or {}).get("pid"),
+        "api": probe.get("reason") or probe.get("http_status"),
+    }
+    return json.dumps(material, sort_keys=True, separators=(",", ":"))
+
+
+def runtime_environment() -> dict[str, str]:
+    environment = dict(os.environ)
+    home = pathlib.Path.home()
+    environment["HOME"] = str(home)
+    environment["PATH"] = ":".join(filter(None, [
+        str(home / ".local/bin"),
+        str(home / ".npm-global/bin"),
+        environment.get("PATH", ""),
+    ]))
+    return environment
+
+
+def run_command(command: list[str], args: argparse.Namespace, stream) -> subprocess.CompletedProcess:
+    stream.write(f"command={json.dumps(command)}\n")
+    stream.flush()
+    try:
+        completed = subprocess.run(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=args.command_timeout,
+            env=args.environment,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        stream.write(f"error={type(error).__name__}\n")
+        stream.flush()
+        return subprocess.CompletedProcess(command, 124)
+    stream.write(f"returncode={completed.returncode}\n")
+    stream.flush()
+    return completed
+
+
+def worker(args: argparse.Namespace) -> int:
+    state_path = pathlib.Path(args.watchdog_state).expanduser()
+    event_path = state_path.with_name("events.jsonl")
+    log_path = state_path.with_name("recovery.log")
+    manager = str(pathlib.Path(args.manager).expanduser())
+    with log_path.open("a", encoding="utf-8") as stream:
+        stream.write(f"worker-start={time.time()}\n")
+        stop = run_command([manager, "stop", "opencode"], args, stream)
+        start = run_command([manager, "start", "opencode"], args, stream)
+        payload, inspect_code, detail = owner_inspect(args)
+        probe = api_probe(args.port, args.api_timeout) if payload and payload.get("status") == "running" else {"status": "not-probed"}
+        healthy = inspect_code == 0 and payload is not None and payload.get("status") == "running" and probe.get("status") == "healthy"
+        stream.write(f"worker-result={'success' if healthy else 'failed'}\n")
+    state = read_json(state_path) or {"schema": SCHEMA, "failures": 0}
+    state.update({"last_worker": time.time(), "last_result": "recovered" if healthy else "failed"})
+    state["failures"] = 0 if healthy else int(state.get("failures", 0)) + 1
+    if healthy:
+        state.pop("degraded_since", None)
+        state.pop("degraded_fingerprint", None)
+        state.pop("last_alert", None)
+    atomic_json(state_path, state)
+    log_event(event_path, action="recovery", result=state["last_result"], stop=stop.returncode, start=start.returncode, inspect=detail)
+    return 0 if healthy else 1
+
+
+def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> int:
+    event_path = state_path.with_name("events.jsonl")
+    state = read_json(state_path) or {"schema": SCHEMA, "failures": 0}
+    payload, inspect_code, detail = owner_inspect(args)
+    if payload is None:
+        value = {"schema": SCHEMA, "status": "skip", "reason": detail, "inspect_code": inspect_code}
+        emit(value, args.json)
+        return 0
+
+    probe = api_probe(args.port, args.api_timeout) if payload.get("status") == "running" else {"status": "not-probed"}
+    reasons = set(str(reason) for reason in payload.get("reasons", []))
+    if probe.get("reason") == "api-unreachable":
+        reasons.add("api-unreachable")
+    if not reasons:
+        state.update({"last_healthy": time.time(), "failures": 0})
+        state.pop("degraded_since", None)
+        state.pop("degraded_fingerprint", None)
+        state.pop("last_alert", None)
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        emit({"schema": SCHEMA, "status": "healthy", "reason": "owner-and-api-healthy", "probe": probe}, args.json)
+        return 0
+
+    if not reasons.issubset(SAFE_REASONS) or payload.get("status") == "stopped":
+        emit({"schema": SCHEMA, "status": "skip", "reason": "owner-not-safe-to-restart", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+
+    now = time.time()
+    current_fingerprint = fingerprint(payload, probe)
+    if state.get("degraded_fingerprint") != current_fingerprint:
+        state.update({"degraded_since": now, "degraded_fingerprint": current_fingerprint})
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        emit({"schema": SCHEMA, "status": "suspect", "reason": "confirmation-pending", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+    if now - float(state.get("degraded_since", now)) < args.confirm_seconds:
+        emit({"schema": SCHEMA, "status": "suspect", "reason": "confirmation-pending", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+    if now - float(state.get("last_attempt", 0)) < args.cooldown:
+        emit({"schema": SCHEMA, "status": "skip", "reason": "cooldown", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+    if int(state.get("failures", 0)) >= args.max_failures:
+        if now - float(state.get("last_alert", 0)) < args.alert_cooldown:
+            emit({"schema": SCHEMA, "status": "alert", "reason": "failure-alert-cooldown", "failures": state.get("failures", 0)}, args.json)
+            return 0
+        state["last_alert"] = now
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        emit({"schema": SCHEMA, "status": "alert", "reason": "recovery-failure-threshold", "failures": state.get("failures", 0)}, args.json)
+        return 0
+    if args.dry_run:
+        emit({"schema": SCHEMA, "status": "dry-run", "reason": "would-dispatch-recovery", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+        return 0
+
+    state.update({"last_attempt": now, "last_reason": sorted(reasons)})
+    atomic_json(state_path, state)
+    command = [
+        sys.executable, str(pathlib.Path(__file__).resolve()),
+        "--worker", "--expected-host", args.expected_host,
+        "--owner", args.owner, "--owner-state", args.owner_state,
+        "--manager", args.manager, "--project", args.project,
+        "--port", str(args.port), "--watchdog-state", args.watchdog_state,
+        "--api-timeout", str(args.api_timeout),
+        "--command-timeout", str(args.command_timeout),
+    ]
+    log_path = state_path.with_name("recovery.log")
+    with log_path.open("a", encoding="utf-8") as stream:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=args.environment,
+        )
+    log_event(event_path, action="dispatch", result="dispatched", reasons=sorted(reasons), fingerprint=current_fingerprint)
+    emit({"schema": SCHEMA, "status": "dispatched", "reason": "detached-recovery", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
+    return 0
+
+
+def run(args: argparse.Namespace) -> int:
+    if not host_matches(args.expected_host):
+        value = {"schema": SCHEMA, "status": "skip", "reason": "wrong-host", "expected_host": args.expected_host}
+        emit(value, args.json)
+        return 0
+    args.environment = runtime_environment()
+    if args.worker:
+        return worker(args)
+
+    state_path = pathlib.Path(args.watchdog_state).expanduser()
+    if args.dry_run:
+        return assess_and_dispatch(args, state_path)
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = state_path.with_name("watchdog.lock")
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit({"schema": SCHEMA, "status": "skip", "reason": "watchdog-already-running"}, args.json)
+            return 0
+        return assess_and_dispatch(args, state_path)
+
+
+def parser() -> argparse.ArgumentParser:
+    home = pathlib.Path.home()
+    state_home = pathlib.Path(os.environ.get("XDG_STATE_HOME", str(home / ".local/state")))
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--expected-host", required=True)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--worker", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("--owner", default=str(home / ".local/bin/opencode-owner"))
+    p.add_argument("--owner-state", default=str(state_home / "telegram-agents/opencode.json"))
+    p.add_argument("--manager", default=str(home / ".local/bin/telegram-agent-host"))
+    p.add_argument("--project", default=str(home / "HelmCortex"))
+    p.add_argument("--port", type=int, default=4096)
+    p.add_argument("--watchdog-state", default=str(state_home / "opencode-watchdog/state.json"))
+    p.add_argument("--api-timeout", type=float, default=3.0)
+    p.add_argument("--command-timeout", type=float, default=120.0)
+    p.add_argument("--confirm-seconds", type=float, default=DEFAULT_CONFIRM_SECONDS)
+    p.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN)
+    p.add_argument("--alert-cooldown", type=float, default=DEFAULT_ALERT_COOLDOWN)
+    p.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    return p
+
+
+def main() -> int:
+    args = parser().parse_args()
+    return run(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+#+END_SRC
+
+** OpenCode watchdog cron deployment helper
+
+#+BEGIN_SRC bash :tangle all/.local/bin/opencode-watchdog-cron-apply :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+
+TAG="opencode-watchdog-cron-apply"
+TARGET="/etc/cron.d/dotcortex-opencode-watchdog"
+REMOVE=0
+DRY=0
+EXPECTED_HOST=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --remove) REMOVE=1 ;;
+    --dry-run) DRY=1 ;;
+    --host)
+      [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }
+      EXPECTED_HOST="$2"
+      shift ;;
+    -h|--help|help)
+      echo "Usage: $TAG --host EXACT_HOST [--dry-run] [--remove]"
+      exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then
+    echo "remove $TARGET"
+  else
+    run_priv rm -f "$TARGET"
+    echo "$TAG: removed $TARGET"
+  fi
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --host EXACT_HOST is required" >&2; exit 2; }
+CURRENT_HOST="$(hostname)"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  echo "$TAG: refusing installation on $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  exit 1
+}
+
+USER_NAME="$(id -un)"
+USER_ID="$(id -u)"
+TARGET_HOME="$HOME"
+WATCHDOG="$TARGET_HOME/.local/bin/opencode-watchdog"
+LOG_DIR="$TARGET_HOME/.local/state/opencode-watchdog"
+if [ "$DRY" != 1 ] && [ ! -x "$WATCHDOG" ]; then
+  echo "$TAG: missing $WATCHDOG; tangle and stow first" >&2
+  exit 1
+fi
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex OpenCode watchdog; managed by $TAG.
+*/3 * * * * ${USER_NAME} HOME=${TARGET_HOME} PATH=${TARGET_HOME}/.local/bin:${TARGET_HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/${USER_ID} ${WATCHDOG} --expected-host ${EXPECTED_HOST} --json >>${LOG_DIR}/cron.log 2>&1
+EOF
+
+if [ "$DRY" = 1 ]; then
+  cat "$TMP"
+else
+  mkdir -p "$LOG_DIR"
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+  echo "$TAG: installed $TARGET"
+fi
+#+END_SRC
+
 * Agent Control Script
 
+
+
 #+BEGIN_SRC bash :tangle all/.local/bin/telegram-agent-host :shebang "#!/usr/bin/env bash"
+# Agent Control Script
+
+
+# [[file:../../../agents-bots.org::*Agent Control Script][Agent Control Script:1]]
 # ~/DotCortex/all/.local/bin/telegram-agent-host
 # Manage which Telegram agents run on this machine
 
@@ -206,6 +960,17 @@ HOSTS_FILE="$AGENTS_DIR/hosts.conf"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agents"
 KNOWN_AGENTS="opencode ductor claudecode hermes codex pi-agent"
 DUCTOR_HOME_DIR="${DUCTOR_HOME_DIR:-$HOME/HelmCortex/FORGE/brain/ductor}"
+OPENCODE_PROJECT_ROOT="${OPENCODE_PROJECT_ROOT:-$HOME/HelmCortex}"
+OPENCODE_PORT="${OPENCODE_PORT:-4096}"
+OPENCODE_STATE_FILE="${OPENCODE_STATE_FILE:-$STATE_DIR/opencode.json}"
+OPENCODE_POLLER_BIN="${OPENCODE_POLLER_BIN:-$HOME/.npm-global/bin/opencode-telegram}"
+OPENCODE_TELEGRAM_HOME="${OPENCODE_TELEGRAM_HOME:-$HOME/.config/opencode-telegram-bot}"
+OPENCODE_NODE_OPTIONS="${OPENCODE_NODE_OPTIONS:---dns-result-order=ipv4first --no-network-family-autoselection}"
+OPENCODE_PATCH_APPLIER="${OPENCODE_PATCH_APPLIER:-$HOME/HelmCortex/FORGE/bin/opencode-telegram-patch-apply}"
+export OPENCODE_TELEGRAM_HOME
+OPENCODE_OWNER_HELPER="${OPENCODE_OWNER_HELPER:-${DOTCORTEX_BIN_DIR:-$HOME/DotCortex/all/.local/bin}/opencode-owner}"
+OPENCODE_BACKEND_PID_FILE="$STATE_DIR/opencode-backend.pid"
+OPENCODE_POLLER_PID_FILE="$STATE_DIR/opencode-poller.pid"
 
 usage() {
     cat <<EOF
@@ -288,30 +1053,112 @@ list_agents() {
 }
 
 check_opencode() {
-    if pgrep -f "opencode serve" >/dev/null 2>&1; then
-        echo "  opencode serve: RUNNING"
-    else
-        echo "  opencode serve: STOPPED"
+    local status_json status_code
+    if [ ! -x "$OPENCODE_OWNER_HELPER" ]; then
+        echo "opencode: STOPPED (owner helper unavailable)"
+        return 1
     fi
-    if pgrep -f "opencode-telegram" >/dev/null 2>&1; then
-        echo "  opencode-telegram: RUNNING"
-    else
-        echo "  opencode-telegram: STOPPED"
-    fi
+    set +e
+    status_json=$("$OPENCODE_OWNER_HELPER" inspect \
+        --state "$OPENCODE_STATE_FILE" \
+        --project "$OPENCODE_PROJECT_ROOT" \
+        --host 127.0.0.1 --port "$OPENCODE_PORT")
+    status_code=$?
+    set -e
+    python3 - "$status_json" <<'PY'
+import json
+import sys
+
+payload = json.loads(sys.argv[1])
+print(f"opencode: {payload.get('status', 'unknown').upper()}")
+for role in ("backend", "poller"):
+    row = payload.get(role) or {}
+    state = "RUNNING" if row.get("valid") else ("STOPPED" if not row else "INVALID")
+    print(f"  opencode {role}: {state} pid={row.get('pid', '?') if row else '?'}")
+native = payload.get("native_poller") or {}
+session = payload.get("session") or {}
+print(f"  opencode native poller status: {native.get('status', 'unknown')}")
+print(f"  opencode session binding: {session.get('status', 'session-unbound')}")
+print(f"  opencode project: {payload.get('project', 'see owner state')}")
+print(f"  opencode port: {payload.get('host', '127.0.0.1')}:{payload.get('port', '?')}")
+PY
+    return "$status_code"
+}
+
+write_opencode_state() {
+    local backend_pid poller_pid
+    [ -r "$OPENCODE_BACKEND_PID_FILE" ] || return 1
+    backend_pid=$(cat "$OPENCODE_BACKEND_PID_FILE")
+    poller_pid=$(python3 - "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" <<'PY'
+import json
+import sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        value = json.load(handle)
+    print(value.get("pid", ""))
+except (OSError, ValueError, TypeError):
+    print("")
+PY
+    )
+    [ -n "$poller_pid" ] || return 1
+    [ -x "$OPENCODE_OWNER_HELPER" ] || return 1
+    "$OPENCODE_OWNER_HELPER" capture \
+        --state "$OPENCODE_STATE_FILE" \
+        --project "$OPENCODE_PROJECT_ROOT" \
+        --host 127.0.0.1 --port "$OPENCODE_PORT" \
+        --backend-pid "$backend_pid" --poller-pid "$poller_pid" \
+        --poller-entrypoint "$OPENCODE_POLLER_BIN" \
+        --poller-service-state "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" >/dev/null
 }
 
 check_ductor() {
-    if ductor_running; then
+    if ductor_ready; then
         echo "  ductor: RUNNING"
+    elif ductor_running; then
+        echo "  ductor: DEGRADED (supervisor alive, child unavailable)"
     else
         echo "  ductor: STOPPED"
     fi
 }
 
+pid_file_has_command() {
+    local pid_file="$1" expected="$2" pid argument
+    [ -r "$pid_file" ] || return 1
+    IFS= read -r pid < "$pid_file" || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        [ "${argument##*/}" = "$expected" ] && return 0
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
 ductor_running() {
-    # Healthy = the ductor-supervise loop is up (it stays up across the daemon's
-    # own hot-restarts); fall back to a bare daemon for any pre-supervisor launch.
-    pgrep -f "ductor-supervise" >/dev/null 2>&1 || pgrep -f "python.*$HOME/.local/bin/ductor" >/dev/null 2>&1
+    pid_file_has_command "$STATE_DIR/ductor-supervise.pid" ductor-supervise
+}
+
+ductor_ready() {
+    ductor_running && pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor
+}
+
+stop_ductor_owned() {
+    local supervisor_pid child_pid
+    if ductor_running; then
+        IFS= read -r supervisor_pid < "$STATE_DIR/ductor-supervise.pid"
+        kill -TERM "$supervisor_pid"
+        for _ in {1..15}; do
+            [ ! -r "/proc/$supervisor_pid/cmdline" ] && break
+            sleep 1
+        done
+        if [ -r "/proc/$supervisor_pid/cmdline" ]; then
+            echo "ductor supervisor $supervisor_pid did not stop" >&2
+            return 1
+        fi
+    elif pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor; then
+        IFS= read -r child_pid < "$STATE_DIR/ductor-child.pid"
+        kill -TERM "$child_pid"
+    fi
+    rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
 }
 
 hermes_service_unit() {
@@ -405,8 +1252,13 @@ check_pi_agent() {
 }
 
 status_cmd() {
+    local requested="${1:-}"
     local host
     host=$(get_hostname)
+    if [ "$requested" = "opencode" ]; then
+        check_opencode
+        return
+    fi
     echo "Host: $host"
     echo "Enabled agents: $(get_enabled_agents "$host")"
     echo ""
@@ -531,28 +1383,87 @@ start_agent() {
     validate_agent "$agent"
     case "$agent" in
         opencode)
-            if ! pgrep -f "opencode serve" >/dev/null 2>&1; then
-                echo "Starting opencode serve..."
-                nohup opencode serve > "$STATE_DIR/opencode-serve.log" 2>&1 </dev/null &
-                sleep 2
+            if [ ! -d "$OPENCODE_PROJECT_ROOT" ]; then
+                echo "OpenCode project root not found: $OPENCODE_PROJECT_ROOT" >&2
+                return 1
             fi
-            if ! pgrep -f "opencode-telegram" >/dev/null 2>&1; then
-                echo "Starting opencode-telegram..."
-                nohup ~/.npm-global/bin/opencode-telegram start > "$STATE_DIR/opencode-telegram.log" 2>&1 </dev/null &
-                sleep 3
+            if [ ! -x "$OPENCODE_PATCH_APPLIER" ]; then
+                echo "OpenCode Telegram patch applier not found: $OPENCODE_PATCH_APPLIER" >&2
+                return 1
             fi
+            if ! "$OPENCODE_PATCH_APPLIER"; then
+                echo "OpenCode Telegram package seam is not ready; refusing start" >&2
+                return 1
+            fi
+            if [ -r "$OPENCODE_STATE_FILE" ]; then
+                if check_opencode >/dev/null 2>&1; then
+                    echo "opencode is already running"
+                    return 0
+                fi
+                echo "Existing OpenCode owner state is not healthy; validating and stopping only its owned processes..."
+                "$OPENCODE_OWNER_HELPER" stop --state "$OPENCODE_STATE_FILE" --project "$OPENCODE_PROJECT_ROOT" --host 127.0.0.1 --port "$OPENCODE_PORT" || true
+            fi
+            if command -v ss >/dev/null 2>&1 && ss -Hln "sport = :$OPENCODE_PORT" 2>/dev/null | grep -q .; then
+                echo "Refusing OpenCode start: port $OPENCODE_PORT is already occupied by an unowned listener" >&2
+                return 1
+            fi
+            echo "Starting opencode serve in $OPENCODE_PROJECT_ROOT..."
+            (
+                cd "$OPENCODE_PROJECT_ROOT"
+                exec nohup opencode serve --hostname 127.0.0.1 --port "$OPENCODE_PORT"
+            ) > "$STATE_DIR/opencode-serve.log" 2>&1 </dev/null &
+            printf '%s\n' "$!" > "$OPENCODE_BACKEND_PID_FILE"
+            sleep 2
+            if [ ! -s "$OPENCODE_BACKEND_PID_FILE" ]; then
+                echo "OpenCode backend did not publish an owned PID" >&2
+                return 1
+            fi
+            echo "Starting opencode-telegram in $OPENCODE_PROJECT_ROOT..."
+            if ! (umask 077; cd "$OPENCODE_PROJECT_ROOT" && env NODE_OPTIONS="$OPENCODE_NODE_OPTIONS" "$OPENCODE_POLLER_BIN" start --daemon --mode installed > "$STATE_DIR/opencode-telegram.log" 2>&1 </dev/null); then
+                backend_pid=$(cat "$OPENCODE_BACKEND_PID_FILE")
+                kill -TERM "$backend_pid" 2>/dev/null || true
+                rm -f "$OPENCODE_BACKEND_PID_FILE"
+                echo "OpenCode Telegram daemon failed to start; rolled back owned backend" >&2
+                return 1
+            fi
+            for _ in {1..15}; do
+                [ -s "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" ] && break
+                sleep 1
+            done
+            write_opencode_state || {
+                "$OPENCODE_POLLER_BIN" stop >/dev/null 2>&1 || true
+                backend_pid=$(cat "$OPENCODE_BACKEND_PID_FILE")
+                kill -TERM "$backend_pid" 2>/dev/null || true
+                rm -f "$OPENCODE_BACKEND_PID_FILE" "$OPENCODE_POLLER_PID_FILE"
+                echo "OpenCode backend/poller did not produce a complete owner state" >&2
+                return 1
+            }
+            python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$OPENCODE_TELEGRAM_HOME/run/bot-service.json" > "$OPENCODE_POLLER_PID_FILE"
             ;;
         ductor)
             if command -v ductor >/dev/null 2>&1; then
-                if ductor_running; then
+                if ductor_ready; then
                     echo "ductor is already running"
+                elif ductor_running; then
+                    echo "ductor supervisor is running but its child is not ready" >&2
+                    return 1
                 else
                     echo "Starting ductor (supervised)..."
-                    setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
-                    sleep 8
+                    rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
+                    nohup setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
+                    for _ in {1..15}; do
+                        ductor_ready && break
+                        sleep 1
+                    done
+                    if ! ductor_ready; then
+                        echo "ductor failed supervised readiness" >&2
+                        return 1
+                    fi
+                    echo "ductor started"
                 fi
             else
                 echo "ductor not found in PATH"
+                return 1
             fi
             ;;
         claudecode)
@@ -600,15 +1511,18 @@ stop_agent() {
     validate_agent "$agent"
     case "$agent" in
         opencode)
-            pkill -f "opencode-telegram" 2>/dev/null || true
-            pkill -f "opencode serve" 2>/dev/null || true
+            if [ -x "$OPENCODE_OWNER_HELPER" ]; then
+                "$OPENCODE_OWNER_HELPER" stop \
+                    --state "$OPENCODE_STATE_FILE" \
+                    --project "$OPENCODE_PROJECT_ROOT" \
+                    --host 127.0.0.1 --port "$OPENCODE_PORT"
+            else
+                echo "OpenCode owner helper unavailable; refusing unscoped stop" >&2
+                return 1
+            fi
             ;;
         ductor)
-            # Kill the supervisor first — its SIGTERM trap stops the daemon child
-            # with no relaunch — then sweep any bare pre-supervisor daemon.
-            pkill -TERM -f "ductor-supervise" 2>/dev/null || true
-            sleep 1
-            pkill -f "python.*$HOME/.local/bin/ductor" 2>/dev/null || true
+            stop_ductor_owned
             ;;
         claudecode)
             pkill -f "claude.*channels.*telegram" 2>/dev/null || true
@@ -711,7 +1625,7 @@ switch_to_machine() {
 
     echo "Stopping agents on $target before restart..."
     if [ -n "$target_ssh" ]; then
-        ssh "$target_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'opencode-telegram' 2>/dev/null || true; pkill -f 'opencode serve' 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
+        ssh "$target_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
         sleep 1
     fi
 
@@ -749,7 +1663,7 @@ bring_here() {
             other_ssh=$(echo "$host_line" | cut -d'|' -f3)
             if [ -n "$other_ssh" ]; then
                 echo "Stopping agents on $other_host..."
-                ssh "$other_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'opencode-telegram' 2>/dev/null || true; pkill -f 'opencode serve' 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
+                ssh "$other_ssh" "systemctl --user stop hermes-gateway.service 2>/dev/null || pkill -x hermes 2>/dev/null || true; pkill -f 'ductor' 2>/dev/null || true" 2>/dev/null || true
             fi
         fi
     done
@@ -764,7 +1678,7 @@ shift || true
 
 case "$COMMAND" in
     list) list_agents ;;
-    status) status_cmd ;;
+    status) status_cmd "${1:-}" ;;
     enable) enable_agent "${1:-}" ;;
     disable) disable_agent "${1:-}" ;;
     sync) sync_configs ;;
@@ -786,6 +1700,8 @@ case "$COMMAND" in
     bring) bring_here ;;
     *) usage; exit 1 ;;
 esac
+# Agent Control Script:1 ends here
+
 #+END_SRC
 
 * Remote Start Helper
@@ -801,7 +1717,7 @@ starts new ones, waits for confirmation, then exits cleanly.
 set -euo pipefail
 
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agents"
-KNOWN_AGENTS="opencode ductor hermes"
+KNOWN_AGENTS="ductor hermes"
 DUCTOR_HOME_DIR="${DUCTOR_HOME_DIR:-$HOME/HelmCortex/FORGE/brain/ductor}"
 mkdir -p "$STATE_DIR"
 
@@ -816,10 +1732,41 @@ validate_agent() {
     esac
 }
 
+pid_file_has_command() {
+    local pid_file="$1" expected="$2" pid argument
+    [ -r "$pid_file" ] || return 1
+    IFS= read -r pid < "$pid_file" || return 1
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        [ "${argument##*/}" = "$expected" ] && return 0
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
 ductor_running() {
-    # Healthy = the ductor-supervise loop is up (it stays up across the daemon's
-    # own hot-restarts); fall back to a bare daemon for any pre-supervisor launch.
-    pgrep -f "ductor-supervise" >/dev/null 2>&1 || pgrep -f "python.*$HOME/.local/bin/ductor" >/dev/null 2>&1
+    pid_file_has_command "$STATE_DIR/ductor-supervise.pid" ductor-supervise
+}
+
+ductor_ready() {
+    ductor_running && pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor
+}
+
+stop_ductor_owned() {
+    local supervisor_pid child_pid
+    if ductor_running; then
+        IFS= read -r supervisor_pid < "$STATE_DIR/ductor-supervise.pid"
+        kill -TERM "$supervisor_pid"
+        for _ in {1..15}; do
+            [ ! -r "/proc/$supervisor_pid/cmdline" ] && break
+            sleep 1
+        done
+        [ ! -r "/proc/$supervisor_pid/cmdline" ] || return 1
+    elif pid_file_has_command "$STATE_DIR/ductor-child.pid" ductor; then
+        IFS= read -r child_pid < "$STATE_DIR/ductor-child.pid"
+        kill -TERM "$child_pid"
+    fi
+    rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
 }
 
 hermes_service_unit() {
@@ -840,39 +1787,20 @@ hermes_running() {
 for agent in "$@"; do
     validate_agent "$agent" || continue
     case "$agent" in
-    opencode)
-        echo "Stopping existing opencode processes..."
-        pkill -f "opencode-telegram" 2>/dev/null || true
-        pkill -f "opencode serve" 2>/dev/null || true
-        sleep 1
-        echo "Starting opencode serve..."
-        nohup opencode serve > "$STATE_DIR/opencode-serve.log" 2>&1 </dev/null &
-        disown
-        sleep 3
-        echo "Starting opencode-telegram..."
-        nohup ~/.npm-global/bin/opencode-telegram start > "$STATE_DIR/opencode-telegram.log" 2>&1 </dev/null &
-        disown
-        sleep 3
-        if pgrep -f "opencode-telegram" >/dev/null 2>&1; then
-            echo "opencode-telegram: STARTED OK"
-        else
-            echo "opencode-telegram: FAILED TO START"
-        fi
-        ;;
     ductor)
         echo "Stopping existing ductor process..."
-        pkill -TERM -f "ductor-supervise" 2>/dev/null || true
-        pkill -f "python.*$HOME/.local/bin/ductor" 2>/dev/null || true
-        sleep 1
-        if ductor_running; then
-            echo "ductor: already running"
+        if ! stop_ductor_owned; then
+            echo "ductor: FAILED TO STOP OWNED PROCESS"
             continue
         fi
+        rm -f "$STATE_DIR/ductor-supervise.pid" "$STATE_DIR/ductor-child.pid"
         echo "Starting ductor (supervised)..."
-        setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
-        disown
-        sleep 8
-        if ductor_running; then
+        nohup setsid env DUCTOR_HOME="$DUCTOR_HOME_DIR" ductor-supervise > "$STATE_DIR/ductor-supervise.log" 2>&1 </dev/null &
+        for _ in {1..15}; do
+            ductor_ready && break
+            sleep 1
+        done
+        if ductor_ready; then
             echo "ductor: STARTED OK"
         else
             echo "ductor: FAILED TO START"
