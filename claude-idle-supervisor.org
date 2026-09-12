@@ -164,6 +164,7 @@ from __future__ import annotations
 import ctypes
 import datetime
 import errno
+import hashlib
 import fcntl
 import json
 import os
@@ -202,6 +203,7 @@ CONTROL_COMMANDS = {
     "cancel",
     "trigger",
     "inject",
+    "preserve",
 }
 
 INJECT_RE = re.compile(r"^/mcp reconnect ([A-Za-z0-9_.:-]{1,128})$")
@@ -518,6 +520,19 @@ def now() -> float:
 def monotonic() -> float:
     """Return monotonic seconds used only for local retry/poll scheduling."""
     return time.monotonic()
+
+
+def executable_generation() -> str:
+    """Hash executable bytes without confusing install time with load time."""
+    try:
+        return hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return "unavailable"
+
+
+# Capture once while this generation loads.  A later source/stow update can
+# change the installed bytes, but it cannot rewrite this running process.
+LOADED_GENERATION = executable_generation()
 
 
 HERDR_SOURCE = "claude-warm"
@@ -1222,6 +1237,11 @@ class Supervisor:
         self.last_gate_rejection_reason: str | None = None
         self.last_injection_result: str | None = None
         self.last_state_transition = "supervisor-started"
+        self.preservation_request_id: str | None = None
+        self.preservation_reservation_id: str | None = None
+        self.preservation_state: str | None = None
+        self.preservation_failure: str | None = None
+        self.preservation_expected_epoch: int | None = None
         self.last_channel_activity: float | None = None
         self.last_channel_event: str | None = None
         self.last_channel_death: float | None = None
@@ -1261,10 +1281,14 @@ class Supervisor:
 
     def state(self) -> dict:
         """Return safe persisted state for controls and diagnostics."""
+        installed_generation = executable_generation()
         return {
             "channel": self.channel,
             "pid": self.pid,
             "supervisor_pid": os.getpid(),
+            "loaded_generation": LOADED_GENERATION,
+            "installed_generation": installed_generation,
+            "generation_loaded": LOADED_GENERATION == installed_generation,
             "pty_master_owned": self.master_fd is not None,
             "pty_master_fd": self.master_fd,
             "pty_child_terminal": self.child_tty,
@@ -1318,6 +1342,11 @@ class Supervisor:
             "last_gate_rejection_reason": self.last_gate_rejection_reason,
             "last_injection_result": self.last_injection_result,
             "last_state_transition": self.last_state_transition,
+            "preservation_request_id": self.preservation_request_id,
+            "preservation_reservation_id": self.preservation_reservation_id,
+            "preservation_state": self.preservation_state,
+            "preservation_failure": self.preservation_failure,
+            "preservation_expected_epoch": self.preservation_expected_epoch,
             "last_channel_activity": self.last_channel_activity,
             "last_channel_event": self.last_channel_event,
             "last_channel_death": self.last_channel_death,
@@ -1567,6 +1596,8 @@ class Supervisor:
             "transcript-quiescent",
             completed_turn_epoch=self.completed_turn_epoch,
         )
+        if self.preservation_state == "requested":
+            self.attempt(command="/compact", purpose="compact")
         if self.recovery_pending:
             self._arm_recovery()
         else:
@@ -1755,6 +1786,13 @@ class Supervisor:
             f"compaction-failed channel={short_id(self.channel)} reason={reason}"
         )
         self._guard_log("compaction-failed", reason=reason)
+        if self.preservation_state == "native_started":
+            self.preservation_state = "pending_recovery"
+            self.preservation_failure = reason
+            self._save_preservation()
+            self._guard_log(
+                "preservation-pending-recovery", request_id=self.preservation_request_id, reason=reason
+            )
         self._write_state()
 
     def _is_failed_compaction_entry(self, entry: dict) -> bool:
@@ -2059,7 +2097,10 @@ class Supervisor:
         self.pid = pid
         self.master_fd = master_fd
         os.set_blocking(master_fd, False)
-        self.child_tty = self._read_child_tty()
+        # Do not bind while the forked child may still expose the inherited
+        # Herdr terminal before exec installs the forkpty slave.  The first
+        # final-gate probe binds both values after the child is settled.
+        self.child_tty = self.child_tty_device = None
         self.selector.register(master_fd, selectors.EVENT_READ, "master")
         self._install_signals()
         self._install_terminal()
@@ -2081,6 +2122,19 @@ class Supervisor:
         except OSError:
             return None
 
+    def _read_child_tty_device(self) -> int | None:
+        """Return the child stdin terminal device, independent of mount paths."""
+        if not self.pid:
+            return None
+        try:
+            device = os.stat(f"/proc/{self.pid}/fd/0").st_rdev
+        except OSError:
+            return None
+        # Pipes and regular files have no terminal device identity.  A PTY
+        # slave keeps the same device identity even when different mount
+        # namespaces render it with different /dev/pts/N pathnames.
+        return device or None
+
     def _pty_ownership_failure(self) -> str | None:
         """Return a bounded label for the first failing ownership condition."""
         if not self.pid or self.master_fd is None:
@@ -2089,15 +2143,21 @@ class Supervisor:
             return "child-not-alive"
         if self.child_tty is None:
             self.child_tty = self._read_child_tty()
-        if self.child_tty is None:
+        current_device = self._read_child_tty_device()
+        if getattr(self, "child_tty_device", None) is None:
+            self.child_tty_device = current_device
+        if self.child_tty is None or self.child_tty_device is None or current_device is None:
             return "child-tty-unknown"
         try:
             if os.getpgid(self.pid) != self.pid:
                 return "pgid-mismatch"
-            if os.readlink(f"/proc/{self.pid}/fd/0") != self.child_tty:
+            if current_device != self.child_tty_device:
                 return "stdin-not-pty"
         except OSError as error:
             return f"oserror-{error.errno or 0}"
+        # Keep the display-only path current without making namespace-local
+        # /dev/pts numbering part of the ownership decision.
+        self.child_tty = self._read_child_tty()
         return None
 
     def _pty_still_owned(self) -> bool:
@@ -2371,7 +2431,14 @@ class Supervisor:
                 transient=reason not in DORMANT_GATE_REASONS,
             )
             self._write_state()
-            if purpose == "compact" and reason not in DORMANT_GATE_REASONS:
+            if purpose == "compact" and self.preservation_state == "requested":
+                self.preservation_state = "pending_recovery"
+                self.preservation_failure = reason
+                self._save_preservation()
+                self._guard_log(
+                    "preservation-pending-recovery", request_id=self.preservation_request_id, reason=reason
+                )
+            if purpose == "compact" and reason not in DORMANT_GATE_REASONS and self.preservation_state != "pending_recovery":
                 self.rearm(f"gate-refused:{reason}")
             return False
         if not validate_inject_command(command, self.watched_servers, self.recovery_command):
@@ -2416,6 +2483,13 @@ class Supervisor:
                 self.last_injection_result = "failed"
                 self.last_state_transition = "injection-failed"
                 self._debug(f"compaction-failed channel={short_id(self.channel)} error={error}")
+                if self.preservation_state == "requested":
+                    self.preservation_state = "pending_recovery"
+                    self.preservation_failure = "compaction-injection-failed"
+                    self._save_preservation()
+                    self._guard_log(
+                        "preservation-pending-recovery", request_id=self.preservation_request_id, reason="pty-write-failed"
+                    )
             elif purpose == "recovery":
                 self.recovery_awaiting = False
                 self.recovery_command_inflight = False
@@ -2451,6 +2525,12 @@ class Supervisor:
                 ),
                 queued_behind_turn=queued_behind_turn,
             )
+            if self.preservation_state == "requested":
+                self.preservation_state = "native_started"
+                self._save_preservation()
+                self._guard_log(
+                    "preservation-native-started", request_id=self.preservation_request_id
+                )
         else:
             self._guard_log("manual-injection-requested", command=command)
         self._write_state()
@@ -2497,6 +2577,7 @@ class Supervisor:
                 )
             self.session_id = session_id
             if new_session:
+                self._load_preservation()
                 self._record_last_session("session-bound")
                 self.completed_turn_epoch = 0
                 self.status_snapshot_epoch = None
@@ -2560,6 +2641,12 @@ class Supervisor:
             self.last_lifecycle_activity = current
             self.last_local_input = None
             self.transcript_activity_at = None
+            if self.preservation_state == "requested":
+                self._guard_log(
+                    "preservation-safe-boundary",
+                    request_id=self.preservation_request_id,
+                    completed_turn_epoch=self.completed_turn_epoch,
+                )
             self.transcript_gate_blocked = False
             self.transcript_gate_blocked_at = None
             self.last_transcript_classification = None
@@ -2597,6 +2684,13 @@ class Supervisor:
             self.last_injection_result = "succeeded"
             self.last_lifecycle_activity = current
             self._reset_transcript_cursor()
+            if self.preservation_state == "native_started":
+                self.preservation_state = "native_completed"
+                self._save_preservation()
+                self._guard_log(
+                    "preservation-native-completed",
+                    request_id=self.preservation_request_id,
+                )
             self.cancel("compaction-completed")
             self.last_state_transition = "compaction-completed"
             self._debug(f"compaction-completed channel={short_id(self.channel)}")
@@ -2640,6 +2734,111 @@ class Supervisor:
         self._write_state()
         return {"ok": True}
 
+    def _preservation_path(self) -> pathlib.Path | None:
+        """Return a private, session-stable ledger path without exposing the ID."""
+        if not self.session_id:
+            return None
+        digest = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:32]
+        directory = self.state_root / "preservation"
+        safe_mkdir(directory)
+        return directory / f"{digest}.json"
+
+    def _save_preservation(self) -> None:
+        """Persist before acknowledgement so lost replies are safely replayable."""
+        path = self._preservation_path()
+        if path is None or self.preservation_request_id is None:
+            return
+        payload = {
+            "session_id": self.session_id,
+            "request_id": self.preservation_request_id,
+            "reservation_id": self.preservation_reservation_id,
+            "state": self.preservation_state,
+            "failure": self.preservation_failure,
+            "expected_epoch": self.preservation_expected_epoch,
+        }
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def _load_preservation(self) -> None:
+        """Recover terminal state; in-flight work requires a fresh owner request."""
+        self.preservation_request_id = None
+        self.preservation_reservation_id = None
+        self.preservation_state = None
+        self.preservation_failure = None
+        self.preservation_expected_epoch = None
+        path = self._preservation_path()
+        if path is None:
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if payload.get("session_id") != self.session_id:
+            return
+        self.preservation_request_id = payload.get("request_id")
+        self.preservation_reservation_id = payload.get("reservation_id")
+        self.preservation_state = payload.get("state")
+        self.preservation_failure = payload.get("failure")
+        self.preservation_expected_epoch = payload.get("expected_epoch")
+        if self.preservation_state in {"reserved", "requested", "native_started"}:
+            self.preservation_state = "pending_recovery"
+            self.preservation_failure = "owner-restarted"
+            self._save_preservation()
+
+    def _request_preservation(self, message: dict) -> dict:
+        """Persist one idempotent request and compact only through this PTY owner."""
+        request_id = message.get("request_id")
+        reservation_id = message.get("reservation_id")
+        expected_session_id = message.get("expected_session_id")
+        expected_supervisor_pid = message.get("expected_supervisor_pid")
+        expected_epoch = message.get("expected_epoch")
+        if not all(
+            isinstance(value, str) and SESSION_RE.fullmatch(value)
+            for value in (request_id, reservation_id, expected_session_id)
+        ):
+            return {"ok": False, "error": "invalid-preservation-identity"}
+        if not isinstance(expected_supervisor_pid, int) or not isinstance(expected_epoch, int):
+            return {"ok": False, "error": "invalid-preservation-owner"}
+        if self.preservation_request_id == request_id:
+            return {"ok": True, "replayed": True, "state": self.state()}
+        if self.preservation_request_id and self.preservation_state not in {
+            "native_completed", "failed", "pending_recovery",
+        }:
+            return {"ok": False, "error": "preservation-already-pending", "state": self.state()}
+        if not self.enabled:
+            return {"ok": False, "error": "protection-disabled", "state": self.state()}
+        if (
+            expected_session_id != self.session_id
+            or expected_supervisor_pid != os.getpid()
+            or expected_epoch != self.completed_turn_epoch
+        ):
+            return {"ok": False, "error": "preservation-owner-mismatch", "state": self.state()}
+        self.preservation_request_id = request_id
+        self.preservation_reservation_id = reservation_id
+        self.preservation_state = "reserved"
+        self.preservation_failure = None
+        self.preservation_expected_epoch = expected_epoch
+        self._save_preservation()
+        self._guard_log(
+            "preservation-reserved",
+            request_id=request_id,
+            reservation_id=reservation_id,
+        )
+        self.preservation_state = "requested"
+        self._save_preservation()
+        self._guard_log("preservation-requested", request_id=request_id)
+        if (
+            self.status == "idle"
+            and self.transcript_quiescence_deadline is None
+            and self.transcript_quiescence_at is not None
+        ):
+            self.attempt(command="/compact", purpose="compact")
+        self._save_preservation()
+        self._write_state()
+        return {"ok": True, "state": self.state()}
+
     def _handle_control(self, message: dict) -> dict:
         """Handle one local control command without exposing prompts or secrets."""
         if message.get("kind") != "control":
@@ -2649,6 +2848,8 @@ class Supervisor:
         command = message.get("command")
         if command not in CONTROL_COMMANDS:
             return {"ok": False, "error": "unknown-control"}
+        if command == "preserve":
+            return self._request_preservation(message)
         if command == "state":
             return {"ok": True, "state": self.state()}
         if command == "enable":
@@ -2885,6 +3086,13 @@ class Supervisor:
                     self.last_cancellation_reason = "compaction-timeout"
                     self.last_injection_result = "failed"
                     self.last_state_transition = "compaction-timeout"
+                    if self.preservation_state == "native_started":
+                        self.preservation_state = "failed"
+                        self.preservation_failure = "compaction-timeout"
+                        self._save_preservation()
+                        self._guard_log(
+                            "preservation-failed", request_id=self.preservation_request_id, reason="timeout"
+                        )
                     self._debug(f"compaction-timeout channel={short_id(self.channel)}")
                     self._guard_log("compaction-failed", reason="timeout")
                     self.rearm("compaction-timeout")
@@ -3023,6 +3231,7 @@ def control_main(argv: list[str]) -> int:
         print("       claude-warmctl profile CHANNEL long|short|auto")
         print("       claude-warmctl cancel CHANNEL | trigger CHANNEL")
         print("       claude-warmctl inject CHANNEL /compact|/reload-plugins|/mcp reconnect SERVER")
+        print("       claude-warmctl preserve CHANNEL REQUEST RESERVATION SESSION PID EPOCH")
         return 0
     command = argv[0]
     if command == "list":
@@ -3043,6 +3252,22 @@ def control_main(argv: list[str]) -> int:
             print("inject requires a whitelisted command", file=sys.stderr)
             return 2
         fields = {"text": " ".join(argv[2:])}
+    if command == "preserve":
+        if len(argv) != 7:
+            print("preserve requires CHANNEL REQUEST RESERVATION SESSION PID EPOCH", file=sys.stderr)
+            return 2
+        try:
+            expected_supervisor_pid = int(argv[5])
+            expected_epoch = int(argv[6])
+        except ValueError:
+            print("preserve PID and EPOCH must be integers", file=sys.stderr)
+            return 2
+        fields = {
+            "request_id": argv[2], "reservation_id": argv[3],
+            "expected_session_id": argv[4],
+            "expected_supervisor_pid": expected_supervisor_pid,
+            "expected_epoch": expected_epoch,
+        }
     try:
         response = send_control(channel, "state" if command == "show" else command, **fields)
     except (OSError, RuntimeError, ValueError) as error:
@@ -3112,6 +3337,7 @@ import os
 import pathlib
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -3642,4 +3868,523 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+#+END_SRC
+
+* Telegram poller liveness watchdog
+
+The warm supervisor can remain alive after its Telegram long-poller has lost
+update ownership.  Process supervision alone cannot see that state.  This
+watchdog reconciles each labelled warm-session record with its live runtime
+state and the plugin's =bot.pid= lock.  It deliberately ignores poller-log
+mtime because a healthy idle long-poller may write nothing for hours.
+
+Auto-revive is fail-closed.  The current supervisor and Claude child must both
+be alive and ancestrally coherent, the runtime state must identify the same
+session and report =idle=, and the poller must be missing, dead, or outside the
+supervisor's process tree.  Missing state, clean exits, active turns,
+compaction, and the startup grace window are skips.  Revives use Nurse Joy's
+own home-machine and graceful-exit guards, never =--force=, with a persistent
+cooldown and an extended alert cooldown after repeated failures.  A deaf
+observation must also persist across watchdog ticks before any action, so a
+brief plugin restart cannot revive an otherwise healthy session.
+
+#+BEGIN_SRC python :tangle all/.local/bin/claude-poller-watchdog :shebang "#!/usr/bin/env python3" :comments no
+"""Detect deaf Claude Telegram pollers and request a guarded Nurse Joy revive."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import pathlib
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+
+SCHEMA = "dotcortex.claude-poller-watchdog.v1"
+LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
+CHANNEL_RE = re.compile(r"^claude-[0-9a-f]{32}$")
+DEFAULT_COOLDOWN_SECONDS = 30 * 60
+DEFAULT_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
+DEFAULT_STARTUP_GRACE_SECONDS = 5 * 60
+DEFAULT_CONFIRM_SECONDS = 2 * 60
+DEFAULT_MAX_FAILURES = 3
+
+
+def read_json(path: pathlib.Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def atomic_json(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def proc_identity(pid: object, proc_root: pathlib.Path) -> tuple[int, str, int] | None:
+    if not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        text = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+        tail = text[text.rfind(")") + 2 :].split()
+        state = tail[0]
+        parent = int(tail[1])
+        start_ticks = int(tail[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    return (parent, state, start_ticks)
+
+
+def process_alive(pid: object, proc_root: pathlib.Path) -> bool:
+    identity = proc_identity(pid, proc_root)
+    if identity is None or identity[1] == "Z":
+        return False
+    if proc_root == pathlib.Path("/proc"):
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError, TypeError):
+            return False
+    return True
+
+
+def process_fingerprint(pid: int, proc_root: pathlib.Path) -> str | None:
+    identity = proc_identity(pid, proc_root)
+    return f"{pid}:{identity[2]}" if identity is not None else None
+
+
+def is_descendant(pid: int, ancestor: int, proc_root: pathlib.Path) -> bool:
+    if pid == ancestor:
+        return True
+    seen: set[int] = set()
+    current = pid
+    for _ in range(128):
+        if current in seen or current <= 1:
+            return False
+        seen.add(current)
+        identity = proc_identity(current, proc_root)
+        if identity is None:
+            return False
+        current = identity[0]
+        if current == ancestor:
+            return True
+    return False
+
+
+def telegram_enabled(argv: object) -> bool:
+    if not isinstance(argv, list):
+        return False
+    for index, item in enumerate(argv[:-1]):
+        if item == "--channels" and "telegram" in str(argv[index + 1]).lower():
+            return True
+    return False
+
+
+def poller_pid(path: pathlib.Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not value.isdigit():
+        return None
+    parsed = int(value)
+    return parsed if parsed > 1 else None
+
+
+def result(label: str, status: str, reason: str, **fields: object) -> dict:
+    return {"schema": SCHEMA, "label": label, "status": status, "reason": reason, **fields}
+
+
+def assess_record(
+    record: dict,
+    *,
+    state_root: pathlib.Path,
+    runtime_root: pathlib.Path,
+    channels_root: pathlib.Path,
+    proc_root: pathlib.Path,
+    current_time: float,
+    startup_grace: float,
+) -> dict:
+    label = record.get("agent")
+    if not isinstance(label, str) or not LABEL_RE.fullmatch(label):
+        return result("unknown", "skip", "invalid-label")
+    if not telegram_enabled(record.get("argv")):
+        return result(label, "skip", "telegram-not-enabled")
+    if record.get("event") == "supervisor-exit":
+        return result(label, "skip", "deliberate-exit")
+    session_id = record.get("session_id")
+    channel = record.get("channel")
+    if not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
+        return result(label, "skip", "invalid-session")
+    if not isinstance(channel, str) or not CHANNEL_RE.fullmatch(channel):
+        return result(label, "skip", "invalid-channel")
+
+    runtime = read_json(runtime_root / channel / "state.json")
+    if runtime is None:
+        return result(label, "skip", "missing-runtime-state")
+    expected_supervisor = record.get("supervisor_pid")
+    expected_child = record.get("pid")
+    if (
+        runtime.get("session_id") != session_id
+        or runtime.get("supervisor_pid") != expected_supervisor
+        or runtime.get("pid") != expected_child
+    ):
+        return result(label, "skip", "runtime-record-mismatch")
+    if runtime.get("status") == "exited":
+        return result(label, "skip", "deliberate-exit")
+    if not process_alive(expected_supervisor, proc_root) or not process_alive(expected_child, proc_root):
+        return result(label, "skip", "owner-not-live")
+    if not is_descendant(expected_child, expected_supervisor, proc_root):
+        return result(label, "skip", "owner-tree-incoherent")
+    owner_fingerprint = (
+        f"{process_fingerprint(expected_supervisor, proc_root)}/"
+        f"{process_fingerprint(expected_child, proc_root)}"
+    )
+
+    recorded_at = record.get("recorded_at")
+    if not isinstance(recorded_at, (int, float)) or current_time - float(recorded_at) < startup_grace:
+        return result(label, "skip", "startup-grace")
+    if runtime.get("compacting"):
+        return result(label, "skip", "compacting")
+    if runtime.get("status") != "idle":
+        return result(label, "skip", "owner-busy", owner_status=runtime.get("status"))
+
+    lock = channels_root / f"telegram-{label.lower()}" / "bot.pid"
+    pid = poller_pid(lock)
+    if pid is None:
+        return result(label, "deaf", "poller-lock-missing-or-invalid", _fingerprint=f"{owner_fingerprint}/none")
+    if not process_alive(pid, proc_root):
+        return result(
+            label, "deaf", "poller-dead", poller_pid=pid,
+            _fingerprint=f"{owner_fingerprint}/{process_fingerprint(pid, proc_root)}",
+        )
+    if not is_descendant(pid, expected_child, proc_root):
+        return result(
+            label, "deaf", "poller-foreign", poller_pid=pid,
+            _fingerprint=f"{owner_fingerprint}/{process_fingerprint(pid, proc_root)}",
+        )
+    return result(
+        label, "healthy", "poller-owned", poller_pid=pid,
+        _fingerprint=f"{owner_fingerprint}/{process_fingerprint(pid, proc_root)}",
+    )
+
+
+def revive_command(nurse_joy: pathlib.Path, label: str, session_id: str) -> list[str]:
+    return [str(nurse_joy), "revive", label, "--resume", session_id, "--no-visit"]
+
+
+def retry_disposition(
+    entry: dict, *, current_time: float, cooldown: float, alert_cooldown: float, max_failures: int
+) -> str:
+    last_attempt = entry.get("last_attempt")
+    failures = entry.get("failures", 0)
+    if not isinstance(last_attempt, (int, float)):
+        return "attempt"
+    elapsed = current_time - float(last_attempt)
+    if isinstance(failures, int) and failures >= max_failures and elapsed < alert_cooldown:
+        return "alert-cooldown"
+    if elapsed < cooldown:
+        return "cooldown"
+    return "attempt"
+
+
+def confirmation_disposition(
+    entry: dict, *, reason: str, fingerprint: str, current_time: float, confirm_seconds: float
+) -> str:
+    since = entry.get("deaf_since")
+    if (
+        entry.get("last_deaf_reason") != reason
+        or entry.get("last_deaf_fingerprint") != fingerprint
+        or not isinstance(since, (int, float))
+    ):
+        entry.update(
+            {"deaf_since": current_time, "last_deaf_reason": reason, "last_deaf_fingerprint": fingerprint}
+        )
+        return "confirmed" if confirm_seconds <= 0 else "observe"
+    return "confirmed" if current_time - float(since) >= confirm_seconds else "observe"
+
+
+def default_nurse_joy() -> pathlib.Path:
+    configured = os.environ.get("CLAUDE_POLLER_WATCHDOG_NURSE_JOY")
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    discovered = shutil.which("nurse-joy")
+    if discovered:
+        return pathlib.Path(discovered)
+    local = pathlib.Path.home() / ".local/bin/nurse-joy"
+    if local.exists():
+        return local
+    return pathlib.Path.home() / "HelmCortex/FORGE/bin/nurse-joy"
+
+
+def discover_records(state_root: pathlib.Path) -> list[dict]:
+    records: list[dict] = []
+    for path in sorted(state_root.glob("last-session.*.json")):
+        payload = read_json(path)
+        if payload is not None:
+            records.append(payload)
+    return records
+
+
+def emit(payload: dict, json_output: bool) -> None:
+    payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if json_output:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"{payload.get('label')}: {payload.get('status')} ({payload.get('reason')})")
+
+
+def run(arguments: argparse.Namespace) -> int:
+    if arguments.expected_host and socket.gethostname() != arguments.expected_host:
+        emit(result("fleet", "skip", "wrong-host", expected_host=arguments.expected_host), arguments.json)
+        return 0
+    state_root = pathlib.Path(arguments.state_root).expanduser()
+    runtime_root = pathlib.Path(arguments.runtime_root).expanduser()
+    channels_root = pathlib.Path(arguments.channels_root).expanduser()
+    proc_root = pathlib.Path(arguments.proc_root)
+    watchdog_root = pathlib.Path(arguments.watchdog_root).expanduser()
+    watchdog_root.mkdir(parents=True, exist_ok=True)
+    lock_path = watchdog_root / "watchdog.lock"
+    state_path = watchdog_root / "state.json"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit(result("fleet", "skip", "watchdog-already-running"), arguments.json)
+            return 0
+        state = read_json(state_path) or {"schema": SCHEMA, "targets": {}}
+        targets = state.setdefault("targets", {})
+        current_time = time.time()
+        for record in discover_records(state_root):
+            assessment = assess_record(
+                record,
+                state_root=state_root,
+                runtime_root=runtime_root,
+                channels_root=channels_root,
+                proc_root=proc_root,
+                current_time=current_time,
+                startup_grace=arguments.startup_grace,
+            )
+            label = assessment["label"]
+            if label == "unknown":
+                emit(assessment, arguments.json)
+                continue
+            entry = targets.setdefault(label, {"failures": 0})
+            if assessment["status"] == "healthy":
+                entry.update({"failures": 0, "last_healthy": current_time, "last_reason": assessment["reason"]})
+                entry.pop("deaf_since", None)
+                entry.pop("last_deaf_reason", None)
+                entry.pop("last_deaf_fingerprint", None)
+                emit(assessment, arguments.json)
+                continue
+            if assessment["status"] != "deaf":
+                emit(assessment, arguments.json)
+                continue
+            if confirmation_disposition(
+                entry,
+                reason=assessment["reason"],
+                fingerprint=assessment["_fingerprint"],
+                current_time=current_time,
+                confirm_seconds=arguments.confirm_seconds,
+            ) != "confirmed":
+                assessment.update({"status": "suspect", "retry": "confirmation-pending"})
+                emit(assessment, arguments.json)
+                continue
+            rechecked = assess_record(
+                record,
+                state_root=state_root,
+                runtime_root=runtime_root,
+                channels_root=channels_root,
+                proc_root=proc_root,
+                current_time=time.time(),
+                startup_grace=arguments.startup_grace,
+            )
+            if (
+                rechecked.get("status") != "deaf"
+                or rechecked.get("reason") != assessment.get("reason")
+                or rechecked.get("_fingerprint") != assessment.get("_fingerprint")
+            ):
+                emit(result(label, "skip", "pre-revive-revalidation-changed"), arguments.json)
+                continue
+            disposition = retry_disposition(
+                entry,
+                current_time=current_time,
+                cooldown=arguments.cooldown,
+                alert_cooldown=arguments.alert_cooldown,
+                max_failures=arguments.max_failures,
+            )
+            if disposition != "attempt":
+                assessment["status"] = "alert" if disposition == "alert-cooldown" else "skip"
+                assessment["retry"] = disposition
+                assessment["failures"] = entry.get("failures", 0)
+                emit(assessment, arguments.json)
+                continue
+            command = revive_command(pathlib.Path(arguments.nurse_joy), label, record["session_id"])
+            assessment["command"] = command
+            if arguments.dry_run:
+                assessment["status"] = "dry-run"
+                emit(assessment, arguments.json)
+                continue
+            entry.update({"last_attempt": current_time, "last_reason": assessment["reason"]})
+            # Persist the cooldown before invoking Nurse Joy.  If this process
+            # is interrupted during a slow graceful exit, the next cron tick
+            # must not launch an overlapping revive.
+            state["updated_at"] = current_time
+            atomic_json(state_path, state)
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=arguments.revive_timeout,
+                )
+                returncode = completed.returncode
+            except (OSError, subprocess.TimeoutExpired):
+                returncode = 124
+            if returncode == 0:
+                entry.update({"failures": 0, "last_success": current_time})
+                entry.pop("deaf_since", None)
+                entry.pop("last_deaf_reason", None)
+                entry.pop("last_deaf_fingerprint", None)
+                assessment.update({"status": "revived", "returncode": 0})
+            else:
+                entry["failures"] = int(entry.get("failures", 0)) + 1
+                assessment.update(
+                    {"status": "alert" if entry["failures"] >= arguments.max_failures else "failed",
+                     "returncode": returncode, "failures": entry["failures"]}
+                )
+            emit(assessment, arguments.json)
+        state["updated_at"] = current_time
+        if not arguments.dry_run:
+            atomic_json(state_path, state)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    state = os.environ.get("XDG_STATE_HOME", str(pathlib.Path.home() / ".local/state"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--expected-host")
+    parser.add_argument("--state-root", default=str(pathlib.Path(state) / "claude-idle-compaction"))
+    parser.add_argument("--runtime-root", default=str(pathlib.Path(runtime) / "claude-idle-compaction"))
+    parser.add_argument("--channels-root", default=str(pathlib.Path.home() / ".claude/channels"))
+    parser.add_argument("--proc-root", default="/proc")
+    parser.add_argument("--watchdog-root", default=str(pathlib.Path(state) / "claude-poller-watchdog"))
+    parser.add_argument("--nurse-joy", default=str(default_nurse_joy()))
+    parser.add_argument("--startup-grace", type=float, default=DEFAULT_STARTUP_GRACE_SECONDS)
+    parser.add_argument("--confirm-seconds", type=float, default=DEFAULT_CONFIRM_SECONDS)
+    parser.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN_SECONDS)
+    parser.add_argument("--alert-cooldown", type=float, default=DEFAULT_ALERT_COOLDOWN_SECONDS)
+    parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    parser.add_argument("--revive-timeout", type=float, default=180.0)
+    return parser
+
+
+def main() -> int:
+    return run(build_parser().parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+** Cron deployment helper
+
+The source remains host-agnostic and contains no account name.  The explicit
+apply command resolves the invoking user, home, and uid and installs a
+three-minute =/etc/cron.d= schedule.  Tangling does not deploy it.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/claude-poller-watchdog-cron-apply :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+
+TAG="claude-poller-watchdog-cron-apply"
+TARGET="/etc/cron.d/dotcortex-claude-poller-watchdog"
+REMOVE=0
+DRY=0
+EXPECTED_HOST=""
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --remove) REMOVE=1 ;;
+    --dry-run) DRY=1 ;;
+    --host)
+      [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }
+      EXPECTED_HOST="$2"
+      shift ;;
+    -h|--help|help)
+      echo "Usage: $TAG --host EXACT_HOST [--dry-run] [--remove]"
+      exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then
+    echo "remove $TARGET"
+  else
+    run_priv rm -f "$TARGET"
+    echo "$TAG: removed $TARGET"
+  fi
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --host EXACT_HOST is required" >&2; exit 2; }
+CURRENT_HOST="$(hostname)"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  echo "$TAG: refusing installation on $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  exit 1
+}
+
+USER_NAME="$(id -un)"
+USER_ID="$(id -u)"
+TARGET_HOME="$HOME"
+WATCHDOG="$TARGET_HOME/.local/bin/claude-poller-watchdog"
+LOG_DIR="$TARGET_HOME/.local/state/claude-poller-watchdog"
+if [ "$DRY" != 1 ] && [ ! -x "$WATCHDOG" ]; then
+  echo "$TAG: missing $WATCHDOG; tangle and stow first" >&2
+  exit 1
+fi
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex Claude Telegram poller watchdog; managed by $TAG.
+*/3 * * * * ${USER_NAME} HOME=${TARGET_HOME} XDG_RUNTIME_DIR=/run/user/${USER_ID} ${WATCHDOG} --expected-host ${EXPECTED_HOST} --json >>${LOG_DIR}/cron.log 2>&1
+EOF
+
+if [ "$DRY" = 1 ]; then
+  cat "$TMP"
+else
+  mkdir -p "$LOG_DIR"
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+  echo "$TAG: installed $TARGET"
+fi
 #+END_SRC
