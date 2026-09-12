@@ -6,6 +6,7 @@ from __future__ import annotations
 import ctypes
 import datetime
 import errno
+import hashlib
 import fcntl
 import json
 import os
@@ -44,6 +45,7 @@ CONTROL_COMMANDS = {
     "cancel",
     "trigger",
     "inject",
+    "preserve",
 }
 
 INJECT_RE = re.compile(r"^/mcp reconnect ([A-Za-z0-9_.:-]{1,128})$")
@@ -360,6 +362,19 @@ def now() -> float:
 def monotonic() -> float:
     """Return monotonic seconds used only for local retry/poll scheduling."""
     return time.monotonic()
+
+
+def executable_generation() -> str:
+    """Hash executable bytes without confusing install time with load time."""
+    try:
+        return hashlib.sha256(pathlib.Path(__file__).read_bytes()).hexdigest()
+    except OSError:
+        return "unavailable"
+
+
+# Capture once while this generation loads.  A later source/stow update can
+# change the installed bytes, but it cannot rewrite this running process.
+LOADED_GENERATION = executable_generation()
 
 
 HERDR_SOURCE = "claude-warm"
@@ -1064,6 +1079,11 @@ class Supervisor:
         self.last_gate_rejection_reason: str | None = None
         self.last_injection_result: str | None = None
         self.last_state_transition = "supervisor-started"
+        self.preservation_request_id: str | None = None
+        self.preservation_reservation_id: str | None = None
+        self.preservation_state: str | None = None
+        self.preservation_failure: str | None = None
+        self.preservation_expected_epoch: int | None = None
         self.last_channel_activity: float | None = None
         self.last_channel_event: str | None = None
         self.last_channel_death: float | None = None
@@ -1103,10 +1123,14 @@ class Supervisor:
 
     def state(self) -> dict:
         """Return safe persisted state for controls and diagnostics."""
+        installed_generation = executable_generation()
         return {
             "channel": self.channel,
             "pid": self.pid,
             "supervisor_pid": os.getpid(),
+            "loaded_generation": LOADED_GENERATION,
+            "installed_generation": installed_generation,
+            "generation_loaded": LOADED_GENERATION == installed_generation,
             "pty_master_owned": self.master_fd is not None,
             "pty_master_fd": self.master_fd,
             "pty_child_terminal": self.child_tty,
@@ -1160,6 +1184,11 @@ class Supervisor:
             "last_gate_rejection_reason": self.last_gate_rejection_reason,
             "last_injection_result": self.last_injection_result,
             "last_state_transition": self.last_state_transition,
+            "preservation_request_id": self.preservation_request_id,
+            "preservation_reservation_id": self.preservation_reservation_id,
+            "preservation_state": self.preservation_state,
+            "preservation_failure": self.preservation_failure,
+            "preservation_expected_epoch": self.preservation_expected_epoch,
             "last_channel_activity": self.last_channel_activity,
             "last_channel_event": self.last_channel_event,
             "last_channel_death": self.last_channel_death,
@@ -1409,6 +1438,8 @@ class Supervisor:
             "transcript-quiescent",
             completed_turn_epoch=self.completed_turn_epoch,
         )
+        if self.preservation_state == "requested":
+            self.attempt(command="/compact", purpose="compact")
         if self.recovery_pending:
             self._arm_recovery()
         else:
@@ -1597,6 +1628,13 @@ class Supervisor:
             f"compaction-failed channel={short_id(self.channel)} reason={reason}"
         )
         self._guard_log("compaction-failed", reason=reason)
+        if self.preservation_state == "native_started":
+            self.preservation_state = "pending_recovery"
+            self.preservation_failure = reason
+            self._save_preservation()
+            self._guard_log(
+                "preservation-pending-recovery", request_id=self.preservation_request_id, reason=reason
+            )
         self._write_state()
 
     def _is_failed_compaction_entry(self, entry: dict) -> bool:
@@ -1901,7 +1939,10 @@ class Supervisor:
         self.pid = pid
         self.master_fd = master_fd
         os.set_blocking(master_fd, False)
-        self.child_tty = self._read_child_tty()
+        # Do not bind while the forked child may still expose the inherited
+        # Herdr terminal before exec installs the forkpty slave.  The first
+        # final-gate probe binds both values after the child is settled.
+        self.child_tty = self.child_tty_device = None
         self.selector.register(master_fd, selectors.EVENT_READ, "master")
         self._install_signals()
         self._install_terminal()
@@ -1923,6 +1964,19 @@ class Supervisor:
         except OSError:
             return None
 
+    def _read_child_tty_device(self) -> int | None:
+        """Return the child stdin terminal device, independent of mount paths."""
+        if not self.pid:
+            return None
+        try:
+            device = os.stat(f"/proc/{self.pid}/fd/0").st_rdev
+        except OSError:
+            return None
+        # Pipes and regular files have no terminal device identity.  A PTY
+        # slave keeps the same device identity even when different mount
+        # namespaces render it with different /dev/pts/N pathnames.
+        return device or None
+
     def _pty_ownership_failure(self) -> str | None:
         """Return a bounded label for the first failing ownership condition."""
         if not self.pid or self.master_fd is None:
@@ -1931,15 +1985,21 @@ class Supervisor:
             return "child-not-alive"
         if self.child_tty is None:
             self.child_tty = self._read_child_tty()
-        if self.child_tty is None:
+        current_device = self._read_child_tty_device()
+        if getattr(self, "child_tty_device", None) is None:
+            self.child_tty_device = current_device
+        if self.child_tty is None or self.child_tty_device is None or current_device is None:
             return "child-tty-unknown"
         try:
             if os.getpgid(self.pid) != self.pid:
                 return "pgid-mismatch"
-            if os.readlink(f"/proc/{self.pid}/fd/0") != self.child_tty:
+            if current_device != self.child_tty_device:
                 return "stdin-not-pty"
         except OSError as error:
             return f"oserror-{error.errno or 0}"
+        # Keep the display-only path current without making namespace-local
+        # /dev/pts numbering part of the ownership decision.
+        self.child_tty = self._read_child_tty()
         return None
 
     def _pty_still_owned(self) -> bool:
@@ -2213,7 +2273,14 @@ class Supervisor:
                 transient=reason not in DORMANT_GATE_REASONS,
             )
             self._write_state()
-            if purpose == "compact" and reason not in DORMANT_GATE_REASONS:
+            if purpose == "compact" and self.preservation_state == "requested":
+                self.preservation_state = "pending_recovery"
+                self.preservation_failure = reason
+                self._save_preservation()
+                self._guard_log(
+                    "preservation-pending-recovery", request_id=self.preservation_request_id, reason=reason
+                )
+            if purpose == "compact" and reason not in DORMANT_GATE_REASONS and self.preservation_state != "pending_recovery":
                 self.rearm(f"gate-refused:{reason}")
             return False
         if not validate_inject_command(command, self.watched_servers, self.recovery_command):
@@ -2258,6 +2325,13 @@ class Supervisor:
                 self.last_injection_result = "failed"
                 self.last_state_transition = "injection-failed"
                 self._debug(f"compaction-failed channel={short_id(self.channel)} error={error}")
+                if self.preservation_state == "requested":
+                    self.preservation_state = "pending_recovery"
+                    self.preservation_failure = "compaction-injection-failed"
+                    self._save_preservation()
+                    self._guard_log(
+                        "preservation-pending-recovery", request_id=self.preservation_request_id, reason="pty-write-failed"
+                    )
             elif purpose == "recovery":
                 self.recovery_awaiting = False
                 self.recovery_command_inflight = False
@@ -2293,6 +2367,12 @@ class Supervisor:
                 ),
                 queued_behind_turn=queued_behind_turn,
             )
+            if self.preservation_state == "requested":
+                self.preservation_state = "native_started"
+                self._save_preservation()
+                self._guard_log(
+                    "preservation-native-started", request_id=self.preservation_request_id
+                )
         else:
             self._guard_log("manual-injection-requested", command=command)
         self._write_state()
@@ -2339,6 +2419,7 @@ class Supervisor:
                 )
             self.session_id = session_id
             if new_session:
+                self._load_preservation()
                 self._record_last_session("session-bound")
                 self.completed_turn_epoch = 0
                 self.status_snapshot_epoch = None
@@ -2402,6 +2483,12 @@ class Supervisor:
             self.last_lifecycle_activity = current
             self.last_local_input = None
             self.transcript_activity_at = None
+            if self.preservation_state == "requested":
+                self._guard_log(
+                    "preservation-safe-boundary",
+                    request_id=self.preservation_request_id,
+                    completed_turn_epoch=self.completed_turn_epoch,
+                )
             self.transcript_gate_blocked = False
             self.transcript_gate_blocked_at = None
             self.last_transcript_classification = None
@@ -2439,6 +2526,13 @@ class Supervisor:
             self.last_injection_result = "succeeded"
             self.last_lifecycle_activity = current
             self._reset_transcript_cursor()
+            if self.preservation_state == "native_started":
+                self.preservation_state = "native_completed"
+                self._save_preservation()
+                self._guard_log(
+                    "preservation-native-completed",
+                    request_id=self.preservation_request_id,
+                )
             self.cancel("compaction-completed")
             self.last_state_transition = "compaction-completed"
             self._debug(f"compaction-completed channel={short_id(self.channel)}")
@@ -2482,6 +2576,111 @@ class Supervisor:
         self._write_state()
         return {"ok": True}
 
+    def _preservation_path(self) -> pathlib.Path | None:
+        """Return a private, session-stable ledger path without exposing the ID."""
+        if not self.session_id:
+            return None
+        digest = hashlib.sha256(self.session_id.encode("utf-8")).hexdigest()[:32]
+        directory = self.state_root / "preservation"
+        safe_mkdir(directory)
+        return directory / f"{digest}.json"
+
+    def _save_preservation(self) -> None:
+        """Persist before acknowledgement so lost replies are safely replayable."""
+        path = self._preservation_path()
+        if path is None or self.preservation_request_id is None:
+            return
+        payload = {
+            "session_id": self.session_id,
+            "request_id": self.preservation_request_id,
+            "reservation_id": self.preservation_reservation_id,
+            "state": self.preservation_state,
+            "failure": self.preservation_failure,
+            "expected_epoch": self.preservation_expected_epoch,
+        }
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+
+    def _load_preservation(self) -> None:
+        """Recover terminal state; in-flight work requires a fresh owner request."""
+        self.preservation_request_id = None
+        self.preservation_reservation_id = None
+        self.preservation_state = None
+        self.preservation_failure = None
+        self.preservation_expected_epoch = None
+        path = self._preservation_path()
+        if path is None:
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if payload.get("session_id") != self.session_id:
+            return
+        self.preservation_request_id = payload.get("request_id")
+        self.preservation_reservation_id = payload.get("reservation_id")
+        self.preservation_state = payload.get("state")
+        self.preservation_failure = payload.get("failure")
+        self.preservation_expected_epoch = payload.get("expected_epoch")
+        if self.preservation_state in {"reserved", "requested", "native_started"}:
+            self.preservation_state = "pending_recovery"
+            self.preservation_failure = "owner-restarted"
+            self._save_preservation()
+
+    def _request_preservation(self, message: dict) -> dict:
+        """Persist one idempotent request and compact only through this PTY owner."""
+        request_id = message.get("request_id")
+        reservation_id = message.get("reservation_id")
+        expected_session_id = message.get("expected_session_id")
+        expected_supervisor_pid = message.get("expected_supervisor_pid")
+        expected_epoch = message.get("expected_epoch")
+        if not all(
+            isinstance(value, str) and SESSION_RE.fullmatch(value)
+            for value in (request_id, reservation_id, expected_session_id)
+        ):
+            return {"ok": False, "error": "invalid-preservation-identity"}
+        if not isinstance(expected_supervisor_pid, int) or not isinstance(expected_epoch, int):
+            return {"ok": False, "error": "invalid-preservation-owner"}
+        if self.preservation_request_id == request_id:
+            return {"ok": True, "replayed": True, "state": self.state()}
+        if self.preservation_request_id and self.preservation_state not in {
+            "native_completed", "failed", "pending_recovery",
+        }:
+            return {"ok": False, "error": "preservation-already-pending", "state": self.state()}
+        if not self.enabled:
+            return {"ok": False, "error": "protection-disabled", "state": self.state()}
+        if (
+            expected_session_id != self.session_id
+            or expected_supervisor_pid != os.getpid()
+            or expected_epoch != self.completed_turn_epoch
+        ):
+            return {"ok": False, "error": "preservation-owner-mismatch", "state": self.state()}
+        self.preservation_request_id = request_id
+        self.preservation_reservation_id = reservation_id
+        self.preservation_state = "reserved"
+        self.preservation_failure = None
+        self.preservation_expected_epoch = expected_epoch
+        self._save_preservation()
+        self._guard_log(
+            "preservation-reserved",
+            request_id=request_id,
+            reservation_id=reservation_id,
+        )
+        self.preservation_state = "requested"
+        self._save_preservation()
+        self._guard_log("preservation-requested", request_id=request_id)
+        if (
+            self.status == "idle"
+            and self.transcript_quiescence_deadline is None
+            and self.transcript_quiescence_at is not None
+        ):
+            self.attempt(command="/compact", purpose="compact")
+        self._save_preservation()
+        self._write_state()
+        return {"ok": True, "state": self.state()}
+
     def _handle_control(self, message: dict) -> dict:
         """Handle one local control command without exposing prompts or secrets."""
         if message.get("kind") != "control":
@@ -2491,6 +2690,8 @@ class Supervisor:
         command = message.get("command")
         if command not in CONTROL_COMMANDS:
             return {"ok": False, "error": "unknown-control"}
+        if command == "preserve":
+            return self._request_preservation(message)
         if command == "state":
             return {"ok": True, "state": self.state()}
         if command == "enable":
@@ -2727,6 +2928,13 @@ class Supervisor:
                     self.last_cancellation_reason = "compaction-timeout"
                     self.last_injection_result = "failed"
                     self.last_state_transition = "compaction-timeout"
+                    if self.preservation_state == "native_started":
+                        self.preservation_state = "failed"
+                        self.preservation_failure = "compaction-timeout"
+                        self._save_preservation()
+                        self._guard_log(
+                            "preservation-failed", request_id=self.preservation_request_id, reason="timeout"
+                        )
                     self._debug(f"compaction-timeout channel={short_id(self.channel)}")
                     self._guard_log("compaction-failed", reason="timeout")
                     self.rearm("compaction-timeout")
@@ -2865,6 +3073,7 @@ def control_main(argv: list[str]) -> int:
         print("       claude-warmctl profile CHANNEL long|short|auto")
         print("       claude-warmctl cancel CHANNEL | trigger CHANNEL")
         print("       claude-warmctl inject CHANNEL /compact|/reload-plugins|/mcp reconnect SERVER")
+        print("       claude-warmctl preserve CHANNEL REQUEST RESERVATION SESSION PID EPOCH")
         return 0
     command = argv[0]
     if command == "list":
@@ -2885,6 +3094,22 @@ def control_main(argv: list[str]) -> int:
             print("inject requires a whitelisted command", file=sys.stderr)
             return 2
         fields = {"text": " ".join(argv[2:])}
+    if command == "preserve":
+        if len(argv) != 7:
+            print("preserve requires CHANNEL REQUEST RESERVATION SESSION PID EPOCH", file=sys.stderr)
+            return 2
+        try:
+            expected_supervisor_pid = int(argv[5])
+            expected_epoch = int(argv[6])
+        except ValueError:
+            print("preserve PID and EPOCH must be integers", file=sys.stderr)
+            return 2
+        fields = {
+            "request_id": argv[2], "reservation_id": argv[3],
+            "expected_session_id": argv[4],
+            "expected_supervisor_pid": expected_supervisor_pid,
+            "expected_epoch": expected_epoch,
+        }
     try:
         response = send_control(channel, "state" if command == "show" else command, **fields)
     except (OSError, RuntimeError, ValueError) as error:

@@ -1,0 +1,423 @@
+#!/usr/bin/env python3
+"""Detect deaf Claude Telegram pollers and request a guarded Nurse Joy revive."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import pathlib
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+
+
+SCHEMA = "dotcortex.claude-poller-watchdog.v1"
+LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
+CHANNEL_RE = re.compile(r"^claude-[0-9a-f]{32}$")
+DEFAULT_COOLDOWN_SECONDS = 30 * 60
+DEFAULT_ALERT_COOLDOWN_SECONDS = 6 * 60 * 60
+DEFAULT_STARTUP_GRACE_SECONDS = 5 * 60
+DEFAULT_CONFIRM_SECONDS = 2 * 60
+DEFAULT_MAX_FAILURES = 3
+
+
+def read_json(path: pathlib.Path) -> dict | None:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def atomic_json(path: pathlib.Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(payload, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def proc_identity(pid: object, proc_root: pathlib.Path) -> tuple[int, str, int] | None:
+    if not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        text = (proc_root / str(pid) / "stat").read_text(encoding="utf-8")
+        tail = text[text.rfind(")") + 2 :].split()
+        state = tail[0]
+        parent = int(tail[1])
+        start_ticks = int(tail[19])
+    except (OSError, ValueError, IndexError):
+        return None
+    return (parent, state, start_ticks)
+
+
+def process_alive(pid: object, proc_root: pathlib.Path) -> bool:
+    identity = proc_identity(pid, proc_root)
+    if identity is None or identity[1] == "Z":
+        return False
+    if proc_root == pathlib.Path("/proc"):
+        try:
+            os.kill(int(pid), 0)
+        except (OSError, ValueError, TypeError):
+            return False
+    return True
+
+
+def process_fingerprint(pid: int, proc_root: pathlib.Path) -> str | None:
+    identity = proc_identity(pid, proc_root)
+    return f"{pid}:{identity[2]}" if identity is not None else None
+
+
+def is_descendant(pid: int, ancestor: int, proc_root: pathlib.Path) -> bool:
+    if pid == ancestor:
+        return True
+    seen: set[int] = set()
+    current = pid
+    for _ in range(128):
+        if current in seen or current <= 1:
+            return False
+        seen.add(current)
+        identity = proc_identity(current, proc_root)
+        if identity is None:
+            return False
+        current = identity[0]
+        if current == ancestor:
+            return True
+    return False
+
+
+def telegram_enabled(argv: object) -> bool:
+    if not isinstance(argv, list):
+        return False
+    for index, item in enumerate(argv[:-1]):
+        if item == "--channels" and "telegram" in str(argv[index + 1]).lower():
+            return True
+    return False
+
+
+def poller_pid(path: pathlib.Path) -> int | None:
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not value.isdigit():
+        return None
+    parsed = int(value)
+    return parsed if parsed > 1 else None
+
+
+def result(label: str, status: str, reason: str, **fields: object) -> dict:
+    return {"schema": SCHEMA, "label": label, "status": status, "reason": reason, **fields}
+
+
+def assess_record(
+    record: dict,
+    *,
+    state_root: pathlib.Path,
+    runtime_root: pathlib.Path,
+    channels_root: pathlib.Path,
+    proc_root: pathlib.Path,
+    current_time: float,
+    startup_grace: float,
+) -> dict:
+    label = record.get("agent")
+    if not isinstance(label, str) or not LABEL_RE.fullmatch(label):
+        return result("unknown", "skip", "invalid-label")
+    if not telegram_enabled(record.get("argv")):
+        return result(label, "skip", "telegram-not-enabled")
+    if record.get("event") == "supervisor-exit":
+        return result(label, "skip", "deliberate-exit")
+    session_id = record.get("session_id")
+    channel = record.get("channel")
+    if not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
+        return result(label, "skip", "invalid-session")
+    if not isinstance(channel, str) or not CHANNEL_RE.fullmatch(channel):
+        return result(label, "skip", "invalid-channel")
+
+    runtime = read_json(runtime_root / channel / "state.json")
+    if runtime is None:
+        return result(label, "skip", "missing-runtime-state")
+    expected_supervisor = record.get("supervisor_pid")
+    expected_child = record.get("pid")
+    if (
+        runtime.get("session_id") != session_id
+        or runtime.get("supervisor_pid") != expected_supervisor
+        or runtime.get("pid") != expected_child
+    ):
+        return result(label, "skip", "runtime-record-mismatch")
+    if runtime.get("status") == "exited":
+        return result(label, "skip", "deliberate-exit")
+    if not process_alive(expected_supervisor, proc_root) or not process_alive(expected_child, proc_root):
+        return result(label, "skip", "owner-not-live")
+    if not is_descendant(expected_child, expected_supervisor, proc_root):
+        return result(label, "skip", "owner-tree-incoherent")
+    owner_fingerprint = (
+        f"{process_fingerprint(expected_supervisor, proc_root)}/"
+        f"{process_fingerprint(expected_child, proc_root)}"
+    )
+
+    recorded_at = record.get("recorded_at")
+    if not isinstance(recorded_at, (int, float)) or current_time - float(recorded_at) < startup_grace:
+        return result(label, "skip", "startup-grace")
+    if runtime.get("compacting"):
+        return result(label, "skip", "compacting")
+    if runtime.get("status") != "idle":
+        return result(label, "skip", "owner-busy", owner_status=runtime.get("status"))
+
+    lock = channels_root / f"telegram-{label.lower()}" / "bot.pid"
+    pid = poller_pid(lock)
+    if pid is None:
+        return result(label, "deaf", "poller-lock-missing-or-invalid", _fingerprint=f"{owner_fingerprint}/none")
+    if not process_alive(pid, proc_root):
+        return result(
+            label, "deaf", "poller-dead", poller_pid=pid,
+            _fingerprint=f"{owner_fingerprint}/{process_fingerprint(pid, proc_root)}",
+        )
+    if not is_descendant(pid, expected_child, proc_root):
+        return result(
+            label, "deaf", "poller-foreign", poller_pid=pid,
+            _fingerprint=f"{owner_fingerprint}/{process_fingerprint(pid, proc_root)}",
+        )
+    return result(
+        label, "healthy", "poller-owned", poller_pid=pid,
+        _fingerprint=f"{owner_fingerprint}/{process_fingerprint(pid, proc_root)}",
+    )
+
+
+def revive_command(nurse_joy: pathlib.Path, label: str, session_id: str) -> list[str]:
+    return [str(nurse_joy), "revive", label, "--resume", session_id, "--no-visit"]
+
+
+def retry_disposition(
+    entry: dict, *, current_time: float, cooldown: float, alert_cooldown: float, max_failures: int
+) -> str:
+    last_attempt = entry.get("last_attempt")
+    failures = entry.get("failures", 0)
+    if not isinstance(last_attempt, (int, float)):
+        return "attempt"
+    elapsed = current_time - float(last_attempt)
+    if isinstance(failures, int) and failures >= max_failures and elapsed < alert_cooldown:
+        return "alert-cooldown"
+    if elapsed < cooldown:
+        return "cooldown"
+    return "attempt"
+
+
+def confirmation_disposition(
+    entry: dict, *, reason: str, fingerprint: str, current_time: float, confirm_seconds: float
+) -> str:
+    since = entry.get("deaf_since")
+    if (
+        entry.get("last_deaf_reason") != reason
+        or entry.get("last_deaf_fingerprint") != fingerprint
+        or not isinstance(since, (int, float))
+    ):
+        entry.update(
+            {"deaf_since": current_time, "last_deaf_reason": reason, "last_deaf_fingerprint": fingerprint}
+        )
+        return "confirmed" if confirm_seconds <= 0 else "observe"
+    return "confirmed" if current_time - float(since) >= confirm_seconds else "observe"
+
+
+def default_nurse_joy() -> pathlib.Path:
+    configured = os.environ.get("CLAUDE_POLLER_WATCHDOG_NURSE_JOY")
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    discovered = shutil.which("nurse-joy")
+    if discovered:
+        return pathlib.Path(discovered)
+    local = pathlib.Path.home() / ".local/bin/nurse-joy"
+    if local.exists():
+        return local
+    return pathlib.Path.home() / "HelmCortex/FORGE/bin/nurse-joy"
+
+
+def discover_records(state_root: pathlib.Path) -> list[dict]:
+    records: list[dict] = []
+    for path in sorted(state_root.glob("last-session.*.json")):
+        payload = read_json(path)
+        if payload is not None:
+            records.append(payload)
+    return records
+
+
+def emit(payload: dict, json_output: bool) -> None:
+    payload = {key: value for key, value in payload.items() if not key.startswith("_")}
+    if json_output:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"{payload.get('label')}: {payload.get('status')} ({payload.get('reason')})")
+
+
+def run(arguments: argparse.Namespace) -> int:
+    if arguments.expected_host and socket.gethostname() != arguments.expected_host:
+        emit(result("fleet", "skip", "wrong-host", expected_host=arguments.expected_host), arguments.json)
+        return 0
+    state_root = pathlib.Path(arguments.state_root).expanduser()
+    runtime_root = pathlib.Path(arguments.runtime_root).expanduser()
+    channels_root = pathlib.Path(arguments.channels_root).expanduser()
+    proc_root = pathlib.Path(arguments.proc_root)
+    watchdog_root = pathlib.Path(arguments.watchdog_root).expanduser()
+    watchdog_root.mkdir(parents=True, exist_ok=True)
+    lock_path = watchdog_root / "watchdog.lock"
+    state_path = watchdog_root / "state.json"
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            emit(result("fleet", "skip", "watchdog-already-running"), arguments.json)
+            return 0
+        state = read_json(state_path) or {"schema": SCHEMA, "targets": {}}
+        targets = state.setdefault("targets", {})
+        current_time = time.time()
+        for record in discover_records(state_root):
+            assessment = assess_record(
+                record,
+                state_root=state_root,
+                runtime_root=runtime_root,
+                channels_root=channels_root,
+                proc_root=proc_root,
+                current_time=current_time,
+                startup_grace=arguments.startup_grace,
+            )
+            label = assessment["label"]
+            if label == "unknown":
+                emit(assessment, arguments.json)
+                continue
+            entry = targets.setdefault(label, {"failures": 0})
+            if assessment["status"] == "healthy":
+                entry.update({"failures": 0, "last_healthy": current_time, "last_reason": assessment["reason"]})
+                entry.pop("deaf_since", None)
+                entry.pop("last_deaf_reason", None)
+                entry.pop("last_deaf_fingerprint", None)
+                emit(assessment, arguments.json)
+                continue
+            if assessment["status"] != "deaf":
+                emit(assessment, arguments.json)
+                continue
+            if confirmation_disposition(
+                entry,
+                reason=assessment["reason"],
+                fingerprint=assessment["_fingerprint"],
+                current_time=current_time,
+                confirm_seconds=arguments.confirm_seconds,
+            ) != "confirmed":
+                assessment.update({"status": "suspect", "retry": "confirmation-pending"})
+                emit(assessment, arguments.json)
+                continue
+            rechecked = assess_record(
+                record,
+                state_root=state_root,
+                runtime_root=runtime_root,
+                channels_root=channels_root,
+                proc_root=proc_root,
+                current_time=time.time(),
+                startup_grace=arguments.startup_grace,
+            )
+            if (
+                rechecked.get("status") != "deaf"
+                or rechecked.get("reason") != assessment.get("reason")
+                or rechecked.get("_fingerprint") != assessment.get("_fingerprint")
+            ):
+                emit(result(label, "skip", "pre-revive-revalidation-changed"), arguments.json)
+                continue
+            disposition = retry_disposition(
+                entry,
+                current_time=current_time,
+                cooldown=arguments.cooldown,
+                alert_cooldown=arguments.alert_cooldown,
+                max_failures=arguments.max_failures,
+            )
+            if disposition != "attempt":
+                assessment["status"] = "alert" if disposition == "alert-cooldown" else "skip"
+                assessment["retry"] = disposition
+                assessment["failures"] = entry.get("failures", 0)
+                emit(assessment, arguments.json)
+                continue
+            command = revive_command(pathlib.Path(arguments.nurse_joy), label, record["session_id"])
+            assessment["command"] = command
+            if arguments.dry_run:
+                assessment["status"] = "dry-run"
+                emit(assessment, arguments.json)
+                continue
+            entry.update({"last_attempt": current_time, "last_reason": assessment["reason"]})
+            # Persist the cooldown before invoking Nurse Joy.  If this process
+            # is interrupted during a slow graceful exit, the next cron tick
+            # must not launch an overlapping revive.
+            state["updated_at"] = current_time
+            atomic_json(state_path, state)
+            try:
+                completed = subprocess.run(
+                    command,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=arguments.revive_timeout,
+                )
+                returncode = completed.returncode
+            except (OSError, subprocess.TimeoutExpired):
+                returncode = 124
+            if returncode == 0:
+                entry.update({"failures": 0, "last_success": current_time})
+                entry.pop("deaf_since", None)
+                entry.pop("last_deaf_reason", None)
+                entry.pop("last_deaf_fingerprint", None)
+                assessment.update({"status": "revived", "returncode": 0})
+            else:
+                entry["failures"] = int(entry.get("failures", 0)) + 1
+                assessment.update(
+                    {"status": "alert" if entry["failures"] >= arguments.max_failures else "failed",
+                     "returncode": returncode, "failures": entry["failures"]}
+                )
+            emit(assessment, arguments.json)
+        state["updated_at"] = current_time
+        if not arguments.dry_run:
+            atomic_json(state_path, state)
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    runtime = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    state = os.environ.get("XDG_STATE_HOME", str(pathlib.Path.home() / ".local/state"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--expected-host")
+    parser.add_argument("--state-root", default=str(pathlib.Path(state) / "claude-idle-compaction"))
+    parser.add_argument("--runtime-root", default=str(pathlib.Path(runtime) / "claude-idle-compaction"))
+    parser.add_argument("--channels-root", default=str(pathlib.Path.home() / ".claude/channels"))
+    parser.add_argument("--proc-root", default="/proc")
+    parser.add_argument("--watchdog-root", default=str(pathlib.Path(state) / "claude-poller-watchdog"))
+    parser.add_argument("--nurse-joy", default=str(default_nurse_joy()))
+    parser.add_argument("--startup-grace", type=float, default=DEFAULT_STARTUP_GRACE_SECONDS)
+    parser.add_argument("--confirm-seconds", type=float, default=DEFAULT_CONFIRM_SECONDS)
+    parser.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN_SECONDS)
+    parser.add_argument("--alert-cooldown", type=float, default=DEFAULT_ALERT_COOLDOWN_SECONDS)
+    parser.add_argument("--max-failures", type=int, default=DEFAULT_MAX_FAILURES)
+    parser.add_argument("--revive-timeout", type=float, default=180.0)
+    return parser
+
+
+def main() -> int:
+    return run(build_parser().parse_args())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
