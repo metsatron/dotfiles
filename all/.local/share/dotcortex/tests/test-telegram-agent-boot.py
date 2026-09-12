@@ -27,15 +27,28 @@ class TelegramAgentBootTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def write_manager(self, succeed_after: int) -> None:
+    def write_manager(self, failures: dict[str, int]) -> None:
+        encoded = json.dumps(failures, sort_keys=True)
         self.manager.write_text(
-            "#!/bin/sh\n"
-            f"count_file={str(self.root / 'count')!r}\n"
-            "count=0\n"
-            "[ ! -f \"$count_file\" ] || count=$(cat \"$count_file\")\n"
-            "count=$((count + 1))\n"
-            "printf '%s\\n' \"$count\" >\"$count_file\"\n"
-            f"[ \"$count\" -ge {succeed_after} ]\n",
+            "#!/usr/bin/env python3\n"
+            "import json, pathlib, sys\n"
+            f"root = pathlib.Path({str(self.root)!r})\n"
+            f"failures = {encoded!r}\n"
+            "failures = json.loads(failures)\n"
+            "if sys.argv[1:] == ['enabled']:\n"
+            "    print('ductor codex opencode')\n"
+            "    raise SystemExit(0)\n"
+            "if len(sys.argv) != 3 or sys.argv[1] != 'start':\n"
+            "    raise SystemExit(2)\n"
+            "agent = sys.argv[2]\n"
+            "calls = root / 'calls'\n"
+            "with calls.open('a', encoding='utf-8') as stream:\n"
+            "    stream.write(agent + '\\n')\n"
+            "count_file = root / ('count-' + agent)\n"
+            "count = int(count_file.read_text()) if count_file.exists() else 0\n"
+            "count += 1\n"
+            "count_file.write_text(str(count))\n"
+            "raise SystemExit(1 if count <= int(failures.get(agent, 0)) else 0)\n",
             encoding="utf-8",
         )
         self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
@@ -51,22 +64,26 @@ class TelegramAgentBootTest(unittest.TestCase):
         )
 
     def test_retry_then_ready_receipt(self) -> None:
-        self.write_manager(succeed_after=2)
+        self.write_manager({"ductor": 1})
         result = self.run_boot("--attempts", "3")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual((self.root / "count").read_text().strip(), "2")
+        self.assertEqual((self.root / "calls").read_text().splitlines(), ["ductor", "codex", "opencode", "ductor"])
         receipt = json.loads((self.state / "receipt.json").read_text())
         self.assertEqual((receipt["status"], receipt["attempt"], receipt["host"]), ("ready", 2, HOST.lower()))
+        self.assertEqual(receipt["schema"], "dotcortex.telegram-agent-boot.v2")
+        self.assertEqual(receipt["agents"], {"ductor": "ready", "codex": "ready", "opencode": "ready"})
 
     def test_exhaustion_is_loud_and_durable(self) -> None:
-        self.write_manager(succeed_after=9)
+        self.write_manager({"ductor": 9})
         result = self.run_boot("--attempts", "2")
         self.assertEqual(result.returncode, 1)
         receipt = json.loads((self.state / "receipt.json").read_text())
         self.assertEqual((receipt["status"], receipt["attempt"]), ("failed", 2))
+        self.assertEqual(receipt["agents"], {"ductor": "failed", "codex": "ready", "opencode": "ready"})
+        self.assertEqual((self.root / "calls").read_text().splitlines(), ["ductor", "codex", "opencode", "ductor"])
 
     def test_wrong_host_refuses_before_state_or_manager(self) -> None:
-        self.write_manager(succeed_after=1)
+        self.write_manager({})
         result = subprocess.run(
             [str(BOOT), "--expected-host", "definitely-not-this-host", "--delay", "0",
              "--manager", str(self.manager), "--state-dir", str(self.state)],
@@ -74,16 +91,16 @@ class TelegramAgentBootTest(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 64)
         self.assertFalse(self.state.exists())
-        self.assertFalse((self.root / "count").exists())
+        self.assertFalse((self.root / "calls").exists())
 
     def test_lock_prevents_duplicate_launch(self) -> None:
-        self.write_manager(succeed_after=1)
+        self.write_manager({})
         self.state.mkdir(parents=True)
         with (self.state / "boot.lock").open("w") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = self.run_boot("--attempts", "1")
         self.assertEqual(result.returncode, 0)
-        self.assertFalse((self.root / "count").exists())
+        self.assertFalse((self.root / "calls").exists())
 
     def test_help_is_side_effect_free(self) -> None:
         result = subprocess.run([str(BOOT), "--help"], text=True, capture_output=True, timeout=10)
