@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -u
+
+EXPECTED_HOST=""
+DELAY=15
+ATTEMPTS=4
+RETRY_SECONDS=15
+MANAGER="${TELEGRAM_AGENT_MANAGER:-$HOME/.local/bin/telegram-agent-host}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agent-boot"
+NO_LOG="${TELEGRAM_AGENT_BOOT_NO_LOG:-0}"
+
+usage() {
+  echo "Usage: telegram-agent-boot --expected-host HOST [--delay SECONDS] [--attempts COUNT] [--retry-seconds SECONDS] [--manager PATH] [--state-dir PATH]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --expected-host) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --delay) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; DELAY="$2"; shift ;;
+    --attempts) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ATTEMPTS="$2"; shift ;;
+    --retry-seconds) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RETRY_SECONDS="$2"; shift ;;
+    --manager) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; MANAGER="$2"; shift ;;
+    --state-dir) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; STATE_DIR="$2"; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "telegram-agent-boot: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$EXPECTED_HOST" ] || { echo "telegram-agent-boot: --expected-host is required" >&2; exit 2; }
+case "$DELAY:$ATTEMPTS:$RETRY_SECONDS" in
+  *[!0-9:]*|:*|*::*|*:) echo "telegram-agent-boot: delay, attempts and retry seconds must be non-negative integers" >&2; exit 2 ;;
+esac
+[ "$ATTEMPTS" -gt 0 ] || { echo "telegram-agent-boot: attempts must be positive" >&2; exit 2; }
+
+CURRENT_HOST="$(hostname | tr '[:upper:]' '[:lower:]')"
+EXPECTED_HOST="$(printf '%s' "$EXPECTED_HOST" | tr '[:upper:]' '[:lower:]')"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  echo "telegram-agent-boot: refusing host $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  exit 64
+}
+[ -x "$MANAGER" ] || { echo "telegram-agent-boot: manager is not executable: $MANAGER" >&2; exit 69; }
+
+umask 077
+mkdir -p "$STATE_DIR"
+if [ "$NO_LOG" != 1 ]; then
+  LOG="$STATE_DIR/boot.log"
+  if [ -f "$LOG" ] && [ "$(wc -c <"$LOG")" -ge 10485760 ]; then
+    mv -f "$LOG" "$LOG.1"
+  fi
+  exec >>"$LOG" 2>&1
+fi
+
+exec 9>"$STATE_DIR/boot.lock"
+if ! flock -n 9; then
+  echo "telegram-agent-boot: another boot attempt owns the lock"
+  exit 0
+fi
+
+write_receipt() {
+  status="$1"
+  attempt="$2"
+  RECEIPT_TMP="$STATE_DIR/receipt.json.tmp.$$"
+  python3 - "$RECEIPT_TMP" "$STATE_DIR/receipt.json" "$CURRENT_HOST" "$status" "$attempt" <<'PY'
+import json, os, pathlib, sys, time
+tmp, dest, host, status, attempt = sys.argv[1:]
+path = pathlib.Path(tmp)
+path.write_text(json.dumps({"attempt": int(attempt), "host": host, "schema": "dotcortex.telegram-agent-boot.v1", "status": status, "timestamp": int(time.time())}, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+os.chmod(path, 0o600)
+os.replace(path, dest)
+PY
+}
+
+[ "$DELAY" -eq 0 ] || sleep "$DELAY"
+attempt=1
+while [ "$attempt" -le "$ATTEMPTS" ]; do
+  echo "telegram-agent-boot: attempt $attempt/$ATTEMPTS"
+  if "$MANAGER" start; then
+    write_receipt ready "$attempt"
+    echo "telegram-agent-boot: ready"
+    exit 0
+  fi
+  write_receipt retry "$attempt"
+  [ "$attempt" -ge "$ATTEMPTS" ] || sleep "$RETRY_SECONDS"
+  attempt=$((attempt + 1))
+done
+
+write_receipt failed "$ATTEMPTS"
+echo "telegram-agent-boot: failed after $ATTEMPTS attempts" >&2
+exit 1
