@@ -221,7 +221,7 @@ lutris "" gaming ubuntu-only ""
 
 # --- Third-party (require repos from repos.ssv) ---
 signal-desktop "" third-party shared ""
-brave-browser "" third-party shared ""
+brave-browser "1.92.143" third-party shared ""
 gh "" third-party shared ""
 antigravity "" third-party shared ""
 tailscale "" third-party shared ""
@@ -237,6 +237,170 @@ mkusb-nox "" system ubuntu-only ""
 
 # --- Vendefoul Wolf distro tools (only where ID=vendefoul) ---
 am-vendefoul "" apps vendefoul-only ""
+#+END_SRC
+
+* Brave stable canary gate (T480s)
+The native Brave package is deliberately kept in the Nala manifest, but a Chromium
+regression must not be allowed to turn a desktop update into a broken browser.  The
+T480s policy is a bounded hold, not a permanent security pin: =known_good= is the
+last GUI-verified version, =rejected= records only the failed stable candidate, and
+the next strictly newer stable candidate automatically re-enters the isolated GUI
+canary.  The gate verifies Brave's signed =InRelease=, the Packages-file digest,
+and the package SHA-256 before extracting it.  Canary profiles are always temporary
+and never use the real Brave profile.
+
+#+BEGIN_SRC text :tangle debian/.nala/manifest/brave-policy.ssv :padline no :comments none
+# KEY VALUE — T480s native Brave policy; the rejected version is advanced by the gate.
+known_good 1.92.143
+rejected 1.95.101
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle debian/.local/bin/brave-canary-gate :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+set -euo pipefail
+
+POLICY="${BRAVE_POLICY:-$HOME/.nala/manifest/brave-policy.ssv}"
+STATE="${BRAVE_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/dotcortex/brave-canary.state}"
+TEST="${BRAVE_GATE_TEST:-0}"
+mkdir -p "$(dirname "$STATE")"
+
+read_policy() {
+  local key value
+  while read -r key value _; do
+    case "$key" in
+      known_good) KNOWN_GOOD="$value" ;;
+      rejected) REJECTED="$value" ;;
+    esac
+  done < "$POLICY"
+}
+read_state() {
+  [ -f "$STATE" ] || return 0
+  local key value
+  while read -r key value _; do
+    case "$key" in
+      known_good) KNOWN_GOOD="$value" ;;
+      rejected) REJECTED="$value" ;;
+    esac
+  done < "$STATE"
+}
+write_state() {
+  local d="$(dirname "$STATE")" tmp
+  tmp="$(mktemp "$d/.brave-state.XXXXXX")"
+  printf 'known_good %s\nrejected %s\n' "$KNOWN_GOOD" "$REJECTED" > "$tmp"
+  chmod 600 "$tmp"
+  mv -f "$tmp" "$STATE"
+}
+log_action() { [ "$TEST" = 1 ] && printf '%s\n' "$*" >> "${BRAVE_GATE_TEST_ACTIONS:?}" || true; }
+
+read_policy
+read_state
+candidate="${BRAVE_GATE_TEST_CANDIDATE:-$(apt-cache policy brave-browser | awk '/Candidate:/{print $2; exit}')}"
+installed="${BRAVE_GATE_TEST_INSTALLED:-$(dpkg-query -W -f='${Version}\n' brave-browser 2>/dev/null || true)}"
+[ -n "$candidate" ] || { echo 'brave-canary-gate: no apt candidate' >&2; exit 1; }
+
+# Test mode exercises the state machine without network, GUI, package, or profile effects.
+if [ "$TEST" = 1 ]; then
+  if dpkg --compare-versions "$candidate" le "$KNOWN_GOOD"; then
+    echo gate=baseline; exit 0
+  fi
+  if [ "$candidate" = "$REJECTED" ]; then
+    log_action hold; echo gate=known-bad-rejected; exit 0
+  fi
+  if [ "${BRAVE_GATE_TEST_CANARY:-fail}" = pass ]; then
+    KNOWN_GOOD="$candidate"; REJECTED=""; log_action "approve $candidate"; write_state
+    echo gate=approved; exit 0
+  fi
+  REJECTED="$candidate"; log_action "rollback $KNOWN_GOOD"; log_action hold; write_state
+  echo gate=rollback-hold; exit 0
+fi
+
+# Existing rejected releases stay held.  A newer stable release is the only event
+# that clears this bounded hold and demands a new canary.
+if [ "$candidate" = "$REJECTED" ] || dpkg --compare-versions "$candidate" le "$KNOWN_GOOD"; then
+  sudo apt-mark hold brave-browser >/dev/null
+  exit 0
+fi
+
+repo=https://brave-browser-apt-release.s3.brave.com
+td="$(mktemp -d "${TMPDIR:-/tmp}/brave-gate.XXXXXX")"
+trap 'find "$td" -depth -delete 2>/dev/null || true' EXIT
+curl -fsSL "$repo/dists/stable/InRelease" -o "$td/InRelease"
+gpgv --keyring /usr/share/keyrings/brave-browser-release-keyring.gpg "$td/InRelease" >/dev/null
+curl -fsSL "$repo/dists/stable/main/binary-amd64/Packages" -o "$td/Packages"
+packages_sha="$(awk '$0 == "SHA256:" {ok=1; next} ok && $3 == "main/binary-amd64/Packages" {print $1; exit}' "$td/InRelease")"
+printf '%s  %s\n' "$packages_sha" "$td/Packages" | sha256sum -c - >/dev/null
+stanza="$(awk -v RS='' -v ver="$candidate" '$1 == "Package:" && $2 == "brave-browser" && $0 ~ "Version: " ver {print; exit}' "$td/Packages")"
+asset="$(awk '$1 == "Filename:" {print $2}' <<<"$stanza")"
+digest="$(awk '$1 == "SHA256:" {print $2}' <<<"$stanza")"
+[ -n "$asset" ] && [ -n "$digest" ] || { echo "brave-canary-gate: signed candidate $candidate absent" >&2; exit 1; }
+deb="$td/$(basename "$asset")"
+curl -fL "$repo/$asset" -o "$deb"
+printf '%s  %s\n' "$digest" "$deb" | sha256sum -c - >/dev/null
+dpkg-deb -x "$deb" "$td/root"
+bin="$td/root/opt/brave.com/brave/brave-browser"
+test -x "$bin"
+
+# Import only non-secret desktop variables from the live XFCE session.
+session_pid="$(pgrep -u "$(id -u)" -x xfce4-session | head -1)"
+while IFS= read -r kv; do
+  case "$kv" in DISPLAY=*|XAUTHORITY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*|XDG_DATA_DIRS=*|XDG_CURRENT_DESKTOP=*|DESKTOP_SESSION=*|HOME=*|PATH=*|LANG=*|LC_*|UBUNTU_MENUPROXY=*) export "$kv";; esac
+done < <(tr '\0' '\n' < "/proc/$session_pid/environ")
+unset GTK_MODULES
+log="$td/canary.log"
+"$bin" --no-sandbox --user-data-dir="$td/profile" --no-first-run --no-default-browser-check >/dev/null 2>"$log" & canary_pid=$!
+sleep 8
+if kill -0 "$canary_pid" 2>/dev/null && DISPLAY="${DISPLAY:-:0}" xdotool search --class brave >/dev/null 2>&1; then
+  kill "$canary_pid" 2>/dev/null || true
+  wait "$canary_pid" 2>/dev/null || true
+  sudo apt-mark unhold brave-browser >/dev/null || true
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "$deb" >/dev/null
+  KNOWN_GOOD="$candidate"; REJECTED=""; write_state
+else
+  kill "$canary_pid" 2>/dev/null || true
+  wait "$canary_pid" 2>/dev/null || true
+  fallback="/var/cache/apt/archives/brave-browser_${KNOWN_GOOD}_amd64.deb"
+  [ -r "$fallback" ] || { echo "brave-canary-gate: no recoverable $KNOWN_GOOD fallback" >&2; exit 1; }
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --allow-downgrades "$fallback" >/dev/null
+  REJECTED="$candidate"; write_state
+  sudo apt-mark hold brave-browser >/dev/null
+  echo "brave-canary-gate: rejected $candidate; held at $KNOWN_GOOD" >&2
+fi
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle debian/.local/share/dotcortex/tests/brave-canary-gate.sh :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../../../.." && pwd)"
+GATE="$ROOT/debian/.local/bin/brave-canary-gate"
+tmp="$(mktemp -d)"
+trap 'find "$tmp" -depth -delete 2>/dev/null || true' EXIT
+policy="$tmp/policy"; state="$tmp/state"; actions="$tmp/actions"; profile="$tmp/real-profile"
+printf '%s\n' 'known_good 1.92.143' 'rejected 1.95.101' > "$policy"
+mkdir "$profile"; printf '%s\n' untouched > "$profile/sentinel"; before="$(sha256sum "$profile/sentinel")"
+
+run_gate() {
+  : > "$actions"
+  BRAVE_GATE_TEST=1 BRAVE_POLICY="$policy" BRAVE_STATE="$state" BRAVE_GATE_TEST_ACTIONS="$actions" \
+    BRAVE_GATE_TEST_CANDIDATE="$1" BRAVE_GATE_TEST_CANARY="${2:-fail}" BRAVE_GATE_TEST_INSTALLED=1.92.143 \
+    "$GATE" >/dev/null
+}
+
+run_gate 1.95.101 pass
+grep -qx hold "$actions"
+run_gate 1.96.0 fail
+grep -qx 'rollback 1.92.143' "$actions"
+grep -qx hold "$actions"
+grep -qx 'rejected 1.96.0' <(awk '$1 == "rejected" {print $1, $2}' "$state")
+run_gate 1.96.0 pass
+if grep -qx 'approve 1.96.0' "$actions"; then
+  echo 'known-bad candidate was re-canaried' >&2
+  exit 1
+fi
+run_gate 1.97.0 pass
+grep -qx 'approve 1.97.0' "$actions"
+grep -qx 'known_good 1.97.0' <(awk '$1 == "known_good" {print $1, $2}' "$state")
+[ "$(sha256sum "$profile/sentinel")" = "$before" ]
+grep -q '\[ "$pkg" = brave-browser \] && continue' "$ROOT/debian/.local/bin/nala-apply"
+printf '%s\n' 'brave canary gate fixtures: ok'
 #+END_SRC
 
 * Third-party repos manifest
@@ -1035,6 +1199,8 @@ ENFORCE="${ENFORCE:-1}"
 UNINSTALL="${UNINSTALL:-0}"
 REL_SYNC_HELPER="${HOME}/.local/bin/nala-release-sync"
 [ -x "$REL_SYNC_HELPER" ] || REL_SYNC_HELPER="${HOME}/DotCortex/debian/.local/bin/nala-release-sync"
+BRAVE_GATE="${HOME}/.local/bin/brave-canary-gate"
+[ -x "$BRAVE_GATE" ] || BRAVE_GATE="${HOME}/DotCortex/debian/.local/bin/brave-canary-gate"
 HOST_EXCLUDES_BIN="${HOME}/.local/bin/host-excludes"
 [ -x "$HOST_EXCLUDES_BIN" ] || HOST_EXCLUDES_BIN="${HOME}/DotCortex/all/.local/bin/host-excludes"
 
@@ -1079,6 +1245,13 @@ else
 fi
 echo "Using: $APT"
 
+# Brave is the one apt package whose stable candidate must pass the real-display
+# canary gate.  Run it before the generic manifest loop so an absent package also
+# cannot bypass the gate.
+if [ -x "$BRAVE_GATE" ]; then
+  "$BRAVE_GATE"
+fi
+
 # --- Parse manifest, filter by scope ---
 INSTALL_LIST=()
 
@@ -1088,6 +1261,8 @@ while IFS='|' read -r pkg _ver _cat scope _extra; do
   if ! scope_matches "$scope"; then
     continue
   fi
+
+  [ "$pkg" = brave-browser ] && continue
 
   if [ -x "$HOST_EXCLUDES_BIN" ] && "$HOST_EXCLUDES_BIN" nala "$pkg"; then
     continue
