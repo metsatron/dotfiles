@@ -1,0 +1,176 @@
+#!/usr/bin/env python3
+"""Deliver one TimeArk wakeup through the exact live OpenCode owner."""
+
+from __future__ import annotations
+
+import fcntl
+import hashlib
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
+
+
+RESULT_SCHEMA = "timeark.agent-wakeup-adapter-result.v1"
+JOB_SCHEMA = "timeark.oneshot.v1"
+NUDGE_SCHEMA = "dotcortex.opencode-nudge-state.v1"
+MAX_REQUEST_BYTES = 16_384
+KEY_RE = re.compile(r"^opencode:[0-9a-f]{64}$")
+PROMPT = (
+    "Continuity wake-up: inspect the durable handoff for this session. "
+    "If work remains, resume the next lawful step; otherwise report completion and disarm the nudge."
+)
+
+
+def load_warm():
+    path = Path(__file__).with_name("opencode-warm")
+    loader = SourceFileLoader("dotcortex_opencode_warm", str(path))
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("warm-module-unavailable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def output(job: dict, outcome: str, detail: str, code: int = 0) -> int:
+    print(json.dumps({
+        "schema": RESULT_SCHEMA, "job_id": job.get("id"),
+        "idempotency_key": job.get("idempotency_key"),
+        "outcome": outcome, "detail": detail,
+    }, sort_keys=True, separators=(",", ":")))
+    return code
+
+
+def validate_job(value: object) -> dict:
+    expected = {
+        "schema", "id", "idempotency_key", "due_at", "expires_at", "timezone",
+        "lane", "target", "reference", "state", "claim_owner", "lease_until",
+        "attempts", "created_at", "updated_at", "detail",
+    }
+    if not isinstance(value, dict) or set(value) != expected or value.get("schema") != JOB_SCHEMA:
+        raise ValueError("invalid-job-schema")
+    if value.get("lane") != "agent-wakeup" or value.get("target") != "opencode":
+        raise ValueError("wrong-job-target")
+    if value.get("id") != value.get("idempotency_key") or not isinstance(value.get("id"), str) or not KEY_RE.fullmatch(value["id"]):
+        raise ValueError("invalid-job-identity")
+    if value.get("state") != "claimed" or not isinstance(value.get("claim_owner"), str):
+        raise ValueError("job-not-claimed")
+    return value
+
+
+def main() -> int:
+    raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
+    seed = {"id": None, "idempotency_key": None}
+    try:
+        if len(raw) > MAX_REQUEST_BYTES:
+            raise ValueError("request-too-large")
+        job = validate_job(json.loads(raw))
+    except (TypeError, ValueError, json.JSONDecodeError) as error:
+        return output(seed, "cancelled", str(error), 78)
+    warm = load_warm()
+    root = warm.state_dir()
+    try:
+        owner_value = warm.read_json(warm.owner_state_path())
+        if not isinstance(owner_value, dict):
+            raise warm.CandidateError("owner-state-missing-or-invalid")
+        binding = owner_value.get("session_binding")
+        session_id = binding.get("session_id") if isinstance(binding, dict) else None
+        owner = warm.validate_owner_record(owner_value, session_id)
+        warm.validate_owner_inspection(owner, session_id)
+    except Exception as error:
+        return output(job, "retry", f"owner-revalidation:{error}", 1)
+    lock_path = root / "nudge.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        nudge = warm.read_json(root / "nudge.json")
+        if not isinstance(nudge, dict) or nudge.get("schema") != NUDGE_SCHEMA:
+            return output(job, "cancelled", "nudge-state-missing", 1)
+        armed = (
+            nudge.get("policy") == "AGENT" and nudge.get("agent_state") == "ARMED"
+            or nudge.get("policy") == "FORCE" and nudge.get("force_pending") is True
+        )
+        if not armed:
+            return output(job, "cancelled", "nudge-disarmed", 1)
+        reset_epoch = nudge.get("reset_epoch")
+        if isinstance(reset_epoch, bool) or not isinstance(reset_epoch, int):
+            return output(job, "cancelled", "reset-epoch-missing", 1)
+        fingerprint = warm.owner_fingerprint(owner, session_id)
+        digest = hashlib.sha256(f"{fingerprint}\0{session_id}\0{reset_epoch}".encode()).hexdigest()
+        identity = f"opencode:{digest}"
+        if job["idempotency_key"] != identity:
+            return output(job, "cancelled", "owner-session-reset-mismatch", 1)
+        handoff = warm.read_json(root / "handoff.json")
+        if not isinstance(handoff, dict) or handoff.get("reference") != job.get("reference") or handoff.get("session_id") != session_id:
+            return output(job, "cancelled", "handoff-changed", 1)
+        if nudge.get("sent_for_reset_epoch") == reset_epoch:
+            return output(job, "delivered", "already-delivered")
+        receipt_path = root / "wakeup-receipts" / f"{digest}.json"
+        receipt = warm.read_json(receipt_path)
+        if isinstance(receipt, dict):
+            if receipt.get("status") == "delivered":
+                return output(job, "delivered", "receipt-already-delivered")
+            if receipt.get("status") in {"dispatching", "uncertain"}:
+                return output(job, "uncertain", "prior-delivery-unresolved", 1)
+        api = warm.OpenCodeAPI(os.environ.get("OPENCODE_WARM_BASE_URL", "http://127.0.0.1:4096"))
+        status_code, status_payload = api.request("GET", "/session/status")
+        if status_code != 200 or warm.status_for(status_payload, session_id) != "idle":
+            return output(job, "retry", "session-not-idle", 1)
+        message_code, messages = api.request("GET", f"/session/{warm.quote(session_id, safe='')}/message")
+        if message_code != 200:
+            return output(job, "retry", "session-messages-unavailable", 1)
+        assistant = warm.completed_assistant(messages)
+        decision = warm.policy_decision(root, session_id, assistant, time.time(), prospective_cache=True)
+        if decision.get("action") == "COMPLETE_OR_EXIT":
+            return output(job, "cancelled", "policy-reports-complete", 1)
+        if decision.get("action") != "CONTINUE_LOCAL":
+            return output(job, "retry", f"policy-not-ready:{decision.get('action')}", 1)
+        message_id = f"msg_{digest[:26]}"
+        warm.atomic_json(receipt_path, {
+            "schema": "dotcortex.opencode-wakeup-receipt.v1", "status": "dispatching",
+            "idempotency_key": identity, "session_id": session_id,
+            "reset_epoch": reset_epoch, "message_id": message_id, "started_at": time.time(),
+        })
+        try:
+            response_status, _ = api.request(
+                "POST", f"/session/{warm.quote(session_id, safe='')}/prompt_async",
+                {"messageID": message_id, "parts": [{"type": "text", "text": PROMPT}]},
+            )
+        except warm.CandidateError as error:
+            warm.atomic_json(receipt_path, {
+                "schema": "dotcortex.opencode-wakeup-receipt.v1", "status": "uncertain",
+                "idempotency_key": identity, "session_id": session_id,
+                "reset_epoch": reset_epoch, "message_id": message_id,
+                "detail": str(error), "updated_at": time.time(),
+            })
+            nudge.update(delivery_state="uncertain", updated_at=time.time())
+            warm.atomic_json(root / "nudge.json", nudge)
+            return output(job, "uncertain", "prompt transport unresolved; replay prohibited", 1)
+        if response_status != 204:
+            warm.atomic_json(receipt_path, {
+                "schema": "dotcortex.opencode-wakeup-receipt.v1", "status": "rejected",
+                "idempotency_key": identity, "session_id": session_id,
+                "reset_epoch": reset_epoch, "message_id": message_id,
+                "http_status": response_status, "updated_at": time.time(),
+            })
+            return output(job, "retry", f"prompt rejected:{response_status}", 1)
+        warm.atomic_json(receipt_path, {
+            "schema": "dotcortex.opencode-wakeup-receipt.v1", "status": "delivered",
+            "idempotency_key": identity, "session_id": session_id,
+            "reset_epoch": reset_epoch, "message_id": message_id, "delivered_at": time.time(),
+        })
+        nudge.update(
+            sent_for_reset_epoch=reset_epoch, delivery_state="delivered",
+            force_pending=False, updated_at=time.time(),
+        )
+        warm.atomic_json(root / "nudge.json", nudge)
+        return output(job, "delivered", "prompt accepted")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -167,17 +167,21 @@ import errno
 import hashlib
 import fcntl
 import json
+import math
 import os
 import pathlib
 import pty
+import queue
 import re
 import selectors
 import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import termios
+import threading
 import time
 import tty
 import uuid
@@ -269,7 +273,6 @@ TRANSCRIPT_INTERNAL_TYPES = frozenset(
 )
 COMPACTION_FAILURE_MARKER = "not enough messages"
 
-
 def env_int(name: str, default: int, minimum: int = 0) -> int:
     """Read a bounded integer configuration value from the environment."""
     try:
@@ -284,6 +287,35 @@ def env_float(name: str, default: float, minimum: float = 0.0) -> float:
         return max(minimum, float(os.environ.get(name, str(default))))
     except ValueError:
         return default
+
+
+PRESERVATION_FEDERATION_SCHEMA = "fleet.preservation-sync-request.v1"
+PRESERVATION_FEDERATION_RESPONSE_SCHEMA = "fleet.preservation-sync.v1"
+PRESERVATION_BRIDGE_ADAPTER = "federated_preservation.SshAuthorityTransport"
+PRESERVATION_BRIDGE_PROTOCOL = "stdin-json-v1"
+PRESERVATION_HOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+PRESERVATION_BINDING_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
+PRESERVATION_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,240}$")
+PRESERVATION_MAX_BYTES = 64 * 1024
+_preservation_poll_seconds = env_float(
+    "CLAUDE_WARM_PRESERVATION_POLL_SECONDS", 30.0, 0.1
+)
+PRESERVATION_POLL_SECONDS = (
+    _preservation_poll_seconds if math.isfinite(_preservation_poll_seconds) else 30.0
+)
+_preservation_bridge_timeout_seconds = env_float(
+    "CLAUDE_WARM_PRESERVATION_BRIDGE_TIMEOUT_SECONDS", 8.0, 0.1
+)
+PRESERVATION_BRIDGE_TIMEOUT_SECONDS = min(
+    _preservation_bridge_timeout_seconds
+    if math.isfinite(_preservation_bridge_timeout_seconds)
+    else 8.0,
+    8.0,
+)
+# A completed worker must become visible promptly, but an in-flight bridge
+# must never turn the owner loop into a zero-timeout poller.  This cap is only
+# a wake bound; it is not a second preservation deadline.
+PRESERVATION_IN_FLIGHT_WAKE_SECONDS = 0.25
 
 
 def channel_arguments(argv: list[str]) -> list[str]:
@@ -1157,6 +1189,415 @@ class Inotify:
             self.fd = -1
 
 
+class PreservationFederationClient:
+    """Poll one configured federation bridge from the native owner loop.
+
+    The bridge is a request/response adapter for the tested federation API.
+    It owns transport and central-authority access; this process only supplies
+    current owner facts and, if directed, invokes its own native preservation
+    path.  No local ledger, fallback transport, or second PTY owner exists.
+    """
+
+    REQUIRED = {
+        "bridge": "CLAUDE_WARM_PRESERVATION_BRIDGE",
+        "bridge_adapter": "CLAUDE_WARM_PRESERVATION_BRIDGE_ADAPTER",
+        "authority_host": "CLAUDE_WARM_PRESERVATION_AUTHORITY_HOST",
+        "authority_identity": "CLAUDE_WARM_PRESERVATION_AUTHORITY_IDENTITY",
+        "authority_executable": "CLAUDE_WARM_PRESERVATION_AUTHORITY_EXECUTABLE",
+        "ledger_root": "CLAUDE_WARM_PRESERVATION_LEDGER_ROOT",
+        "telemetry_source": "CLAUDE_WARM_PRESERVATION_TELEMETRY_SOURCE",
+        "telemetry_host": "CLAUDE_WARM_PRESERVATION_TELEMETRY_HOST",
+        "transport": "CLAUDE_WARM_PRESERVATION_TRANSPORT",
+        "provider": "CLAUDE_WARM_PRESERVATION_PROVIDER",
+        "account_hash": "CLAUDE_WARM_PRESERVATION_ACCOUNT_HASH",
+        "model_pool": "CLAUDE_WARM_PRESERVATION_MODEL_POOL",
+        "estimate": "CLAUDE_WARM_PRESERVATION_ESTIMATE_PERCENT",
+        "uncertainty": "CLAUDE_WARM_PRESERVATION_ESTIMATE_UNCERTAINTY_PERCENT",
+        "in_flight": "CLAUDE_WARM_PRESERVATION_IN_FLIGHT_RESERVE_PERCENT",
+        "control": "CLAUDE_WARM_PRESERVATION_CONTROL_RESERVE_PERCENT",
+        "protection": "CLAUDE_WARM_PRESERVATION_PROTECTION_ENABLED",
+        "nudge": "CLAUDE_WARM_PRESERVATION_NUDGE_ENABLED",
+    }
+
+    def __init__(self, owner: object):
+        self.owner = owner
+        self.config, self.disabled_reason = self._read_config()
+        self.enabled = self.config is not None
+        self.next_poll: float | None = (
+            monotonic() + PRESERVATION_POLL_SECONDS if self.enabled else None
+        )
+        self.bridge_thread: threading.Thread | None = None
+        self.bridge_result: queue.SimpleQueue | None = None
+        self.last_poll_at: float | None = None
+        self.last_result: str | None = None
+        self.last_error: str | None = None
+        self.last_decision: str | None = None
+        self.last_next_action: str | None = None
+        self.last_observation_age: float | None = None
+        self.last_headroom: float | None = None
+        self.last_reserve: float | None = None
+        self.last_protection_enabled: bool | None = None
+        self.last_nudge_enabled: bool | None = None
+        self.last_generation_loaded: bool | None = None
+
+    @staticmethod
+    def _percent(name: str, value: str) -> float | None:
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        return number if 0.0 <= number <= 100.0 else None
+
+    @classmethod
+    def _read_config(cls) -> tuple[dict[str, object] | None, str]:
+        values = {
+            key: os.environ.get(environment, "").strip()
+            for key, environment in cls.REQUIRED.items()
+        }
+        missing = [environment for key, environment in cls.REQUIRED.items() if not values[key]]
+        if missing:
+            return None, "missing-bindings:" + ",".join(missing)
+        bridge = pathlib.Path(str(values["bridge"])).expanduser()
+        if (
+            not bridge.is_absolute()
+            or not bridge.is_file()
+            or not os.access(bridge, os.X_OK)
+        ):
+            return None, "bridge-unavailable"
+        for key in ("authority_executable", "ledger_root"):
+            if not pathlib.Path(str(values[key])).is_absolute():
+                return None, f"{key}-not-absolute"
+        if (
+            not PRESERVATION_HOST_RE.fullmatch(str(values["authority_host"]))
+            or not PRESERVATION_HOST_RE.fullmatch(str(values["authority_identity"]))
+            or not PRESERVATION_HOST_RE.fullmatch(str(values["telemetry_host"]))
+        ):
+            return None, "invalid-authority-host"
+        if str(values["transport"]) != "ssh":
+            return None, "unsupported-transport"
+        if str(values["bridge_adapter"]) != PRESERVATION_BRIDGE_ADAPTER:
+            return None, "unsupported-bridge-adapter"
+        if str(values["telemetry_source"]) != f'authority:{values["authority_host"]}':
+            return None, "telemetry-not-authority-owned"
+        for key in ("telemetry_source", "provider", "account_hash", "model_pool"):
+            if not PRESERVATION_BINDING_RE.fullmatch(str(values[key])):
+                return None, f"invalid-{key}"
+        percentages: dict[str, float] = {}
+        for key in ("estimate", "uncertainty", "in_flight", "control"):
+            number = cls._percent(key, str(values[key]))
+            if number is None:
+                return None, f"invalid-{key}"
+            percentages[key] = number
+        booleans: dict[str, bool] = {}
+        for key in ("protection", "nudge"):
+            if str(values[key]) not in {"0", "1"}:
+                return None, f"invalid-{key}"
+            booleans[key] = str(values[key]) == "1"
+        provider = str(values["provider"])
+        account_hash = str(values["account_hash"])
+        model_pool = str(values["model_pool"])
+        return {
+            "bridge": str(bridge),
+            "bridge_adapter": PRESERVATION_BRIDGE_ADAPTER,
+            "authority_host": str(values["authority_host"]),
+            "authority_identity": str(values["authority_identity"]),
+            "authority_executable": str(values["authority_executable"]),
+            "ledger_root": str(values["ledger_root"]),
+            "telemetry_source": str(values["telemetry_source"]),
+            "telemetry_host": str(values["telemetry_host"]),
+            "transport": "ssh",
+            "provider": provider,
+            "account_hash": account_hash,
+            "model_pool": model_pool,
+            "pool_key": f"{provider}:{account_hash}:{model_pool}",
+            **percentages,
+            **booleans,
+        }, ""
+
+    def state(self) -> dict[str, object]:
+        """Return bounded operator evidence without secrets or response payloads."""
+        return {
+            "preservation_federation_enabled": self.enabled,
+            "preservation_federation_disabled_reason": self.disabled_reason,
+            "preservation_federation_last_poll_at": self.last_poll_at,
+            "preservation_federation_last_result": self.last_result,
+            "preservation_federation_last_error": self.last_error,
+            "preservation_federation_last_decision": self.last_decision,
+            "preservation_federation_last_next_action": self.last_next_action,
+            "preservation_federation_observation_age_seconds": self.last_observation_age,
+            "preservation_federation_limiting_headroom_percent": self.last_headroom,
+            "preservation_federation_aggregate_reserve_percent": self.last_reserve,
+            "preservation_federation_protection_enabled": self.last_protection_enabled,
+            "preservation_federation_nudge_enabled": self.last_nudge_enabled,
+            "preservation_federation_generation_loaded": self.last_generation_loaded,
+            "preservation_federation_next_poll_monotonic": self.next_poll,
+            "preservation_federation_poll_in_flight": (
+                self.bridge_thread is not None and self.bridge_thread.is_alive()
+            ),
+        }
+
+    def _request(self) -> dict[str, object]:
+        config = self.config
+        assert config is not None
+        owner = self.owner
+        return {
+            "schema": PRESERVATION_FEDERATION_SCHEMA,
+            "host": socket.gethostname(),
+            "now": now(),
+            "telemetry": None,
+            "telemetry_binding": config["telemetry_source"],
+            "bridge": {
+                "adapter": config["bridge_adapter"],
+                "protocol": PRESERVATION_BRIDGE_PROTOCOL,
+            },
+            "authority": {
+                "host": config["authority_host"],
+                "executable": config["authority_executable"],
+                "ledger_root": config["ledger_root"],
+                "transport": config["transport"],
+            },
+            "pool": {
+                "provider": config["provider"],
+                "account_hash": config["account_hash"],
+                "model_pool": config["model_pool"],
+                "pool_key": config["pool_key"],
+            },
+            "session": {
+                "session_id": owner.session_id,
+                "pool_key": config["pool_key"],
+                "owner_kind": "claude-warm",
+                "dirty": owner.dirty,
+                "current_context_tokens": owner.current_tokens,
+                "estimated_preservation_percent": config["estimate"],
+                "estimate_uncertainty_percent": config["uncertainty"],
+                "in_flight_reserve_percent": config["in_flight"],
+                "control_reserve_percent": config["control"],
+                "protection_enabled": config["protection"],
+                "nudge_enabled": config["nudge"],
+            },
+            "owner_state": {
+                "channel": owner.channel,
+                "session_id": owner.session_id,
+                "supervisor_pid": os.getpid(),
+                "completed_turn_epoch": owner.completed_turn_epoch,
+                "loaded_generation": LOADED_GENERATION,
+                "installed_generation": executable_generation(),
+                "native_state": owner.preservation_state,
+                "native_failure": owner.preservation_failure or "",
+            },
+        }
+
+    def _failure(self, reason: str) -> None:
+        reason = re.sub(r"[^A-Za-z0-9_.:-]", "_", str(reason))[:160] or "unknown"
+        self.last_result = "failed-closed"
+        self.last_error = reason
+        self.owner._debug(f"preservation-federation-failed reason={self.last_error}")
+        self.owner._guard_log("preservation-federation-failed", reason=self.last_error)
+
+    def _accept_response(self, response: object) -> None:
+        config = self.config
+        if not isinstance(response, dict) or response.get("schema") != PRESERVATION_FEDERATION_RESPONSE_SCHEMA:
+            received = response.get("schema") if isinstance(response, dict) else type(response).__name__
+            label = received if isinstance(received, str) and PRESERVATION_BINDING_RE.fullmatch(received) else "unknown"
+            self._failure("invalid-response-schema:" + label)
+            return
+        # The evidence-backed negative response is intentionally small and
+        # does not repeat the positive adapter metadata.  It is an authority
+        # refusal, not permission to inject, and therefore remains fail-closed.
+        if response.get("ok") is False:
+            error = response.get("error")
+            next_action = response.get("next_action")
+            if (
+                not isinstance(error, str)
+                or not PRESERVATION_BINDING_RE.fullmatch(error)
+                or not isinstance(next_action, str)
+                or not PRESERVATION_BINDING_RE.fullmatch(next_action)
+            ):
+                self._failure("invalid-authority-refusal")
+            else:
+                self._failure(error)
+            return
+        if (
+            response.get("bridge_adapter") != PRESERVATION_BRIDGE_ADAPTER
+            or response.get("bridge_protocol") != PRESERVATION_BRIDGE_PROTOCOL
+        ):
+            self._failure("invalid-bridge-contract")
+            return
+        if response.get("ok") is not True:
+            self._failure("invalid-authority-status")
+            return
+        if response.get("pool_key") != config["pool_key"]:
+            self._failure("non-authoritative-pool")
+            return
+        for key in ("decision", "next_action"):
+            if not isinstance(response.get(key), str) or not PRESERVATION_BINDING_RE.fullmatch(response[key]):
+                self._failure("invalid-response-decision")
+                return
+        for key in ("protection_enabled", "nudge_enabled", "generation_loaded"):
+            if not isinstance(response.get(key), bool):
+                self._failure("invalid-response-status")
+                return
+        for key in ("observation_age_seconds", "limiting_headroom_percent", "aggregate_reserve_percent"):
+            value = response.get(key)
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(float(value))
+                or float(value) < 0.0
+                or (key != "observation_age_seconds" and float(value) > 100.0)
+            ):
+                self._failure("invalid-response-telemetry")
+                return
+        directive = response.get("directive")
+        if directive is not None and (
+            not isinstance(directive, dict)
+            or set(directive) != {"request_id", "reservation_id"}
+            or not all(
+                isinstance(directive[key], str)
+                and PRESERVATION_ID_RE.fullmatch(directive[key])
+                for key in directive
+            )
+        ):
+            self._failure("invalid-response-directive")
+            return
+        self.last_result = "accepted"
+        self.last_error = ""
+        self.last_decision = response["decision"]
+        self.last_next_action = response["next_action"]
+        self.last_observation_age = float(response["observation_age_seconds"])
+        self.last_headroom = float(response["limiting_headroom_percent"])
+        self.last_reserve = float(response["aggregate_reserve_percent"])
+        self.last_protection_enabled = response["protection_enabled"]
+        self.last_nudge_enabled = response["nudge_enabled"]
+        self.last_generation_loaded = response["generation_loaded"]
+        if directive is None:
+            return
+        owner = self.owner
+        owner_result = owner._request_preservation({
+            "kind": "control",
+            "channel": owner.channel,
+            "request_id": directive["request_id"],
+            "reservation_id": directive["reservation_id"],
+            "expected_session_id": owner.session_id,
+            "expected_supervisor_pid": os.getpid(),
+            "expected_epoch": owner.completed_turn_epoch,
+        })
+        if not isinstance(owner_result, dict) or not owner_result.get("ok"):
+            self._failure(str(owner_result.get("error") if isinstance(owner_result, dict) else "owner-refused"))
+            return
+        self.last_result = "directive-delivered"
+
+    @staticmethod
+    def _run_bridge(
+        config: dict[str, object], request: dict[str, object]
+    ) -> tuple[str, object]:
+        """Run only the external adapter; never access or mutate the owner."""
+        try:
+            result = subprocess.run(
+                [
+                    str(config["bridge"]), "owner-poll",
+                    "--authority-host", str(config["authority_host"]),
+                    "--expected-authority-hostname", str(config["authority_identity"]),
+                    "--authority-executable", str(config["authority_executable"]),
+                    "--authority-root", str(config["ledger_root"]),
+                    "--telemetry-host", str(config["telemetry_host"]),
+                    "--provider", str(config["provider"]),
+                    "--account-hash", str(config["account_hash"]),
+                    "--model-pool", str(config["model_pool"]),
+                    "--authority-timeout", str(PRESERVATION_BRIDGE_TIMEOUT_SECONDS),
+                ],
+                input=json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n",
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=PRESERVATION_BRIDGE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            return "error", "bridge-timeout"
+        except OSError:
+            return "error", "bridge-unavailable"
+        if result.returncode != 0:
+            return "error", f"bridge-exit-{result.returncode}"
+        if not isinstance(result.stdout, str):
+            return "error", "invalid-bridge-response"
+        if len(result.stdout.encode("utf-8")) > PRESERVATION_MAX_BYTES:
+            return "error", "bridge-response-too-large"
+        try:
+            response = json.loads(result.stdout)
+        except (TypeError, UnicodeError, ValueError, json.JSONDecodeError):
+            return "error", "invalid-bridge-response"
+        return "response", response
+
+    @staticmethod
+    def _bridge_worker(
+        config: dict[str, object],
+        request: dict[str, object],
+        result_queue: queue.SimpleQueue,
+    ) -> None:
+        """Worker body is deliberately limited to adapter I/O and queue delivery."""
+        result_queue.put(PreservationFederationClient._run_bridge(config, request))
+
+    def poll(self) -> None:
+        """Start or reap one bounded poll without blocking the native owner loop."""
+        if self.bridge_thread is not None:
+            if self.bridge_thread.is_alive():
+                return
+            self.bridge_thread.join(timeout=0)
+            self.bridge_thread = None
+            result_queue = self.bridge_result
+            self.bridge_result = None
+            if result_queue is None:
+                self._failure("missing-bridge-result")
+            else:
+                try:
+                    result_kind, result = result_queue.get_nowait()
+                except queue.Empty:
+                    self._failure("missing-bridge-result")
+                else:
+                    if result_kind == "error":
+                        self._failure(str(result))
+                    else:
+                        self._accept_response(result)
+            self.owner._write_state()
+            return
+        if not self.enabled or self.next_poll is None or monotonic() < self.next_poll:
+            return
+        self.next_poll = monotonic() + PRESERVATION_POLL_SECONDS
+        owner = self.owner
+        native_reconciliation = (
+            owner.preservation_state == "native_completed"
+            and self.last_result == "directive-delivered"
+        )
+        if (
+            not owner.session_id
+            or owner.status not in {"idle", "active"}
+            or not child_alive(owner.pid)
+            or not (
+                owner.dirty
+                or owner.preservation_state in {"native_started", "pending_recovery"}
+                or native_reconciliation
+            )
+        ):
+            self.last_result = "not-eligible"
+            return
+        self.last_poll_at = now()
+        result_queue = queue.SimpleQueue()
+        self.bridge_result = result_queue
+        self.bridge_thread = threading.Thread(
+            target=self._bridge_worker,
+            args=(self.config, self._request(), result_queue),
+            name="claude-warm-preservation-bridge",
+            daemon=True,
+        )
+        try:
+            self.bridge_thread.start()
+        except RuntimeError:
+            self.bridge_thread = None
+            self.bridge_result = None
+            self._failure("bridge-thread-start-failed")
+            owner._write_state()
+
+
 class Supervisor:
     """Own one Claude PTY, lifecycle socket, state file, and idle timer."""
 
@@ -1268,6 +1709,7 @@ class Supervisor:
         self.herdr = HerdrReporter()
         self.screen_classifier = ClaudeScreenClassifier()
         self.screen_state: str | None = None
+        self.preservation_federation = PreservationFederationClient(self)
         self._guard_log("supervisor-started")
         self._write_state()
 
@@ -1347,6 +1789,7 @@ class Supervisor:
             "preservation_state": self.preservation_state,
             "preservation_failure": self.preservation_failure,
             "preservation_expected_epoch": self.preservation_expected_epoch,
+            **self.preservation_federation.state(),
             "last_channel_activity": self.last_channel_activity,
             "last_channel_event": self.last_channel_event,
             "last_channel_death": self.last_channel_death,
@@ -3060,6 +3503,7 @@ class Supervisor:
             while master_open:
                 child_exited = self._child_has_exited()
                 self.herdr.heartbeat(self.screen_state, self.session_id)
+                self.preservation_federation.poll()
                 self._check_channel_attach()
                 self._flush_input_classifier()
                 if (
@@ -3129,6 +3573,14 @@ class Supervisor:
                         min(timeout, self.transcript_quiescence_deadline - now()),
                     )
                 timeout = min(timeout, max(0.0, self.next_transcript_poll - monotonic()))
+                next_preservation_poll = self.preservation_federation.next_poll
+                if next_preservation_poll is not None:
+                    timeout = min(timeout, max(0.0, next_preservation_poll - monotonic()))
+                if self.preservation_federation.bridge_thread is not None:
+                    # Bounded wake strategy for result reaping.  The owner
+                    # loop still sleeps while the worker is in flight, and
+                    # all state/control mutations happen after reaping here.
+                    timeout = min(timeout, PRESERVATION_IN_FLIGHT_WAKE_SECONDS)
                 self._ensure_control_socket()
                 events = self.selector.select(timeout)
                 for key, _mask in events:
@@ -3294,6 +3746,7 @@ def main(argv: list[str]) -> int:
         print("CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS, CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS")
         print("CLAUDE_WARM_HERDR_AGENT, CLAUDE_WARM_HERDR_HEARTBEAT_SECONDS,")
         print("CLAUDE_WARM_HERDR_REGISTRATION_TTL_MS")
+        print("CLAUDE_WARM_PRESERVATION_* (all bindings are required; unset is inert)")
         print("Use claude-warmctl for per-session state and controls.")
         return 0
     try:
