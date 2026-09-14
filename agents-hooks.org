@@ -105,6 +105,10 @@ The tracked JSON below is the SHARED settings baseline for every machine. It tan
         "hooks": [
           {
             "type": "command",
+            "command": "claude-hook-telegram-delivery-guard"
+          },
+          {
+            "type": "command",
             "command": "claude-hook-stop"
           },
           {
@@ -1660,6 +1664,129 @@ if [ "$COUNT" -ge 15 ]; then
   COUNT=0
 fi
 echo "$COUNT" > "$COUNTFILE"
+#+END_SRC
+
+* Telegram delivery guard
+*event: Stop (wired first in the Stop array above).*
+
+In a Telegram-bridged session the assistant's transcript text never reaches Mètsàtron — only a Telegram reply tool call does. This Stop hook lives in the SHARED baseline so it deploys to =~/.claude/settings.json= at USER scope: it therefore protects every warm bot (Fable/Auryn/Haiku/Opus) regardless of working directory, unlike the old HelmCortex-root-only wiring that most bots never loaded (Claude Code loads the cwd's own =.claude/settings.json= plus user scope, not ancestor project dirs).
+
+At turn end, if the LAST user prompt actually arrived FROM Telegram (carries a =<channel source="...telegram...">= tag) and the turn produced spoken assistant text but made no Telegram delivery call (=reply=/=edit_message=), it blocks the stop and tells the model to deliver. A plain TUI prompt is never blocked (the terminal is what the user sees there). Gated to channel-bound sessions; fail-OPEN on any error (never wedge a session); never loops (honors =stop_hook_active=). The transcript read retries once to survive a flush race, and logs the distinct failure shapes (missing path / present-but-unreadable / no transcript_path) so a real fault is diagnosable rather than silent.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/claude-hook-telegram-delivery-guard :shebang "#!/usr/bin/env bash" :comments no
+# ~/DotCortex/all/.local/bin/claude-hook-telegram-delivery-guard
+# Stop hook. Fail-OPEN on any error (never wedge a session).
+# User-scope: loaded for every session via ~/.claude/settings.json, so it
+# protects all warm bots (Fable/Auryn/Haiku/Opus) regardless of working dir --
+# unlike the old HelmCortex-root-only wiring that most bots never loaded.
+INPUT=$(cat 2>/dev/null || true)
+HOOK_NAME="telegram-delivery-guard"
+LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/claude-hooks"
+ERROR_LOG="$LOG_DIR/telegram-delivery-guard.log"
+
+log() {
+  local message="${1:-unknown}"
+  message="${message//$'\n'/ }"
+  mkdir -p "$LOG_DIR" 2>/dev/null || return 0
+  printf '%s hook=%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')" "$HOOK_NAME" "$message" >> "$ERROR_LOG" 2>/dev/null || true
+}
+
+# Gate 1: only channel-bound (bridged) sessions -- else the transcript IS the user's view.
+[ -n "${CLAUDE_IDLE_CHANNEL:-}" ] || exit 0
+command -v python3 >/dev/null 2>&1 || exit 0
+
+# Gate 2: never loop -- if a prior Stop already blocked this turn, let it pass.
+STOP_ACTIVE=$(printf '%s' "$INPUT" | python3 -c 'import json,sys
+try: print("1" if json.load(sys.stdin).get("stop_hook_active") else "0")
+except Exception: print("0")' 2>/dev/null)
+[ "$STOP_ACTIVE" = "1" ] && exit 0
+
+TP=$(printf '%s' "$INPUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("transcript_path","") or "")
+except Exception: print("")' 2>/dev/null)
+if [ -z "$TP" ]; then
+  log "error=no transcript_path in Stop payload"
+  exit 0
+fi
+# The transcript can lag the Stop event by a flush; retry once before giving up.
+[ -r "$TP" ] || sleep 0.15
+if [ ! -r "$TP" ]; then
+  if [ -e "$TP" ]; then log "error=transcript present but unreadable: $TP"
+  else log "error=transcript path does not exist: $TP"; fi
+  exit 0
+fi
+
+VERDICT=$(python3 -c '
+import json, sys, re
+tp = sys.argv[1]
+recs = []
+try:
+    with open(tp) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            try: recs.append(json.loads(line))
+            except Exception: pass
+except Exception:
+    print("pass"); sys.exit(0)
+
+def texts(content):
+    out = []
+    if isinstance(content, str):
+        out.append(content)
+    elif isinstance(content, list):
+        for b in content:
+            if isinstance(b, dict) and b.get("type") == "text":
+                t = b.get("text") or ""
+                if t: out.append(t)
+    return out
+
+# Last REAL user prompt: type=user, role=user, carrying text.
+# (tool_result turns are role=user but carry only tool_result blocks -- not prompts.)
+last_user = -1
+last_text = ""
+for i, d in enumerate(recs):
+    if d.get("type") != "user": continue
+    m = d.get("message") or {}
+    if m.get("role") != "user": continue
+    joined = "\n".join(texts(m.get("content"))).strip()
+    if joined:
+        last_user = i
+        last_text = joined
+
+if last_user < 0:
+    print("pass"); sys.exit(0)
+
+# Only guard prompts that arrived FROM Telegram; a plain TUI prompt needs no
+# Telegram reply because the terminal is what the user sees there.
+if not re.search(r"<channel\b[^>]*telegram", last_text, re.I):
+    print("pass"); sys.exit(0)
+
+deliver = re.compile(r"telegram.*(reply|edit_message)", re.I)
+spoke = delivered = False
+for d in recs[last_user+1:]:
+    if d.get("type") != "assistant": continue
+    c = (d.get("message") or {}).get("content")
+    if not isinstance(c, list): continue
+    for b in c:
+        if not isinstance(b, dict): continue
+        if b.get("type") == "text" and (b.get("text") or "").strip():
+            spoke = True
+        elif b.get("type") == "tool_use" and deliver.search(str(b.get("name",""))):
+            delivered = True
+
+print("block" if (spoke and not delivered) else "pass")
+' "$TP" 2>/dev/null) || VERDICT="pass"
+
+if [ "$VERDICT" = "block" ]; then
+  log "decision=block spoke-without-telegram-delivery"
+  python3 -c 'import json,sys; sys.stdout.write(json.dumps({"decision":"block","reason":(
+"TELEGRAM DELIVERY GUARD: this turn produced a response but never called the Telegram reply tool. "
+"Your transcript text is INVISIBLE to Mètsàtron -- only mcp__plugin_telegram_telegram__reply reaches his chat. "
+"Deliver your message now via the reply tool (chat_id from the inbound <channel> tag), turn-final, then stop.")}))'
+  exit 0
+fi
+exit 0
 #+END_SRC
 
 * Skill forced eval
