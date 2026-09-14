@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""Bounded, fail-closed OpenCode continuity candidate."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import pathlib
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlparse
+from urllib.request import Request, urlopen
+
+
+OWNER_SCHEMA = "helmcortex.opencode-owner.v2"
+OWNER_NAME = "telegram-agent-host:opencode"
+OWNER_BOT = "opencode"
+OWNER_PROJECT = "/home/metsatron/HelmCortex"
+OWNER_HOST = "127.0.0.1"
+OWNER_PORT = 4096
+SCHEMA = "dotcortex.opencode-warm.v1"
+RECEIPT_SCHEMA = "dotcortex.opencode-continuity-receipt.v1"
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
+ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,160}$")
+REFERENCE_RE = re.compile(r"^continuity://[A-Za-z0-9._:/-]{1,150}$")
+ALLOWED_EVENTS = frozenset({"session.idle", "session.compacted"})
+
+
+class CandidateError(RuntimeError):
+    """A deliberate gate refusal or bounded transport failure."""
+
+
+def now() -> float:
+    return time.time()
+
+
+def env_float(name: str, default: float) -> float:
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+def env_int(name: str, default: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value >= 0 else default
+
+
+MAX_TELEMETRY_AGE = env_float("OPENCODE_WARM_MAX_TELEMETRY_AGE", 120.0)
+MAX_RECEIPT_AGE = env_float("OPENCODE_WARM_MAX_RECEIPT_AGE", 1800.0)
+CLOCK_SKEW = env_float("OPENCODE_WARM_CLOCK_SKEW", 10.0)
+MIN_CONTEXT_TOKENS = env_int("OPENCODE_WARM_MIN_CONTEXT_TOKENS", 70000)
+API_TIMEOUT = env_float("OPENCODE_WARM_API_TIMEOUT", 5.0)
+POLICY_SCHEMA = "helmcortex.opencode-continuity-policy-decision.v1"
+NUDGE_SCHEMA = "dotcortex.opencode-nudge-state.v1"
+POLICY_ACTIONS = frozenset({
+    "CONTINUE_LOCAL", "WAIT_AND_NUDGE", "HANDOFF_AND_COMPACT",
+    "COMPLETE_OR_EXIT", "EMERGENCY_CHECKPOINT", "HANDOFF_AND_QUEUE",
+    "HANDOFF_AND_DELEGATE",
+})
+
+
+def read_json(path: pathlib.Path) -> dict | list | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, (dict, list)) else None
+
+
+def atomic_json(path: pathlib.Path, value: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def state_dir() -> pathlib.Path:
+    configured = os.environ.get("OPENCODE_WARM_STATE_DIR")
+    if configured:
+        path = pathlib.Path(configured).expanduser()
+    else:
+        xdg = os.environ.get("XDG_STATE_HOME")
+        base = pathlib.Path(xdg).expanduser() if xdg else pathlib.Path.home() / ".local/state"
+        path = base / "opencode-idle-continuity"
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path, 0o700)
+    return path
+
+
+def owner_state_path() -> pathlib.Path:
+    configured = os.environ.get("OPENCODE_WARM_OWNER_STATE")
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    xdg = os.environ.get("XDG_STATE_HOME")
+    base = pathlib.Path(xdg).expanduser() if xdg else pathlib.Path.home() / ".local/state"
+    return base / "telegram-agents/opencode.json"
+
+
+def owner_helper_path() -> pathlib.Path:
+    configured = os.environ.get("OPENCODE_WARM_OWNER_HELPER")
+    if configured:
+        return pathlib.Path(configured).expanduser()
+    return pathlib.Path.home() / ".local/bin/opencode-owner"
+
+
+def checked_id(value: object, pattern: re.Pattern[str], label: str) -> str:
+    if not isinstance(value, str) or not pattern.fullmatch(value):
+        raise CandidateError(f"{label}-invalid")
+    return value
+
+
+def timestamp(value: object, label: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CandidateError(f"{label}-unknown")
+    number = float(value)
+    if number > 100_000_000_000:
+        number /= 1000.0
+    if number <= 0:
+        raise CandidateError(f"{label}-unknown")
+    return number
+
+
+def owner_fingerprint(owner: dict, session_id: str) -> str:
+    material = {key: owner.get(key) for key in (
+        "schema", "owner", "bot", "project", "host", "port"
+    )}
+    material["session_id"] = session_id
+    encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def validate_owner_record(owner: object, session_id: str) -> dict:
+    if not isinstance(owner, dict):
+        raise CandidateError("owner-state-missing-or-invalid")
+    exact = {
+        "schema": OWNER_SCHEMA, "owner": OWNER_NAME, "bot": OWNER_BOT,
+        "project": OWNER_PROJECT, "host": OWNER_HOST, "port": OWNER_PORT,
+    }
+    for key, expected in exact.items():
+        if owner.get(key) != expected:
+            raise CandidateError(f"owner-{key}-mismatch")
+    for role in ("backend", "poller"):
+        for key in ("pid", "start_ticks"):
+            try:
+                if int(owner.get(f"{role}_{key}")) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                raise CandidateError(f"owner-{role}-{key}-invalid")
+        if owner.get(f"{role}_cwd") != OWNER_PROJECT:
+            raise CandidateError(f"owner-{role}-cwd-mismatch")
+        argv = owner.get(f"{role}_argv")
+        if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+            raise CandidateError(f"owner-{role}-argv-invalid")
+    if owner.get("poller_package") != "@grinev/opencode-telegram-bot":
+        raise CandidateError("owner-poller-package-mismatch")
+    if owner.get("poller_package_version") != "0.22.5":
+        raise CandidateError("owner-poller-version-mismatch")
+    binding = owner.get("session_binding")
+    if not isinstance(binding, dict) or binding.get("status") != "bound":
+        raise CandidateError("owner-session-unbound")
+    if binding.get("project_worktree") != OWNER_PROJECT or binding.get("session_directory") != OWNER_PROJECT:
+        raise CandidateError("owner-session-project-mismatch")
+    bound = checked_id(binding.get("session_id"), SESSION_RE, "owner-session-id")
+    if bound != session_id:
+        raise CandidateError("owner-session-id-mismatch")
+    return owner
+
+
+def validate_owner_inspection(owner: dict, session_id: str) -> None:
+    helper = owner_helper_path()
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        raise CandidateError("owner-helper-unavailable")
+    try:
+        result = subprocess.run(
+            [str(helper), "inspect", "--state", str(owner_state_path()),
+             "--project", OWNER_PROJECT, "--host", OWNER_HOST, "--port", str(OWNER_PORT)],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise CandidateError(f"owner-inspect-{type(exc).__name__}") from exc
+    try:
+        inspected = json.loads(result.stdout)
+    except (ValueError, TypeError) as exc:
+        raise CandidateError("owner-inspect-invalid-json") from exc
+    if result.returncode != 0 or not isinstance(inspected, dict) or inspected.get("status") != "running":
+        raise CandidateError("owner-inspect-not-running")
+    if inspected.get("project") != OWNER_PROJECT or inspected.get("host") != OWNER_HOST or inspected.get("port") != OWNER_PORT:
+        raise CandidateError("owner-inspect-boundary-mismatch")
+    for role in ("backend", "poller"):
+        row = inspected.get(role)
+        if not isinstance(row, dict) or row.get("valid") is not True:
+            raise CandidateError(f"owner-inspect-{role}-invalid")
+    session = inspected.get("session")
+    if not isinstance(session, dict) or session.get("status") != "bound" or session.get("session_id") != session_id:
+        raise CandidateError("owner-inspect-session-mismatch")
+    if inspected.get("owner") not in (None, OWNER_NAME):
+        raise CandidateError("owner-inspect-owner-mismatch")
+    expected = owner_fingerprint(owner, session_id)
+    if inspected.get("owner_fingerprint", expected) != expected:
+        raise CandidateError("owner-inspect-fingerprint-mismatch")
+
+
+class OpenCodeAPI:
+    def __init__(self, base_url: str):
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+            raise CandidateError("api-boundary-invalid")
+        self.base_url = base_url.rstrip("/")
+
+    def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, object | None]:
+        data = None
+        headers = {"Accept": "application/json"}
+        if body is not None:
+            data = json.dumps(body, separators=(",", ":")).encode()
+            headers["Content-Type"] = "application/json"
+        request = Request(self.base_url + path, data=data, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=API_TIMEOUT) as response:
+                raw = response.read()
+                status = int(response.status)
+        except HTTPError as exc:
+            raw = exc.read()
+            status = int(exc.code)
+        except (OSError, URLError, TimeoutError) as exc:
+            raise CandidateError(f"api-{type(exc).__name__}") from exc
+        if not raw:
+            return status, None
+        try:
+            return status, json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise CandidateError("api-invalid-json") from exc
+
+
+def status_for(payload: object, session_id: str) -> str:
+    value: object = None
+    if isinstance(payload, dict):
+        value = payload.get(session_id)
+        if value is None and payload.get("sessionID") == session_id:
+            value = payload
+        elif value is None and "sessionID" not in payload:
+            # OpenCode 1.18.30 publishes only active sessions in this map.
+            # A bound session absent from a valid map is idle.
+            return "idle"
+    elif isinstance(payload, list):
+        for row in payload:
+            if isinstance(row, dict) and row.get("sessionID") == session_id:
+                value = row
+                break
+        if value is None:
+            return "idle"
+    if isinstance(value, dict):
+        value = value.get("status", value.get("type"))
+    if not isinstance(value, str):
+        return "unknown"
+    normalized = value.lower()
+    if normalized == "idle":
+        return "idle"
+    if normalized in {"busy", "working", "running", "retry", "compacting"}:
+        return normalized
+    return "unknown"
+
+
+def completed_assistant(payload: object) -> dict:
+    if not isinstance(payload, list):
+        raise CandidateError("messages-invalid")
+    candidates: list[tuple[float, int, dict]] = []
+    for index, row in enumerate(payload):
+        if not isinstance(row, dict):
+            continue
+        info = row.get("info") if isinstance(row.get("info"), dict) else row
+        if info.get("role") != "assistant" or info.get("error") is not None:
+            continue
+        timing = info.get("time")
+        completed = timing.get("completed") if isinstance(timing, dict) else None
+        if completed is None:
+            continue
+        if info.get("finish") is not None and not info.get("finish"):
+            continue
+        completed_at = timestamp(completed, "assistant-completed")
+        candidates.append((completed_at, index, info))
+    if not candidates:
+        raise CandidateError("completed-assistant-missing")
+    _, _, info = max(candidates, key=lambda item: (item[0], item[1]))
+    message_id = checked_id(info.get("id"), ID_RE, "assistant-message-id")
+    tokens = info.get("tokens")
+    if not isinstance(tokens, dict):
+        raise CandidateError("assistant-usage-missing")
+    cache = tokens.get("cache")
+    if not isinstance(cache, dict):
+        raise CandidateError("assistant-cache-usage-unknown")
+    numbers: list[int] = []
+    value = tokens.get("input")
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise CandidateError("context-tokens-unknown")
+    numbers.append(value)
+    for key in ("read", "write"):
+        value = cache.get(key)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise CandidateError("context-tokens-unknown")
+        numbers.append(value)
+    provider = info.get("providerID")
+    model = info.get("modelID")
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        model_info = info.get("model")
+        if isinstance(model_info, dict):
+            provider = model_info.get("providerID")
+            model = model_info.get("modelID", model_info.get("id"))
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        raise CandidateError("model-identity-missing")
+    return {
+        "message_id": message_id, "completed_at": timestamp(completed, "assistant-completed"),
+        "provider_id": provider, "model_id": model, "context_tokens": sum(numbers),
+    }
+
+
+def validate_receipts(root: pathlib.Path, owner: dict, session_id: str, assistant: dict, observed_at: float) -> str:
+    checkpoint = read_json(root / "checkpoint.json")
+    handoff = read_json(root / "handoff.json")
+    if not isinstance(checkpoint, dict):
+        raise CandidateError("checkpoint-receipt-missing")
+    if not isinstance(handoff, dict):
+        raise CandidateError("handoff-receipt-missing")
+    fingerprint = owner_fingerprint(owner, session_id)
+    for item, kind, label in ((checkpoint, "checkpoint", "checkpoint"), (handoff, "handoff", "handoff")):
+        for key, expected in {
+            "schema": RECEIPT_SCHEMA, "kind": kind, "session_id": session_id,
+            "message_id": assistant["message_id"], "owner_fingerprint": fingerprint,
+        }.items():
+            if item.get(key) != expected:
+                raise CandidateError(f"{label}-{key.replace('_', '-')}-mismatch")
+        created = timestamp(item.get("created_at"), f"{label}-created-at")
+        if now() - created > MAX_RECEIPT_AGE or created - observed_at > CLOCK_SKEW:
+            raise CandidateError(f"{label}-receipt-stale")
+    checkpoint_id = checked_id(checkpoint.get("checkpoint_id"), ID_RE, "checkpoint-id")
+    if handoff.get("checkpoint_id") != checkpoint_id:
+        raise CandidateError("handoff-checkpoint-mismatch")
+    handoff_id = checked_id(handoff.get("handoff_id"), ID_RE, "handoff-id")
+    reference = handoff.get("reference")
+    if not isinstance(reference, str) or not REFERENCE_RE.fullmatch(reference):
+        raise CandidateError("handoff-reference-invalid")
+    return f"{checkpoint_id}:{handoff_id}:{reference}"
+
+
+def validate_telemetry(assistant: dict, observed_at: float) -> None:
+    current = now()
+    if observed_at > current + CLOCK_SKEW or current - observed_at > MAX_TELEMETRY_AGE:
+        raise CandidateError("telemetry-stale")
+    if assistant["completed_at"] > observed_at + CLOCK_SKEW:
+        raise CandidateError("telemetry-before-assistant-completion")
+    if observed_at - assistant["completed_at"] > MAX_TELEMETRY_AGE:
+        raise CandidateError("assistant-telemetry-stale")
+
+
+def state_key(session_id: str, assistant: dict, owner: dict) -> str:
+    value = (
+        f"{owner_fingerprint(owner, session_id)}\0{session_id}\0"
+        f"{assistant['message_id']}\0{assistant['context_tokens']}\0"
+        f"{assistant['provider_id']}\0{assistant['model_id']}"
+    )
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
+def initial_state() -> dict:
+    return {"schema": SCHEMA, "in_flight": False, "current_tokens": 0, "last_success_key": None}
+
+
+def result(action: str, **fields: object) -> int:
+    print(json.dumps({"action": action, **fields}, sort_keys=True))
+    return 0
+
+
+def policy_decision(root: pathlib.Path, session_id: str, assistant: dict,
+                    observed_at: float, prospective_cache: bool = False) -> dict:
+    """Return a validated authority decision or the preserving legacy fallback."""
+    helper_value = os.environ.get("OPENCODE_WARM_POLICY_HELPER")
+    if not helper_value:
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "context-only-fallback"}
+    helper = pathlib.Path(helper_value).expanduser()
+    if not helper.is_file() or not os.access(helper, os.X_OK):
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "policy-helper-unavailable"}
+    names = {
+        "root": "OPENCODE_WARM_POLICY_ROOT",
+        "expected-authority-hostname": "OPENCODE_WARM_POLICY_AUTHORITY_IDENTITY",
+        "telemetry-host": "OPENCODE_WARM_POLICY_TELEMETRY_HOST",
+        "provider": "OPENCODE_WARM_POLICY_PROVIDER",
+        "account-hash": "OPENCODE_WARM_POLICY_ACCOUNT_HASH",
+        "model-pool": "OPENCODE_WARM_POLICY_MODEL_POOL",
+        "estimated-preservation-percent": "OPENCODE_WARM_POLICY_ESTIMATED_PRESERVATION_PERCENT",
+        "estimate-uncertainty-percent": "OPENCODE_WARM_POLICY_ESTIMATE_UNCERTAINTY_PERCENT",
+        "in-flight-reserve-percent": "OPENCODE_WARM_POLICY_IN_FLIGHT_RESERVE_PERCENT",
+        "control-reserve-percent": "OPENCODE_WARM_POLICY_CONTROL_RESERVE_PERCENT",
+        "safety-margin-seconds": "OPENCODE_WARM_POLICY_SAFETY_MARGIN_SECONDS",
+    }
+    values = {flag: os.environ.get(name) for flag, name in names.items()}
+    cache_ttl = os.environ.get("OPENCODE_WARM_CACHE_TTL_SECONDS")
+    if any(value is None or not value for value in values.values()) or not cache_ttl:
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "policy-binding-incomplete"}
+    try:
+        ttl = float(cache_ttl)
+    except ValueError:
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "cache-ttl-invalid"}
+    if ttl <= 0:
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "cache-ttl-invalid"}
+    handoff = read_json(root / "handoff.json")
+    reference = handoff.get("reference") if isinstance(handoff, dict) else None
+    if not isinstance(reference, str) or not REFERENCE_RE.fullmatch(reference):
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "handoff-reference-invalid"}
+    command = [str(helper)]
+    for flag, value in values.items():
+        command.extend((f"--{flag}", str(value)))
+    nudge = read_json(root / "nudge.json")
+    scheduler = pathlib.Path(os.environ.get("OPENCODE_WARM_NUDGE_SCHEDULER", "")).expanduser()
+    adapter = pathlib.Path(os.environ.get("OPENCODE_WARM_WAKEUP_ADAPTER", "")).expanduser()
+    nudge_armed = (
+        isinstance(nudge, dict) and nudge.get("schema") == NUDGE_SCHEMA
+        and (nudge.get("policy") == "AGENT" and nudge.get("agent_state") == "ARMED"
+             or nudge.get("policy") == "FORCE" and nudge.get("force_pending") is True)
+    )
+    if nudge_armed and scheduler.is_file() and os.access(scheduler, os.X_OK) and adapter.is_file() and os.access(adapter, os.X_OK):
+        command.append("--nudge-ready")
+    payload = {
+        "schema": "helmcortex.opencode-continuity-policy-request.v1",
+        "session_id": session_id,
+        "dirty": True,
+        "context_tokens": assistant["context_tokens"],
+        "observed_at": observed_at,
+        "cache_expires_at": (now() if prospective_cache else assistant["completed_at"]) + ttl,
+        "work_remaining": True,
+        "handoff_reference": reference,
+    }
+    try:
+        completed = subprocess.run(
+            command, input=json.dumps(payload), capture_output=True, text=True,
+            timeout=15, check=False,
+        )
+        response = json.loads(completed.stdout)
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError):
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "policy-call-failed"}
+    action = response.get("action") if isinstance(response, dict) else None
+    if completed.returncode != 0 or response.get("schema") != POLICY_SCHEMA or action not in POLICY_ACTIONS:
+        return {"action": "HANDOFF_AND_COMPACT", "mode": "policy-response-invalid"}
+    return response
+
+
+def schedule_wakeup(root: pathlib.Path, session_id: str, owner: dict, policy: dict) -> dict:
+    scheduler = pathlib.Path(os.environ.get("OPENCODE_WARM_NUDGE_SCHEDULER", "")).expanduser()
+    reset = policy.get("reset")
+    reset_at = reset.get("reset_at") if isinstance(reset, dict) else None
+    if not scheduler.is_file() or not os.access(scheduler, os.X_OK):
+        raise CandidateError("nudge-scheduler-unavailable")
+    if isinstance(reset_at, bool) or not isinstance(reset_at, (int, float)):
+        raise CandidateError("nudge-reset-unknown")
+    reset_epoch = int(reset_at)
+    current = now()
+    delay = env_float("OPENCODE_WARM_NUDGE_DELAY_SECONDS", 15.0)
+    lifetime = max(60.0, env_float("OPENCODE_WARM_NUDGE_EXPIRY_SECONDS", 1800.0))
+    due_at = max(current, float(reset_at) + delay)
+    fingerprint = owner_fingerprint(owner, session_id)
+    digest = hashlib.sha256(f"{fingerprint}\0{session_id}\0{reset_epoch}".encode()).hexdigest()
+    identity = f"opencode:{digest}"
+    nudge_path = root / "nudge.json"
+    lock_path = root / "nudge.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+        nudge = read_json(nudge_path)
+        if not isinstance(nudge, dict) or nudge.get("schema") != NUDGE_SCHEMA:
+            raise CandidateError("nudge-state-invalid")
+        if nudge.get("sent_for_reset_epoch") == reset_epoch:
+            return {"status": "already-delivered", "job_id": identity, "reset_epoch": reset_epoch}
+        handoff = read_json(root / "handoff.json")
+        reference = handoff.get("reference") if isinstance(handoff, dict) else None
+        if not isinstance(reference, str) or not REFERENCE_RE.fullmatch(reference):
+            raise CandidateError("nudge-handoff-reference-invalid")
+        job = {
+            "schema": "timeark.oneshot.v1", "id": identity,
+            "idempotency_key": identity, "due_at": due_at,
+            "expires_at": due_at + lifetime,
+            "timezone": os.environ.get("OPENCODE_WARM_NUDGE_TIMEZONE", "Australia/Melbourne"),
+            "lane": "agent-wakeup", "target": "opencode", "reference": reference,
+            "state": "pending", "claim_owner": None, "lease_until": None,
+            "attempts": 0, "created_at": current, "updated_at": current, "detail": "",
+        }
+        try:
+            completed = subprocess.run(
+                [str(scheduler)], input=json.dumps(job), capture_output=True, text=True,
+                timeout=10, check=False,
+            )
+            scheduled = json.loads(completed.stdout)
+        except (OSError, subprocess.TimeoutExpired, TypeError, ValueError) as exc:
+            raise CandidateError(f"nudge-schedule-{type(exc).__name__}") from exc
+        if completed.returncode != 0 or not isinstance(scheduled, dict) or scheduled.get("idempotency_key") != identity:
+            raise CandidateError("nudge-schedule-refused")
+        if scheduled.get("state") == "delivered":
+            return {"status": "already-delivered", "job_id": identity, "reset_epoch": reset_epoch}
+        current_nudge = read_json(nudge_path)
+        if (
+            not isinstance(current_nudge, dict)
+            or current_nudge.get("schema") != NUDGE_SCHEMA
+            or not (
+                current_nudge.get("policy") == "AGENT"
+                and current_nudge.get("agent_state") == "ARMED"
+                or current_nudge.get("policy") == "FORCE"
+                and current_nudge.get("force_pending") is True
+            )
+        ):
+            return {"status": "disarmed-before-record", "job_id": identity, "reset_epoch": reset_epoch}
+        current_nudge.update(
+            reset_epoch=reset_epoch, delivery_state="scheduled", job_id=identity,
+            scheduled_at=current, due_at=due_at, updated_at=current,
+        )
+        atomic_json(nudge_path, current_nudge)
+    return {"status": "scheduled", "job_id": identity, "due_at": due_at, "expires_at": due_at + lifetime}
+
+
+def completed_summary(payload: object, started_at: float) -> dict:
+    if not isinstance(payload, list):
+        raise CandidateError("messages-invalid")
+    candidates: list[tuple[float, int, dict]] = []
+    for index, row in enumerate(payload):
+        if not isinstance(row, dict):
+            continue
+        info = row.get("info") if isinstance(row.get("info"), dict) else row
+        if info.get("role") != "assistant" or info.get("summary") is not True:
+            continue
+        timing = info.get("time")
+        completed = timing.get("completed") if isinstance(timing, dict) else None
+        if completed is None:
+            continue
+        completed_at = timestamp(completed, "summary-completed")
+        if completed_at + CLOCK_SKEW < started_at:
+            continue
+        candidates.append((completed_at, index, info))
+    if not candidates:
+        raise CandidateError("compaction-summary-missing")
+    completed_at, _, info = max(candidates, key=lambda item: (item[0], item[1]))
+    return {
+        "message_id": checked_id(info.get("id"), ID_RE, "summary-message-id"),
+        "completed_at": completed_at,
+    }
+
+
+def validate_compaction_event(root: pathlib.Path, session_id: str, started_at: float) -> None:
+    event = read_json(root / "events" / f"{session_id}.json")
+    if not isinstance(event, dict):
+        raise CandidateError("compaction-event-missing")
+    if event.get("schema") != "dotcortex.opencode-continuity-event.v1":
+        raise CandidateError("compaction-event-schema-mismatch")
+    if event.get("type") != "session.compacted" or event.get("session_id") != session_id:
+        raise CandidateError("compaction-event-boundary-mismatch")
+    observed_at = timestamp(event.get("observed_at"), "compaction-event-observed-at")
+    if observed_at > now() + CLOCK_SKEW:
+        raise CandidateError("compaction-event-from-future")
+    if observed_at < started_at:
+        raise CandidateError("compaction-event-stale")
+
+
+def confirm_compaction(root: pathlib.Path, session_id: str, messages: object) -> int:
+    state_path = root / "state.json"
+    state = read_json(state_path)
+    if not isinstance(state, dict) or state.get("schema") != SCHEMA:
+        raise CandidateError("compaction-not-pending")
+    if state.get("in_flight") is not True or state.get("session_id") != session_id:
+        receipt = read_json(root / "receipt.json")
+        if isinstance(receipt, dict) and receipt.get("status") == "success" and receipt.get("session_id") == session_id:
+            return result("skipped", reason="already-confirmed", key=receipt.get("key"))
+        raise CandidateError("compaction-not-pending")
+    started_at = timestamp(state.get("started_at"), "compaction-started-at")
+    validate_compaction_event(root, session_id, started_at)
+    summary = completed_summary(messages, started_at)
+    completed_at = now()
+    key = checked_id(state.get("trigger_key"), re.compile(r"^[0-9a-f]{64}$"), "trigger-key")
+    attempt_id = checked_id(state.get("attempt_id"), re.compile(r"^[0-9a-f]{32}$"), "attempt-id")
+    atomic_json(root / "receipt.json", {
+        "schema": RECEIPT_SCHEMA, "kind": "idempotence", "status": "success",
+        "key": key, "attempt_id": attempt_id, "session_id": session_id,
+        "message_id": state.get("message_id"), "summary_message_id": summary["message_id"],
+        "requested_at": started_at, "completed_at": completed_at,
+        "transport": "legacy-summarize", "v2": state.get("v2", "not-probed"),
+    })
+    atomic_json(state_path, {
+        "schema": SCHEMA, "in_flight": False, "session_id": session_id,
+        "current_tokens": 0, "last_success_key": key, "last_success_at": completed_at,
+        "last_attempt_id": attempt_id, "summary_message_id": summary["message_id"],
+        "last_error": None,
+    })
+    return result("compacted", key=key, summary_message_id=summary["message_id"])
+
+
+def prepare(args: argparse.Namespace) -> int:
+    session_id = checked_id(args.session, SESSION_RE, "session-id")
+    if args.event != "session.idle":
+        raise CandidateError("prepare-event-not-idle")
+    observed_at = timestamp(args.observed_at, "telemetry")
+    root = state_dir()
+    owner = validate_owner_record(read_json(owner_state_path()), session_id)
+    validate_owner_inspection(owner, session_id)
+    api = OpenCodeAPI(os.environ.get("OPENCODE_WARM_BASE_URL", "http://127.0.0.1:4096"))
+    status_code, status_payload = api.request("GET", "/session/status")
+    if status_code != 200:
+        raise CandidateError("session-status-unavailable")
+    session_status = status_for(status_payload, session_id)
+    if session_status != "idle":
+        raise CandidateError(f"session-status-{session_status}")
+    message_status, messages = api.request("GET", f"/session/{quote(session_id, safe='')}/message")
+    if message_status != 200:
+        raise CandidateError("session-messages-unavailable")
+    assistant = completed_assistant(messages)
+    validate_telemetry(assistant, observed_at)
+    if assistant["context_tokens"] < MIN_CONTEXT_TOKENS:
+        return result("skipped", reason="below-token-threshold", context_tokens=assistant["context_tokens"])
+    fingerprint = owner_fingerprint(owner, session_id)
+    digest = hashlib.sha256(
+        f"{fingerprint}\0{session_id}\0{assistant['message_id']}".encode()
+    ).hexdigest()
+    created_at = now()
+    checkpoint_id = f"checkpoint-{digest[:24]}"
+    handoff_id = f"handoff-{digest[24:48]}"
+    common = {
+        "schema": RECEIPT_SCHEMA, "session_id": session_id,
+        "message_id": assistant["message_id"], "checkpoint_id": checkpoint_id,
+        "owner_fingerprint": fingerprint, "created_at": created_at,
+    }
+    atomic_json(root / "checkpoint.json", {**common, "kind": "checkpoint"})
+    atomic_json(root / "handoff.json", {
+        **common, "kind": "handoff", "handoff_id": handoff_id,
+        "reference": f"continuity://opencode/{digest}",
+        "critical": {
+            "next": "wait-for-explicit-input",
+            "prohibition": "do-not-auto-continue-after-compaction",
+        },
+    })
+    return result(
+        "prepared", session_id=session_id, message_id=assistant["message_id"],
+        checkpoint_id=checkpoint_id, context_tokens=assistant["context_tokens"],
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    session_id = checked_id(args.session, SESSION_RE, "session-id")
+    if args.event not in ALLOWED_EVENTS:
+        raise CandidateError("event-not-eligible")
+    observed_at = timestamp(args.observed_at, "telemetry")
+    root = state_dir()
+    owner = validate_owner_record(read_json(owner_state_path()), session_id)
+    validate_owner_inspection(owner, session_id)
+    api = OpenCodeAPI(os.environ.get("OPENCODE_WARM_BASE_URL", "http://127.0.0.1:4096"))
+    status_code, status_payload = api.request("GET", "/session/status")
+    if status_code != 200:
+        raise CandidateError("session-status-unavailable")
+    session_status = status_for(status_payload, session_id)
+    if args.event == "session.idle" and session_status != "idle":
+        raise CandidateError(f"session-status-{session_status}")
+    message_status, messages = api.request("GET", f"/session/{quote(session_id, safe='')}/message")
+    if message_status != 200:
+        raise CandidateError("session-messages-unavailable")
+    if args.event == "session.compacted":
+        lock_path = root / "compaction.lock"
+        with lock_path.open("a+", encoding="utf-8") as lock_stream:
+            os.chmod(lock_path, 0o600)
+            try:
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise CandidateError("concurrent-compaction") from exc
+            return confirm_compaction(root, session_id, messages)
+    assistant = completed_assistant(messages)
+    validate_telemetry(assistant, observed_at)
+    if assistant["context_tokens"] < MIN_CONTEXT_TOKENS:
+        return result("skipped", reason="below-token-threshold", context_tokens=assistant["context_tokens"])
+    handoff_ref = validate_receipts(root, owner, session_id, assistant, observed_at)
+    policy = policy_decision(root, session_id, assistant, observed_at)
+    if policy["action"] in {"CONTINUE_LOCAL", "COMPLETE_OR_EXIT"}:
+        return result(
+            "skipped", reason="continuity-policy-continue", context_tokens=assistant["context_tokens"],
+            policy=policy,
+        )
+    if policy["action"] == "WAIT_AND_NUDGE":
+        scheduled = schedule_wakeup(root, session_id, owner, policy)
+        if scheduled["status"] == "already-delivered":
+            return result(
+                "skipped", reason="nudge-already-delivered-for-reset",
+                context_tokens=assistant["context_tokens"], policy=policy, wakeup=scheduled,
+            )
+        if scheduled["status"] != "scheduled":
+            return result(
+                "skipped", reason=f"nudge-{scheduled['status']}",
+                context_tokens=assistant["context_tokens"], policy=policy, wakeup=scheduled,
+            )
+        return result(
+            "waiting", reason="continuity-policy-wait-and-nudge",
+            context_tokens=assistant["context_tokens"], policy=policy, wakeup=scheduled,
+        )
+    if policy["action"] != "HANDOFF_AND_COMPACT":
+        raise CandidateError(f"continuity-policy-{policy['action'].lower()}")
+    key = state_key(session_id, assistant, owner)
+    state_path = root / "state.json"
+    lock_path = root / "compaction.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_stream:
+        os.chmod(lock_path, 0o600)
+        try:
+            fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CandidateError("concurrent-compaction") from exc
+        state = read_json(state_path)
+        if not isinstance(state, dict) or state.get("schema") != SCHEMA:
+            state = initial_state()
+        if state.get("in_flight") is True:
+            if state.get("trigger_key") == key:
+                return result("skipped", reason="already-pending", key=key)
+            raise CandidateError("concurrent-compaction")
+        receipt = read_json(root / "receipt.json")
+        if isinstance(receipt, dict) and receipt.get("status") == "success" and receipt.get("key") == key:
+            return result("skipped", reason="already-fired", key=key)
+        attempt_id = hashlib.sha256(f"{key}\0{time.time_ns()}".encode()).hexdigest()[:32]
+        started_at = now()
+        atomic_json(state_path, {
+            **state, "schema": SCHEMA, "in_flight": True, "attempt_id": attempt_id,
+            "session_id": session_id, "current_tokens": assistant["context_tokens"],
+            "message_id": assistant["message_id"], "trigger_key": key,
+            "started_at": started_at, "last_error": None,
+        })
+        v2 = "disabled-untrusted"
+        try:
+            recheck_status_code, recheck_status = api.request("GET", "/session/status")
+            if recheck_status_code != 200 or status_for(recheck_status, session_id) != "idle":
+                raise CandidateError("session-changed-before-summarize")
+            recheck_code, recheck_messages = api.request(
+                "GET", f"/session/{quote(session_id, safe='')}/message"
+            )
+            if recheck_code != 200:
+                raise CandidateError("session-changed-before-summarize")
+            rechecked = completed_assistant(recheck_messages)
+            if any(rechecked[key] != assistant[key] for key in (
+                "message_id", "completed_at", "provider_id", "model_id", "context_tokens"
+            )):
+                raise CandidateError("session-changed-before-summarize")
+            try:
+                response_status, _ = api.request(
+                    "POST", f"/session/{quote(session_id, safe='')}/summarize",
+                    {"providerID": assistant["provider_id"], "modelID": assistant["model_id"], "auto": bool(args.auto)},
+                )
+            except CandidateError as exc:
+                # OpenCode keeps this HTTP response open until the model has
+                # finished compacting.  A read timeout after the request was
+                # delivered is therefore an unknown/pending result, not proof
+                # of failure.  The native session.compacted event is the only
+                # authority that promotes this receipt to success.
+                if str(exc) != "api-TimeoutError":
+                    raise
+                response_status = None
+            if response_status is not None and (response_status < 200 or response_status >= 300):
+                raise CandidateError(f"legacy-summarize-http-{response_status}")
+            atomic_json(root / "receipt.json", {
+                "schema": RECEIPT_SCHEMA, "kind": "idempotence", "status": "pending",
+                "key": key, "attempt_id": attempt_id, "session_id": session_id,
+                "message_id": assistant["message_id"], "requested_at": started_at,
+                "transport": "legacy-summarize", "v2": v2,
+                "response": "timeout-pending" if response_status is None else "accepted",
+            })
+            atomic_json(state_path, {
+                "schema": SCHEMA, "in_flight": True, "session_id": session_id,
+                "current_tokens": assistant["context_tokens"], "trigger_key": key,
+                "message_id": assistant["message_id"], "attempt_id": attempt_id,
+                "started_at": started_at, "v2": v2, "last_error": None,
+            })
+            return result(
+                "requested", key=key, context_tokens=assistant["context_tokens"],
+                handoff=handoff_ref, v2=v2, policy=policy,
+            )
+        except Exception as exc:
+            atomic_json(state_path, {
+                **state, "schema": SCHEMA, "in_flight": False, "session_id": session_id,
+                "current_tokens": assistant["context_tokens"], "last_attempt_id": attempt_id,
+                "last_error": str(exc), "failed_at": now(),
+            })
+            if isinstance(exc, CandidateError):
+                raise
+            raise CandidateError(f"compaction-{type(exc).__name__}") from exc
+
+
+def parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--session", required=True)
+    parser.add_argument("--event", required=True)
+    parser.add_argument("--observed-at", required=True, type=float)
+    parser.add_argument("--auto", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--prepare-only", action="store_true")
+    return parser
+
+
+def main() -> int:
+    try:
+        args = parser().parse_args()
+        return prepare(args) if args.prepare_only else run(args)
+    except CandidateError as exc:
+        print(json.dumps({"action": "refused", "reason": str(exc)}, sort_keys=True), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
