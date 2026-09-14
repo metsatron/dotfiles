@@ -91,6 +91,92 @@ raise SystemExit(main())
 '''
 
 
+FAKE_PRESERVATION_BRIDGE = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+
+
+request = json.load(sys.stdin)
+calls = os.environ.get("CLAUDE_TEST_PRESERVATION_CALLS")
+if calls:
+    with open(calls, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(request, sort_keys=True) + "\n")
+mode = os.environ.get("CLAUDE_TEST_PRESERVATION_MODE", "directive")
+if mode == "unavailable":
+    raise SystemExit(78)
+if mode == "stale":
+    print(json.dumps({
+        "schema": "fleet.preservation-sync.v1",
+        "ok": False,
+        "error": "telemetry-refresh-required",
+        "next_action": "central-authority-unavailable",
+    }))
+    raise SystemExit(0)
+if mode == "malformed":
+    print("not-json")
+    raise SystemExit(0)
+if mode == "wrong-contract":
+    print(json.dumps({
+        "schema": "fleet.preservation-sync.v1",
+        "bridge_adapter": "wrong.Adapter",
+        "bridge_protocol": "wrong-protocol",
+        "ok": True,
+    }))
+    raise SystemExit(0)
+if mode == "slow":
+    time.sleep(2.0)
+owner = request["owner_state"]
+completed = owner.get("native_state") == "native_completed"
+print(json.dumps({
+    "schema": "fleet.preservation-sync.v1",
+    "bridge_adapter": "federated_preservation.SshAuthorityTransport",
+    "bridge_protocol": "stdin-json-v1",
+    "ok": True,
+    "pool_key": request["pool"]["pool_key"],
+    "observation_age_seconds": 1.0,
+    "limiting_headroom_percent": 5.0,
+    "aggregate_reserve_percent": 8.0,
+    "decision": "admit_work" if completed else "request_native_preservation",
+    "protection_enabled": True,
+    "nudge_enabled": False,
+    "generation_loaded": owner["loaded_generation"] == owner["installed_generation"],
+    "directive": None if completed or mode == "none" else {
+        "request_id": "preserve-test-request",
+        "reservation_id": "preserve:preserve-test-request",
+    },
+    "next_action": "none" if completed or mode == "none" else "invoke-native-owner",
+}))
+'''
+
+
+PRESERVATION_ENV_KEYS = (
+    "CLAUDE_WARM_PRESERVATION_BRIDGE",
+    "CLAUDE_WARM_PRESERVATION_BRIDGE_ADAPTER",
+    "CLAUDE_WARM_PRESERVATION_AUTHORITY_HOST",
+    "CLAUDE_WARM_PRESERVATION_AUTHORITY_IDENTITY",
+    "CLAUDE_WARM_PRESERVATION_AUTHORITY_EXECUTABLE",
+    "CLAUDE_WARM_PRESERVATION_LEDGER_ROOT",
+    "CLAUDE_WARM_PRESERVATION_TELEMETRY_SOURCE",
+    "CLAUDE_WARM_PRESERVATION_TELEMETRY_HOST",
+    "CLAUDE_WARM_PRESERVATION_TRANSPORT",
+    "CLAUDE_WARM_PRESERVATION_PROVIDER",
+    "CLAUDE_WARM_PRESERVATION_ACCOUNT_HASH",
+    "CLAUDE_WARM_PRESERVATION_MODEL_POOL",
+    "CLAUDE_WARM_PRESERVATION_ESTIMATE_PERCENT",
+    "CLAUDE_WARM_PRESERVATION_ESTIMATE_UNCERTAINTY_PERCENT",
+    "CLAUDE_WARM_PRESERVATION_IN_FLIGHT_RESERVE_PERCENT",
+    "CLAUDE_WARM_PRESERVATION_CONTROL_RESERVE_PERCENT",
+    "CLAUDE_WARM_PRESERVATION_PROTECTION_ENABLED",
+    "CLAUDE_WARM_PRESERVATION_NUDGE_ENABLED",
+    "CLAUDE_WARM_PRESERVATION_POLL_SECONDS",
+    "CLAUDE_WARM_PRESERVATION_BRIDGE_TIMEOUT_SECONDS",
+    "CLAUDE_TEST_PRESERVATION_CALLS",
+    "CLAUDE_TEST_PRESERVATION_MODE",
+)
+
+
 # Captured Kikin metadata shape for the delayed 2026-08-04 production record.
 # Content and all identifiers are deliberately redacted; the classifier only
 # needs the public record type/subtype and lifecycle metadata shape.
@@ -139,14 +225,23 @@ class Session:
         spawn_channel=False,
         retry=300,
         compact_timeout=900,
+        preservation=False,
+        preservation_mode="directive",
     ):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
         self.fake = self.root / "fake-claude"
         self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
         self.fake.chmod(0o700)
+        self.preservation_calls = self.root / "preservation-calls.jsonl"
+        if preservation:
+            self.preservation_bridge = self.root / "fake-preservation-bridge"
+            self.preservation_bridge.write_text(FAKE_PRESERVATION_BRIDGE, encoding="utf-8")
+            self.preservation_bridge.chmod(0o700)
         self.transcript = self.root / "transcript.jsonl"
         self.transcript.write_text("", encoding="utf-8")
         environment = os.environ.copy()
+        for key in PRESERVATION_ENV_KEYS:
+            environment.pop(key, None)
         environment.update(
             {
                 "XDG_RUNTIME_DIR": str(self.root),
@@ -166,6 +261,31 @@ class Session:
                 "CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS": str(compact_timeout),
             }
         )
+        if preservation:
+            environment.update({
+                "CLAUDE_WARM_PRESERVATION_BRIDGE": str(self.preservation_bridge),
+                "CLAUDE_WARM_PRESERVATION_BRIDGE_ADAPTER": "federated_preservation.SshAuthorityTransport",
+                "CLAUDE_WARM_PRESERVATION_AUTHORITY_HOST": "authority-host",
+                "CLAUDE_WARM_PRESERVATION_AUTHORITY_IDENTITY": "kikin-kushi",
+                "CLAUDE_WARM_PRESERVATION_AUTHORITY_EXECUTABLE": "/opt/helmcortex/fleet-preservation",
+                "CLAUDE_WARM_PRESERVATION_LEDGER_ROOT": "/var/lib/helmcortex/fleet-preservation",
+                "CLAUDE_WARM_PRESERVATION_TELEMETRY_SOURCE": "authority:authority-host",
+                "CLAUDE_WARM_PRESERVATION_TELEMETRY_HOST": "t480s",
+                "CLAUDE_WARM_PRESERVATION_TRANSPORT": "ssh",
+                "CLAUDE_WARM_PRESERVATION_PROVIDER": "claude",
+                "CLAUDE_WARM_PRESERVATION_ACCOUNT_HASH": "sha256:account",
+                "CLAUDE_WARM_PRESERVATION_MODEL_POOL": "opus",
+                "CLAUDE_WARM_PRESERVATION_ESTIMATE_PERCENT": "4",
+                "CLAUDE_WARM_PRESERVATION_ESTIMATE_UNCERTAINTY_PERCENT": "1",
+                "CLAUDE_WARM_PRESERVATION_IN_FLIGHT_RESERVE_PERCENT": "0.5",
+                "CLAUDE_WARM_PRESERVATION_CONTROL_RESERVE_PERCENT": "0.5",
+                "CLAUDE_WARM_PRESERVATION_PROTECTION_ENABLED": "1",
+                "CLAUDE_WARM_PRESERVATION_NUDGE_ENABLED": "0",
+                "CLAUDE_WARM_PRESERVATION_POLL_SECONDS": "0.1",
+                "CLAUDE_WARM_PRESERVATION_BRIDGE_TIMEOUT_SECONDS": "1",
+                "CLAUDE_TEST_PRESERVATION_CALLS": str(self.preservation_calls),
+                "CLAUDE_TEST_PRESERVATION_MODE": preservation_mode,
+            })
         if channel:
             extra_args = ("--channels", "plugin:fixture@fixture", *extra_args)
             if spawn_channel:
@@ -516,6 +636,191 @@ class ClaudeWarmTests(unittest.TestCase):
             message="later normal turn did not arm a fresh timer",
         )
         self.assertTrue(session.read_state()["dirty"])
+
+    def test_federation_automatic_trigger_uses_existing_owner_gate(self):
+        session = self.make_session(delay=3300, preservation=True)
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_result"] in {
+                "directive-delivered", "accepted"
+            },
+            message="configured federation did not poll",
+        )
+        session.wait_output("COMPACT_RECEIVED")
+        state = session.read_state()
+        self.assertIn(state["preservation_state"], {"requested", "native_started"})
+        self.assertEqual(state["preservation_federation_last_decision"], "request_native_preservation")
+        self.assertFalse(state["preservation_federation_nudge_enabled"])
+
+    def test_slow_bridge_does_not_block_owner_ipc_progress(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="slow")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_poll_in_flight"],
+            message="slow bridge did not enter flight",
+        )
+        started = time.monotonic()
+        response = session.control("state")
+        elapsed = time.monotonic() - started
+        self.assertTrue(response["ok"])
+        self.assertLess(elapsed, 0.5)
+        session.status(tokens=81234)
+        session.submit_local_byte(b"ping\n")
+        session.wait_output("INPUT:b'ping\\n'")
+        snapshot = json.loads((session.state_path.parent / "status.json").read_text())
+        self.assertEqual(snapshot["current_input_context_tokens"], 81234)
+
+    def test_slow_bridge_allows_only_one_poll_in_flight(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="slow")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_poll_in_flight"],
+            message="slow bridge did not enter flight",
+        )
+        time.sleep(0.4)
+        self.assertEqual(len(session.preservation_calls.read_text(encoding="utf-8").splitlines()), 1)
+
+    def test_federation_stale_telemetry_fails_closed_without_injection(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="stale")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_result"] == "failed-closed",
+            message="stale telemetry was not rejected",
+        )
+        self.assertEqual(session.read_state()["preservation_federation_last_error"], "telemetry-refresh-required")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_federation_unavailable_authority_fails_closed_without_injection(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="unavailable")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_error"] == "bridge-exit-78",
+            message="unavailable authority was not recorded",
+        )
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_federation_malformed_output_fails_closed_without_injection(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="malformed")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_error"] == "invalid-bridge-response",
+            message="malformed bridge output was not rejected",
+        )
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_federation_timeout_fails_closed_without_injection(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="slow")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_error"] == "bridge-timeout",
+            timeout=3,
+            message="bridge timeout was not recorded",
+        )
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_federation_wrong_contract_fails_closed_without_injection(self):
+        session = self.make_session(delay=3300, preservation=True, preservation_mode="wrong-contract")
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_error"] == "invalid-bridge-contract",
+            message="wrong bridge contract was not rejected",
+        )
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_federation_replay_delivers_one_request_id_idempotently(self):
+        session = self.make_session(delay=3300, preservation=True)
+        session.stop_and_bind()
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_state"] in {"requested", "native_started"},
+            message="first preservation directive was not delivered",
+        )
+        session.wait_output("COMPACT_RECEIVED")
+        first = len(session.preservation_calls.read_text(encoding="utf-8").splitlines())
+        wait_until(
+            lambda: len(session.preservation_calls.read_text(encoding="utf-8").splitlines()) > first,
+            message="replay poll did not reach bridge",
+        )
+        self.assertEqual(session.read_state()["preservation_request_id"], "preserve-test-request")
+        self.assertEqual(bytes(session.output).count(b"COMPACT_RECEIVED"), 1)
+
+    def test_federation_busy_owner_waits_for_validated_stop(self):
+        session = self.make_session(delay=3300, preservation=True)
+        session.event("session-start", transcript_path=str(session.transcript))
+        session.status(tokens=80000)
+        session.event("stop", stop_hook_active=False)
+        session.event("user-prompt-submit")
+        wait_until(lambda: session.read_state() and session.read_state()["status"] == "active")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_state"] == "requested",
+            message="busy owner did not queue preservation",
+        )
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+        session.status(tokens=80000)
+        session.event("stop", stop_hook_active=False)
+        session.wait_output("COMPACT_RECEIVED")
+
+    def test_federation_native_completion_is_reported_after_post_compact(self):
+        session = self.make_session(delay=3300, preservation=True)
+        session.stop_and_bind()
+        session.wait_output("COMPACT_RECEIVED")
+        session.event("post-compact")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_state"] == "native_completed",
+            message="native completion was not persisted",
+        )
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["preservation_federation_last_decision"] == "admit_work",
+            message="completed native state was not reconciled with federation",
+        )
+        state = session.read_state()
+        self.assertFalse(state["dirty"])
+        self.assertTrue(state["preservation_federation_generation_loaded"])
+
+    def test_unconfigured_federation_is_inert(self):
+        session = self.make_session(delay=3300)
+        session.stop_and_bind()
+        time.sleep(0.2)
+        state = session.read_state()
+        self.assertFalse(state["preservation_federation_enabled"])
+        self.assertIsNone(state["preservation_federation_next_poll_monotonic"])
+        self.assertIsNone(state["preservation_federation_last_poll_at"])
+        self.assertIsNone(state["preservation_federation_last_result"])
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
+    def test_disabled_federation_does_not_spin_or_create_poll_deadline(self):
+        session = self.make_session(delay=3300)
+        owner = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        owner.enabled = False
+        owner.next_poll = None
+        owner.bridge_thread = None
+        owner.bridge_result = None
+        calls = 0
+
+        def fake_failure(_reason):
+            nonlocal calls
+            calls += 1
+
+        owner._failure = fake_failure
+        for _ in range(10000):
+            self.module.PreservationFederationClient.poll(owner)
+        self.assertEqual(calls, 0)
+        self.assertIsNone(owner.next_poll)
+        self.assertIsNone(owner.bridge_thread)
+        self.assertIsNone(session.read_state()["preservation_federation_next_poll_monotonic"])
 
     def test_last_session_record_survives_exit(self):
         # The runtime dir is removed at exit; the label-keyed record under

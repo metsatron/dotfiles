@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""Read or reconcile the bounded OpenCode continuity candidate."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import tempfile
+import sys
+import time
+
+
+NUDGE_SCHEMA = "dotcortex.opencode-nudge-state.v1"
+
+
+def root() -> Path:
+    configured = os.environ.get("OPENCODE_WARM_STATE_DIR")
+    if configured:
+        return Path(configured).expanduser()
+    base = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))).expanduser()
+    return base / "opencode-idle-continuity"
+
+
+def read(path: Path) -> object | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def write(path: Path, value: dict) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    finally:
+        try:
+            os.unlink(temporary)
+        except FileNotFoundError:
+            pass
+
+
+def update_nudge(command: str) -> dict:
+    directory = root()
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = directory / "nudge.lock"
+    with lock_path.open("a+", encoding="utf-8") as stream:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+        path = directory / "nudge.json"
+        current = read(path)
+        if not isinstance(current, dict) or current.get("schema") != NUDGE_SCHEMA:
+            current = {
+                "schema": NUDGE_SCHEMA, "policy": "OFF", "agent_state": "DISARMED",
+                "reset_epoch": None, "sent_for_reset_epoch": None,
+                "delivery_state": "none",
+            }
+        if command == "arm":
+            current.update(policy="AGENT", agent_state="ARMED")
+        elif command == "disarm":
+            current.update(policy="OFF", agent_state="DISARMED", force_pending=False)
+        elif command == "force-next":
+            current.update(policy="FORCE", force_pending=True)
+        else:
+            raise ValueError("unknown nudge control")
+        current["updated_at"] = time.time()
+        write(path, current)
+        return current
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("status", help="print durable candidate state without mutation")
+    sub.add_parser("arm", help="allow one reset-aware nudge for each new reset epoch")
+    sub.add_parser("disarm", help="disable automatic reset-aware nudges")
+    sub.add_parser("force-next", help="request one nudge at the next validated boundary")
+    checkpoint = sub.add_parser("checkpoint", help="refresh the exact idle-session handoff without compacting")
+    checkpoint.add_argument("session")
+    confirm = sub.add_parser("confirm", help="reconcile a native compaction event receipt")
+    confirm.add_argument("session")
+    args = parser.parse_args()
+    if args.command == "status":
+        directory = root()
+        print(json.dumps({
+            "state": read(directory / "state.json"),
+            "receipt": read(directory / "receipt.json"),
+            "nudge": read(directory / "nudge.json"),
+        }, sort_keys=True))
+        return 0
+    if args.command in {"arm", "disarm", "force-next"}:
+        print(json.dumps(update_nudge(args.command), sort_keys=True))
+        return 0
+    warm = Path(__file__).with_name("opencode-warm")
+    if args.command == "checkpoint":
+        os.execv(str(warm), [str(warm), "--session", args.session,
+                 "--event", "session.idle", "--observed-at", str(time.time()),
+                 "--prepare-only"])
+    os.execv(str(warm), [str(warm), "--session", args.session,
+             "--event", "session.compacted", "--observed-at", str(time.time())])
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
