@@ -275,7 +275,7 @@ class Session:
                 "CLAUDE_WARM_PRESERVATION_PROVIDER": "claude",
                 "CLAUDE_WARM_PRESERVATION_ACCOUNT_HASH": "sha256:account",
                 "CLAUDE_WARM_PRESERVATION_MODEL_POOL": "opus",
-                "CLAUDE_WARM_PRESERVATION_ESTIMATE_PERCENT": "4",
+                "CLAUDE_WARM_PRESERVATION_ESTIMATE_PERCENT": "5",
                 "CLAUDE_WARM_PRESERVATION_ESTIMATE_UNCERTAINTY_PERCENT": "1",
                 "CLAUDE_WARM_PRESERVATION_IN_FLIGHT_RESERVE_PERCENT": "0.5",
                 "CLAUDE_WARM_PRESERVATION_CONTROL_RESERVE_PERCENT": "0.5",
@@ -652,6 +652,34 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertIn(state["preservation_state"], {"requested", "native_started"})
         self.assertEqual(state["preservation_federation_last_decision"], "request_native_preservation")
         self.assertFalse(state["preservation_federation_nudge_enabled"])
+
+    def test_federation_estimate_scales_upward_from_live_context(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 5.0}
+        client.owner = mock.Mock(current_tokens=271672)
+        self.assertEqual(client._scaled_estimate(), (3.0, True))
+        client.owner.current_tokens = 500000
+        self.assertEqual(client._scaled_estimate(), (5.0, True))
+        client.owner.current_tokens = 1000000
+        self.assertEqual(client._scaled_estimate(), (10.0, True))
+
+    def test_federation_estimate_excludes_known_uncompactable_context(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 4.0}
+        client.owner = mock.Mock(current_tokens=self.module.MIN_TOKENS - 1)
+        self.assertEqual(client._scaled_estimate(), (0.0, False))
+
+    def test_federation_unknown_context_uses_full_conservative_estimate(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 5.0}
+        client.owner = mock.Mock(current_tokens=None)
+        self.assertEqual(client._scaled_estimate(), (5.0, True))
 
     def test_slow_bridge_does_not_block_owner_ipc_progress(self):
         session = self.make_session(delay=3300, preservation=True, preservation_mode="slow")
