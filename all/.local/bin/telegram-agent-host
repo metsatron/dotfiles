@@ -18,7 +18,7 @@ AGENTS_DIR="${DOTCORTEX_AGENTS_DIR:-$HOME/DotCortex/all/.bots}"
 CONFIG_DIR="$HOME/.config"
 HOSTS_FILE="$AGENTS_DIR/hosts.conf"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agents"
-KNOWN_AGENTS="opencode ductor claudecode hermes codex pi-agent"
+KNOWN_AGENTS="opencode ductor claudecode hermes codex deepseek-harness pi-agent"
 DUCTOR_HOME_DIR="${DUCTOR_HOME_DIR:-$HOME/HelmCortex/FORGE/brain/ductor}"
 DUCTOR_SUPERVISOR="${DUCTOR_SUPERVISOR:-$HOME/HelmCortex/FORGE/bin/ductor-supervise}"
 CORE_PROFILE_BIN="${CORE_PROFILE_BIN:-$HOME/.guix-extra-profiles/core/core/bin}"
@@ -34,6 +34,25 @@ export OPENCODE_TELEGRAM_HOME
 OPENCODE_OWNER_HELPER="${OPENCODE_OWNER_HELPER:-${DOTCORTEX_BIN_DIR:-$HOME/DotCortex/all/.local/bin}/opencode-owner}"
 OPENCODE_BACKEND_PID_FILE="$STATE_DIR/opencode-backend.pid"
 OPENCODE_POLLER_PID_FILE="$STATE_DIR/opencode-poller.pid"
+DSH_TELEGRAM_ENV_FILE="${DSH_TELEGRAM_ENV_FILE:-$HOME/.config/deepseek-harness-telegram/env}"
+DSH_TELEGRAM_PID_FILE="${DSH_TELEGRAM_PID_FILE:-$STATE_DIR/deepseek-harness.pid}"
+DSH_TELEGRAM_LOG_FILE="${DSH_TELEGRAM_LOG_FILE:-$STATE_DIR/deepseek-harness.log}"
+DSH_TELEGRAM_LOG_MAX_BYTES="${DSH_TELEGRAM_LOG_MAX_BYTES:-10485760}"
+DSH_TELEGRAM_LOG_KEEP="${DSH_TELEGRAM_LOG_KEEP:-5}"
+DSH_TELEGRAM_PROFILE="${DSH_TELEGRAM_PROFILE:-helmcortex-telegram}"
+DSH_TELEGRAM_PLUGIN_ROOT="${DSH_TELEGRAM_PLUGIN_ROOT:-$HOME/HelmCortex/NEXUS/git/dsh-telegram}"
+DSH_TELEGRAM_WORKSPACE="${DSH_TELEGRAM_WORKSPACE:-$HOME/.local/share/deepseek-harness-telegram/workspace}"
+DSH_HOME="${DSH_HOME:-$HOME/.local/share/deepseek-harness-telegram/dsh-home}"
+DSH_TELEGRAM_SETTINGS_TEMPLATE="${DSH_TELEGRAM_SETTINGS_TEMPLATE:-$AGENTS_DIR/templates/deepseek-harness-settings.yaml}"
+DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE="${DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE:-$AGENTS_DIR/templates/deepseek-harness-cordis.patch.yml}"
+DSH_TELEGRAM_MODEL_PROVIDER="${DSH_TELEGRAM_MODEL_PROVIDER:-neuralwatt}"
+DSH_TELEGRAM_MODEL="${DSH_TELEGRAM_MODEL:-deepseek-v4-pro-preview}"
+DSH_TELEGRAM_PROVIDER_BASE_URL="${DSH_TELEGRAM_PROVIDER_BASE_URL:-https://api.neuralwatt.com/v1}"
+export DSH_HOME
+GEMMA_TELEGRAM_WRAPPER="${GEMMA_TELEGRAM_WRAPPER:-$HOME/HelmCortex/FORGE/bin/gemma-pi-telegram}"
+GEMMA_TELEGRAM_STATE_DIR="${GEMMA_TELEGRAM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gemma-pi-telegram}"
+GEMMA_TELEGRAM_PID_FILE="$GEMMA_TELEGRAM_STATE_DIR/adapter.pid"
+GEMMA_TELEGRAM_LOG_FILE="${GEMMA_TELEGRAM_LOG_FILE:-$GEMMA_TELEGRAM_STATE_DIR/adapter.log}"
 
 load_opencode_continuity_policy() {
     local policy_file="${OPENCODE_WARM_POLICY_ENV:-$HOME/.config/opencode-continuity/policy.env}"
@@ -73,7 +92,7 @@ Commands:
   switch <machine>  Switch to another machine's agents (disables local, enables remote)
   bring             Bring agents to this machine (stop remote, start local)
 
-Agents: opencode ductor claudecode hermes codex pi-agent
+Agents: opencode ductor claudecode hermes codex deepseek-harness pi-agent
 
 Examples:
   telegram-agent-host list
@@ -126,7 +145,8 @@ list_agents() {
     echo "  claudecode  - Claude Code (MCP send/receive)"
     echo "  hermes      - Hermes gateway (native Telegram)"
     echo "  codex       - HelmAstra Codex app-server + Telegram bot"
-    echo "  pi-agent    - Pi Coding Agent (no bot yet)"
+    echo "  deepseek-harness - DeepSeek Harness + dsh-telegram bot"
+    echo "  pi-agent    - Pi Agent Gemma Telegram adapter"
     echo ""
     echo "Configured hosts:"
     if [ -f "$HOSTS_FILE" ]; then
@@ -322,6 +342,355 @@ check_codex() {
     fi
 }
 
+deepseek_harness_config_file() {
+    printf '%s\n' "$DSH_TELEGRAM_WORKSPACE/.pi/telegram.json"
+}
+
+deepseek_harness_pid_matches() {
+    local pid="${1:-}" profile="${2:-$DSH_TELEGRAM_PROFILE}"
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    python3 - "$pid" "$profile" <<'PY'
+from pathlib import Path
+import sys
+
+pid, profile = sys.argv[1], sys.argv[2]
+raw = Path("/proc", pid, "cmdline").read_bytes().split(b"\0")
+argv = [part.decode("utf-8", "replace") for part in raw if part]
+basenames = {Path(arg).name for arg in argv}
+if "dsh" not in basenames:
+    raise SystemExit(1)
+for idx, arg in enumerate(argv[:-1]):
+    if arg == "--profile" and argv[idx + 1] == profile:
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+deepseek_harness_running() {
+    local pid
+    [ -r "$DSH_TELEGRAM_PID_FILE" ] || return 1
+    pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
+    deepseek_harness_pid_matches "$pid"
+}
+
+deepseek_harness_find_unowned() {
+    python3 - "$$" "$DSH_TELEGRAM_PROFILE" "$DSH_TELEGRAM_PID_FILE" <<'PY'
+from pathlib import Path
+import sys
+
+self_pid = int(sys.argv[1])
+profile = sys.argv[2]
+pid_file = Path(sys.argv[3])
+owned = None
+try:
+    owned = int(pid_file.read_text().strip())
+except Exception:
+    pass
+
+for proc in Path("/proc").iterdir():
+    if not proc.name.isdigit():
+        continue
+    pid = int(proc.name)
+    if pid in {self_pid, owned}:
+        continue
+    try:
+        raw = (proc / "cmdline").read_bytes().split(b"\0")
+    except OSError:
+        continue
+    argv = [part.decode("utf-8", "replace") for part in raw if part]
+    if not argv:
+        continue
+    if "dsh" not in {Path(arg).name for arg in argv}:
+        continue
+    for idx, arg in enumerate(argv[:-1]):
+        if arg == "--profile" and argv[idx + 1] == profile:
+            print(pid)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+deepseek_harness_rotate_log() {
+    local log="$DSH_TELEGRAM_LOG_FILE" max="$DSH_TELEGRAM_LOG_MAX_BYTES" keep="$DSH_TELEGRAM_LOG_KEEP"
+    case "$max" in ''|*[!0-9]*) max=10485760 ;; esac
+    case "$keep" in ''|*[!0-9]*) keep=5 ;; esac
+    [ -f "$log" ] || return 0
+    local size
+    size=$(wc -c < "$log" 2>/dev/null || printf '0')
+    [ "$size" -le "$max" ] && return 0
+    local i prev
+    i="$keep"
+    while [ "$i" -gt 1 ]; do
+        prev=$((i - 1))
+        [ -f "$log.$prev" ] && mv "$log.$prev" "$log.$i"
+        i="$prev"
+    done
+    mv "$log" "$log.1"
+}
+
+deepseek_harness_load_env() {
+    local env_file="$DSH_TELEGRAM_ENV_FILE" mode key value
+    if [ ! -f "$env_file" ]; then
+        echo "DeepSeek Harness private env file is missing: $env_file" >&2
+        return 1
+    fi
+    mode=$(stat -c '%a' "$env_file" 2>/dev/null || printf '000')
+    if [ "$mode" != "600" ]; then
+        echo "DeepSeek Harness private env file must be mode 0600: $env_file" >&2
+        return 1
+    fi
+    while IFS='=' read -r key value; do
+        key="${key#export }"
+        key="${key%$'\r'}"
+        value="${value%$'\r'}"
+        case "$key" in ''|\#*) continue ;; esac
+        case "$key" in
+            TELEGRAM_BOT_TOKEN|TELEGRAM_BOT_TOKEN_FILE|DEEPSEEK_API_KEY|DEEPSEEK_API_KEY_FILE|\
+            DSH_HOME|DSH_TELEGRAM_PROFILE|DSH_TELEGRAM_WORKSPACE|DSH_TELEGRAM_PLUGIN_ROOT|\
+            DSH_TELEGRAM_MODEL_PROVIDER|DSH_TELEGRAM_MODEL|DSH_TELEGRAM_PROVIDER_BASE_URL)
+                value="${value%\"}"
+                value="${value#\"}"
+                value="${value%\'}"
+                value="${value#\'}"
+                export "$key=$value"
+                ;;
+        esac
+    done < "$env_file"
+}
+
+deepseek_harness_validate_private_config() {
+    local token_file key_file config settings profile_patch
+    deepseek_harness_load_env || return 1
+
+    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+        token_file="${TELEGRAM_BOT_TOKEN_FILE:-}"
+        if [ -z "$token_file" ]; then
+            echo "DeepSeek Harness Telegram token is missing; set TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN_FILE" >&2
+            return 1
+        fi
+        if [ ! -r "$token_file" ]; then
+            echo "DeepSeek Harness token file is not readable: $token_file" >&2
+            return 1
+        fi
+        if [ "$(stat -c '%a' "$token_file" 2>/dev/null || printf '000')" != "600" ]; then
+            echo "DeepSeek Harness token file must be mode 0600: $token_file" >&2
+            return 1
+        fi
+    fi
+
+    if [ -z "${DEEPSEEK_API_KEY:-}" ]; then
+        key_file="${DEEPSEEK_API_KEY_FILE:-}"
+        if [ -z "$key_file" ] || [ "$key_file" = "YOUR_HELMCORTEX_NEURALWATT_KEY_FILE" ]; then
+            echo "DeepSeek Harness requires DEEPSEEK_API_KEY_FILE pointing to the private HelmCortex NeuralWatt key" >&2
+            return 1
+        fi
+        if [ ! -r "$key_file" ]; then
+            echo "HelmCortex NeuralWatt key file is not readable: $key_file" >&2
+            return 1
+        fi
+        if [ "$(stat -c '%a' "$key_file" 2>/dev/null || printf '000')" != "600" ]; then
+            echo "HelmCortex NeuralWatt key file must be mode 0600: $key_file" >&2
+            return 1
+        fi
+        IFS= read -r DEEPSEEK_API_KEY < "$key_file" || true
+        DEEPSEEK_API_KEY="${DEEPSEEK_API_KEY%$'\r'}"
+        export DEEPSEEK_API_KEY
+        if [ -z "$DEEPSEEK_API_KEY" ]; then
+            echo "HelmCortex NeuralWatt key file is empty: $key_file" >&2
+            return 1
+        fi
+    fi
+
+    if [ "$DSH_TELEGRAM_MODEL_PROVIDER" != "neuralwatt" ] || \
+       [ "$DSH_TELEGRAM_MODEL" != "deepseek-v4-pro-preview" ] || \
+       [ "$DSH_TELEGRAM_PROVIDER_BASE_URL" != "https://api.neuralwatt.com/v1" ]; then
+        echo "DeepSeek Harness must target neuralwatt/deepseek-v4-pro-preview at https://api.neuralwatt.com/v1; no fallback is permitted" >&2
+        return 1
+    fi
+
+    settings="$DSH_HOME/settings.yaml"
+    if [ ! -r "$DSH_TELEGRAM_SETTINGS_TEMPLATE" ]; then
+        echo "DeepSeek Harness NeuralWatt settings template is missing: $DSH_TELEGRAM_SETTINGS_TEMPLATE" >&2
+        return 1
+    fi
+    if [ ! -r "$settings" ]; then
+        echo "DeepSeek Harness settings are missing: $settings (copy the NeuralWatt template exactly)" >&2
+        return 1
+    fi
+    if ! cmp -s "$settings" "$DSH_TELEGRAM_SETTINGS_TEMPLATE"; then
+        echo "DeepSeek Harness settings differ from the single-model NeuralWatt Pro template; refusing possible fallback" >&2
+        return 1
+    fi
+
+    profile_patch="$DSH_HOME/profiles/$DSH_TELEGRAM_PROFILE/cordis.patch.yml"
+    if [ ! -r "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" ]; then
+        echo "DeepSeek Harness credential-containment patch template is missing: $DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" >&2
+        return 1
+    fi
+    if [ ! -r "$profile_patch" ]; then
+        echo "DeepSeek Harness profile patch is missing: $profile_patch (copy the credential-containment template exactly)" >&2
+        return 1
+    fi
+    if ! cmp -s "$profile_patch" "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"; then
+        echo "DeepSeek Harness profile patch does not disable native DeepSeek chat/search routes; refusing credential egress" >&2
+        return 1
+    fi
+
+    config="$(deepseek_harness_config_file)"
+    if [ ! -r "$config" ]; then
+        echo "DeepSeek Harness Telegram config is missing: $config" >&2
+        return 1
+    fi
+    python3 - "$config" "$DSH_TELEGRAM_MODEL_PROVIDER" "$DSH_TELEGRAM_MODEL" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+expected_provider, expected_model = sys.argv[2], sys.argv[3]
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"DeepSeek Harness Telegram config is invalid JSON: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+allowed = (((data.get("security") or {}).get("allowedChatIds")) or [])
+if not isinstance(allowed, list):
+    print("DeepSeek Harness security.allowedChatIds must be a list", file=sys.stderr)
+    raise SystemExit(1)
+if not allowed:
+    print("DeepSeek Harness security.allowedChatIds is empty; startup remains deny-all", file=sys.stderr)
+    raise SystemExit(1)
+if not all(isinstance(item, int) for item in allowed):
+    print("DeepSeek Harness security.allowedChatIds must contain numeric chat IDs only", file=sys.stderr)
+    raise SystemExit(1)
+model = data.get("model") or {}
+if model.get("provider") != expected_provider or model.get("model") != expected_model:
+    print(
+        f"DeepSeek Harness Telegram model must be {expected_provider}/{expected_model}; no fallback is permitted",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+PY
+}
+
+deepseek_harness_preflight_model() {
+    env \
+        DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+        DSH_TELEGRAM_PROVIDER_BASE_URL="$DSH_TELEGRAM_PROVIDER_BASE_URL" \
+        DSH_TELEGRAM_MODEL="$DSH_TELEGRAM_MODEL" \
+        python3 - <<'PY'
+import json
+import os
+import sys
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+base_url = os.environ["DSH_TELEGRAM_PROVIDER_BASE_URL"].rstrip("/")
+model = os.environ["DSH_TELEGRAM_MODEL"]
+request = Request(
+    f"{base_url}/models",
+    headers={"Authorization": f"Bearer {os.environ['DEEPSEEK_API_KEY']}"},
+)
+try:
+    with urlopen(request, timeout=15) as response:
+        payload = json.load(response)
+except HTTPError as exc:
+    print(f"NeuralWatt model visibility preflight failed: HTTP {exc.code}", file=sys.stderr)
+    raise SystemExit(1)
+except (URLError, TimeoutError, OSError, ValueError) as exc:
+    print(f"NeuralWatt model visibility preflight failed: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+visible = set()
+data = payload.get("data") if isinstance(payload, dict) else None
+if isinstance(data, list):
+    visible.update(item.get("id") for item in data if isinstance(item, dict) and isinstance(item.get("id"), str))
+models = payload.get("models") if isinstance(payload, dict) else None
+if isinstance(models, dict):
+    visible.update(key for key in models if isinstance(key, str))
+if model not in visible:
+    print(
+        f"NeuralWatt does not expose required model {model}; refusing Flash fallback and poller start",
+        file=sys.stderr,
+    )
+    raise SystemExit(1)
+print(f"NeuralWatt model visibility preflight passed: {model}")
+PY
+}
+
+deepseek_harness_validate_install() {
+    if ! env PATH="$AGENT_RUNTIME_PATH" bash -c 'command -v dsh >/dev/null 2>&1'; then
+        echo "DeepSeek Harness CLI not found in PATH; run loom npm:apply after tangling" >&2
+        return 1
+    fi
+    if [ ! -d "$DSH_TELEGRAM_PLUGIN_ROOT" ]; then
+        echo "dsh-telegram checkout missing: $DSH_TELEGRAM_PLUGIN_ROOT" >&2
+        return 1
+    fi
+    python3 - "$DSH_TELEGRAM_PLUGIN_ROOT/package.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"dsh-telegram package.json unreadable: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+if data.get("name") != "dsh-telegram":
+    print(f"dsh-telegram package name mismatch: {data.get('name')}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+    [ -f "$DSH_TELEGRAM_PLUGIN_ROOT/package-lock.json" ] || {
+        echo "dsh-telegram package-lock.json missing; refusing unverified build source" >&2
+        return 1
+    }
+    [ -f "$DSH_TELEGRAM_PLUGIN_ROOT/dist/index.js" ] || {
+        echo "dsh-telegram build output missing; run loom bun:apply before startup" >&2
+        return 1
+    }
+    python3 - "$DSH_HOME/profiles/$DSH_TELEGRAM_PROFILE/package.json" "$DSH_TELEGRAM_PLUGIN_ROOT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+plugin_root = Path(sys.argv[2]).expanduser()
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except Exception as exc:
+    print(f"dsh profile package.json unreadable: {exc}", file=sys.stderr)
+    raise SystemExit(1)
+
+deps = {}
+for key in ("dependencies", "devDependencies", "optionalDependencies"):
+    value = data.get(key)
+    if isinstance(value, dict):
+        deps.update(value)
+
+expected = f"link:{plugin_root}"
+if deps.get("dsh-telegram") != expected:
+    print(f"dsh profile '{path.parent.name}' does not depend on dsh-telegram as {expected}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+check_deepseek_harness() {
+    if deepseek_harness_running; then
+        local pid
+        pid="$(cat "$DSH_TELEGRAM_PID_FILE")"
+        echo "  deepseek-harness: RUNNING pid=$pid profile=$DSH_TELEGRAM_PROFILE"
+    elif [ -r "$DSH_TELEGRAM_PID_FILE" ]; then
+        echo "  deepseek-harness: STOPPED (stale owner state)"
+        return 1
+    else
+        echo "  deepseek-harness: STOPPED"
+        return 1
+    fi
+}
+
 codex_telegram_running() {
     local adapter="${CODEX_TELEGRAM_ADAPTER:-$HOME/HelmCortex/FORGE/scripts/codex_telegram.py}"
     local pid_file="$STATE_DIR/codex-helmastra-telegram.pid"
@@ -340,12 +709,19 @@ codex_telegram_running() {
 }
 
 gemma_telegram_running() {
-    local pid_file="$HOME/.local/state/gemma-pi-telegram/adapter.pid"
-    [ -f "$pid_file" ] || return 1
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null)" || return 1
+    local pid argument
+    [ -f "$GEMMA_TELEGRAM_PID_FILE" ] || return 1
+    pid="$(cat "$GEMMA_TELEGRAM_PID_FILE" 2>/dev/null)" || return 1
     [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    kill -0 "$pid" 2>/dev/null
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        case "$argument" in
+            */gemma_telegram.py|gemma_telegram.py)
+                return 0
+                ;;
+        esac
+    done < "/proc/$pid/cmdline"
+    return 1
 }
 
 start_pi_agent() {
@@ -353,25 +729,57 @@ start_pi_agent() {
         echo "pi-agent (Gemma Telegram): already running"
         return 0
     fi
-    echo "Gemma Telegram is not running."
-    echo "Start with: gemma-pi-telegram"
-    echo "Env file:   $HOME/.config/gemma-pi-telegram/.env (provision from KeePass)"
+    if [ ! -x "$GEMMA_TELEGRAM_WRAPPER" ]; then
+        echo "Gemma Telegram wrapper not found: $GEMMA_TELEGRAM_WRAPPER" >&2
+        return 1
+    fi
+    if [ ! -f "$HOME/.config/gemma-pi-telegram/.env" ]; then
+        echo "Gemma Telegram private env missing: $HOME/.config/gemma-pi-telegram/.env" >&2
+        return 1
+    fi
+    mkdir -p "$GEMMA_TELEGRAM_STATE_DIR"
+    echo "Starting pi-agent (Gemma Telegram)..."
+    nohup setsid env PATH="$AGENT_RUNTIME_PATH" "$GEMMA_TELEGRAM_WRAPPER" > "$GEMMA_TELEGRAM_LOG_FILE" 2>&1 </dev/null &
+    for _ in {1..20}; do
+        gemma_telegram_running && return 0
+        sleep 0.5
+    done
+    echo "Gemma Telegram failed readiness; inspect $GEMMA_TELEGRAM_LOG_FILE" >&2
+    return 1
 }
 
 stop_pi_agent() {
-    local pid_file="$HOME/.local/state/gemma-pi-telegram/adapter.pid"
     if ! gemma_telegram_running; then
         echo "pi-agent: not running"
         return 0
     fi
-    local pid
-    pid="$(cat "$pid_file" 2>/dev/null)"
-    kill -TERM "$pid" 2>/dev/null || true
+    local pid pgid
+    pid="$(cat "$GEMMA_TELEGRAM_PID_FILE" 2>/dev/null)"
+    pgid=$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)
+    if [ "$pgid" = "$pid" ]; then
+        kill -TERM -- "-$pgid" 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+    for _ in {1..20}; do
+        gemma_telegram_running || break
+        sleep 0.25
+    done
+    if gemma_telegram_running; then
+        echo "Gemma Telegram did not stop gracefully; forcing verified process group" >&2
+        if [ "$pgid" = "$pid" ]; then
+            kill -KILL -- "-$pgid" 2>/dev/null || true
+        else
+            kill -KILL "$pid" 2>/dev/null || true
+        fi
+    fi
+    gemma_telegram_running && return 1
+    rm -f "$GEMMA_TELEGRAM_PID_FILE"
 }
 
 check_pi_agent() {
     if gemma_telegram_running; then
-        echo "  pi-agent (gemma-pi-telegram): RUNNING"
+        echo "  pi-agent (gemma-pi-telegram): RUNNING pid=$(cat "$GEMMA_TELEGRAM_PID_FILE")"
     else
         echo "  pi-agent (gemma-pi-telegram): STOPPED"
     fi
@@ -385,6 +793,10 @@ status_cmd() {
         check_opencode
         return
     fi
+    if [ "$requested" = "deepseek-harness" ]; then
+        check_deepseek_harness
+        return
+    fi
     echo "Host: $host"
     echo "Enabled agents: $(get_enabled_agents "$host")"
     echo ""
@@ -394,6 +806,7 @@ status_cmd() {
     check_claudecode
     check_hermes
     check_codex
+    check_deepseek_harness || true
     check_pi_agent
 }
 
@@ -494,6 +907,7 @@ sync_configs() {
 
     mkdir -p "$HOME/.config/opencode-telegram-bot"
     mkdir -p "$HOME/.config/codex-telegram-helmastra"
+    mkdir -p "$HOME/.config/deepseek-harness-telegram"
     mkdir -p "$HOME/.config/pi-agent" 2>/dev/null || true
     mkdir -p "$HOME/.config/telegram-agents"
 
@@ -626,6 +1040,45 @@ start_agent() {
                 fi
             fi
             ;;
+        deepseek-harness)
+            mkdir -p "$STATE_DIR"
+            deepseek_harness_validate_private_config || return 1
+            deepseek_harness_validate_install || return 1
+            if deepseek_harness_running; then
+                echo "deepseek-harness already has an owned poller"
+                return 1
+            fi
+            if [ -r "$DSH_TELEGRAM_PID_FILE" ]; then
+                echo "DeepSeek Harness owner state is stale or invalid; run telegram-agent-host stop deepseek-harness first" >&2
+                return 1
+            fi
+            local other_pid
+            other_pid="$(deepseek_harness_find_unowned 2>/dev/null || true)"
+            if [ -n "$other_pid" ]; then
+                echo "Refusing DeepSeek Harness start: another dsh poller already uses profile $DSH_TELEGRAM_PROFILE (pid $other_pid)" >&2
+                return 1
+            fi
+            deepseek_harness_preflight_model || return 1
+            deepseek_harness_rotate_log
+            echo "Starting DeepSeek Harness Telegram profile $DSH_TELEGRAM_PROFILE..."
+            (
+                cd "$DSH_TELEGRAM_WORKSPACE"
+                exec nohup setsid env \
+                    PATH="$AGENT_RUNTIME_PATH" \
+                    DSH_HOME="$DSH_HOME" \
+                    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
+                    TELEGRAM_BOT_TOKEN_FILE="${TELEGRAM_BOT_TOKEN_FILE:-}" \
+                    DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY" \
+                    dsh --profile "$DSH_TELEGRAM_PROFILE" web
+            ) >> "$DSH_TELEGRAM_LOG_FILE" 2>&1 </dev/null &
+            printf '%s\n' "$!" > "$DSH_TELEGRAM_PID_FILE"
+            sleep 2
+            if ! deepseek_harness_running; then
+                rm -f "$DSH_TELEGRAM_PID_FILE"
+                echo "DeepSeek Harness Telegram failed to publish an owned poller; inspect $DSH_TELEGRAM_LOG_FILE" >&2
+                return 1
+            fi
+            ;;
         pi-agent)
             start_pi_agent
             ;;
@@ -693,6 +1146,35 @@ stop_agent() {
                 return 1
             fi
             ;;
+        deepseek-harness)
+            local dsh_pid dsh_pgid
+            if deepseek_harness_running; then
+                dsh_pid=$(cat "$DSH_TELEGRAM_PID_FILE")
+                dsh_pgid=$(ps -o pgid= -p "$dsh_pid" 2>/dev/null | tr -d ' ' || true)
+                if [ "$dsh_pgid" = "$dsh_pid" ]; then
+                    kill -TERM -- "-$dsh_pgid" 2>/dev/null || true
+                else
+                    kill -TERM "$dsh_pid" 2>/dev/null || true
+                fi
+                for _ in {1..20}; do
+                    deepseek_harness_running || break
+                    sleep 0.25
+                done
+                if deepseek_harness_running; then
+                    echo "DeepSeek Harness Telegram did not stop gracefully; forcing its verified process group" >&2
+                    if [ "$dsh_pgid" = "$dsh_pid" ]; then
+                        kill -KILL -- "-$dsh_pgid" 2>/dev/null || true
+                    else
+                        kill -KILL "$dsh_pid" 2>/dev/null || true
+                    fi
+                fi
+            fi
+            if deepseek_harness_running; then
+                echo "DeepSeek Harness Telegram failed to stop" >&2
+                return 1
+            fi
+            rm -f "$DSH_TELEGRAM_PID_FILE"
+            ;;
         pi-agent)
             stop_pi_agent
             ;;
@@ -727,7 +1209,7 @@ start_all() {
 }
 
 stop_all() {
-    for agent in opencode ductor claudecode hermes codex pi-agent; do
+    for agent in opencode ductor claudecode hermes codex deepseek-harness pi-agent; do
         stop_agent "$agent" 2>/dev/null || true
     done
     echo "All agents stopped"
