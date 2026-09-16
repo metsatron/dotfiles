@@ -135,7 +135,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                     "security": {"allowedChatIds": allowed_chat_ids},
                     "model": {
                         "provider": "neuralwatt",
-                        "model": "deepseek-v4-pro-preview",
+                        "model": "deepseek-v4-flash",
                     },
                 }
             ),
@@ -159,7 +159,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                 "      api: openai-completions",
                 "      baseURL: https://api.neuralwatt.com/v1",
                 "      models:",
-                "        - id: deepseek-v4-pro-preview",
+                "        - id: deepseek-v4-flash",
                 "          contextWindow: 1048576",
                 "          compat:",
                 "            thinkingFormat: deepseek",
@@ -177,7 +177,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                 "- id: agent-default-model",
                 "  config:",
                 "    provider: neuralwatt",
-                "    model: deepseek-v4-pro-preview",
+                "    model: deepseek-v4-flash",
                 "",
                 "- id: llm-deepseek",
                 "  disabled: true",
@@ -207,7 +207,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                     f"DSH_TELEGRAM_WORKSPACE={workspace}",
                     f"DSH_TELEGRAM_PLUGIN_ROOT={plugin}",
                     "DSH_TELEGRAM_MODEL_PROVIDER=neuralwatt",
-                    "DSH_TELEGRAM_MODEL=deepseek-v4-pro-preview",
+                    "DSH_TELEGRAM_MODEL=deepseek-v4-flash",
                     "DSH_TELEGRAM_PROVIDER_BASE_URL=https://api.neuralwatt.com/v1",
                     "",
                 ]
@@ -263,7 +263,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.prepare_deepseek_harness([123])
         config = self.home / ".local/share/deepseek-harness-telegram/workspace/.pi/telegram.json"
         data = json.loads(config.read_text(encoding="utf-8"))
-        data["model"] = {"provider": "neuralwatt", "model": "deepseek-v4-flash"}
+        data["model"] = {"provider": "neuralwatt", "model": "deepseek-v4-flash-flex"}
         config.write_text(json.dumps(data), encoding="utf-8")
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
@@ -280,7 +280,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "- id: agent-default-model\n"
             "  config:\n"
             "    provider: neuralwatt\n"
-            "    model: deepseek-v4-pro-preview\n",
+            "    model: deepseek-v4-flash\n",
             encoding="utf-8",
         )
         result = self.run_manager("start", "deepseek-harness", timeout=2)
