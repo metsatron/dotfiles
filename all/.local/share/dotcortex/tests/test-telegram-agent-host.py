@@ -125,6 +125,10 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         plugin.mkdir(parents=True)
         plugin.joinpath("package.json").write_text(json.dumps({"name": "dsh-telegram"}), encoding="utf-8")
         plugin.joinpath("package-lock.json").write_text("{}", encoding="utf-8")
+        plugin.joinpath("cordis.patch.yml").write_text(
+            "- insert:\n    - id: dsh-telegram\n      name: dsh-telegram\n",
+            encoding="utf-8",
+        )
         plugin.joinpath("dist").mkdir()
         plugin.joinpath("dist/index.js").write_text("", encoding="utf-8")
         workspace = self.home / ".local/share/deepseek-harness-telegram/workspace"
