@@ -186,6 +186,9 @@
    (task 'stow:s24 "Safe stow S24 overlays (all termux s24)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all termux s24' make safe-stow")))
 
+   (task 'odin:deploy "Deploy Odin Lite RetroArch config to the device over adb"
+         (lambda () (sh "bash odin-config/deploy.sh")))
+
    (task 'stow:health
          "Scan broken symlinks under $HOME, optionally clean Stow orphans"
          (lambda ()

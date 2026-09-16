@@ -17,7 +17,7 @@ STOW_TARGET ?= $(HOME)
 STOW_FLAGS = --target="$(STOW_TARGET)"
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
-        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census
+        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census odin\:deploy
 
 lint:
 | all/.local/bin/org-style-lint
@@ -187,6 +187,10 @@ preview-stow:
 x11-apply: tangle
 | cd $(HOME)/DotCortex && stow $(STOW_FLAGS) x230
 | @echo "✅ X11 applied."
+
+# The escaped colon preserves the public odin:deploy command name for make.
+odin\:deploy:
+| bash odin-config/deploy.sh
 
 include $(HOME)/DotCortex/all/.mk/flatpak.mk
 include $(HOME)/DotCortex/all/.mk/icons.mk
