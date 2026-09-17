@@ -159,7 +159,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                 "  providers:",
                 "    neuralwatt:",
                 "      displayName: HelmCortex NeuralWatt",
-                "      apiKeyEnv: DEEPSEEK_API_KEY",
+                "      apiKeyEnv: NEURALWATT_API_KEY",
                 "      api: openai-completions",
                 "      baseURL: https://api.neuralwatt.com/v1",
                 "      models:",
@@ -205,7 +205,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "\n".join(
                 [
                     f"TELEGRAM_BOT_TOKEN_FILE={token}",
-                    f"DEEPSEEK_API_KEY_FILE={key}",
+                    f"NEURALWATT_API_KEY_FILE={key}",
                     f"DSH_HOME={self.home / '.local/share/deepseek-harness-telegram/dsh-home'}",
                     "DSH_TELEGRAM_PROFILE=helmcortex-telegram",
                     f"DSH_TELEGRAM_WORKSPACE={workspace}",
@@ -290,6 +290,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
         self.assertIn("refusing credential egress", result.stderr)
+
+    def test_deepseek_harness_scrubs_ambient_deepseek_credentials(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        scrub = "env -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE"
+        self.assertGreaterEqual(manager_text.count(scrub), 2)
+        self.assertNotIn('DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"', manager_text)
+        self.assertIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
 
 
 if __name__ == "__main__":
