@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import datetime
 import io
 import json
 import fcntl
@@ -383,10 +384,11 @@ class Session:
         message = {"event": event, "session_id": self.session_id, **fields}
         return self.ipc(message)
 
-    def status(self, tokens=80000, session_id=None, timestamp=None):
+    def status(self, tokens=80000, session_id=None, timestamp=None, model="Opus 4.8"):
         payload = {
             "channel": self.channel,
             "session_id": session_id or self.session_id,
+            "model": model,
             "current_input_context_tokens": tokens,
             "update_timestamp": timestamp if timestamp is not None else time.time(),
         }
@@ -658,7 +660,11 @@ class ClaudeWarmTests(unittest.TestCase):
             self.module.PreservationFederationClient
         )
         client.config = {"estimate": 5.0}
-        client.owner = mock.Mock(current_tokens=271672)
+        client.owner = mock.Mock(
+            current_tokens=271672,
+            current_model="Opus 4.8",
+            post_compact_baseline_tokens=None,
+        )
         self.assertEqual(client._scaled_estimate(), (3.0, True))
         client.owner.current_tokens = 500000
         self.assertEqual(client._scaled_estimate(), (5.0, True))
@@ -670,7 +676,11 @@ class ClaudeWarmTests(unittest.TestCase):
             self.module.PreservationFederationClient
         )
         client.config = {"estimate": 4.0}
-        client.owner = mock.Mock(current_tokens=self.module.MIN_TOKENS - 1)
+        client.owner = mock.Mock(
+            current_tokens=self.module.MIN_TOKENS - 1,
+            current_model="Opus 4.8",
+            post_compact_baseline_tokens=None,
+        )
         self.assertEqual(client._scaled_estimate(), (0.0, False))
 
     def test_federation_unknown_context_uses_full_conservative_estimate(self):
@@ -678,8 +688,88 @@ class ClaudeWarmTests(unittest.TestCase):
             self.module.PreservationFederationClient
         )
         client.config = {"estimate": 5.0}
-        client.owner = mock.Mock(current_tokens=None)
+        client.owner = mock.Mock(
+            current_tokens=None,
+            current_model=None,
+            post_compact_baseline_tokens=None,
+        )
         self.assertEqual(client._scaled_estimate(), (5.0, True))
+
+    def test_federation_sonnet_uses_one_third_opus_weight(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 5.0}
+        client.owner = mock.Mock(
+            current_tokens=300000,
+            current_model="Sonnet 4.6",
+            post_compact_baseline_tokens=None,
+        )
+        self.assertEqual(client._scaled_estimate(), (1.0, True))
+        client.owner.current_model = "unknown-future-model"
+        self.assertEqual(client._scaled_estimate(), (3.0, True))
+
+    def test_federation_haiku_uses_one_third_sonnet_weight(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 5.0}
+        client.owner = mock.Mock(
+            current_tokens=900000,
+            current_model="Haiku 4.5",
+            post_compact_baseline_tokens=None,
+        )
+        self.assertEqual(client._scaled_estimate(), (1.0, True))
+
+    def test_federation_fable_model_costs_three_times_opus(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 5.0}
+        client.owner = mock.Mock(
+            current_tokens=500000,
+            current_model="claude-fable-5",
+            post_compact_baseline_tokens=None,
+        )
+        self.assertEqual(client._scaled_estimate(), (15.0, True))
+
+    def test_federation_excludes_latest_post_compact_baseline(self):
+        client = self.module.PreservationFederationClient.__new__(
+            self.module.PreservationFederationClient
+        )
+        client.config = {"estimate": 5.0}
+        client.owner = mock.Mock(
+            current_tokens=97000,
+            current_model="Sonnet 4.6",
+            post_compact_baseline_tokens=22666,
+        )
+        self.assertEqual(client._scaled_estimate(), (0.5, True))
+        client.owner.current_tokens = 90000
+        client.owner.post_compact_baseline_tokens = 25000
+        self.assertEqual(client._scaled_estimate(), (0.0, False))
+
+    def test_post_compact_loads_exact_transcript_baseline(self):
+        session = self.make_session(delay=3300)
+        session.event("session-start", transcript_path=str(session.transcript))
+        with session.transcript.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                "compactMetadata": {"preTokens": 97465, "postTokens": 22666},
+            }) + "\n")
+        session.event("post-compact")
+        state = session.read_state()
+        self.assertEqual(state["post_compact_baseline_tokens"], 22666)
+        self.assertIsNotNone(state["post_compact_baseline_at"])
+        session.stop_and_bind()
+        session.status(tokens=90000, model="Sonnet 4.6")
+        session.control("trigger")
+        wait_until(
+            lambda: session.read_state()
+            and session.read_state()["last_cancellation_reason"] == "below-token-threshold"
+        )
+        self.assertEqual(session.read_state()["unpreserved_context_tokens"], 67334)
 
     def test_slow_bridge_does_not_block_owner_ipc_progress(self):
         session = self.make_session(delay=3300, preservation=True, preservation_mode="slow")
