@@ -328,6 +328,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             state_dir = self.state / "telegram-agents"
             state_dir.mkdir(parents=True)
             state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.write_dsh_marker(proc.pid)
             result = self.run_manager("status", "deepseek-harness", timeout=2)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertIn("deepseek-harness: RUNNING", result.stdout)
@@ -335,32 +336,6 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             proc.terminate()
             proc.wait(timeout=5)
 
-    def test_deepseek_harness_rejects_model_fallback_in_private_config(self) -> None:
-        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
-        self.prepare_deepseek_harness([123])
-        config = self.home / ".local/share/deepseek-harness-telegram/workspace/.pi/telegram.json"
-        data = json.loads(config.read_text(encoding="utf-8"))
-        data["model"] = {"provider": "neuralwatt", "model": "deepseek-v4-flash-flex"}
-        config.write_text(json.dumps(data), encoding="utf-8")
-        result = self.run_manager("start", "deepseek-harness", timeout=2)
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("no fallback is permitted", result.stderr)
-
-    def test_deepseek_harness_rejects_native_deepseek_credential_route(self) -> None:
-        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
-        self.prepare_deepseek_harness([123])
-        profile_patch = (
-            self.home
-            / ".local/share/deepseek-harness-telegram/dsh-home/profiles/helmcortex-telegram/cordis.patch.yml"
-        )
-            self.write_dsh_marker(proc.pid)
-        profile_patch.write_text(
-            "- id: agent-default-model\n"
-            "  config:\n"
-            "    provider: neuralwatt\n"
-            "    model: deepseek-v4-flash\n",
-            encoding="utf-8",
-        )
     def test_deepseek_harness_stop_migrates_verified_legacy_pid_only_owner(self) -> None:
         self.prepare_deepseek_harness([123])
         proc = subprocess.Popen(
@@ -396,6 +371,31 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertFalse(state_dir.joinpath("deepseek-harness.pid").exists())
         self.assertFalse(state_dir.joinpath("deepseek-harness.ready").exists())
 
+    def test_deepseek_harness_rejects_model_fallback_in_private_config(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        self.prepare_deepseek_harness([123])
+        config = self.home / ".local/share/deepseek-harness-telegram/workspace/.pi/telegram.json"
+        data = json.loads(config.read_text(encoding="utf-8"))
+        data["model"] = {"provider": "neuralwatt", "model": "deepseek-v4-flash-flex"}
+        config.write_text(json.dumps(data), encoding="utf-8")
+        result = self.run_manager("start", "deepseek-harness", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("no fallback is permitted", result.stderr)
+
+    def test_deepseek_harness_rejects_native_deepseek_credential_route(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        self.prepare_deepseek_harness([123])
+        profile_patch = (
+            self.home
+            / ".local/share/deepseek-harness-telegram/dsh-home/profiles/helmcortex-telegram/cordis.patch.yml"
+        )
+        profile_patch.write_text(
+            "- id: agent-default-model\n"
+            "  config:\n"
+            "    provider: neuralwatt\n"
+            "    model: deepseek-v4-flash\n",
+            encoding="utf-8",
+        )
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
         self.assertIn("refusing credential egress", result.stderr)
@@ -406,6 +406,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertGreaterEqual(manager_text.count(provider_scrub), 2)
         self.assertIn("env -u TELEGRAM_BOT_TOKEN " + provider_scrub, manager_text)
         self.assertNotIn('DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"', manager_text)
+        self.assertNotIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
+        self.assertNotIn('TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"', manager_text)
 
     def test_deepseek_harness_log_redactor_lives_in_detached_session(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
@@ -431,5 +433,3 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-        self.assertNotIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
-        self.assertNotIn('TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"', manager_text)
