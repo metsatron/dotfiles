@@ -47,15 +47,29 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
         return fields[19]
 
-    def write_dsh_marker(self, pid: int, *, start_ticks: str | None = None, profile: str = "helmcortex-telegram") -> None:
-        marker = self.state / "telegram-agents/deepseek-harness.ready"
+    def write_dsh_marker(
+        self,
+        pid: int,
+        *,
+        start_ticks: str | None = None,
+        profile: str = "helmcortex-telegram",
+        generation: str = "0123456789abcdef0123456789abcdef",
+        expected_generation: str | None = None,
+    ) -> None:
+        marker_base = self.state / "telegram-agents/deepseek-harness.ready"
+        marker = marker_base.with_name(f"{marker_base.name}.{generation}")
         marker.parent.mkdir(parents=True, exist_ok=True)
+        (marker.parent / "deepseek-harness.generation").write_text(
+            expected_generation if expected_generation is not None else generation,
+            encoding="utf-8",
+        )
         marker.write_text(json.dumps({
             "schema": 1,
             "component": "dsh-telegram",
             "pid": pid,
             "start_ticks": start_ticks if start_ticks is not None else self.read_start_ticks(pid),
             "profile": profile,
+            "generation": generation,
             "provider": "neuralwatt",
             "model": "deepseek-v4-flash",
             "telegram_bot_identity_validated": True,
@@ -316,6 +330,122 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             proc.terminate()
             proc.wait(timeout=5)
 
+    def test_deepseek_harness_status_rejects_wrong_launch_generation(self) -> None:
+        self.prepare_deepseek_harness([123])
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.environment(2),
+        )
+        try:
+            state_dir = self.state / "telegram-agents"
+            state_dir.mkdir(parents=True)
+            state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.write_dsh_marker(
+                proc.pid,
+                generation="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                expected_generation="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            )
+            result = self.run_manager("status", "deepseek-harness", timeout=2)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("readiness owner state not verified", result.stdout)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_deepseek_harness_status_rejects_wrong_profile(self) -> None:
+        self.prepare_deepseek_harness([123])
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.environment(2),
+        )
+        try:
+            state_dir = self.state / "telegram-agents"
+            state_dir.mkdir(parents=True)
+            state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.write_dsh_marker(proc.pid, profile="other-profile")
+            result = self.run_manager("status", "deepseek-harness", timeout=2)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("readiness owner state not verified", result.stdout)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_deepseek_harness_status_rejects_child_that_exited_after_marker(self) -> None:
+        self.prepare_deepseek_harness([123])
+        generation = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+        state_dir = self.state / "telegram-agents"
+        state_dir.mkdir(parents=True)
+        state_dir.joinpath("deepseek-harness.generation").write_text(generation, encoding="utf-8")
+        marker = state_dir / f"deepseek-harness.ready.{generation}"
+        self.write_executable(
+            "dsh",
+            "#!/bin/sh\n"
+            "pid=$$\n"
+            "ticks=$(python3 -c 'from pathlib import Path; import sys; s=Path(f\"/proc/{sys.argv[1]}/stat\").read_text(); print(s[s.rfind(\")\") + 2:].split()[19])' \"$pid\")\n"
+            "python3 - \"$DSH_TELEGRAM_READY_MARKER\" \"$pid\" \"$ticks\" <<'PY'\n"
+            "import json, sys\n"
+            "from pathlib import Path\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'schema': 1, 'component': 'dsh-telegram', 'pid': int(sys.argv[2]), 'start_ticks': sys.argv[3], 'profile': 'helmcortex-telegram', 'provider': 'neuralwatt', 'model': 'deepseek-v4-flash', 'telegram_bot_identity_validated': True, 'long_polling_owned': True}), encoding='utf-8')\n"
+            "PY\n"
+            "exit 0\n",
+        )
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env={**self.environment(2), "DSH_TELEGRAM_READY_MARKER": str(marker)},
+        )
+        proc.wait(timeout=5)
+        state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+        result = self.run_manager("status", "deepseek-harness", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("readiness owner state not verified", result.stdout)
+
+    def test_deepseek_harness_start_refuses_markerless_lookalike_process(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        self.prepare_deepseek_harness([123])
+        (self.home / ".local/share/deepseek-harness-telegram/dsh-home/profiles/helmcortex-telegram/package.json").write_text(
+            json.dumps({"dependencies": {"dsh-telegram": f"link:{self.home / 'HelmCortex/NEXUS/git/dsh-telegram'}"}}), encoding="utf-8"
+        )
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.environment(2),
+        )
+        try:
+            result = self.run_manager("start", "deepseek-harness", timeout=2)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("another dsh poller already uses profile", result.stderr)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_deepseek_harness_second_starter_refuses_while_first_holds_lock(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        self.prepare_deepseek_harness([123])
+        lock_path = self.state / "telegram-agents/deepseek-harness.start.lock"
+        holder = subprocess.Popen(
+            [
+                "python3",
+                "-c",
+                "import fcntl, pathlib, sys, time; p = pathlib.Path(sys.argv[1]); p.parent.mkdir(parents=True, exist_ok=True); f = p.open('w'); fcntl.flock(f, fcntl.LOCK_EX); time.sleep(5)",
+                str(lock_path),
+            ],
+        )
+        try:
+            time.sleep(0.2)
+            result = self.run_manager("start", "deepseek-harness", timeout=2)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("another DeepSeek Harness starter holds the launch lock", result.stderr)
+        finally:
+            holder.terminate()
+            holder.wait(timeout=5)
+
     def test_deepseek_harness_status_accepts_matching_marker(self) -> None:
         self.prepare_deepseek_harness([123])
         proc = subprocess.Popen(
@@ -424,6 +554,10 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
         self.assertIn('DSH_TELEGRAM_READY_MARKER=', manager_text)
+        self.assertIn('DSH_TELEGRAM_GENERATION_FILE=', manager_text)
+        self.assertIn('launch_generation', manager_text)
+        self.assertIn('launch_marker="${DSH_TELEGRAM_READY_MARKER}.${launch_generation}"', manager_text)
+        self.assertIn('data.get("generation") != sys.argv[5]', manager_text)
         self.assertIn('DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"', manager_text)
         self.assertIn('telegram_bot_identity_validated', manager_text)
         self.assertIn('long_polling_owned', manager_text)
