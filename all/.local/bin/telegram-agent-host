@@ -38,6 +38,8 @@ DSH_TELEGRAM_ENV_FILE="${DSH_TELEGRAM_ENV_FILE:-$HOME/.config/deepseek-harness-t
 DSH_TELEGRAM_PID_FILE="${DSH_TELEGRAM_PID_FILE:-$STATE_DIR/deepseek-harness.pid}"
 DSH_TELEGRAM_LOG_FILE="${DSH_TELEGRAM_LOG_FILE:-$STATE_DIR/deepseek-harness.log}"
 DSH_TELEGRAM_READY_MARKER="${DSH_TELEGRAM_READY_MARKER:-$STATE_DIR/deepseek-harness.ready}"
+DSH_TELEGRAM_GENERATION_FILE="${DSH_TELEGRAM_GENERATION_FILE:-$STATE_DIR/deepseek-harness.generation}"
+DSH_TELEGRAM_START_LOCK="${DSH_TELEGRAM_START_LOCK:-$STATE_DIR/deepseek-harness.start.lock}"
 DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"
 DSH_TELEGRAM_LOG_MAX_BYTES="${DSH_TELEGRAM_LOG_MAX_BYTES:-10485760}"
 DSH_TELEGRAM_LOG_KEEP="${DSH_TELEGRAM_LOG_KEEP:-5}"
@@ -385,10 +387,11 @@ PY
 }
 
 deepseek_harness_marker_matches() {
-    local pid="${1:-}" marker="${2:-$DSH_TELEGRAM_READY_MARKER}" ticks
+    local pid="${1:-}" marker="${2:-$DSH_TELEGRAM_READY_MARKER}" ticks generation
     deepseek_harness_pid_matches "$pid" || return 1
     ticks="$(deepseek_harness_start_ticks "$pid" 2>/dev/null)" || return 1
-    python3 - "$marker" "$pid" "$ticks" "$DSH_TELEGRAM_PROFILE" <<'PY'
+    generation="$(deepseek_harness_read_generation 2>/dev/null)" || return 1
+    python3 - "$marker" "$pid" "$ticks" "$DSH_TELEGRAM_PROFILE" "$generation" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -401,24 +404,75 @@ if data.get("schema") != 1 or data.get("component") != "dsh-telegram":
     raise SystemExit(1)
 if data.get("pid") != int(sys.argv[2]) or str(data.get("start_ticks")) != sys.argv[3]:
     raise SystemExit(1)
-if data.get("profile") != sys.argv[4]:
+if data.get("profile") != sys.argv[4] or data.get("generation") != sys.argv[5]:
     raise SystemExit(1)
 if data.get("telegram_bot_identity_validated") is not True or data.get("long_polling_owned") is not True:
     raise SystemExit(1)
 PY
 }
 
+deepseek_harness_read_generation() {
+    local generation
+    [ -r "$DSH_TELEGRAM_GENERATION_FILE" ] || return 1
+    generation="$(cat "$DSH_TELEGRAM_GENERATION_FILE" 2>/dev/null || true)"
+    [[ "$generation" =~ ^[0-9a-f]{32}$ ]] || return 1
+    printf '%s\n' "$generation"
+}
+
+deepseek_harness_marker_path() {
+    local generation
+    generation="$(deepseek_harness_read_generation)" || return 1
+    printf '%s.%s\n' "$DSH_TELEGRAM_READY_MARKER" "$generation"
+}
+
+deepseek_harness_write_generation() {
+    local temporary generation
+    generation="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')" || return 1
+    case "$generation" in
+        ''|*[!0-9a-f]*) return 1 ;;
+    esac
+    temporary="$(mktemp "$DSH_TELEGRAM_GENERATION_FILE.tmp.XXXXXX")" || return 1
+    printf '%s\n' "$generation" > "$temporary"
+    chmod 600 "$temporary"
+    mv -f "$temporary" "$DSH_TELEGRAM_GENERATION_FILE"
+    printf '%s\n' "$generation"
+}
+
+deepseek_harness_acquire_start_lock() {
+    local lock_fd
+    command -v flock >/dev/null 2>&1 || {
+        echo "DeepSeek Harness start lock requires flock" >&2
+        return 1
+    }
+    exec {lock_fd}>"$DSH_TELEGRAM_START_LOCK"
+    if ! flock -n "$lock_fd"; then
+        eval "exec ${lock_fd}>&-"
+        echo "Refusing DeepSeek Harness start: another DeepSeek Harness starter holds the launch lock" >&2
+        return 1
+    fi
+    DSH_TELEGRAM_START_LOCK_FD="$lock_fd"
+}
+
+deepseek_harness_release_start_lock() {
+    if [ -n "${DSH_TELEGRAM_START_LOCK_FD:-}" ]; then
+        eval "exec ${DSH_TELEGRAM_START_LOCK_FD}>&-"
+        DSH_TELEGRAM_START_LOCK_FD=""
+    fi
+}
+
 deepseek_harness_ready() {
-    local pid
-    [ -r "$DSH_TELEGRAM_PID_FILE" ] && [ -r "$DSH_TELEGRAM_READY_MARKER" ] || return 1
+    local pid marker
+    marker="$(deepseek_harness_marker_path 2>/dev/null)" || return 1
+    [ -r "$DSH_TELEGRAM_PID_FILE" ] && [ -r "$marker" ] || return 1
     pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
-    deepseek_harness_marker_matches "$pid"
+    deepseek_harness_marker_matches "$pid" "$marker"
 }
 
 deepseek_harness_clear_stale_marker() {
-    [ -e "$DSH_TELEGRAM_READY_MARKER" ] || return 0
-    local marker_pid
-    marker_pid="$(python3 - "$DSH_TELEGRAM_READY_MARKER" <<'PY'
+    local marker marker_pid
+    marker="$(deepseek_harness_marker_path 2>/dev/null || true)"
+    [ -n "$marker" ] && [ -e "$marker" ] || return 0
+    marker_pid="$(python3 - "$marker" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -430,11 +484,11 @@ except (OSError, ValueError, TypeError):
 print(value if isinstance(value, int) else "")
 PY
 )"
-    if [ -n "$marker_pid" ] && deepseek_harness_marker_matches "$marker_pid"; then
+    if [ -n "$marker_pid" ] && deepseek_harness_marker_matches "$marker_pid" "$marker"; then
         echo "DeepSeek Harness readiness marker belongs to a live process; refusing replacement" >&2
         return 1
     fi
-    rm -f "$DSH_TELEGRAM_READY_MARKER"
+    rm -f "$marker"
 }
 
 deepseek_harness_kill_owned() {
@@ -465,10 +519,18 @@ deepseek_harness_wait_ready() {
     case "$timeout" in ''|*[!0-9]*) echo "Invalid DSH_TELEGRAM_READY_TIMEOUT: $timeout" >&2; return 1 ;; esac
     attempts=$((timeout * 2))
     for ((i = 0; i < attempts; i += 1)); do
-        deepseek_harness_ready && return 0
+        if deepseek_harness_ready; then
+            sleep 0.1
+            deepseek_harness_ready && return 0
+        fi
         sleep 0.5
     done
-    deepseek_harness_ready
+    if deepseek_harness_ready; then
+        sleep 0.1
+        deepseek_harness_ready
+    else
+        return 1
+    fi
 }
 
 deepseek_harness_running() {
@@ -1158,29 +1220,41 @@ start_agent() {
             ;;
         deepseek-harness)
             mkdir -p "$STATE_DIR"
-            deepseek_harness_validate_private_config || return 1
-            deepseek_harness_validate_install || return 1
+            deepseek_harness_acquire_start_lock || return 1
+            deepseek_harness_validate_private_config || { deepseek_harness_release_start_lock; return 1; }
+            deepseek_harness_validate_install || { deepseek_harness_release_start_lock; return 1; }
             if deepseek_harness_ready; then
+                deepseek_harness_release_start_lock
                 echo "deepseek-harness already has a ready owned poller"
                 return 1
             fi
             if deepseek_harness_running; then
+                deepseek_harness_release_start_lock
                 echo "DeepSeek Harness has a legacy PID-only poller; stop it before starting under the readiness contract" >&2
                 return 1
             fi
-            deepseek_harness_clear_stale_marker || return 1
+            deepseek_harness_clear_stale_marker || { deepseek_harness_release_start_lock; return 1; }
             if [ -r "$DSH_TELEGRAM_PID_FILE" ]; then
+                deepseek_harness_release_start_lock
                 echo "DeepSeek Harness owner state is stale or invalid; run telegram-agent-host stop deepseek-harness first" >&2
                 return 1
             fi
             local other_pid
             other_pid="$(deepseek_harness_find_unowned 2>/dev/null || true)"
             if [ -n "$other_pid" ]; then
+                deepseek_harness_release_start_lock
                 echo "Refusing DeepSeek Harness start: another dsh poller already uses profile $DSH_TELEGRAM_PROFILE (pid $other_pid)" >&2
                 return 1
             fi
-            deepseek_harness_preflight_model || return 1
+            deepseek_harness_preflight_model || { deepseek_harness_release_start_lock; return 1; }
             deepseek_harness_rotate_log
+            local launch_generation launch_marker
+            launch_generation="$(deepseek_harness_write_generation)" || {
+                deepseek_harness_release_start_lock
+                echo "DeepSeek Harness could not publish a launch generation" >&2
+                return 1
+            }
+            launch_marker="${DSH_TELEGRAM_READY_MARKER}.${launch_generation}"
             printf '\n=== deepseek-harness launch %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DSH_TELEGRAM_LOG_FILE"
             echo "Starting DeepSeek Harness Telegram profile $DSH_TELEGRAM_PROFILE..."
             (
@@ -1190,7 +1264,8 @@ start_agent() {
                     NODE_OPTIONS="$DSH_TELEGRAM_NODE_OPTIONS" \
                     DSH_HOME="$DSH_HOME" \
                     DSH_TELEGRAM_PROFILE="$DSH_TELEGRAM_PROFILE" \
-                    DSH_TELEGRAM_READY_MARKER="$DSH_TELEGRAM_READY_MARKER" \
+                    DSH_TELEGRAM_READY_GENERATION="$launch_generation" \
+                    DSH_TELEGRAM_READY_MARKER="$launch_marker" \
                     DSH_TELEGRAM_LOG_FILE="$DSH_TELEGRAM_LOG_FILE" \
                     TELEGRAM_BOT_TOKEN_FILE="$TELEGRAM_BOT_TOKEN_FILE" \
                     NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE" \
@@ -1217,8 +1292,10 @@ start_agent() {
                 else
                     echo "DeepSeek Harness Telegram owner changed; preserving state and refusing unverified stop" >&2
                 fi
+                deepseek_harness_release_start_lock
                 return 1
             fi
+            deepseek_harness_release_start_lock
             ;;
         pi-agent)
             start_pi_agent
@@ -1288,8 +1365,11 @@ stop_agent() {
             fi
             ;;
         deepseek-harness)
-            local dsh_pid dsh_ticks
-            if [ ! -e "$DSH_TELEGRAM_PID_FILE" ] && [ ! -e "$DSH_TELEGRAM_READY_MARKER" ]; then
+            local dsh_pid dsh_ticks dsh_marker
+            dsh_marker="$(deepseek_harness_marker_path 2>/dev/null || true)"
+            if [ ! -e "$DSH_TELEGRAM_PID_FILE" ] && [ ! -e "$DSH_TELEGRAM_READY_MARKER" ] && \
+               [ ! -e "$DSH_TELEGRAM_GENERATION_FILE" ] && \
+               { [ -z "$dsh_marker" ] || [ ! -e "$dsh_marker" ]; }; then
                 return 0
             fi
             dsh_pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
@@ -1306,7 +1386,8 @@ stop_agent() {
                 echo "DeepSeek Harness owner state is stale but an unowned poller uses this profile; refusing cleanup" >&2
                 return 1
             fi
-            rm -f "$DSH_TELEGRAM_PID_FILE" "$DSH_TELEGRAM_READY_MARKER"
+            rm -f "$DSH_TELEGRAM_PID_FILE" "$DSH_TELEGRAM_READY_MARKER" "$DSH_TELEGRAM_GENERATION_FILE"
+            [ -z "$dsh_marker" ] || rm -f "$dsh_marker"
             ;;
         pi-agent)
             stop_pi_agent
