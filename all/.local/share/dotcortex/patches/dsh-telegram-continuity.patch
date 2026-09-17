@@ -1,0 +1,225 @@
+diff --git a/src/core/chat-bindings.ts b/src/core/chat-bindings.ts
+index 4d9447c..3d9f10e 100644
+--- a/src/core/chat-bindings.ts
++++ b/src/core/chat-bindings.ts
+@@ -26,0 +27,16 @@ export type ChatBindings = Record<string, ChatBindingEntry>;
++export interface RestoreBindingResult<Handle> {
++  ok: boolean;
++  text: string;
++  agentId?: string;
++  handle?: Handle;
++}
++
++export interface RestoreBindingOps<Handle> {
++  isAllowed(chatId: number): boolean;
++  liveAgentId(sessionId: string): string | undefined;
++  resume(sessionId: string): Promise<RestoreBindingResult<Handle>>;
++  adopt(handle: Handle): void;
++  bind(chatId: number, sessionId: string): void;
++  log(message: string): void;
++}
++
+@@ -79,3 +95,37 @@ export function saveChatBinding(configRoot: string, chatId: number, agentId: str
+     /* best effort */
+   }
+ }
++
++/** Restore every allowed saved binding before Telegram polling starts.
++ * A process restart leaves persisted sessions cold, so registry lookup alone
++ * can never establish continuity. Any allowed binding that cannot be resumed
++ * fails the mount: polling with it unbound would silently create a new session
++ * on the next inbound message and falsely present that as successful recovery.
++ */
++export async function restoreChatBindings<Handle>(configRoot: string, ops: RestoreBindingOps<Handle>): Promise<void> {
++  for (const [chatIdRaw, entry] of Object.entries(readChatBindings(configRoot))) {
++    const chatId = Number(chatIdRaw);
++    if (!Number.isInteger(chatId) || !ops.isAllowed(chatId)) continue;
++    let liveId = ops.liveAgentId(entry.agentId);
++    if (liveId === undefined) {
++      const resumed = await ops.resume(entry.agentId);
++      if (!resumed.ok || resumed.handle === undefined || resumed.agentId === undefined) {
++        throw new Error(`cannot restore chat ${chatId} session ${entry.agentId}: ${resumed.text}`);
++      }
++      if (resumed.agentId !== entry.agentId) {
++        throw new Error(`restored session identity mismatch for chat ${chatId}: expected ${entry.agentId}, got ${resumed.agentId}`);
++      }
++      ops.adopt(resumed.handle);
++      liveId = ops.liveAgentId(entry.agentId);
++      if (liveId !== entry.agentId) {
++        throw new Error(`restored session ${entry.agentId} did not publish as live for chat ${chatId}`);
++      }
++      ops.log(`binding resumed chatId=${chatId} agentId=${entry.agentId}`);
++    }
++    if (liveId !== entry.agentId) {
++      throw new Error(`live session identity mismatch for chat ${chatId}: expected ${entry.agentId}, got ${liveId}`);
++    }
++    ops.bind(chatId, entry.agentId);
++    ops.log(`binding restored chatId=${chatId} agentId=${entry.agentId}`);
++  }
++}
+diff --git a/src/index.ts b/src/index.ts
+index 8fb6f72..dfe6f2c 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -45,5 +45,5 @@
+ import { StatusPanel } from "./telegram/status-panel.js";
+ import { TelegramTransport } from "./telegram/transport.js";
+ import { TELEGRAM_COMMANDS, maskConfigValue } from "./core/commands.js";
+-import { readChatBindings, saveChatBinding } from "./core/chat-bindings.js";
++import { restoreChatBindings, saveChatBinding } from "./core/chat-bindings.js";
+ import { findWorkspaceRoot } from "./workspace.js";
+@@ -114,0 +115,5 @@ let compactionWatcher: CompactionWatcher | undefined;
++type AssistantConsumer = (chatId: number, text: string, assistantMessageId?: string) => void;
++/** The feed mounts before the transport/Bridge on first apply; retain its
++ * consumer until constructMount can attach it to the new bridge. */
++let assistantConsumer: AssistantConsumer | undefined;
++
+@@ -376,4 +381,5 @@ function buildExtensionHost(): ExtensionHost {
+     bindAgent: (chatId, agentId) => state.bridge?.bindAgent(chatId, agentId),
+     unbindChat: (chatId) => state.bridge?.bindAgent(chatId, undefined),
+     setAssistantConsumer: (consumer) => {
++      assistantConsumer = consumer;
+       state.bridge?.setAssistantConsumer(consumer);
+@@ -1241,19 +1247,4 @@ function constructMount(ctx: Context, botToken: string): void {
+     log,
+   });
+   state.bridge.attach();
+-
+-  // Restore saved bindings whose sessions are still live. Cold sessions stay
+-  // unbound on purpose (the Sessions card's Use/resume flow owns those).
+-  try {
+-    for (const [chatIdRaw, entry] of Object.entries(readChatBindings(state.configRoot))) {
+-      const chatId = Number(chatIdRaw);
+-      if (!Number.isInteger(chatId)) continue;
+-      if (!isChatAllowed(state.config, chatId)) continue;
+-      const live = ctx.agents?.get(entry.agentId as never);
+-      if (!live) continue;
+-      state.bridge.bindAgent(chatId, String(live.id));
+-      log(`binding restored chatId=${chatId} agentId=${String(live.id)}`);
+-    }
+-  } catch (err) {
+-    log("binding restore failed", err instanceof Error ? err.message : String(err));
+-  }
++  state.bridge.setAssistantConsumer(assistantConsumer);
+@@ -1590,0 +1582,32 @@ function constructMount(ctx: Context, botToken: string): void {
++/** Resume every allowed persisted chat session before polling can accept an
++ * update. The profile is intentionally single-provider/model; passing that
++ * configured pair explicitly prevents one restored chat from inheriting a
++ * different chat's live model during a multi-chat cold start. */
++async function restorePersistedChats(ctx: Context): Promise<void> {
++  await restoreChatBindings(state.configRoot, {
++    isAllowed: (chatId) => isChatAllowed(state.config, chatId),
++    liveAgentId: (sessionId) => {
++      const live = ctx.agents?.get(sessionId as never);
++      return live === undefined ? undefined : String(live.id);
++    },
++    resume: async (sessionId) => {
++      const agents = ctx.agents;
++      if (agents === undefined) return { ok: false, text: "agents service is unavailable in this profile" };
++      try {
++        const handle = await agents.resume({
++          resumeSessionId: sessionId as never,
++          agentOptions: {
++            provider: state.config.model?.provider,
++            model: state.config.model?.model,
++          },
++        });
++        return { ok: true, text: `Resumed ${String(handle.agent.id)}`, agentId: String(handle.agent.id), handle };
++      } catch (err) {
++        return { ok: false, text: err instanceof Error ? err.message : String(err) };
++      }
++    },
++    adopt: (handle) => sessionLifecycle.adopt(handle),
++    bind: (chatId, sessionId) => state.bridge?.bindAgent(chatId, sessionId),
++    log: (message) => log(message),
++  });
++}
+@@ -1601,6 +1625,7 @@ async function mountTransport(ctx: Context): Promise<void> {
+   if (botToken === undefined) return;
+   try {
+     constructMount(ctx, botToken);
++    await restorePersistedChats(ctx);
+   } catch (err) {
+     const failed = state.transport;
+     try {
+diff --git a/test/chat-bindings.test.mjs b/test/chat-bindings.test.mjs
+index 10eafdb..a845300 100644
+--- a/test/chat-bindings.test.mjs
++++ b/test/chat-bindings.test.mjs
+@@ -90,3 +90,76 @@ test('readChatBindings drops expired entries', async () => {
+     rmSync(root, { recursive: true, force: true });
+   }
+ });
++
++test('restoreChatBindings resumes and adopts a cold session before binding it', async () => {
++  const { restoreChatBindings, saveChatBinding } = await import('../dist/core/chat-bindings.js');
++  const root = mkdtempSync(join(tmpdir(), 'tg-bindings-restore-'));
++  try {
++    saveChatBinding(root, 100, 'persisted-session');
++    const live = new Set();
++    const order = [];
++    await restoreChatBindings(root, {
++      isAllowed: (chatId) => chatId === 100,
++      liveAgentId: (sessionId) => live.has(sessionId) ? sessionId : undefined,
++      resume: async (sessionId) => {
++        order.push(`resume:${sessionId}`);
++        live.add(sessionId);
++        return { ok: true, text: 'ok', agentId: sessionId, handle: { sessionId } };
++      },
++      adopt: (handle) => order.push(`adopt:${handle.sessionId}`),
++      bind: (chatId, sessionId) => order.push(`bind:${chatId}:${sessionId}`),
++      log: () => {},
++    });
++    assert.deepEqual(order, [
++      'resume:persisted-session',
++      'adopt:persisted-session',
++      'bind:100:persisted-session',
++    ]);
++  } finally {
++    rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test('restoreChatBindings fails closed when an allowed cold session cannot resume', async () => {
++  const { restoreChatBindings, saveChatBinding } = await import('../dist/core/chat-bindings.js');
++  const root = mkdtempSync(join(tmpdir(), 'tg-bindings-fail-'));
++  try {
++    saveChatBinding(root, 100, 'missing-session');
++    let bound = false;
++    await assert.rejects(
++      restoreChatBindings(root, {
++        isAllowed: () => true,
++        liveAgentId: () => undefined,
++        resume: async () => ({ ok: false, text: 'not found' }),
++        adopt: () => assert.fail('failed resume must not be adopted'),
++        bind: () => { bound = true; },
++        log: () => {},
++      }),
++      /cannot restore chat 100 session missing-session: not found/,
++    );
++    assert.equal(bound, false);
++  } finally {
++    rmSync(root, { recursive: true, force: true });
++  }
++});
++
++test('restoreChatBindings reuses live sessions and ignores disallowed saved chats', async () => {
++  const { restoreChatBindings, saveChatBinding } = await import('../dist/core/chat-bindings.js');
++  const root = mkdtempSync(join(tmpdir(), 'tg-bindings-live-'));
++  try {
++    saveChatBinding(root, 100, 'already-live');
++    saveChatBinding(root, 200, 'not-allowed');
++    const bound = [];
++    await restoreChatBindings(root, {
++      isAllowed: (chatId) => chatId === 100,
++      liveAgentId: (sessionId) => sessionId === 'already-live' ? sessionId : undefined,
++      resume: async () => assert.fail('live and disallowed sessions must not resume'),
++      adopt: () => assert.fail('live sessions must not be adopted again'),
++      bind: (chatId, sessionId) => bound.push([chatId, sessionId]),
++      log: () => {},
++    });
++    assert.deepEqual(bound, [[100, 'already-live']]);
++  } finally {
++    rmSync(root, { recursive: true, force: true });
++  }
++});
