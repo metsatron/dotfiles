@@ -1179,11 +1179,18 @@ class PreservationFederationClient:
         }
 
     def _scaled_estimate(self) -> tuple[float, bool]:
-        """Scale the 500k-token calibration from the freshest owner snapshot.
+        """Scale only unpreserved context with the active model's quota cost.
 
         Unknown context remains conservatively eligible at the full calibrated
         estimate.  A known context below the native owner's minimum is excluded
-        from the aggregate reserve because /compact would reject it.
+        from the aggregate reserve because /compact would reject it.  Context
+        retained by the latest successful compaction is a baseline, not new
+        preservation liability.  Sonnet consumes approximately one third of
+        Opus quota for the same new context, Haiku one third of Sonnet, and a
+        genuine Fable-tier model three times Opus.  The Fable owner identity
+        does not imply Fable-tier weights when its actual model is Opus.
+        Unknown models retain the Opus weight so missing model telemetry never
+        weakens protection.
         """
         config = self.config
         assert config is not None
@@ -1191,9 +1198,20 @@ class PreservationFederationClient:
         baseline = float(config["estimate"])
         if tokens is None:
             return baseline, True
-        if tokens < MIN_TOKENS:
+        preserved = self.owner.post_compact_baseline_tokens
+        effective_tokens = max(0, tokens - preserved) if preserved is not None else tokens
+        if effective_tokens < MIN_TOKENS:
             return 0.0, False
-        scaled = baseline * tokens / 500_000.0
+        model = (self.owner.current_model or "").lower()
+        if "fable" in model:
+            model_weight = 3.0
+        elif "haiku" in model:
+            model_weight = 1.0 / 9.0
+        elif "sonnet" in model:
+            model_weight = 1.0 / 3.0
+        else:
+            model_weight = 1.0
+        scaled = baseline * effective_tokens / 500_000.0 * model_weight
         return min(100.0, math.ceil(scaled * 2.0) / 2.0), True
 
     def _request(self) -> dict[str, object]:
@@ -1227,6 +1245,8 @@ class PreservationFederationClient:
                 "session_id": owner.session_id,
                 "pool_key": config["pool_key"],
                 "owner_kind": "claude-warm",
+                "owner_label": os.environ.get("CLAUDE_WARM_HERDR_AGENT"),
+                "model": owner.current_model,
                 "dirty": owner.dirty,
                 "current_context_tokens": owner.current_tokens,
                 "preservation_eligible": eligible,
@@ -1521,6 +1541,9 @@ class Supervisor:
         self.rearm_count = 0
         self.last_rearm_reason: str | None = None
         self.current_tokens: int | None = None
+        self.current_model: str | None = None
+        self.post_compact_baseline_tokens: int | None = None
+        self.post_compact_baseline_at: float | None = None
         self.status_timestamp: float | None = None
         self.completed_turn_epoch = 0
         self.status_snapshot_epoch: int | None = None
@@ -1619,6 +1642,15 @@ class Supervisor:
             "channel_debug_log": str(self.debug_log_path) if self.watched_servers else None,
             "status": self.status,
             "current_input_context_tokens": self.current_tokens,
+            "current_model": self.current_model,
+            "post_compact_baseline_tokens": self.post_compact_baseline_tokens,
+            "post_compact_baseline_at": self.post_compact_baseline_at,
+            "unpreserved_context_tokens": (
+                None if self.current_tokens is None else max(
+                    0,
+                    self.current_tokens - (self.post_compact_baseline_tokens or 0),
+                )
+            ),
             "status_snapshot_timestamp": self.status_timestamp,
             "completed_turn_epoch": self.completed_turn_epoch,
             "status_snapshot_epoch": self.status_snapshot_epoch,
@@ -2543,20 +2575,70 @@ class Supervisor:
         if payload.get("session_id") != self.session_id:
             return None, "status-session-mismatch"
         tokens = payload.get("current_input_context_tokens")
+        model = payload.get("model")
         timestamp = payload.get("update_timestamp")
         if not isinstance(tokens, int) or tokens < 0:
             return None, "status-token-invalid"
         if not isinstance(timestamp, (int, float)):
             return None, "status-timestamp-invalid"
+        if model is not None and (
+            not isinstance(model, str)
+            or not model.strip()
+            or model.strip() != model
+            or len(model) > 128
+        ):
+            return None, "status-model-invalid"
         if (
             self.last_normal_stop
             and float(timestamp) + SNAPSHOT_STOP_SKEW_SECONDS < self.last_normal_stop
         ):
             return None, "status-snapshot-before-stop"
         self.current_tokens = tokens
+        self.current_model = model
         self.status_timestamp = float(timestamp)
         self.status_snapshot_epoch = self.completed_turn_epoch
         return payload, None
+
+    def _load_latest_compaction_baseline(self, *, require_recent: bool) -> None:
+        """Load the newest exact PostCompact token baseline from JSONL metadata."""
+        path = self.transcript_path
+        if path is None:
+            self.post_compact_baseline_tokens = None
+            self.post_compact_baseline_at = None
+            return
+        latest: tuple[int, float] | None = None
+        try:
+            with path.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if '"compact_boundary"' not in line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except (TypeError, ValueError):
+                        continue
+                    if record.get("type") != "system" or record.get("subtype") != "compact_boundary":
+                        continue
+                    metadata = record.get("compactMetadata")
+                    tokens = metadata.get("postTokens") if isinstance(metadata, dict) else None
+                    timestamp = record.get("timestamp")
+                    if isinstance(tokens, bool) or not isinstance(tokens, int) or tokens < 0:
+                        continue
+                    if not isinstance(timestamp, str):
+                        continue
+                    try:
+                        observed = datetime.datetime.fromisoformat(
+                            timestamp.replace("Z", "+00:00")
+                        ).timestamp()
+                    except ValueError:
+                        continue
+                    latest = (tokens, observed)
+        except OSError:
+            latest = None
+        if latest is None or (require_recent and abs(now() - latest[1]) > 900):
+            self.post_compact_baseline_tokens = None
+            self.post_compact_baseline_at = None
+            return
+        self.post_compact_baseline_tokens, self.post_compact_baseline_at = latest
 
     def _gate_reason(self, purpose: str = "compact") -> str | None:
         """Return the first failed final eligibility condition, if any."""
@@ -2637,8 +2719,13 @@ class Supervisor:
         _, snapshot_error = self._read_snapshot()
         if purpose == "compact" and snapshot_error:
             return snapshot_error
-        if purpose == "compact" and (self.current_tokens or 0) < MIN_TOKENS:
-            return "below-token-threshold"
+        if purpose == "compact":
+            unpreserved_tokens = max(
+                0,
+                (self.current_tokens or 0) - (self.post_compact_baseline_tokens or 0),
+            )
+            if unpreserved_tokens < MIN_TOKENS:
+                return "below-token-threshold"
         return None
 
     def _schedule_next_recovery(self) -> None:
@@ -2875,6 +2962,9 @@ class Supervisor:
                 self.recovery_ignore_next_stop = False
                 self.compaction_requested_at = None
                 self.compaction_ignore_next_stop = False
+                self.current_model = None
+                self.post_compact_baseline_tokens = None
+                self.post_compact_baseline_at = None
                 self.channel_health = "none" if not self.watched_servers else "reconnecting"
                 self.channel_attach_checked = not bool(self.watched_servers)
                 self.channel_attach_deadline = (
@@ -2892,6 +2982,8 @@ class Supervisor:
                 self.transcript_gate_blocked_at = None
                 self.last_transcript_classification = None
             self._set_transcript(message.get("transcript_path"))
+            if new_session:
+                self._load_latest_compaction_baseline(require_recent=False)
             self.status = "starting"
             self.screen_classifier.reset()
             self.screen_state = None
@@ -2979,6 +3071,7 @@ class Supervisor:
             self.compaction_requested_at = None
             self.compaction_ignore_next_stop = False
             self.current_tokens = None
+            self._load_latest_compaction_baseline(require_recent=True)
             self.status_timestamp = None
             self.status_snapshot_epoch = None
             self.transcript_quiescence_deadline = None
