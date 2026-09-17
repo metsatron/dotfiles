@@ -244,8 +244,9 @@ allowlist from private credential storage on the target machine.
 # Copy to ~/.config/deepseek-harness-telegram/env on the target machine.
 # Keep the private file mode 0600.
 
-TELEGRAM_BOT_TOKEN=YOUR_BOT_TOKEN
-# TELEGRAM_BOT_TOKEN_FILE=/home/metsatron/.config/deepseek-harness-telegram/token
+# Store the BotFather token only in this separate mode-0600 file. Inline tokens
+# are deliberately rejected so they cannot appear in process arguments.
+TELEGRAM_BOT_TOKEN_FILE=/home/metsatron/.config/deepseek-harness-telegram/token
 # Provider boundary invariant: DeepSeek is the model author; NeuralWatt is the
 # only approved API provider. Credential names must identify NeuralWatt.
 # DSH's apiKeyEnv contract consumes NEURALWATT_API_KEY. telegram-agent-host reads
@@ -1586,6 +1587,26 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                     pass
         self.temp.cleanup()
 
+    def read_start_ticks(self, pid: int) -> str:
+        fields = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        return fields[19]
+
+    def write_dsh_marker(self, pid: int, *, start_ticks: str | None = None, profile: str = "helmcortex-telegram") -> None:
+        marker = self.state / "telegram-agents/deepseek-harness.ready"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text(json.dumps({
+            "schema": 1,
+            "component": "dsh-telegram",
+            "pid": pid,
+            "start_ticks": start_ticks if start_ticks is not None else self.read_start_ticks(pid),
+            "profile": profile,
+            "provider": "neuralwatt",
+            "model": "deepseek-v4-flash",
+            "telegram_bot_identity_validated": True,
+            "long_polling_owned": True,
+            "ready_at": "2026-09-17T00:00:00Z",
+        }), encoding="utf-8")
+
     def write_executable(self, name: str, body: str, directory: Path | None = None) -> None:
         path = (directory or self.bin) / name
         path.write_text(body, encoding="utf-8")
@@ -1786,7 +1807,21 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("allowedChatIds is empty", result.stderr)
 
-    def test_deepseek_harness_status_reports_owned_process(self) -> None:
+    def test_deepseek_harness_rejects_inline_telegram_token(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        self.prepare_deepseek_harness([123])
+        env_file = self.home / ".config/deepseek-harness-telegram/env"
+        lines = [
+            line for line in env_file.read_text(encoding="utf-8").splitlines()
+            if not line.startswith("TELEGRAM_BOT_TOKEN_FILE=")
+        ]
+        lines.insert(0, "TELEGRAM_BOT_TOKEN=fake-inline-token")
+        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        result = self.run_manager("start", "deepseek-harness", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Telegram token file is missing", result.stderr)
+
+    def test_deepseek_harness_status_rejects_pid_only_health(self) -> None:
         self.prepare_deepseek_harness([123])
         proc = subprocess.Popen(
             [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
@@ -1824,33 +1859,118 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             / ".local/share/deepseek-harness-telegram/dsh-home/profiles/helmcortex-telegram/cordis.patch.yml"
         )
         profile_patch.write_text(
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("readiness owner state not verified", result.stdout)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_deepseek_harness_status_rejects_stale_marker(self) -> None:
+        self.prepare_deepseek_harness([123])
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.environment(2),
+        )
+        try:
+            state_dir = self.state / "telegram-agents"
+            state_dir.mkdir(parents=True)
+            state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.write_dsh_marker(proc.pid, start_ticks="0")
+            result = self.run_manager("status", "deepseek-harness", timeout=2)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("readiness owner state not verified", result.stdout)
+        finally:
+            proc.terminate()
+            proc.wait(timeout=5)
+
+    def test_deepseek_harness_status_accepts_matching_marker(self) -> None:
+        self.prepare_deepseek_harness([123])
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.environment(2),
+        )
+        try:
+            state_dir = self.state / "telegram-agents"
+            state_dir.mkdir(parents=True)
+            state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+            self.write_dsh_marker(proc.pid)
+            result = self.run_manager("status", "deepseek-harness", timeout=2)
             "- id: agent-default-model\n"
             "  config:\n"
             "    provider: neuralwatt\n"
             "    model: deepseek-v4-flash\n",
             encoding="utf-8",
         )
+    def test_deepseek_harness_stop_migrates_verified_legacy_pid_only_owner(self) -> None:
+        self.prepare_deepseek_harness([123])
+        proc = subprocess.Popen(
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=self.environment(2),
+        )
+        state_dir = self.state / "telegram-agents"
+        state_dir.mkdir(parents=True)
+        state_dir.joinpath("deepseek-harness.pid").write_text(str(proc.pid), encoding="utf-8")
+        result = self.run_manager("stop", "deepseek-harness", timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        proc.wait(timeout=5)
+        self.assertFalse(state_dir.joinpath("deepseek-harness.pid").exists())
+
+    def test_deepseek_harness_stop_clears_stale_state_without_a_matching_process(self) -> None:
+        self.prepare_deepseek_harness([123])
+        state_dir = self.state / "telegram-agents"
+        state_dir.mkdir(parents=True)
+        state_dir.joinpath("deepseek-harness.pid").write_text("99999999", encoding="utf-8")
+        state_dir.joinpath("deepseek-harness.ready").write_text("{}", encoding="utf-8")
+        env = self.environment(2)
+        env["DSH_TELEGRAM_PROFILE"] = "stale-test-profile"
+        result = subprocess.run(
+            [str(MANAGER), "stop", "deepseek-harness"],
+            text=True,
+            capture_output=True,
+            env=env,
+            timeout=7,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(state_dir.joinpath("deepseek-harness.pid").exists())
+        self.assertFalse(state_dir.joinpath("deepseek-harness.ready").exists())
+
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
         self.assertIn("refusing credential egress", result.stderr)
 
     def test_deepseek_harness_scrubs_ambient_deepseek_credentials(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
-        scrub = "env -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE"
-        self.assertGreaterEqual(manager_text.count(scrub), 2)
+        provider_scrub = "-u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE -u NEURALWATT_API_KEY"
+        self.assertGreaterEqual(manager_text.count(provider_scrub), 2)
+        self.assertIn("env -u TELEGRAM_BOT_TOKEN " + provider_scrub, manager_text)
         self.assertNotIn('DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"', manager_text)
 
     def test_deepseek_harness_log_redactor_lives_in_detached_session(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
-        detached = manager_text.index('exec nohup setsid env -u DEEPSEEK_API_KEY')
+        detached = manager_text.index('exec nohup setsid env -u TELEGRAM_BOT_TOKEN')
         detached_shell = manager_text.index("bash -c '", detached)
         redactor = manager_text.index("sed -u -E", detached_shell)
         launch = manager_text.index('exec dsh --profile "$DSH_TELEGRAM_PROFILE"', detached_shell)
-        pid_publish = manager_text.index("printf '%s\\n' \"$!\" > \"$DSH_TELEGRAM_PID_FILE\"", launch)
+        pid_publish = manager_text.index('printf \'%s\\n\' "$launched_pid" > "$DSH_TELEGRAM_PID_FILE"', launch)
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
-        self.assertIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
+        self.assertIn('NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE"', manager_text)
+
+    def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        self.assertIn('DSH_TELEGRAM_READY_MARKER=', manager_text)
+        self.assertIn('DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"', manager_text)
+        self.assertIn('telegram_bot_identity_validated', manager_text)
+        self.assertIn('long_polling_owned', manager_text)
+        self.assertNotIn('TELEGRAM_BOT_TOKEN', manager_text[manager_text.index('deepseek_harness_marker_matches'):manager_text.index('deepseek_harness_wait_ready')])
+        self.assertNotIn('chatId', manager_text[manager_text.index('deepseek_harness_marker_matches'):manager_text.index('deepseek_harness_wait_ready')])
 
 
 if __name__ == "__main__":
@@ -1864,6 +1984,8 @@ if __name__ == "__main__":
 #+BEGIN_SRC bash :tangle all/.local/bin/telegram-agent-host :shebang "#!/usr/bin/env bash"
 # Agent Control Script
 
+        self.assertNotIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
+        self.assertNotIn('TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"', manager_text)
 
 # [[file:../../../agents-bots.org::*Agent Control Script][Agent Control Script:1]]
 # ~/DotCortex/all/.local/bin/telegram-agent-host
@@ -1919,6 +2041,8 @@ load_opencode_continuity_policy() {
     while IFS='=' read -r key value; do
         key="${key%$'\r'}"
         value="${value%$'\r'}"
+DSH_TELEGRAM_READY_MARKER="${DSH_TELEGRAM_READY_MARKER:-$STATE_DIR/deepseek-harness.ready}"
+DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"
         case "$key" in
             OPENCODE_WARM_POLICY_HELPER|OPENCODE_WARM_POLICY_ROOT|OPENCODE_WARM_POLICY_AUTHORITY_IDENTITY|\
             OPENCODE_WARM_POLICY_TELEMETRY_HOST|OPENCODE_WARM_POLICY_PROVIDER|OPENCODE_WARM_POLICY_ACCOUNT_HASH|\
@@ -2229,6 +2353,20 @@ deepseek_harness_running() {
     local pid
     [ -r "$DSH_TELEGRAM_PID_FILE" ] || return 1
     pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
+deepseek_harness_start_ticks() {
+    python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    stat = Path("/proc", sys.argv[1], "stat").read_text(encoding="utf-8")
+    fields = stat[stat.rfind(")") + 2:].split()
+    print(fields[19])
+except (OSError, IndexError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
     deepseek_harness_pid_matches "$pid"
 }
 
@@ -2250,6 +2388,93 @@ for proc in Path("/proc").iterdir():
     if not proc.name.isdigit():
         continue
     pid = int(proc.name)
+deepseek_harness_marker_matches() {
+    local pid="${1:-}" marker="${2:-$DSH_TELEGRAM_READY_MARKER}" ticks
+    deepseek_harness_pid_matches "$pid" || return 1
+    ticks="$(deepseek_harness_start_ticks "$pid" 2>/dev/null)" || return 1
+    python3 - "$marker" "$pid" "$ticks" "$DSH_TELEGRAM_PROFILE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+if data.get("schema") != 1 or data.get("component") != "dsh-telegram":
+    raise SystemExit(1)
+if data.get("pid") != int(sys.argv[2]) or str(data.get("start_ticks")) != sys.argv[3]:
+    raise SystemExit(1)
+if data.get("profile") != sys.argv[4]:
+    raise SystemExit(1)
+if data.get("telegram_bot_identity_validated") is not True or data.get("long_polling_owned") is not True:
+    raise SystemExit(1)
+PY
+}
+
+deepseek_harness_ready() {
+    local pid
+    [ -r "$DSH_TELEGRAM_PID_FILE" ] && [ -r "$DSH_TELEGRAM_READY_MARKER" ] || return 1
+    pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
+    deepseek_harness_marker_matches "$pid"
+}
+
+deepseek_harness_clear_stale_marker() {
+    [ -e "$DSH_TELEGRAM_READY_MARKER" ] || return 0
+    local marker_pid
+    marker_pid="$(python3 - "$DSH_TELEGRAM_READY_MARKER" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+try:
+    value = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8")).get("pid")
+except (OSError, ValueError, TypeError):
+    value = None
+print(value if isinstance(value, int) else "")
+PY
+)"
+    if [ -n "$marker_pid" ] && deepseek_harness_marker_matches "$marker_pid"; then
+        echo "DeepSeek Harness readiness marker belongs to a live process; refusing replacement" >&2
+        return 1
+    fi
+    rm -f "$DSH_TELEGRAM_READY_MARKER"
+}
+
+deepseek_harness_kill_owned() {
+    local pid="$1" expected_ticks="$2" current_ticks pgid
+    deepseek_harness_pid_matches "$pid" || return 1
+    current_ticks="$(deepseek_harness_start_ticks "$pid" 2>/dev/null)" || return 1
+    [ "$current_ticks" = "$expected_ticks" ] || return 1
+    pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    if [ "$pgid" = "$pid" ]; then
+        kill -TERM -- "-$pgid" 2>/dev/null || true
+    else
+        kill -TERM "$pid" 2>/dev/null || true
+    fi
+    for _ in {1..20}; do
+        deepseek_harness_pid_matches "$pid" || return 0
+        sleep 0.25
+    done
+    if [ "$pgid" = "$pid" ]; then
+        kill -KILL -- "-$pgid" 2>/dev/null || true
+    else
+        kill -KILL "$pid" 2>/dev/null || true
+    fi
+    ! deepseek_harness_pid_matches "$pid"
+}
+
+deepseek_harness_wait_ready() {
+    local timeout="$DSH_TELEGRAM_READY_TIMEOUT" attempts
+    case "$timeout" in ''|*[!0-9]*) echo "Invalid DSH_TELEGRAM_READY_TIMEOUT: $timeout" >&2; return 1 ;; esac
+    attempts=$((timeout * 2))
+    for ((i = 0; i < attempts; i += 1)); do
+        deepseek_harness_ready && return 0
+        sleep 0.5
+    done
+    deepseek_harness_ready
+}
+
     if pid in {self_pid, owned}:
         continue
     try:
@@ -2312,7 +2537,7 @@ deepseek_harness_load_env() {
         value="${value%$'\r'}"
         case "$key" in ''|\#*) continue ;; esac
         case "$key" in
-            TELEGRAM_BOT_TOKEN|TELEGRAM_BOT_TOKEN_FILE|NEURALWATT_API_KEY|NEURALWATT_API_KEY_FILE|\
+            TELEGRAM_BOT_TOKEN_FILE|NEURALWATT_API_KEY_FILE|\
             DSH_HOME|DSH_TELEGRAM_PROFILE|DSH_TELEGRAM_WORKSPACE|DSH_TELEGRAM_PLUGIN_ROOT|\
             DSH_TELEGRAM_MODEL_PROVIDER|DSH_TELEGRAM_MODEL|DSH_TELEGRAM_PROVIDER_BASE_URL)
                 value="${value%\"}"
@@ -2329,20 +2554,22 @@ deepseek_harness_validate_private_config() {
     local token_file key_file config settings profile_patch
     deepseek_harness_load_env || return 1
 
-    if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
-        token_file="${TELEGRAM_BOT_TOKEN_FILE:-}"
-        if [ -z "$token_file" ]; then
-            echo "DeepSeek Harness Telegram token is missing; set TELEGRAM_BOT_TOKEN or TELEGRAM_BOT_TOKEN_FILE" >&2
-            return 1
-        fi
-        if [ ! -r "$token_file" ]; then
-            echo "DeepSeek Harness token file is not readable: $token_file" >&2
-            return 1
-        fi
-        if [ "$(stat -c '%a' "$token_file" 2>/dev/null || printf '000')" != "600" ]; then
-            echo "DeepSeek Harness token file must be mode 0600: $token_file" >&2
-            return 1
-        fi
+    token_file="${TELEGRAM_BOT_TOKEN_FILE:-}"
+    if [ -z "$token_file" ]; then
+        echo "DeepSeek Harness Telegram token file is missing; set TELEGRAM_BOT_TOKEN_FILE" >&2
+        return 1
+    fi
+    if [ ! -r "$token_file" ]; then
+        echo "DeepSeek Harness token file is not readable: $token_file" >&2
+        return 1
+    fi
+    if [ "$(stat -c '%a' "$token_file" 2>/dev/null || printf '000')" != "600" ]; then
+        echo "DeepSeek Harness token file must be mode 0600: $token_file" >&2
+        return 1
+    fi
+    if [ ! -s "$token_file" ]; then
+        echo "DeepSeek Harness token file is empty: $token_file" >&2
+        return 1
     fi
 
     key_file="${NEURALWATT_API_KEY_FILE:-}"
@@ -2358,10 +2585,7 @@ deepseek_harness_validate_private_config() {
         echo "HelmCortex NeuralWatt key file must be mode 0600: $key_file" >&2
         return 1
     fi
-    IFS= read -r NEURALWATT_API_KEY < "$key_file" || true
-    NEURALWATT_API_KEY="${NEURALWATT_API_KEY%$'\r'}"
-    export NEURALWATT_API_KEY
-    if [ -z "$NEURALWATT_API_KEY" ]; then
+    if [ ! -s "$key_file" ]; then
         echo "HelmCortex NeuralWatt key file is empty: $key_file" >&2
         return 1
     fi
@@ -2439,8 +2663,8 @@ PY
 }
 
 deepseek_harness_preflight_model() {
-    env -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE \
-        NEURALWATT_API_KEY="$NEURALWATT_API_KEY" \
+    env -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE -u NEURALWATT_API_KEY \
+        NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE" \
         DSH_TELEGRAM_PROVIDER_BASE_URL="$DSH_TELEGRAM_PROVIDER_BASE_URL" \
         DSH_TELEGRAM_MODEL="$DSH_TELEGRAM_MODEL" \
         python3 - <<'PY'
@@ -2454,7 +2678,7 @@ base_url = os.environ["DSH_TELEGRAM_PROVIDER_BASE_URL"].rstrip("/")
 model = os.environ["DSH_TELEGRAM_MODEL"]
 request = Request(
     f"{base_url}/models",
-    headers={"Authorization": f"Bearer {os.environ['NEURALWATT_API_KEY']}"},
+    headers={"Authorization": f"Bearer {api_key}"},
 )
 try:
     with urlopen(request, timeout=15) as response:
@@ -2475,8 +2699,11 @@ if isinstance(models, dict):
     visible.update(key for key in models if isinstance(key, str))
 if model not in visible:
     print(
+from pathlib import Path
+
         f"NeuralWatt does not expose required model {model}; refusing undeclared fallback and poller start",
         file=sys.stderr,
+api_key = Path(os.environ["NEURALWATT_API_KEY_FILE"]).read_text(encoding="utf-8").splitlines()[0]
     )
     raise SystemExit(1)
 print(f"NeuralWatt model visibility preflight passed: {model}")
@@ -2546,12 +2773,12 @@ PY
 }
 
 check_deepseek_harness() {
-    if deepseek_harness_running; then
+    if deepseek_harness_ready; then
         local pid
         pid="$(cat "$DSH_TELEGRAM_PID_FILE")"
         echo "  deepseek-harness: RUNNING pid=$pid profile=$DSH_TELEGRAM_PROFILE"
-    elif [ -r "$DSH_TELEGRAM_PID_FILE" ]; then
-        echo "  deepseek-harness: STOPPED (stale owner state)"
+    elif [ -r "$DSH_TELEGRAM_PID_FILE" ] || [ -r "$DSH_TELEGRAM_READY_MARKER" ]; then
+        echo "  deepseek-harness: STOPPED (readiness owner state not verified)"
         return 1
     else
         echo "  deepseek-harness: STOPPED"
@@ -2913,7 +3140,7 @@ start_agent() {
             deepseek_harness_validate_private_config || return 1
             deepseek_harness_validate_install || return 1
             if deepseek_harness_running; then
-                echo "deepseek-harness already has an owned poller"
+                echo "DeepSeek Harness has a legacy PID-only poller; stop it before starting under the readiness contract" >&2
                 return 1
             fi
             if [ -r "$DSH_TELEGRAM_PID_FILE" ]; then
@@ -2932,19 +3159,23 @@ start_agent() {
             echo "Starting DeepSeek Harness Telegram profile $DSH_TELEGRAM_PROFILE..."
             (
                 cd "$DSH_TELEGRAM_WORKSPACE"
-                exec nohup setsid env -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE \
+                exec nohup setsid env -u TELEGRAM_BOT_TOKEN -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE -u NEURALWATT_API_KEY \
                     PATH="$AGENT_RUNTIME_PATH" \
                     NODE_OPTIONS="$DSH_TELEGRAM_NODE_OPTIONS" \
                     DSH_HOME="$DSH_HOME" \
                     DSH_TELEGRAM_PROFILE="$DSH_TELEGRAM_PROFILE" \
                     DSH_TELEGRAM_LOG_FILE="$DSH_TELEGRAM_LOG_FILE" \
-                    TELEGRAM_BOT_TOKEN="${TELEGRAM_BOT_TOKEN:-}" \
-                    TELEGRAM_BOT_TOKEN_FILE="${TELEGRAM_BOT_TOKEN_FILE:-}" \
-                    NEURALWATT_API_KEY="$NEURALWATT_API_KEY" \
+                    TELEGRAM_BOT_TOKEN_FILE="$TELEGRAM_BOT_TOKEN_FILE" \
+                    NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE" \
+            if deepseek_harness_ready; then
+                echo "deepseek-harness already has a ready owned poller"
+                return 1
+            fi
                     bash -c '
                         exec dsh --profile "$DSH_TELEGRAM_PROFILE" > >(
                             sed -u -E \
                                 -e '\''s#bot[0-9]{8,}:[A-Za-z0-9_-]{30,}#bot[REDACTED]#g'\'' \
+            deepseek_harness_clear_stale_marker || return 1
                                 -e '\''s#chatId=-?[0-9]+#chatId=[REDACTED]#g'\'' \
                                 -e '\''s#bar-sync\(-?[0-9]+\)#bar-sync([REDACTED])#g'\'' \
                                 -e '\''s#([?&]token=)[A-Za-z0-9_-]+#\1[REDACTED]#g'\'' \
@@ -2952,11 +3183,16 @@ start_agent() {
                         ) 2>&1 </dev/null
                     '
             ) &
-            printf '%s\n' "$!" > "$DSH_TELEGRAM_PID_FILE"
-            sleep 2
-            if ! deepseek_harness_running; then
-                rm -f "$DSH_TELEGRAM_PID_FILE"
-                echo "DeepSeek Harness Telegram failed to publish an owned poller; inspect $DSH_TELEGRAM_LOG_FILE" >&2
+            local launched_pid="$!" launched_ticks
+            launched_ticks="$(deepseek_harness_start_ticks "$launched_pid" 2>/dev/null || true)"
+            printf '%s\n' "$launched_pid" > "$DSH_TELEGRAM_PID_FILE"
+            if [ -z "$launched_ticks" ] || ! deepseek_harness_wait_ready; then
+                echo "DeepSeek Harness Telegram readiness timeout; refusing PID-only health" >&2
+                if [ -n "$launched_ticks" ] && deepseek_harness_kill_owned "$launched_pid" "$launched_ticks"; then
+                    rm -f "$DSH_TELEGRAM_PID_FILE"
+                else
+                    echo "DeepSeek Harness Telegram owner changed; preserving state and refusing unverified stop" >&2
+                fi
                 return 1
             fi
             ;;
@@ -2966,11 +3202,14 @@ start_agent() {
         *)
             echo "Unknown agent: $agent"
             exit 1
+                    DSH_TELEGRAM_READY_MARKER="$DSH_TELEGRAM_READY_MARKER" \
             ;;
     esac
     echo "$agent started"
 }
 
+                        IFS= read -r NEURALWATT_API_KEY < "$NEURALWATT_API_KEY_FILE"
+                        export NEURALWATT_API_KEY
 stop_agent() {
     local agent="$1"
     validate_agent "$agent"
@@ -3028,33 +3267,25 @@ stop_agent() {
             fi
             ;;
         deepseek-harness)
-            local dsh_pid dsh_pgid
-            if deepseek_harness_running; then
-                dsh_pid=$(cat "$DSH_TELEGRAM_PID_FILE")
-                dsh_pgid=$(ps -o pgid= -p "$dsh_pid" 2>/dev/null | tr -d ' ' || true)
-                if [ "$dsh_pgid" = "$dsh_pid" ]; then
-                    kill -TERM -- "-$dsh_pgid" 2>/dev/null || true
-                else
-                    kill -TERM "$dsh_pid" 2>/dev/null || true
-                fi
-                for _ in {1..20}; do
-                    deepseek_harness_running || break
-                    sleep 0.25
-                done
-                if deepseek_harness_running; then
-                    echo "DeepSeek Harness Telegram did not stop gracefully; forcing its verified process group" >&2
-                    if [ "$dsh_pgid" = "$dsh_pid" ]; then
-                        kill -KILL -- "-$dsh_pgid" 2>/dev/null || true
-                    else
-                        kill -KILL "$dsh_pid" 2>/dev/null || true
-                    fi
-                fi
+            local dsh_pid dsh_ticks
+            if [ ! -e "$DSH_TELEGRAM_PID_FILE" ] && [ ! -e "$DSH_TELEGRAM_READY_MARKER" ]; then
+                return 0
             fi
-            if deepseek_harness_running; then
-                echo "DeepSeek Harness Telegram failed to stop" >&2
+            dsh_pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
+            if deepseek_harness_ready || deepseek_harness_pid_matches "$dsh_pid"; then
+                dsh_ticks="$(deepseek_harness_start_ticks "$dsh_pid" 2>/dev/null)" || {
+                    echo "DeepSeek Harness process start ticks unavailable; refusing stop" >&2
+                    return 1
+                }
+                if ! deepseek_harness_kill_owned "$dsh_pid" "$dsh_ticks"; then
+                    echo "DeepSeek Harness Telegram failed to stop its verified owner" >&2
+                    return 1
+                fi
+            elif [ -n "$(deepseek_harness_find_unowned 2>/dev/null || true)" ]; then
+                echo "DeepSeek Harness owner state is stale but an unowned poller uses this profile; refusing cleanup" >&2
                 return 1
             fi
-            rm -f "$DSH_TELEGRAM_PID_FILE"
+            rm -f "$DSH_TELEGRAM_PID_FILE" "$DSH_TELEGRAM_READY_MARKER"
             ;;
         pi-agent)
             stop_pi_agent
