@@ -296,6 +296,17 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         scrub = "env -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE"
         self.assertGreaterEqual(manager_text.count(scrub), 2)
         self.assertNotIn('DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"', manager_text)
+
+    def test_deepseek_harness_log_redactor_lives_in_detached_session(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        detached = manager_text.index('exec nohup setsid env -u DEEPSEEK_API_KEY')
+        detached_shell = manager_text.index("bash -c '", detached)
+        redactor = manager_text.index("sed -u -E", detached_shell)
+        launch = manager_text.index('exec dsh --profile "$DSH_TELEGRAM_PROFILE"', detached_shell)
+        pid_publish = manager_text.index("printf '%s\\n' \"$!\" > \"$DSH_TELEGRAM_PID_FILE\"", launch)
+        self.assertLess(detached_shell, launch)
+        self.assertLess(launch, redactor)
+        self.assertLess(redactor, pid_publish)
         self.assertIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
 
 
