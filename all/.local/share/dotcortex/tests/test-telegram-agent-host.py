@@ -142,6 +142,31 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertIn("pi-agent started", result.stdout)
         self.assertIn("Failed to start enabled agent: ductor", result.stderr)
 
+    def test_targeted_pi_agent_status_is_parseable_without_other_agents(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|pi-agent\n", encoding="utf-8")
+        gemma_env = self.home / ".config/gemma-pi-telegram/.env"
+        gemma_env.parent.mkdir(parents=True)
+        gemma_env.write_text("TELEGRAM_BOT_TOKEN=fake\nTELEGRAM_ALLOWED_USER_ID=1\n", encoding="utf-8")
+        gemma_env.chmod(0o600)
+        fake_adapter = self.home / "gemma_telegram.py"
+        fake_adapter.write_text("import time\nwhile True: time.sleep(1)\n", encoding="utf-8")
+        self.write_executable(
+            "gemma-pi-telegram",
+            f"#!/bin/sh\n"
+            "d=$XDG_STATE_HOME/gemma-pi-telegram\nmkdir -p \"$d\"\n"
+            "printf '%s\\n' $$ >\"$d/adapter.pid\"\n"
+            f"exec python3 {str(fake_adapter)!r}\n",
+            directory=self.forge_bin,
+        )
+
+        started = self.run_manager("start", "pi-agent", timeout=2)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        status = self.run_manager("status", "pi-agent", timeout=2)
+
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertRegex(status.stdout, r"^pi-agent: RUNNING pid=\d+ \(gemma-pi-telegram\)\n$")
+        self.assertNotIn("opencode", status.stdout)
+
     def test_sanitized_boot_binds_core_node_before_opencode_preflight(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|opencode\n", encoding="utf-8")
         marker = self.root / "resolved-node"
