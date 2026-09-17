@@ -246,7 +246,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
     def test_deepseek_harness_status_reports_owned_process(self) -> None:
         self.prepare_deepseek_harness([123])
         proc = subprocess.Popen(
-            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram", "web"],
+            [str(self.bin / "dsh"), "--profile", "helmcortex-telegram"],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             env=self.environment(2),
