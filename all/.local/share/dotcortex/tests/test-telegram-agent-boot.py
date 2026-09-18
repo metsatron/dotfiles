@@ -105,6 +105,47 @@ class TelegramAgentBootTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertFalse((self.root / "calls").exists())
 
+    def test_boot_lock_not_inherited_by_spawned_child(self) -> None:
+        # A daemonized agent must never inherit the boot lock (fd 9). If it does,
+        # the flock stays held for the agent's whole lifetime and every later boot
+        # -- including the self-heal cron -- fails flock -n and skips the spawn.
+        # The manager is a shell that backgrounds a lingering child WITHOUT closing
+        # fds (mimicking the real host); Python's own Popen would auto-close fds and
+        # hide the very leak this guards against.
+        self.state.mkdir(parents=True)
+        pid_file = self.root / "child.pid"
+        self.manager.write_text(
+            "#!/usr/bin/env bash\n"
+            'case "$1" in\n'
+            "  enabled) echo one ;;\n"
+            # Detach the child's stdio from the captured pipe (else run_boot blocks
+            # on it for 30s); fd 9 is untouched, so the inheritance check stays valid.
+            f'  start) sleep 30 </dev/null >/dev/null 2>&1 & echo "$!" > {str(pid_file)!r} ;;\n'
+            "esac\n",
+            encoding="utf-8",
+        )
+        self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
+        result = self.run_boot("--attempts", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        child = int(pid_file.read_text().strip())
+        try:
+            fd_dir = Path("/proc") / str(child) / "fd"
+            holders = []
+            if fd_dir.exists():
+                for fd in fd_dir.iterdir():
+                    try:
+                        target = os.readlink(str(fd))
+                    except OSError:
+                        continue
+                    if target.rsplit("/", 1)[-1] == "boot.lock":
+                        holders.append((fd.name, target))
+            self.assertEqual(holders, [], "spawned child inherited the boot lock: %r" % (holders,))
+        finally:
+            try:
+                os.kill(child, 9)
+            except ProcessLookupError:
+                pass
+
     def test_help_is_side_effect_free(self) -> None:
         result = subprocess.run([str(BOOT), "--help"], text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0)
