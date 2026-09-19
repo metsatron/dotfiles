@@ -119,8 +119,8 @@ set -g @continuum-restore 'on'
 set -g @continuum-status-on 'off'
 
 # --- Initialize TPM (keep at bottom) ---
-set-environment -g TMUX_PLUGIN_MANAGER_PATH '~/.config/tmux/plugins'
-run '~/.config/tmux/plugins/tpm/tpm'
+set-environment -g TMUX_PLUGIN_MANAGER_PATH '~/.tmux/plugins'
+run '~/.tmux/plugins/tpm/tpm'
 
 # --- DotCortex tmux-resurrect hardening ---
 # tmux-resurrect names saves at one-second precision. When two saves land in
@@ -141,7 +141,7 @@ set -euo pipefail
 RESURRECT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/tmux/resurrect"
 LAST_LINK="${RESURRECT_DIR}/last"
 LOCKDIR="${RESURRECT_DIR}/.save-safe.lock"
-UPSTREAM_SAVE="${HOME}/.config/tmux/plugins/tmux-resurrect/scripts/save.sh"
+UPSTREAM_SAVE="${HOME}/.tmux/plugins/tmux-resurrect/scripts/save.sh"
 
 candidate_name() {
   printf 'tmux_resurrect_%s.txt\n' "$(date +"%Y%m%dT%H%M%S")"
@@ -198,7 +198,7 @@ main "$@"
 #!/usr/bin/env bash
 set -euo pipefail
 
-TPM_DIR="${HOME}/.config/tmux/plugins/tpm"
+TPM_DIR="${HOME}/.tmux/plugins/tpm"
 RESURRECT_DIR="${HOME}/.local/share/tmux/resurrect"
 
 echo "== tmux bootstrap =="
@@ -224,6 +224,112 @@ fi
 echo "Done."
 #+END_SRC
 
+** Tmux boot restore
+
+On systemd hosts, tmux-continuum's =@continuum-boot 'on'= starts a tmux server at boot via a user service, which fires the continuum restore. This fleet is sysvinit/OpenRC, so there is no such service and NOTHING starts a tmux server at boot — meaning continuum never restores and the Claude tmux bots (Fable/Auryn/Opus/Haiku) stay dead after a cold reboot even though =@continuum-restore= is on and a valid save exists (the 2026-09-19 incident: forced reboot, host bots up, all four Claude bots down). This lane is the missing boot trigger: a headless =@reboot= hook (user lingering is on, so =/run/user/$UID= exists at boot) that starts the tmux server, which loads the config, TPM, and continuum, whose restore then recreates the saved sessions and relaunches each bot's =claude-warm --resume= process. =CLAUDE_IDLE_REAL_EXECUTABLE= is set in the cron environment so the restored claude-warm panes resolve the Claude binary regardless of the bare-boot PATH (Auryn hit exactly that resolver miss on 2026-09-19).
+
+#+BEGIN_SRC bash :tangle all/.local/bin/tmux-boot-restore :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+set -uo pipefail
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot-restore.log"
+mkdir -p "$(dirname "$LOG")"
+exec >>"$LOG" 2>&1
+echo "$(date -Is) tmux-boot-restore: start"
+
+# Wait for the runtime dir + tmux to be available at boot.
+for _ in $(seq 1 30); do
+  [ -d "$XDG_RUNTIME_DIR" ] && command -v tmux >/dev/null 2>&1 && break
+  sleep 2
+done
+command -v tmux >/dev/null 2>&1 || { echo "$(date -Is) tmux not found; giving up"; exit 1; }
+
+# Never clobber a live tree: if the server already holds real (non-_boot) sessions, stop.
+if tmux list-sessions 2>/dev/null | grep -qv '^_boot:'; then
+  echo "$(date -Is) server already has sessions; skipping restore"
+  exit 0
+fi
+
+# Start the server via a throwaway session: this loads the config -> TPM ->
+# continuum, and @continuum-restore 'on' fires the restore of the saved sessions
+# (recreating each bot pane and relaunching its claude-warm --resume process).
+tmux new-session -d -s _boot -c "$HOME" 2>/dev/null || true
+echo "$(date -Is) server started; waiting for continuum restore"
+
+# Give continuum up to ~60s to restore the bot sessions.
+for _ in $(seq 1 30); do
+  tmux list-sessions 2>/dev/null | grep -qE '^(Fable|Auryn|Opus|Haiku):' && break
+  sleep 2
+done
+
+if tmux list-sessions 2>/dev/null | grep -qE '^(Fable|Auryn|Opus|Haiku):'; then
+  tmux kill-session -t _boot 2>/dev/null || true
+  echo "$(date -Is) restore confirmed: $(tmux list-sessions 2>/dev/null | cut -d: -f1 | paste -sd, -)"
+else
+  echo "$(date -Is) continuum did not restore within timeout; running explicit resurrect restore"
+  restore="$HOME/.tmux/plugins/tmux-resurrect/scripts/restore.sh"
+  if [ -x "$restore" ]; then "$restore"; else echo "$(date -Is) explicit restore.sh unavailable"; fi
+fi
+echo "$(date -Is) tmux-boot-restore: done"
+#+END_SRC
+
+** Tmux boot restore cron deployment helper
+
+#+BEGIN_SRC bash :tangle all/.local/bin/tmux-boot-restore-cron-apply :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+
+TAG="tmux-boot-restore-cron-apply"
+TARGET="/etc/cron.d/dotcortex-tmux-boot-restore"
+EXPECTED_HOST=""
+DRY=0
+REMOVE=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host) [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --dry-run) DRY=1 ;;
+    --remove) REMOVE=1 ;;
+    -h|--help|help) echo "Usage: $TAG --host EXACT_HOST [--dry-run] [--remove]"; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then echo "remove $TARGET"; else run_priv rm -f "$TARGET"; echo "$TAG: removed $TARGET"; fi
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --host EXACT_HOST is required" >&2; exit 2; }
+[ "$(hostname)" = "$EXPECTED_HOST" ] || { echo "$TAG: refusing installation on $(hostname); expected $EXPECTED_HOST" >&2; exit 1; }
+
+USER_NAME="$(id -un)"
+USER_ID="$(id -u)"
+TARGET_HOME="$HOME"
+HOOK="$TARGET_HOME/.local/bin/tmux-boot-restore"
+[ "$DRY" = 1 ] || [ -x "$HOOK" ] || { echo "$TAG: missing $HOOK; tangle and stow first" >&2; exit 1; }
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex tmux boot restore; managed by $TAG.
+# Sysvinit/OpenRC has no continuum-boot service, so nothing starts a tmux server
+# at boot; this @reboot hook does, which fires tmux-continuum's restore and brings
+# the Claude tmux bots back with their claude-warm --resume processes. Lingering is
+# on, so /run/user/${USER_ID} exists at boot.
+@reboot ${USER_NAME} HOME=${TARGET_HOME} PATH=${TARGET_HOME}/.guix-extra-profiles/core/core/bin:${TARGET_HOME}/HelmCortex/FORGE/bin:${TARGET_HOME}/.local/bin:${TARGET_HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/${USER_ID} CLAUDE_IDLE_REAL_EXECUTABLE=${TARGET_HOME}/.npm-global/bin/claude ${HOOK}
+EOF
+
+if [ "$DRY" = 1 ]; then
+  cat "$TMP"
+else
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+  echo "$TAG: installed $TARGET"
+fi
+#+END_SRC
+
 ** Tmux health
 #+BEGIN_SRC bash :tangle all/.local/bin/tmux-health :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 #!/usr/bin/env bash
@@ -237,7 +343,7 @@ else
   echo "[tmux] NOT FOUND"
 fi
 
-TPM_DIR="${HOME}/.config/tmux/plugins/tpm"
+TPM_DIR="${HOME}/.tmux/plugins/tpm"
 if [ -d "$TPM_DIR" ]; then
   echo "[tpm] installed at $TPM_DIR"
 else
@@ -245,7 +351,7 @@ else
 fi
 
 for plugin in tmux-resurrect tmux-continuum tmux-yank tmux-sensible; do
-  dir="${HOME}/.config/tmux/plugins/$plugin"
+  dir="${HOME}/.tmux/plugins/$plugin"
   if [ -d "$dir" ]; then
     echo "[$plugin] installed"
   else
