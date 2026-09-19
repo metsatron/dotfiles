@@ -121,6 +121,7 @@
    "wget"
    "make"
    "python"
+   "python-dbus"                        ; xfce-host-keys: dbus bindings for guest xfconfd access
    "tree"
    "htop"
    "btop"
