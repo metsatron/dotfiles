@@ -8,11 +8,14 @@
 
 * Storage maintenance
 
-This module owns a deliberately small cleanup allowlist.  It collects only
-unreferenced Guix store items, caps the known Redstone 9X =clipmenud.log=
-runaway, and expires old entries from Ductor's regenerable candidate cache.
-It does not sweep generic caches, temporary directories, Flatpak objects,
-Borg state, model files, agent sessions, or HelmCortex data.
+This module owns a deliberately small cleanup allowlist.  It collects
+unreferenced Guix store items; clears Nala's downloaded-package archive;
+removes unused, unpinned Flatpak refs; prunes stale Homebrew downloads and
+dangling uv cache entries; caps the known Redstone 9X =clipmenud.log= runaway;
+and expires old entries from Ductor's regenerable candidate cache.  It does
+not run dependency autoremoval, delete package-manager rollback generations,
+or sweep generic caches, temporary directories, Flatpak objects, Borg state,
+model files, agent sessions, or HelmCortex data.
 
 The cleanup command is host-gated and singleton.  Dry-run mode reports the
 same targets without changing them.  The cron installer is separate so
@@ -35,11 +38,16 @@ Usage: dotcortex-storage-maintenance --expected-host EXACT_HOST [--dry-run]
 
 Run the narrow DotCortex cleanup allowlist:
   - collect unreferenced Guix store items
+  - clear Nala's downloaded-package archive
+  - remove unused, unpinned user Flatpak refs
+  - prune Homebrew downloads older than 30 days
+  - prune dangling uv cache entries
   - truncate Redstone 9X clipmenud.log files larger than 16 MiB
   - remove Ductor candidate-cache entries older than 14 days
 
-No generic cache, temporary-directory, Flatpak, Borg, model, agent-session,
-or HelmCortex cleanup is performed.
+No dependency autoremove, package-generation deletion, generic cache,
+temporary-directory, Flatpak object surgery, Borg, model, agent-session, or
+HelmCortex cleanup is performed.
 EOF
 }
 
@@ -68,6 +76,16 @@ STATE_DIR="${STORAGE_MAINTENANCE_STATE_DIR:-$MAINTENANCE_HOME/.local/state/dotco
 LOCK_FILE="$STATE_DIR/lock"
 CANDIDATE_DIR="$MAINTENANCE_HOME/.cache/ductor-candidates"
 GUIX_BIN="${STORAGE_MAINTENANCE_GUIX:-$MAINTENANCE_HOME/.guix-extra-profiles/core/core/bin/guix}"
+NALA_BIN="${STORAGE_MAINTENANCE_NALA:-$(command -v nala || true)}"
+FLATPAK_BIN="${STORAGE_MAINTENANCE_FLATPAK:-$(command -v flatpak || true)}"
+UV_BIN="${STORAGE_MAINTENANCE_UV:-$(command -v uv || true)}"
+BREW_BIN="${STORAGE_MAINTENANCE_BREW:-$(command -v brew || true)}"
+SUDO_BIN="${STORAGE_MAINTENANCE_SUDO:-$(command -v sudo || true)}"
+APT_ARCHIVE_DIR="${STORAGE_MAINTENANCE_APT_ARCHIVE_DIR:-/var/cache/apt/archives}"
+
+if [ -z "$BREW_BIN" ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+  BREW_BIN=/home/linuxbrew/.linuxbrew/bin/brew
+fi
 
 case "$CANDIDATE_MAX_AGE_DAYS:$CLIPMENU_MAX_BYTES" in
   *[!0-9:]*|:*|*:) printf '%s: cleanup limits must be non-negative integers\n' "$TAG" >&2; exit 2 ;;
@@ -88,6 +106,22 @@ flock -n 9 || { printf '%s: another cleanup is already running\n' "$TAG" >&2; ex
 
 disk_line() {
   df -PB1 "$MAINTENANCE_HOME" | awk 'NR == 2 { printf "used=%s available=%s capacity=%s", $3, $4, $5 }'
+}
+
+run_root() {
+  if [ "$(id -u)" = 0 ]; then
+    "$@"
+  else
+    [ -n "$SUDO_BIN" ] && [ -x "$SUDO_BIN" ] || {
+      printf '%s: sudo is required for %s\n' "$TAG" "$1" >&2
+      return 1
+    }
+    "$SUDO_BIN" -n "$@"
+  fi
+}
+
+optional_executable() {
+  [ -n "$1" ] && [ -x "$1" ]
 }
 
 estimate_dead_bytes() {
@@ -147,7 +181,67 @@ if [ -d "$CANDIDATE_DIR" ]; then
   done < <(find "$CANDIDATE_DIR" -mindepth 1 -maxdepth 1 -mtime "+$CANDIDATE_MAX_AGE_DAYS" -print0)
 fi
 
+PACKAGE_FAILURES=0
+
+if optional_executable "$NALA_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    archive_bytes=0
+    if [ -d "$APT_ARCHIVE_DIR" ]; then
+      archive_bytes="$(du -sB1 "$APT_ARCHIVE_DIR" 2>/dev/null | awk '{print $1}')" || true
+      archive_bytes="${archive_bytes:-0}"
+    fi
+    printf 'would clear Nala/APT downloaded-package archive: bytes=%s\n' "$archive_bytes"
+  elif run_root "$NALA_BIN" clean; then
+    printf 'cleaned Nala/APT downloaded-package archive\n'
+  else
+    printf '%s: Nala archive cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped Nala archive cleanup: executable unavailable\n'
+fi
+
+if optional_executable "$FLATPAK_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would remove unused, unpinned user Flatpak refs\n'
+  elif "$FLATPAK_BIN" uninstall --user --unused --assumeyes --noninteractive; then
+    printf 'removed unused, unpinned user Flatpak refs\n'
+  else
+    printf '%s: Flatpak unused-ref cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped Flatpak unused-ref cleanup: executable unavailable\n'
+fi
+
+if optional_executable "$BREW_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    "$BREW_BIN" cleanup --dry-run --prune=30
+  elif "$BREW_BIN" cleanup --prune=30; then
+    printf 'pruned Homebrew downloads older than 30 days\n'
+  else
+    printf '%s: Homebrew cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped Homebrew cleanup: executable unavailable\n'
+fi
+
+if optional_executable "$UV_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would prune dangling uv cache entries\n'
+  elif "$UV_BIN" cache prune; then
+    printf 'pruned dangling uv cache entries\n'
+  else
+    printf '%s: uv cache cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped uv cache cleanup: executable unavailable\n'
+fi
+
 printf '%s: finish %s\n' "$TAG" "$(disk_line)"
+[ "$PACKAGE_FAILURES" -eq 0 ] || exit 1
 #+END_SRC
 
 ** Daily Kikin schedule
@@ -280,7 +374,7 @@ INSTALLER = ROOT / "linux/.local/bin/dotcortex-storage-maintenance-cron-apply"
 
 
 class StorageMaintenanceTests(unittest.TestCase):
-    def fixture(self, root: Path) -> tuple[dict[str, str], Path, Path, Path]:
+    def fixture(self, root: Path) -> tuple[dict[str, str], Path, Path, Path, Path]:
         fake_guix = root / "guix"
         dead = root / "dead-store-item"
         dead.mkdir()
@@ -295,6 +389,26 @@ class StorageMaintenanceTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_guix.chmod(0o755)
+
+        package_calls = root / "package-calls"
+        package_bins: dict[str, Path] = {}
+        for name in ("nala", "flatpak", "brew", "uv"):
+            executable = root / name
+            executable.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s %s\\n' '{name}' \"$*\" >>'{package_calls}'\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            package_bins[name] = executable
+        fake_sudo = root / "sudo"
+        fake_sudo.write_text(
+            "#!/bin/sh\n"
+            "[ \"${1:-}\" = -n ] && shift\n"
+            "exec \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_sudo.chmod(0o755)
 
         runaway = root / ".local/share/dotcortex/guests/test/home/.cache/redstone-9x/clipmenud.log"
         runaway.parent.mkdir(parents=True)
@@ -317,9 +431,15 @@ class StorageMaintenanceTests(unittest.TestCase):
                 "STORAGE_MAINTENANCE_HOME": str(root),
                 "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
                 "STORAGE_MAINTENANCE_GUIX": str(fake_guix),
+                "STORAGE_MAINTENANCE_NALA": str(package_bins["nala"]),
+                "STORAGE_MAINTENANCE_FLATPAK": str(package_bins["flatpak"]),
+                "STORAGE_MAINTENANCE_BREW": str(package_bins["brew"]),
+                "STORAGE_MAINTENANCE_UV": str(package_bins["uv"]),
+                "STORAGE_MAINTENANCE_SUDO": str(fake_sudo),
+                "STORAGE_MAINTENANCE_APT_ARCHIVE_DIR": str(root / "apt-archives"),
             }
         )
-        return env, marker, runaway, old
+        return env, marker, runaway, old, package_calls
 
     def test_help(self) -> None:
         result = subprocess.run([CLEANUP, "--help"], text=True, capture_output=True)
@@ -341,7 +461,7 @@ class StorageMaintenanceTests(unittest.TestCase):
     def test_dry_run_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            env, marker, runaway, old = self.fixture(root)
+            env, marker, runaway, old, package_calls = self.fixture(root)
             result = subprocess.run(
                 [CLEANUP, "--expected-host", "kikin-kushi", "--dry-run"],
                 env=env,
@@ -354,11 +474,15 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.assertIn("would truncate", result.stdout)
             self.assertIn("would remove", result.stdout)
+            self.assertEqual(
+                package_calls.read_text(encoding="utf-8").splitlines(),
+                ["brew cleanup --dry-run --prune=30"],
+            )
 
     def test_real_run_changes_only_allowlisted_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            env, marker, runaway, old = self.fixture(root)
+            env, marker, runaway, old, package_calls = self.fixture(root)
             result = subprocess.run(
                 [CLEANUP, "--expected-host", "kikin-kushi"],
                 env=env,
@@ -373,6 +497,15 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertEqual((root / ".cache/must-survive").read_text(), "keeper")
             self.assertNotIn("detail-1", result.stdout)
             self.assertIn("summary-2", result.stdout)
+            self.assertEqual(
+                package_calls.read_text(encoding="utf-8").splitlines(),
+                [
+                    "nala clean",
+                    "flatpak uninstall --user --unused --assumeyes --noninteractive",
+                    "brew cleanup --prune=30",
+                    "uv cache prune",
+                ],
+            )
 
     def test_cron_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
