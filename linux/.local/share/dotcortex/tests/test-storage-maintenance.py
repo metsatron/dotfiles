@@ -24,7 +24,8 @@ class StorageMaintenanceTests(unittest.TestCase):
         fake_guix.write_text(
             "#!/bin/sh\n"
             f"if [ \"$*\" = 'gc --list-dead' ]; then printf '%s\\n' '{dead}'; exit 0; fi\n"
-            f"if [ \"$*\" = 'gc' ]; then : >'{marker}'; exit 0; fi\n"
+            f"if [ \"$*\" = 'gc' ]; then : >'{marker}'; "
+            "printf '%s\\n' detail-1 detail-2 detail-3 summary-1 summary-2; exit 0; fi\n"
             "exit 2\n",
             encoding="utf-8",
         )
@@ -105,6 +106,8 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertFalse(old.exists())
             self.assertTrue((root / ".cache/ductor-candidates/fresh").exists())
             self.assertEqual((root / ".cache/must-survive").read_text(), "keeper")
+            self.assertNotIn("detail-1", result.stdout)
+            self.assertIn("summary-2", result.stdout)
 
     def test_cron_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
