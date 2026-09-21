@@ -1,0 +1,391 @@
+#+TITLE: Deterministic Storage Maintenance: DotCortex
+#+DESCRIPTION: Narrow, auditable cleanup policy for fleet hosts
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments no
+#+PROPERTY: header-args:python :comments no
+
+* Storage maintenance
+
+This module owns a deliberately small cleanup allowlist.  It collects only
+unreferenced Guix store items, caps the known Redstone 9X =clipmenud.log=
+runaway, and expires old entries from Ductor's regenerable candidate cache.
+It does not sweep generic caches, temporary directories, Flatpak objects,
+Borg state, model files, agent sessions, or HelmCortex data.
+
+The cleanup command is host-gated and singleton.  Dry-run mode reports the
+same targets without changing them.  The cron installer is separate so
+tangling never changes the live scheduler.
+
+** Cleanup command
+
+#+BEGIN_SRC bash :tangle all/.local/bin/dotcortex-storage-maintenance :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="dotcortex-storage-maintenance"
+DRY_RUN=0
+EXPECTED_HOST=""
+CANDIDATE_MAX_AGE_DAYS="${STORAGE_MAINTENANCE_CANDIDATE_DAYS:-14}"
+CLIPMENU_MAX_BYTES="${STORAGE_MAINTENANCE_CLIPMENU_MAX_BYTES:-16777216}"
+
+usage() {
+  cat <<'EOF'
+Usage: dotcortex-storage-maintenance --expected-host EXACT_HOST [--dry-run]
+
+Run the narrow DotCortex cleanup allowlist:
+  - collect unreferenced Guix store items
+  - truncate Redstone 9X clipmenud.log files larger than 16 MiB
+  - remove Ductor candidate-cache entries older than 14 days
+
+No generic cache, temporary-directory, Flatpak, Borg, model, agent-session,
+or HelmCortex cleanup is performed.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --expected-host)
+      [ "$#" -ge 2 ] || { printf '%s: --expected-host requires a value\n' "$TAG" >&2; exit 2; }
+      EXPECTED_HOST="$2"
+      shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) printf '%s: unknown argument: %s\n' "$TAG" "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$EXPECTED_HOST" ] || { printf '%s: --expected-host is required\n' "$TAG" >&2; exit 2; }
+CURRENT_HOST="${STORAGE_MAINTENANCE_HOSTNAME:-$(hostname)}"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  printf '%s: refusing on %s; expected %s\n' "$TAG" "$CURRENT_HOST" "$EXPECTED_HOST" >&2
+  exit 1
+}
+
+MAINTENANCE_HOME="${STORAGE_MAINTENANCE_HOME:-$HOME}"
+STATE_DIR="${STORAGE_MAINTENANCE_STATE_DIR:-$MAINTENANCE_HOME/.local/state/dotcortex-storage-maintenance}"
+LOCK_FILE="$STATE_DIR/lock"
+CANDIDATE_DIR="$MAINTENANCE_HOME/.cache/ductor-candidates"
+GUIX_BIN="${STORAGE_MAINTENANCE_GUIX:-$MAINTENANCE_HOME/.guix-extra-profiles/core/core/bin/guix}"
+
+case "$CANDIDATE_MAX_AGE_DAYS:$CLIPMENU_MAX_BYTES" in
+  *[!0-9:]*|:*|*:) printf '%s: cleanup limits must be non-negative integers\n' "$TAG" >&2; exit 2 ;;
+esac
+
+if [ ! -x "$GUIX_BIN" ]; then
+  GUIX_BIN="$(command -v guix || true)"
+fi
+[ -n "$GUIX_BIN" ] && [ -x "$GUIX_BIN" ] || {
+  printf '%s: Guix executable not found\n' "$TAG" >&2
+  exit 1
+}
+command -v flock >/dev/null 2>&1 || { printf '%s: flock is required\n' "$TAG" >&2; exit 1; }
+
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { printf '%s: another cleanup is already running\n' "$TAG" >&2; exit 1; }
+
+disk_line() {
+  df -PB1 "$MAINTENANCE_HOME" | awk 'NR == 2 { printf "used=%s available=%s capacity=%s", $3, $4, $5 }'
+}
+
+estimate_dead_bytes() {
+  local path total=0
+  while IFS= read -r path; do
+    [ -e "$path" ] || continue
+    total=$((total + $(du -sB1 "$path" 2>/dev/null | awk '{print $1}')))
+  done < <("$GUIX_BIN" gc --list-dead)
+  printf '%s' "$total"
+}
+
+printf '%s: start host=%s dry_run=%s %s\n' "$TAG" "$CURRENT_HOST" "$DRY_RUN" "$(disk_line)"
+
+if [ "$DRY_RUN" = 1 ]; then
+  DEAD_COUNT="$("$GUIX_BIN" gc --list-dead | awk 'NF { count++ } END { print count + 0 }')"
+  DEAD_BYTES="$(estimate_dead_bytes)"
+  printf 'would collect Guix garbage: paths=%s estimated_bytes=%s\n' "$DEAD_COUNT" "$DEAD_BYTES"
+else
+  printf 'collecting Guix garbage\n'
+  "$GUIX_BIN" gc
+fi
+
+shopt -s nullglob
+for logfile in "$MAINTENANCE_HOME"/.local/share/dotcortex/guests/*/home/.cache/redstone-9x/clipmenud.log; do
+  [ -f "$logfile" ] || continue
+  size="$(stat -c '%s' "$logfile")"
+  [ "$size" -gt "$CLIPMENU_MAX_BYTES" ] || continue
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would truncate oversized Redstone log: bytes=%s path=%s\n' "$size" "$logfile"
+  else
+    : >"$logfile"
+    printf 'truncated oversized Redstone log: prior_bytes=%s path=%s\n' "$size" "$logfile"
+  fi
+done
+
+if [ -d "$CANDIDATE_DIR" ]; then
+  while IFS= read -r -d '' candidate; do
+    case "$candidate" in
+      "$CANDIDATE_DIR"/*) ;;
+      *) printf '%s: refusing unexpected candidate path: %s\n' "$TAG" "$candidate" >&2; exit 1 ;;
+    esac
+    if [ "$DRY_RUN" = 1 ]; then
+      printf 'would remove expired Ductor candidate cache entry: %s\n' "$candidate"
+    else
+      rm -rf -- "$candidate"
+      printf 'removed expired Ductor candidate cache entry: %s\n' "$candidate"
+    fi
+  done < <(find "$CANDIDATE_DIR" -mindepth 1 -maxdepth 1 -mtime "+$CANDIDATE_MAX_AGE_DAYS" -print0)
+fi
+
+printf '%s: finish %s\n' "$TAG" "$(disk_line)"
+#+END_SRC
+
+** Daily Kikin schedule
+
+The Kikin contract runs at 06:30, after the overnight Borg window and before
+the morning fleet report.  The installer derives the account identity at
+apply time and requires an exact hostname, keeping the public source free of
+machine-local identity values.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/dotcortex-storage-maintenance-cron-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="dotcortex-storage-maintenance-cron-apply"
+DEFAULT_TARGET="/etc/cron.d/dotcortex-storage-maintenance"
+TARGET="${STORAGE_MAINTENANCE_CRON_TARGET:-$DEFAULT_TARGET}"
+DRY_RUN=0
+CHECK=0
+REMOVE=0
+EXPECTED_HOST=""
+
+usage() {
+  cat <<'EOF'
+Usage: dotcortex-storage-maintenance-cron-apply --host EXACT_HOST [--dry-run|--check|--remove]
+
+Install, verify, preview, or remove the host-gated 06:30 daily cleanup job.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host)
+      [ "$#" -ge 2 ] || { printf '%s: --host requires a value\n' "$TAG" >&2; exit 2; }
+      EXPECTED_HOST="$2"
+      shift ;;
+    --dry-run) DRY_RUN=1 ;;
+    --check) CHECK=1 ;;
+    --remove) REMOVE=1 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) printf '%s: unknown argument: %s\n' "$TAG" "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ "$((DRY_RUN + CHECK + REMOVE))" -le 1 ] || {
+  printf '%s: choose only one of --dry-run, --check, or --remove\n' "$TAG" >&2
+  exit 2
+}
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$TARGET" = "$DEFAULT_TARGET" ]; then
+    run_priv rm -f "$TARGET"
+  else
+    rm -f "$TARGET"
+  fi
+  printf '%s: removed %s\n' "$TAG" "$TARGET"
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { printf '%s: --host EXACT_HOST is required\n' "$TAG" >&2; exit 2; }
+CURRENT_HOST="${STORAGE_MAINTENANCE_HOSTNAME:-$(hostname)}"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  printf '%s: refusing installation on %s; expected %s\n' "$TAG" "$CURRENT_HOST" "$EXPECTED_HOST" >&2
+  exit 1
+}
+
+TARGET_HOME="${STORAGE_MAINTENANCE_HOME:-$HOME}"
+USER_NAME="${STORAGE_MAINTENANCE_USER:-$(id -un)}"
+USER_ID="${STORAGE_MAINTENANCE_UID:-$(id -u)}"
+CLEANUP="$TARGET_HOME/.local/bin/dotcortex-storage-maintenance"
+STATE_DIR="$TARGET_HOME/.local/state/dotcortex-storage-maintenance"
+CORE_BIN="$TARGET_HOME/.guix-extra-profiles/core/core/bin"
+CRON_PATH="$CORE_BIN:$TARGET_HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+case "$TARGET_HOME:$USER_NAME:$USER_ID:$EXPECTED_HOST" in
+  *[[:space:]]*) printf '%s: whitespace is not valid in cron fields\n' "$TAG" >&2; exit 2 ;;
+esac
+[ "$DRY_RUN" = 1 ] || [ -x "$CLEANUP" ] || {
+  printf '%s: missing %s; tangle and stow first\n' "$TAG" "$CLEANUP" >&2
+  exit 1
+}
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex deterministic Kikin storage maintenance; managed by $TAG.
+SHELL=/bin/sh
+30 6 * * * $USER_NAME HOME=$TARGET_HOME PATH=$CRON_PATH XDG_RUNTIME_DIR=/run/user/$USER_ID $CLEANUP --expected-host $EXPECTED_HOST >>$STATE_DIR/cron.log 2>&1
+EOF
+
+if [ "$DRY_RUN" = 1 ]; then
+  cat "$TMP"
+  exit 0
+fi
+if [ "$CHECK" = 1 ]; then
+  cmp -s "$TMP" "$TARGET" || {
+    printf '%s: drift or missing target: %s\n' "$TAG" "$TARGET" >&2
+    exit 1
+  }
+  printf '%s: installed contract matches %s\n' "$TAG" "$TARGET"
+  exit 0
+fi
+
+mkdir -p "$STATE_DIR"
+if [ "$TARGET" = "$DEFAULT_TARGET" ]; then
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+else
+  install -m 0644 "$TMP" "$TARGET"
+fi
+printf '%s: installed %s\n' "$TAG" "$TARGET"
+#+END_SRC
+
+** Contract tests
+
+#+BEGIN_SRC python :tangle linux/.local/share/dotcortex/tests/test-storage-maintenance.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[5]
+CLEANUP = ROOT / "all/.local/bin/dotcortex-storage-maintenance"
+INSTALLER = ROOT / "linux/.local/bin/dotcortex-storage-maintenance-cron-apply"
+
+
+class StorageMaintenanceTests(unittest.TestCase):
+    def fixture(self, root: Path) -> tuple[dict[str, str], Path, Path, Path]:
+        fake_guix = root / "guix"
+        dead = root / "dead-store-item"
+        dead.mkdir()
+        (dead / "payload").write_bytes(b"x" * 4096)
+        marker = root / "guix-gc-ran"
+        fake_guix.write_text(
+            "#!/bin/sh\n"
+            f"if [ \"$*\" = 'gc --list-dead' ]; then printf '%s\\n' '{dead}'; exit 0; fi\n"
+            f"if [ \"$*\" = 'gc' ]; then : >'{marker}'; exit 0; fi\n"
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        fake_guix.chmod(0o755)
+
+        runaway = root / ".local/share/dotcortex/guests/test/home/.cache/redstone-9x/clipmenud.log"
+        runaway.parent.mkdir(parents=True)
+        with runaway.open("wb") as handle:
+            handle.truncate(17 * 1024 * 1024)
+
+        candidates = root / ".cache/ductor-candidates"
+        old = candidates / "old"
+        fresh = candidates / "fresh"
+        old.mkdir(parents=True)
+        fresh.mkdir()
+        old_time = time.time() - (20 * 86400)
+        os.utime(old, (old_time, old_time))
+
+        unrelated = root / ".cache/must-survive"
+        unrelated.write_text("keeper", encoding="utf-8")
+        env = os.environ.copy()
+        env.update(
+            {
+                "STORAGE_MAINTENANCE_HOME": str(root),
+                "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
+                "STORAGE_MAINTENANCE_GUIX": str(fake_guix),
+            }
+        )
+        return env, marker, runaway, old
+
+    def test_help(self) -> None:
+        result = subprocess.run([CLEANUP, "--help"], text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("narrow DotCortex cleanup allowlist", result.stdout)
+
+    def test_host_guard(self) -> None:
+        env = os.environ.copy()
+        env["STORAGE_MAINTENANCE_HOSTNAME"] = "not-kikin"
+        result = subprocess.run(
+            [CLEANUP, "--expected-host", "kikin-kushi", "--dry-run"],
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("refusing", result.stderr)
+
+    def test_dry_run_is_non_mutating(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, marker, runaway, old = self.fixture(root)
+            result = subprocess.run(
+                [CLEANUP, "--expected-host", "kikin-kushi", "--dry-run"],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(marker.exists())
+            self.assertEqual(runaway.stat().st_size, 17 * 1024 * 1024)
+            self.assertTrue(old.exists())
+            self.assertIn("would truncate", result.stdout)
+            self.assertIn("would remove", result.stdout)
+
+    def test_real_run_changes_only_allowlisted_targets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env, marker, runaway, old = self.fixture(root)
+            result = subprocess.run(
+                [CLEANUP, "--expected-host", "kikin-kushi"],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue(marker.exists())
+            self.assertEqual(runaway.stat().st_size, 0)
+            self.assertFalse(old.exists())
+            self.assertTrue((root / ".cache/ductor-candidates/fresh").exists())
+            self.assertEqual((root / ".cache/must-survive").read_text(), "keeper")
+
+    def test_cron_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "STORAGE_MAINTENANCE_HOME": str(root),
+                    "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
+                    "STORAGE_MAINTENANCE_USER": "test-user",
+                    "STORAGE_MAINTENANCE_UID": "1234",
+                }
+            )
+            result = subprocess.run(
+                [INSTALLER, "--host", "kikin-kushi", "--dry-run"],
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("30 6 * * * test-user", result.stdout)
+            self.assertIn("--expected-host kikin-kushi", result.stdout)
+            self.assertIn(str(root / ".local/state/dotcortex-storage-maintenance/cron.log"), result.stdout)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC

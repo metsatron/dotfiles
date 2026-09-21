@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TAG="dotcortex-storage-maintenance"
+DRY_RUN=0
+EXPECTED_HOST=""
+CANDIDATE_MAX_AGE_DAYS="${STORAGE_MAINTENANCE_CANDIDATE_DAYS:-14}"
+CLIPMENU_MAX_BYTES="${STORAGE_MAINTENANCE_CLIPMENU_MAX_BYTES:-16777216}"
+
+usage() {
+  cat <<'EOF'
+Usage: dotcortex-storage-maintenance --expected-host EXACT_HOST [--dry-run]
+
+Run the narrow DotCortex cleanup allowlist:
+  - collect unreferenced Guix store items
+  - truncate Redstone 9X clipmenud.log files larger than 16 MiB
+  - remove Ductor candidate-cache entries older than 14 days
+
+No generic cache, temporary-directory, Flatpak, Borg, model, agent-session,
+or HelmCortex cleanup is performed.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY_RUN=1 ;;
+    --expected-host)
+      [ "$#" -ge 2 ] || { printf '%s: --expected-host requires a value\n' "$TAG" >&2; exit 2; }
+      EXPECTED_HOST="$2"
+      shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) printf '%s: unknown argument: %s\n' "$TAG" "$1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$EXPECTED_HOST" ] || { printf '%s: --expected-host is required\n' "$TAG" >&2; exit 2; }
+CURRENT_HOST="${STORAGE_MAINTENANCE_HOSTNAME:-$(hostname)}"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  printf '%s: refusing on %s; expected %s\n' "$TAG" "$CURRENT_HOST" "$EXPECTED_HOST" >&2
+  exit 1
+}
+
+MAINTENANCE_HOME="${STORAGE_MAINTENANCE_HOME:-$HOME}"
+STATE_DIR="${STORAGE_MAINTENANCE_STATE_DIR:-$MAINTENANCE_HOME/.local/state/dotcortex-storage-maintenance}"
+LOCK_FILE="$STATE_DIR/lock"
+CANDIDATE_DIR="$MAINTENANCE_HOME/.cache/ductor-candidates"
+GUIX_BIN="${STORAGE_MAINTENANCE_GUIX:-$MAINTENANCE_HOME/.guix-extra-profiles/core/core/bin/guix}"
+
+case "$CANDIDATE_MAX_AGE_DAYS:$CLIPMENU_MAX_BYTES" in
+  *[!0-9:]*|:*|*:) printf '%s: cleanup limits must be non-negative integers\n' "$TAG" >&2; exit 2 ;;
+esac
+
+if [ ! -x "$GUIX_BIN" ]; then
+  GUIX_BIN="$(command -v guix || true)"
+fi
+[ -n "$GUIX_BIN" ] && [ -x "$GUIX_BIN" ] || {
+  printf '%s: Guix executable not found\n' "$TAG" >&2
+  exit 1
+}
+command -v flock >/dev/null 2>&1 || { printf '%s: flock is required\n' "$TAG" >&2; exit 1; }
+
+mkdir -p "$STATE_DIR"
+exec 9>"$LOCK_FILE"
+flock -n 9 || { printf '%s: another cleanup is already running\n' "$TAG" >&2; exit 1; }
+
+disk_line() {
+  df -PB1 "$MAINTENANCE_HOME" | awk 'NR == 2 { printf "used=%s available=%s capacity=%s", $3, $4, $5 }'
+}
+
+estimate_dead_bytes() {
+  local path total=0
+  while IFS= read -r path; do
+    [ -e "$path" ] || continue
+    total=$((total + $(du -sB1 "$path" 2>/dev/null | awk '{print $1}')))
+  done < <("$GUIX_BIN" gc --list-dead)
+  printf '%s' "$total"
+}
+
+printf '%s: start host=%s dry_run=%s %s\n' "$TAG" "$CURRENT_HOST" "$DRY_RUN" "$(disk_line)"
+
+if [ "$DRY_RUN" = 1 ]; then
+  DEAD_COUNT="$("$GUIX_BIN" gc --list-dead | awk 'NF { count++ } END { print count + 0 }')"
+  DEAD_BYTES="$(estimate_dead_bytes)"
+  printf 'would collect Guix garbage: paths=%s estimated_bytes=%s\n' "$DEAD_COUNT" "$DEAD_BYTES"
+else
+  printf 'collecting Guix garbage\n'
+  "$GUIX_BIN" gc
+fi
+
+shopt -s nullglob
+for logfile in "$MAINTENANCE_HOME"/.local/share/dotcortex/guests/*/home/.cache/redstone-9x/clipmenud.log; do
+  [ -f "$logfile" ] || continue
+  size="$(stat -c '%s' "$logfile")"
+  [ "$size" -gt "$CLIPMENU_MAX_BYTES" ] || continue
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would truncate oversized Redstone log: bytes=%s path=%s\n' "$size" "$logfile"
+  else
+    : >"$logfile"
+    printf 'truncated oversized Redstone log: prior_bytes=%s path=%s\n' "$size" "$logfile"
+  fi
+done
+
+if [ -d "$CANDIDATE_DIR" ]; then
+  while IFS= read -r -d '' candidate; do
+    case "$candidate" in
+      "$CANDIDATE_DIR"/*) ;;
+      *) printf '%s: refusing unexpected candidate path: %s\n' "$TAG" "$candidate" >&2; exit 1 ;;
+    esac
+    if [ "$DRY_RUN" = 1 ]; then
+      printf 'would remove expired Ductor candidate cache entry: %s\n' "$candidate"
+    else
+      rm -rf -- "$candidate"
+      printf 'removed expired Ductor candidate cache entry: %s\n' "$candidate"
+    fi
+  done < <(find "$CANDIDATE_DIR" -mindepth 1 -maxdepth 1 -mtime "+$CANDIDATE_MAX_AGE_DAYS" -print0)
+fi
+
+printf '%s: finish %s\n' "$TAG" "$(disk_line)"
