@@ -13,11 +13,16 @@ Usage: dotcortex-storage-maintenance --expected-host EXACT_HOST [--dry-run]
 
 Run the narrow DotCortex cleanup allowlist:
   - collect unreferenced Guix store items
+  - clear Nala's downloaded-package archive
+  - remove unused, unpinned user Flatpak refs
+  - prune Homebrew downloads older than 30 days
+  - prune dangling uv cache entries
   - truncate Redstone 9X clipmenud.log files larger than 16 MiB
   - remove Ductor candidate-cache entries older than 14 days
 
-No generic cache, temporary-directory, Flatpak, Borg, model, agent-session,
-or HelmCortex cleanup is performed.
+No dependency autoremove, package-generation deletion, generic cache,
+temporary-directory, Flatpak object surgery, Borg, model, agent-session, or
+HelmCortex cleanup is performed.
 EOF
 }
 
@@ -46,6 +51,16 @@ STATE_DIR="${STORAGE_MAINTENANCE_STATE_DIR:-$MAINTENANCE_HOME/.local/state/dotco
 LOCK_FILE="$STATE_DIR/lock"
 CANDIDATE_DIR="$MAINTENANCE_HOME/.cache/ductor-candidates"
 GUIX_BIN="${STORAGE_MAINTENANCE_GUIX:-$MAINTENANCE_HOME/.guix-extra-profiles/core/core/bin/guix}"
+NALA_BIN="${STORAGE_MAINTENANCE_NALA:-$(command -v nala || true)}"
+FLATPAK_BIN="${STORAGE_MAINTENANCE_FLATPAK:-$(command -v flatpak || true)}"
+UV_BIN="${STORAGE_MAINTENANCE_UV:-$(command -v uv || true)}"
+BREW_BIN="${STORAGE_MAINTENANCE_BREW:-$(command -v brew || true)}"
+SUDO_BIN="${STORAGE_MAINTENANCE_SUDO:-$(command -v sudo || true)}"
+APT_ARCHIVE_DIR="${STORAGE_MAINTENANCE_APT_ARCHIVE_DIR:-/var/cache/apt/archives}"
+
+if [ -z "$BREW_BIN" ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
+  BREW_BIN=/home/linuxbrew/.linuxbrew/bin/brew
+fi
 
 case "$CANDIDATE_MAX_AGE_DAYS:$CLIPMENU_MAX_BYTES" in
   *[!0-9:]*|:*|*:) printf '%s: cleanup limits must be non-negative integers\n' "$TAG" >&2; exit 2 ;;
@@ -66,6 +81,22 @@ flock -n 9 || { printf '%s: another cleanup is already running\n' "$TAG" >&2; ex
 
 disk_line() {
   df -PB1 "$MAINTENANCE_HOME" | awk 'NR == 2 { printf "used=%s available=%s capacity=%s", $3, $4, $5 }'
+}
+
+run_root() {
+  if [ "$(id -u)" = 0 ]; then
+    "$@"
+  else
+    [ -n "$SUDO_BIN" ] && [ -x "$SUDO_BIN" ] || {
+      printf '%s: sudo is required for %s\n' "$TAG" "$1" >&2
+      return 1
+    }
+    "$SUDO_BIN" -n "$@"
+  fi
+}
+
+optional_executable() {
+  [ -n "$1" ] && [ -x "$1" ]
 }
 
 estimate_dead_bytes() {
@@ -125,4 +156,64 @@ if [ -d "$CANDIDATE_DIR" ]; then
   done < <(find "$CANDIDATE_DIR" -mindepth 1 -maxdepth 1 -mtime "+$CANDIDATE_MAX_AGE_DAYS" -print0)
 fi
 
+PACKAGE_FAILURES=0
+
+if optional_executable "$NALA_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    archive_bytes=0
+    if [ -d "$APT_ARCHIVE_DIR" ]; then
+      archive_bytes="$(du -sB1 "$APT_ARCHIVE_DIR" 2>/dev/null | awk '{print $1}')" || true
+      archive_bytes="${archive_bytes:-0}"
+    fi
+    printf 'would clear Nala/APT downloaded-package archive: bytes=%s\n' "$archive_bytes"
+  elif run_root "$NALA_BIN" clean; then
+    printf 'cleaned Nala/APT downloaded-package archive\n'
+  else
+    printf '%s: Nala archive cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped Nala archive cleanup: executable unavailable\n'
+fi
+
+if optional_executable "$FLATPAK_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would remove unused, unpinned user Flatpak refs\n'
+  elif "$FLATPAK_BIN" uninstall --user --unused --assumeyes --noninteractive; then
+    printf 'removed unused, unpinned user Flatpak refs\n'
+  else
+    printf '%s: Flatpak unused-ref cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped Flatpak unused-ref cleanup: executable unavailable\n'
+fi
+
+if optional_executable "$BREW_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    "$BREW_BIN" cleanup --dry-run --prune=30
+  elif "$BREW_BIN" cleanup --prune=30; then
+    printf 'pruned Homebrew downloads older than 30 days\n'
+  else
+    printf '%s: Homebrew cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped Homebrew cleanup: executable unavailable\n'
+fi
+
+if optional_executable "$UV_BIN"; then
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would prune dangling uv cache entries\n'
+  elif "$UV_BIN" cache prune; then
+    printf 'pruned dangling uv cache entries\n'
+  else
+    printf '%s: uv cache cleanup failed\n' "$TAG" >&2
+    PACKAGE_FAILURES=$((PACKAGE_FAILURES + 1))
+  fi
+else
+  printf 'skipped uv cache cleanup: executable unavailable\n'
+fi
+
 printf '%s: finish %s\n' "$TAG" "$(disk_line)"
+[ "$PACKAGE_FAILURES" -eq 0 ] || exit 1

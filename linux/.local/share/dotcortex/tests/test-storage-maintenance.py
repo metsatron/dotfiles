@@ -15,7 +15,7 @@ INSTALLER = ROOT / "linux/.local/bin/dotcortex-storage-maintenance-cron-apply"
 
 
 class StorageMaintenanceTests(unittest.TestCase):
-    def fixture(self, root: Path) -> tuple[dict[str, str], Path, Path, Path]:
+    def fixture(self, root: Path) -> tuple[dict[str, str], Path, Path, Path, Path]:
         fake_guix = root / "guix"
         dead = root / "dead-store-item"
         dead.mkdir()
@@ -30,6 +30,26 @@ class StorageMaintenanceTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_guix.chmod(0o755)
+
+        package_calls = root / "package-calls"
+        package_bins: dict[str, Path] = {}
+        for name in ("nala", "flatpak", "brew", "uv"):
+            executable = root / name
+            executable.write_text(
+                "#!/bin/sh\n"
+                f"printf '%s %s\\n' '{name}' \"$*\" >>'{package_calls}'\n",
+                encoding="utf-8",
+            )
+            executable.chmod(0o755)
+            package_bins[name] = executable
+        fake_sudo = root / "sudo"
+        fake_sudo.write_text(
+            "#!/bin/sh\n"
+            "[ \"${1:-}\" = -n ] && shift\n"
+            "exec \"$@\"\n",
+            encoding="utf-8",
+        )
+        fake_sudo.chmod(0o755)
 
         runaway = root / ".local/share/dotcortex/guests/test/home/.cache/redstone-9x/clipmenud.log"
         runaway.parent.mkdir(parents=True)
@@ -52,9 +72,15 @@ class StorageMaintenanceTests(unittest.TestCase):
                 "STORAGE_MAINTENANCE_HOME": str(root),
                 "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
                 "STORAGE_MAINTENANCE_GUIX": str(fake_guix),
+                "STORAGE_MAINTENANCE_NALA": str(package_bins["nala"]),
+                "STORAGE_MAINTENANCE_FLATPAK": str(package_bins["flatpak"]),
+                "STORAGE_MAINTENANCE_BREW": str(package_bins["brew"]),
+                "STORAGE_MAINTENANCE_UV": str(package_bins["uv"]),
+                "STORAGE_MAINTENANCE_SUDO": str(fake_sudo),
+                "STORAGE_MAINTENANCE_APT_ARCHIVE_DIR": str(root / "apt-archives"),
             }
         )
-        return env, marker, runaway, old
+        return env, marker, runaway, old, package_calls
 
     def test_help(self) -> None:
         result = subprocess.run([CLEANUP, "--help"], text=True, capture_output=True)
@@ -76,7 +102,7 @@ class StorageMaintenanceTests(unittest.TestCase):
     def test_dry_run_is_non_mutating(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            env, marker, runaway, old = self.fixture(root)
+            env, marker, runaway, old, package_calls = self.fixture(root)
             result = subprocess.run(
                 [CLEANUP, "--expected-host", "kikin-kushi", "--dry-run"],
                 env=env,
@@ -89,11 +115,15 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.assertIn("would truncate", result.stdout)
             self.assertIn("would remove", result.stdout)
+            self.assertEqual(
+                package_calls.read_text(encoding="utf-8").splitlines(),
+                ["brew cleanup --dry-run --prune=30"],
+            )
 
     def test_real_run_changes_only_allowlisted_targets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            env, marker, runaway, old = self.fixture(root)
+            env, marker, runaway, old, package_calls = self.fixture(root)
             result = subprocess.run(
                 [CLEANUP, "--expected-host", "kikin-kushi"],
                 env=env,
@@ -108,6 +138,15 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertEqual((root / ".cache/must-survive").read_text(), "keeper")
             self.assertNotIn("detail-1", result.stdout)
             self.assertIn("summary-2", result.stdout)
+            self.assertEqual(
+                package_calls.read_text(encoding="utf-8").splitlines(),
+                [
+                    "nala clean",
+                    "flatpak uninstall --user --unused --assumeyes --noninteractive",
+                    "brew cleanup --prune=30",
+                    "uv cache prune",
+                ],
+            )
 
     def test_cron_contract(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
