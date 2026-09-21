@@ -66,6 +66,13 @@ class StorageMaintenanceTests(unittest.TestCase):
 
         unrelated = root / ".cache/must-survive"
         unrelated.write_text("keeper", encoding="utf-8")
+        telegram_state = root / ".local/state/telegram-agents"
+        claude_state = root / ".local/state/claude-idle-compaction"
+        telegram_state.mkdir(parents=True)
+        claude_state.mkdir()
+        (telegram_state / "agent.log").write_text("large", encoding="utf-8")
+        (claude_state / "diagnostic.log").write_text("large", encoding="utf-8")
+        (root / ".local/state/caddy-refresh.log").write_text("large", encoding="utf-8")
         env = os.environ.copy()
         env.update(
             {
@@ -78,6 +85,9 @@ class StorageMaintenanceTests(unittest.TestCase):
                 "STORAGE_MAINTENANCE_UV": str(package_bins["uv"]),
                 "STORAGE_MAINTENANCE_SUDO": str(fake_sudo),
                 "STORAGE_MAINTENANCE_APT_ARCHIVE_DIR": str(root / "apt-archives"),
+                "STORAGE_MAINTENANCE_TELEGRAM_STATE_MAX_BYTES": "1",
+                "STORAGE_MAINTENANCE_CLAUDE_STATE_MAX_BYTES": "1",
+                "STORAGE_MAINTENANCE_CADDY_LOG_MAX_BYTES": "1",
             }
         )
         return env, marker, runaway, old, package_calls
@@ -115,6 +125,7 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertTrue(old.exists())
             self.assertIn("would truncate", result.stdout)
             self.assertIn("would remove", result.stdout)
+            self.assertEqual(result.stdout.count("WARNING runtime-log high-water exceeded"), 3)
             self.assertEqual(
                 package_calls.read_text(encoding="utf-8").splitlines(),
                 ["brew cleanup --dry-run --prune=30"],
