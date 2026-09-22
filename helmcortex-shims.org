@@ -1110,6 +1110,151 @@ def dispatch(transport, tool, argv, root, local_real, tool_dir, stack, protocol,
     return run_bounded([ssh, "-T", *ssh_options, alias, command], frame)
 #+END_SRC
 
+* Hub switchover — deploy and verify a declared authority change
+
+=hx-hub-switchover= does not copy HelmCortex data and does not choose a new hub.
+Those are explicit operator gates: reconcile and checkpoint the corpus first, then
+change the two declarative registries.  This command verifies that both registries
+agree, proves the target has a local HelmCortex tree, tangles and stows the router
+on named clients, refreshes the shared shim manifest on the hub, and verifies each
+client from its own vantage.  It never deletes data or rewrites a repository.
+
+Clients use =SSH_ALIAS:STOW_TARGET=, for example =x230:x230=.  The current
+machine uses =local:STOW_TARGET= and never requires an SSH loopback.  Every
+remote checkout must contain byte-identical router sources before =apply= is
+admitted.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/hx-hub-switchover :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: hx-hub-switchover plan|apply|verify [--client SSH_ALIAS:STOW_TARGET]...
+
+The registries must already declare exactly one hub and agree on its key/alias.
+plan    validates topology and source parity without changing anything
+apply   tangles/stows the declared router, captures shims on the hub, then applies them
+verify  checks registry agreement, target storage, and hx-diff on every named client
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  plan|apply|verify) mode="$1"; shift ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+clients=()
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --client)
+      [ "$#" -ge 2 ] || { echo "hx-hub-switchover: --client requires SSH_ALIAS:STOW_TARGET" >&2; exit 2; }
+      clients+=("$2"); shift 2 ;;
+    *) echo "hx-hub-switchover: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+root="${DOTCORTEX_ROOT:-$HOME/DotCortex}"
+fleet="$root/all/.config/agent-session/fleet-router.json"
+machines="$root/all/.config/agent-session/version-registry.json"
+sources=(services-agent-sessiond.org services-fleet-router.org helmcortex-shims.org)
+for path in "$fleet" "$machines"; do
+  [ -r "$path" ] || { echo "hx-hub-switchover: missing $path" >&2; exit 69; }
+done
+
+readarray -t topology < <(python3 - "$fleet" "$machines" <<'PY'
+import json, pathlib, sys
+fleet = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+machines = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
+transport = fleet.get("transport") or {}
+rows = machines.get("machines") or []
+hubs = [row for row in rows if row.get("role") == "hub"]
+if len(hubs) != 1:
+    raise SystemExit(f"expected exactly one machine role=hub; found {len(hubs)}")
+hub = hubs[0]
+if transport.get("hub_machine_key") != hub.get("key"):
+    raise SystemExit("fleet router hub_machine_key disagrees with machine role=hub")
+alias = transport.get("hub_ssh_alias")
+if not isinstance(alias, str) or not alias or alias.startswith("-"):
+    raise SystemExit("fleet router hub_ssh_alias is invalid")
+if hub.get("ssh_alias") != alias:
+    raise SystemExit("fleet router hub_ssh_alias disagrees with machine registry")
+print(hub["key"])
+print(alias)
+PY
+)
+hub_key="${topology[0]}"
+hub_alias="${topology[1]}"
+
+ssh_opts=(
+  -o BatchMode=yes
+  -o PasswordAuthentication=no
+  -o KbdInteractiveAuthentication=no
+  -o PreferredAuthentications=publickey
+  -o ConnectTimeout=10
+  -o ConnectionAttempts=1
+)
+if [ -r "$HOME/.ssh/id_ed25519" ]; then
+  ssh_opts+=( -o IdentitiesOnly=yes -i "$HOME/.ssh/id_ed25519" )
+fi
+
+remote() {
+  local alias="$1"; shift
+  if [ "$alias" = local ]; then
+    /bin/sh -c "$1"
+  else
+    /usr/bin/ssh "${ssh_opts[@]}" "$alias" "$@"
+  fi
+}
+validate_client() {
+  case "$1" in
+    *:*) ;;
+    *) echo "hx-hub-switchover: invalid client '$1'" >&2; return 2 ;;
+  esac
+  local alias="${1%%:*}" stow="${1#*:}"
+  case "$alias:$stow" in
+    *[!A-Za-z0-9._:-]*) echo "hx-hub-switchover: unsafe client '$1'" >&2; return 2 ;;
+  esac
+  [ -n "$alias" ] && [ -n "$stow" ]
+}
+
+echo "declared hub: $hub_key via $hub_alias"
+remote "$hub_alias" 'set -eu; test -d "$HOME/HelmCortex/FORGE/bin"; test ! -L "$HOME/HelmCortex"; printf "target=%s host=%s\n" "$(realpath "$HOME/HelmCortex")" "$(hostname)"'
+
+local_hashes="$(cd "$root" && sha256sum "${sources[@]}")"
+for client in "${clients[@]}"; do
+  validate_client "$client"
+  alias="${client%%:*}"
+  remote_hashes="$(remote "$alias" 'cd "$HOME/DotCortex" && sha256sum services-agent-sessiond.org services-fleet-router.org helmcortex-shims.org')"
+  [ "$remote_hashes" = "$local_hashes" ] || {
+    echo "hx-hub-switchover: router source drift on $alias" >&2
+    exit 65
+  }
+  echo "source parity: $alias"
+done
+
+if [ "$mode" = apply ]; then
+  for client in "${clients[@]}"; do
+    alias="${client%%:*}"; stow="${client#*:}"
+    remote "$alias" "set -eu; cd \"\$HOME/DotCortex\"; tangle-one services-agent-sessiond.org; tangle-one services-fleet-router.org; tangle-one helmcortex-shims.org; \"\$HOME/DotCortex/all/.local/bin/loom\" stow:$stow"
+  done
+  remote "$hub_alias" 'set -eu; "$HOME/.local/bin/hx-capture"'
+  for client in "${clients[@]}"; do
+    alias="${client%%:*}"
+    remote "$alias" 'set -eu; "$HOME/.local/bin/hx-apply"'
+  done
+fi
+
+if [ "$mode" != plan ]; then
+  for client in "${clients[@]}"; do
+    alias="${client%%:*}"
+    remote "$alias" 'set -eu; "$HOME/.local/bin/hx-diff"'
+  done
+fi
+
+echo "hx-hub-switchover: $mode complete for $hub_key"
+#+END_SRC
+
 * Diff — report drift without changing anything
 
 #+BEGIN_SRC bash :tangle all/.local/bin/hx-diff :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
