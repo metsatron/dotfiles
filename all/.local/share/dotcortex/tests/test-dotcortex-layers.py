@@ -17,8 +17,10 @@ GUARD = ROOT / "all/.local/bin/dotcortex-stow-target-guard"
 MAAK = ROOT / "all/.config/maak/maak.scm"
 HOSTS = ROOT / "all/.config/dotcortex/hosts.ssv"
 USERS = ROOT / "all/.config/dotcortex/users.ssv"
-# Verbs that are not host stacks: platform-only verbs, the sanctuary projection, and stow:auto itself.
-NON_HOST_VERBS = {"stow", "stow:linux", "stow:debian", "stow:devuan", "stow:cortex", "stow:auto"}
+VOCAB = ROOT / "all/.config/dotcortex/layers.ssv"
+# Verbs that are not host stacks: platform/family verbs, the sanctuary projection, and stow:auto itself.
+NON_HOST_VERBS = {"stow", "stow:linux", "stow:debian", "stow:devuan", "stow:openmandriva",
+                  "stow:cortex", "stow:auto"}
 
 
 def run(cmd, **env):
@@ -75,6 +77,15 @@ class RegistryTests(unittest.TestCase):
                                  f"{name}: stow:auto diverges from {legacy}")
                 checked += 1
         self.assertGreaterEqual(checked, 6)
+
+    def test_openmandriva_is_a_distro_family_not_a_host(self):
+        self.assertNotIn("openmandriva", {row[0] for row in rows(HOSTS)})
+        vocab = {row[0]: row[1] for row in rows(VOCAB)}
+        self.assertEqual(vocab.get("openmandriva"), "distro")
+        self.assertEqual(vocab.get("debian"), "distro")
+        result = run([sys.executable, str(HELPER), "validate", "--packages", "all linux openmandriva"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
 
     def test_every_host_stow_verb_has_a_registry_row(self):
         covered = {row[8] for row in rows(HOSTS)}
@@ -221,6 +232,11 @@ class GuardTests(unittest.TestCase):
         result = self.guard("all linux think")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("'think' is not declared", result.stderr)
+
+    def test_family_verb_stack_passes_the_guard_unchanged(self):
+        # stow:openmandriva is a family verb now; its stack gets no new output either.
+        result = run([sys.executable, str(HELPER), "validate", "--packages", "all linux openmandriva"])
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
 
     def test_legacy_stacks_get_no_new_output_from_the_layer_check(self):
         for verb, packages in legacy_verbs().items():
