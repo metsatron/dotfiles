@@ -256,6 +256,8 @@ class GatedNalaTests(unittest.TestCase):
         rows = ['honeyonly "" stack beelink ""', 'git "" bootstrap shared ""']
         for host, expected in (("testhost", "to install (0)"), ("beelink", "to install (1): honeyonly")):
             box = Sandbox(gated=True, installed="git", manifest_rows=rows, sim="Inst honeyonly\\n")
+            # beelink is a known host because a provisioning registry lists it.
+            box.gates.write_text(box.gates.read_text() + 'beelink additive - "fixture"\n')
             try:
                 result, _calls = box.run(NALA_APPLY, NALA_HOSTNAME=host)
                 self.assertIn(expected, result.stdout, host)
@@ -320,6 +322,61 @@ class HoneyLaneTests(unittest.TestCase):
             self.assertEqual(set(line.split(":", 1)[1].split()), HONEY_TO_INSTALL, line)
             self.assertIn("0 removed", result.stdout)
             self.assertIn("dry-run", result.stdout)
+
+
+REAL_EXCLUDES = ROOT / "all/.provision/host-excludes.ssv"
+FLEET_MANIFEST = ROOT / "debian/.nala/manifest/packages.ssv"
+
+
+def install_set(calls):
+    for call in calls:
+        if call.startswith("sudo ") and " install -y " in call:
+            return set(call.split(" install -y ", 1)[1].split())
+    return set()
+
+
+class HostScopeTests(unittest.TestCase):
+    """SCOPE naming a known host applies on that host only (the kikin-kushi fix)."""
+
+    def resolve(self, script, manifest, host):
+        box = Sandbox(gated=False, installed="")
+        try:
+            box.env["NALA_SSV"] = str(manifest)
+            result, calls = box.run(script, NALA_HOSTNAME=host, HOST_EXCLUDES=str(REAL_EXCLUDES),
+                                    HOST_EXCLUDES_HOSTNAME=host)
+            return result, install_set(calls)
+        finally:
+            box.close()
+
+    def test_firmware_row_only_on_kikin_kushi_and_other_hosts_unchanged(self):
+        self.assertIn('firmware-amd-graphics "" system kikin-kushi ""', FLEET_MANIFEST.read_text())
+        with tempfile.TemporaryDirectory() as tmp:
+            old_script = Path(tmp) / "nala-apply.master"
+            old_manifest = Path(tmp) / "packages.master.ssv"
+            for rel, out in (("debian/.local/bin/nala-apply", old_script),
+                             ("debian/.nala/manifest/packages.ssv", old_manifest)):
+                out.write_text(subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_REV}:{rel}"],
+                                              capture_output=True, text=True, check=True).stdout)
+            for host in ("x230", "t480s", "t480", "kikin-kushi", "beelink", "some-new-box"):
+                new_result, new_set = self.resolve(NALA_APPLY, FLEET_MANIFEST, host)
+                _old_result, old_set = self.resolve(old_script, old_manifest, host)
+                self.assertEqual(new_result.returncode, 0, new_result.stderr)
+                self.assertNotIn("unknown SCOPE", new_result.stderr, host)
+                self.assertTrue(old_set, host)
+                if host == "kikin-kushi":
+                    self.assertEqual(new_set, old_set | {"firmware-amd-graphics"}, host)
+                else:
+                    self.assertEqual(new_set, old_set, f"{host}: install set changed vs master")
+
+    def test_unknown_scope_still_installs_but_warns(self):
+        rows = ['mystery-pkg "" cli someday-maybe ""', 'git "" bootstrap shared ""']
+        box = Sandbox(gated=False, installed="", manifest_rows=rows)
+        try:
+            result, calls = box.run(NALA_APPLY, NALA_HOSTNAME="x230")
+            self.assertIn("mystery-pkg", install_set(calls))
+            self.assertIn("unknown SCOPE 'someday-maybe'", result.stderr)
+        finally:
+            box.close()
 
 
 class UngatedHostsUnchangedTests(unittest.TestCase):
