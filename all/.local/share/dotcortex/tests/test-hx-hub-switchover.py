@@ -78,6 +78,12 @@ class SwitchoverTests(unittest.TestCase):
         with self.assertRaises(hx.Refusal):
             hx.parse_client("bad alias:t480s")
 
+    def test_hub_self_route_is_local(self):
+        hub = {"key": "x230", "ssh_alias": "x230",
+               "hostnames": ["ThinkPad-X230", "x230"]}
+        self.assertEqual(hx.hub_access_alias(hub, "ThinkPad-X230"), "local")
+        self.assertEqual(hx.hub_access_alias(hub, "ThinkPad-T480s"), "x230")
+
 
 if __name__ == "__main__":
     unittest.main()
