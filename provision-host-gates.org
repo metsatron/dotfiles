@@ -1,0 +1,445 @@
+#+TITLE: Per-Host Provisioning Gates: DotCortex
+#+DESCRIPTION: Additive-only, dry-run-by-default package provisioning for hosts that must never lose a package (Honey)
+#+AUTHOR: Selkiekitty (Gillean Carroll), for Mètsàtron's DotCortex
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments both
+#+PROPERTY: header-args:python :comments no
+#+PROPERTY: header-args:text :comments no
+
+* Why
+
+Some hosts run production state DotCortex did not create and must never damage. Honey (hostname =beelink=) is Gillean's clinical and local-inference box: its Vulkan llama.cpp build dependencies, Docker, Samba, Syncthing, Tailscale, Caddy, Borg, LightDM/bspwm and the OpenRC service layer were all installed by hand, and none of them are in any DotCortex manifest. A manifest-driven apply that treats "not in the list" as "remove", or an upgrade that resolves a conflict by removing packages, would take her work stack down.
+
+This module adds one small per-host gate. A gated host gets *additive-only* provisioning: installs happen only with an explicit =PROVISION_APPLY=1=, the default is a dry run, and removal, purge, autoremove and upgrade are never run by any DotCortex apply on that host. Hosts without a gate row behave exactly as before.
+
+* What "apply" does today (audited 2026-09-23, before this module)
+
+| Lane    | Entry points                                                                  | Can it remove packages?                                                                                                                                                                                                                                                                                                                  | Dry-run path                                                  |
+|---------+-------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+---------------------------------------------------------------|
+| nala    | =loom nala:apply= / =nala:apply-auto= -> =make nala-apply= / =nala-apply-auto= | *Yes, three ways.* (1) The make targets run =sudo nala upgrade= (=--assume-yes= for =-auto=) before the manifest step; nala's upgrade is a full upgrade by default and nala autoremoves by default, so it can remove packages. (2) =nala-apply= runs =apt remove -y= on every *installed* package that =host-excludes.ssv= excludes for this host (apt also removes reverse dependencies). (3) =nala-release-sync= and the Brave canary gate install =.deb= bundles with =dpkg -i= / =--allow-downgrades=. It does *not* remove packages merely for being absent from the manifest: =ENFORCE= and =UNINSTALL= are declared in =nala-apply= but never read. =nala-apply= also bootstraps =nala= itself with =sudo apt-get install -y nala= when missing. | =loom nala:diff= (read-only); no simulated apply existed     |
+| npm     | =loom npm:apply=, =make npm-apply=                                            | *Yes*: =ENFORCE=1 UNINSTALL=1= (the script default too) runs =npm uninstall -g= on every global not in the manifest.                                                                                                                                                                                                                      | =loom npm:diff=                                              |
+| cargo   | =loom cargo:apply=, =make cargo-apply=                                        | *Yes*: =cargo uninstall= of extras (=UNINSTALL=1= default).                                                                                                                                                                                                                                                                              | =loom cargo:diff=                                            |
+| bun     | =loom bun:apply=, =make bun-apply=                                            | *Yes*: =bun remove -g= of extras (=UNINSTALL=1= default).                                                                                                                                                                                                                                                                                | =loom bun:diff=                                              |
+| flatpak | =loom flatpak:apply=, =make flatpak-apply=                                    | *Yes*: =flatpak --user uninstall= of extras. The script comment says "removals only if UNINSTALL=1", but =UNINSTALL= defaults to =1=.                                                                                                                                                                                                    | =loom flatpak:diff=                                          |
+| misc    | =pkg-update-all=                                                              | *Yes*: =nala full-upgrade -y; nala autoremove --purge -y= (or the apt equivalents) and =flatpak uninstall --unused=.                                                                                                                                                                                                                  | none                                                         |
+| boot    | =INSTALL.sh=                                                                  | Installs only (apt Phase 1; pip/npm/cargo with =ENFORCE=0 UNINSTALL=0=), but it also stows with backup-and-remove of conflicting *files*.                                                                                                                                                                                                | none                                                         |
+
+* Gate data: host-gates.ssv
+
+Columns: =HOST GATE MANIFEST NOTE=.
+
+- =HOST=: the =hostname -s= value (same key as =host-excludes.ssv=).
+- =GATE=: =additive= is the only gate. An unrecognised value is treated as =additive= (fail safe).
+- =MANIFEST=: the nala manifest this host provisions from, relative to the DotCortex checkout (or absolute), or =-= for the shared fleet list. A gated host should always name its own list: the shared =packages.ssv= is a desktop fleet list and is not what a gated box wants.
+- =NOTE=: freeform, never parsed.
+
+Deployed to =~/.provision/host-gates.ssv=. The helper reads the repo copy *and* the stowed copy and treats the host as gated if either says so, so a host that has never been stowed (Honey today) is still gated.
+
+#+BEGIN_SRC text :tangle all/.provision/host-gates.ssv :padline no
+# HOST     GATE      MANIFEST                                   NOTE
+beelink    additive  debian/.nala/manifest/hosts/beelink.ssv    "Honey: Gillean's production box (hosts row honey, planned). Installs only with PROVISION_APPLY=1; never removes, purges, autoremoves or upgrades."
+#+END_SRC
+
+* Gate semantics
+
+For a host listed in =host-gates.ssv=, every DotCortex package apply asks =provision-gate mode <lane>= first:
+
+| Mode       | When                                   | Effect                                                                                                             |
+|------------+----------------------------------------+--------------------------------------------------------------------------------------------------------------------|
+| =open=     | host has no gate row                   | legacy behaviour, byte-for-byte the same code path                                                                 |
+| =dry-run=  | gated host, default                    | plan only: nala prints the satisfied / to-install split and an =apt-get -s= simulation; other lanes stop with a note |
+| =additive= | gated host with =PROVISION_APPLY=1=    | installs missing packages only; removals stay refused                                                              |
+
+On a gated host, in every mode:
+
+- *No removal ever.* nala: =apt-get install --no-remove -o APT::Get::AutomaticRemove=false= (apt aborts if the transaction would remove anything); the transaction is simulated first and refused (exit 3) if the simulation shows any =Remv= or =Purg= line; host-excluded packages are reported, never removed. npm/cargo/bun/flatpak: =UNINSTALL= is forced to =0=.
+- *No upgrade.* =make nala-apply= / =nala-apply-auto= skip =sudo nala upgrade=.
+- *No side-channel installs.* nala is never bootstrapped (plain =apt-get= is used); third-party repo setup (=make nala-repos=), the Brave canary gate and the release-backed =.deb= sync are skipped. Each of those is a deliberate, reviewed, by-hand step on a gated host.
+- *Nothing outside the host's own list.* The gated manifest replaces the shared fleet list (unless =NALA_SSV= is set explicitly).
+
+Opting into removal on a gated host is not a flag: it is a reviewed commit that removes the host's row from =host-gates.ssv=.
+
+* Helper: provision-gate
+
+#+BEGIN_SRC bash :tangle all/.local/bin/provision-gate :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+ROOT="${DOTCORTEX_ROOT:-$HOME/DotCortex}"
+HOST="${PROVISION_GATE_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
+
+usage() {
+  cat <<EOF
+Usage: provision-gate status              show this host's gate
+       provision-gate is-gated            exit 0 if this host is gated, else 1
+       provision-gate gate                print the gate name, or "open"
+       provision-gate manifest            print the gated nala manifest path (absolute), or nothing
+       provision-gate mode <lane>         print open | dry-run | additive for a package lane
+       provision-gate allow-removal <lane> [what...]
+                                          exit 0 if removals may run here, else refuse (exit 1)
+Env:   PROVISION_GATES (gate file; default: repo copy + ~/.provision/host-gates.ssv)
+       PROVISION_GATE_HOSTNAME (default: hostname -s)
+       PROVISION_APPLY=1 (gated hosts: allow additive installs)
+EOF
+}
+
+gate_files() {
+  if [ -n "${PROVISION_GATES:-}" ]; then
+    printf '%s\n' "$PROVISION_GATES"
+    return
+  fi
+  printf '%s\n' "$ROOT/all/.provision/host-gates.ssv" "$HOME/.provision/host-gates.ssv"
+}
+
+# Print "GATE<TAB>MANIFEST" for this host from the first file that has a row.
+gate_row() {
+  local file
+  while IFS= read -r file; do
+    [ -f "$file" ] || continue
+    if awk -v host="$HOST" '
+         /^[ \t]*#/ || NF==0 { next }
+         $1==host { print $2 "\t" ($3 == "" ? "-" : $3); found=1; exit }
+         END { exit(found?0:1) }
+       ' "$file"; then
+      return 0
+    fi
+  done < <(gate_files)
+  return 1
+}
+
+row="$(gate_row || true)"
+GATE="open"
+MANIFEST="-"
+if [ -n "$row" ]; then
+  GATE="${row%%$'\t'*}"
+  MANIFEST="${row#*$'\t'}"
+  case "$GATE" in
+    additive) ;;
+    *) GATE="additive" ;;  # unknown gate names fail safe
+  esac
+fi
+
+cmd="${1:-}"
+case "$cmd" in
+  -h|--help|help) usage; exit 0 ;;
+  status)
+    if [ "$GATE" = open ]; then
+      echo "$HOST: open (no provisioning gate)"
+    else
+      echo "$HOST: gated ($GATE), manifest=$MANIFEST, PROVISION_APPLY=${PROVISION_APPLY:-0}"
+    fi
+    ;;
+  is-gated) [ "$GATE" != open ] ;;
+  gate) echo "$GATE" ;;
+  manifest)
+    if [ "$GATE" != open ] && [ "$MANIFEST" != "-" ]; then
+      case "$MANIFEST" in
+        /*) echo "$MANIFEST" ;;
+        *) echo "$ROOT/$MANIFEST" ;;
+      esac
+    fi
+    ;;
+  mode)
+    lane="${2:?Usage: provision-gate mode <lane>}"
+    if [ "$GATE" = open ]; then
+      echo open
+    elif [ "${PROVISION_APPLY:-0}" = 1 ]; then
+      echo "provision-gate: $HOST is gated ($GATE): $lane runs additive-only (installs yes, removals never)" >&2
+      echo additive
+    else
+      echo "provision-gate: $HOST is gated ($GATE): $lane is dry-run; set PROVISION_APPLY=1 to install (removals stay refused)" >&2
+      echo dry-run
+    fi
+    ;;
+  allow-removal)
+    lane="${2:?Usage: provision-gate allow-removal <lane> [what...]}"
+    shift 2
+    if [ "$GATE" = open ]; then
+      exit 0
+    fi
+    echo "REFUSED: $HOST is gated ($GATE): $lane removal is never run here${*:+: $*}" >&2
+    echo "         remove the host's row from host-gates.ssv in a reviewed commit to change that" >&2
+    exit 1
+    ;;
+  *) usage >&2; exit 2 ;;
+esac
+#+END_SRC
+
+* Honey's provisioning list
+
+The list itself lives with the other nala manifests in =package-nala.org= (heading "Gated host manifest: Honey (beelink)"), tangled to =debian/.nala/manifest/hosts/beelink.ssv=. It declares what DotCortex needs to run on a Devuan/OpenRC host, sourced from =INSTALL.sh= Phase 1 and the modules Honey will use. It is *not* a list of everything Honey should have: Gillean's production stack is protected by the gate, not by being listed, so an incomplete list can never cost her a package.
+
+* Tests
+
+Run with =python3 all/.local/share/dotcortex/tests/test-provision-gate.py -v=. Every package tool is a stub on a private =PATH= (=sudo=, =apt-get=, =apt-cache=, =dpkg=, =dpkg-query=, =nala=, =npm=), each of which only logs its arguments, so nothing is ever installed or removed. They prove:
+
+- *Dry-run is the default* on a gated host: =nala-apply= plans and simulates, and calls no =sudo=.
+- *A gated host refuses removal*: a simulated transaction containing =Remv= is refused with exit 3; host-excluded installed packages are reported and never removed; =PROVISION_APPLY=1= installs with =--no-remove= and never calls =remove=, =purge=, =autoremove= or =upgrade=; nala is never bootstrapped; release-sync and the Brave gate are skipped.
+- *Other hosts are unchanged*: on an ungated host the new =nala-apply= issues exactly the same command sequence as the pre-gate script (compared against a pinned copy from =origin/master=), and the make targets still run =sudo nala upgrade=.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-provision-gate.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import os
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[5]
+GATE = ROOT / "all/.local/bin/provision-gate"
+NALA_APPLY = ROOT / "debian/.local/bin/nala-apply"
+HOST_EXCLUDES = ROOT / "all/.local/bin/host-excludes"
+NALA_MK = ROOT / "all/.mk/nala.mk"
+# The pre-gate nala-apply (origin/master 5b101ea25) and nala.mk, pinned in git so
+# "other hosts unchanged" is checked against the real old behaviour.
+BASE_REV = "5b101ea25"
+
+STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    printf '%s %s\\n' "$(basename "$0")" "$*" >> "$STUB_LOG"
+    name="$(basename "$0")"
+    case "$name" in
+      dpkg)
+        [ "${1:-}" = "-s" ] || exit 0
+        for p in $FAKE_INSTALLED; do [ "$p" = "${2:-}" ] && exit 0; done
+        exit 1 ;;
+      dpkg-query)
+        pkg="${@: -1}"
+        for p in $FAKE_INSTALLED; do [ "$p" = "$pkg" ] && { printf 'ii '; exit 0; }; done
+        exit 1 ;;
+      apt-cache)
+        for p in $FAKE_MISSING; do [ "$p" = "${2:-}" ] && exit 100; done
+        exit 0 ;;
+      apt-get)
+        case " $* " in *" -s "*) printf '%b' "${FAKE_SIM:-}"; exit "${FAKE_SIM_RC:-0}" ;; esac
+        exit 0 ;;
+      *) exit 0 ;;
+    esac
+""")
+
+
+class Sandbox:
+    def __init__(self, gated: bool, installed="git stow", missing="", sim="", sim_rc=0,
+                 excludes="", manifest_rows=None):
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.home = base / "home"
+        self.bin = base / "bin"
+        self.log = base / "stub.log"
+        (self.home / ".local/bin").mkdir(parents=True)
+        self.bin.mkdir()
+        for name in ("sudo", "apt-get", "apt-cache", "dpkg", "dpkg-query", "nala", "npm"):
+            stub = self.bin / name
+            stub.write_text(STUB)
+            stub.chmod(0o755)
+        # Helpers nala-apply resolves under $HOME/.local/bin: real host-excludes and
+        # provision-gate, logging stubs for the side-channel installers.
+        os.symlink(HOST_EXCLUDES, self.home / ".local/bin/host-excludes")
+        os.symlink(GATE, self.home / ".local/bin/provision-gate")
+        for side in ("nala-release-sync", "brave-canary-gate", "nala-repos-setup"):
+            stub = self.home / ".local/bin" / side
+            stub.write_text(STUB)
+            stub.chmod(0o755)
+        rows = manifest_rows or ['git "" bootstrap shared ""', 'tree "" bootstrap shared ""',
+                                 'keychain "" bootstrap shared ""']
+        self.manifest = base / "manifest.ssv"
+        self.manifest.write_text("# PKG VERSION CATEGORY SCOPE EXTRA\n" + "\n".join(rows) + "\n")
+        self.gates = base / "host-gates.ssv"
+        self.gates.write_text(f'testhost additive {self.manifest} "fixture"\n' if gated else "# empty\n")
+        self.excludes = base / "host-excludes.ssv"
+        self.excludes.write_text("".join(f"testhost nala {p} \"fixture\"\n" for p in excludes.split()))
+        self.env = {
+            "PATH": f"{self.bin}:/usr/bin:/bin",
+            "HOME": str(self.home),
+            "DOTCORTEX_ROOT": str(ROOT),
+            "STUB_LOG": str(self.log),
+            "FAKE_INSTALLED": installed,
+            "FAKE_MISSING": missing,
+            "FAKE_SIM": sim,
+            "FAKE_SIM_RC": str(sim_rc),
+            "PROVISION_GATES": str(self.gates),
+            "PROVISION_GATE_HOSTNAME": "testhost",
+            "HOST_EXCLUDES": str(self.excludes),
+            "HOST_EXCLUDES_HOSTNAME": "testhost",
+        }
+        if not gated:
+            self.env["NALA_SSV"] = str(self.manifest)
+
+    def run(self, script, *args, **extra):
+        env = dict(self.env, **extra)
+        result = subprocess.run(["bash", str(script), *args], capture_output=True, text=True, env=env)
+        calls = self.log.read_text().splitlines() if self.log.exists() else []
+        self.log.unlink(missing_ok=True)
+        return result, calls
+
+    def close(self):
+        self.tmp.cleanup()
+
+
+def mutating(calls):
+    return [c for c in calls if c.startswith(("sudo ", "nala ", "nala-release-sync", "brave-canary-gate",
+                                              "nala-repos-setup"))]
+
+
+class GateHelperTests(unittest.TestCase):
+    def gate(self, *args, gated=True, **env):
+        with tempfile.TemporaryDirectory() as tmp:
+            gates = Path(tmp) / "g.ssv"
+            gates.write_text('testhost additive debian/x.ssv "f"\nother weird - "f"\n' if gated else "")
+            full = dict(os.environ, PROVISION_GATES=str(gates), PROVISION_GATE_HOSTNAME="testhost",
+                        DOTCORTEX_ROOT="/repo")
+            full.update(env)
+            return subprocess.run(["bash", str(GATE), *args], capture_output=True, text=True, env=full)
+
+    def test_modes(self):
+        self.assertEqual(self.gate("mode", "nala", gated=False).stdout.strip(), "open")
+        self.assertEqual(self.gate("mode", "nala").stdout.strip(), "dry-run")
+        self.assertEqual(self.gate("mode", "nala", PROVISION_APPLY="1").stdout.strip(), "additive")
+
+    def test_removal_refused_only_when_gated(self):
+        self.assertEqual(self.gate("allow-removal", "nala", gated=False).returncode, 0)
+        refused = self.gate("allow-removal", "nala", "foo", PROVISION_APPLY="1")
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("REFUSED", refused.stderr)
+
+    def test_manifest_is_resolved_against_the_checkout(self):
+        self.assertEqual(self.gate("manifest").stdout.strip(), "/repo/debian/x.ssv")
+        self.assertEqual(self.gate("manifest", gated=False).stdout.strip(), "")
+
+    def test_unknown_gate_name_fails_safe(self):
+        result = self.gate("gate", PROVISION_GATE_HOSTNAME="other")
+        self.assertEqual(result.stdout.strip(), "additive")
+
+    def test_repo_honey_row_is_gated(self):
+        env = dict(os.environ, PROVISION_GATE_HOSTNAME="beelink", DOTCORTEX_ROOT=str(ROOT), HOME="/nonexistent")
+        env.pop("PROVISION_GATES", None)
+        result = subprocess.run(["bash", str(GATE), "mode", "nala"], capture_output=True, text=True, env=env)
+        self.assertEqual(result.stdout.strip(), "dry-run")
+        manifest = subprocess.run(["bash", str(GATE), "manifest"], capture_output=True, text=True, env=env)
+        self.assertTrue(Path(manifest.stdout.strip()).is_file(), manifest.stdout)
+
+
+class GatedNalaTests(unittest.TestCase):
+    def test_dry_run_is_the_default(self):
+        box = Sandbox(gated=True, sim="Inst tree (2.2.1-1 Devuan)\\nInst keychain (2.8.5-5 Devuan)\\n")
+        try:
+            result, calls = box.run(NALA_APPLY)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("dry-run", result.stdout)
+            self.assertIn("satisfied (1): git", result.stdout)
+            self.assertIn("to install (2): tree keychain", result.stdout)
+            self.assertEqual(mutating(calls), [], calls)
+            self.assertTrue(any(c.startswith("apt-get -s") and "--no-remove" in c for c in calls), calls)
+        finally:
+            box.close()
+
+    def test_simulated_removal_is_refused(self):
+        box = Sandbox(gated=True, sim="Remv samba [2:4.22.8]\\nInst tree (2.2.1-1 Devuan)\\n")
+        try:
+            result, calls = box.run(NALA_APPLY, PROVISION_APPLY="1")
+            self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+            self.assertIn("REFUSED", result.stdout + result.stderr)
+            self.assertEqual(mutating(calls), [], calls)
+        finally:
+            box.close()
+
+    def test_failed_simulation_is_refused(self):
+        box = Sandbox(gated=True, sim="E: Packages need to be removed but remove is disabled.\\n", sim_rc=100)
+        try:
+            result, calls = box.run(NALA_APPLY, PROVISION_APPLY="1")
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(mutating(calls), [], calls)
+        finally:
+            box.close()
+
+    def test_apply_is_additive_only(self):
+        box = Sandbox(gated=True, installed="git stow samba", excludes="samba",
+                      sim="Inst tree (2.2.1-1 Devuan)\\n")
+        try:
+            result, calls = box.run(NALA_APPLY, PROVISION_APPLY="1")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            sudo = [c for c in calls if c.startswith("sudo ")]
+            self.assertEqual(len(sudo), 1, calls)
+            self.assertIn("apt-get install -y --no-remove -o APT::Get::AutomaticRemove=false", sudo[0])
+            joined = "\n".join(calls)
+            for verb in (" remove", " purge", "autoremove", " upgrade", "full-upgrade", "dpkg -i", "dpkg -r"):
+                self.assertNotIn(verb, joined)
+            self.assertFalse(any(c.startswith(("nala ", "nala-release-sync", "brave-canary-gate")) for c in calls), calls)
+            self.assertIn("samba", result.stdout)  # host-excluded + installed: reported, not removed
+            self.assertIn("never removed", result.stdout)
+        finally:
+            box.close()
+
+    def test_gated_host_never_bootstraps_nala(self):
+        box = Sandbox(gated=True, sim="Inst tree\\n")
+        try:
+            (box.bin / "nala").unlink()
+            result, calls = box.run(NALA_APPLY, PROVISION_APPLY="1")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(any("install -y nala" in c for c in calls), calls)
+        finally:
+            box.close()
+
+
+class UngatedHostsUnchangedTests(unittest.TestCase):
+    def base_file(self, path, tmp):
+        out = Path(tmp) / Path(path).name
+        blob = subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_REV}:{path}"],
+                              capture_output=True, text=True, check=True).stdout
+        out.write_text(blob)
+        return out
+
+    def test_nala_apply_issues_the_same_commands_as_before(self):
+        cases = [
+            dict(installed="git stow", sim=""),
+            dict(installed="git stow samba", excludes="samba"),
+            dict(installed="git", missing="keychain"),
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            old = self.base_file("debian/.local/bin/nala-apply", tmp)
+            for case in cases:
+                box = Sandbox(gated=False, **case)
+                try:
+                    before = box.run(old)
+                    after = box.run(NALA_APPLY)
+                    self.assertEqual(after[0].returncode, before[0].returncode, case)
+                    self.assertEqual(after[1], before[1], f"{case}: command sequence changed")
+                    self.assertEqual(after[0].stdout, before[0].stdout, case)
+                finally:
+                    box.close()
+
+    @unittest.skipUnless(shutil.which("make"), "make not installed")
+    def test_make_targets_still_upgrade_on_ungated_hosts(self):
+        box = Sandbox(gated=False)
+        try:
+            (box.home / ".local/bin/nala-apply").symlink_to(NALA_APPLY)
+            result = subprocess.run(["make", "-s", "-f", str(NALA_MK), "nala-apply"],
+                                    capture_output=True, text=True, env=dict(box.env))
+            calls = box.log.read_text().splitlines()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(calls[0], "nala-repos-setup ")
+            self.assertEqual(calls[1], "sudo nala upgrade")
+        finally:
+            box.close()
+
+    @unittest.skipUnless(shutil.which("make"), "make not installed")
+    def test_make_targets_skip_upgrade_and_repos_on_gated_hosts(self):
+        box = Sandbox(gated=True, sim="Inst tree\\n")
+        try:
+            (box.home / ".local/bin/nala-apply").symlink_to(NALA_APPLY)
+            result = subprocess.run(["make", "-s", "-f", str(NALA_MK), "nala-apply-auto"],
+                                    capture_output=True, text=True, env=dict(box.env))
+            calls = box.log.read_text().splitlines()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertEqual(mutating(calls), [], calls)
+            self.assertIn("skipped on gated host", result.stdout)
+        finally:
+            box.close()
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
