@@ -87,6 +87,16 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stderr, "")
 
+    def test_s24_termux_account_resolves_like_stow_s24(self):
+        # The S24's Termux app account (u0_a458) maps to metsatron, so stow:auto
+        # there, resolved from the account alone, equals the legacy stow:s24 stack.
+        for hostname in ("s24", "localhost"):
+            result = run([sys.executable, str(HELPER), "resolve"],
+                         DOTCORTEX_LAYERS_HOSTNAME=hostname, DOTCORTEX_LAYERS_ACCOUNT="u0_a458")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.split(), legacy_verbs()["stow:s24"])
+            self.assertEqual(result.stdout.split(), ["all", "termux", "s24"])
+
     def test_every_host_stow_verb_has_a_registry_row(self):
         covered = {row[8] for row in rows(HOSTS)}
         for verb in legacy_verbs():
