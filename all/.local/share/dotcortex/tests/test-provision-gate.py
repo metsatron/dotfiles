@@ -14,6 +14,12 @@ GATE = ROOT / "all/.local/bin/provision-gate"
 NALA_APPLY = ROOT / "debian/.local/bin/nala-apply"
 HOST_EXCLUDES = ROOT / "all/.local/bin/host-excludes"
 NALA_MK = ROOT / "all/.mk/nala.mk"
+LANE_SCRIPTS = {
+    "npm": ROOT / "all/.local/bin/npm-apply",
+    "cargo": ROOT / "all/.local/bin/cargo-apply",
+    "bun": ROOT / "all/.local/bin/bun-apply",
+    "flatpak": ROOT / "linux/.local/bin/flatpak-apply",
+}
 # The pre-gate nala-apply (origin/master 5b101ea25) and nala.mk, pinned in git so
 # "other hosts unchanged" is checked against the real old behaviour.
 BASE_REV = "5b101ea25"
@@ -203,6 +209,22 @@ class GatedNalaTests(unittest.TestCase):
             self.assertFalse(any("install -y nala" in c for c in calls), calls)
         finally:
             box.close()
+
+    def test_other_lanes_stop_in_dry_run(self):
+        for lane, script in LANE_SCRIPTS.items():
+            box = Sandbox(gated=True)
+            try:
+                result, calls = box.run(script)
+                self.assertEqual(result.returncode, 0, f"{lane}: {result.stdout}{result.stderr}")
+                self.assertIn("dry-run", result.stdout + result.stderr, lane)
+                self.assertEqual(calls, [], f"{lane}: {calls}")
+            finally:
+                box.close()
+
+    def test_other_lanes_force_uninstall_off_when_applying(self):
+        for lane, script in LANE_SCRIPTS.items():
+            text = script.read_text()
+            self.assertIn('additive) UNINSTALL=0', text, lane)
 
 
 class UngatedHostsUnchangedTests(unittest.TestCase):
