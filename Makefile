@@ -17,7 +17,8 @@ STOW_TARGET ?= $(HOME)
 STOW_FLAGS = --target="$(STOW_TARGET)"
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
-        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census odin\:deploy
+        stow safe-stow x11-apply bridge-flatpak bridge-flatpak-reset preview-stow lint census odin\:deploy \
+        layers-show layers-check auto-stow preview-auto-stow
 
 lint:
 | all/.local/bin/org-style-lint
@@ -182,6 +183,27 @@ safe-stow:
 
 preview-stow:
 | cd $(HOME)/DotCortex && stow $(STOW_FLAGS) -n $(STOW_PKGS) || true
+
+# Registry-resolved stack for this host + user (layers.org): the non-Guile
+# equivalent of loom stow:auto / layers:show / layers:check.
+LAYERS_HELPER ?= $(HOME)/DotCortex/all/.local/bin/dotcortex-layers
+
+layers-show:
+| "$(LAYERS_HELPER)" show
+
+layers-check:
+| "$(LAYERS_HELPER)" check
+
+auto-stow:
+| set -euo pipefail; \
+| pkgs="$$("$(LAYERS_HELPER)" resolve --explain)"; \
+| echo ">> auto-stow: $$pkgs"; \
+| $(MAKE) --no-print-directory safe-stow STOW_PKGS="$$pkgs"
+
+preview-auto-stow:
+| set -euo pipefail; \
+| pkgs="$$("$(LAYERS_HELPER)" resolve --explain)"; \
+| cd $(HOME)/DotCortex && stow $(STOW_FLAGS) -n $$pkgs || true
 
 # X11 apply for x230 overlay
 x11-apply: tangle
