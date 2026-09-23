@@ -4,7 +4,7 @@ SHELL := /bin/bash
 
 .PHONY: nala-repos nala-capture nala-diff nala-release-diff nala-release-sync nala-sync nala-apply nala-apply-auto nala-health
 
-# Gated hosts (provision-host-gates.org): repo setup and upgrades never run from
+# Gated hosts (package-host-gates.org): repo setup and upgrades never run from
 # make; nala-apply itself plans a dry run (PROVISION_APPLY=1: additive installs).
 PROVISION_GATE ?= $(firstword $(wildcard $(HOME)/.local/bin/provision-gate $(HOME)/DotCortex/all/.local/bin/provision-gate))
 GATED = [ -n "$(PROVISION_GATE)" ] && "$(PROVISION_GATE)" is-gated
