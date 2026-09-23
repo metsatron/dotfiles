@@ -159,20 +159,20 @@
    (task 'stow:debian "Safe stow shared + linux + debian overlays (all linux debian)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian' make safe-stow")))
 
-   (task 'stow:x230 "Safe stow X230 overlays (all linux debian x230)"
-         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian x230' make safe-stow")))
+   (task 'stow:x230 "Safe stow X230 overlays (all linux debian x230 user-metsatron)"
+         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian x230 user-metsatron' make safe-stow")))
 
    (task 'stow:cortex
          "Apply the X230-shaped public layer to the T1700 Cortex sanctuary"
          (lambda ()
            (sh "set -euo pipefail; host=$(hostname -s 2>/dev/null || hostname); case \"$host\" in kikin-kushi|ThinkPad-T1700|t1700) ;; *) echo 'stow:cortex must run on Kikin-Kushi/T1700' >&2; exit 2 ;; esac; root=\"${DOTCORTEX_ROOT:-$HOME/DotCortex}\"; guest=\"${SANCTUARY_CORTEX_GUEST_HOME:-}\"; case \"$HOME\" in */.local/share/dotcortex/guests/sanctuary-cortex/home) guest=\"${guest:-$HOME}\" ;; *) guest=\"${guest:-$HOME/.local/share/dotcortex/guests/sanctuary-cortex/home}\" ;; esac; private=\"${SANCTUARY_CORTEX_PRIVATE_ROOT:-$HOME/HelmCortex/NEXUS/sanctuaries/sanctuary-cortex}\"; helper=\"$root/linux/.local/bin/sanctuary-cortex-stow\"; [ -x \"$helper\" ] || { echo \"stow:cortex: missing sanctuary helper: $helper\" >&2; exit 1; }; DOTCORTEX_ROOT=\"$root\" SANCTUARY_CORTEX_GUEST_HOME=\"$guest\" SANCTUARY_CORTEX_PRIVATE_ROOT=\"$private\" bash \"$helper\"")))
 
-   (task 'stow:t480s "Safe stow T480s overlays (all linux debian devuan t480s)"
-         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t480s' make safe-stow")))
+   (task 'stow:t480s "Safe stow T480s overlays (all linux debian devuan t480s user-metsatron)"
+         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t480s user-metsatron' make safe-stow")))
 
    ;; Kikin-kushi follows the Devuan laptop overlay stack and adds T1700 last.
-   (task 'stow:t1700 "Safe stow T1700 kikin-kushi overlays (all linux debian devuan t1700)"
-         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t1700' make safe-stow")))
+   (task 'stow:t1700 "Safe stow T1700 kikin-kushi overlays (all linux debian devuan t1700 user-metsatron)"
+         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian devuan t1700 user-metsatron' make safe-stow")))
 
    (task 'stow:devuan "Safe stow shared + linux + devuan overlays (all linux devuan)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux devuan' make safe-stow")))
@@ -180,11 +180,11 @@
    (task 'stow:openmandriva "Safe stow OpenMandriva overlays (all linux openmandriva)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux openmandriva' make safe-stow")))
 
-   (task 'stow:t480 "Safe stow T480 Vendefoul Wolf overlays (all linux debian t480)"
-         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian t480' make safe-stow")))
+   (task 'stow:t480 "Safe stow T480 Vendefoul Wolf overlays (all linux debian t480 user-metsatron)"
+         (lambda () (stow-then-reload-tmux "STOW_PKGS='all linux debian t480 user-metsatron' make safe-stow")))
 
-   (task 'stow:s24 "Safe stow S24 overlays (all termux s24)"
-         (lambda () (stow-then-reload-tmux "STOW_PKGS='all termux s24' make safe-stow")))
+   (task 'stow:s24 "Safe stow S24 overlays (all termux s24 user-metsatron)"
+         (lambda () (stow-then-reload-tmux "STOW_PKGS='all termux s24 user-metsatron' make safe-stow")))
 
    ;; Registry-driven stow (layers.org). Resolves this host + invoking user through
    ;; all/.config/dotcortex/{hosts,users}.ssv in the order all -> linux -> distro ->
