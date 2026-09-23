@@ -157,5 +157,94 @@ class SkeletonTests(unittest.TestCase):
             self.assertIn("inactive", result.stderr)
 
 
+
+class GuardTests(unittest.TestCase):
+    """The stow target guard (agents-hooks.org) in package mode, against fixture roots."""
+
+    def fixture(self, tmp, user_files):
+        root = Path(tmp)
+        (root / "all").mkdir()
+        (root / "all/.zshrc").write_text("shared\n")
+        (root / "all/.config").mkdir()
+        (root / "all/.config/shared.conf").write_text("shared\n")
+        pkg = root / "user-tester"
+        pkg.mkdir()
+        (pkg / ".stow-local-ignore").write_text("^/README.*\n")
+        (pkg / "README.org").write_text("placeholder\n")
+        for rel in user_files:
+            (pkg / rel).parent.mkdir(parents=True, exist_ok=True)
+            (pkg / rel).write_text("user\n")
+        (root / "user-other").mkdir()
+        (root / "users.ssv").write_text(
+            'tester tester active tester "fixture"\nother other active other "fixture"\n')
+        (root / "hosts.ssv").write_text(
+            'box box active - - - - tester,other - "fixture"\n')
+        return {"DOTCORTEX_ROOT": str(root),
+                "DOTCORTEX_HOSTS_SSV": str(root / "hosts.ssv"),
+                "DOTCORTEX_USERS_SSV": str(root / "users.ssv"),
+                "DOTCORTEX_LAYERS_ACCOUNT": "tester"}
+
+    def guard(self, packages, **env):
+        return run([sys.executable, str(GUARD), "--packages", packages], **env)
+
+    def test_guard_blocks_user_layer_overlapping_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self.fixture(tmp, [".zshrc", ".config/shared.conf"])
+            result = self.guard("all user-tester", **env)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn("overlaps", result.stderr)
+            self.assertIn(".zshrc (also in all)", result.stderr)
+            self.assertIn(".config/shared.conf (also in all)", result.stderr)
+
+    def test_guard_allows_disjoint_user_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self.fixture(tmp, [".config/mine.conf"])
+            result = self.guard("all user-tester", **env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("BLOCKED", result.stderr)
+
+    def test_guard_blocks_someone_elses_user_layer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self.fixture(tmp, [".config/mine.conf"])
+            result = self.guard("all user-other", **env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("does not belong", result.stderr)
+
+    def test_guard_blocks_two_user_layers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = self.fixture(tmp, [".config/mine.conf"])
+            result = self.guard("all user-tester user-other", **env)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("at most one user layer", result.stderr)
+
+    def test_guard_only_warns_on_undeclared_package(self):
+        result = self.guard("all linux think")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("'think' is not declared", result.stderr)
+
+    def test_legacy_stacks_get_no_new_output_from_the_layer_check(self):
+        for verb, packages in legacy_verbs().items():
+            result = run([sys.executable, str(HELPER), "validate", "--packages", " ".join(packages)])
+            self.assertEqual(result.returncode, 0, f"{verb}: {result.stderr}")
+            self.assertEqual(result.stderr, "", f"{verb}: unexpected output {result.stderr!r}")
+
+    def test_machine_check_is_unchanged(self):
+        # The pre-existing host check still fires first: a foreign machine overlay is
+        # blocked with the old message on any host that is not that machine.
+        foreign = "s24" if not socket_hostname().startswith(("s24", "localhost")) else "x230"
+        result = self.guard(f"all linux debian {foreign}")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("does not match the machine", result.stderr)
+
+    def test_hook_mode_ignores_stow_auto(self):
+        result = run([sys.executable, str(GUARD), "--command", "loom stow:auto"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout + result.stderr, "")
+
+
+def socket_hostname():
+    import socket
+    return socket.gethostname().split(".", 1)[0]
+
 if __name__ == "__main__":
     unittest.main()
