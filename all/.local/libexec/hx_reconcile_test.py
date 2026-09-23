@@ -137,6 +137,22 @@ os.execv("/bin/sh",["sh","-c",sys.argv[-1]])
         body = rc.MAGIC + len(header).to_bytes(8, "big") + header + b"".join(b for _, b in contents)
         return body + hashlib.sha256(body).digest()
 
+    def test_telegram_policy_accepts_declared_agent_slugs_only(self):
+        entry = self.config["tools"]["telegram-export-pipeline"]
+        self.assertEqual(rc.check_policy(entry), rc.TELEGRAM_PROTOCOL)
+        legacy = copy.deepcopy(entry)
+        del legacy["reconcile"]["agent_conversation_slugs"]
+        self.assertEqual(rc.check_policy(legacy), rc.TELEGRAM_PROTOCOL)
+        for slugs in ("not-a-list", ["duplicate", "duplicate"], ["../escape"], [4]):
+            invalid = copy.deepcopy(entry)
+            invalid["reconcile"]["agent_conversation_slugs"] = slugs
+            with self.subTest(slugs=slugs), self.assertRaises(rc.Refusal):
+                rc.check_policy(invalid)
+        invalid = copy.deepcopy(entry)
+        invalid["reconcile"]["unexpected"] = True
+        with self.assertRaises(rc.Refusal):
+            rc.check_policy(invalid)
+
     def test_divergent_dirty_untracked_and_exact_transport(self):
         strange = "checkout space;'$()`☃\nnext"
         target = self.caller / strange
