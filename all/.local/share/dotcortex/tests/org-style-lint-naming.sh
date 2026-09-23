@@ -12,7 +12,7 @@ cat >"$tmp/README.org" <<'EOF'
 | =package-*=    | fixture                                  |
 | =widgets-*=    | fixture family added in the same commit  |
 EOF
-for f in package-foo.org shell.org widgets.org widgets-bar.org newfamily-thing.org Bad_Name.org; do
+for f in package-foo.org shell.org layers.org widgets.org widgets-bar.org newfamily-thing.org Bad_Name.org; do
   printf '* fixture\n' >"$tmp/$f"
 done
 
@@ -23,7 +23,7 @@ refute() { if printf '%s\n' "$out" | grep -qF -- "$1"; then echo "unexpected war
 expect "?? naming: newfamily-thing.org matches no documented namespace"
 expect "?? naming: Bad_Name.org is not lowercase-kebab"
 expect "?? naming: Bad_Name.org matches no documented namespace"
-for ok in package-foo.org shell.org widgets.org widgets-bar.org README.org; do
+for ok in package-foo.org shell.org layers.org widgets.org widgets-bar.org README.org; do
   refute "naming: $ok"
 done
 
