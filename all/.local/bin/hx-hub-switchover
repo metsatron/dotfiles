@@ -1,129 +1,533 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/usr/bin/env python3
+"""Guarded HelmCortex hub migration and HX router deployment."""
+from __future__ import annotations
 
-usage() {
-  cat <<'EOF'
-Usage: hx-hub-switchover plan|apply|verify [--client SSH_ALIAS:STOW_TARGET]...
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
 
-The registries must already declare exactly one hub and agree on its key/alias.
-plan    validates topology and source parity without changing anything
-apply   tangles/stows the declared router, captures shims on the hub, then applies them
-verify  checks registry agreement, target storage, and hx-diff on every named client
-EOF
-}
-
-case "${1:-}" in
-  -h|--help) usage; exit 0 ;;
-  plan|apply|verify) mode="$1"; shift ;;
-  *) usage >&2; exit 2 ;;
-esac
-
-clients=()
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --client)
-      [ "$#" -ge 2 ] || { echo "hx-hub-switchover: --client requires SSH_ALIAS:STOW_TARGET" >&2; exit 2; }
-      clients+=("$2"); shift 2 ;;
-    *) echo "hx-hub-switchover: unknown argument: $1" >&2; exit 2 ;;
-  esac
-done
-
-root="${DOTCORTEX_ROOT:-$HOME/DotCortex}"
-fleet="$root/all/.config/agent-session/fleet-router.json"
-machines="$root/all/.config/agent-session/version-registry.json"
-sources=(services-agent-sessiond.org services-fleet-router.org helmcortex-shims.org)
-for path in "$fleet" "$machines"; do
-  [ -r "$path" ] || { echo "hx-hub-switchover: missing $path" >&2; exit 69; }
-done
-
-readarray -t topology < <(python3 - "$fleet" "$machines" <<'PY'
-import json, pathlib, sys
-fleet = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-machines = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
-transport = fleet.get("transport") or {}
-rows = machines.get("machines") or []
-hubs = [row for row in rows if row.get("role") == "hub"]
-if len(hubs) != 1:
-    raise SystemExit(f"expected exactly one machine role=hub; found {len(hubs)}")
-hub = hubs[0]
-if transport.get("hub_machine_key") != hub.get("key"):
-    raise SystemExit("fleet router hub_machine_key disagrees with machine role=hub")
-alias = transport.get("hub_ssh_alias")
-if not isinstance(alias, str) or not alias or alias.startswith("-"):
-    raise SystemExit("fleet router hub_ssh_alias is invalid")
-if hub.get("ssh_alias") != alias:
-    raise SystemExit("fleet router hub_ssh_alias disagrees with machine registry")
-print(hub["key"])
-print(alias)
-PY
+SCHEMA = "dotcortex.hx-hub-switchover.v1"
+SOURCES = ("services-agent-sessiond.org", "services-fleet-router.org", "helmcortex-shims.org")
+REQUIRED_HOOKS = ("quiesce", "checkpoint", "cutover", "verify", "resume", "rollback")
+SSH_OPTIONS = (
+    "-o", "BatchMode=yes",
+    "-o", "PasswordAuthentication=no",
+    "-o", "KbdInteractiveAuthentication=no",
+    "-o", "PreferredAuthentications=publickey",
+    "-o", "ConnectTimeout=10",
+    "-o", "ConnectionAttempts=1",
 )
-hub_key="${topology[0]}"
-hub_alias="${topology[1]}"
+SAFE_TOKEN = re.compile(r"^[A-Za-z0-9._-]+$")
+SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$")
+MAX_PLAN_BYTES = 64 * 1024 * 1024
 
-ssh_opts=(
-  -o BatchMode=yes
-  -o PasswordAuthentication=no
-  -o KbdInteractiveAuthentication=no
-  -o PreferredAuthentications=publickey
-  -o ConnectTimeout=10
-  -o ConnectionAttempts=1
-)
-if [ -r "$HOME/.ssh/id_ed25519" ]; then
-  ssh_opts+=( -o IdentitiesOnly=yes -i "$HOME/.ssh/id_ed25519" )
-fi
 
-remote() {
-  local alias="$1"; shift
-  if [ "$alias" = local ]; then
-    /bin/sh -c "$1"
-  else
-    /usr/bin/ssh "${ssh_opts[@]}" "$alias" "$@"
-  fi
-}
-validate_client() {
-  case "$1" in
-    *:*) ;;
-    *) echo "hx-hub-switchover: invalid client '$1'" >&2; return 2 ;;
-  esac
-  local alias="${1%%:*}" stow="${1#*:}"
-  case "$alias:$stow" in
-    *[!A-Za-z0-9._:-]*) echo "hx-hub-switchover: unsafe client '$1'" >&2; return 2 ;;
-  esac
-  [ -n "$alias" ] && [ -n "$stow" ]
-}
+class Refusal(RuntimeError):
+    pass
 
-echo "declared hub: $hub_key via $hub_alias"
-remote "$hub_alias" 'set -eu; test -d "$HOME/HelmCortex/FORGE/bin"; test ! -L "$HOME/HelmCortex"; printf "target=%s host=%s\n" "$(realpath "$HOME/HelmCortex")" "$(hostname)"'
 
-local_hashes="$(cd "$root" && sha256sum "${sources[@]}")"
-for client in "${clients[@]}"; do
-  validate_client "$client"
-  alias="${client%%:*}"
-  remote_hashes="$(remote "$alias" 'cd "$HOME/DotCortex" && sha256sum services-agent-sessiond.org services-fleet-router.org helmcortex-shims.org')"
-  [ "$remote_hashes" = "$local_hashes" ] || {
-    echo "hx-hub-switchover: router source drift on $alias" >&2
-    exit 65
-  }
-  echo "source parity: $alias"
-done
+def refuse(message: str) -> None:
+    raise Refusal(message)
 
-if [ "$mode" = apply ]; then
-  for client in "${clients[@]}"; do
-    alias="${client%%:*}"; stow="${client#*:}"
-    remote "$alias" "set -eu; cd \"\$HOME/DotCortex\"; tangle-one services-agent-sessiond.org; tangle-one services-fleet-router.org; tangle-one helmcortex-shims.org; \"\$HOME/DotCortex/all/.local/bin/loom\" stow:$stow"
-  done
-  remote "$hub_alias" 'set -eu; "$HOME/.local/bin/hx-capture"'
-  for client in "${clients[@]}"; do
-    alias="${client%%:*}"
-    remote "$alias" 'set -eu; "$HOME/.local/bin/hx-apply"'
-  done
-fi
 
-if [ "$mode" != plan ]; then
-  for client in "${clients[@]}"; do
-    alias="${client%%:*}"
-    remote "$alias" 'set -eu; "$HOME/.local/bin/hx-diff"'
-  done
-fi
+def run(argv, *, capture=False, check=True, input_bytes=None, cwd=None):
+    result = subprocess.run(
+        argv, cwd=cwd, input=input_bytes,
+        stdout=subprocess.PIPE if capture else None,
+        stderr=subprocess.PIPE if capture else None,
+        check=False,
+    )
+    if check and result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip() if capture else ""
+        refuse(f"command failed ({result.returncode}): {shlex.join(argv)}"
+               + (f": {detail}" if detail else ""))
+    return result
 
-echo "hx-hub-switchover: $mode complete for $hub_key"
+
+def ssh_argv() -> list[str]:
+    argv = ["/usr/bin/ssh", *SSH_OPTIONS]
+    identity = Path.home() / ".ssh" / "id_ed25519"
+    if identity.is_file():
+        argv.extend(("-o", "IdentitiesOnly=yes", "-i", str(identity)))
+    return argv
+
+
+def host_run(alias: str, argv: list[str], *, capture=False, check=True, input_bytes=None):
+    validate_token(alias, "SSH alias", allow_local=True)
+    command = argv if alias == "local" else [*ssh_argv(), alias, shlex.join(argv)]
+    return run(command, capture=capture, check=check, input_bytes=input_bytes)
+
+
+def validate_token(value, label, *, allow_local=False):
+    if not isinstance(value, str) or not value or not SAFE_TOKEN.fullmatch(value):
+        refuse(f"invalid {label}: {value!r}")
+    if value == "local" and not allow_local:
+        refuse(f"{label} must name a host, not local")
+    return value
+
+
+def validate_path(value, label):
+    if (not isinstance(value, str) or not value.startswith("/") or "\0" in value
+            or ".." in Path(value).parts):
+        refuse(f"invalid absolute {label}: {value!r}")
+    normalized = value.rstrip("/") or "/"
+    if normalized in {"/", "/home", "/root", str(Path.home())} or len(Path(normalized).parts) < 3:
+        refuse(f"refusing broad {label}: {value!r}")
+    return normalized
+
+
+def validate_endpoint(value, label, *, target=False):
+    required = {"machine_key", "ssh_alias", "root"}
+    if target:
+        required |= {"stow_target", "state_root"}
+    if not isinstance(value, dict) or set(value) != required:
+        refuse(f"{label} must contain exactly {sorted(required)}")
+    result = {
+        "machine_key": validate_token(value["machine_key"], f"{label} machine_key"),
+        "ssh_alias": validate_token(value["ssh_alias"], f"{label} ssh_alias"),
+        "root": validate_path(value["root"], f"{label} root"),
+    }
+    if target:
+        result["stow_target"] = validate_token(value["stow_target"], "target stow_target")
+        result["state_root"] = validate_path(value["state_root"], "target state_root")
+    return result
+
+
+def validate_manifest(value):
+    if not isinstance(value, dict) or set(value) != {
+            "schema", "id", "source", "target", "clients", "hooks", "excludes"}:
+        refuse("manifest fields must be schema,id,source,target,clients,hooks,excludes")
+    if value["schema"] != SCHEMA or not isinstance(value["id"], str) or not SAFE_ID.fullmatch(value["id"]):
+        refuse("unsupported schema or invalid migration id")
+    source = validate_endpoint(value["source"], "source")
+    target = validate_endpoint(value["target"], "target", target=True)
+    if source["machine_key"] == target["machine_key"] or source["ssh_alias"] == target["ssh_alias"]:
+        refuse("source and target must be different machines")
+    clients = []
+    if not isinstance(value["clients"], list) or not value["clients"]:
+        refuse("clients must be a non-empty list")
+    for row in value["clients"]:
+        if not isinstance(row, dict) or set(row) != {"ssh_alias", "stow_target"}:
+            refuse("each client must contain exactly ssh_alias and stow_target")
+        clients.append({
+            "ssh_alias": validate_token(row["ssh_alias"], "client ssh_alias", allow_local=True),
+            "stow_target": validate_token(row["stow_target"], "client stow_target"),
+        })
+    aliases = [row["ssh_alias"] for row in clients]
+    if len(aliases) != len(set(aliases)):
+        refuse("client SSH aliases must be unique")
+    if target["ssh_alias"] not in aliases:
+        refuse("clients must include the target hub so its router and shims are deployed")
+    target_prefix = target["root"].rstrip("/") + "/"
+    if target["state_root"] == target["root"] or target["state_root"].startswith(target_prefix):
+        refuse("target state_root must be outside the synchronized HelmCortex root")
+    hooks = value["hooks"]
+    if not isinstance(hooks, dict) or not set(hooks).issubset({"preflight", *REQUIRED_HOOKS}):
+        refuse("manifest contains an unknown hook phase")
+    for phase in REQUIRED_HOOKS:
+        if not isinstance(hooks.get(phase), list) or not hooks[phase]:
+            refuse(f"required hook phase is empty: {phase}")
+    clean_hooks = {}
+    for phase, rows in hooks.items():
+        if not isinstance(rows, list):
+            refuse(f"hook phase must be a list: {phase}")
+        clean_hooks[phase] = []
+        for row in rows:
+            if not isinstance(row, dict) or set(row) != {"ssh_alias", "path"}:
+                refuse(f"hook row in {phase} must contain exactly ssh_alias and path")
+            clean_hooks[phase].append({
+                "ssh_alias": validate_token(row["ssh_alias"], f"{phase} hook alias", allow_local=True),
+                "path": validate_path(row["path"], f"{phase} hook path"),
+            })
+    excludes = value["excludes"]
+    if not isinstance(excludes, list):
+        refuse("excludes must be a list")
+    for pattern in excludes:
+        if (not isinstance(pattern, str) or not pattern or pattern.startswith("/")
+                or "\0" in pattern or ".." in Path(pattern).parts):
+            refuse(f"unsafe relative exclude: {pattern!r}")
+    return {"schema": SCHEMA, "id": value["id"], "source": source, "target": target,
+            "clients": clients, "hooks": clean_hooks, "excludes": excludes}
+
+
+def load_manifest(path):
+    raw = Path(path).read_bytes()
+    try:
+        value = json.loads(raw)
+    except (ValueError, UnicodeError) as exc:
+        refuse(f"cannot parse manifest: {exc}")
+    return validate_manifest(value), raw
+
+
+def load_topology(root: Path):
+    fleet_path = root / "all/.config/agent-session/fleet-router.json"
+    machines_path = root / "all/.config/agent-session/version-registry.json"
+    try:
+        fleet = json.loads(fleet_path.read_text(encoding="utf-8"))
+        machines = json.loads(machines_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        refuse(f"cannot load tangled topology: {exc}")
+    rows = machines.get("machines") or []
+    hubs = [row for row in rows if row.get("role") == "hub"]
+    if len(hubs) != 1:
+        refuse(f"expected exactly one machine role=hub; found {len(hubs)}")
+    hub = hubs[0]
+    transport = fleet.get("transport") or {}
+    if transport.get("hub_machine_key") != hub.get("key"):
+        refuse("fleet router hub_machine_key disagrees with machine role=hub")
+    if transport.get("hub_ssh_alias") != hub.get("ssh_alias"):
+        refuse("fleet router hub_ssh_alias disagrees with machine registry")
+    return hub, rows
+
+
+def source_hashes(root: Path):
+    digest = []
+    for name in SOURCES:
+        digest.append(f"{hashlib.sha256((root / name).read_bytes()).hexdigest()}  {name}")
+    return "\n".join(digest) + "\n"
+
+
+def check_source_parity(root: Path, clients):
+    local = source_hashes(root)
+    for client in clients:
+        alias = client["ssh_alias"]
+        command = ["/bin/sh", "-ceu",
+                   "cd \"$HOME/DotCortex\"; sha256sum " + " ".join(SOURCES)]
+        remote = host_run(alias, command, capture=True).stdout.decode()
+        if remote != local:
+            refuse(f"router source drift on {alias}")
+        print(f"source parity: {alias}")
+
+
+def validate_local_tree(alias, root, label):
+    script = (
+        "set -eu; p=$1; test -d \"$p/FORGE/bin\"; test ! -L \"$p\"; "
+        "fs=$(findmnt -no FSTYPE -T \"$p\" | tail -1); "
+        "case $fs in nfs*|cifs|fuse.sshfs) exit 78;; esac; "
+        "printf '%s|%s|%s\\n' \"$(hostname)\" \"$(realpath \"$p\")\" \"$fs\""
+    )
+    result = host_run(alias, ["/bin/sh", "-ceu", script, "sh", root], capture=True)
+    print(f"{label}: {result.stdout.decode().strip()}")
+
+
+def run_hooks(plan, phase):
+    for row in plan["hooks"].get(phase, []):
+        alias, path = row["ssh_alias"], row["path"]
+        host_run(alias, ["test", "-x", path])
+        print(f"hook {phase}: {alias}:{path}")
+        host_run(alias, [path, phase, plan["id"], plan["source"]["machine_key"],
+                         plan["target"]["machine_key"]])
+
+
+def check_hooks(plan):
+    for phase, rows in plan["hooks"].items():
+        for row in rows:
+            host_run(row["ssh_alias"], ["test", "-x", row["path"]])
+            print(f"hook executable: {phase} {row['ssh_alias']}:{row['path']}")
+
+
+def rsync_argv(plan, *, dry_run, backup_dir=None):
+    source, target = plan["source"], plan["target"]
+    remote_shell = shlex.join(["/usr/bin/ssh", *SSH_OPTIONS])
+    argv = ["/usr/bin/rsync", "-aHAXS", "--safe-links", "--delete-delay",
+            "--itemize-changes", "--out-format=%i|%n%L", "--human-readable",
+            "--protect-args", "-e", remote_shell]
+    if dry_run:
+        argv.append("--dry-run")
+    else:
+        if not backup_dir:
+            refuse("live rsync requires a backup directory")
+        argv.extend(("--backup", f"--backup-dir={backup_dir}"))
+    for pattern in plan["excludes"]:
+        argv.extend(("--exclude", pattern))
+    argv.extend((f"{source['ssh_alias']}:{source['root']}/", f"{target['root']}/"))
+    return argv
+
+
+def transfer_plan(plan):
+    result = host_run(plan["target"]["ssh_alias"], rsync_argv(plan, dry_run=True), capture=True)
+    data = result.stdout
+    if len(data) > MAX_PLAN_BYTES:
+        refuse("rsync plan exceeds 64 MiB receipt bound")
+    return data
+
+
+def approval_token(manifest_raw, transfer):
+    return hashlib.sha256(hashlib.sha256(manifest_raw).digest() + b"\0" + transfer).hexdigest()
+
+
+def state_path(plan, name):
+    return f"{plan['target']['state_root']}/{plan['id']}/{name}"
+
+
+def write_target(plan, name, data):
+    path = state_path(plan, name)
+    code = ("import os,pathlib,sys,tempfile; p=pathlib.Path(sys.argv[1]);"
+            "p.parent.mkdir(parents=True,exist_ok=True);"
+            "f=tempfile.NamedTemporaryFile(dir=p.parent,delete=False);"
+            "f.write(sys.stdin.buffer.read());f.flush();os.fsync(f.fileno());f.close();"
+            "os.chmod(f.name,0o600);os.replace(f.name,p)")
+    host_run(plan["target"]["ssh_alias"], ["/usr/bin/python3", "-c", code, path],
+             input_bytes=data)
+
+
+def read_target(plan, name):
+    return host_run(plan["target"]["ssh_alias"], ["cat", state_path(plan, name)],
+                    capture=True).stdout
+
+
+def receipt(plan, manifest_raw, transfer, stage, **extra):
+    value = {
+        "schema": SCHEMA,
+        "id": plan["id"],
+        "stage": stage,
+        "manifest_sha256": hashlib.sha256(manifest_raw).hexdigest(),
+        "transfer_sha256": hashlib.sha256(transfer).hexdigest(),
+        "approval_token": approval_token(manifest_raw, transfer),
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        **extra,
+    }
+    write_target(plan, "receipt.json", (json.dumps(value, sort_keys=True, indent=2) + "\n").encode())
+    return value
+
+
+def read_receipt(plan):
+    try:
+        return json.loads(read_target(plan, "receipt.json"))
+    except (ValueError, UnicodeError) as exc:
+        refuse(f"invalid prepared receipt: {exc}")
+
+
+def preflight(root, plan, *, run_preflight_hooks=True):
+    hub, _ = load_topology(root)
+    target = plan["target"]
+    if (hub.get("key"), hub.get("ssh_alias")) != (target["machine_key"], target["ssh_alias"]):
+        refuse("tangled registries do not declare the manifest target as hub; run declare, review, commit and synchronize first")
+    validate_local_tree(plan["source"]["ssh_alias"], plan["source"]["root"], "source")
+    validate_local_tree(target["ssh_alias"], target["root"], "target")
+    check_hooks(plan)
+    check_source_parity(root, plan["clients"])
+    if run_preflight_hooks:
+        run_hooks(plan, "preflight")
+
+
+def router_cycle(root, mode, clients, expected=None):
+    hub, _ = load_topology(root)
+    if expected and (hub.get("key"), hub.get("ssh_alias")) != expected:
+        refuse("declared hub does not match migration target")
+    validate_local_tree(hub["ssh_alias"], str(Path.home() / "HelmCortex"), "declared hub")
+    check_source_parity(root, clients)
+    if mode == "apply":
+        for client in clients:
+            alias, stow = client["ssh_alias"], client["stow_target"]
+            script = (
+                "set -eu; cd \"$HOME/DotCortex\"; "
+                "\"$HOME/.local/bin/tangle-one\" services-agent-sessiond.org; "
+                "\"$HOME/.local/bin/tangle-one\" services-fleet-router.org; "
+                "\"$HOME/.local/bin/tangle-one\" helmcortex-shims.org; "
+                f"\"$HOME/DotCortex/all/.local/bin/loom\" stow:{stow}"
+            )
+            host_run(alias, ["/bin/sh", "-ceu", script])
+        host_run(hub["ssh_alias"], ["/bin/sh", "-ceu", '"$HOME/.local/bin/hx-capture"'])
+        for client in clients:
+            host_run(client["ssh_alias"], ["/bin/sh", "-ceu", '"$HOME/.local/bin/hx-apply"'])
+    if mode != "plan":
+        for client in clients:
+            host_run(client["ssh_alias"], ["/bin/sh", "-ceu", '"$HOME/.local/bin/hx-diff"'])
+    print(f"hx-hub-switchover: router {mode} complete for {hub['key']}")
+
+
+def declaration_text(fleet_text, machine_text, old_key, old_alias, new_key, new_alias):
+    key_old = f'"hub_machine_key": "{old_key}"'
+    key_new = f'"hub_machine_key": "{new_key}"'
+    alias_old = f'"hub_ssh_alias": "{old_alias}"'
+    alias_new = f'"hub_ssh_alias": "{new_alias}"'
+    if fleet_text.count(key_old) != 1 or fleet_text.count(alias_old) != 1:
+        refuse("router Org source does not contain one exact current hub declaration")
+    fleet_text = fleet_text.replace(key_old, key_new).replace(alias_old, alias_new)
+
+    def role(text, key, before, after):
+        pattern = re.compile(rf'^(\s*\{{"key": "{re.escape(key)}".*?"role": "){before}(".*)$', re.M)
+        changed, count = pattern.subn(rf'\g<1>{after}\2', text)
+        if count != 1:
+            refuse(f"machine Org source does not contain one {before} role row for {key}")
+        return changed
+
+    machine_text = role(machine_text, old_key, "hub", "client")
+    machine_text = role(machine_text, new_key, "client", "hub")
+    return fleet_text, machine_text
+
+
+def atomic_write(path: Path, text: str):
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as stream:
+        stream.write(text)
+        stream.flush()
+        os.fsync(stream.fileno())
+        temporary = stream.name
+    os.chmod(temporary, path.stat().st_mode & 0o777)
+    os.replace(temporary, path)
+
+
+def declare(root, plan):
+    hub, rows = load_topology(root)
+    target = next((row for row in rows if row.get("key") == plan["target"]["machine_key"]), None)
+    if target is None or target.get("ssh_alias") != plan["target"]["ssh_alias"]:
+        refuse("migration target is absent from the machine registry or its alias disagrees")
+    if hub.get("key") == target.get("key"):
+        print("hub declaration already matches migration target")
+        return
+    paths = ["services-fleet-router.org", "services-agent-sessiond.org"]
+    for diff_args in (("diff", "--quiet", "--"), ("diff", "--cached", "--quiet", "--")):
+        if run(["git", *diff_args, *paths], cwd=root, check=False).returncode:
+            refuse("hub declaration source paths are dirty; preserve and reconcile them before declare")
+    fleet_path, machines_path = (root / paths[0], root / paths[1])
+    fleet, machines = declaration_text(
+        fleet_path.read_text(encoding="utf-8"), machines_path.read_text(encoding="utf-8"),
+        hub["key"], hub["ssh_alias"], target["key"], target["ssh_alias"])
+    atomic_write(fleet_path, fleet)
+    atomic_write(machines_path, machines)
+    try:
+        tangle = str(Path.home() / ".local/bin/tangle-one")
+        run([tangle, paths[0]], cwd=root)
+        run([tangle, paths[1]], cwd=root)
+        stage = [*paths, "all/.config/agent-session/fleet-router.json",
+                 "all/.config/agent-session/version-registry.json"]
+        run(["git", "add", "--", *stage], cwd=root)
+        load_topology(root)
+    except Exception:
+        print("hx-hub-switchover: declaration edit failed after writing source; inspect staged and working state", file=sys.stderr)
+        raise
+    print("declaration staged; review and commit, then synchronize each client before prepare")
+
+
+def prepare(root, plan, raw):
+    preflight(root, plan)
+    run_hooks(plan, "quiesce")
+    run_hooks(plan, "checkpoint")
+    transfer = transfer_plan(plan)
+    write_target(plan, "rsync.plan", transfer)
+    value = receipt(plan, raw, transfer, "prepared")
+    print(f"prepared changes={len(transfer.splitlines())} approval={value['approval_token']}")
+    print(f"services remain held; apply with --approve {value['approval_token']}")
+
+
+def apply_migration(root, plan, raw, approve):
+    if not approve or not re.fullmatch(r"[0-9a-f]{64}", approve):
+        refuse("apply requires --approve with the prepared 64-character token")
+    preflight(root, plan, run_preflight_hooks=False)
+    prior = read_receipt(plan)
+    if prior.get("stage") != "prepared" or prior.get("approval_token") != approve:
+        refuse("approval does not match the prepared receipt")
+    transfer = transfer_plan(plan)
+    if approval_token(raw, transfer) != approve:
+        refuse("quiesced transfer plan changed after approval; run prepare again")
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = state_path(plan, f"backups/{stamp}")
+    result = host_run(plan["target"]["ssh_alias"],
+                      rsync_argv(plan, dry_run=False, backup_dir=backup), capture=True)
+    write_target(plan, f"rsync-{stamp}.log", result.stdout + result.stderr)
+    residual = transfer_plan(plan)
+    write_target(plan, "rsync.verify", residual)
+    if residual:
+        receipt(plan, raw, residual, "sync-drift", backup_dir=backup)
+        refuse("post-copy rsync verification still reports drift; services remain held")
+    receipt(plan, raw, transfer, "synced", backup_dir=backup)
+    run_hooks(plan, "cutover")
+    router_cycle(root, "apply", plan["clients"],
+                 expected=(plan["target"]["machine_key"], plan["target"]["ssh_alias"]))
+    verify_migration(root, plan, raw, stage="verified", backup_dir=backup)
+    print("migration verified; services remain held until release")
+
+
+def verify_migration(root, plan, raw, *, stage=None, backup_dir=None):
+    preflight(root, plan, run_preflight_hooks=False)
+    residual = transfer_plan(plan)
+    write_target(plan, "rsync.verify", residual)
+    if residual:
+        refuse(f"data verification reports {len(residual.splitlines())} changes")
+    run_hooks(plan, "verify")
+    router_cycle(root, "verify", plan["clients"],
+                 expected=(plan["target"]["machine_key"], plan["target"]["ssh_alias"]))
+    if stage:
+        receipt(plan, raw, b"", stage, backup_dir=backup_dir)
+    print("migration verification passed")
+
+
+def release_migration(root, plan, raw):
+    verify_migration(root, plan, raw)
+    run_hooks(plan, "resume")
+    receipt(plan, raw, b"", "released")
+    print("migration released")
+
+
+def abort_migration(plan, raw, approve):
+    prior = read_receipt(plan)
+    if not approve or prior.get("approval_token") != approve:
+        refuse("abort requires --approve matching the current receipt")
+    run_hooks(plan, "rollback")
+    run_hooks(plan, "resume")
+    receipt(plan, raw, b"", "aborted", preserved_backup_dir=prior.get("backup_dir"))
+    print("topology rollback hooks completed; data backup remains preserved")
+
+
+def parse_client(value):
+    if value.count(":") != 1:
+        refuse(f"invalid client: {value!r}")
+    alias, stow = value.split(":", 1)
+    return {"ssh_alias": validate_token(alias, "client alias", allow_local=True),
+            "stow_target": validate_token(stow, "client stow target")}
+
+
+def parser():
+    result = argparse.ArgumentParser(description=__doc__)
+    result.add_argument("mode", choices=("declare", "plan", "prepare", "apply", "verify",
+                                         "release", "abort"))
+    result.add_argument("--manifest")
+    result.add_argument("--approve")
+    result.add_argument("--client", action="append", default=[])
+    return result
+
+
+def main():
+    args = parser().parse_args()
+    root = Path(os.environ.get("DOTCORTEX_ROOT", str(Path.home() / "DotCortex"))).resolve()
+    try:
+        if not args.manifest:
+            if args.mode not in {"plan", "apply", "verify"}:
+                refuse(f"{args.mode} requires --manifest")
+            router_cycle(root, args.mode, [parse_client(value) for value in args.client])
+            return
+        if args.client:
+            refuse("--client belongs to router-only mode; migration clients live in the manifest")
+        plan, raw = load_manifest(args.manifest)
+        if args.mode == "declare":
+            declare(root, plan)
+        elif args.mode == "plan":
+            preflight(root, plan)
+            transfer = transfer_plan(plan)
+            print(f"preview changes={len(transfer.splitlines())} token={approval_token(raw, transfer)}")
+        elif args.mode == "prepare":
+            prepare(root, plan, raw)
+        elif args.mode == "apply":
+            apply_migration(root, plan, raw, args.approve)
+        elif args.mode == "verify":
+            verify_migration(root, plan, raw)
+        elif args.mode == "release":
+            release_migration(root, plan, raw)
+        elif args.mode == "abort":
+            abort_migration(plan, raw, args.approve)
+    except (OSError, Refusal) as exc:
+        print(f"hx-hub-switchover: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()
