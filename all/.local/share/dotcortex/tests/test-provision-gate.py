@@ -224,7 +224,102 @@ class GatedNalaTests(unittest.TestCase):
     def test_other_lanes_force_uninstall_off_when_applying(self):
         for lane, script in LANE_SCRIPTS.items():
             text = script.read_text()
-            self.assertIn('additive) UNINSTALL=0', text, lane)
+            self.assertIn('additive) UNINSTALL=0; MAN="$HOST_MAN"', text, lane)
+
+    def test_gated_lane_without_host_lane_installs_nothing_even_when_applying(self):
+        for lane, script in LANE_SCRIPTS.items():
+            box = Sandbox(gated=True)
+            try:
+                result, calls = box.run(script, PROVISION_APPLY="1")
+                self.assertEqual(result.returncode, 0, f"{lane}: {result.stdout}{result.stderr}")
+                self.assertIn("no " + lane + " host lane", result.stdout, lane)
+                self.assertEqual(calls, [], f"{lane}: {calls}")
+            finally:
+                box.close()
+
+    def test_gated_npm_dry_run_reads_only_the_host_lane(self):
+        box = Sandbox(gated=True)
+        try:
+            lane_dir = box.home / "DotCortex/all/.npm/manifest/hosts"
+            lane_dir.mkdir(parents=True)
+            (lane_dir.parent / "global.ssv").write_text('fleet-only "" "" "global" "registry" "" "" ""\n')
+            (lane_dir / "testhost.ssv").write_text('# lane\na "" "" "global" "registry" "" "" ""\n'
+                                                   'b "" "" "global" "registry" "" "" ""\n')
+            result, calls = box.run(LANE_SCRIPTS["npm"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("declares 2 package(s)", result.stdout)
+            self.assertEqual(calls, [])
+        finally:
+            box.close()
+
+    def test_beelink_scoped_rows_apply_on_honey_only(self):
+        rows = ['honeyonly "" stack beelink ""', 'git "" bootstrap shared ""']
+        for host, expected in (("testhost", "to install (0)"), ("beelink", "to install (1): honeyonly")):
+            box = Sandbox(gated=True, installed="git", manifest_rows=rows, sim="Inst honeyonly\\n")
+            try:
+                result, _calls = box.run(NALA_APPLY, NALA_HOSTNAME=host)
+                self.assertIn(expected, result.stdout, host)
+            finally:
+                box.close()
+
+
+HONEY_NALA_LANE = ROOT / "debian/.nala/manifest/hosts/beelink.ssv"
+HONEY_NPM_LANE = ROOT / "all/.npm/manifest/hosts/beelink.ssv"
+HONEY_TO_INSTALL = {"python3-venv", "keychain", "tree", "pkg-config", "libfreetype-dev", "libfontconfig-dev"}
+
+
+def declared(path):
+    return {line.split()[0] for line in path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")}
+
+
+def on_honey():
+    import socket
+    return socket.gethostname().split(".", 1)[0] == "beelink"
+
+
+class HoneyLaneTests(unittest.TestCase):
+    """Drift checks for Honey's host lanes. The live ones only run on Honey itself."""
+
+    def test_every_honey_nala_row_is_scoped_beelink_and_unique(self):
+        rows = [line.split() for line in HONEY_NALA_LANE.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+        names = [row[0] for row in rows]
+        self.assertEqual(len(names), len(set(names)), "duplicate rows")
+        self.assertEqual({row[3] for row in rows}, {"beelink"})
+
+    @unittest.skipUnless(on_honey() and shutil.which("apt-mark"), "live drift check runs on Honey only")
+    def test_every_manual_package_on_honey_is_declared(self):
+        manual = set(subprocess.run(["apt-mark", "showmanual"], capture_output=True, text=True,
+                                    check=True).stdout.split())
+        missing = sorted(manual - declared(HONEY_NALA_LANE))
+        self.assertEqual(missing, [], f"undeclared manual packages on Honey: {missing}")
+
+    @unittest.skipUnless(on_honey() and shutil.which("npm"), "live drift check runs on Honey only")
+    def test_every_global_npm_package_on_honey_is_declared(self):
+        import json
+        out = subprocess.run(["npm", "ls", "-g", "--depth=0", "--json"], capture_output=True, text=True).stdout
+        live = set(json.loads(out or "{}").get("dependencies", {}))
+        self.assertEqual(sorted(live - declared(HONEY_NPM_LANE)), [])
+
+    @unittest.skipUnless(on_honey(), "live dry-run runs on Honey only")
+    def test_honey_dry_run_installs_only_the_six_and_removes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trap = Path(tmp) / "sudo"
+            log = Path(tmp) / "sudo.log"
+            trap.write_text(f'#!/bin/sh\necho "sudo $*" >> {log}\nexit 99\n')
+            trap.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}")
+            for key in ("PROVISION_APPLY", "NALA_SSV", "PROVISION_GATES", "PROVISION_GATE_HOSTNAME",
+                        "HOST_EXCLUDES", "HOST_EXCLUDES_HOSTNAME", "NALA_HOSTNAME"):
+                env.pop(key, None)
+            result = subprocess.run(["bash", str(NALA_APPLY)], capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(log.exists(), "sudo was called during a gated dry-run")
+            line = next(l for l in result.stdout.splitlines() if l.strip().startswith("to install ("))
+            self.assertEqual(set(line.split(":", 1)[1].split()), HONEY_TO_INSTALL, line)
+            self.assertIn("0 removed", result.stdout)
+            self.assertIn("dry-run", result.stdout)
 
 
 class UngatedHostsUnchangedTests(unittest.TestCase):
