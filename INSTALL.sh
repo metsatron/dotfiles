@@ -687,6 +687,13 @@ if [ -d /sys/devices/platform/thinkpad_acpi ] || echo "$PRODUCT" | grep -qi thin
   esac
 fi
 
+# User layer (layers.org): the invoking account's active user layer, if any
+# (e.g. user-metsatron carries the git config that used to live in all/).
+if command -v python3 >/dev/null 2>&1 && [ -f "$DOTCORTEX/all/.local/bin/dotcortex-layers" ]; then
+  USER_LAYER="$(DOTCORTEX_ROOT="$DOTCORTEX" python3 "$DOTCORTEX/all/.local/bin/dotcortex-layers" user-layer 2>/dev/null || true)"
+  [ -z "$USER_LAYER" ] || OVERLAYS="$OVERLAYS $USER_LAYER"
+fi
+
 info "Stowing: $OVERLAYS"
 
 # Detect if HelmCortex is a symlink (mounted machine)

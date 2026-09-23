@@ -95,7 +95,7 @@ class RegistryTests(unittest.TestCase):
                          DOTCORTEX_LAYERS_HOSTNAME=hostname, DOTCORTEX_LAYERS_ACCOUNT="u0_a458")
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.split(), legacy_verbs()["stow:s24"])
-            self.assertEqual(result.stdout.split(), ["all", "termux", "s24"])
+            self.assertEqual(result.stdout.split(), ["all", "termux", "s24", "user-metsatron"])
 
     def test_every_host_stow_verb_has_a_registry_row(self):
         covered = {row[8] for row in rows(HOSTS)}
@@ -161,21 +161,41 @@ class OrderTests(unittest.TestCase):
 
 class SkeletonTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which("stow"), "GNU Stow not installed")
-    def test_user_skeletons_stow_nothing(self):
+    def test_user_gille_skeleton_stows_nothing(self):
         with tempfile.TemporaryDirectory() as target:
-            result = run(["stow", "--simulate", "-v", "-d", str(ROOT), "-t", target,
-                          "user-metsatron", "user-gille"])
+            result = run(["stow", "--simulate", "-v", "-d", str(ROOT), "-t", target, "user-gille"])
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertNotIn("LINK", result.stdout + result.stderr)
             self.assertEqual(os.listdir(target), [])
 
-    def test_validator_sees_no_files_in_skeletons(self):
-        for user in ("metsatron", "gille"):
+    @unittest.skipUnless(shutil.which("stow"), "GNU Stow not installed")
+    def test_user_metsatron_links_exactly_the_git_config(self):
+        with tempfile.TemporaryDirectory() as target:
+            result = run(["stow", "--simulate", "-v", "-d", str(ROOT), "-t", target, "user-metsatron"])
+            links = [l for l in (result.stdout + result.stderr).splitlines() if l.startswith("LINK")]
+            self.assertEqual(len(links), 1, links)
+            self.assertIn(".config => ../", links[0].replace("LINK: ", ""), links)
+
+    def test_validator_sees_no_overlap_in_user_layers(self):
+        for user, state in (("metsatron", "active"), ("gille", "inactive")):
             result = run([sys.executable, str(HELPER), "validate",
                           "--packages", f"all linux debian user-{user}", "--account", user])
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertNotIn("overlaps", result.stderr)
-            self.assertIn("inactive", result.stderr)
+            self.assertEqual("inactive" in result.stderr, state == "inactive")
+
+    def test_git_config_lives_only_in_user_metsatron(self):
+        self.assertFalse((ROOT / "all/.config/git/config").exists())
+        self.assertTrue((ROOT / "user-metsatron/.config/git/config").is_file())
+
+    def test_user_layer_subcommand(self):
+        cases = [("x230", "metsatron", "user-metsatron"), ("localhost", "u0_a458", "user-metsatron"),
+                 ("beelink", "gille", ""), ("beelink", "metsatron", ""), ("unregistered-box", "metsatron", "user-metsatron")]
+        for host, account, expected in cases:
+            result = run([sys.executable, str(HELPER), "user-layer"],
+                         DOTCORTEX_LAYERS_HOSTNAME=host, DOTCORTEX_LAYERS_ACCOUNT=account)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), expected, (host, account))
 
 
 
@@ -250,7 +270,9 @@ class GuardTests(unittest.TestCase):
 
     def test_legacy_stacks_get_no_new_output_from_the_layer_check(self):
         for verb, packages in legacy_verbs().items():
-            result = run([sys.executable, str(HELPER), "validate", "--packages", " ".join(packages)])
+            # The legacy verbs are Metsatron's: validate them as his account.
+            result = run([sys.executable, str(HELPER), "validate", "--packages", " ".join(packages),
+                          "--account", "metsatron"])
             self.assertEqual(result.returncode, 0, f"{verb}: {result.stderr}")
             self.assertEqual(result.stderr, "", f"{verb}: unexpected output {result.stderr!r}")
 

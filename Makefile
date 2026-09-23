@@ -77,7 +77,15 @@ safe-stow:
 | STOW_GUARD="$(HOME)/.local/bin/dotcortex-stow-target-guard"; \
 | [ -x "$$STOW_GUARD" ] || STOW_GUARD="$(HOME)/DotCortex/all/.local/bin/dotcortex-stow-target-guard"; \
 | [ -x "$$STOW_GUARD" ] || { echo "safe-stow: missing dotcortex-stow-target-guard — refusing to continue" >&2; exit 1; }; \
-| "$$STOW_GUARD" --packages "$(STOW_PKGS)"; \
+| PKGS="$(STOW_PKGS)"; \
+| case " $$PKGS " in \
+|   *" user-"*) ;; \
+|   *) LAYERS_BIN="$(HOME)/.local/bin/dotcortex-layers"; \
+|      [ -x "$$LAYERS_BIN" ] || LAYERS_BIN="$(HOME)/DotCortex/all/.local/bin/dotcortex-layers"; \
+|      UL=""; [ -x "$$LAYERS_BIN" ] && UL="$$("$$LAYERS_BIN" user-layer 2>/dev/null || true)"; \
+|      if [ -n "$$UL" ]; then PKGS="$$PKGS $$UL"; echo ">> user layer $$UL appended (layers.org: STOW_PKGS named none)"; fi ;; \
+| esac; \
+| "$$STOW_GUARD" --packages "$$PKGS"; \
 | repair_mutable_agent_dir() { \
 |   local rel="$$1" target="$(HOME)/$$1" resolved entry name rel_entry ts backup; \
 |   [ -L "$$target" ] || return 0; \
@@ -119,7 +127,7 @@ safe-stow:
 | repair_mutable_agent_dir .agents; \
 | repair_mutable_agent_dir .opencode; \
 | repair_mutable_agent_dir .codex; \
-| for pkg in $(STOW_PKGS); do \
+| for pkg in $$PKGS; do \
 |   preview_file=$$(mktemp); \
 |   echo ">> preview $$pkg"; \
 |   stow $(STOW_FLAGS) -n --ignore='\.bak\.' $$pkg >"$$preview_file" 2>&1 || true; \
@@ -182,7 +190,9 @@ safe-stow:
 | esac
 
 preview-stow:
-| cd $(HOME)/DotCortex && stow $(STOW_FLAGS) -n $(STOW_PKGS) || true
+| PKGS="$(STOW_PKGS)"; \
+| case " $$PKGS " in *" user-"*) ;; *) UL="$$("$(HOME)/DotCortex/all/.local/bin/dotcortex-layers" user-layer 2>/dev/null || true)"; [ -z "$$UL" ] || PKGS="$$PKGS $$UL" ;; esac; \
+| cd $(HOME)/DotCortex && stow $(STOW_FLAGS) -n $$PKGS || true
 
 # Registry-resolved stack for this host + user (layers.org): the non-Guile
 # equivalent of loom stow:auto / layers:show / layers:check.
