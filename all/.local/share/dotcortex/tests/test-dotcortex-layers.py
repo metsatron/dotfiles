@@ -17,8 +17,8 @@ GUARD = ROOT / "all/.local/bin/dotcortex-stow-target-guard"
 MAAK = ROOT / "all/.config/maak/maak.scm"
 HOSTS = ROOT / "all/.config/dotcortex/hosts.ssv"
 USERS = ROOT / "all/.config/dotcortex/users.ssv"
-# Verbs that are not host stacks: platform-only verbs and the sanctuary projection.
-NON_HOST_VERBS = {"stow", "stow:linux", "stow:debian", "stow:devuan", "stow:cortex"}
+# Verbs that are not host stacks: platform-only verbs, the sanctuary projection, and stow:auto itself.
+NON_HOST_VERBS = {"stow", "stow:linux", "stow:debian", "stow:devuan", "stow:cortex", "stow:auto"}
 
 
 def run(cmd, **env):
