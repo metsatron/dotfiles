@@ -56,7 +56,7 @@ On a gated host, in every mode:
 - *No removal ever.* nala: =apt-get install --no-remove -o APT::Get::AutomaticRemove=false= (apt aborts if the transaction would remove anything); the transaction is simulated first and refused (exit 3) if the simulation shows any =Remv= or =Purg= line; host-excluded packages are reported, never removed. npm/cargo/bun/flatpak: =UNINSTALL= is forced to =0=.
 - *No upgrade.* =make nala-apply= / =nala-apply-auto= skip =sudo nala upgrade=.
 - *No side-channel installs.* nala is never bootstrapped (plain =apt-get= is used); third-party repo setup (=make nala-repos=), the Brave canary gate and the release-backed =.deb= sync are skipped. Each of those is a deliberate, reviewed, by-hand step on a gated host.
-- *Nothing outside the host's own list.* The gated manifest replaces the shared fleet list (unless =NALA_SSV= is set explicitly).
+- *Nothing outside the host's own list.* nala: the gated manifest replaces the shared fleet list (unless =NALA_SSV= is set explicitly). npm/cargo/bun/flatpak: a gated host uses only its *host lane*, =<manifest dir>/hosts/<hostname>.ssv=. With no host lane there is nothing to install, and the lane exits 0 without running anything. For flatpak a host lane would replace =apps.ssv= only; there is none for Honey.
 
 Opting into removal on a gated host is not a flag: it is a reviewed commit that removes the host's row from =host-gates.ssv=.
 
@@ -74,6 +74,7 @@ Usage: provision-gate status              show this host's gate
        provision-gate is-gated            exit 0 if this host is gated, else 1
        provision-gate gate                print the gate name, or "open"
        provision-gate manifest            print the gated nala manifest path (absolute), or nothing
+       provision-gate host                print the hostname the gate is evaluated for
        provision-gate mode <lane>         print open | dry-run | additive for a package lane
        provision-gate allow-removal <lane> [what...]
                                           exit 0 if removals may run here, else refuse (exit 1)
@@ -131,6 +132,7 @@ case "$cmd" in
     ;;
   is-gated) [ "$GATE" != open ] ;;
   gate) echo "$GATE" ;;
+  host) echo "$HOST" ;;
   manifest)
     if [ "$GATE" != open ] && [ "$MANIFEST" != "-" ]; then
       case "$MANIFEST" in
@@ -165,9 +167,13 @@ case "$cmd" in
 esac
 #+END_SRC
 
-* Honey's provisioning list
+* Honey's provisioning lanes
 
-The list itself lives with the other nala manifests in =package-nala.org= (heading "Gated host manifest: Honey (beelink)"), tangled to =debian/.nala/manifest/hosts/beelink.ssv=. It declares what DotCortex needs to run on a Devuan/OpenRC host, sourced from =INSTALL.sh= Phase 1 and the modules Honey will use. It is *not* a list of everything Honey should have: Gillean's production stack is protected by the gate, not by being listed, so an incomplete list can never cost her a package.
+- *nala:* [[file:package-nala-honey.org][package-nala-honey.org]], tangled to =debian/.nala/manifest/hosts/beelink.ssv=. It declares every package =apt-mark showmanual= lists on Honey: 572 on 2026-09-23. Together with the 27 DotCortex-needs rows that makes 582 rows, all scope =beelink=, grouped as DotCortex needs / Gillean's production stack / base system / rest of the image. It was split out of =package-nala.org= along the section seam to keep that module under the 100 KB budget.
+- *npm:* =package-npm.org= "Host lane: Honey (beelink)", tangled to =all/.npm/manifest/hosts/beelink.ssv=, holding the 4 globals in Honey's =~/.local= prefix.
+- *bun, cargo, flatpak:* Honey has none (=~/.bun/install/global= is empty, there is no =~/.cargo=, and no user flatpaks are managed), so there is no host lane. A gated run of those lanes installs nothing and removes nothing.
+
+The first version of the nala list (the 27 DotCortex-needs rows) was described as follows. It declares what DotCortex needs to run on a Devuan/OpenRC host, sourced from =INSTALL.sh= Phase 1 and the modules Honey will use. It is *not* a list of everything Honey should have: Gillean's production stack is protected by the gate, not by being listed, so an incomplete list can never cost her a package.
 
 * Tests
 
@@ -403,7 +409,102 @@ class GatedNalaTests(unittest.TestCase):
     def test_other_lanes_force_uninstall_off_when_applying(self):
         for lane, script in LANE_SCRIPTS.items():
             text = script.read_text()
-            self.assertIn('additive) UNINSTALL=0', text, lane)
+            self.assertIn('additive) UNINSTALL=0; MAN="$HOST_MAN"', text, lane)
+
+    def test_gated_lane_without_host_lane_installs_nothing_even_when_applying(self):
+        for lane, script in LANE_SCRIPTS.items():
+            box = Sandbox(gated=True)
+            try:
+                result, calls = box.run(script, PROVISION_APPLY="1")
+                self.assertEqual(result.returncode, 0, f"{lane}: {result.stdout}{result.stderr}")
+                self.assertIn("no " + lane + " host lane", result.stdout, lane)
+                self.assertEqual(calls, [], f"{lane}: {calls}")
+            finally:
+                box.close()
+
+    def test_gated_npm_dry_run_reads_only_the_host_lane(self):
+        box = Sandbox(gated=True)
+        try:
+            lane_dir = box.home / "DotCortex/all/.npm/manifest/hosts"
+            lane_dir.mkdir(parents=True)
+            (lane_dir.parent / "global.ssv").write_text('fleet-only "" "" "global" "registry" "" "" ""\n')
+            (lane_dir / "testhost.ssv").write_text('# lane\na "" "" "global" "registry" "" "" ""\n'
+                                                   'b "" "" "global" "registry" "" "" ""\n')
+            result, calls = box.run(LANE_SCRIPTS["npm"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("declares 2 package(s)", result.stdout)
+            self.assertEqual(calls, [])
+        finally:
+            box.close()
+
+    def test_beelink_scoped_rows_apply_on_honey_only(self):
+        rows = ['honeyonly "" stack beelink ""', 'git "" bootstrap shared ""']
+        for host, expected in (("testhost", "to install (0)"), ("beelink", "to install (1): honeyonly")):
+            box = Sandbox(gated=True, installed="git", manifest_rows=rows, sim="Inst honeyonly\\n")
+            try:
+                result, _calls = box.run(NALA_APPLY, NALA_HOSTNAME=host)
+                self.assertIn(expected, result.stdout, host)
+            finally:
+                box.close()
+
+
+HONEY_NALA_LANE = ROOT / "debian/.nala/manifest/hosts/beelink.ssv"
+HONEY_NPM_LANE = ROOT / "all/.npm/manifest/hosts/beelink.ssv"
+HONEY_TO_INSTALL = {"python3-venv", "keychain", "tree", "pkg-config", "libfreetype-dev", "libfontconfig-dev"}
+
+
+def declared(path):
+    return {line.split()[0] for line in path.read_text().splitlines()
+            if line.strip() and not line.lstrip().startswith("#")}
+
+
+def on_honey():
+    import socket
+    return socket.gethostname().split(".", 1)[0] == "beelink"
+
+
+class HoneyLaneTests(unittest.TestCase):
+    """Drift checks for Honey's host lanes. The live ones only run on Honey itself."""
+
+    def test_every_honey_nala_row_is_scoped_beelink_and_unique(self):
+        rows = [line.split() for line in HONEY_NALA_LANE.read_text().splitlines()
+                if line.strip() and not line.startswith("#")]
+        names = [row[0] for row in rows]
+        self.assertEqual(len(names), len(set(names)), "duplicate rows")
+        self.assertEqual({row[3] for row in rows}, {"beelink"})
+
+    @unittest.skipUnless(on_honey() and shutil.which("apt-mark"), "live drift check runs on Honey only")
+    def test_every_manual_package_on_honey_is_declared(self):
+        manual = set(subprocess.run(["apt-mark", "showmanual"], capture_output=True, text=True,
+                                    check=True).stdout.split())
+        missing = sorted(manual - declared(HONEY_NALA_LANE))
+        self.assertEqual(missing, [], f"undeclared manual packages on Honey: {missing}")
+
+    @unittest.skipUnless(on_honey() and shutil.which("npm"), "live drift check runs on Honey only")
+    def test_every_global_npm_package_on_honey_is_declared(self):
+        import json
+        out = subprocess.run(["npm", "ls", "-g", "--depth=0", "--json"], capture_output=True, text=True).stdout
+        live = set(json.loads(out or "{}").get("dependencies", {}))
+        self.assertEqual(sorted(live - declared(HONEY_NPM_LANE)), [])
+
+    @unittest.skipUnless(on_honey(), "live dry-run runs on Honey only")
+    def test_honey_dry_run_installs_only_the_six_and_removes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            trap = Path(tmp) / "sudo"
+            log = Path(tmp) / "sudo.log"
+            trap.write_text(f'#!/bin/sh\necho "sudo $*" >> {log}\nexit 99\n')
+            trap.chmod(0o755)
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}")
+            for key in ("PROVISION_APPLY", "NALA_SSV", "PROVISION_GATES", "PROVISION_GATE_HOSTNAME",
+                        "HOST_EXCLUDES", "HOST_EXCLUDES_HOSTNAME", "NALA_HOSTNAME"):
+                env.pop(key, None)
+            result = subprocess.run(["bash", str(NALA_APPLY)], capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertFalse(log.exists(), "sudo was called during a gated dry-run")
+            line = next(l for l in result.stdout.splitlines() if l.strip().startswith("to install ("))
+            self.assertEqual(set(line.split(":", 1)[1].split()), HONEY_TO_INSTALL, line)
+            self.assertIn("0 removed", result.stdout)
+            self.assertIn("dry-run", result.stdout)
 
 
 class UngatedHostsUnchangedTests(unittest.TestCase):
