@@ -69,11 +69,19 @@ def check_policy(entry):
     require(protocol in {PROTOCOL, TELEGRAM_PROTOCOL},
             "unsupported reconcile declaration", 78)
     if protocol == TELEGRAM_PROTOCOL:
-        require(set(entry["reconcile"]) == {
-                    "protocol", "legacy_unscoped_source_machine_key"}
-                and isinstance(entry["reconcile"]["legacy_unscoped_source_machine_key"], str)
-                and entry["reconcile"]["legacy_unscoped_source_machine_key"],
+        policy = entry["reconcile"]
+        required = {"protocol", "legacy_unscoped_source_machine_key"}
+        require(required <= set(policy) <= required | {"agent_conversation_slugs"}
+                and isinstance(policy["legacy_unscoped_source_machine_key"], str)
+                and policy["legacy_unscoped_source_machine_key"],
                 "unsupported Telegram reconcile declaration", 78)
+        if "agent_conversation_slugs" in policy:
+            slugs = policy["agent_conversation_slugs"]
+            require(isinstance(slugs, list) and len(slugs) <= 256
+                    and all(isinstance(slug, str)
+                            and re.fullmatch(r"[a-z0-9_]{1,80}", slug) for slug in slugs)
+                    and len(set(slugs)) == len(slugs),
+                    "invalid Telegram agent conversation slugs", 78)
     else:
         require(set(entry["reconcile"]) == {"protocol"},
                 "unsupported reconcile declaration", 78)
