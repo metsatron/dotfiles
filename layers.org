@@ -138,3 +138,623 @@ Phase A: nothing here is linked into $HOME. Content arrives in Phase D.
 Never put private values (IPs, tokens, client material) in this public
 layer. Do not edit files here directly; edit the owning .org source.
 #+END_SRC
+
+* Resolver: dotcortex-layers
+
+One helper owns registry parsing, so =loom stow:auto=, the Makefile fallback, the stow target guard and the tests never re-implement it. It reads the *repo* copies of the registries (=$DOTCORTEX_ROOT=, default: the checkout this script lives in, else =~/DotCortex=), so it works on a fresh host before the first stow.
+
+- =dotcortex-layers resolve [--host H] [--user ID] [--allow-planned] [--explain]= prints the space-separated package list for this host and invoking account (or the given ones). Refuses: unregistered host (exit 2), planned row (exit 3), account or user not assigned to the host (exit 2), a layer without a directory (exit 4). =--explain= prints the slot-by-slot stack on stderr.
+- =dotcortex-layers show= is =resolve --explain= for humans (=loom layers:show=).
+- =dotcortex-layers check= lints both registries and proves every =LEGACY_VERB= resolves to exactly the package list that verb passes today (=loom layers:check=).
+- =dotcortex-layers validate --packages "..."= is what the stow target guard calls; see below.
+
+Test hooks: =DOTCORTEX_LAYERS_HOSTNAME=, =DOTCORTEX_LAYERS_ACCOUNT=, =DOTCORTEX_HOSTS_SSV=, =DOTCORTEX_USERS_SSV= override the live hostname, account and registry paths. =DOTCORTEX_LOCAL_PKGS= appends machine-local packages (last slot).
+
+** Validation (called by the stow target guard)
+
+=validate= enforces what Stow alone reports too late or not at all:
+
+1. At most one =user-*= package per stack.
+2. A =user-<id>= package must be registered in =users.ssv= and must belong to the invoking account (you only ever stow your own user layer).
+3. *No file overlap* between a =user-*= package and any other package in the stack (the file-disjoint rule). The walk honours the user package's own =.stow-local-ignore=, so the skeleton's README never counts.
+4. Package names declared nowhere in the registries (and not =user-*=) produce a *warning*, not a failure, so no existing stow invocation changes behaviour. This can become fatal once every stack in use is registered.
+
+Exit 0 means allowed (warnings go to stderr), exit 2 means blocked.
+
+#+BEGIN_SRC python :tangle all/.local/bin/dotcortex-layers :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Resolve and validate DotCortex stow layer stacks (layers.org)."""
+
+import argparse
+import fnmatch
+import os
+import pwd
+import re
+import shlex
+import socket
+import sys
+from pathlib import Path
+
+HOST_COLUMNS = ("HOST", "ALIASES", "STATUS", "PLATFORM", "DISTRO", "INIT",
+                "HOSTPKG", "USERS", "LEGACY_VERB", "NOTE")
+USER_COLUMNS = ("ID", "ACCOUNTS", "LAYER", "GITLAB", "NOTE")
+# Precedence slots after the implicit base layer "all", in stack order.
+SLOTS = (("platform", "PLATFORM"), ("distro", "DISTRO"),
+         ("init", "INIT"), ("host", "HOSTPKG"))
+SHARED_PACKAGES = {"all", "linux", "debian", "devuan", "termux"}
+USER_PREFIX = "user-"
+HOST_STATUSES = {"active", "planned"}
+LAYER_STATES = {"active", "inactive"}
+
+
+class LayerError(Exception):
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+def repo_root():
+    env = os.environ.get("DOTCORTEX_ROOT")
+    if env:
+        return Path(env)
+    # all/.local/bin/dotcortex-layers -> the checkout is three levels up.
+    candidate = Path(os.path.realpath(__file__)).parents[3]
+    if (candidate / "all").is_dir():
+        return candidate
+    return Path.home() / "DotCortex"
+
+
+def registry_path(root, name, env_name):
+    env = os.environ.get(env_name)
+    return Path(env) if env else root / "all/.config/dotcortex" / name
+
+
+def parse_ssv(path, columns):
+    rows = []
+    with open(path, encoding="utf-8") as handle:
+        for lineno, line in enumerate(handle, 1):
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#"):
+                continue
+            try:
+                fields = shlex.split(stripped)
+            except ValueError as exc:
+                raise LayerError(f"{path}:{lineno}: {exc}") from exc
+            if len(fields) != len(columns):
+                raise LayerError(
+                    f"{path}:{lineno}: expected {len(columns)} columns "
+                    f"({' '.join(columns)}), got {len(fields)}")
+            row = dict(zip(columns, fields))
+            row["_line"] = lineno
+            rows.append(row)
+    return rows
+
+
+def split_list(value):
+    return [] if value == "-" else [item for item in value.split(",") if item]
+
+
+def load_registries(root):
+    hosts_path = registry_path(root, "hosts.ssv", "DOTCORTEX_HOSTS_SSV")
+    users_path = registry_path(root, "users.ssv", "DOTCORTEX_USERS_SSV")
+    hosts = parse_ssv(hosts_path, HOST_COLUMNS) if hosts_path.is_file() else None
+    users = parse_ssv(users_path, USER_COLUMNS) if users_path.is_file() else None
+    return hosts, users
+
+
+def live_hostname():
+    return os.environ.get("DOTCORTEX_LAYERS_HOSTNAME") or socket.gethostname().split(".", 1)[0]
+
+
+def live_account():
+    env = os.environ.get("DOTCORTEX_LAYERS_ACCOUNT")
+    if env:
+        return env
+    try:
+        return pwd.getpwuid(os.getuid()).pw_name
+    except KeyError:
+        return os.environ.get("USER", "")
+
+
+def find_host(hosts, hostname):
+    matches = [row for row in hosts
+               if row["HOST"] == hostname or hostname in split_list(row["ALIASES"])]
+    if len(matches) > 1:
+        raise LayerError(f"hostname '{hostname}' matches several hosts.ssv rows: "
+                         + ", ".join(row["HOST"] for row in matches))
+    return matches[0] if matches else None
+
+
+def find_user(users, user_id):
+    return next((row for row in users if row["ID"] == user_id), None)
+
+
+def user_for_account(users, account):
+    matches = [row for row in users
+               if any(fnmatch.fnmatchcase(account, pattern)
+                      for pattern in split_list(row["ACCOUNTS"]))]
+    if len(matches) > 1:
+        raise LayerError(f"account '{account}' matches several users.ssv rows: "
+                         + ", ".join(row["ID"] for row in matches))
+    return matches[0] if matches else None
+
+
+def local_packages():
+    return shlex.split(os.environ.get("DOTCORTEX_LOCAL_PKGS", ""))
+
+
+def resolve(root, hosts, users, hostname=None, user_id=None, allow_planned=False):
+    """Return (stack, host_row, user_row); stack is [(slot, package, note)]."""
+    if hosts is None or users is None:
+        raise LayerError("hosts.ssv or users.ssv is missing from all/.config/dotcortex/")
+    hostname = hostname or live_hostname()
+    row = find_host(hosts, hostname)
+    if row is None:
+        raise LayerError(f"host '{hostname}' is not registered in hosts.ssv; "
+                         "use its legacy loom stow verb or add a row (layers.org)")
+    if row["STATUS"] != "active" and not allow_planned:
+        raise LayerError(f"host row '{row['HOST']}' is {row['STATUS']}, not active; "
+                         "nothing is stowed from a planned row", 3)
+    if user_id:
+        user = find_user(users, user_id)
+        if user is None:
+            raise LayerError(f"user '{user_id}' is not registered in users.ssv")
+    else:
+        account = live_account()
+        user = user_for_account(users, account)
+        if user is None:
+            raise LayerError(f"account '{account}' maps to no user in users.ssv")
+    if user["ID"] not in split_list(row["USERS"]):
+        raise LayerError(f"user '{user['ID']}' is not assigned to host '{row['HOST']}' "
+                         f"(USERS={row['USERS']})")
+
+    stack = [("base", "all", "")]
+    for slot, column in SLOTS:
+        if row[column] != "-":
+            stack.append((slot, row[column], ""))
+    user_pkg = USER_PREFIX + user["ID"]
+    if user["LAYER"] == "active":
+        stack.append(("user", user_pkg, ""))
+    else:
+        stack.append(("user", user_pkg, "inactive: not stowed"))
+    for pkg in local_packages():
+        stack.append(("local", pkg, ""))
+
+    for slot, pkg, note in stack:
+        if note:
+            continue
+        if not (root / pkg).is_dir():
+            raise LayerError(f"layer '{pkg}' ({slot} slot) has no directory in {root}", 4)
+    return stack, row, user
+
+
+def stack_packages(stack):
+    return [pkg for _slot, pkg, note in stack if not note]
+
+
+def explain(stack, row, user, hostname, stream):
+    print(f"dotcortex-layers: host '{hostname}' -> row '{row['HOST']}' "
+          f"({row['STATUS']}), user '{user['ID']}' ({user['LAYER']})", file=stream)
+    for slot, pkg, note in stack:
+        print(f"  {slot:<9}{pkg}" + (f"   ({note})" if note else ""), file=stream)
+
+
+def legacy_verb_packages(root, verb):
+    """Package list a legacy loom stow verb passes to safe-stow, or None."""
+    maak = root / "all/.config/maak/maak.scm"
+    if not maak.is_file():
+        return None
+    text = maak.read_text(encoding="utf-8")
+    match = re.search(r"\(task '" + re.escape(verb) + r"\s(.*?)(?=\(task '|\Z)", text, re.S)
+    if not match or "make safe-stow" not in match.group(1):
+        return None
+    pkgs = re.search(r"STOW_PKGS='([^']*)'", match.group(1))
+    return pkgs.group(1).split() if pkgs else ["all"]
+
+
+def guard_expected_hosts():
+    guard = Path(os.path.realpath(__file__)).with_name("dotcortex-stow-target-guard")
+    if not guard.is_file():
+        return None
+    from importlib.machinery import SourceFileLoader
+    from importlib.util import module_from_spec, spec_from_loader
+    loader = SourceFileLoader("dotcortex_stow_target_guard", str(guard))
+    module = module_from_spec(spec_from_loader(loader.name, loader))
+    loader.exec_module(module)
+    return module.EXPECTED_HOSTS
+
+
+def check(root, out=sys.stdout):
+    problems = []
+    hosts, users = load_registries(root)
+    if hosts is None or users is None:
+        print("!! hosts.ssv or users.ssv missing", file=out)
+        return 1
+
+    seen_names = {}
+    for row in hosts:
+        if row["STATUS"] not in HOST_STATUSES:
+            problems.append(f"host '{row['HOST']}': STATUS must be one of {sorted(HOST_STATUSES)}")
+        for name in [row["HOST"]] + split_list(row["ALIASES"]):
+            owner = seen_names.get(name)
+            if owner and owner != row["HOST"]:
+                problems.append(f"hostname '{name}' is claimed by rows '{owner}' and '{row['HOST']}'")
+            seen_names[name] = row["HOST"]
+    user_ids = [user["ID"] for user in users]
+    for user in users:
+        if user_ids.count(user["ID"]) > 1:
+            problems.append(f"user id '{user['ID']}' is declared twice")
+        if user["LAYER"] not in LAYER_STATES:
+            problems.append(f"user '{user['ID']}': LAYER must be one of {sorted(LAYER_STATES)}")
+        if not (root / (USER_PREFIX + user["ID"])).is_dir():
+            problems.append(f"user '{user['ID']}': package directory {USER_PREFIX}{user['ID']}/ is missing")
+
+    for row in hosts:
+        for user_id in split_list(row["USERS"]):
+            if user_id not in user_ids:
+                problems.append(f"host '{row['HOST']}': USERS names unknown user '{user_id}'")
+        if row["STATUS"] != "active":
+            print(f"-- {row['HOST']}: {row['STATUS']} (not resolvable yet)", file=out)
+            continue
+        for _slot, column in SLOTS:
+            if row[column] != "-" and not (root / row[column]).is_dir():
+                problems.append(f"host '{row['HOST']}': {column} layer '{row[column]}' has no directory")
+        if row["LEGACY_VERB"] == "-":
+            continue
+        legacy = legacy_verb_packages(root, row["LEGACY_VERB"])
+        if legacy is None:
+            problems.append(f"host '{row['HOST']}': legacy verb {row['LEGACY_VERB']} not found in maak.scm")
+            continue
+        users_here = split_list(row["USERS"])
+        if not users_here:
+            problems.append(f"host '{row['HOST']}': no USERS")
+            continue
+        try:
+            stack, _row, _user = resolve(root, hosts, users, row["HOST"], users_here[0])
+        except LayerError as exc:
+            problems.append(f"host '{row['HOST']}': {exc}")
+            continue
+        resolved = [pkg for pkg in stack_packages(stack) if pkg not in local_packages()]
+        if resolved == legacy:
+            print(f"ok {row['HOST']}: stow:auto == {row['LEGACY_VERB']} == {' '.join(legacy)}", file=out)
+        else:
+            problems.append(f"host '{row['HOST']}': resolves '{' '.join(resolved)}' "
+                            f"but {row['LEGACY_VERB']} uses '{' '.join(legacy)}'")
+
+    expected = guard_expected_hosts()
+    if expected is not None:
+        for machine, names in expected.items():
+            row = next((r for r in hosts if r["HOST"] == machine), None)
+            if row is None:
+                problems.append(f"guard machine '{machine}' has no hosts.ssv row")
+            elif set(split_list(row["ALIASES"])) != set(names):
+                problems.append(f"host '{machine}': ALIASES {sorted(split_list(row['ALIASES']))} "
+                                f"differ from the guard's {sorted(names)}")
+        if not problems:
+            print("ok guard tables and hosts.ssv aliases agree", file=out)
+
+    for problem in problems:
+        print(f"!! {problem}", file=out)
+    print("layers:check " + ("FAILED" if problems else "passed"), file=out)
+    return 1 if problems else 0
+
+
+def load_ignore(pkgdir):
+    patterns = []
+    ignore = pkgdir / ".stow-local-ignore"
+    if ignore.is_file():
+        for line in ignore.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and not line.startswith("#"):
+                patterns.append(line)
+    return patterns
+
+
+def is_ignored(rel, patterns):
+    base = rel.rsplit("/", 1)[-1]
+    for pattern in patterns:
+        try:
+            if "/" in pattern:
+                if re.search(r"(?:^|/)(?:" + pattern + r")(?:/|$)", "/" + rel):
+                    return True
+            elif re.fullmatch(pattern, base):
+                return True
+        except re.error:
+            continue
+    return False
+
+
+def walk_package(pkgdir):
+    """Yield (relative path, is_real_dir) for what Stow would consider."""
+    patterns = load_ignore(pkgdir)
+    for dirpath, dirnames, filenames in os.walk(pkgdir):
+        base = Path(dirpath)
+        keep = []
+        for name in dirnames:
+            rel = (base / name).relative_to(pkgdir).as_posix()
+            if is_ignored(rel, patterns):
+                continue
+            if (base / name).is_symlink():
+                yield rel, False
+                continue
+            keep.append(name)
+            yield rel, True
+        dirnames[:] = keep
+        for name in filenames:
+            rel = (base / name).relative_to(pkgdir).as_posix()
+            if rel == ".stow-local-ignore" or is_ignored(rel, patterns):
+                continue
+            yield rel, False
+
+
+def validate(root, packages, account=None):
+    """Return (errors, warnings) for a STOW_PKGS stack."""
+    errors, warnings = [], []
+    hosts, users = load_registries(root)
+    user_pkgs = [pkg for pkg in packages if pkg.startswith(USER_PREFIX)]
+    if not user_pkgs and hosts is None:
+        return errors, warnings
+
+    if len(user_pkgs) > 1:
+        errors.append("a stack may contain at most one user layer, got: " + " ".join(user_pkgs))
+    if user_pkgs and users is None:
+        errors.append("user layers requested but users.ssv is missing")
+        return errors, warnings
+
+    account = account or live_account()
+    for pkg in user_pkgs:
+        user = find_user(users, pkg[len(USER_PREFIX):])
+        if user is None:
+            errors.append(f"user layer '{pkg}' is not registered in users.ssv")
+            continue
+        owner = user_for_account(users, account)
+        if owner is None or owner["ID"] != user["ID"]:
+            errors.append(f"user layer '{pkg}' does not belong to the invoking account '{account}'")
+        if user["LAYER"] != "active":
+            warnings.append(f"user layer '{pkg}' is inactive in users.ssv (placeholder only)")
+        pkgdir = root / pkg
+        if not pkgdir.is_dir():
+            errors.append(f"user layer '{pkg}' has no directory in {root}")
+            continue
+        overlaps = []
+        for rel, is_dir in walk_package(pkgdir):
+            for other in packages:
+                if other == pkg:
+                    continue
+                target = root / other / rel
+                if not os.path.lexists(target):
+                    continue
+                if is_dir and target.is_dir() and not target.is_symlink():
+                    continue
+                overlaps.append(f"{rel} (also in {other})")
+        if overlaps:
+            shown = "; ".join(overlaps[:10])
+            more = f" ... and {len(overlaps) - 10} more" if len(overlaps) > 10 else ""
+            errors.append(f"user layer '{pkg}' overlaps other layers (file-disjoint rule): {shown}{more}")
+
+    if hosts is not None:
+        known = set(SHARED_PACKAGES) | set(local_packages())
+        for row in hosts:
+            known.update(row[column] for _slot, column in SLOTS if row[column] != "-")
+        for pkg in packages:
+            if pkg not in known and not pkg.startswith(USER_PREFIX):
+                warnings.append(f"package '{pkg}' is not declared in hosts.ssv (allowed for now; see layers.org)")
+    return errors, warnings
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(prog="dotcortex-layers", description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    for name in ("resolve", "show"):
+        p = sub.add_parser(name)
+        p.add_argument("--host", help="hostname or hosts.ssv key (default: live hostname)")
+        p.add_argument("--user", help="users.ssv id (default: mapped from the invoking account)")
+        p.add_argument("--allow-planned", action="store_true", help="resolve a planned row (inspection only)")
+        if name == "resolve":
+            p.add_argument("--explain", action="store_true", help="print the stack on stderr")
+    sub.add_parser("check")
+    p = sub.add_parser("validate")
+    p.add_argument("--packages", required=True, help="space-separated STOW_PKGS value")
+    p.add_argument("--account", help="Unix account (default: invoking account)")
+    args = parser.parse_args(argv)
+    root = repo_root()
+
+    try:
+        if args.cmd == "check":
+            return check(root)
+        if args.cmd == "validate":
+            errors, warnings = validate(root, shlex.split(args.packages), args.account)
+            for warning in warnings:
+                print(f"dotcortex-layers: warning: {warning}", file=sys.stderr)
+            for error in errors:
+                print(f"BLOCKED: {error}", file=sys.stderr)
+            return 2 if errors else 0
+        hosts, users = load_registries(root)
+        hostname = args.host or live_hostname()
+        stack, row, user = resolve(root, hosts, users, hostname, args.user, args.allow_planned)
+        if args.cmd == "show":
+            explain(stack, row, user, hostname, sys.stdout)
+            return 0
+        if args.explain:
+            explain(stack, row, user, hostname, sys.stderr)
+        print(" ".join(stack_packages(stack)))
+        return 0
+    except LayerError as exc:
+        print(f"dotcortex-layers: {exc}", file=sys.stderr)
+        return exc.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+#+END_SRC
+
+* Tests
+
+Run with =python3 all/.local/share/dotcortex/tests/test-dotcortex-layers.py -v= from the repo root (no stow into =$HOME=, no network, no root: every stow call is =--simulate= into a scratch target). What they prove:
+
+- *Zero behaviour change:* for every =hosts.ssv= row with a =LEGACY_VERB=, and for every hostname alias of that row, =resolve= yields exactly the package list the legacy verb passes today, parsed independently from the tangled =maak.scm=; and every host-shaped =stow:*= verb in =maak.scm= has a registry row.
+- *Refusals:* unregistered host, planned row (Honey), unassigned user, unknown account.
+- *Order:* an active user layer lands after the host layer and before machine-local packages.
+- *Skeletons are inert:* =stow --simulate= of =user-metsatron= and =user-gille= plans no links, and the validator's walk sees no files in them.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-dotcortex-layers.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import os
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[5]
+HELPER = ROOT / "all/.local/bin/dotcortex-layers"
+GUARD = ROOT / "all/.local/bin/dotcortex-stow-target-guard"
+MAAK = ROOT / "all/.config/maak/maak.scm"
+HOSTS = ROOT / "all/.config/dotcortex/hosts.ssv"
+USERS = ROOT / "all/.config/dotcortex/users.ssv"
+# Verbs that are not host stacks: platform-only verbs and the sanctuary projection.
+NON_HOST_VERBS = {"stow", "stow:linux", "stow:debian", "stow:devuan", "stow:cortex"}
+
+
+def run(cmd, **env):
+    full_env = dict(os.environ)
+    for key in ("DOTCORTEX_ROOT", "DOTCORTEX_HOSTS_SSV", "DOTCORTEX_USERS_SSV",
+                "DOTCORTEX_LAYERS_HOSTNAME", "DOTCORTEX_LAYERS_ACCOUNT", "DOTCORTEX_LOCAL_PKGS"):
+        full_env.pop(key, None)
+    full_env.update(env)
+    return subprocess.run(cmd, capture_output=True, text=True, env=full_env, cwd=ROOT)
+
+
+def rows(path):
+    out = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            out.append(shlex.split(line))
+    return out
+
+
+def legacy_verbs():
+    """Independent parse of every stow verb in the tangled maak.scm."""
+    text = MAAK.read_text(encoding="utf-8")
+    verbs = {}
+    for match in re.finditer(r"\(task '(stow(?::[A-Za-z0-9_-]+)?)\s(.*?)(?=\(task '|\Z)", text, re.S):
+        body = match.group(2)
+        if "make safe-stow" not in body:
+            continue
+        pkgs = re.search(r"STOW_PKGS='([^']*)'", body)
+        verbs[match.group(1)] = pkgs.group(1).split() if pkgs else ["all"]
+    return verbs
+
+
+class RegistryTests(unittest.TestCase):
+    def test_check_passes(self):
+        result = run([sys.executable, str(HELPER), "check"])
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("layers:check passed", result.stdout)
+
+    def test_stow_auto_matches_every_legacy_verb_for_every_alias(self):
+        verbs = legacy_verbs()
+        checked = 0
+        for row in rows(HOSTS):
+            host, aliases, status, *_rest, users, legacy, _note = row
+            if status != "active" or legacy == "-":
+                continue
+            self.assertIn(legacy, verbs, f"{host}: {legacy} missing from maak.scm")
+            for name in [host] + aliases.split(","):
+                result = run([sys.executable, str(HELPER), "resolve"],
+                             DOTCORTEX_LAYERS_HOSTNAME=name,
+                             DOTCORTEX_LAYERS_ACCOUNT=users.split(",")[0])
+                self.assertEqual(result.returncode, 0, f"{name}: {result.stderr}")
+                self.assertEqual(result.stdout.split(), verbs[legacy],
+                                 f"{name}: stow:auto diverges from {legacy}")
+                checked += 1
+        self.assertGreaterEqual(checked, 6)
+
+    def test_every_host_stow_verb_has_a_registry_row(self):
+        covered = {row[8] for row in rows(HOSTS)}
+        for verb in legacy_verbs():
+            if verb in NON_HOST_VERBS:
+                continue
+            self.assertIn(verb, covered, f"{verb} has no hosts.ssv row")
+
+
+class RefusalTests(unittest.TestCase):
+    def resolve(self, *args, **env):
+        return run([sys.executable, str(HELPER), "resolve", *args], **env)
+
+    def test_unregistered_host_is_refused(self):
+        result = self.resolve(DOTCORTEX_LAYERS_HOSTNAME="no-such-host", DOTCORTEX_LAYERS_ACCOUNT="metsatron")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not registered", result.stderr)
+
+    def test_planned_honey_is_refused(self):
+        result = self.resolve(DOTCORTEX_LAYERS_HOSTNAME="beelink", DOTCORTEX_LAYERS_ACCOUNT="gille")
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("planned", result.stderr)
+        self.assertEqual(result.stdout, "")
+
+    def test_planned_honey_shows_its_intended_stack(self):
+        result = run([sys.executable, str(HELPER), "show", "--allow-planned"],
+                     DOTCORTEX_LAYERS_HOSTNAME="beelink", DOTCORTEX_LAYERS_ACCOUNT="gille")
+        # honey/ does not exist yet, so even inspection stops at the missing layer.
+        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
+        self.assertIn("'honey'", result.stderr)
+
+    def test_user_not_assigned_to_host_is_refused(self):
+        result = self.resolve("--user", "gille", DOTCORTEX_LAYERS_HOSTNAME="x230")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not assigned", result.stderr)
+
+    def test_unknown_account_is_refused(self):
+        result = self.resolve(DOTCORTEX_LAYERS_HOSTNAME="x230", DOTCORTEX_LAYERS_ACCOUNT="nobody-here")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("maps to no user", result.stderr)
+
+
+class OrderTests(unittest.TestCase):
+    def test_active_user_layer_lands_after_host_and_before_local(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for pkg in ("all", "linux", "debian", "devuan", "t480s", "user-metsatron", "local-t480s"):
+                (root / pkg).mkdir()
+            (root / "hosts.ssv").write_text(
+                't480s t480s active linux debian devuan t480s metsatron stow:t480s "fixture"\n')
+            (root / "users.ssv").write_text('metsatron metsatron active metsatron "fixture"\n')
+            result = run([sys.executable, str(HELPER), "resolve", "--explain"],
+                         DOTCORTEX_ROOT=str(root),
+                         DOTCORTEX_HOSTS_SSV=str(root / "hosts.ssv"),
+                         DOTCORTEX_USERS_SSV=str(root / "users.ssv"),
+                         DOTCORTEX_LAYERS_HOSTNAME="t480s",
+                         DOTCORTEX_LAYERS_ACCOUNT="metsatron",
+                         DOTCORTEX_LOCAL_PKGS="local-t480s")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.split(),
+                             ["all", "linux", "debian", "devuan", "t480s", "user-metsatron", "local-t480s"])
+
+
+class SkeletonTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("stow"), "GNU Stow not installed")
+    def test_user_skeletons_stow_nothing(self):
+        with tempfile.TemporaryDirectory() as target:
+            result = run(["stow", "--simulate", "-v", "-d", str(ROOT), "-t", target,
+                          "user-metsatron", "user-gille"])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertNotIn("LINK", result.stdout + result.stderr)
+            self.assertEqual(os.listdir(target), [])
+
+    def test_validator_sees_no_files_in_skeletons(self):
+        for user in ("metsatron", "gille"):
+            result = run([sys.executable, str(HELPER), "validate",
+                          "--packages", f"all linux debian user-{user}", "--account", user])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertNotIn("overlaps", result.stderr)
+            self.assertIn("inactive", result.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
