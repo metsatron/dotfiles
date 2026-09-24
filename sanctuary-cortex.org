@@ -1423,13 +1423,25 @@ if [ -x "$HOME/.local/bin/sanctuary-cortex-xpra" ]; then
   AGENTIFY_STATE="${AGENTIFY_CORTEX_STATE:-$HOME/.agentify-desktop/state.json}"
   AGENTIFY_LOCK="${AGENTIFY_CORTEX_LOCK:-$HOME/.agentify-desktop/agentify-cortex.lock}"
 
-  if ! "$XPRA_BIN" list 2>/dev/null | grep -Fq "$DISPLAY_NUM"; then
-    "$HOME/.local/bin/sanctuary-cortex-xpra" start-full
-  fi
-
   mkdir -p "$(dirname -- "$AGENTIFY_STATE")"
   exec 9>"$AGENTIFY_LOCK"
   flock 9
+
+  xpra_display_live() {
+    "$XPRA_BIN" list 2>/dev/null | awk -v display="$DISPLAY_NUM" '$NF == display { found=1 } END { exit !found }'
+  }
+
+  if ! xpra_display_live; then
+    "$HOME/.local/bin/sanctuary-cortex-xpra" start-full
+    for _ in $(seq 1 "${AGENTIFY_CORTEX_XPRA_WAIT:-100}"); do
+      xpra_display_live && break
+      sleep 0.2
+    done
+    xpra_display_live || {
+      echo "agentify-cortex: Xpra display $DISPLAY_NUM did not become live" >&2
+      exit 1
+    }
+  fi
 
   state_is_healthy() {
     local pid port server_id health
@@ -1479,9 +1491,9 @@ if [ -x "$HOME/.local/bin/sanctuary-cortex-xpra" ]; then
   }
 
   if bus_is_usable; then
-    setsid env "${COMMON_ENV[@]}" "$AGENTIFY_DESKTOP_BIN" "${AGENTIFY_DESKTOP_ARGS[@]}" >"$LOG" 2>&1 &
+    setsid env "${COMMON_ENV[@]}" "$AGENTIFY_DESKTOP_BIN" "${AGENTIFY_DESKTOP_ARGS[@]}" >"$LOG" 2>&1 9>&- &
   else
-    setsid "$DBUS_RUN_SESSION_BIN" -- env "${COMMON_ENV[@]}" "$AGENTIFY_DESKTOP_BIN" "${AGENTIFY_DESKTOP_ARGS[@]}" >"$LOG" 2>&1 &
+    setsid "$DBUS_RUN_SESSION_BIN" -- env "${COMMON_ENV[@]}" "$AGENTIFY_DESKTOP_BIN" "${AGENTIFY_DESKTOP_ARGS[@]}" >"$LOG" 2>&1 9>&- &
   fi
   launch_pid=$!
 
@@ -1528,10 +1540,18 @@ tmp="$(mktemp -d)"
 trap 'if [ -f "$tmp/fake.pid" ]; then kill "$(cat "$tmp/fake.pid")" 2>/dev/null || true; fi; rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/home/.local/bin"
 touch "$tmp/home/.Xauthority"
-printf '%s\n' ':101' >"$tmp/home/.local/bin/sanctuary-cortex-xpra"
+cat >"$tmp/home/.local/bin/sanctuary-cortex-xpra" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$FAKE_XPRA_START_MARKER"
+touch "$FAKE_XPRA_READY"
+EOF
 cat >"$tmp/bin/xpra" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' ':101'
+if [ -f "$FAKE_XPRA_READY" ]; then
+  printf '%s\n' ':101'
+else
+  printf '%s\n' "${FAKE_XPRA_LIST:-:101}"
+fi
 EOF
 cat >"$tmp/bin/gdbus" <<'EOF'
 #!/usr/bin/env bash
@@ -1570,8 +1590,10 @@ run_launcher() {
   AGENTIFY_CORTEX_DESKTOP_BIN="$tmp/bin/agentify-desktop" \
   AGENTIFY_CORTEX_CHROME_BIN="$tmp/bin/fake-chrome" FAKE_CHROME_BIN="$tmp/bin/fake-chrome" \
   FAKE_DBUS_MARKER="$tmp/dbus.marker" FAKE_LAUNCH_COUNT="$tmp/launches" \
+  FAKE_XPRA_READY="$tmp/xpra.ready" FAKE_XPRA_START_MARKER="$tmp/xpra.start" \
   FAKE_STATE_PID="$$" \
   FAKE_DBUS_MODE="$TEST_DBUS_MODE" FAKE_HEALTH_MODE="$TEST_HEALTH_MODE" \
+  FAKE_XPRA_LIST="${TEST_XPRA_LIST:-:101}" \
   "$LAUNCHER"
 }
 
@@ -1592,11 +1614,231 @@ printf '%s\n' "{\"ok\":true,\"pid\":$$,\"port\":43123,\"serverId\":\"healthy\",\
 TEST_DBUS_MODE=good TEST_HEALTH_MODE=good run_launcher
 [[ "$(cat "$tmp/launches")" == 2 ]]
 
+rm -f "$tmp/state.json" "$tmp/xpra.ready" "$tmp/xpra.start"
+TEST_DBUS_MODE=bad TEST_HEALTH_MODE=good TEST_XPRA_LIST=:1010 run_launcher
+[[ "$(cat "$tmp/xpra.start")" == start-full ]]
+[[ "$(cat "$tmp/launches")" == 3 ]]
+:
+
 printf '%s\n' '{"ok":true,"pid":2147483647,"port":43123,"serverId":"mcp-not-gui","startedAt":"2026-09-12T00:00:00Z"}' >"$tmp/state.json"
 TEST_DBUS_MODE=good TEST_HEALTH_MODE=good run_launcher
-[[ "$(cat "$tmp/launches")" == 3 ]]
+[[ "$(cat "$tmp/launches")" == 4 ]]
 ! grep -q 'pgrep' "$LAUNCHER"
 printf '%s\n' 'agentify-cortex lifecycle tests: ok'
+#+END_SRC
+
+** Agentify Cortex boot and liveness owner
+
+The graphical Agentify control center must survive the same cold-boot boundary as
+its Telegram consumers.  A healthy Telegram process does not imply that Xpra,
+Brave, or Agentify's control center exists.  This supervisor calls the idempotent
+=agentify-cortex= owner behind an expected-host guard, a non-blocking singleton
+lock, bounded retries, and an atomic receipt.  Cron invokes it once after boot and
+again every two minutes so a later deaf desktop is repaired without multiplying
+owners.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/agentify-cortex-supervise :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="agentify-cortex-supervise"
+EXPECTED_HOST=""
+DELAY=0
+ATTEMPTS=1
+RETRY_SECONDS=15
+LAUNCH_TIMEOUT=120
+LAUNCHER="${AGENTIFY_CORTEX_SUPERVISE_LAUNCHER:-$HOME/.local/bin/agentify-cortex}"
+STATE_DIR="${AGENTIFY_CORTEX_SUPERVISE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agentify-cortex-supervise}"
+HOSTNAME_BIN="${AGENTIFY_CORTEX_SUPERVISE_HOSTNAME_BIN:-hostname}"
+TIMEOUT_BIN="${AGENTIFY_CORTEX_SUPERVISE_TIMEOUT_BIN:-timeout}"
+JQ_BIN="${AGENTIFY_CORTEX_SUPERVISE_JQ_BIN:-jq}"
+
+usage() {
+  echo "Usage: $TAG --expected-host HOST [--delay SECONDS] [--attempts COUNT] [--retry-seconds SECONDS] [--launch-timeout SECONDS] [--launcher PATH] [--state-dir PATH]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --expected-host) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --delay) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; DELAY="$2"; shift ;;
+    --attempts) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ATTEMPTS="$2"; shift ;;
+    --retry-seconds) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RETRY_SECONDS="$2"; shift ;;
+    --launch-timeout) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; LAUNCH_TIMEOUT="$2"; shift ;;
+    --launcher) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; LAUNCHER="$2"; shift ;;
+    --state-dir) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; STATE_DIR="$2"; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --expected-host is required" >&2; exit 2; }
+for value in "$DELAY" "$ATTEMPTS" "$RETRY_SECONDS" "$LAUNCH_TIMEOUT"; do
+  case "$value" in ''|*[!0-9]*) echo "$TAG: timing and attempt values must be non-negative integers" >&2; exit 2 ;; esac
+done
+[ "$ATTEMPTS" -gt 0 ] || { echo "$TAG: --attempts must be positive" >&2; exit 2; }
+[ "$LAUNCH_TIMEOUT" -gt 0 ] || { echo "$TAG: --launch-timeout must be positive" >&2; exit 2; }
+
+CURRENT_HOST="$($HOSTNAME_BIN -s)"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  echo "$TAG: refusing host $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  exit 1
+}
+[ -x "$LAUNCHER" ] || { echo "$TAG: launcher is not executable: $LAUNCHER" >&2; exit 69; }
+
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/owner.lock"
+if ! flock -n 9; then
+  echo "$TAG: another supervisor owns the lock"
+  exit 0
+fi
+
+write_receipt() {
+  local status="$1" attempt="$2" detail="$3" tmp
+  tmp="$STATE_DIR/receipt.json.tmp.$$"
+  "$JQ_BIN" -nc \
+    --arg schema "dotcortex.agentify-cortex-supervise.v1" \
+    --arg status "$status" --arg host "$CURRENT_HOST" --arg detail "$detail" \
+    --argjson attempt "$attempt" --argjson timestamp "$(date +%s)" \
+    '{schema:$schema,status:$status,host:$host,attempt:$attempt,detail:$detail,timestamp:$timestamp}' >"$tmp"
+  mv -f "$tmp" "$STATE_DIR/receipt.json"
+}
+
+[ "$DELAY" -eq 0 ] || sleep "$DELAY"
+attempt=1
+while [ "$attempt" -le "$ATTEMPTS" ]; do
+  if "$TIMEOUT_BIN" --signal=TERM "$LAUNCH_TIMEOUT" "$LAUNCHER" 9>&-; then
+    write_receipt ready "$attempt" "launcher healthy"
+    echo "$TAG: ready"
+    exit 0
+  fi
+  rc=$?
+  write_receipt retry "$attempt" "launcher exit $rc"
+  [ "$attempt" -ge "$ATTEMPTS" ] || sleep "$RETRY_SECONDS"
+  attempt=$((attempt + 1))
+done
+
+write_receipt failed "$ATTEMPTS" "bounded attempts exhausted"
+echo "$TAG: failed after $ATTEMPTS attempts" >&2
+exit 1
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/agentify-cortex-supervise-cron-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="agentify-cortex-supervise-cron-apply"
+TARGET="/etc/cron.d/dotcortex-agentify-cortex-supervise"
+EXPECTED_HOST=""
+DRY=0
+REMOVE=0
+HOSTNAME_BIN="${AGENTIFY_CORTEX_CRON_HOSTNAME_BIN:-hostname}"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host) [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --dry-run) DRY=1 ;;
+    --remove) REMOVE=1 ;;
+    -h|--help|help) echo "Usage: $TAG --host EXACT_HOST [--dry-run] [--remove]"; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then echo "remove $TARGET"; else run_priv rm -f "$TARGET"; echo "$TAG: removed $TARGET"; fi
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --host EXACT_HOST is required" >&2; exit 2; }
+CURRENT_HOST="$($HOSTNAME_BIN -s)"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || { echo "$TAG: refusing installation on $CURRENT_HOST; expected $EXPECTED_HOST" >&2; exit 1; }
+
+USER_NAME="$(id -un)"
+USER_ID="$(id -u)"
+TARGET_HOME="$HOME"
+SUPERVISOR="$TARGET_HOME/.local/bin/agentify-cortex-supervise"
+[ "$DRY" = 1 ] || [ -x "$SUPERVISOR" ] || { echo "$TAG: missing $SUPERVISOR; tangle and stow first" >&2; exit 1; }
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex Agentify/Xpra boot and liveness owner; managed by $TAG.
+@reboot ${USER_NAME} HOME=${TARGET_HOME} PATH=${TARGET_HOME}/.guix-extra-profiles/core/core/bin:${TARGET_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/${USER_ID} ${SUPERVISOR} --expected-host ${EXPECTED_HOST} --delay 15 --attempts 8 --retry-seconds 15
+*/2 * * * * ${USER_NAME} HOME=${TARGET_HOME} PATH=${TARGET_HOME}/.guix-extra-profiles/core/core/bin:${TARGET_HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/${USER_ID} ${SUPERVISOR} --expected-host ${EXPECTED_HOST} --attempts 1
+EOF
+
+if [ "$DRY" = 1 ]; then
+  cat "$TMP"
+else
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+  echo "$TAG: installed $TARGET"
+fi
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle linux/.local/share/dotcortex/tests/agentify-cortex-supervision.sh :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+ROOT="$(cd -- "$(dirname -- "$0")/../../../../.." && pwd)"
+SUPERVISOR="$ROOT/linux/.local/bin/agentify-cortex-supervise"
+CRON_APPLY="$ROOT/linux/.local/bin/agentify-cortex-supervise-cron-apply"
+tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+mkdir -p "$tmp/bin" "$tmp/state"
+
+cat >"$tmp/bin/hostname" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' kikin-kushi
+EOF
+cat >"$tmp/bin/agentify-cortex" <<'EOF'
+#!/usr/bin/env bash
+count=0
+[ -f "$FAKE_COUNT" ] && count="$(cat "$FAKE_COUNT")"
+count=$((count + 1))
+printf '%s\n' "$count" >"$FAKE_COUNT"
+[ -z "${FAKE_HOLD_SECONDS:-}" ] || sleep "$FAKE_HOLD_SECONDS"
+[ "$count" -ge "${FAKE_SUCCEED_AT:-1}" ]
+EOF
+chmod 755 "$tmp/bin/hostname" "$tmp/bin/agentify-cortex"
+
+FAKE_COUNT="$tmp/count" FAKE_SUCCEED_AT=2 \
+AGENTIFY_CORTEX_SUPERVISE_HOSTNAME_BIN="$tmp/bin/hostname" \
+"$SUPERVISOR" --expected-host kikin-kushi --attempts 3 --retry-seconds 0 \
+  --launch-timeout 5 --launcher "$tmp/bin/agentify-cortex" --state-dir "$tmp/state"
+[[ "$(cat "$tmp/count")" == 2 ]]
+jq -e '.schema == "dotcortex.agentify-cortex-supervise.v1" and .status == "ready" and .attempt == 2' \
+  "$tmp/state/receipt.json" >/dev/null
+
+rm -f "$tmp/count"
+FAKE_COUNT="$tmp/count" FAKE_SUCCEED_AT=1 FAKE_HOLD_SECONDS=1 \
+AGENTIFY_CORTEX_SUPERVISE_HOSTNAME_BIN="$tmp/bin/hostname" \
+"$SUPERVISOR" --expected-host kikin-kushi --attempts 1 --launch-timeout 5 \
+  --launcher "$tmp/bin/agentify-cortex" --state-dir "$tmp/state.concurrent" &
+owner_pid=$!
+for _ in $(seq 1 50); do [ -s "$tmp/count" ] && break; sleep 0.02; done
+locked_out="$(FAKE_COUNT="$tmp/count" FAKE_SUCCEED_AT=1 \
+  AGENTIFY_CORTEX_SUPERVISE_HOSTNAME_BIN="$tmp/bin/hostname" \
+  "$SUPERVISOR" --expected-host kikin-kushi --attempts 1 --launch-timeout 5 \
+  --launcher "$tmp/bin/agentify-cortex" --state-dir "$tmp/state.concurrent")"
+grep -Fq 'another supervisor owns the lock' <<<"$locked_out"
+wait "$owner_pid"
+[[ "$(cat "$tmp/count")" == 1 ]]
+
+if AGENTIFY_CORTEX_SUPERVISE_HOSTNAME_BIN="$tmp/bin/hostname" \
+  "$SUPERVISOR" --expected-host wrong-host --launcher "$tmp/bin/agentify-cortex" --state-dir "$tmp/state.bad"; then
+  echo "wrong-host supervisor unexpectedly succeeded" >&2
+  exit 1
+fi
+
+cron_out="$(HOME="$tmp/home" AGENTIFY_CORTEX_CRON_HOSTNAME_BIN="$tmp/bin/hostname" \
+  "$CRON_APPLY" --host kikin-kushi --dry-run)"
+grep -Fq '@reboot' <<<"$cron_out"
+grep -Fq '*/2 * * * *' <<<"$cron_out"
+grep -Fq 'agentify-cortex-supervise --expected-host kikin-kushi' <<<"$cron_out"
+
+[[ "$("$SUPERVISOR" --help)" == Usage:* ]]
+[[ "$("$CRON_APPLY" --help)" == Usage:* ]]
+printf '%s\n' 'agentify-cortex supervision tests: ok'
 #+END_SRC
 
 * Verification helpers

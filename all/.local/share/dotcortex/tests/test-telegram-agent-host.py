@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -526,6 +527,28 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertFalse(state_dir.joinpath("deepseek-harness.pid").exists())
         self.assertFalse(state_dir.joinpath("deepseek-harness.ready").exists())
 
+    def test_deepseek_harness_start_retires_dead_owner_before_model_preflight(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        start = manager_text.index("        deepseek-harness)\n")
+        clear_marker = manager_text.index(
+            "deepseek_harness_clear_stale_marker ||", start
+        )
+        retire_owner = manager_text.index(
+            "deepseek_harness_retire_stale_owner ||", clear_marker
+        )
+        model_preflight = manager_text.index(
+            "deepseek_harness_preflight_model ||", retire_owner
+        )
+        self.assertLess(clear_marker, retire_owner)
+        self.assertLess(retire_owner, model_preflight)
+        retire_function = manager_text[
+            manager_text.index("deepseek_harness_retire_stale_owner()"):
+            manager_text.index("deepseek_harness_kill_owned()")
+        ]
+        self.assertIn("deepseek_harness_find_unowned", retire_function)
+        self.assertIn("refusing cleanup", retire_function)
+        self.assertIn('rm -f "$DSH_TELEGRAM_PID_FILE"', retire_function)
+
     def test_deepseek_harness_rejects_model_fallback_in_private_config(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
         self.prepare_deepseek_harness([123])
@@ -583,11 +606,40 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertIn('launch_generation', manager_text)
         self.assertIn('launch_marker="${DSH_TELEGRAM_READY_MARKER}.${launch_generation}"', manager_text)
         self.assertIn('data.get("generation") != sys.argv[5]', manager_text)
-        self.assertIn('DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"', manager_text)
+        self.assertIn('DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-120}"', manager_text)
         self.assertIn('telegram_bot_identity_validated', manager_text)
         self.assertIn('long_polling_owned', manager_text)
         self.assertNotIn('TELEGRAM_BOT_TOKEN', manager_text[manager_text.index('deepseek_harness_marker_matches'):manager_text.index('deepseek_harness_wait_ready')])
         self.assertNotIn('chatId', manager_text[manager_text.index('deepseek_harness_marker_matches'):manager_text.index('deepseek_harness_wait_ready')])
+
+    def test_deepseek_harness_uses_canonical_recall_endpoint(self) -> None:
+        profile = HERE.parents[3] / "../.bots/templates/deepseek-harness-cordis.patch.yml"
+        profile_text = profile.resolve().read_text(encoding="utf-8")
+        self.assertIn("url: @DSH_RECALL_MCP_URL@", profile_text)
+        # Rule 21: the public template never carries a tailnet or private address.
+        self.assertIsNone(re.search(r"\b(100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])|10\.[0-9]{1,3}|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}\b", profile_text))
+
+    def test_deepseek_harness_renders_recall_url_before_comparing(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        self.prepare_deepseek_harness([123])
+        template = self.agents / "templates/deepseek-harness-cordis.patch.yml"
+        template.write_text(template.read_text(encoding="utf-8") + "url: @DSH_RECALL_MCP_URL@\n", encoding="utf-8")
+        profile_patch = (
+            self.home
+            / ".local/share/deepseek-harness-telegram/dsh-home/profiles/helmcortex-telegram/cordis.patch.yml"
+        )
+        rendered = template.read_text(encoding="utf-8").replace("@DSH_RECALL_MCP_URL@", "http://recall.invalid:3004/mcp")
+        profile_patch.write_text(rendered, encoding="utf-8")
+        env_file = self.home / ".config/deepseek-harness-telegram/env"
+        env_file.write_text(env_file.read_text(encoding="utf-8") + "DSH_RECALL_MCP_URL=http://recall.invalid:3004/mcp\n", encoding="utf-8")
+        result = self.run_manager("start", "deepseek-harness", timeout=2)
+        self.assertNotIn("refusing credential egress", result.stderr)
+        self.assertNotIn("cannot resolve the Recall MCP URL", result.stderr)
+        # A profile that keeps the unrendered placeholder is refused.
+        profile_patch.write_text(template.read_text(encoding="utf-8"), encoding="utf-8")
+        result = self.run_manager("start", "deepseek-harness", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("refusing credential egress", result.stderr)
 
 
 if __name__ == "__main__":
