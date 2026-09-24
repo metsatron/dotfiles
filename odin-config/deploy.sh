@@ -32,6 +32,20 @@ if [ ! -x "$ADB" ]; then
 fi
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Host-side adb access is a udev rule owned by android-udev-install (below).
+# A reimaged host fails here, loudly, instead of adb's bare "no permissions".
+UDEV_INSTALL="$HOME/.local/bin/android-udev-install"
+[ -x "$UDEV_INSTALL" ] || UDEV_INSTALL="$SRC/../linux/.local/bin/android-udev-install"
+if [ -x "$UDEV_INSTALL" ] && ! "$UDEV_INSTALL" --check >/dev/null 2>&1; then
+  if (( DRY_RUN == 1 )); then
+    echo "Dry run: host udev rule missing or drifted (run android-udev-install)"
+  else
+    echo "odin: host udev rule missing or drifted; run android-udev-install first" >&2
+    exit 1
+  fi
+fi
+
 REMOTE_DATA_DIR="/sdcard/Android/data/${TARGET_PKG}/files"
 REMOTE_CONFIG_DIR="/sdcard/RetroArch/config"
 

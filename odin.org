@@ -51,6 +51,20 @@ if [ ! -x "$ADB" ]; then
 fi
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Host-side adb access is a udev rule owned by android-udev-install (below).
+# A reimaged host fails here, loudly, instead of adb's bare "no permissions".
+UDEV_INSTALL="$HOME/.local/bin/android-udev-install"
+[ -x "$UDEV_INSTALL" ] || UDEV_INSTALL="$SRC/../linux/.local/bin/android-udev-install"
+if [ -x "$UDEV_INSTALL" ] && ! "$UDEV_INSTALL" --check >/dev/null 2>&1; then
+  if (( DRY_RUN == 1 )); then
+    echo "Dry run: host udev rule missing or drifted (run android-udev-install)"
+  else
+    echo "odin: host udev rule missing or drifted; run android-udev-install first" >&2
+    exit 1
+  fi
+fi
+
 REMOTE_DATA_DIR="/sdcard/Android/data/${TARGET_PKG}/files"
 REMOTE_CONFIG_DIR="/sdcard/RetroArch/config"
 
@@ -96,4 +110,160 @@ if (( DRY_RUN == 1 )); then
 else
   echo "Success: Odin Lite RetroArch config deployed for ${TARGET_PKG} (config only)."
 fi
+#+END_SRC
+
+* Host adb access: the Android udev rule
+
+The Odin is reached over USB from a Linux host (the T480s today). adb needs
+the device node writable by the operator, and the fleet's Devuan hosts run
+without systemd-logind, so the =uaccess= tag grants nothing; access comes from
+=GROUP="plugdev"= instead. The rule was hand-laid on the T480s on 2026-09-15.
+This section makes it reproducible: =android-udev-install= carries the
+canonical rule, installs it root-owned into =/etc/udev/rules.d/=, and reloads
+udev so it applies without a reboot. =--check= compares the live file byte for
+byte and confirms the operator is in =plugdev=. The deploy script above runs
+that check first, so a reimaged host fails loudly rather than with adb's bare
+"no permissions".
+
+It follows the fleet's =/etc= provisioning shape (=herdr-web-boot-install=,
+=storage-maintenance=): one installer in =linux/.local/bin=, =--dry-run= and
+=--check= modes, privilege only through =sudo -n=.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/android-udev-install :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="dotcortex-android-udev"
+DEFAULT_TARGET="/etc/udev/rules.d/51-android.rules"
+target="${ANDROID_UDEV_TARGET:-$DEFAULT_TARGET}"
+user_name="${ANDROID_UDEV_USER:-$(id -un)}"
+
+usage() {
+  cat <<'EOF'
+Usage: android-udev-install [--dry-run|--check|--help]
+
+Install the host udev rule that gives the plugdev group adb/fastboot access
+to Android devices (AYN Odin Lite / MediaTek 0e8d; Google bootloader 18d1).
+  (no flag)  install root-owned to /etc/udev/rules.d/51-android.rules via
+             sudo -n, then reload udev rules and re-trigger USB devices
+  --dry-run  print the rule; change nothing
+  --check    exit 0 only if the live rule matches byte for byte and the
+             operator is in plugdev; change nothing
+EOF
+}
+
+mode=install
+case "${1:-}" in
+  --help|-h) usage; exit 0 ;;
+  --dry-run) mode=dry-run ;;
+  --check) mode=check ;;
+  '') ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+cat >"$tmp" <<'EOF'
+# Android adb/fastboot device access — DotCortex fleet (Odin-Lite-Revival, 2026-09-15)
+# metsatron is in the plugdev group; Devuan has no systemd-logind, so use GROUP not uaccess.
+# MediaTek (AYN Odin Lite / MT6877 — adb enumerates as VID 0e8d)
+SUBSYSTEM=="usb", ATTR{idVendor}=="0e8d", MODE="0660", GROUP="plugdev"
+# Google / common bootloader-fastboot VID (for the later, deferred unlock phase)
+SUBSYSTEM=="usb", ATTR{idVendor}=="18d1", MODE="0660", GROUP="plugdev"
+EOF
+
+in_plugdev() {
+  id -nG "$user_name" 2>/dev/null | tr ' ' '\n' | grep -qx plugdev
+}
+
+case "$mode" in
+  dry-run)
+    cat "$tmp"
+    exit 0
+    ;;
+  check)
+    cmp -s "$tmp" "$target" || {
+      printf '%s: drift or missing target: %s\n' "$TAG" "$target" >&2
+      exit 1
+    }
+    in_plugdev || {
+      printf '%s: %s is not in plugdev; the rule grants nothing\n' "$TAG" "$user_name" >&2
+      exit 1
+    }
+    printf '%s: installed rule matches %s\n' "$TAG" "$target"
+    exit 0
+    ;;
+esac
+
+if cmp -s "$tmp" "$target"; then
+  printf '%s: already installed: %s\n' "$TAG" "$target"
+elif [ "$target" = "$DEFAULT_TARGET" ]; then
+  getent group plugdev >/dev/null || {
+    printf '%s: group plugdev does not exist on this host\n' "$TAG" >&2
+    exit 1
+  }
+  sudo -n install -m 0644 -o root -g root "$tmp" "$target"
+  sudo -n udevadm control --reload-rules
+  sudo -n udevadm trigger --subsystem-match=usb
+  printf '%s: installed %s and reloaded udev\n' "$TAG" "$target"
+else
+  install -m 0644 "$tmp" "$target"
+  printf '%s: installed %s\n' "$TAG" "$target"
+fi
+in_plugdev || printf '%s: warning: %s is not in plugdev (sudo usermod -aG plugdev %s, then log in again)\n' "$TAG" "$user_name" "$user_name" >&2
+#+END_SRC
+
+#+BEGIN_SRC python :tangle linux/.local/share/dotcortex/tests/test-android-udev.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[5]
+INSTALLER = ROOT / "linux/.local/bin/android-udev-install"
+
+
+class AndroidUdevTests(unittest.TestCase):
+    def run_installer(self, *args: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(INSTALLER), *args], env=env, text=True, capture_output=True, check=False
+        )
+
+    def test_install_check_and_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            target = Path(tmp) / "51-android.rules"
+            env = os.environ.copy()
+            env["ANDROID_UDEV_TARGET"] = str(target)
+            env["ANDROID_UDEV_USER"] = "root"
+
+            dry = self.run_installer("--dry-run", env=env)
+            self.assertEqual(dry.returncode, 0, dry.stderr)
+            self.assertIn('ATTR{idVendor}=="0e8d"', dry.stdout)
+            self.assertFalse(target.exists(), "--dry-run must not write")
+
+            missing = self.run_installer("--check", env=env)
+            self.assertEqual(missing.returncode, 1)
+
+            done = self.run_installer(env=env)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(target.read_text(encoding="utf-8"), dry.stdout)
+
+            again = self.run_installer(env=env)
+            self.assertIn("already installed", again.stdout)
+
+            target.write_text(dry.stdout + "# drift\n", encoding="utf-8")
+            drifted = self.run_installer("--check", env=env)
+            self.assertEqual(drifted.returncode, 1)
+            self.assertIn("drift", drifted.stderr)
+
+    def test_rejects_unknown_flag(self) -> None:
+        bad = self.run_installer("--bogus", env=os.environ.copy())
+        self.assertEqual(bad.returncode, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
 #+END_SRC
