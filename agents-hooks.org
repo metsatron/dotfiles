@@ -1039,11 +1039,138 @@ fi
 exit 0
 #+END_SRC
 
+* Network-address guard (rule 21)
+AGENTS.md rule 21 says DotCortex holds no network addresses, because the repository is public and mirrored. Until 2026-09-24 that rule was prose only, and three tailnet addresses sat in public history for a month (introduced 2026-08-25 by two "bind to the tailnet IP, not 0.0.0.0" commits). This guard makes the rule mechanical.
+
+- It scans only *added* lines, so existing history never blocks work but no new address can enter.
+- It runs at commit time (=--staged=, from the pre-commit and pre-merge-commit hooks) and again at push time (=--pre-push=, from the pre-push hook, over every commit the push would publish).
+- It refuses tailnet (CGNAT, 100.64/10) and private (RFC 1918) IPv4 literals.
+- There is no override flag. A known-fake fixture address can be named in =DOTCORTEX_GUARD_ALLOWED_ADDRESSES= (space-separated); the default allows only the CGNAT base address that the herdr-web test uses as a stand-in.
+
+Resolve a machine's own tailnet address at runtime instead, with =tailscale ip -4= filtered to the first IPv4 line (see the Recall units in =services.org=). Per-host addresses that are not the machine's own belong in machine-local, uncommitted env files.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/dotcortex-address-guard :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/bin/dotcortex-address-guard
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: dotcortex-address-guard --staged
+       dotcortex-address-guard --pre-push <remote-name> <remote-url>  (reads refs on stdin)
+       dotcortex-address-guard --range <rev-range>
+
+Refuse tailnet (100.64/10) and private (RFC 1918) IPv4 literals in lines
+being added to DotCortex (AGENTS.md rule 21). Only added lines are scanned.
+Known-fake fixture addresses: DOTCORTEX_GUARD_ALLOWED_ADDRESSES (space-separated).
+USAGE
+}
+
+ADDRESS_RE='(100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])|10\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])|192\.168)\.[0-9]{1,3}\.[0-9]{1,3}'
+ALLOWED=" ${DOTCORTEX_GUARD_ALLOWED_ADDRESSES:-100.64.0.1} "
+
+# Read a unified diff on stdin; print "path: address" for every added-line hit.
+scan_diff() {
+  awk -v re="$ADDRESS_RE" -v allowed="$ALLOWED" '
+    /^\+\+\+ / { path = substr($0, 5); sub(/^b\//, "", path); next }
+    /^\+/ {
+      line = substr($0, 2)
+      while (match(line, re)) {
+        hit = substr(line, RSTART, RLENGTH)
+        before = (RSTART > 1) ? substr(line, RSTART - 1, 1) : ""
+        after = substr(line, RSTART + RLENGTH, 1)
+        if (before !~ /[0-9.]/ && after !~ /[0-9]/ && index(allowed, " " hit " ") == 0)
+          print path ": " hit
+        line = substr(line, RSTART + RLENGTH)
+      }
+    }'
+}
+
+report() {
+  local hits="$1" where="$2"
+  [ -z "$hits" ] && return 0
+  printf 'dotcortex-address-guard: refusing %s: network addresses in a public repo (AGENTS.md rule 21)\n' "$where" >&2
+  printf '%s\n' "$hits" | sort -u | sed 's/^/  - /' >&2
+  printf 'dotcortex-address-guard: resolve the address at runtime (tailscale ip -4) or keep it in a machine-local env file\n' >&2
+  return 1
+}
+
+case "${1:-}" in
+  -h|--help) usage; exit 0 ;;
+  --staged)
+    report "$(git diff --cached -U0 --no-color --no-ext-diff | scan_diff)" "commit" ;;
+  --range)
+    [ -n "${2:-}" ] || { usage >&2; exit 2; }
+    report "$(git log -p -U0 --no-color --no-ext-diff --format= "$2" | scan_diff)" "range $2" ;;
+  --pre-push)
+    zero="0000000000000000000000000000000000000000"
+    status=0
+    while read -r local_ref local_sha remote_ref remote_sha; do
+      [ "$local_sha" = "$zero" ] && continue
+      if [ "$remote_sha" = "$zero" ]; then
+        hits="$(git log -p -U0 --no-color --no-ext-diff --format= "$local_sha" --not --remotes | scan_diff)"
+      else
+        hits="$(git log -p -U0 --no-color --no-ext-diff --format= "$remote_sha..$local_sha" | scan_diff)"
+      fi
+      report "$hits" "push of $local_ref" || status=1
+    done
+    exit "$status" ;;
+  *) usage >&2; exit 2 ;;
+esac
+#+END_SRC
+
+The test builds throwaway repositories and assembles every address at runtime, so this file never carries a literal the guard would refuse.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/tests/test-address-guard.sh :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/share/dotcortex/tests/test-address-guard.sh
+set -euo pipefail
+here="$(cd "$(dirname "$0")" && pwd)"
+guard="${DOTCORTEX_ADDRESS_GUARD:-$here/../../../bin/dotcortex-address-guard}"
+tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+ip() { printf '%s.%s.%s.%s' "$@"; }
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+git init -q -b master "$tmp/r"; cd "$tmp/r"
+git config user.email t@example.invalid; git config user.name t
+echo base > a.txt; git add a.txt; git commit -qm base
+
+# A tailnet address in a staged line is refused.
+echo "host=$(ip 100 101 7 9)" > b.txt; git add b.txt
+"$guard" --staged 2>/dev/null && fail "tailnet address was admitted"
+# So is an RFC 1918 LAN address.
+echo "lan=$(ip 192 168 1 20)" > b.txt; git add b.txt
+"$guard" --staged 2>/dev/null && fail "LAN address was admitted"
+# Version strings and public documentation ranges pass.
+printf 'version 1.10.2.3\ndoc %s\n' "$(ip 192 0 2 1)" > b.txt; git add b.txt
+"$guard" --staged || fail "a non-private dotted number was refused"
+# The fixture allowlist admits exactly the named fake address.
+echo "fixture=$(ip 100 64 0 1)" > b.txt; git add b.txt
+"$guard" --staged || fail "the allowlisted fixture address was refused"
+# Existing history never blocks: only added lines count.
+git commit -qm fixture
+echo "unrelated" > c.txt; git add c.txt
+"$guard" --staged || fail "a clean commit was blocked by history"
+git commit -qm clean
+
+# Pre-push refuses a range that would publish an address, and passes otherwise.
+git init -q --bare "$tmp/remote.git"; git remote add origin "$tmp/remote.git"
+git push -q origin master
+echo "host=$(ip 100 101 7 9)" > d.txt; git add d.txt; git commit -qm leak
+new="$(git rev-parse HEAD)"; old="$(git rev-parse origin/master)"
+printf 'refs/heads/master %s refs/heads/master %s\n' "$new" "$old" | "$guard" --pre-push origin x 2>/dev/null && fail "pre-push admitted a leaking range"
+git reset -q --hard HEAD~1
+echo ok > e.txt; git add e.txt; git commit -qm fine
+printf 'refs/heads/master %s refs/heads/master %s\n' "$(git rev-parse HEAD)" "$old" | "$guard" --pre-push origin x || fail "pre-push refused a clean range"
+echo "address guard: all checks passed"
+#+END_SRC
+
 * Git hook wrappers
 #+BEGIN_SRC bash :tangle .githooks/pre-commit :shebang "#!/usr/bin/env bash"
 #!/usr/bin/env bash
 set -euo pipefail
 repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+address_guard="${HOME}/.local/bin/dotcortex-address-guard"
+[ -x "$address_guard" ] || address_guard="$repo/all/.local/bin/dotcortex-address-guard"
+"$address_guard" --staged
 helper="${HOME}/.local/bin/dotcortex-git-guard"
 [ -x "$helper" ] || helper="$repo/all/.local/bin/dotcortex-git-guard"
 exec "$helper"
@@ -1053,9 +1180,22 @@ exec "$helper"
 #!/usr/bin/env bash
 set -euo pipefail
 repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+address_guard="${HOME}/.local/bin/dotcortex-address-guard"
+[ -x "$address_guard" ] || address_guard="$repo/all/.local/bin/dotcortex-address-guard"
+"$address_guard" --staged
 helper="${HOME}/.local/bin/dotcortex-git-guard"
 [ -x "$helper" ] || helper="$repo/all/.local/bin/dotcortex-git-guard"
 exec "$helper"
+#+END_SRC
+
+#+BEGIN_SRC bash :tangle .githooks/pre-push :shebang "#!/usr/bin/env bash"
+#!/usr/bin/env bash
+# Rule 21 at publication time: nothing a push would publish may add a network address.
+set -euo pipefail
+repo="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+address_guard="${HOME}/.local/bin/dotcortex-address-guard"
+[ -x "$address_guard" ] || address_guard="$repo/all/.local/bin/dotcortex-address-guard"
+exec "$address_guard" --pre-push "$@"
 #+END_SRC
 
 #+BEGIN_SRC bash :tangle .githooks/post-merge :shebang "#!/usr/bin/env bash"
@@ -1115,7 +1255,7 @@ set -euo pipefail
 repo="${DOTCORTEX_REPO:-$HOME/DotCortex}"
 cd "$repo"
 
-chmod +x .githooks/pre-commit .githooks/pre-merge-commit .githooks/post-merge
+chmod +x .githooks/pre-commit .githooks/pre-merge-commit .githooks/pre-push .githooks/post-merge
 git config core.hooksPath .githooks
 
 echo "Installed DotCortex git hooks."
