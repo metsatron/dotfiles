@@ -1,0 +1,367 @@
+#+TITLE: HelmCortex skills mirror — a local, read-only skill store on every machine
+#+DESCRIPTION: Sparse, partial git mirror of the HelmCortex skill sources, pulled from the hub on a timer
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+OPTIONS: toc:2
+
+* Why this exists
+
+A System One model (a small router that sits in front of an agent) has to see every skill index and load skill bodies directly, on machines where HelmCortex itself is not local. Honey is the first: Gillean's machine, where Tiago's own account runs agents but HelmCortex lives on the x230 hub. Over a network filesystem the skill store would vanish whenever the tailnet does, and on a multi-user machine an NFS export keyed by uid is unsafe (uid 1000 on Honey is not Tiago). So each machine that needs it keeps a *local* copy of just the skill sources, pulled from the hub on a timer. That is the "comprehensive skill index synced from a local store and pulled across the fleet" (Mètsàtron, 2026-09-24).
+
+The mirror is a normal git checkout with two restrictions:
+
+- *Sparse*: only the skill paths below are checked out, never LOGS, NADA, NEXUS or the rest of the 40 GB tree.
+- *Partial* (=--filter=blob:none=): only the blobs those paths need are fetched. HelmCortex's history is about 1.1 GB; a mirror is a small fraction of that.
+
+It is read-only by contract. Agents read it; nobody edits it. A dirty or diverged mirror is refused loudly, never repaired silently, because a repair could hide exactly the drift a System One must not act on.
+
+* What is mirrored
+
+The canonical skill sources are the harness files (=FORGE/harness/<scope>/SKILLS.md= and friends, the input to =helmcortex-compile=). The compiled per-platform skill bodies that are tracked in git come along too, so a loader can read a ready =SKILL.md= without running the compiler. Untracked compiled outputs (for example the userspace skills that =helmstow= deploys) are not in git and so are not in the mirror; the harness source carries the same content.
+
+#+NAME: helmcortex-skills-patterns
+#+BEGIN_SRC text
+/FORGE/harness/
+/.agents/skills/
+/FORGE/.agents/skills/
+/FORGE/bridge/.agents/skills/
+/CORTEX/GoldenAge_Loom/*/.agents/skills/
+/AGENTS.md
+/CLAUDE.md
+#+END_SRC
+
+The patterns are non-cone sparse-checkout patterns. Adding a path here and re-running =helmcortex-skills-sync= widens every mirror on its next run.
+
+* Hub side: a read-only git key
+
+The mirror authenticates with its own key, authorised on the hub with a forced command that can only serve fetches of the HelmCortex repository. Nothing the client sends can choose a different command or path, push, or open a shell. This line belongs in the hub account's =~/.ssh/authorized_keys= (per-host and private, so it is documented here rather than tangled):
+
+#+BEGIN_SRC text
+command="/usr/bin/git -c uploadpack.allowFilter=true upload-pack HelmCortex",from="<client tailnet address>",restrict ssh-ed25519 AAAA... <user>@<client> helmcortex-skills-mirror
+#+END_SRC
+
+=uploadpack.allowFilter= is passed on the command line so the hub repository's own config is untouched. On the client, give the key a host alias (for example =x230-helmcortex-git=, with =IdentitiesOnly yes=) and point =HELMCORTEX_SKILLS_REMOTE= at =<alias>:HelmCortex=. The path part is ignored by the forced command; it is there so git has something to parse.
+
+* The sync command
+
+=helmcortex-skills-sync= keeps the mirror current. Verbs:
+
+- =sync= (default): clone on first run, then fetch and fast-forward. Refuses a dirty mirror, a diverged history, or a mirror whose remote is not the configured one. Writes =status.json= either way.
+- =status=: print the last =status.json=.
+- =paths=: print the sparse patterns.
+- =cron-apply [--remove] [--dry-run]=: install the user-crontab schedule (=@reboot= plus every 15 minutes, marker-managed, all other lines preserved).
+
+Configuration comes from the environment, with defaults:
+
+| Variable | Default |
+|---|---|
+| =HELMCORTEX_SKILLS_REMOTE= | =x230-helmcortex-git:HelmCortex= |
+| =HELMCORTEX_SKILLS_DIR= | =~/.local/share/helmcortex/skills-mirror= |
+| =HELMCORTEX_SKILLS_BRANCH= | =master= |
+| =HELMCORTEX_SKILLS_STATE= | =~/.local/state/helmcortex-skills-mirror= |
+
+It never runs against the hub's own HelmCortex: a mirror directory that is, or sits inside, an existing HelmCortex checkout is refused.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/helmcortex-skills-sync :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :noweb yes
+set -euo pipefail
+
+TAG="helmcortex-skills-sync"
+MARK="# dotcortex:helmcortex-skills-sync"
+REMOTE="${HELMCORTEX_SKILLS_REMOTE:-x230-helmcortex-git:HelmCortex}"
+DIR="${HELMCORTEX_SKILLS_DIR:-$HOME/.local/share/helmcortex/skills-mirror}"
+BRANCH="${HELMCORTEX_SKILLS_BRANCH:-master}"
+STATE="${HELMCORTEX_SKILLS_STATE:-$HOME/.local/state/helmcortex-skills-mirror}"
+
+PATTERNS="$(cat <<'PATTERNS_EOF'
+<<helmcortex-skills-patterns>>
+PATTERNS_EOF
+)"
+
+usage() {
+  cat <<'EOF'
+Usage: helmcortex-skills-sync [sync|status|paths|cron-apply [--remove] [--dry-run]]
+
+Keep a sparse, partial, read-only git mirror of the HelmCortex skill sources.
+  sync         clone or fast-forward the mirror (default); fails loud on a
+               dirty, diverged or foreign mirror
+  status       print the last status.json
+  paths        print the sparse-checkout patterns
+  cron-apply   install the user-crontab schedule (@reboot and every 15 min);
+               --remove removes it, --dry-run prints the resulting crontab
+
+Environment: HELMCORTEX_SKILLS_REMOTE, HELMCORTEX_SKILLS_DIR,
+HELMCORTEX_SKILLS_BRANCH, HELMCORTEX_SKILLS_STATE.
+EOF
+}
+
+write_status() {
+  # $1 ok|error, $2 message
+  mkdir -p "$STATE"
+  local head=""
+  head="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+  python3 - "$STATE/status.json" "$1" "$2" "$REMOTE" "$DIR" "$BRANCH" "$head" <<'PY'
+import json, sys, datetime, os
+path, result, message, remote, directory, branch, head = sys.argv[1:8]
+previous = {}
+try:
+    previous = json.load(open(path))
+except Exception:
+    pass
+now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+status = {
+    'schema': 'dotcortex.helmcortex-skills-mirror.v1',
+    'result': result, 'message': message, 'checked_at': now,
+    'remote': remote, 'dir': directory, 'branch': branch, 'head': head or None,
+    'last_success': now if result == 'ok' else previous.get('last_success'),
+}
+tmp = path + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(status, f, indent=2)
+    f.write('\n')
+os.replace(tmp, path)
+PY
+}
+
+fail() {
+  write_status error "$1" || true
+  echo "$TAG: $1" >&2
+  exit 1
+}
+
+inside_helmcortex_checkout() {
+  local probe="$1"
+  while [ "$probe" != "/" ] && [ -n "$probe" ]; do
+    if [ -d "$probe/FORGE/harness" ] && [ -d "$probe/LOGS" ]; then
+      return 0
+    fi
+    probe="$(dirname "$probe")"
+  done
+  return 1
+}
+
+do_sync() {
+  command -v git >/dev/null 2>&1 || fail "git is not installed"
+  local parent
+  parent="$(dirname "$DIR")"
+  mkdir -p "$parent" "$STATE"
+  if inside_helmcortex_checkout "$parent"; then
+    fail "refusing: $DIR sits inside a full HelmCortex checkout (the hub needs no mirror)"
+  fi
+  exec 9>"$STATE/lock"
+  if ! flock -n 9; then
+    echo "$TAG: another sync holds the lock; skipping" >&2
+    exit 0
+  fi
+
+  if [ ! -d "$DIR/.git" ]; then
+    if [ -e "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
+      fail "refusing: $DIR exists, is not empty and is not a git mirror"
+    fi
+    local tmp="$DIR.partial.$$"
+    rm -rf "$tmp"
+    if ! git clone --quiet --filter=blob:none --no-checkout --branch "$BRANCH" "$REMOTE" "$tmp"; then
+      rm -rf "$tmp"
+      fail "clone from $REMOTE failed"
+    fi
+    git -C "$tmp" sparse-checkout init --no-cone
+    printf '%s\n' "$PATTERNS" | git -C "$tmp" sparse-checkout set --no-cone --stdin
+    if ! git -C "$tmp" checkout --quiet "$BRANCH"; then
+      rm -rf "$tmp"
+      fail "initial checkout failed"
+    fi
+    mv "$tmp" "$DIR"
+    write_status ok "cloned"
+    echo "$TAG: cloned $(git -C "$DIR" rev-parse --short HEAD) into $DIR"
+    return 0
+  fi
+
+  local actual_remote
+  actual_remote="$(git -C "$DIR" remote get-url origin 2>/dev/null || true)"
+  [ "$actual_remote" = "$REMOTE" ] || fail "refusing: mirror origin is '$actual_remote', expected '$REMOTE'"
+  [ -z "$(git -C "$DIR" status --porcelain --untracked-files=no)" ] || fail "refusing: the mirror has local edits; it is read-only by contract"
+  [ "$(git -C "$DIR" symbolic-ref --short HEAD 2>/dev/null || true)" = "$BRANCH" ] || fail "refusing: mirror is not on $BRANCH"
+
+  # Re-apply the patterns every run so a widened list reaches every mirror.
+  printf '%s\n' "$PATTERNS" | git -C "$DIR" sparse-checkout set --no-cone --stdin
+  git -C "$DIR" fetch --quiet origin "$BRANCH" || fail "fetch from $REMOTE failed"
+  local before after
+  before="$(git -C "$DIR" rev-parse HEAD)"
+  if ! git -C "$DIR" merge --quiet --ff-only FETCH_HEAD; then
+    fail "refusing: the hub's $BRANCH is not a fast-forward of the mirror (history rewritten?); re-clone deliberately"
+  fi
+  after="$(git -C "$DIR" rev-parse HEAD)"
+  if [ "$before" = "$after" ]; then
+    write_status ok "current"
+  else
+    write_status ok "updated ${before:0:9}..${after:0:9}"
+    echo "$TAG: updated ${before:0:9}..${after:0:9}"
+  fi
+}
+
+do_cron_apply() {
+  local mode=install dry=0
+  for arg in "$@"; do
+    case "$arg" in
+      --remove) mode=remove ;;
+      --dry-run) dry=1 ;;
+      *) echo "$TAG: unknown cron-apply argument: $arg" >&2; exit 2 ;;
+    esac
+  done
+  command -v crontab >/dev/null 2>&1 || { echo "$TAG: no crontab binary on this host — nothing installed" >&2; exit 1; }
+  mkdir -p "$STATE"
+  local existing managed="" result
+  existing="$(crontab -l 2>/dev/null | grep -vF "$MARK" || true)"
+  if [ "$mode" = install ]; then
+    local env_prefix=""
+    [ -n "${HELMCORTEX_SKILLS_REMOTE:-}" ] && env_prefix="HELMCORTEX_SKILLS_REMOTE=$HELMCORTEX_SKILLS_REMOTE "
+    [ -n "${HELMCORTEX_SKILLS_DIR:-}" ] && env_prefix="${env_prefix}HELMCORTEX_SKILLS_DIR=$HELMCORTEX_SKILLS_DIR "
+    local cmd="${env_prefix}\$HOME/.local/bin/helmcortex-skills-sync sync >/dev/null 2>>\$HOME/.local/state/helmcortex-skills-mirror/cron-errors.log"
+    managed="$(printf '%s\n%s' "@reboot sleep 90; $cmd $MARK" "*/15 * * * * $cmd $MARK")"
+  fi
+  result="$(printf '%s\n%s\n' "$existing" "$managed" | sed '/^[[:space:]]*$/d')"
+  if [ "$dry" = 1 ]; then
+    printf '%s\n' "$result"
+    return 0
+  fi
+  printf '%s\n' "$result" | crontab -
+  echo "$TAG: cron schedule ${mode}ed"
+}
+
+case "${1:-sync}" in
+  -h|--help|help) usage ;;
+  sync) do_sync ;;
+  status) cat "$STATE/status.json" 2>/dev/null || { echo "$TAG: no status yet" >&2; exit 1; } ;;
+  paths) printf '%s\n' "$PATTERNS" ;;
+  cron-apply) shift; do_cron_apply "$@" ;;
+  *) echo "$TAG: unknown verb: $1" >&2; usage >&2; exit 2 ;;
+esac
+#+END_SRC
+
+* Tests
+
+The tests build a throwaway hub repository and run the tangled command against it over =file://=, so they need no network and never touch a real mirror. From the checkout root, after tangling:
+
+=python3 -B -c 'from pathlib import Path; s=Path("helmcortex-skills-mirror.org").read_text(); b=s.split("#+NAME: helmcortex-skills-mirror-tests",1)[1].split("#+BEGIN_SRC python :tangle no\n",1)[1].split("#+END_SRC",1)[0]; exec(compile(b,"helmcortex-skills-mirror-tests","exec"))'=
+
+#+NAME: helmcortex-skills-mirror-tests
+#+BEGIN_SRC python :tangle no
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+SCRIPT = Path("all/.local/bin/helmcortex-skills-sync").resolve()
+
+
+def git(*args, cwd=None):
+    return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True).stdout.strip()
+
+
+class SkillsMirrorTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.hub = root / "hub" / "HelmCortex"
+        self.hub.mkdir(parents=True)
+        git("init", "-q", "-b", "master", cwd=self.hub)
+        git("config", "user.email", "t@example.invalid", cwd=self.hub)
+        git("config", "user.name", "t", cwd=self.hub)
+        git("config", "uploadpack.allowFilter", "true", cwd=self.hub)
+        files = {
+            "FORGE/harness/userspace/SKILLS.md": "<!-- SKILL: commit -->\n# commit\n",
+            ".agents/skills/helmcortex-index/SKILL.md": "# index\n",
+            "CORTEX/GoldenAge_Loom/PalmCortex/.agents/skills/palm/SKILL.md": "# palm\n",
+            "AGENTS.md": "# agents\n",
+            "LOGS/secret-session.md": "must never be checked out\n",
+            "NEXUS/data.txt": "must never be checked out\n",
+            "CORTEX/GoldenAge_Loom/PalmCortex/Diary.md": "must never be checked out\n",
+        }
+        for rel, body in files.items():
+            path = self.hub / rel
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(body)
+        git("add", "-A", cwd=self.hub)
+        git("commit", "-qm", "base", cwd=self.hub)
+        self.mirror = root / "client" / "mirror"
+        self.env = dict(os.environ,
+                        HELMCORTEX_SKILLS_REMOTE=f"file://{self.hub}",
+                        HELMCORTEX_SKILLS_DIR=str(self.mirror),
+                        HELMCORTEX_SKILLS_STATE=str(root / "state"))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_sync(self, *args):
+        return subprocess.run([str(SCRIPT), *args], env=self.env, capture_output=True, text=True)
+
+    def status(self):
+        return json.loads((Path(self.env["HELMCORTEX_SKILLS_STATE"]) / "status.json").read_text())
+
+    def test_first_sync_checks_out_only_skill_paths(self):
+        result = self.run_sync("sync")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.mirror / "FORGE/harness/userspace/SKILLS.md").exists())
+        self.assertTrue((self.mirror / ".agents/skills/helmcortex-index/SKILL.md").exists())
+        self.assertTrue((self.mirror / "CORTEX/GoldenAge_Loom/PalmCortex/.agents/skills/palm/SKILL.md").exists())
+        self.assertFalse((self.mirror / "LOGS").exists())
+        self.assertFalse((self.mirror / "NEXUS").exists())
+        self.assertFalse((self.mirror / "CORTEX/GoldenAge_Loom/PalmCortex/Diary.md").exists())
+        self.assertEqual(self.status()["result"], "ok")
+
+    def test_fast_forward_update(self):
+        self.assertEqual(self.run_sync("sync").returncode, 0)
+        (self.hub / "FORGE/harness/userspace/SKILLS.md").write_text("<!-- SKILL: commit -->\n# commit v2\n")
+        git("commit", "-qam", "update", cwd=self.hub)
+        result = self.run_sync("sync")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("v2", (self.mirror / "FORGE/harness/userspace/SKILLS.md").read_text())
+        self.assertEqual(self.status()["head"], git("rev-parse", "HEAD", cwd=self.hub))
+
+    def test_dirty_mirror_is_refused(self):
+        self.assertEqual(self.run_sync("sync").returncode, 0)
+        (self.mirror / "FORGE/harness/userspace/SKILLS.md").write_text("tampered\n")
+        result = self.run_sync("sync")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("local edits", result.stderr)
+        self.assertEqual(self.status()["result"], "error")
+
+    def test_rewritten_hub_history_is_refused(self):
+        self.assertEqual(self.run_sync("sync").returncode, 0)
+        git("commit", "-q", "--amend", "-m", "rewritten", cwd=self.hub)
+        result = self.run_sync("sync")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("not a fast-forward", result.stderr)
+
+    def test_foreign_remote_is_refused(self):
+        self.assertEqual(self.run_sync("sync").returncode, 0)
+        env = dict(self.env, HELMCORTEX_SKILLS_REMOTE="file:///elsewhere")
+        result = subprocess.run([str(SCRIPT), "sync"], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("origin", result.stderr)
+
+    def test_refuses_inside_a_full_helmcortex_checkout(self):
+        env = dict(self.env, HELMCORTEX_SKILLS_DIR=str(self.hub / "FORGE" / "mirror"))
+        (self.hub / "LOGS").mkdir(exist_ok=True)
+        result = subprocess.run([str(SCRIPT), "sync"], env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("full HelmCortex checkout", result.stderr)
+
+    def test_cron_apply_dry_run_is_marker_managed(self):
+        result = self.run_sync("cron-apply", "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        managed = [l for l in result.stdout.splitlines() if "dotcortex:helmcortex-skills-sync" in l]
+        self.assertEqual(len(managed), 2)
+        self.assertTrue(any(l.startswith("@reboot") for l in managed))
+        self.assertTrue(any(l.startswith("*/15") for l in managed))
+
+    def test_help_has_no_side_effects(self):
+        result = self.run_sync("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertFalse(self.mirror.exists())
+        self.assertFalse(Path(self.env["HELMCORTEX_SKILLS_STATE"]).exists())
+
+
+unittest.main(argv=["helmcortex-skills-mirror-tests"])
+#+END_SRC
