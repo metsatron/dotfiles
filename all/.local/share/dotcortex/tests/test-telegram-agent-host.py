@@ -526,6 +526,28 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertFalse(state_dir.joinpath("deepseek-harness.pid").exists())
         self.assertFalse(state_dir.joinpath("deepseek-harness.ready").exists())
 
+    def test_deepseek_harness_start_retires_dead_owner_before_model_preflight(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        start = manager_text.index("        deepseek-harness)\n")
+        clear_marker = manager_text.index(
+            "deepseek_harness_clear_stale_marker ||", start
+        )
+        retire_owner = manager_text.index(
+            "deepseek_harness_retire_stale_owner ||", clear_marker
+        )
+        model_preflight = manager_text.index(
+            "deepseek_harness_preflight_model ||", retire_owner
+        )
+        self.assertLess(clear_marker, retire_owner)
+        self.assertLess(retire_owner, model_preflight)
+        retire_function = manager_text[
+            manager_text.index("deepseek_harness_retire_stale_owner()"):
+            manager_text.index("deepseek_harness_kill_owned()")
+        ]
+        self.assertIn("deepseek_harness_find_unowned", retire_function)
+        self.assertIn("refusing cleanup", retire_function)
+        self.assertIn('rm -f "$DSH_TELEGRAM_PID_FILE"', retire_function)
+
     def test_deepseek_harness_rejects_model_fallback_in_private_config(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
         self.prepare_deepseek_harness([123])
@@ -583,11 +605,17 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertIn('launch_generation', manager_text)
         self.assertIn('launch_marker="${DSH_TELEGRAM_READY_MARKER}.${launch_generation}"', manager_text)
         self.assertIn('data.get("generation") != sys.argv[5]', manager_text)
-        self.assertIn('DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"', manager_text)
+        self.assertIn('DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-120}"', manager_text)
         self.assertIn('telegram_bot_identity_validated', manager_text)
         self.assertIn('long_polling_owned', manager_text)
         self.assertNotIn('TELEGRAM_BOT_TOKEN', manager_text[manager_text.index('deepseek_harness_marker_matches'):manager_text.index('deepseek_harness_wait_ready')])
         self.assertNotIn('chatId', manager_text[manager_text.index('deepseek_harness_marker_matches'):manager_text.index('deepseek_harness_wait_ready')])
+
+    def test_deepseek_harness_uses_canonical_recall_endpoint(self) -> None:
+        profile = HERE.parents[3] / "../.bots/templates/deepseek-harness-cordis.patch.yml"
+        profile_text = profile.resolve().read_text(encoding="utf-8")
+        self.assertIn("url: http://100.85.136.120:3004/mcp", profile_text)
+        self.assertNotIn("100.118.131.50", profile_text)
 
 
 if __name__ == "__main__":

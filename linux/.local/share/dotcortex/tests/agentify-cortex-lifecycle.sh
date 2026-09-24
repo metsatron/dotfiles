@@ -8,10 +8,18 @@ tmp="$(mktemp -d)"
 trap 'if [ -f "$tmp/fake.pid" ]; then kill "$(cat "$tmp/fake.pid")" 2>/dev/null || true; fi; rm -rf -- "$tmp"' EXIT
 mkdir -p "$tmp/bin" "$tmp/home/.local/bin"
 touch "$tmp/home/.Xauthority"
-printf '%s\n' ':101' >"$tmp/home/.local/bin/sanctuary-cortex-xpra"
+cat >"$tmp/home/.local/bin/sanctuary-cortex-xpra" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >"$FAKE_XPRA_START_MARKER"
+touch "$FAKE_XPRA_READY"
+EOF
 cat >"$tmp/bin/xpra" <<'EOF'
 #!/usr/bin/env bash
-printf '%s\n' ':101'
+if [ -f "$FAKE_XPRA_READY" ]; then
+  printf '%s\n' ':101'
+else
+  printf '%s\n' "${FAKE_XPRA_LIST:-:101}"
+fi
 EOF
 cat >"$tmp/bin/gdbus" <<'EOF'
 #!/usr/bin/env bash
@@ -50,8 +58,10 @@ run_launcher() {
   AGENTIFY_CORTEX_DESKTOP_BIN="$tmp/bin/agentify-desktop" \
   AGENTIFY_CORTEX_CHROME_BIN="$tmp/bin/fake-chrome" FAKE_CHROME_BIN="$tmp/bin/fake-chrome" \
   FAKE_DBUS_MARKER="$tmp/dbus.marker" FAKE_LAUNCH_COUNT="$tmp/launches" \
+  FAKE_XPRA_READY="$tmp/xpra.ready" FAKE_XPRA_START_MARKER="$tmp/xpra.start" \
   FAKE_STATE_PID="$$" \
   FAKE_DBUS_MODE="$TEST_DBUS_MODE" FAKE_HEALTH_MODE="$TEST_HEALTH_MODE" \
+  FAKE_XPRA_LIST="${TEST_XPRA_LIST:-:101}" \
   "$LAUNCHER"
 }
 
@@ -72,9 +82,15 @@ printf '%s\n' "{\"ok\":true,\"pid\":$$,\"port\":43123,\"serverId\":\"healthy\",\
 TEST_DBUS_MODE=good TEST_HEALTH_MODE=good run_launcher
 [[ "$(cat "$tmp/launches")" == 2 ]]
 
+rm -f "$tmp/state.json" "$tmp/xpra.ready" "$tmp/xpra.start"
+TEST_DBUS_MODE=bad TEST_HEALTH_MODE=good TEST_XPRA_LIST=:1010 run_launcher
+[[ "$(cat "$tmp/xpra.start")" == start-full ]]
+[[ "$(cat "$tmp/launches")" == 3 ]]
+:
+
 printf '%s\n' '{"ok":true,"pid":2147483647,"port":43123,"serverId":"mcp-not-gui","startedAt":"2026-09-12T00:00:00Z"}' >"$tmp/state.json"
 TEST_DBUS_MODE=good TEST_HEALTH_MODE=good run_launcher
-[[ "$(cat "$tmp/launches")" == 3 ]]
+[[ "$(cat "$tmp/launches")" == 4 ]]
 ! grep -q 'pgrep' "$LAUNCHER"
 printf '%s\n' 'agentify-cortex lifecycle tests: ok'
 # Agentify Cortex — host-side browser-session lane:3 ends here
