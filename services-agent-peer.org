@@ -243,19 +243,39 @@ Schema alone cannot express the full relationship cleanly.
       "required": ["type", "body"],
       "properties": {
         "type": {
-          "enum": ["message", "task_handoff"]
+          "enum": ["message", "task_handoff", "spawn_request"]
         },
         "body": {
           "type": "string"
         },
         "task_handoff": {
           "type": "object"
+        },
+        "spawn": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["profile"],
+          "properties": {
+            "profile": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+            }
+          }
         }
       }
     }
   }
 }
 #+END_SRC
+
+** Client-zone senders and remote spawn (2026-09-24)
+
+Mètsàtron's ruling of 2026-09-24 accepts Honey (=beelink=, Gillean's machine) as a peer *sender*: its agents may message fleet endpoints and ask a fleet host to start a worker, not only reply over the restricted peerbridge. Honey is a separate trust zone (other principals share its account), so two rules make that safe without giving it any fleet shell:
+
+1. *Sender identity is bound to the transport, never to the envelope.* =from= is self-asserted. A destination that accepts a client zone pins the zone's host in that key's forced command, =command="agent-peer receive --origin-host beelink -",restrict=, and =receive= then refuses any envelope whose =from.host_id= is not the pinned host. The trusted side's =pull <host>= applies the same binding, so an envelope drained from host X must come from X. Unpinned receives keep today's behaviour inside the fleet's own zone.
+2. *A remote spawn is a request against a destination-owned profile.* =peer-start= stays host-local. A destination may register =spawn_profiles= in its private registry (=agent-peer spawn-profile-set=): each names the provider, the Herdr session, the checkout the worker runs in, the exact argv (model and permission mode pinned by the destination), an optional destination-owned intro contract, and the exact peers allowed to request it. A sender's =agent-peer spawn= carries only the profile name, the new worker's peer ID and a body. The destination starts the worker from the profile, registers its endpoint accepting only the requester, and delivers the body as an ordinary framed peer message. The request confers no user authority, no Git authority (spawn requests are read-only, never leased), and cannot choose the command. Spawn names are single-use: an existing endpoint is never replaced.
+
+Both are recorded: receipts and inbox records carry =origin_host= when pinned, and a spawn's record keeps the profile, the new peer ID and the start result. The deployment (keys, forced commands, profiles, routes) is private machine-local configuration and never enters this public repository.
 
 ** Semantic rules
 
@@ -268,6 +288,8 @@ Schema alone cannot express the full relationship cleanly.
 5. Write-capable tasks use the existing =task_handoff= payload.
 6. =allow_destructive= remains false in protocol version one.  A peer cannot
    manufacture destructive authority even when its sender has such authority.
+7. =payload.type=spawn_request= requires =kind=control=, read access, no Git,
+   push or pull authority and no lease; =payload.spawn= names only a profile.
 
 * Private runtime configuration boundary
 
@@ -505,12 +527,29 @@ def validate_envelope(envelope: object) -> list[str]:
     payload_missing = sorted(payload_required - set(payload))
     if payload_missing:
         errors.append(f"payload is missing: {', '.join(payload_missing)}")
-    payload_extras = sorted(set(payload) - payload_required - {"task_handoff"})
+    payload_extras = sorted(set(payload) - payload_required - {"task_handoff", "spawn"})
     if payload_extras:
         errors.append(f"payload has unsupported fields: {', '.join(payload_extras)}")
     payload_type = payload.get("type")
-    if payload_type not in {"message", "task_handoff"}:
-        errors.append("payload.type must be message or task_handoff")
+    if payload_type not in {"message", "task_handoff", "spawn_request"}:
+        errors.append("payload.type must be message, task_handoff or spawn_request")
+    if "spawn" in payload and payload_type != "spawn_request":
+        errors.append("payload.spawn is only valid on a spawn_request")
+    if payload_type == "spawn_request":
+        spawn = mapping(payload.get("spawn"), "payload.spawn", errors)
+        if set(spawn) != {"profile"}:
+            errors.append("payload.spawn must contain exactly: profile")
+        profile = spawn.get("profile")
+        if not isinstance(profile, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", profile):
+            errors.append("payload.spawn.profile must be a safe profile name")
+        if kind != "control":
+            errors.append("a spawn_request must use kind control")
+        if access != "read":
+            errors.append("a spawn_request must use read access")
+        if any(authority.get(key) is not False for key in ("allow_git", "allow_push", "allow_pull")):
+            errors.append("a spawn_request carries no Git, push or pull authority")
+        if lease_value is not None:
+            errors.append("a spawn_request never carries a lease")
     if not isinstance(payload.get("body"), str):
         errors.append("payload.body must be a string")
     if payload_type == "task_handoff" and not isinstance(payload.get("task_handoff"), dict):
@@ -618,6 +657,27 @@ def command_selftest() -> int:
         mismatched_peer,
         "peer_id must equal host_id/provider/session_id",
     )
+
+    spawn = copy.deepcopy(base)
+    spawn["kind"] = "control"
+    spawn["payload"] = {"type": "spawn_request", "body": "Fixture spawn.", "spawn": {"profile": "worker"}}
+    expect("valid-spawn-request", spawn, None)
+
+    spawn_task = copy.deepcopy(spawn)
+    spawn_task["kind"] = "task"
+    expect("spawn-needs-control-kind", spawn_task, "must use kind control")
+
+    spawn_git = copy.deepcopy(spawn)
+    spawn_git["authority"]["allow_git"] = True
+    expect("spawn-carries-no-git", spawn_git, "carries no Git")
+
+    spawn_command = copy.deepcopy(spawn)
+    spawn_command["payload"]["spawn"]["command"] = ["sh", "-c", "id"]
+    expect("spawn-cannot-choose-command", spawn_command, "exactly: profile")
+
+    stray_spawn = copy.deepcopy(base)
+    stray_spawn["payload"]["spawn"] = {"profile": "worker"}
+    expect("spawn-field-only-on-spawn-request", stray_spawn, "only valid on a spawn_request")
 
     passed = all(test["passed"] for test in tests)
     emit({"schema": "agent-peer-lab.selftest.v1", "passed": passed, "tests": tests})
@@ -1229,6 +1289,27 @@ def command_peer_start(
     tab: str | None = None,
     intro_file: str | None = None,
 ) -> int:
+    intro_body: str | None = None
+    if intro_file:
+        intro_body = pathlib.Path(intro_file).expanduser().read_text(encoding="utf-8").strip()
+        if not intro_body:
+            raise PeerError("intro file is empty")
+    emit(start_peer(herdr_session, agent_name, cwd, command, workspace, tab, intro_body))
+    return 0
+
+
+def start_peer(
+    herdr_session: str,
+    agent_name: str,
+    cwd: str,
+    command: list[str],
+    workspace: str | None = None,
+    tab: str | None = None,
+    intro_body: str | None = None,
+) -> dict[str, object]:
+    # The side-effect half of peer-start, returning its report instead of
+    # printing it, so the remote spawn gate can start a worker without
+    # writing a second JSON document into the receive pipe.
     validate_component(herdr_session, "herdr_session")
     validate_component(agent_name, "agent_name")
     root = pathlib.Path(cwd).expanduser().resolve(strict=True)
@@ -1238,11 +1319,6 @@ def command_peer_start(
         raise PeerError("peer-start requires an explicit command after --")
     if workspace and tab:
         raise PeerError("peer-start takes --workspace or --tab, not both")
-    intro_body: str | None = None
-    if intro_file:
-        intro_body = pathlib.Path(intro_file).expanduser().read_text(encoding="utf-8").strip()
-        if not intro_body:
-            raise PeerError("intro file is empty")
     snapshot_for_session(herdr_session)
     start_style = herdr_start_style()
     created_workspace: str | None = None
@@ -1368,21 +1444,69 @@ def command_peer_start(
     intro_delivery: dict[str, object] | None = None
     if intro_body:
         intro_delivery = inject_peer_intro(herdr_session, agent_name, intro_body)
-    emit(
-        {
-            "started": True,
-            "herdr_session": herdr_session,
-            "agent_name": agent_name,
-            "cwd": str(root),
-            "workspace": created_workspace or workspace,
-            "tab": tab,
-            "start_style": start_style,
-            "warm_note": warm_note,
-            "intro": intro_delivery,
-            "next": "run agent-peer inventory, then register the exact endpoint",
-            "herdr_output": result.stdout.strip() or None,
-        }
-    )
+    return {
+        "started": True,
+        "herdr_session": herdr_session,
+        "agent_name": agent_name,
+        "cwd": str(root),
+        "workspace": created_workspace or workspace,
+        "tab": tab,
+        "start_style": start_style,
+        "warm_note": warm_note,
+        "intro": intro_delivery,
+        "next": "run agent-peer inventory, then register the exact endpoint",
+        "herdr_output": result.stdout.strip() or None,
+    }
+
+
+def command_spawn_profile_set(
+    name: str,
+    provider: str,
+    herdr_session: str,
+    cwd: str,
+    accept_from: list[str],
+    command: list[str],
+    intro_file: str | None,
+) -> int:
+    # A spawn profile is destination-owned authority: the exact argv (model
+    # and permission mode pinned here, never by the requester), the Herdr
+    # session, the checkout, an optional destination-authored intro contract,
+    # and the exact peers allowed to request it (2026-09-24).
+    validate_component(name, "profile")
+    validate_component(provider, "provider")
+    validate_component(herdr_session, "herdr_session")
+    root = pathlib.Path(cwd).expanduser().resolve(strict=True)
+    if not root.is_dir():
+        raise PeerError("spawn profile cwd must be an existing directory")
+    if not command or not all(isinstance(part, str) and part for part in command):
+        raise PeerError("spawn-profile-set requires the worker argv after --")
+    if not SAFE_COMMAND.fullmatch(command[0]):
+        raise PeerError("spawn profile argv[0] is unsafe")
+    if not accept_from:
+        raise PeerError("at least one exact --accept-from peer is required")
+    for sender in accept_from:
+        parse_peer_id(sender)
+    intro: str | None = None
+    if intro_file:
+        intro_path = pathlib.Path(intro_file).expanduser().resolve(strict=True)
+        if not intro_path.read_text(encoding="utf-8").strip():
+            raise PeerError("spawn profile intro file is empty")
+        intro = str(intro_path)
+    registry = read_registry()
+    profiles = registry.setdefault("spawn_profiles", {})
+    if not isinstance(profiles, dict):
+        raise PeerError("registry.spawn_profiles must be an object")
+    profile = {
+        "provider": provider,
+        "herdr_session": herdr_session,
+        "cwd": str(root),
+        "command": list(command),
+        "accept_from": sorted(set(accept_from)),
+        "intro_file": intro,
+    }
+    profiles[name] = profile
+    write_registry(registry)
+    emit({"profile": name, "spawn_profile": profile, "updated": True})
     return 0
 
 
@@ -2016,7 +2140,7 @@ def receipt(
     }
 
 
-def receive_envelope(envelope: object) -> dict[str, object]:
+def receive_envelope(envelope: object, origin_host: str | None = None) -> dict[str, object]:
     validated = validate_envelope(envelope)
     registry = read_registry()
     destination = validated["to"]
@@ -2024,6 +2148,18 @@ def receive_envelope(envelope: object) -> dict[str, object]:
     assert isinstance(destination, dict) and isinstance(source, dict)
     if destination.get("host_id") != registry["local_host_id"]:
         raise PeerError("envelope destination does not belong to this host")
+    if origin_host is not None:
+        # Client-zone binding (2026-09-24): `from` is self-asserted, so a
+        # receive pinned to a transport origin (forced command, or pull from
+        # that host) refuses any other claimed sender host.
+        validate_component(origin_host, "origin_host")
+        if source.get("host_id") != origin_host:
+            raise PeerError(
+                f"sender host {source.get('host_id')!r} does not match the transport origin {origin_host!r}"
+            )
+    payload_type = validated["payload"].get("type") if isinstance(validated["payload"], dict) else None
+    if payload_type == "spawn_request":
+        return receive_spawn(validated, registry, origin_host)
     endpoints = registry["endpoints"]
     assert isinstance(endpoints, dict)
     endpoint = endpoints.get(destination.get("peer_id"))
@@ -2070,17 +2206,18 @@ def receive_envelope(envelope: object) -> dict[str, object]:
             raise PeerError(
                 f"message {message_id} is already recorded as {state}; refusing duplicate injection"
             )
-        write_record("inbox", validated, "delivering")
+        write_record("inbox", validated, "delivering", origin_host=origin_host)
     finally:
         lock.close()
 
     try:
         delivery = deliver_herdr(validated, endpoint)
         state = "stored" if delivery.get("adapter") == "store-only" else "delivered"
-        result = receipt(validated, state, delivery=delivery, duplicate=False)
+        extra = {"origin_host": origin_host} if origin_host is not None else {}
+        result = receipt(validated, state, delivery=delivery, duplicate=False, **extra)
         lock = ledger_lock()
         try:
-            write_record("inbox", validated, state, receipt=result)
+            write_record("inbox", validated, state, receipt=result, origin_host=origin_host)
         finally:
             lock.close()
         return result
@@ -2093,7 +2230,126 @@ def receive_envelope(envelope: object) -> dict[str, object]:
         raise
 
 
-def command_receive(path: str) -> int:
+def receive_spawn(
+    validated: dict[str, object], registry: dict[str, object], origin_host: str | None
+) -> dict[str, object]:
+    # Remote spawn gate (2026-09-24): start a worker from a destination-owned
+    # profile. The requester supplies only the profile name, the new worker's
+    # peer ID and a body; argv, session, checkout and intro contract come from
+    # this host's private registry. Spawn names are single-use.
+    destination = validated["to"]
+    source = validated["from"]
+    workspace = validated["workspace"]
+    payload = validated["payload"]
+    assert isinstance(destination, dict) and isinstance(source, dict)
+    assert isinstance(workspace, dict) and isinstance(payload, dict)
+    spawn = payload["spawn"]
+    assert isinstance(spawn, dict)
+    name = str(spawn["profile"])
+    profiles = registry.get("spawn_profiles", {})
+    if not isinstance(profiles, dict):
+        raise PeerError("registry.spawn_profiles must be an object")
+    profile = profiles.get(name)
+    if not isinstance(profile, dict):
+        raise PeerError(f"spawn profile {name!r} is not registered on this host")
+    accepted = profile.get("accept_from")
+    if not isinstance(accepted, list) or source.get("peer_id") not in accepted:
+        raise PeerError("sender is not allowed by the spawn profile")
+    if destination.get("provider") != profile.get("provider"):
+        raise PeerError("requested peer provider does not match the spawn profile")
+    cwd = pathlib.Path(str(profile["cwd"])).resolve(strict=True)
+    if pathlib.Path(str(workspace["repo_root"])).resolve(strict=True) != cwd:
+        raise PeerError("spawn repository does not match the profile checkout")
+    peer_id = str(destination["peer_id"])
+    agent_name = validate_component(destination.get("session_id"), "agent_name")
+    message_id = str(validated["message_id"])
+    endpoints = registry["endpoints"]
+    assert isinstance(endpoints, dict)
+    lock = ledger_lock()
+    try:
+        existing = read_record("inbox", message_id)
+        if existing:
+            state = str(existing.get("state"))
+            prior = existing.get("receipt")
+            if state == "spawned" and isinstance(prior, dict):
+                duplicate = dict(prior)
+                duplicate["duplicate"] = True
+                return duplicate
+            raise PeerError(f"message {message_id} is already recorded as {state}; refusing duplicate spawn")
+        if peer_id in endpoints:
+            raise PeerError(f"peer {peer_id} already exists; spawn names are single-use")
+        write_record("inbox", validated, "spawning", origin_host=origin_host, spawn_profile=name)
+    finally:
+        lock.close()
+    try:
+        intro_body: str | None = None
+        intro_file = profile.get("intro_file")
+        if intro_file:
+            intro_body = pathlib.Path(str(intro_file)).read_text(encoding="utf-8").strip() or None
+        command = profile.get("command")
+        if not isinstance(command, list) or not command:
+            raise PeerError(f"spawn profile {name!r} has no argv")
+        started = start_peer(
+            str(profile["herdr_session"]), agent_name, str(cwd), [str(part) for part in command],
+            intro_body=intro_body,
+        )
+        endpoint = {
+            "provider": str(profile["provider"]),
+            "session_id": agent_name,
+            "herdr_session": str(profile["herdr_session"]),
+            "herdr_target": agent_name,
+            "repo_root": str(cwd),
+            "accept_from": [str(source["peer_id"])],
+            "delivery": "pane",
+            "spawned_by": {"message_id": message_id, "profile": name, "origin_host": origin_host},
+        }
+        lock = ledger_lock()
+        try:
+            current = read_registry()
+            current_endpoints = current["endpoints"]
+            assert isinstance(current_endpoints, dict)
+            current_endpoints[peer_id] = endpoint
+            write_registry(current)
+        finally:
+            lock.close()
+        try:
+            first = deliver_herdr(validated, endpoint)
+        except PeerError as error:
+            first = {"delivered": False, "reason": str(error)}
+        result = receipt(
+            validated,
+            "spawned",
+            spawn={
+                "profile": name,
+                "peer_id": peer_id,
+                "herdr_session": endpoint["herdr_session"],
+                "workspace": started.get("workspace"),
+                "intro": started.get("intro"),
+            },
+            delivery=first,
+            duplicate=False,
+            origin_host=origin_host,
+        )
+        lock = ledger_lock()
+        try:
+            write_record("inbox", validated, "spawned", receipt=result, origin_host=origin_host, spawn_profile=name)
+        finally:
+            lock.close()
+        return result
+    except PeerError as error:
+        lock = ledger_lock()
+        try:
+            write_record("inbox", validated, "failed", error=str(error), origin_host=origin_host, spawn_profile=name)
+        finally:
+            lock.close()
+        raise
+
+
+def command_receive(path: str, origin_host: str | None = None) -> int:
+    pinned = os.environ.get("AGENT_PEER_ORIGIN_HOST") or None
+    if origin_host and pinned and origin_host != pinned:
+        raise PeerError("--origin-host disagrees with AGENT_PEER_ORIGIN_HOST")
+    origin_host = origin_host or pinned
     if path == "-":
         try:
             envelope = json.load(sys.stdin)
@@ -2101,7 +2357,7 @@ def command_receive(path: str) -> int:
             raise PeerError(f"stdin is not valid JSON: {error}") from error
     else:
         envelope = load_json(pathlib.Path(path))
-    emit_wire(receive_envelope(envelope))
+    emit_wire(receive_envelope(envelope, origin_host))
     return 0
 
 
@@ -2188,6 +2444,7 @@ def compose_envelope(
     lease_id: str | None,
     kind: str = "task",
     in_reply_to: str | None = None,
+    spawn_profile: str | None = None,
 ) -> dict[str, object]:
     # Cross-zone fix (2026-08-14, first Honey peerbridge envelope): the
     # workspace repo_root names a path on the DESTINATION machine. Same-host
@@ -2215,7 +2472,12 @@ def compose_envelope(
         scopes.add("upstream-integration")
     if (allow_push or allow_pull) and not allow_git:
         raise PeerError("push or pull authority requires Git authority")
-    if handoff is not None:
+    if spawn_profile is not None:
+        if handoff is not None or access != "read" or allow_git or allow_push or allow_pull or lease_id:
+            raise PeerError("a spawn request is read-only and carries no handoff, Git authority or lease")
+        validate_component(spawn_profile, "profile")
+        payload = {"type": "spawn_request", "body": body, "spawn": {"profile": spawn_profile}}
+    elif handoff is not None:
         validate_task_handoff(handoff, access)
         git_mode = handoff_git_mode(handoff)
         if (git_mode != "none") != allow_git:
@@ -2310,6 +2572,31 @@ def command_send(args: argparse.Namespace) -> int:
     return 0
 
 
+def command_spawn(args: argparse.Namespace) -> int:
+    # Ask a (usually remote) host to start a worker from one of ITS spawn
+    # profiles. The body reaches the new worker as a framed peer message.
+    body = body_from_args(args.body, args.body_file)
+    envelope = compose_envelope(
+        from_peer=args.from_peer,
+        to_peer=args.to_peer,
+        repo=args.repo,
+        repo_root=args.repo_root,
+        checkout_id=args.checkout_id,
+        access="read",
+        body=body,
+        handoff=None,
+        allow_git=False,
+        allow_push=False,
+        allow_pull=False,
+        lease_id=None,
+        kind="control",
+        spawn_profile=args.profile,
+    )
+    result = send_envelope(envelope)
+    emit({"envelope": envelope, "receipt": result})
+    return 0
+
+
 def command_outbound_pending(dest_host: str) -> int:
     # Pull-relay half A (2026-08-14): emit this host's transport-failed
     # outbound envelopes destined for dest_host, one JSON object per line, so
@@ -2383,7 +2670,8 @@ def command_pull(host_id: str) -> int:
             continue
         message_id = envelope.get("message_id") if isinstance(envelope, dict) else None
         try:
-            receipt = receive_envelope(envelope)
+            # An envelope drained from host_id must come from host_id.
+            receipt = receive_envelope(envelope, origin_host=host_id)
             pulled.append(
                 {
                     "message_id": message_id,
@@ -2574,6 +2862,8 @@ def command_selftest() -> int:
                 "AGENT_PEER_SSH_BIN",
                 "AGENT_PEER_TEST_CAPTURE",
                 "AGENT_PEER_TEST_CALLS",
+                "AGENT_PEER_DELIVERY_READY_TIMEOUT_MS",
+                "AGENT_PEER_ORIGIN_HOST",
             )
         }
         try:
@@ -2923,6 +3213,130 @@ def command_selftest() -> int:
                 and pull_report.get("count") == 1
                 and pull_report["pulled"][0].get("message_id") == pull_source["message_id"],
             )
+
+            # --- Client-zone senders and remote spawn (2026-09-24) ---
+            os.environ["AGENT_PEER_HERDR_STYLE"] = "cwd"
+            os.environ["AGENT_PEER_HERDR_PROMPT"] = "pane-run"
+            os.environ["AGENT_PEER_DELIVERY_READY_TIMEOUT_MS"] = "100"
+            os.environ["AGENT_PEER_SSH_BIN"] = "/bin/false"
+            zone = blank_registry("host-b")
+            zone["routes"] = {"host-b": {"transport": "local"}, "host-c": {"transport": "ssh", "target": "host-c"}}
+            zone["endpoints"] = {
+                "host-b/codex/session-b": {
+                    "provider": "codex",
+                    "session_id": "session-b",
+                    "herdr_session": "peer-lab",
+                    "herdr_target": "session-b",
+                    "repo_root": str(root),
+                    "accept_from": ["host-a/claude/session-a"],
+                }
+            }
+            zone["spawn_profiles"] = {
+                "worker": {
+                    "provider": "codex",
+                    "herdr_session": "peer-lab",
+                    "cwd": str(root),
+                    "command": ["codex", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high"],
+                    "accept_from": ["host-a/claude/session-a"],
+                    "intro_file": None,
+                }
+            }
+            write_registry(zone)
+
+            def zone_message(sender: str = "host-a/claude/session-a") -> dict[str, object]:
+                return compose_envelope(
+                    from_peer=sender, to_peer="host-b/codex/session-b", repo="fixture",
+                    repo_root=str(root), checkout_id="host-b:zone", access="read",
+                    body="Zone fixture.", handoff=None, allow_git=False, allow_push=False,
+                    allow_pull=False, lease_id=None,
+                )
+
+            def spawn_request(to_peer: str, profile: str = "worker",
+                              sender: str = "host-a/claude/session-a") -> dict[str, object]:
+                return compose_envelope(
+                    from_peer=sender, to_peer=to_peer, repo="fixture", repo_root=str(root),
+                    checkout_id="host-b:spawn", access="read", body="Please take the fixture job.",
+                    handoff=None, allow_git=False, allow_push=False, allow_pull=False,
+                    lease_id=None, kind="control", spawn_profile=profile,
+                )
+
+            def refused(label: str, wanted: str, action) -> None:
+                try:
+                    action()
+                except PeerError as error:
+                    check(label, wanted in str(error), str(error))
+                else:
+                    check(label, False, "accepted")
+
+            refused("origin-binding-rejects-foreign-sender", "transport origin",
+                    lambda: receive_envelope(zone_message(), origin_host="host-z"))
+            pinned = receive_envelope(zone_message(), origin_host="host-a")
+            pinned_record = read_record("inbox", str(pinned["message_id"])) or {}
+            check("origin-binding-accepts-pinned-sender",
+                  pinned.get("state") == "delivered" and pinned.get("origin_host") == "host-a"
+                  and pinned_record.get("origin_host") == "host-a")
+            os.environ["AGENT_PEER_ORIGIN_HOST"] = "host-z"
+            unpinned_file = root / "zone-envelope.json"
+            unpinned_file.write_text(json.dumps(zone_message()), encoding="utf-8")
+            refused("origin-binding-from-forced-command-env", "transport origin",
+                    lambda: command_receive(str(unpinned_file)))
+            os.environ.pop("AGENT_PEER_ORIGIN_HOST", None)
+
+            capture.write_text("[]", encoding="utf-8")
+            request = spawn_request("host-b/codex/spawned-1")
+            spawned = receive_envelope(request, origin_host="host-a")
+            started_argv = json.loads(capture.read_text(encoding="utf-8"))
+            new_endpoint = read_registry()["endpoints"].get("host-b/codex/spawned-1", {})
+            check("spawn-starts-profile-argv",
+                  spawned.get("state") == "spawned"
+                  and "spawned-1" in started_argv and "gpt-5.6-luna" in started_argv
+                  and started_argv[-5:] == ["codex", "--model", "gpt-5.6-luna", "-c", "model_reasoning_effort=high"],
+                  json.dumps(started_argv))
+            check("spawned-endpoint-accepts-only-requester",
+                  new_endpoint.get("accept_from") == ["host-a/claude/session-a"]
+                  and new_endpoint.get("spawned_by", {}).get("profile") == "worker")
+            check("spawn-duplicate-is-idempotent",
+                  receive_envelope(request, origin_host="host-a").get("duplicate") is True)
+            refused("spawn-names-are-single-use", "single-use",
+                    lambda: receive_envelope(spawn_request("host-b/codex/spawned-1"), origin_host="host-a"))
+            refused("spawn-rejects-unlisted-sender", "not allowed by the spawn profile",
+                    lambda: receive_envelope(spawn_request("host-b/codex/spawned-2", sender="host-a/claude/other")))
+            refused("spawn-rejects-unknown-profile", "not registered",
+                    lambda: receive_envelope(spawn_request("host-b/codex/spawned-3", profile="missing")))
+            refused("spawn-rejects-provider-mismatch", "provider does not match",
+                    lambda: receive_envelope(spawn_request("host-b/claude/spawned-4")))
+            refused("spawn-request-carries-no-git", "read-only",
+                    lambda: compose_envelope(
+                        from_peer="host-a/claude/session-a", to_peer="host-b/codex/spawned-5",
+                        repo="fixture", repo_root=str(root), checkout_id="host-b:spawn",
+                        access="read", body="x", handoff=None, allow_git=True, allow_push=False,
+                        allow_pull=False, lease_id=None, kind="control", spawn_profile="worker"))
+            refused("spawn-profile-needs-accept-from", "accept-from",
+                    lambda: command_spawn_profile_set("bare", "codex", "peer-lab", str(root), [], ["codex"], None))
+
+            forged = zone_message()
+            forged_file = root / "forged-pull.json"
+            forged_file.write_text(json.dumps(forged), encoding="utf-8")
+            fake_zone_ssh = root / "ssh-zone"
+            fake_zone_ssh.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                "if 'outbound-pending' in sys.argv:\n"
+                f" print(pathlib.Path({str(forged_file)!r}).read_text(encoding='utf-8'))\n"
+                "else:\n"
+                " raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            fake_zone_ssh.chmod(0o755)
+            os.environ["AGENT_PEER_SSH_BIN"] = str(fake_zone_ssh)
+            zone_io = io.StringIO()
+            with contextlib.redirect_stdout(zone_io):
+                command_pull("host-c")
+            zone_report = json.loads(zone_io.getvalue())
+            check("pull-binds-origin-host",
+                  zone_report.get("count") == 1 and zone_report["pulled"][0].get("state") == "rejected"
+                  and "transport origin" in str(zone_report["pulled"][0].get("error")),
+                  json.dumps(zone_report))
         finally:
             for key, value in old_env.items():
                 if value is None:
@@ -2989,7 +3403,26 @@ def build_parser() -> argparse.ArgumentParser:
     add_body_arguments(reply)
 
     receive = sub.add_parser("receive")
+    receive.add_argument("--origin-host")
     receive.add_argument("path", nargs="?", default="-")
+
+    spawn = sub.add_parser("spawn")
+    spawn.add_argument("--from", dest="from_peer", required=True)
+    spawn.add_argument("--to", dest="to_peer", required=True)
+    spawn.add_argument("--profile", required=True)
+    spawn.add_argument("--repo", required=True)
+    spawn.add_argument("--repo-root", required=True)
+    spawn.add_argument("--checkout-id", required=True)
+    add_body_arguments(spawn)
+
+    profile = sub.add_parser("spawn-profile-set")
+    profile.add_argument("name")
+    profile.add_argument("--provider", required=True)
+    profile.add_argument("--herdr-session", required=True)
+    profile.add_argument("--cwd", required=True)
+    profile.add_argument("--accept-from", action="append", default=[])
+    profile.add_argument("--intro-file")
+    profile.add_argument("profile_command", nargs=argparse.REMAINDER)
     inventory = sub.add_parser("inventory")
     inventory.add_argument("--session")
     sub.add_parser("inbox")
@@ -3053,7 +3486,17 @@ def main() -> int:
         if args.command == "reply":
             return command_reply(args)
         if args.command == "receive":
-            return command_receive(args.path)
+            return command_receive(args.path, args.origin_host)
+        if args.command == "spawn":
+            return command_spawn(args)
+        if args.command == "spawn-profile-set":
+            command = list(args.profile_command)
+            if command and command[0] == "--":
+                command = command[1:]
+            return command_spawn_profile_set(
+                args.name, args.provider, args.herdr_session, args.cwd,
+                args.accept_from, command, args.intro_file,
+            )
         if args.command == "inventory":
             return command_inventory(args.session)
         if args.command == "inbox":
