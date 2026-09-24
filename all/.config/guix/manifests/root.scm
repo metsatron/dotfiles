@@ -1,4 +1,4 @@
-;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:3]]
+;; [[file:../../../../package-guix.org::*Guix User profile manifests][Guix User profile manifests:4]]
 (specifications->manifest
  '(
    "git" "htop" "jq" "direnv" "btop"
@@ -22,4 +22,4 @@
    ;; "fd"
    ;; "bat"
    ))
-;; Guix User profile manifests:3 ends here
+;; Guix User profile manifests:4 ends here
