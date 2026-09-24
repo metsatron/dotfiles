@@ -24,7 +24,7 @@ grep -qx hold "$actions"
 grep -qx 'rejected 1.96.0' <(awk '$1 == "rejected" {print $1, $2}' "$state")
 run_gate 1.96.0 pass
 if grep -qx 'approve 1.96.0' "$actions"; then
-  echo 'known-bad candidate was re-can aried' >&2
+  echo 'known-bad candidate was re-canaried' >&2
   exit 1
 fi
 run_gate 1.97.0 pass
