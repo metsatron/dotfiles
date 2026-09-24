@@ -1,0 +1,96 @@
+#!/usr/bin/env bash
+# Agentify Cortex boot and liveness owner
+
+# The graphical Agentify control center must survive the same cold-boot boundary as
+# its Telegram consumers.  A healthy Telegram process does not imply that Xpra,
+# Brave, or Agentify's control center exists.  This supervisor calls the idempotent
+# =agentify-cortex= owner behind an expected-host guard, a non-blocking singleton
+# lock, bounded retries, and an atomic receipt.  Cron invokes it once after boot and
+# again every two minutes so a later deaf desktop is repaired without multiplying
+# owners.
+
+
+# [[file:../../../sanctuary-cortex.org::*Agentify Cortex boot and liveness owner][Agentify Cortex boot and liveness owner:1]]
+set -euo pipefail
+
+TAG="agentify-cortex-supervise"
+EXPECTED_HOST=""
+DELAY=0
+ATTEMPTS=1
+RETRY_SECONDS=15
+LAUNCH_TIMEOUT=120
+LAUNCHER="${AGENTIFY_CORTEX_SUPERVISE_LAUNCHER:-$HOME/.local/bin/agentify-cortex}"
+STATE_DIR="${AGENTIFY_CORTEX_SUPERVISE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/agentify-cortex-supervise}"
+HOSTNAME_BIN="${AGENTIFY_CORTEX_SUPERVISE_HOSTNAME_BIN:-hostname}"
+TIMEOUT_BIN="${AGENTIFY_CORTEX_SUPERVISE_TIMEOUT_BIN:-timeout}"
+JQ_BIN="${AGENTIFY_CORTEX_SUPERVISE_JQ_BIN:-jq}"
+
+usage() {
+  echo "Usage: $TAG --expected-host HOST [--delay SECONDS] [--attempts COUNT] [--retry-seconds SECONDS] [--launch-timeout SECONDS] [--launcher PATH] [--state-dir PATH]"
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --expected-host) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --delay) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; DELAY="$2"; shift ;;
+    --attempts) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; ATTEMPTS="$2"; shift ;;
+    --retry-seconds) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; RETRY_SECONDS="$2"; shift ;;
+    --launch-timeout) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; LAUNCH_TIMEOUT="$2"; shift ;;
+    --launcher) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; LAUNCHER="$2"; shift ;;
+    --state-dir) [ "$#" -ge 2 ] || { usage >&2; exit 2; }; STATE_DIR="$2"; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --expected-host is required" >&2; exit 2; }
+for value in "$DELAY" "$ATTEMPTS" "$RETRY_SECONDS" "$LAUNCH_TIMEOUT"; do
+  case "$value" in ''|*[!0-9]*) echo "$TAG: timing and attempt values must be non-negative integers" >&2; exit 2 ;; esac
+done
+[ "$ATTEMPTS" -gt 0 ] || { echo "$TAG: --attempts must be positive" >&2; exit 2; }
+[ "$LAUNCH_TIMEOUT" -gt 0 ] || { echo "$TAG: --launch-timeout must be positive" >&2; exit 2; }
+
+CURRENT_HOST="$($HOSTNAME_BIN -s)"
+[ "$CURRENT_HOST" = "$EXPECTED_HOST" ] || {
+  echo "$TAG: refusing host $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  exit 1
+}
+[ -x "$LAUNCHER" ] || { echo "$TAG: launcher is not executable: $LAUNCHER" >&2; exit 69; }
+
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/owner.lock"
+if ! flock -n 9; then
+  echo "$TAG: another supervisor owns the lock"
+  exit 0
+fi
+
+write_receipt() {
+  local status="$1" attempt="$2" detail="$3" tmp
+  tmp="$STATE_DIR/receipt.json.tmp.$$"
+  "$JQ_BIN" -nc \
+    --arg schema "dotcortex.agentify-cortex-supervise.v1" \
+    --arg status "$status" --arg host "$CURRENT_HOST" --arg detail "$detail" \
+    --argjson attempt "$attempt" --argjson timestamp "$(date +%s)" \
+    '{schema:$schema,status:$status,host:$host,attempt:$attempt,detail:$detail,timestamp:$timestamp}' >"$tmp"
+  mv -f "$tmp" "$STATE_DIR/receipt.json"
+}
+
+[ "$DELAY" -eq 0 ] || sleep "$DELAY"
+attempt=1
+while [ "$attempt" -le "$ATTEMPTS" ]; do
+  if "$TIMEOUT_BIN" --signal=TERM "$LAUNCH_TIMEOUT" "$LAUNCHER" 9>&-; then
+    write_receipt ready "$attempt" "launcher healthy"
+    echo "$TAG: ready"
+    exit 0
+  fi
+  rc=$?
+  write_receipt retry "$attempt" "launcher exit $rc"
+  [ "$attempt" -ge "$ATTEMPTS" ] || sleep "$RETRY_SECONDS"
+  attempt=$((attempt + 1))
+done
+
+write_receipt failed "$ATTEMPTS" "bounded attempts exhausted"
+echo "$TAG: failed after $ATTEMPTS attempts" >&2
+exit 1
+# Agentify Cortex boot and liveness owner:1 ends here

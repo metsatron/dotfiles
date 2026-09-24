@@ -40,13 +40,16 @@ DSH_TELEGRAM_LOG_FILE="${DSH_TELEGRAM_LOG_FILE:-$STATE_DIR/deepseek-harness.log}
 DSH_TELEGRAM_READY_MARKER="${DSH_TELEGRAM_READY_MARKER:-$STATE_DIR/deepseek-harness.ready}"
 DSH_TELEGRAM_GENERATION_FILE="${DSH_TELEGRAM_GENERATION_FILE:-$STATE_DIR/deepseek-harness.generation}"
 DSH_TELEGRAM_START_LOCK="${DSH_TELEGRAM_START_LOCK:-$STATE_DIR/deepseek-harness.start.lock}"
-DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-60}"
+# Native Recall, TimeArk, and Agentify initialization can consume roughly a
+# minute on a cold cache.  Leave one additional long-poll interval for the
+# Telegram plugin to publish its generation-bound readiness marker.
+DSH_TELEGRAM_READY_TIMEOUT="${DSH_TELEGRAM_READY_TIMEOUT:-120}"
 DSH_TELEGRAM_LOG_MAX_BYTES="${DSH_TELEGRAM_LOG_MAX_BYTES:-10485760}"
 DSH_TELEGRAM_LOG_KEEP="${DSH_TELEGRAM_LOG_KEEP:-5}"
 DSH_TELEGRAM_NODE_OPTIONS="${DSH_TELEGRAM_NODE_OPTIONS:---dns-result-order=ipv4first --no-network-family-autoselection}"
 DSH_TELEGRAM_PROFILE="${DSH_TELEGRAM_PROFILE:-helmcortex-telegram}"
 DSH_TELEGRAM_PLUGIN_ROOT="${DSH_TELEGRAM_PLUGIN_ROOT:-$HOME/HelmCortex/NEXUS/git/dsh-telegram}"
-DSH_TELEGRAM_WORKSPACE="${DSH_TELEGRAM_WORKSPACE:-$HOME/.local/share/deepseek-harness-telegram/workspace}"
+DSH_TELEGRAM_WORKSPACE="${DSH_TELEGRAM_WORKSPACE:-$HOME/HelmCortex/FORGE/brain/DeepSeek}"
 DSH_HOME="${DSH_HOME:-$HOME/.local/share/deepseek-harness-telegram/dsh-home}"
 DSH_TELEGRAM_SETTINGS_TEMPLATE="${DSH_TELEGRAM_SETTINGS_TEMPLATE:-$AGENTS_DIR/templates/deepseek-harness-settings.yaml}"
 DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE="${DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE:-$AGENTS_DIR/templates/deepseek-harness-cordis.patch.yml}"
@@ -491,6 +494,23 @@ PY
     rm -f "$marker"
 }
 
+deepseek_harness_retire_stale_owner() {
+    local pid other_pid
+    [ -r "$DSH_TELEGRAM_PID_FILE" ] || return 0
+    pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
+    if deepseek_harness_pid_matches "$pid"; then
+        echo "DeepSeek Harness PID file still names a live matching process; refusing stale-owner retirement" >&2
+        return 1
+    fi
+    other_pid="$(deepseek_harness_find_unowned 2>/dev/null || true)"
+    if [ -n "$other_pid" ]; then
+        echo "DeepSeek Harness owner state is stale but an unowned poller uses this profile; refusing cleanup" >&2
+        return 1
+    fi
+    rm -f "$DSH_TELEGRAM_PID_FILE" "$DSH_TELEGRAM_READY_MARKER" "$DSH_TELEGRAM_GENERATION_FILE"
+    echo "DeepSeek Harness retired dead pre-boot owner state"
+}
+
 deepseek_harness_kill_owned() {
     local pid="$1" expected_ticks="$2" current_ticks pgid
     deepseek_harness_pid_matches "$pid" || return 1
@@ -622,7 +642,8 @@ deepseek_harness_load_env() {
         case "$key" in
             TELEGRAM_BOT_TOKEN_FILE|NEURALWATT_API_KEY_FILE|\
             DSH_HOME|DSH_TELEGRAM_PROFILE|DSH_TELEGRAM_WORKSPACE|DSH_TELEGRAM_PLUGIN_ROOT|\
-            DSH_TELEGRAM_MODEL_PROVIDER|DSH_TELEGRAM_MODEL|DSH_TELEGRAM_PROVIDER_BASE_URL)
+            DSH_TELEGRAM_MODEL_PROVIDER|DSH_TELEGRAM_MODEL|DSH_TELEGRAM_PROVIDER_BASE_URL|\
+            DSH_RECALL_MCP_URL)
                 value="${value%\"}"
                 value="${value#\"}"
                 value="${value%\'}"
@@ -703,10 +724,27 @@ deepseek_harness_validate_private_config() {
         echo "DeepSeek Harness profile patch is missing: $profile_patch (copy the credential-containment template exactly)" >&2
         return 1
     fi
-    if ! cmp -s "$profile_patch" "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"; then
+    local expected_patch recall_url tailnet_ip
+    expected_patch="$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"
+    if grep -q '@DSH_RECALL_MCP_URL@' "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"; then
+        recall_url="${DSH_RECALL_MCP_URL:-}"
+        if [ -z "$recall_url" ]; then
+            tailnet_ip="$(tailscale ip -4 2>/dev/null | grep -m1 -E '^[0-9.]+$' || true)"
+            [ -n "$tailnet_ip" ] && recall_url="http://$tailnet_ip:3004/mcp"
+        fi
+        if [ -z "$recall_url" ]; then
+            echo "DeepSeek Harness cannot resolve the Recall MCP URL (set DSH_RECALL_MCP_URL in the private env file, or bring the tailnet up)" >&2
+            return 1
+        fi
+        expected_patch="$(mktemp)"
+        sed "s|@DSH_RECALL_MCP_URL@|$recall_url|g" "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" > "$expected_patch"
+    fi
+    if ! cmp -s "$profile_patch" "$expected_patch"; then
+        [ "$expected_patch" = "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" ] || rm -f "$expected_patch"
         echo "DeepSeek Harness profile patch does not disable native DeepSeek chat/search routes; refusing credential egress" >&2
         return 1
     fi
+    [ "$expected_patch" = "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" ] || rm -f "$expected_patch"
 
     config="$(deepseek_harness_config_file)"
     if [ ! -r "$config" ]; then
@@ -753,6 +791,7 @@ deepseek_harness_preflight_model() {
         python3 - <<'PY'
 import json
 import os
+import ssl
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -767,7 +806,10 @@ request = Request(
     headers={"Authorization": f"Bearer {api_key}"},
 )
 try:
-    with urlopen(request, timeout=15) as response:
+    # Cron's Python trust path may differ from the interactive shell's. Pin the
+    # system CA bundle instead of relying on ambient SSL_CERT_FILE/SSL_CERT_DIR.
+    context = ssl.create_default_context(cafile="/etc/ssl/certs/ca-certificates.crt")
+    with urlopen(request, timeout=15, context=context) as response:
         payload = json.load(response)
 except HTTPError as exc:
     print(f"NeuralWatt model visibility preflight failed: HTTP {exc.code}", file=sys.stderr)
@@ -870,20 +912,27 @@ check_deepseek_harness() {
 }
 
 codex_telegram_running() {
-    local adapter="${CODEX_TELEGRAM_ADAPTER:-$HOME/HelmCortex/FORGE/scripts/codex_telegram.py}"
     local pid_file="$STATE_DIR/codex-helmastra-telegram.pid"
     local ready_file="$STATE_DIR/codex-helmastra-telegram.ready"
-    local pid ready argument
-    [ -r "$pid_file" ] && [ -r "$ready_file" ] || return 1
+    local child_file="$STATE_DIR/codex-helmastra-telegram.child.ready"
+    local pid ready child parent argument supervisor_match=0 adapter_match=0
+    [ -r "$pid_file" ] && [ -r "$ready_file" ] && [ -r "$child_file" ] || return 1
     pid=$(cat "$pid_file")
     ready=$(cat "$ready_file")
-    case "$pid" in *[!0-9]*|'') return 1 ;; esac
+    child=$(cat "$child_file")
+    case "$pid:$child" in *[!0-9:]*|:*|*:) return 1 ;; esac
     [ "$ready" = "$pid" ] || return 1
-    [ -r "/proc/$pid/cmdline" ] || return 1
+    [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$child/cmdline" ] || return 1
     while IFS= read -r -d '' argument; do
-        [ "$argument" = "$adapter" ] && return 0
+        case "$argument" in */FORGE/scripts/codex_supervisor.py) supervisor_match=1 ;; esac
     done < "/proc/$pid/cmdline"
-    return 1
+    [ "$supervisor_match" = 1 ] || return 1
+    while IFS= read -r -d '' argument; do
+        case "$argument" in */FORGE/scripts/codex_telegram.py) adapter_match=1 ;; esac
+    done < "/proc/$child/cmdline"
+    [ "$adapter_match" = 1 ] || return 1
+    parent=$(awk '/^PPid:/ {print $2}' "/proc/$child/status" 2>/dev/null) || return 1
+    [ "$parent" = "$pid" ]
 }
 
 gemma_telegram_running() {
@@ -1230,7 +1279,7 @@ start_agent() {
             if deepseek_harness_ready; then
                 deepseek_harness_release_start_lock
                 echo "deepseek-harness already has a ready owned poller"
-                return 1
+                return 0
             fi
             if deepseek_harness_running; then
                 deepseek_harness_release_start_lock
@@ -1238,11 +1287,7 @@ start_agent() {
                 return 1
             fi
             deepseek_harness_clear_stale_marker || { deepseek_harness_release_start_lock; return 1; }
-            if [ -r "$DSH_TELEGRAM_PID_FILE" ]; then
-                deepseek_harness_release_start_lock
-                echo "DeepSeek Harness owner state is stale or invalid; run telegram-agent-host stop deepseek-harness first" >&2
-                return 1
-            fi
+            deepseek_harness_retire_stale_owner || { deepseek_harness_release_start_lock; return 1; }
             local other_pid
             other_pid="$(deepseek_harness_find_unowned 2>/dev/null || true)"
             if [ -n "$other_pid" ]; then
@@ -1262,6 +1307,9 @@ start_agent() {
             printf '\n=== deepseek-harness launch %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DSH_TELEGRAM_LOG_FILE"
             echo "Starting DeepSeek Harness Telegram profile $DSH_TELEGRAM_PROFILE..."
             (
+                # Keep the launch lock in the short-lived owner only; the
+                # detached poller must not pin it across future boot checks.
+                deepseek_harness_release_start_lock
                 cd "$DSH_TELEGRAM_WORKSPACE"
                 exec nohup setsid env -u TELEGRAM_BOT_TOKEN -u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE -u NEURALWATT_API_KEY \
                     PATH="$AGENT_RUNTIME_PATH" \
