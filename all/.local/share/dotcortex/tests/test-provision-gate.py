@@ -20,9 +20,9 @@ LANE_SCRIPTS = {
     "bun": ROOT / "all/.local/bin/bun-apply",
     "flatpak": ROOT / "linux/.local/bin/flatpak-apply",
 }
-# The pre-gate nala-apply (origin/master 5b101ea25) and nala.mk, pinned in git so
+# The pre-gate nala-apply (origin/master 8bf00b9467) and nala.mk, pinned in git so
 # "other hosts unchanged" is checked against the real old behaviour.
-BASE_REV = "5b101ea25"
+BASE_REV = "8bf00b9467"
 
 STUB = textwrap.dedent("""\
     #!/usr/bin/env bash
