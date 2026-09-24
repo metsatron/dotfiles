@@ -1,0 +1,179 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TAG="helmcortex-skills-sync"
+MARK="# dotcortex:helmcortex-skills-sync"
+REMOTE="${HELMCORTEX_SKILLS_REMOTE:-x230-helmcortex-git:HelmCortex}"
+DIR="${HELMCORTEX_SKILLS_DIR:-$HOME/.local/share/helmcortex/skills-mirror}"
+BRANCH="${HELMCORTEX_SKILLS_BRANCH:-master}"
+STATE="${HELMCORTEX_SKILLS_STATE:-$HOME/.local/state/helmcortex-skills-mirror}"
+
+PATTERNS="$(cat <<'PATTERNS_EOF'
+/FORGE/harness/
+/.agents/skills/
+/FORGE/.agents/skills/
+/FORGE/bridge/.agents/skills/
+/CORTEX/GoldenAge_Loom/*/.agents/skills/
+/AGENTS.md
+/CLAUDE.md
+PATTERNS_EOF
+)"
+
+usage() {
+  cat <<'EOF'
+Usage: helmcortex-skills-sync [sync|status|paths|cron-apply [--remove] [--dry-run]]
+
+Keep a sparse, partial, read-only git mirror of the HelmCortex skill sources.
+  sync         clone or fast-forward the mirror (default); fails loud on a
+               dirty, diverged or foreign mirror
+  status       print the last status.json
+  paths        print the sparse-checkout patterns
+  cron-apply   install the user-crontab schedule (@reboot and every 15 min);
+               --remove removes it, --dry-run prints the resulting crontab
+
+Environment: HELMCORTEX_SKILLS_REMOTE, HELMCORTEX_SKILLS_DIR,
+HELMCORTEX_SKILLS_BRANCH, HELMCORTEX_SKILLS_STATE.
+EOF
+}
+
+write_status() {
+  # $1 ok|error, $2 message
+  mkdir -p "$STATE"
+  local head=""
+  head="$(git -C "$DIR" rev-parse HEAD 2>/dev/null || true)"
+  python3 - "$STATE/status.json" "$1" "$2" "$REMOTE" "$DIR" "$BRANCH" "$head" <<'PY'
+import json, sys, datetime, os
+path, result, message, remote, directory, branch, head = sys.argv[1:8]
+previous = {}
+try:
+    previous = json.load(open(path))
+except Exception:
+    pass
+now = datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+status = {
+    'schema': 'dotcortex.helmcortex-skills-mirror.v1',
+    'result': result, 'message': message, 'checked_at': now,
+    'remote': remote, 'dir': directory, 'branch': branch, 'head': head or None,
+    'last_success': now if result == 'ok' else previous.get('last_success'),
+}
+tmp = path + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(status, f, indent=2)
+    f.write('\n')
+os.replace(tmp, path)
+PY
+}
+
+fail() {
+  write_status error "$1" || true
+  echo "$TAG: $1" >&2
+  exit 1
+}
+
+inside_helmcortex_checkout() {
+  local probe="$1"
+  while [ "$probe" != "/" ] && [ -n "$probe" ]; do
+    if [ -d "$probe/FORGE/harness" ] && [ -d "$probe/LOGS" ]; then
+      return 0
+    fi
+    probe="$(dirname "$probe")"
+  done
+  return 1
+}
+
+do_sync() {
+  command -v git >/dev/null 2>&1 || fail "git is not installed"
+  local parent
+  parent="$(dirname "$DIR")"
+  mkdir -p "$parent" "$STATE"
+  if inside_helmcortex_checkout "$parent"; then
+    fail "refusing: $DIR sits inside a full HelmCortex checkout (the hub needs no mirror)"
+  fi
+  exec 9>"$STATE/lock"
+  if ! flock -n 9; then
+    echo "$TAG: another sync holds the lock; skipping" >&2
+    exit 0
+  fi
+
+  if [ ! -d "$DIR/.git" ]; then
+    if [ -e "$DIR" ] && [ -n "$(ls -A "$DIR" 2>/dev/null)" ]; then
+      fail "refusing: $DIR exists, is not empty and is not a git mirror"
+    fi
+    local tmp="$DIR.partial.$$"
+    rm -rf "$tmp"
+    if ! git clone --quiet --filter=blob:none --no-checkout --branch "$BRANCH" "$REMOTE" "$tmp"; then
+      rm -rf "$tmp"
+      fail "clone from $REMOTE failed"
+    fi
+    git -C "$tmp" sparse-checkout init --no-cone
+    printf '%s\n' "$PATTERNS" | git -C "$tmp" sparse-checkout set --no-cone --stdin
+    if ! git -C "$tmp" checkout --quiet "$BRANCH"; then
+      rm -rf "$tmp"
+      fail "initial checkout failed"
+    fi
+    mv "$tmp" "$DIR"
+    write_status ok "cloned"
+    echo "$TAG: cloned $(git -C "$DIR" rev-parse --short HEAD) into $DIR"
+    return 0
+  fi
+
+  local actual_remote
+  actual_remote="$(git -C "$DIR" remote get-url origin 2>/dev/null || true)"
+  [ "$actual_remote" = "$REMOTE" ] || fail "refusing: mirror origin is '$actual_remote', expected '$REMOTE'"
+  [ -z "$(git -C "$DIR" status --porcelain --untracked-files=no)" ] || fail "refusing: the mirror has local edits; it is read-only by contract"
+  [ "$(git -C "$DIR" symbolic-ref --short HEAD 2>/dev/null || true)" = "$BRANCH" ] || fail "refusing: mirror is not on $BRANCH"
+
+  # Re-apply the patterns every run so a widened list reaches every mirror.
+  printf '%s\n' "$PATTERNS" | git -C "$DIR" sparse-checkout set --no-cone --stdin
+  git -C "$DIR" fetch --quiet origin "$BRANCH" || fail "fetch from $REMOTE failed"
+  local before after
+  before="$(git -C "$DIR" rev-parse HEAD)"
+  if ! git -C "$DIR" merge --quiet --ff-only FETCH_HEAD; then
+    fail "refusing: the hub's $BRANCH is not a fast-forward of the mirror (history rewritten?); re-clone deliberately"
+  fi
+  after="$(git -C "$DIR" rev-parse HEAD)"
+  if [ "$before" = "$after" ]; then
+    write_status ok "current"
+  else
+    write_status ok "updated ${before:0:9}..${after:0:9}"
+    echo "$TAG: updated ${before:0:9}..${after:0:9}"
+  fi
+}
+
+do_cron_apply() {
+  local mode=install dry=0
+  for arg in "$@"; do
+    case "$arg" in
+      --remove) mode=remove ;;
+      --dry-run) dry=1 ;;
+      *) echo "$TAG: unknown cron-apply argument: $arg" >&2; exit 2 ;;
+    esac
+  done
+  command -v crontab >/dev/null 2>&1 || { echo "$TAG: no crontab binary on this host — nothing installed" >&2; exit 1; }
+  mkdir -p "$STATE"
+  local existing managed="" result
+  existing="$(crontab -l 2>/dev/null | grep -vF "$MARK" || true)"
+  if [ "$mode" = install ]; then
+    local env_prefix=""
+    [ -n "${HELMCORTEX_SKILLS_REMOTE:-}" ] && env_prefix="HELMCORTEX_SKILLS_REMOTE=$HELMCORTEX_SKILLS_REMOTE "
+    [ -n "${HELMCORTEX_SKILLS_DIR:-}" ] && env_prefix="${env_prefix}HELMCORTEX_SKILLS_DIR=$HELMCORTEX_SKILLS_DIR "
+    local cmd="${env_prefix}\$HOME/.local/bin/helmcortex-skills-sync sync >/dev/null 2>>\$HOME/.local/state/helmcortex-skills-mirror/cron-errors.log"
+    managed="$(printf '%s\n%s' "@reboot sleep 90; $cmd $MARK" "*/15 * * * * $cmd $MARK")"
+  fi
+  result="$(printf '%s\n%s\n' "$existing" "$managed" | sed '/^[[:space:]]*$/d')"
+  if [ "$dry" = 1 ]; then
+    printf '%s\n' "$result"
+    return 0
+  fi
+  printf '%s\n' "$result" | crontab -
+  echo "$TAG: cron schedule ${mode}ed"
+}
+
+case "${1:-sync}" in
+  -h|--help|help) usage ;;
+  sync) do_sync ;;
+  status) cat "$STATE/status.json" 2>/dev/null || { echo "$TAG: no status yet" >&2; exit 1; } ;;
+  paths) printf '%s\n' "$PATTERNS" ;;
+  cron-apply) shift; do_cron_apply "$@" ;;
+  *) echo "$TAG: unknown verb: $1" >&2; usage >&2; exit 2 ;;
+esac
