@@ -1,0 +1,201 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+TAG="claude-warm-openrc-apply"
+MODE="dry-run"
+SERVICE="claude-warm"
+WARM_USER="$(id -un)"
+CWD=""
+SESSION="warm"
+AGENT=""
+LOG=""
+RUNTIME=""
+EXPECTED_HOST=""
+TARGET_DIR="${CLAUDE_WARM_OPENRC_TARGET:-/etc/init.d}"
+RUNLEVEL_DIR="${CLAUDE_WARM_OPENRC_RUNLEVEL:-/etc/runlevels/default}"
+ARGS=()
+
+usage() {
+  cat <<EOF
+Usage: $TAG --cwd DIR --agent NAME [--service NAME] [--user USER] [--session NAME]
+       [--runtime-dir DIR] [--log PATH] [--host EXACT_HOST]
+       [--dry-run | --check | --apply | --remove] -- CLAUDE_WARM_ARGS...
+Render the OpenRC boot owner for a warm Claude consort (agents-claude-idle-supervisor.org).
+--dry-run (default) prints it; --check compares it with the installed script;
+--apply / --remove need --host equal to this host and an OpenRC service manager.
+Nothing is ever started, stopped or restarted: bounce warm consorts via nurse-joy.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --service) SERVICE="${2:?}"; shift ;;
+    --user) WARM_USER="${2:?}"; shift ;;
+    --cwd) CWD="${2:?}"; shift ;;
+    --session) SESSION="${2:?}"; shift ;;
+    --agent) AGENT="${2:?}"; shift ;;
+    --runtime-dir) RUNTIME="${2:?}"; shift ;;
+    --log) LOG="${2:?}"; shift ;;
+    --host) EXPECTED_HOST="${2:?}"; shift ;;
+    --dry-run) MODE="dry-run" ;;
+    --check) MODE="check" ;;
+    --apply) MODE="apply" ;;
+    --remove) MODE="remove" ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; ARGS=("$@"); break ;;
+    *) echo "$TAG: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+safe() { printf '%s' "$1" | grep -Eq '^[A-Za-z0-9._/@:=+-]+$'; }
+for value in "$SERVICE" "$WARM_USER" "$SESSION"; do
+  safe "$value" || { echo "$TAG: unsafe value: $value" >&2; exit 2; }
+done
+
+substrate_is_openrc() {
+  case "${CLAUDE_WARM_OPENRC_PROBE:-live}" in
+    openrc) return 0 ;;
+    none) return 1 ;;
+  esac
+  [ -d /run/openrc ] && return 0
+  command -v dpkg >/dev/null 2>&1 && dpkg -S /etc/init.d/rc 2>/dev/null | grep -q '^openrc:' && return 0
+  return 1
+}
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+TARGET="$TARGET_DIR/$SERVICE"
+if [ "$MODE" = remove ]; then
+  [ -n "$EXPECTED_HOST" ] || { echo "$TAG: --remove requires --host EXACT_HOST" >&2; exit 2; }
+  [ "$(hostname)" = "$EXPECTED_HOST" ] || { echo "$TAG: refusing on $(hostname); expected $EXPECTED_HOST" >&2; exit 1; }
+  substrate_is_openrc || { echo "$TAG: service manager is not OpenRC; refusing" >&2; exit 3; }
+  run_priv rc-update del "$SERVICE" default >/dev/null 2>&1 || true
+  run_priv rm -f "$TARGET"
+  echo "$TAG: removed $TARGET and its default runlevel link (a running supervisor is left alone)"
+  exit 0
+fi
+
+[ -n "$CWD" ] || { echo "$TAG: --cwd is required" >&2; exit 2; }
+[ -n "$AGENT" ] || { echo "$TAG: --agent (a fleet-unique Herdr agent name) is required" >&2; exit 2; }
+safe "$CWD" && safe "$AGENT" || { echo "$TAG: unsafe --cwd or --agent" >&2; exit 2; }
+for arg in "${ARGS[@]}"; do
+  safe "$arg" || { echo "$TAG: unsafe claude-warm argument: $arg" >&2; exit 2; }
+done
+
+PASSWD="$(getent passwd "$WARM_USER" || true)"
+[ -n "$PASSWD" ] || { echo "$TAG: unknown user: $WARM_USER" >&2; exit 2; }
+WARM_UID="$(printf '%s' "$PASSWD" | cut -d: -f3)"
+WARM_HOME="$(printf '%s' "$PASSWD" | cut -d: -f6)"
+RUNTIME="${RUNTIME:-/run/$SESSION}"
+LOG="${LOG:-/var/log/$SERVICE.log}"
+safe "$RUNTIME" && safe "$LOG" || { echo "$TAG: unsafe --runtime-dir or --log" >&2; exit 2; }
+WARM_ARGS="${ARGS[*]:-}"
+
+render() {
+  cat <<EOF
+#!/sbin/openrc-run
+# Warm Claude consort under OpenRC at boot (headless host).
+# Rendered by claude-warm-openrc-apply from agents-claude-idle-supervisor.org
+# ("Boot owner on OpenRC hosts"). Re-render instead of editing this file.
+#
+# claude-warm runs inside a detached tmux session; the tmux pane gives the PTY
+# supervisor its persistent terminal. Control it with claude-warmctl and bounce
+# it only through nurse-joy, both with XDG_RUNTIME_DIR=${RUNTIME}.
+
+name="${SERVICE}"
+description="Warm Claude consort (PTY supervisor + idle auto-compaction)"
+
+warm_user="${WARM_USER}"
+warm_uid="${WARM_UID}"
+warm_home="${WARM_HOME}"
+warm_cwd="${CWD}"
+warm_session="${SESSION}"
+# Fleet-unique Herdr agent name: nurse-joy manages consorts across machines.
+warm_agent="${AGENT}"
+warm_log="${LOG}"
+# A runtime dir this service owns under /run. Never /run/user/<uid>: that is a
+# per-login tmpfs that does not exist at a headless boot.
+xdg="${RUNTIME}"
+warm_path="\${warm_home}/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+depend() {
+    use net dns
+    after net elogind dbus
+}
+
+start_pre() {
+    checkpath -d -m 0700 -o "\${warm_user}:\${warm_user}" "\${xdg}"
+    checkpath -f -m 0644 -o "\${warm_user}:\${warm_user}" "\${warm_log}"
+}
+
+# Matches ONLY this supervisor's cmdline (python3 <path>/claude-warm).
+warm_match="\${warm_home}/.local/bin/claude-warm"
+
+start() {
+    ebegin "Starting warm Claude consort (tmux: \${warm_session}, cwd: \${warm_cwd})"
+    su -l "\${warm_user}" -c "XDG_RUNTIME_DIR='\${xdg}' PATH='\${warm_path}' CLAUDE_WARM_HERDR_AGENT='\${warm_agent}' \\
+        tmux new-session -d -s '\${warm_session}' -c '\${warm_cwd}' \\
+        -e XDG_RUNTIME_DIR='\${xdg}' -e PATH='\${warm_path}' -e CLAUDE_WARM_HERDR_AGENT='\${warm_agent}' \\
+        'exec \${warm_home}/.local/bin/claude-warm ${WARM_ARGS} >> \${warm_log} 2>&1'"
+    eend \$? "Failed to start warm consort"
+}
+
+stop() {
+    ebegin "Stopping warm Claude consort"
+    # claude-warm ignores SIGHUP and survives its pane: SIGTERM the supervisor
+    # itself, then tear down the tmux session.
+    pkill -TERM -u "\${warm_user}" -f "\${warm_match}" 2>/dev/null
+    local i=0
+    while pgrep -u "\${warm_user}" -f "\${warm_match}" >/dev/null 2>&1 && [ \$i -lt 10 ]; do
+        sleep 1; i=\$((i+1))
+    done
+    pgrep -u "\${warm_user}" -f "\${warm_match}" >/dev/null 2>&1 && \\
+        pkill -KILL -u "\${warm_user}" -f "\${warm_match}" 2>/dev/null
+    su -l "\${warm_user}" -c "tmux kill-session -t '\${warm_session}'" 2>/dev/null
+    eend 0
+}
+
+status() {
+    # Truth is the supervisor process, not the tmux pane.
+    if pgrep -u "\${warm_user}" -f "\${warm_match}" >/dev/null 2>&1; then
+        einfo "warm consort supervisor is running"
+        return 0
+    fi
+    einfo "warm consort is not running"
+    return 3
+}
+EOF
+}
+
+case "$MODE" in
+  dry-run)
+    substrate_is_openrc || echo "# $TAG: note: this host's service manager is not OpenRC; --apply would refuse" >&2
+    echo "# $TAG: would install $TARGET" >&2
+    render
+    ;;
+  check)
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    render >"$tmp"
+    if cmp -s "$tmp" "$TARGET"; then
+      echo "$TAG: $TARGET matches the rendered contract"
+    else
+      echo "$TAG: drift or missing: $TARGET" >&2
+      exit 1
+    fi
+    ;;
+  apply)
+    [ -n "$EXPECTED_HOST" ] || { echo "$TAG: --apply requires --host EXACT_HOST" >&2; exit 2; }
+    [ "$(hostname)" = "$EXPECTED_HOST" ] || { echo "$TAG: refusing on $(hostname); expected $EXPECTED_HOST" >&2; exit 1; }
+    substrate_is_openrc || { echo "$TAG: service manager is not OpenRC; refusing" >&2; exit 3; }
+    tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+    render >"$tmp"
+    run_priv install -m 0755 "$tmp" "$TARGET"
+    run_priv rc-update add "$SERVICE" default >/dev/null
+    if [ ! -e "$RUNLEVEL_DIR/$SERVICE" ]; then
+      echo "$TAG: rc-update reported success but $RUNLEVEL_DIR/$SERVICE is missing; the service would not start at boot" >&2
+      exit 1
+    fi
+    echo "$TAG: installed $TARGET and verified $RUNLEVEL_DIR/$SERVICE (not started; bounce via nurse-joy)"
+    ;;
+esac
