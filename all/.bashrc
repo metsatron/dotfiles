@@ -87,9 +87,8 @@ if [ -z "${__SIGNATURE_SHOWN:-}" ]; then
 fi
 
 
-export NVM_DIR="$HOME/.config/nvm"
-[ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"  # This loads nvm
-[ -s "$NVM_DIR/bash_completion" ] && \. "$NVM_DIR/bash_completion"  # This loads nvm bash_completion
+# nvm is not loaded: node comes from the Guix core profile, global npm tools
+# from the ~/.npm-global prefix (package-npm.org), which nvm refuses to share.
 # ~/.cargo/env is now sourced earlier (before .bash_prompt) in the module list.
 
 # --- kitty shell integration (no-op outside kitty) ---
