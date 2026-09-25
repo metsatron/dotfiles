@@ -335,5 +335,38 @@ class OpenCodeGoCredentialTests(unittest.TestCase):
         self.assertNotIn("token", result)
 
 
+class ResultOrderTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def test_provider_grouping_puts_local_before_remote(self):
+        items = [
+            {"provider": "codex", "label": "Codex"},
+            {"provider": "claude", "label": "Claude Code"},
+            {"provider": "opencode-go", "label": "OpenCode Go"},
+            {"provider": "openrouter", "label": "OpenRouter"},
+            {"provider": "codex", "label": "Gillean · Codex", "remote": "Gillean"},
+            {"provider": "claude", "label": "Gillean · Claude Code", "remote": "Gillean"},
+        ]
+        self.assertEqual(
+            [item["label"] for item in self.ai_usage.order_results(items)],
+            ["Codex", "Gillean · Codex", "Claude Code", "Gillean · Claude Code",
+             "OpenCode Go", "OpenRouter"],
+        )
+
+    def test_remote_panels_keep_file_order_and_unknowns_go_last(self):
+        items = [
+            {"provider": "neuralwatt", "label": "NeuralWatt"},
+            {"provider": "codex", "label": "Gillean · Codex", "remote": "Gillean"},
+            {"provider": "codex", "label": "X230 · Codex", "remote": "X230"},
+            {"provider": "codex", "label": "Codex"},
+        ]
+        self.assertEqual(
+            [item["label"] for item in self.ai_usage.order_results(items)],
+            ["Codex", "Gillean · Codex", "X230 · Codex", "NeuralWatt"],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
