@@ -2,7 +2,10 @@
 import importlib.machinery
 import importlib.util
 import io
+import json
+import os
 import re
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -185,6 +188,151 @@ class NeuralWattObservationTests(unittest.TestCase):
         failed = {"provider": "neuralwatt", "label": "NeuralWatt", "state": "error", "source": "api",
                   "summary": "https://api.neuralwatt.com/v1/quota returned HTTP 429", "raw": None}
         self.assertIs(self.ai_usage.apply_neuralwatt_observation(failed, self.now), failed)
+
+
+# Redacted fixture: the real 2026-09-25 GET /zen/go/v1/usage shape (keys/types
+# confirmed live), synthetic values, no identifiers. There is no per-model or
+# dollar field in this API: each window is percent used + ISO reset + status.
+OPENCODE_GO_FIXTURE = {
+    "usage": {
+        "rolling": {"percent": 17, "resetsAt": "2026-09-25T07:30:00Z", "status": "ok"},
+        "weekly": {"percent": 75, "resetsAt": "2026-09-28T00:00:00Z", "status": "ok"},
+        "monthly": {"percent": 91, "resetsAt": "2026-10-01T00:00:00Z", "status": "ok"},
+    }
+}
+
+
+class OpenCodeGoObservationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+        cls.now = datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)
+
+    def ok(self, raw):
+        return {"provider": "opencode-go", "label": "OpenCode Go", "state": "ok",
+                "source": "api", "summary": "", "raw": raw}
+
+    def test_window_fixture(self):
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(OPENCODE_GO_FIXTURE), self.now)
+        self.assertEqual(result["state"], "ok")
+        obs = result["observation"]
+        self.assertEqual(obs["schema"], "opencode-go.usage.v1")
+        self.assertEqual(obs["collected_at"], "2026-09-25T03:00:00+00:00")
+        self.assertEqual(obs["windows"]["rolling"]["used_percent"], 17)
+        self.assertEqual(obs["windows"]["rolling"]["remaining_percent"], 83)
+        self.assertEqual(obs["windows"]["monthly"]["resets_at"], "2026-10-01T00:00:00Z")
+        self.assertEqual(result["summary"], "tightest 30d 91% used")
+
+    def test_window_at_limit(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        raw["usage"]["rolling"] = {"percent": 100, "resetsAt": "2026-09-25T07:30:00Z", "status": "ok"}
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(result["observation"]["windows"]["rolling"]["remaining_percent"], 0)
+        self.assertEqual(result["summary"], "tightest 5h 100% used")
+
+    def test_non_ok_status_is_surfaced(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        raw["usage"]["monthly"]["status"] = "blocked"
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["summary"], "tightest 30d 91% used; 30d status=blocked")
+
+    def test_schema_drift_missing_window_is_an_error(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        del raw["usage"]["weekly"]
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("missing usage.weekly", result["summary"])
+        self.assertNotIn("observation", result)
+
+    def test_out_of_range_percent_is_an_error(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        raw["usage"]["rolling"]["percent"] = 170
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("outside 0-100", result["summary"])
+
+    def test_non_ok_probe_passes_through(self):
+        failed = {"provider": "opencode-go", "label": "OpenCode Go", "state": "error",
+                  "source": "api", "summary": "HTTP 429", "raw": None}
+        self.assertIs(self.ai_usage.apply_opencode_go_observation(failed, self.now), failed)
+
+    def test_renderer_draws_all_three_windows(self):
+        fixed_now = datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz else fixed_now.replace(tzinfo=None)
+
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(OPENCODE_GO_FIXTURE), fixed_now)
+        output = io.StringIO()
+        with patch.object(self.ai_usage, "datetime", FixedDateTime), redirect_stdout(output):
+            self.ai_usage.render_text([result])
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", output.getvalue())
+
+        self.assertRegex(plain, re.compile(r"5h\s+.*83%"))
+        self.assertRegex(plain, re.compile(r"wk\s+.*25%"))
+        self.assertRegex(plain, re.compile(r"30d\s+.*9%"))
+
+
+class OpenCodeGoCredentialTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def test_env_key_wins_over_auth_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = Path(tmp) / "auth.json"
+            auth.write_text(json.dumps({"opencode-go": {"type": "api", "key": "file-key"}}), encoding="utf-8")
+            captured = {}
+
+            def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+                captured["provider"] = provider
+                captured["token"] = token
+                captured["url"] = url
+                return {"provider": provider, "label": label, "state": "error", "source": "api",
+                        "summary": "stub", "raw": None}
+
+            with patch.dict(os.environ, {"OPENCODE_API_KEY": "env-key"}), \
+                 patch.object(self.ai_usage, "OPENCODE_AUTH_FILE", auth), \
+                 patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+                result = self.ai_usage.fetch_opencode_go(1.0)
+
+            self.assertEqual(captured["token"], "env-key")
+            self.assertEqual(captured["provider"], "opencode-go")
+            self.assertEqual(result["state"], "error")
+
+    def test_auth_file_key_used_when_env_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = Path(tmp) / "auth.json"
+            auth.write_text(
+                json.dumps({"openai": {}, "opencode-go": {"type": "api", "key": "file-key"}}),
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+                captured["token"] = token
+                return {"provider": provider, "label": label, "state": "ok", "source": "api",
+                        "summary": "", "raw": json.loads(json.dumps(OPENCODE_GO_FIXTURE))}
+
+            with patch.dict(os.environ, {"OPENCODE_API_KEY": ""}), \
+                 patch.object(self.ai_usage, "OPENCODE_AUTH_FILE", auth), \
+                 patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+                result = self.ai_usage.fetch_opencode_go(1.0)
+
+            self.assertEqual(captured["token"], "file-key")
+            self.assertEqual(result["state"], "ok")
+
+    def test_no_credential_reports_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "auth.json"
+            with patch.dict(os.environ, {"OPENCODE_API_KEY": ""}), \
+                 patch.object(self.ai_usage, "OPENCODE_AUTH_FILE", missing):
+                result = self.ai_usage.fetch_opencode_go(1.0)
+        self.assertEqual(result["state"], "missing")
+        self.assertNotIn("token", result)
 
 
 if __name__ == "__main__":
