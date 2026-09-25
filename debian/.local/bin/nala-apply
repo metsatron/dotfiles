@@ -14,6 +14,20 @@ BRAVE_GATE="${HOME}/.local/bin/brave-canary-gate"
 HOST_EXCLUDES_BIN="${HOME}/.local/bin/host-excludes"
 [ -x "$HOST_EXCLUDES_BIN" ] || HOST_EXCLUDES_BIN="${HOME}/DotCortex/all/.local/bin/host-excludes"
 
+# Per-host provisioning gate (package-host-gates.org). An ungated host prints
+# "open" and takes the unchanged path below; a gated host (Honey) takes
+# gated_apply: its own manifest, dry-run unless PROVISION_APPLY=1, never removes.
+PROVISION_GATE_BIN="${HOME}/.local/bin/provision-gate"
+[ -x "$PROVISION_GATE_BIN" ] || PROVISION_GATE_BIN="${DOTCORTEX_ROOT:-$HOME/DotCortex}/all/.local/bin/provision-gate"
+GATE_MODE=open
+if [ -x "$PROVISION_GATE_BIN" ]; then
+  GATE_MODE="$("$PROVISION_GATE_BIN" mode nala)"
+fi
+if [ "$GATE_MODE" != open ] && [ -z "${NALA_SSV:-}" ]; then
+  GATED_MAN="$("$PROVISION_GATE_BIN" manifest)"
+  [ -n "$GATED_MAN" ] && MAN="$GATED_MAN"
+fi
+
 if [ ! -f "$MAN" ]; then
   echo "No manifest at $MAN" >&2
   exit 1
@@ -29,6 +43,22 @@ fi
 IS_DEVUAN=0
 [ -f /etc/devuan_version ] && IS_DEVUAN=1
 
+nala_hostname() {
+  printf '%s\n' "${NALA_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
+}
+
+# Hostnames the provisioning registries know: column 1 of host-excludes.ssv and
+# host-gates.ssv, repo copy and stowed copy (env overrides win, as in their helpers).
+known_host_scope() {
+  local root="${DOTCORTEX_ROOT:-$HOME/DotCortex}" f
+  for f in "${HOST_EXCLUDES:-}" "$HOME/.provision/host-excludes.ssv" "$root/all/.provision/host-excludes.ssv" \
+           "${PROVISION_GATES:-}" "$HOME/.provision/host-gates.ssv" "$root/all/.provision/host-gates.ssv"; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    awk -v h="$1" '/^[ \t]*#/ || NF==0 { next } $1==h { found=1; exit } END { exit(found?0:1) }' "$f" && return 0
+  done
+  return 1
+}
+
 scope_matches() {
   local scope="$1"
   case "$scope" in
@@ -36,9 +66,93 @@ scope_matches() {
     devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
     ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
     vendefoul-only) [ "$OS_ID" = "vendefoul" ] ;;
-    *) return 0 ;;
+    *)
+      # Host scope: a SCOPE that names a host the provisioning registries already
+      # know (host-excludes.ssv, host-gates.ssv; keyed by hostname -s) applies on
+      # that host only: kikin-kushi, beelink. A truly unknown scope keeps the old
+      # behaviour (installs everywhere) but says so on stderr.
+      if known_host_scope "$scope"; then
+        [ "$scope" = "$(nala_hostname)" ]
+        return
+      fi
+      echo "nala-apply: warning: unknown SCOPE '$scope' treated as shared (see package-nala.org)" >&2
+      return 0
+      ;;
   esac
 }
+
+# --- Gated hosts: additive-only, dry-run by default, never removes ---
+manifest_rows() {
+  awk -v FS='[ \t]+' '
+    function dq(s){ return (s == "\"\"" ? "" : s) }
+    /^[ \t]*#/ || NF==0 { next }
+    { printf "%s|%s|%s|%s|%s\n", dq($1), dq($2), dq($3), dq($4), dq($5) }
+  ' "$MAN"
+}
+
+gated_apply() {
+  local mode="$1" pkg _ver _cat scope _extra sim
+  local satisfied=() install=() missing=() held=()
+  echo "nala-apply: gated host (mode: $mode): additive only; nothing is ever removed here"
+  echo "  manifest: $MAN"
+  while IFS='|' read -r pkg _ver _cat scope _extra; do
+    [ -z "$pkg" ] && continue
+    scope_matches "$scope" || continue
+    if [ -x "$HOST_EXCLUDES_BIN" ] && "$HOST_EXCLUDES_BIN" nala "$pkg"; then
+      continue
+    fi
+    if [ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null)" = "ii " ]; then
+      satisfied+=("$pkg")
+    elif apt-cache show "$pkg" >/dev/null 2>&1; then
+      install+=("$pkg")
+    else
+      missing+=("$pkg")
+    fi
+  done < <(manifest_rows)
+
+  if [ -x "$HOST_EXCLUDES_BIN" ]; then
+    while IFS= read -r pkg; do
+      [ -n "$pkg" ] && dpkg -s "$pkg" >/dev/null 2>&1 && held+=("$pkg")
+    done < <("$HOST_EXCLUDES_BIN" nala)
+  fi
+
+  echo "  satisfied (${#satisfied[@]}): ${satisfied[*]:-}"
+  echo "  to install (${#install[@]}): ${install[*]:-}"
+  [ "${#missing[@]}" -eq 0 ] || echo "  not in apt repos (${#missing[@]}): ${missing[*]}"
+  [ "${#held[@]}" -eq 0 ] || echo "  host-excluded but installed (${#held[@]}): ${held[*]} -- never removed on a gated host"
+  echo "  skipped on gated host: nala bootstrap, nala upgrade, removals, Brave canary gate, release-backed .deb sync"
+
+  if [ "${#install[@]}" -eq 0 ]; then
+    echo "Nothing to install."
+    return 0
+  fi
+
+  # With --no-remove apt aborts if the transaction would remove anything; the
+  # Remv/Purg scan is a second, independent refusal.
+  if ! sim="$(apt-get -s --no-remove -o APT::Get::AutomaticRemove=false install "${install[@]}" 2>&1)"; then
+    echo "REFUSED: apt-get simulation failed; a gated host installs only transactions that remove nothing" >&2
+    printf '%s\n' "$sim" | tail -20 >&2
+    return 3
+  fi
+  if printf '%s\n' "$sim" | grep -qE '^(Remv|Purg) '; then
+    echo "REFUSED: the install transaction would remove packages on a gated host:" >&2
+    printf '%s\n' "$sim" | grep -E '^(Remv|Purg) ' >&2
+    return 3
+  fi
+  echo "  simulation: $(printf '%s\n' "$sim" | grep -c '^Inst ') package(s) would be installed, 0 removed"
+
+  if [ "$mode" != additive ]; then
+    echo "dry-run (default on gated hosts): nothing installed. PROVISION_APPLY=1 installs the ${#install[@]} package(s) above; removals are never run here."
+    return 0
+  fi
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-remove -o APT::Get::AutomaticRemove=false "${install[@]}"
+  echo "Done (additive)."
+}
+
+if [ "$GATE_MODE" != open ]; then
+  gated_apply "$GATE_MODE"
+  exit $?
+fi
 
 # --- Bootstrap nala if missing ---
 APT="apt-get"
