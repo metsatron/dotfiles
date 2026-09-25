@@ -1980,11 +1980,13 @@ def fetch_deepinfra(timeout_seconds: float) -> dict[str, Any]:
 #   NeuralWatt: OpenAI-compatible, base https://api.neuralwatt.com/v1, key is
 #     an sk-... token in NEURALWATT_API_KEY. It ships its OWN usage routes (NOT
 #     OpenAI's /dashboard/billing path): /v1/quota (balance/usage/limits),
-#     /v1/usage/energy, /v1/usage/summary. The two research lanes DISAGREED on
-#     the quota JSON schema and the primary docs page would not load, so the
-#     exact field names are UNCONFIRMED. Hence pass-through (compact_json), no
-#     hardcoded field parser, and an env-overridable URL so it repoints without
-#     a code change if /v1/quota turns out wrong. Verify live before hardening.
+#     /v1/usage/energy, /v1/usage/summary. Schema CONFIRMED 2026-09-25 against
+#     the official docs (docs.neuralwatt.com/api/quota) and a live response:
+#     snapshot_at, balance, usage.{lifetime,current_month}, limits,
+#     subscription (object or null), key.{name,allowance}. The live balance
+#     also carries undocumented legacy_credits_usd/new_credits_usd, kept raw.
+#     Rate limit: 1 req/s per customer (429 + Retry-After). Parsed by
+#     neuralwatt_observation(); drift from the schema is an error, not a guess.
 #
 #   Fireworks: auth is Bearer FIREWORKS_API_KEY. There is NO numeric spend or
 #     credit REST endpoint — that data is firectl-CLI / Stripe only. The one
@@ -2077,7 +2079,119 @@ def fetch_neuralwatt(timeout_seconds: float) -> dict[str, Any]:
             "raw": None,
         }
     url = os.environ.get("NEURALWATT_USAGE_URL", "https://api.neuralwatt.com/v1/quota")
-    return _bearer_json_probe("neuralwatt", "NeuralWatt", url, token, timeout_seconds)
+    result = _bearer_json_probe("neuralwatt", "NeuralWatt", url, token, timeout_seconds)
+    return apply_neuralwatt_observation(result, collected_at=datetime.now(timezone.utc))
+
+
+NEURALWATT_SCHEMA = "neuralwatt.quota.v1"
+NEURALWATT_REQUIRED = ("snapshot_at", "balance", "usage", "limits", "subscription", "key")
+
+
+def _num(value: Any) -> float | None:
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def neuralwatt_observation(data: Any, collected_at: datetime) -> dict[str, Any]:
+    """Normalize a /v1/quota body. Raises ValueError on schema drift."""
+    if not isinstance(data, dict):
+        raise ValueError("quota body is not an object")
+    missing = [key for key in NEURALWATT_REQUIRED if key not in data]
+    if missing:
+        raise ValueError("quota schema drift: missing " + ", ".join(missing))
+    balance = data["balance"] if isinstance(data["balance"], dict) else None
+    usage = data["usage"] if isinstance(data["usage"], dict) else None
+    limits = data["limits"] if isinstance(data["limits"], dict) else None
+    key = data["key"] if isinstance(data["key"], dict) else None
+    if balance is None or usage is None or limits is None or key is None:
+        raise ValueError("quota schema drift: balance/usage/limits/key must be objects")
+    if _num(balance.get("credits_remaining_usd")) is None:
+        raise ValueError("quota schema drift: balance.credits_remaining_usd is not a number")
+    month = usage.get("current_month") if isinstance(usage.get("current_month"), dict) else {}
+    sub_raw = data["subscription"] if isinstance(data["subscription"], dict) else None
+    allowance_raw = key.get("allowance") if isinstance(key.get("allowance"), dict) else None
+    subscription = None
+    if sub_raw is not None:
+        subscription = {
+            "plan": sub_raw.get("plan"),
+            "status": sub_raw.get("status"),
+            "billing_interval": sub_raw.get("billing_interval"),
+            "period_start": sub_raw.get("current_period_start"),
+            "period_end": sub_raw.get("current_period_end"),
+            "kwh_included": _num(sub_raw.get("kwh_included")),
+            "kwh_used": _num(sub_raw.get("kwh_used")),
+            "kwh_remaining": _num(sub_raw.get("kwh_remaining")),
+            "in_overage": sub_raw.get("in_overage"),
+        }
+    allowance = None
+    if allowance_raw is not None:
+        allowance = {
+            "period": allowance_raw.get("period"),
+            "limit_usd": _num(allowance_raw.get("limit_usd")),
+            "spent_usd": _num(allowance_raw.get("spent_usd")),
+            "remaining_usd": _num(allowance_raw.get("remaining_usd")),
+            "blocked": allowance_raw.get("blocked"),
+        }
+    # Balance, subscription allowance and key allowance are separate quantities
+    # with separate owners of truth; they are never summed or substituted.
+    return {
+        "schema": NEURALWATT_SCHEMA,
+        "observed_at": data.get("snapshot_at"),
+        "collected_at": collected_at.astimezone(timezone.utc).isoformat(),
+        "accounting_method": balance.get("accounting_method"),
+        "balance": {
+            "remaining_usd": _num(balance.get("credits_remaining_usd")),
+            "total_usd": _num(balance.get("total_credits_usd")),
+            "used_usd": _num(balance.get("credits_used_usd")),
+        },
+        "current_month": {
+            "cost_usd": _num(month.get("cost_usd")),
+            "requests": month.get("requests") if isinstance(month.get("requests"), int) else None,
+            "tokens": month.get("tokens") if isinstance(month.get("tokens"), int) else None,
+            "energy_kwh": _num(month.get("energy_kwh")),
+        },
+        "overage_limit_usd": _num(limits.get("overage_limit_usd")),
+        "rate_limit_tier": limits.get("rate_limit_tier"),
+        "subscription": subscription,
+        "key_allowance": allowance,
+    }
+
+
+def neuralwatt_summary(observation: dict[str, Any]) -> str:
+    parts: list[str] = []
+    remaining = observation["balance"]["remaining_usd"]
+    parts.append(f"balance ${remaining:.2f}")
+    month_cost = observation["current_month"]["cost_usd"]
+    if month_cost is not None:
+        parts.append(f"month ${month_cost:.2f}")
+    subscription = observation["subscription"]
+    if subscription:
+        plan = subscription.get("plan") or "plan"
+        status = subscription.get("status") or "?"
+        used, included = subscription.get("kwh_used"), subscription.get("kwh_included")
+        if used is not None and included:
+            parts.append(f"{plan} {status} {used:g}/{included:g} kWh")
+        else:
+            parts.append(f"{plan} {status}")
+        if subscription.get("in_overage"):
+            parts.append("IN OVERAGE")
+    else:
+        parts.append("no subscription")
+    allowance = observation["key_allowance"]
+    if allowance and allowance.get("remaining_usd") is not None:
+        parts.append(f"key {allowance.get('period')} ${allowance['remaining_usd']:.2f} left")
+        if allowance.get("blocked"):
+            parts.append("KEY BLOCKED")
+    return "; ".join(parts)
+
+
+def apply_neuralwatt_observation(result: dict[str, Any], collected_at: datetime) -> dict[str, Any]:
+    if result.get("state") != "ok":
+        return result
+    try:
+        observation = neuralwatt_observation(result.get("raw"), collected_at)
+    except ValueError as error:
+        return {**result, "state": "error", "summary": str(error)}
+    return {**result, "summary": neuralwatt_summary(observation), "observation": observation}
 
 
 def _fireworks_summary(data: Any) -> str:
