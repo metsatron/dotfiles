@@ -251,6 +251,25 @@ hermes         2010   no
 pi             2011   yes
 #+END_SRC
 
+*** Clearance groups — who may read what (FLEET LAW)
+=cortex= opens the shared repos to every agent. Some material inside them is
+not for every vendor: a clearance group closes a path to everyone outside it.
+Members are the operator plus the listed tools' agent users; every other agent
+user must NOT be a member, and =agent-fleet-check= reports one that is.
+
+=palm= (2020) — PalmCortex and client material (clients, invoices, client
+session logs and chats). Cleared: Claude and Hermes with NeuralWatt. Not
+cleared: Codex/ChatGPT (OpenAI), OpenCode global models, Gemini, Pi. Ruling,
+Mètsàtron 2026-09-25: client business data goes only to vendors he and his
+clients have chosen to trust with it. Which paths carry the group is private
+data kept beside the private repo (HelmCortex =ROOTS/JSON/agent-boundaries/=),
+applied by =agent-restrict=.
+
+#+BEGIN_SRC text :tangle all/.config/agent-cli/groups.ssv :mkdirp yes :comments no :noweb no
+# group        gid    cleared tools (comma list)
+palm           2020   claude,hermes
+#+END_SRC
+
 *** Fleet membership — which hosts must carry the agent users
 Every host listed here must carry every =provision yes= agent at its canonical
 uid, the =cortex= group at 2000, and the human operator in =cortex=. Aliases are
@@ -766,6 +785,143 @@ if __name__ == "__main__":
     unittest.main()
 #+END_SRC
 
+*** Script: agent-restrict (dry-run by default)
+
+Applies a clearance group (=groups.ssv=) to a private list of paths inside a
+shared repo: each listed directory becomes =GROUP=-owned =2770= (owner and
+group only, setgid), each listed file =GROUP=-owned with no other-access. Only
+the listed entry changes — closing a directory's own mode shuts everything
+beneath it to non-members, so inner files keep their =cortex= modes untouched.
+Paths carrying named ACL entries are refused (an ACL could re-open what the
+mode closes). Every =--apply= first writes the prior group/mode of each entry
+and a restore script to =~/.local/state/agent-restrict/=.
+
+=--check= proves it from both sides when agent users exist: every cleared
+agent must reach each path, every uncleared one must be refused.
+
+Known limit, stated plainly: file modes cannot guard git history. An agent that
+can run git in the repo can still =git show= an old version of a restricted
+file. The durable fix is a separate private repo for the restricted material;
+until then, the wall is the working tree only.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-restrict :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/bin/agent-restrict
+# Close listed repo paths to a clearance group. DRY-RUN unless --apply.
+set -euo pipefail
+
+CONF="${AGENT_CLI_CONF:-$HOME/.config/agent-cli}"
+STATE="${AGENT_RESTRICT_STATE:-$HOME/.local/state/agent-restrict}"
+MODE=dry-run
+GROUP=""
+ROOT=""
+LIST=""
+
+usage() {
+  cat <<'EOF'
+Usage: agent-restrict GROUP --root DIR --paths FILE [--apply|--check|--help]
+  GROUP       a clearance group from groups.ssv (e.g. palm)
+  --root      the repo the listed paths are relative to
+  --paths     file of repo-relative paths, one per line (# comments)
+  (no flag)   show what would change; change nothing
+  --apply     record prior group/mode + restore script, then restrict
+  --check     verify modes, and (with sudo) cleared agents in / others out
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --root) shift; ROOT="${1:-}" ;;
+    --paths) shift; LIST="${1:-}" ;;
+    --apply) MODE=apply ;;
+    --check) MODE=check ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 2 ;;
+    *) [ -z "$GROUP" ] || { usage >&2; exit 2; }; GROUP="$1" ;;
+  esac
+  shift
+done
+[ -n "$GROUP" ] && [ -n "$ROOT" ] && [ -n "$LIST" ] || { usage >&2; exit 2; }
+[ -r "$LIST" ] || { echo "FATAL: path list not readable: $LIST" >&2; exit 1; }
+ROOT="$(cd "$ROOT" && pwd -P)"
+spec="$(awk -v g="$GROUP" '$1 == g {print $2, $3}' "$CONF/groups.ssv" 2>/dev/null)"
+[ -n "$spec" ] || { echo "FATAL: $GROUP is not a clearance group in $CONF/groups.ssv" >&2; exit 1; }
+read -r gid cleared <<<"$spec"
+ent="$(getent group "$GROUP" || true)"
+[ -n "$ent" ] && [ "$(printf '%s' "$ent" | cut -d: -f3)" = "$gid" ] \
+  || { echo "FATAL: group $GROUP missing or not gid $gid here (agent-users-bootstrap first)" >&2; exit 1; }
+
+paths=()
+while IFS= read -r line; do
+  line="${line%%#*}"; line="$(printf '%s' "$line" | sed 's/[[:space:]]*$//')"
+  [ -n "$line" ] || continue
+  if [ ! -e "$ROOT/$line" ]; then echo "skip (absent): $line"; continue; fi
+  if [ -L "$ROOT/$line" ]; then echo "skip (symlink): $line"; continue; fi
+  paths+=("$line")
+done < "$LIST"
+
+acl_named() { getfacl -cp "$1" 2>/dev/null | grep -qE '^(user|group):[^:]+:'; }
+target_mode() { if [ -d "$1" ]; then echo 2770; else printf '%o' $(( ($(stat -c '0%a' "$1") & 0770) | 0060 )); fi; }
+
+fail=0
+for p in "${paths[@]}"; do
+  f="$ROOT/$p"
+  if acl_named "$f"; then echo "REFUSE (named ACL entries): $p"; fail=1; continue; fi
+  have="$(stat -c '%G %a' "$f")"
+  want="$GROUP $(target_mode "$f")"
+  if [ "$have" = "$want" ]; then
+    [ "$MODE" = check ] && echo "OK   $p"
+  elif [ "$MODE" = check ]; then
+    echo "FAIL $p is '$have', want '$want'"; fail=1
+  else
+    echo "$([ "$MODE" = apply ] && echo '+' || echo 'DRY-RUN:') $p: $have -> $want"
+  fi
+done
+
+if [ "$MODE" = check ]; then
+  if sudo -n true 2>/dev/null; then
+    for u in $(getent passwd | cut -d: -f1 | grep '^agent-' || true); do
+      t="${u#agent-}"
+      case ",$cleared," in *",$t,"*) want=reach ;; *) want=refused ;; esac
+      for p in "${paths[@]}"; do
+        if sudo -n -u "$u" -H test -r "$ROOT/$p" 2>/dev/null && { [ ! -d "$ROOT/$p" ] || sudo -n -u "$u" -H ls "$ROOT/$p" >/dev/null 2>&1; }; then got=reach; else got=refused; fi
+        if [ "$got" = "$want" ]; then echo "OK   $u $got $p"; else echo "FAIL $u $got $p (want $want)"; fail=1; fi
+      done
+    done
+  else
+    echo "note: no sudo — agent-side verification skipped (UNVERIFIED)"
+  fi
+  exit "$fail"
+fi
+
+[ "$fail" -eq 0 ] || { echo "FATAL: refused paths above; nothing changed" >&2; exit 1; }
+if [ "$MODE" = dry-run ]; then
+  echo "(dry-run complete — re-run with --apply after approval)"
+  exit 0
+fi
+
+mkdir -p "$STATE"; chmod 700 "$STATE"
+stamp="$GROUP-$(basename "$ROOT")-$(date +%Y%m%d-%H%M%S)"
+: > "$STATE/$stamp.tsv"
+for p in "${paths[@]}"; do printf '%s\t%s\t%s\n' "$(stat -c %a "$ROOT/$p")" "$(stat -c %G "$ROOT/$p")" "$p" >> "$STATE/$stamp.tsv"; done
+cat > "$STATE/restore-$stamp.sh" <<EOF
+#!/usr/bin/env bash
+# agent-restrict restore: $GROUP on $ROOT
+set -euo pipefail
+cd $(printf '%q' "$ROOT")
+while IFS=\$'\t' read -r mode grp path; do
+  chgrp "\$grp" -- "\$path"; chmod "\$(printf '%05d' "\$mode")" -- "\$path"
+done < $(printf '%q' "$STATE/$stamp.tsv")
+EOF
+chmod 700 "$STATE/restore-$stamp.sh"
+echo "restore script: $STATE/restore-$stamp.sh"
+for p in "${paths[@]}"; do
+  f="$ROOT/$p"
+  chgrp "$GROUP" -- "$f"
+  chmod "$(target_mode "$f")" -- "$f"
+done
+echo "restricted. verify: agent-restrict $GROUP --root $ROOT --paths $LIST --check"
+#+END_SRC
+
 *** NFS gotchas for agent users (cost an hour; do not rediscover)
 - With =manage-gids=y= (mountd), the server IGNORES the client's AUTH_SYS group list
   and looks up groups *server-side by numeric uid*. The agent user (with matching
@@ -988,6 +1144,32 @@ for tool in $AGENTS; do
   fi
   run sudo usermod -aG cortex "$user"
 done
+
+# Clearance groups: create at the canonical gid, add the operator and the
+# cleared agents that exist here. Removing an uncleared member is never
+# automatic — agent-fleet-check reports it for a human decision.
+GROUPS_FILE="${AGENT_GROUPS_FILE:-$(dirname "$UIDS")/groups.ssv}"
+if [ -r "$GROUPS_FILE" ]; then
+  while read -r grp gid cleared _rest; do
+    case "$grp" in ""|\#*) continue ;; esac
+    if ! getent group "$grp" >/dev/null 2>&1; then
+      if getent group "$gid" >/dev/null 2>&1; then
+        echo "COLLISION: gid $gid (for $grp) held by group '$(getent group "$gid" | cut -d: -f1)' — reconcile manually"
+        continue
+      fi
+      run sudo groupadd -g "$gid" "$grp"
+    elif [ "$(getent group "$grp" | cut -d: -f3)" != "$gid" ]; then
+      echo "WARNING: group $grp is not gid $gid — reconcile manually"
+      continue
+    fi
+    id -nG "$OPERATOR" | tr ' ' '\n' | grep -qx "$grp" || run sudo usermod -aG "$grp" "$OPERATOR"
+    for t in ${cleared//,/ }; do
+      u="agent-$t"
+      id "$u" >/dev/null 2>&1 || continue
+      id -nG "$u" | tr ' ' '\n' | grep -qx "$grp" || run sudo usermod -aG "$grp" "$u"
+    done
+  done < "$GROUPS_FILE"
+fi
 
 echo "NFS note: if this host serves NFS with manage-gids, flush after changes:"
 echo "  sudo exportfs -f && echo 1 | sudo tee /proc/net/rpc/auth.unix.gid/flush"
@@ -1284,6 +1466,7 @@ set -euo pipefail
 CONF="${AGENT_CLI_CONF:-$HOME/.config/agent-cli}"
 UIDS="$CONF/uids.ssv"
 FLEET="$CONF/fleet.ssv"
+GROUPS_FILE="$CONF/groups.ssv"
 CORTEX_GID=2000
 OPERATOR="$(id -un)"
 PROVISION=0
@@ -1318,6 +1501,10 @@ done
 
 # "tool:uid" pairs for every agent provisioned on the mesh.
 EXPECT="$(awk '$1 !~ /^#/ && $3 == "yes" {printf "%s:%s ", $1, $2}' "$UIDS")"
+# "@group:gid:tool+tool" per clearance group (optional file).
+if [ -r "$GROUPS_FILE" ]; then
+  EXPECT="$EXPECT$(awk '$1 !~ /^#/ && NF >= 3 {gsub(",", "+", $3); printf "@%s:%s:%s ", $1, $2, $3}' "$GROUPS_FILE")"
+fi
 
 # Runs on the target host. Args: operator cortex_gid tool:uid...
 # Prints one verdict line per check: OK|DRIFT|MISSING|COLLISION <subject> <detail>.
@@ -1335,6 +1522,27 @@ fi
 if id -nG "$op" 2>/dev/null | tr ' ' '\n' | grep -qx cortex; then echo "OK $op in cortex"
 else echo "DRIFT $op not in cortex"; fi
 for pair in "$@"; do
+  case "$pair" in
+    @*)
+      spec="${pair#@}"; grp="${spec%%:*}"; rest="${spec#*:}"; gid="${rest%%:*}"; cleared="+${rest#*:}+"
+      ent="$(getent group "$grp" || true)"
+      if [ -z "$ent" ]; then
+        owner="$(getent group "$gid" | cut -d: -f1)"
+        [ -n "$owner" ] && echo "COLLISION $grp gid $gid held by group $owner" || echo "MISSING $grp group"
+        continue
+      fi
+      [ "$(printf '%s' "$ent" | cut -d: -f3)" = "$gid" ] || { echo "DRIFT $grp gid $(printf '%s' "$ent" | cut -d: -f3) (canon $gid)"; continue; }
+      id -nG "$op" | tr ' ' '\n' | grep -qx "$grp" && echo "OK $op in $grp" || echo "DRIFT $op not in $grp"
+      for u in $(getent passwd | cut -d: -f1 | grep '^agent-'); do
+        t="${u#agent-}"; inside=no
+        id -nG "$u" | tr ' ' '\n' | grep -qx "$grp" && inside=yes
+        case "$cleared" in
+          *"+$t+"*) [ "$inside" = yes ] && echo "OK $u in $grp" || echo "DRIFT $u not in $grp" ;;
+          *) [ "$inside" = yes ] && echo "BREACH $u in $grp (not cleared)" || echo "OK $u kept out of $grp" ;;
+        esac
+      done
+      continue ;;
+  esac
   tool="${pair%%:*}"; uid="${pair##*:}"; u="agent-$tool"
   if ent="$(getent passwd "$u")"; then
     hu="$(printf '%s' "$ent" | cut -d: -f3)"; hg="$(printf '%s' "$ent" | cut -d: -f4)"
@@ -1381,7 +1589,7 @@ while read -r alias hn _rest <&3; do
   if printf '%s\n' "$out" | grep -qv '^OK '; then
     [ "$rc" -lt 1 ] && rc=1
     missing="$(printf '%s\n' "$out" | awk '$1 == "MISSING" && $2 ~ /^agent-/ {sub(/^agent-/, "", $2); printf "%s%s", sep, $2; sep=","}')"
-    fixable="$(printf '%s\n' "$out" | grep -E '^MISSING cortex|^DRIFT [^ ]+ not in cortex$|^DRIFT agent-[^ ]+ not-in-cortex$' || true)"
+    fixable="$(printf '%s\n' "$out" | grep -E '^MISSING [a-z]+ group$|^DRIFT [^ ]+ not in [a-z]+$|^DRIFT agent-[^ ]+ not-in-cortex$' || true)"
     if [ "$PROVISION" -eq 1 ] && { [ -n "$missing" ] || [ -n "$fixable" ]; }; then
       cmd=('$HOME/.local/bin/agent-users-bootstrap')
       [ -n "$missing" ] && cmd+=(--only "$missing")
