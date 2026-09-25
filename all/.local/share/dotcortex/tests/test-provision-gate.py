@@ -136,6 +136,19 @@ class GateHelperTests(unittest.TestCase):
         self.assertEqual(self.gate("manifest").stdout.strip(), "/repo/debian/x.ssv")
         self.assertEqual(self.gate("manifest", gated=False).stdout.strip(), "")
 
+    def test_lane_prefers_the_account_lane(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hosts = Path(tmp) / "hosts"
+            hosts.mkdir()
+            (hosts / "testhost.ssv").write_text("")
+            self.assertEqual(self.gate("lane", tmp, PROVISION_GATE_ACCOUNT="someone").stdout.strip(),
+                             f"{tmp}/hosts/testhost.ssv")
+            (hosts / "testhost@someone.ssv").write_text("")
+            self.assertEqual(self.gate("lane", tmp, PROVISION_GATE_ACCOUNT="someone").stdout.strip(),
+                             f"{tmp}/hosts/testhost@someone.ssv")
+            self.assertEqual(self.gate("lane", tmp, PROVISION_GATE_ACCOUNT="other").stdout.strip(),
+                             f"{tmp}/hosts/testhost.ssv")
+
     def test_unknown_gate_name_fails_safe(self):
         result = self.gate("gate", PROVISION_GATE_HOSTNAME="other")
         self.assertEqual(result.stdout.strip(), "additive")
@@ -252,6 +265,24 @@ class GatedNalaTests(unittest.TestCase):
         finally:
             box.close()
 
+    def test_gated_npm_dry_run_uses_the_account_lane(self):
+        box = Sandbox(gated=True)
+        try:
+            lane_dir = box.home / "DotCortex/all/.npm/manifest/hosts"
+            lane_dir.mkdir(parents=True)
+            (lane_dir.parent / "global.ssv").write_text('fleet-only "" "" "global" "registry" "" "" ""\n')
+            (lane_dir / "testhost.ssv").write_text('hers "" "" "global" "registry" "" "" ""\n')
+            (lane_dir / "testhost@guest.ssv").write_text('mine "" "" "global" "registry" "" "" ""\n')
+            result, calls = box.run(LANE_SCRIPTS["npm"], PROVISION_GATE_ACCOUNT="guest")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("testhost@guest.ssv declares 1 package(s): mine", result.stdout)
+            self.assertNotIn("hers", result.stdout)
+            self.assertEqual(calls, [])
+            result, _calls = box.run(LANE_SCRIPTS["npm"], PROVISION_GATE_ACCOUNT="owner")
+            self.assertIn("testhost.ssv declares 1 package(s): hers", result.stdout)
+        finally:
+            box.close()
+
     def test_beelink_scoped_rows_apply_on_honey_only(self):
         rows = ['honeyonly "" stack beelink ""', 'git "" bootstrap shared ""']
         for host, expected in (("testhost", "to install (0)"), ("beelink", "to install (1): honeyonly")):
@@ -267,7 +298,9 @@ class GatedNalaTests(unittest.TestCase):
 
 HONEY_NALA_LANE = ROOT / "debian/.nala/manifest/hosts/beelink.ssv"
 HONEY_NPM_LANE = ROOT / "all/.npm/manifest/hosts/beelink.ssv"
-HONEY_TO_INSTALL = {"python3-venv", "keychain", "tree", "pkg-config", "libfreetype-dev", "libfontconfig-dev"}
+HONEY_METSATRON_NPM_LANE = ROOT / "all/.npm/manifest/hosts/beelink@metsatron.ssv"
+HONEY_TO_INSTALL = {"python3-venv", "keychain", "tree", "pkg-config", "libfreetype-dev", "libfontconfig-dev",
+                    "nodejs", "npm"}
 
 
 def declared(path):
@@ -290,6 +323,10 @@ class HoneyLaneTests(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)), "duplicate rows")
         self.assertEqual({row[3] for row in rows}, {"beelink"})
 
+    def test_metsatron_lane_is_claude_code_and_bun_only(self):
+        self.assertEqual(declared(HONEY_METSATRON_NPM_LANE), {"@anthropic-ai/claude-code", "bun"})
+        self.assertTrue({"nodejs", "npm"} <= declared(HONEY_NALA_LANE))
+
     @unittest.skipUnless(on_honey() and shutil.which("apt-mark"), "live drift check runs on Honey only")
     def test_every_manual_package_on_honey_is_declared(self):
         manual = set(subprocess.run(["apt-mark", "showmanual"], capture_output=True, text=True,
@@ -305,13 +342,14 @@ class HoneyLaneTests(unittest.TestCase):
         self.assertEqual(sorted(live - declared(HONEY_NPM_LANE)), [])
 
     @unittest.skipUnless(on_honey(), "live dry-run runs on Honey only")
-    def test_honey_dry_run_installs_only_the_six_and_removes_nothing(self):
+    def test_honey_dry_run_installs_only_the_eight_and_removes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             trap = Path(tmp) / "sudo"
             log = Path(tmp) / "sudo.log"
             trap.write_text(f'#!/bin/sh\necho "sudo $*" >> {log}\nexit 99\n')
             trap.chmod(0o755)
-            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}")
+            # Plan from this checkout's manifest, not whatever ~/DotCortex has checked out.
+            env = dict(os.environ, PATH=f"{tmp}:{os.environ['PATH']}", DOTCORTEX_ROOT=str(ROOT))
             for key in ("PROVISION_APPLY", "NALA_SSV", "PROVISION_GATES", "PROVISION_GATE_HOSTNAME",
                         "HOST_EXCLUDES", "HOST_EXCLUDES_HOSTNAME", "NALA_HOSTNAME"):
                 env.pop(key, None)
