@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""fleet-health-ingest: forced-command receiver for one client host's health JSON.
+
+Runs as the forced command of a single restricted SSH key, for example:
+
+  command="/usr/bin/python3 <home>/.local/bin/fleet-health-ingest --host beelink",from="<client tailnet address>",restrict ssh-ed25519 AAAA... <comment>
+
+The host is pinned by the key's forced command, never by the document or by
+SSH_ORIGINAL_COMMAND (which is ignored), so a client can only write its own slot.
+
+It reads stdin (capped), checks that it is a JSON object of schema
+honey.health.v1 for the pinned host, and atomically writes
+~/.local/state/fleet-health/<host>.json plus a dated copy under history/
+(newest 14 kept). It does nothing else. Exit codes: 0 stored, 2 usage,
+3 too large, 4 invalid document, 5 write failure.
+"""
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import tempfile
+
+MAX_BYTES = 256 * 1024
+KEEP = 14
+STATE = os.path.join(os.path.expanduser("~"), ".local", "state", "fleet-health")
+SCHEMAS = {"honey.health.v1"}
+HOSTS = {"beelink"}
+TOP_KEYS = {"schema", "schema_version", "host", "generated_at", "checks", "summary",
+            "cleared", "previous_run", "redactions", "collector"}
+REQUIRED = {"schema", "schema_version", "host", "generated_at", "checks", "summary"}
+STATUSES = {"ok", "warn", "crit", "unknown"}
+VERDICTS = {"green", "amber", "red", "unknown"}
+# Defence in depth: the client allowlists its document; refuse anything that still carries an address or a home path.
+FORBIDDEN = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}\b|/home/|/root/", re.I)
+
+
+class Reject(Exception):
+    def __init__(self, code, msg):
+        super().__init__(msg)
+        self.code = code
+
+
+def log(line):
+    try:
+        with open(os.path.join(STATE, "ingest.log"), "a") as f:
+            f.write(datetime.datetime.now().astimezone().isoformat(timespec="seconds") + " " + line + "\n")
+    except OSError:
+        pass
+
+
+def strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for k, v in obj.items():
+            yield str(k)
+            yield from strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from strings(v)
+
+
+def reject_constant(name):
+    raise ValueError("non-finite number " + name)
+
+
+def validate(raw, host):
+    try:
+        doc = json.loads(raw.decode("utf-8"), parse_constant=reject_constant)
+    except (UnicodeDecodeError, ValueError) as e:
+        raise Reject(4, "not valid JSON: %s" % type(e).__name__)
+    if not isinstance(doc, dict):
+        raise Reject(4, "top level is not an object")
+    missing = REQUIRED - doc.keys()
+    if missing:
+        raise Reject(4, "missing keys: " + ",".join(sorted(missing)))
+    extra = doc.keys() - TOP_KEYS
+    if extra:
+        raise Reject(4, "unknown top-level keys: %d" % len(extra))
+    if doc["schema"] not in SCHEMAS or doc["schema_version"] != 1:
+        raise Reject(4, "wrong schema")
+    if doc["host"] != host:
+        raise Reject(4, "host does not match the key's pinned host")
+    try:
+        gen = datetime.datetime.fromisoformat(doc["generated_at"])
+    except (TypeError, ValueError):
+        raise Reject(4, "generated_at is not ISO 8601")
+    if gen.tzinfo is None:
+        raise Reject(4, "generated_at has no timezone")
+    summary = doc["summary"]
+    if not isinstance(summary, dict) or summary.get("verdict") not in VERDICTS:
+        raise Reject(4, "summary.verdict missing or invalid")
+    checks = doc["checks"]
+    if not isinstance(checks, list) or not checks:
+        raise Reject(4, "checks is not a non-empty list")
+    for c in checks:
+        if not isinstance(c, dict) or not isinstance(c.get("id"), str) or c.get("status") not in STATUSES:
+            raise Reject(4, "a check lacks a string id or a valid status")
+    if any(FORBIDDEN.search(s) for s in strings(doc)):
+        raise Reject(4, "document carries an address or home path")
+    return gen
+
+
+def write_atomic(path, data):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".ingest-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def main(argv):
+    if len(argv) != 3 or argv[1] != "--host" or argv[2] not in HOSTS:
+        print("usage: fleet-health-ingest --host <pinned host>", file=sys.stderr)
+        return 2
+    host = argv[2]
+    os.umask(0o077)
+    os.makedirs(os.path.join(STATE, "history"), mode=0o700, exist_ok=True)
+    raw = sys.stdin.buffer.read(MAX_BYTES + 1)
+    try:
+        if len(raw) > MAX_BYTES:
+            raise Reject(3, "input exceeds %d bytes" % MAX_BYTES)
+        gen = validate(raw, host)
+        with open(os.path.join(STATE, ".lock"), "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if gen > datetime.datetime.now().astimezone() + datetime.timedelta(hours=1):
+                raise Reject(4, "generated_at is in the future")
+            try:
+                with open(os.path.join(STATE, host + ".json"), "rb") as f:
+                    current = datetime.datetime.fromisoformat(json.load(f)["generated_at"])
+            except (OSError, ValueError, KeyError, TypeError):
+                current = None
+            if current is not None and gen < current:
+                raise Reject(4, "older than the stored document (replay)")
+            try:
+                write_atomic(os.path.join(STATE, host + ".json"), raw)
+                write_atomic(os.path.join(STATE, "history", "%s-%s.json" % (host, gen.date().isoformat())), raw)
+            except OSError as e:
+                raise Reject(5, "write failed: %s" % type(e).__name__)
+            hist = sorted(n for n in os.listdir(os.path.join(STATE, "history"))
+                          if re.fullmatch(re.escape(host) + r"-\d{4}-\d{2}-\d{2}\.json", n))
+            for old in hist[:-KEEP]:
+                os.unlink(os.path.join(STATE, "history", old))
+    except Reject as e:
+        log("REJECT host=%s bytes=%d code=%d %s" % (host, len(raw), e.code, e))
+        print("rejected: %s" % e, file=sys.stderr)
+        return e.code
+    digest = hashlib.sha256(raw).hexdigest()[:12]
+    log("OK host=%s bytes=%d generated_at=%s sha256=%s" % (host, len(raw), gen.isoformat(), digest))
+    print("stored %s %d bytes sha256:%s" % (host, len(raw), digest))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
