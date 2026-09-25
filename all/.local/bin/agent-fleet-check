@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# Script: agent-fleet-check (read-only unless --provision --apply)
+
+# The fleet-wide answer to "does every machine carry the same agent users at the
+# same uids?". It reads the two ssv files above, probes each fleet host from its
+# own vantage (locally for this host, over public-key-only SSH for the rest), and
+# reports per host: the =cortex= gid, the operator's =cortex= membership, and every
+# =provision yes= agent's uid, primary gid and =cortex= membership. A uid held by a
+# different name is a COLLISION and is never auto-fixed.
+
+# =--provision= turns the drift into the fix: on each drifting host it runs that
+# host's own =agent-users-bootstrap --only <missing>= — dry-run, unless
+# =--apply= is also given (which, per the rollout law, needs the operator's word).
+# Collisions and unreachable hosts are reported, never provisioned. Toolchains,
+# keys, logins and home sealing stay per-host steps (=agent-provision=, sealing
+# recipe above).
+
+# Exit: 0 all hosts conform, 1 drift or collision, 2 a host was unreachable.
+
+
+# [[file:../../../agents.org::*Script: agent-fleet-check (read-only unless --provision --apply)][Script: agent-fleet-check (read-only unless --provision --apply):1]]
+# ~/DotCortex/all/.local/bin/agent-fleet-check
+# Probe every fleet host for canonical agent users. Read-only by default.
+set -euo pipefail
+
+CONF="${AGENT_CLI_CONF:-$HOME/.config/agent-cli}"
+UIDS="$CONF/uids.ssv"
+FLEET="$CONF/fleet.ssv"
+CORTEX_GID=2000
+OPERATOR="$(id -un)"
+PROVISION=0
+APPLY=0
+HOSTS_ONLY=""
+
+usage() {
+  cat <<'EOF'
+Usage: agent-fleet-check [--host ALIAS[,ALIAS...]] [--provision [--apply]]
+  (no flag)    report agent-user conformance on every fleet host; change nothing
+  --host       limit to these fleet aliases
+  --provision  on drifting hosts, run that host's agent-users-bootstrap for the
+               missing agents (dry-run)
+  --apply      with --provision: create them (needs the operator's word)
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --host) shift; HOSTS_ONLY="${1:-}" ;;
+    --provision) PROVISION=1 ;;
+    --apply) APPLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+  shift
+done
+[ "$APPLY" -eq 1 ] && [ "$PROVISION" -eq 0 ] && { echo "--apply needs --provision" >&2; exit 2; }
+for f in "$UIDS" "$FLEET"; do
+  [ -r "$f" ] || { echo "FATAL: missing $f (loom stow first)" >&2; exit 2; }
+done
+
+# "tool:uid" pairs for every agent provisioned on the mesh.
+EXPECT="$(awk '$1 !~ /^#/ && $3 == "yes" {printf "%s:%s ", $1, $2}' "$UIDS")"
+
+# Runs on the target host. Args: operator cortex_gid tool:uid...
+# Prints one verdict line per check: OK|DRIFT|MISSING|COLLISION <subject> <detail>.
+read -r -d '' PROBE <<'EOF' || true
+op="$1"; cg="$2"; shift 2
+g="$(getent group cortex || true)"
+if [ -z "$g" ]; then
+  owner="$(getent group "$cg" | cut -d: -f1)"
+  if [ -n "$owner" ]; then echo "COLLISION cortex gid $cg held by group $owner"
+  else echo "MISSING cortex group"; fi
+else
+  have="$(printf '%s' "$g" | cut -d: -f3)"
+  [ "$have" = "$cg" ] && echo "OK cortex gid $cg" || echo "DRIFT cortex gid $have (canon $cg)"
+fi
+if id -nG "$op" 2>/dev/null | tr ' ' '\n' | grep -qx cortex; then echo "OK $op in cortex"
+else echo "DRIFT $op not in cortex"; fi
+for pair in "$@"; do
+  tool="${pair%%:*}"; uid="${pair##*:}"; u="agent-$tool"
+  if ent="$(getent passwd "$u")"; then
+    hu="$(printf '%s' "$ent" | cut -d: -f3)"; hg="$(printf '%s' "$ent" | cut -d: -f4)"
+    bad=""
+    [ "$hu" = "$uid" ] || bad="$bad uid=$hu(canon $uid)"
+    [ "$hg" = "$uid" ] || bad="$bad gid=$hg(canon $uid)"
+    id -nG "$u" | tr ' ' '\n' | grep -qx cortex || bad="$bad not-in-cortex"
+    [ -z "$bad" ] && echo "OK $u uid $uid" || echo "DRIFT $u$bad"
+  else
+    pu="$(getent passwd "$uid" | cut -d: -f1)"; pg="$(getent group "$uid" | cut -d: -f1)"
+    if [ -n "$pu$pg" ]; then echo "COLLISION $u uid/gid $uid held by ${pu:-?}/${pg:-?}"
+    else echo "MISSING $u"; fi
+  fi
+done
+EOF
+
+SSH=(/usr/bin/ssh -o BatchMode=yes -o PasswordAuthentication=no
+     -o KbdInteractiveAuthentication=no -o PreferredAuthentications=publickey
+     -o ConnectTimeout=10 -o ConnectionAttempts=1)
+LOCAL="$(hostname)"
+
+rc=0
+# The fleet list rides on fd 3: ssh inherits stdin and would swallow it.
+while read -r alias hn _rest <&3; do
+  case "$alias" in ""|\#*) continue ;; esac
+  if [ -n "$HOSTS_ONLY" ]; then
+    case ",$HOSTS_ONLY," in *",$alias,"*) ;; *) continue ;; esac
+  fi
+  echo "== $alias ($hn)"
+  if [ "$hn" = "$LOCAL" ]; then
+    out="$(bash -c "$PROBE" probe "$OPERATOR" "$CORTEX_GID" $EXPECT)" || true
+  else
+    got="$("${SSH[@]}" "$alias" hostname </dev/null 2>/dev/null)" || {
+      echo "UNREACHABLE $alias"; [ "$rc" -lt 2 ] && rc=2; continue; }
+    if [ "$got" != "$hn" ]; then
+      echo "UNREACHABLE $alias answers as '$got', fleet map says '$hn'"; [ "$rc" -lt 2 ] && rc=2; continue
+    fi
+    out="$("${SSH[@]}" "$alias" bash -s -- "$OPERATOR" "$CORTEX_GID" $EXPECT <<<"$PROBE" 2>/dev/null)" || true
+  fi
+  if [ -z "$out" ]; then
+    echo "UNREACHABLE $alias: probe returned nothing"; [ "$rc" -lt 2 ] && rc=2; continue
+  fi
+  printf '%s\n' "$out" | sed 's/^/  /'
+  if printf '%s\n' "$out" | grep -qv '^OK '; then
+    [ "$rc" -lt 1 ] && rc=1
+    missing="$(printf '%s\n' "$out" | awk '$1 == "MISSING" && $2 ~ /^agent-/ {sub(/^agent-/, "", $2); printf "%s%s", sep, $2; sep=","}')"
+    fixable="$(printf '%s\n' "$out" | grep -E '^MISSING cortex|^DRIFT [^ ]+ not in cortex$|^DRIFT agent-[^ ]+ not-in-cortex$' || true)"
+    if [ "$PROVISION" -eq 1 ] && { [ -n "$missing" ] || [ -n "$fixable" ]; }; then
+      cmd=('$HOME/.local/bin/agent-users-bootstrap')
+      [ -n "$missing" ] && cmd+=(--only "$missing")
+      [ "$APPLY" -eq 1 ] && cmd+=(--apply)
+      echo "  -> provision on $alias: agent-users-bootstrap ${cmd[*]:1}"
+      if [ "$hn" = "$LOCAL" ]; then
+        bash -c "${cmd[*]}" | sed 's/^/     /'
+      else
+        "${SSH[@]}" "$alias" "${cmd[*]}" </dev/null 2>&1 | grep -v 'ssh-agent' | sed 's/^/     /'
+      fi
+    fi
+  fi
+done 3< "$FLEET"
+
+case "$rc" in
+  0) echo "fleet conforms to the canonical agent map" ;;
+  1) echo "fleet drift found (see above)" ;;
+  2) echo "fleet check incomplete: a host was unreachable" ;;
+esac
+exit "$rc"
+# Script: agent-fleet-check (read-only unless --provision --apply):1 ends here
