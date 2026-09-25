@@ -261,12 +261,17 @@ Honey Badger's lane, no =cortex=), =s24= (Termux, no multi-user Unix). Add a
 host here only when it joins the personal mesh.
 
 #+BEGIN_SRC text :tangle all/.config/agent-cli/fleet.ssv :mkdirp yes :comments no :noweb no
-# alias        hostname
-kikin          kikin-kushi
-x230           ThinkPad-X230
-t480s          ThinkPad-T480s
-t480           ThinkPad-T480
+# alias        hostname          seal-reach (top-level home entries agents may walk into; - = not yet decided)
+kikin          kikin-kushi       DotCortex,mnt,.guix-extra-profiles
+x230           ThinkPad-X230     -
+t480s          ThinkPad-T480s    -
+t480           ThinkPad-T480     -
 #+END_SRC
+
+The third column feeds =agent-home-seal= on that host. =mnt= on kikin holds the
+autofs NFS mounts of the other homes; opening it only defers to each serving
+host's own seal. A host whose reach is =-= cannot be sealed until the operator
+decides its list.
 
 *** Shared repo access — the cortex group pattern (proven 2026-06-11)
 Agents work in the SAME worktrees as the human — no per-agent clones (ruled out:
@@ -327,14 +332,14 @@ well-known name. So the seal strips =o= from every top-level entry *before* the
 ACL goes on. On a home that was =700= this changes nothing for any existing
 consumer — nothing outside the owner could enter it.
 
-What agents may reach is an explicit list (=AGENT_SEAL_REACH=, default
-=DotCortex .guix-extra-profiles=). The Guix profiles are store symlinks with
+What agents may reach is an explicit per-host list: the =seal-reach= column of
+=fleet.ssv= (=AGENT_SEAL_REACH= overrides it, for tests). On kikin that is
+=DotCortex,mnt,.guix-extra-profiles=. The Guix profiles are store symlinks with
 nothing secret in them, and the rootless sanctuary containers bind-mount that
 directory directly — their mapped guest users are "other" on the host, so
-closing it would break the guests. Reach entries keep their mode: DotCortex is public source and stays
-read-only to agents (=o+rX=, no write). Write access is deliberately not granted —
-an agent that can write the operator's dotfiles can plant code the operator
-later runs as himself, which is exactly the wall this user split builds.
+closing it would break the guests. Reach entries keep their mode here; write access to a repo comes from
+=agent-repo-share= (below), not from the seal. Agents work in DotCortex
+read-write — ruling, Mètsàtron 2026-09-25: the wall guards secrets, not the code.
 Symlinks are never chmod-ed (chmod follows them to their target).
 
 Every =--apply= first writes a restore script (the exact prior mode of each
@@ -349,7 +354,15 @@ agent must reach each reach entry AND be refused the home listing, =~/.env=,
 set -euo pipefail
 
 HOME_DIR="${AGENT_SEAL_HOME:-$HOME}"
-REACH="${AGENT_SEAL_REACH:-DotCortex .guix-extra-profiles}"
+FLEET="${AGENT_CLI_CONF:-$HOME/.config/agent-cli}/fleet.ssv"
+if [ -n "${AGENT_SEAL_REACH:-}" ]; then
+  REACH="$AGENT_SEAL_REACH"
+else
+  REACH="$(awk -v h="$(hostname)" '$1 !~ /^#/ && $2 == h {print $3}' "$FLEET" 2>/dev/null | tr ',' ' ')"
+  case "$REACH" in
+    ""|-) echo "FATAL: no seal-reach decided for $(hostname) in $FLEET" >&2; exit 1 ;;
+  esac
+fi
 STATE="${AGENT_SEAL_STATE:-$HOME/.local/state/agent-home-seal}"
 SECRETS=".env .netrc .pgpass .git-credentials"
 DENY=".env .ssh/id_ed25519 .codex/auth.json .claude/.credentials.json .local/share/opencode/auth.json"
@@ -529,6 +542,224 @@ class AgentHomeSealTests(unittest.TestCase):
     def test_missing_reach_entry_is_fatal(self) -> None:
         self.env["AGENT_SEAL_REACH"] = "NoSuchRepo"
         self.assertEqual(self.seal().returncode, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
+*** Script: agent-repo-share (dry-run by default)
+
+Step 2 of the cortex pattern as a reproducible command: group-share one repo
+with =cortex= so agents work in the same worktree read-write. It touches only
+what git tracks (plus =.git= itself): the tracked files get group =cortex= and
+=g+rw=, their directories =g+rwxs= (setgid, so new files inherit the group), and
+=core.sharedRepository= becomes =group=. Untracked and ignored paths are left
+alone — in DotCortex those are the operator's installed runtimes (=all/.cargo/bin=,
+=all/.bun=, npm caches, =.codex/=), not source. Symlinks are never touched.
+
+Before =--apply= changes anything it writes the prior group and mode of every
+path it will touch to =~/.local/state/agent-repo-share/=, with a restore script
+beside it. =--check= exits 1 while any tracked path is outside the share.
+
+Writers must run with =umask 002= or the files they create stay closed to the
+group; the script warns when the invoking shell's umask is stricter.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-repo-share :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/bin/agent-repo-share
+# Group-share a git repo with cortex for agent users. DRY-RUN unless --apply.
+set -euo pipefail
+
+GROUP="${AGENT_SHARE_GROUP:-cortex}"
+STATE="${AGENT_SHARE_STATE:-$HOME/.local/state/agent-repo-share}"
+MODE=dry-run
+REPO=""
+
+usage() {
+  cat <<'EOF'
+Usage: agent-repo-share REPO [--apply|--check|--help]
+  (no flag)  report what would change; change nothing
+  --apply    record prior group/mode + restore script, then give every tracked
+             path (and .git) group cortex, g+rw, setgid dirs, and set
+             core.sharedRepository=group
+  --check    exit 0 only if every tracked path is already shared
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) MODE=apply ;;
+    --check) MODE=check ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 2 ;;
+    *) [ -z "$REPO" ] || { usage >&2; exit 2; }; REPO="$1" ;;
+  esac
+  shift
+done
+[ -n "$REPO" ] || { usage >&2; exit 2; }
+REPO="$(cd "$REPO" && pwd -P)"
+git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "FATAL: not a git worktree: $REPO" >&2; exit 1; }
+[ "$(git -C "$REPO" rev-parse --show-toplevel)" = "$REPO" ] || { echo "FATAL: $REPO is not the repo root" >&2; exit 1; }
+getent group "$GROUP" >/dev/null || { echo "FATAL: no group $GROUP" >&2; exit 1; }
+
+list="$(mktemp)"; dirs="$(mktemp)"; tsv="$(mktemp)"
+trap 'rm -f "$list" "$dirs" "$tsv"' EXIT
+# One Python pass (a shell loop forks per path; DotCortex tracks ~200k):
+# every tracked non-symlink path that exists, its parent dirs, the root and
+# .git. Writes NUL lists (all paths, dirs) and a mode/group/path TSV, then
+# prints "total pending".
+read -r total pending < <(cd "$REPO" && python3 - "$GROUP" "$list" "$dirs" "$tsv" <<'PY'
+import grp, os, stat, subprocess, sys
+group, list_path, dirs_path, tsv_path = sys.argv[1:5]
+gid = grp.getgrnam(group).gr_gid
+out = subprocess.run(["git", "ls-files", "-s", "-z"], check=True, capture_output=True).stdout
+paths = {"."}
+for rec in out.split(b"\0"):
+    if not rec:
+        continue
+    meta, raw = rec.split(b"\t", 1)
+    path = os.fsdecode(raw)
+    if meta.split()[0] != b"120000" and os.path.lexists(path):
+        paths.add(path)
+    d = os.path.dirname(path)
+    while d and d not in paths:
+        paths.add(d)
+        d = os.path.dirname(d)
+for root, subdirs, files in os.walk(".git"):
+    paths.add(root)
+    for n in subdirs + files:
+        paths.add(os.path.join(root, n))
+total = pending = 0
+with open(list_path, "wb") as lst, open(dirs_path, "wb") as dl, open(tsv_path, "w") as tsv:
+    for p in sorted(paths):
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        total += 1
+        lst.write(os.fsencode(p) + b"\0")
+        tsv.write(f"{stat.S_IMODE(st.st_mode):o}\t{grp.getgrgid(st.st_gid).gr_name}\t{p}\n")
+        need = stat.S_IRGRP | stat.S_IWGRP
+        if stat.S_ISDIR(st.st_mode):
+            dl.write(os.fsencode(p) + b"\0")
+            need |= stat.S_IXGRP | stat.S_ISGID
+        if st.st_gid != gid or (st.st_mode & need) != need:
+            pending += 1
+print(total, pending)
+PY
+)
+[ -n "${total:-}" ] || { echo "FATAL: path enumeration failed" >&2; exit 1; }
+shared="$(git -C "$REPO" config core.sharedRepository || echo unset)"
+echo "$REPO: $total tracked paths, $pending not shared with $GROUP; core.sharedRepository=$shared"
+[ "$(umask)" = 0002 ] || echo "note: this shell's umask is $(umask); writers need 002 or new files stay closed to $GROUP"
+
+if [ "$MODE" = check ]; then
+  [ "$pending" -eq 0 ] && [ "$shared" = group ] && exit 0 || exit 1
+fi
+if [ "$MODE" = dry-run ]; then
+  echo "DRY-RUN: chgrp $GROUP + chmod g+rw on $total paths; chmod g+rwxs on their directories"
+  echo "DRY-RUN: git -C $REPO config core.sharedRepository group"
+  echo "(dry-run complete — re-run with --apply after approval)"
+  exit 0
+fi
+
+mkdir -p "$STATE"; chmod 700 "$STATE"
+stamp="$(basename "$REPO")-$(date +%Y%m%d-%H%M%S)"
+cp "$tsv" "$STATE/$stamp.tsv"
+cat > "$STATE/restore-$stamp.sh" <<EOF
+#!/usr/bin/env bash
+# agent-repo-share restore for $REPO (core.sharedRepository was: $shared)
+set -euo pipefail
+cd $(printf '%q' "$REPO")
+while IFS=\$'\t' read -r mode grp path; do
+  # five digits: GNU chmod keeps a directory's setgid unless the mode says so
+  chgrp -h "\$grp" -- "\$path"; chmod "\$(printf '%05d' "\$mode")" -- "\$path"
+done < $(printf '%q' "$STATE/$stamp.tsv")
+$( [ "$shared" = unset ] && echo "git config --unset core.sharedRepository || true" || printf 'git config core.sharedRepository %q\n' "$shared" )
+EOF
+chmod 700 "$STATE/restore-$stamp.sh"
+echo "restore script: $STATE/restore-$stamp.sh"
+
+cd "$REPO"
+# First, so git rewrites .git/config before the modes below are applied.
+git config core.sharedRepository group
+xargs -0 -r chgrp "$GROUP" -- < "$list"
+xargs -0 -r chmod g+rw -- < "$list"
+xargs -0 -r chmod g+xs -- < "$dirs"
+echo "shared. verify: agent-repo-share $REPO --check"
+#+END_SRC
+
+The test shares a scratch repo (needs only the =cortex= group): dry-run and
+=--check= change nothing, apply shares every tracked path but leaves ignored
+paths and symlinks alone, and the restore script returns every mode and group
+exactly, setgid bits and =.git= included.
+
+#+BEGIN_SRC python :tangle linux/.local/share/dotcortex/tests/test-agent-repo-share.py :shebang "#!/usr/bin/env python3" :comments no :noweb no
+from __future__ import annotations
+
+import grp
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[5]
+SHARE = ROOT / "all/.local/bin/agent-repo-share"
+
+
+def snapshot(repo: Path) -> list[tuple[str, int, int]]:
+    rows = []
+    for p in sorted(repo.rglob("*")) + [repo]:
+        st = p.lstat()
+        rows.append((str(p.relative_to(repo)), st.st_mode, st.st_gid))
+    return rows
+
+
+@unittest.skipUnless(any(g.gr_name == "cortex" for g in grp.getgrall()), "needs the cortex group")
+class AgentRepoShareTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.repo = base / "repo"
+        (self.repo / "sub").mkdir(parents=True)
+        (self.repo / "sub/a").write_text("a")
+        (self.repo / "b").write_text("b")
+        (self.repo / "ign").mkdir()
+        (self.repo / "ign/x").write_text("x")
+        (self.repo / ".gitignore").write_text("ign/\n")
+        (self.repo / "lnk").symlink_to("/etc/hostname")
+        git = ["git", "-C", str(self.repo), "-c", "user.email=t@t", "-c", "user.name=t"]
+        subprocess.run(["git", "init", "-q", str(self.repo)], check=True)
+        subprocess.run(git + ["add", "-A"], check=True)
+        subprocess.run(git + ["commit", "-qm", "init"], check=True)
+        os.chmod(self.repo / "b", 0o600)
+        self.env = dict(os.environ, AGENT_SHARE_STATE=str(base / "state"))
+        self.cortex = grp.getgrnam("cortex").gr_gid
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def share(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(SHARE), str(self.repo), *args], env=self.env, text=True, capture_output=True, check=False)
+
+    def test_share_check_restore(self) -> None:
+        before = snapshot(self.repo)
+        self.assertEqual(self.share().returncode, 0)
+        self.assertEqual(self.share("--check").returncode, 1)
+        self.assertEqual(snapshot(self.repo), before, "dry-run and --check change nothing")
+
+        self.assertEqual(self.share("--apply").returncode, 0)
+        self.assertEqual(self.share("--check").returncode, 0)
+        b = (self.repo / "b").stat()
+        self.assertEqual((b.st_gid, b.st_mode & 0o060), (self.cortex, 0o060))
+        self.assertTrue((self.repo / "sub").stat().st_mode & 0o2000, "dirs get setgid")
+        self.assertNotEqual((self.repo / "ign/x").stat().st_gid, self.cortex, "ignored paths untouched")
+
+        restore = sorted(Path(self.env["AGENT_SHARE_STATE"]).glob("restore-*.sh"))
+        self.assertEqual(len(restore), 1)
+        subprocess.run(["bash", str(restore[0])], check=True, capture_output=True)
+        self.assertEqual(snapshot(self.repo), before, "restore is exact")
 
 
 if __name__ == "__main__":

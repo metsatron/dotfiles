@@ -1,0 +1,141 @@
+#!/usr/bin/env bash
+# Script: agent-repo-share (dry-run by default)
+
+# Step 2 of the cortex pattern as a reproducible command: group-share one repo
+# with =cortex= so agents work in the same worktree read-write. It touches only
+# what git tracks (plus =.git= itself): the tracked files get group =cortex= and
+# =g+rw=, their directories =g+rwxs= (setgid, so new files inherit the group), and
+# =core.sharedRepository= becomes =group=. Untracked and ignored paths are left
+# alone — in DotCortex those are the operator's installed runtimes (=all/.cargo/bin=,
+# =all/.bun=, npm caches, =.codex/=), not source. Symlinks are never touched.
+
+# Before =--apply= changes anything it writes the prior group and mode of every
+# path it will touch to =~/.local/state/agent-repo-share/=, with a restore script
+# beside it. =--check= exits 1 while any tracked path is outside the share.
+
+# Writers must run with =umask 002= or the files they create stay closed to the
+# group; the script warns when the invoking shell's umask is stricter.
+
+
+# [[file:../../../agents.org::*Script: agent-repo-share (dry-run by default)][Script: agent-repo-share (dry-run by default):1]]
+# ~/DotCortex/all/.local/bin/agent-repo-share
+# Group-share a git repo with cortex for agent users. DRY-RUN unless --apply.
+set -euo pipefail
+
+GROUP="${AGENT_SHARE_GROUP:-cortex}"
+STATE="${AGENT_SHARE_STATE:-$HOME/.local/state/agent-repo-share}"
+MODE=dry-run
+REPO=""
+
+usage() {
+  cat <<'EOF'
+Usage: agent-repo-share REPO [--apply|--check|--help]
+  (no flag)  report what would change; change nothing
+  --apply    record prior group/mode + restore script, then give every tracked
+             path (and .git) group cortex, g+rw, setgid dirs, and set
+             core.sharedRepository=group
+  --check    exit 0 only if every tracked path is already shared
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --apply) MODE=apply ;;
+    --check) MODE=check ;;
+    -h|--help) usage; exit 0 ;;
+    -*) usage >&2; exit 2 ;;
+    *) [ -z "$REPO" ] || { usage >&2; exit 2; }; REPO="$1" ;;
+  esac
+  shift
+done
+[ -n "$REPO" ] || { usage >&2; exit 2; }
+REPO="$(cd "$REPO" && pwd -P)"
+git -C "$REPO" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "FATAL: not a git worktree: $REPO" >&2; exit 1; }
+[ "$(git -C "$REPO" rev-parse --show-toplevel)" = "$REPO" ] || { echo "FATAL: $REPO is not the repo root" >&2; exit 1; }
+getent group "$GROUP" >/dev/null || { echo "FATAL: no group $GROUP" >&2; exit 1; }
+
+list="$(mktemp)"; dirs="$(mktemp)"; tsv="$(mktemp)"
+trap 'rm -f "$list" "$dirs" "$tsv"' EXIT
+# One Python pass (a shell loop forks per path; DotCortex tracks ~200k):
+# every tracked non-symlink path that exists, its parent dirs, the root and
+# .git. Writes NUL lists (all paths, dirs) and a mode/group/path TSV, then
+# prints "total pending".
+read -r total pending < <(cd "$REPO" && python3 - "$GROUP" "$list" "$dirs" "$tsv" <<'PY'
+import grp, os, stat, subprocess, sys
+group, list_path, dirs_path, tsv_path = sys.argv[1:5]
+gid = grp.getgrnam(group).gr_gid
+out = subprocess.run(["git", "ls-files", "-s", "-z"], check=True, capture_output=True).stdout
+paths = {"."}
+for rec in out.split(b"\0"):
+    if not rec:
+        continue
+    meta, raw = rec.split(b"\t", 1)
+    path = os.fsdecode(raw)
+    if meta.split()[0] != b"120000" and os.path.lexists(path):
+        paths.add(path)
+    d = os.path.dirname(path)
+    while d and d not in paths:
+        paths.add(d)
+        d = os.path.dirname(d)
+for root, subdirs, files in os.walk(".git"):
+    paths.add(root)
+    for n in subdirs + files:
+        paths.add(os.path.join(root, n))
+total = pending = 0
+with open(list_path, "wb") as lst, open(dirs_path, "wb") as dl, open(tsv_path, "w") as tsv:
+    for p in sorted(paths):
+        st = os.lstat(p)
+        if stat.S_ISLNK(st.st_mode):
+            continue
+        total += 1
+        lst.write(os.fsencode(p) + b"\0")
+        tsv.write(f"{stat.S_IMODE(st.st_mode):o}\t{grp.getgrgid(st.st_gid).gr_name}\t{p}\n")
+        need = stat.S_IRGRP | stat.S_IWGRP
+        if stat.S_ISDIR(st.st_mode):
+            dl.write(os.fsencode(p) + b"\0")
+            need |= stat.S_IXGRP | stat.S_ISGID
+        if st.st_gid != gid or (st.st_mode & need) != need:
+            pending += 1
+print(total, pending)
+PY
+)
+[ -n "${total:-}" ] || { echo "FATAL: path enumeration failed" >&2; exit 1; }
+shared="$(git -C "$REPO" config core.sharedRepository || echo unset)"
+echo "$REPO: $total tracked paths, $pending not shared with $GROUP; core.sharedRepository=$shared"
+[ "$(umask)" = 0002 ] || echo "note: this shell's umask is $(umask); writers need 002 or new files stay closed to $GROUP"
+
+if [ "$MODE" = check ]; then
+  [ "$pending" -eq 0 ] && [ "$shared" = group ] && exit 0 || exit 1
+fi
+if [ "$MODE" = dry-run ]; then
+  echo "DRY-RUN: chgrp $GROUP + chmod g+rw on $total paths; chmod g+rwxs on their directories"
+  echo "DRY-RUN: git -C $REPO config core.sharedRepository group"
+  echo "(dry-run complete — re-run with --apply after approval)"
+  exit 0
+fi
+
+mkdir -p "$STATE"; chmod 700 "$STATE"
+stamp="$(basename "$REPO")-$(date +%Y%m%d-%H%M%S)"
+cp "$tsv" "$STATE/$stamp.tsv"
+cat > "$STATE/restore-$stamp.sh" <<EOF
+#!/usr/bin/env bash
+# agent-repo-share restore for $REPO (core.sharedRepository was: $shared)
+set -euo pipefail
+cd $(printf '%q' "$REPO")
+while IFS=\$'\t' read -r mode grp path; do
+  # five digits: GNU chmod keeps a directory's setgid unless the mode says so
+  chgrp -h "\$grp" -- "\$path"; chmod "\$(printf '%05d' "\$mode")" -- "\$path"
+done < $(printf '%q' "$STATE/$stamp.tsv")
+$( [ "$shared" = unset ] && echo "git config --unset core.sharedRepository || true" || printf 'git config core.sharedRepository %q\n' "$shared" )
+EOF
+chmod 700 "$STATE/restore-$stamp.sh"
+echo "restore script: $STATE/restore-$stamp.sh"
+
+cd "$REPO"
+# First, so git rewrites .git/config before the modes below are applied.
+git config core.sharedRepository group
+xargs -0 -r chgrp "$GROUP" -- < "$list"
+xargs -0 -r chmod g+rw -- < "$list"
+xargs -0 -r chmod g+xs -- < "$dirs"
+echo "shared. verify: agent-repo-share $REPO --check"
+# Script: agent-repo-share (dry-run by default):1 ends here
