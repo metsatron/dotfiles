@@ -1,12 +1,12 @@
 #+TITLE: Tools Loom: ai-usage
-#+DESCRIPTION: ai-usage — Linux usage/quota probe for CodexBar, Fuelcheck, Antigravity, DeepInfra, NeuralWatt, Fireworks
+#+DESCRIPTION: ai-usage — Linux usage/quota probe for CodexBar, Fuelcheck, Antigravity, DeepInfra, NeuralWatt, Fireworks, OpenCode Go
 #+AUTHOR: Mètsàtron
 #+LANGUAGE: en
 #+PROPERTY: header-args :mkdirp yes :results silent
 #+PROPERTY: header-args:bash :comments both
 #+PROPERTY: header-args:makefile :comments no :padline no
 
-* ai-usage - Linux usage wrapper for CodexBar, Fuelcheck, Antigravity, DeepInfra, NeuralWatt, Fireworks
+* ai-usage - Linux usage wrapper for CodexBar, Fuelcheck, Antigravity, DeepInfra, NeuralWatt, Fireworks, OpenCode Go
 This is a Linux-first wrapper that chooses the best local usage probe per
 provider instead of forcing everything through =codexbar=. It prefers
 =fuelcheck-cli= for OAuth/local providers, =antigravity-kit auth quota=
@@ -14,9 +14,12 @@ for Antigravity, =gemini-cli-usage= for Gemini CLI quotas, keeps
 =codexbar= where it is actually useful on Linux, augments Codex with the
 count and local expiry countdown for banked rate-limit resets, and adds direct
 Bearer-token probes for DeepInfra (env token or =deepctl auth token=),
-NeuralWatt (=NEURALWATT_API_KEY=, =/v1/quota=), and Fireworks
+NeuralWatt (=NEURALWATT_API_KEY=, =/v1/quota=), Fireworks
 (=FIREWORKS_API_KEY= + =FIREWORKS_ACCOUNT_ID=; account-status only, since
-Fireworks exposes no numeric spend endpoint over REST).
+Fireworks exposes no numeric spend endpoint over REST), and OpenCode Go
+(=OPENCODE_API_KEY=, else the key OpenCode stores at login in
+=~/.local/share/opencode/auth.json=; =/zen/go/v1/usage= — rolling, weekly and
+monthly percent windows with reset times).
 
 Usage:
 
@@ -94,6 +97,13 @@ CODEX_RESET_CREDITS_URL = "https://chatgpt.com/backend-api/wham/rate-limit-reset
 # ~/.codex/auth.json Bearer token. Lets any Linux box report Codex usage without the
 # macOS-only Homebrew `codexbar` formula. Verified live 2026-09-10.
 CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
+# Native OpenCode Go usage endpoint — the source CodexBar adopted in PR #2879
+# (merged 2026-08-19): GET with `Authorization: Bearer <OPENCODE_API_KEY>`.
+# The key also lives in OpenCode's own login store; see opencode_api_key().
+# Live shape confirmed 2026-09-25: usage.{rolling,weekly,monthly}.
+# {percent,resetsAt,status} — no per-model breakdown, no dollar fields.
+OPENCODE_GO_USAGE_URL = "https://opencode.ai/zen/go/v1/usage"
+OPENCODE_AUTH_FILE = Path.home() / ".local" / "share" / "opencode" / "auth.json"
 
 # Opt-in remote feeds. Each entry pulls `ai-usage --json --no-remote` from another
 # fleet machine over SSH and folds its panels in under a label (e.g. "Gillean · Codex").
@@ -101,7 +111,8 @@ CODEX_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 REMOTES_FILE_DEFAULT = Path(
     os.environ.get("AI_USAGE_REMOTES_FILE", str(Path.home() / ".config" / "ai-usage" / "remotes.json"))
 )
-REMOTE_PROVIDERS_RE = re.compile(r"^[a-z0-9]+(?:,[a-z0-9]+)*$")
+# Provider keys may contain hyphens (opencode-go); leading char stays alphanumeric.
+REMOTE_PROVIDERS_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(?:,[a-z0-9][a-z0-9-]*)*$")
 
 NF = {
     "check": "\uf058",
@@ -221,6 +232,12 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         "Fireworks",
         "fireworks",
         note="Fireworks account-status probe (FIREWORKS_API_KEY + FIREWORKS_ACCOUNT_ID); no numeric spend endpoint exists.",
+    ),
+    ProviderSpec(
+        "opencode-go",
+        "OpenCode Go",
+        "opencode_go",
+        note="Direct OpenCode Go usage probe (OPENCODE_API_KEY, else OpenCode's auth.json); /zen/go/v1/usage.",
     ),
 )
 
@@ -2274,6 +2291,129 @@ def fetch_fireworks(timeout_seconds: float) -> dict[str, Any]:
     )
 
 
+# --- OpenCode Go usage probe ------------------------------------------------
+#
+# OpenCode Go is the subscription that fuels OpenCode's own harness. Its usage
+# endpoint is the one CodexBar adopted in PR #2879 (merged 2026-08-19):
+#   GET https://opencode.ai/zen/go/v1/usage  (Authorization: Bearer <key>)
+# The key is OPENCODE_API_KEY, else the one OpenCode stores at login in
+# ~/.local/share/opencode/auth.json under the "opencode-go" provider entry
+# (type "api", field "key").
+#
+# Live shape CONFIRMED 2026-09-25 by a single shape-only probe:
+#   {"usage": {"rolling": {"percent": int 0-100, "resetsAt": ISO-8601 Z,
+#              "status": "ok"}, "weekly": {...}, "monthly": {...}}}
+# There is NO per-model breakdown and no dollar/limit field in this response:
+# percent is the used share of that window's allowance, so remaining is derived
+# as 100 - percent. A missing window, a non-numeric or out-of-0-100 percent, a
+# non-ISO reset or a missing status is schema drift -> ValueError -> state:
+# error, never a guessed display.
+OPENCODE_GO_SCHEMA = "opencode-go.usage.v1"
+OPENCODE_GO_WINDOW_NAMES = ("rolling", "weekly", "monthly")
+OPENCODE_GO_WINDOW_LABELS = {"rolling": "5h", "weekly": "wk", "monthly": "30d"}
+
+
+def opencode_api_key() -> tuple[str | None, str]:
+    """OPENCODE_API_KEY first, else OpenCode's own login store."""
+    token, source = _env_token("OPENCODE_API_KEY")
+    if token:
+        return token, source
+    try:
+        data = json.loads(OPENCODE_AUTH_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None, "auth"
+    if not isinstance(data, dict):
+        return None, "auth"
+    names = ["opencode-go"]
+    names += sorted(name for name in data if name != "opencode-go" and "opencode" in name.lower())
+    for name in names:
+        entry = data.get(name)
+        if not isinstance(entry, dict):
+            continue
+        for field in ("key", "apiKey", "api_key"):
+            value = entry.get(field)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), f"auth:{name}"
+    return None, "auth"
+
+
+def fetch_opencode_go(timeout_seconds: float) -> dict[str, Any]:
+    token, token_source = opencode_api_key()
+    if not token:
+        return {
+            "provider": "opencode-go",
+            "label": "OpenCode Go",
+            "state": "missing",
+            "source": token_source,
+            "summary": "No OpenCode API key found (set OPENCODE_API_KEY or run `opencode auth login`).",
+            "raw": None,
+        }
+    url = os.environ.get("OPENCODE_GO_USAGE_URL", OPENCODE_GO_USAGE_URL)
+    result = _bearer_json_probe("opencode-go", "OpenCode Go", url, token, timeout_seconds)
+    return apply_opencode_go_observation(result, collected_at=datetime.now(timezone.utc))
+
+
+def opencode_go_observation(data: Any, collected_at: datetime) -> dict[str, Any]:
+    """Normalize a /zen/go/v1/usage body. Raises ValueError on schema drift."""
+    if not isinstance(data, dict):
+        raise ValueError("usage body is not an object")
+    usage = data.get("usage")
+    if not isinstance(usage, dict):
+        raise ValueError("usage schema drift: missing usage object")
+    windows: dict[str, dict[str, Any]] = {}
+    for name in OPENCODE_GO_WINDOW_NAMES:
+        window = usage.get(name)
+        if not isinstance(window, dict):
+            raise ValueError(f"usage schema drift: missing usage.{name}")
+        percent = window.get("percent")
+        if not isinstance(percent, (int, float)) or isinstance(percent, bool):
+            raise ValueError(f"usage schema drift: usage.{name}.percent is not a number")
+        used = float(percent)
+        if not 0.0 <= used <= 100.0:
+            raise ValueError(f"usage schema drift: usage.{name}.percent={used:g} outside 0-100")
+        resets_at = window.get("resetsAt")
+        if not isinstance(resets_at, str) or parse_iso_datetime(resets_at) is None:
+            raise ValueError(f"usage schema drift: usage.{name}.resetsAt is not an ISO timestamp")
+        status = window.get("status")
+        if not isinstance(status, str) or not status:
+            raise ValueError(f"usage schema drift: usage.{name}.status is not a string")
+        windows[name] = {
+            "used_percent": used,
+            "remaining_percent": 100.0 - used,
+            "resets_at": resets_at,
+            "status": status,
+        }
+    return {
+        "schema": OPENCODE_GO_SCHEMA,
+        "collected_at": collected_at.astimezone(timezone.utc).isoformat(),
+        "windows": windows,
+    }
+
+
+def opencode_go_summary(observation: dict[str, Any]) -> str:
+    windows = observation["windows"]
+    tightest_name = max(windows, key=lambda name: windows[name]["used_percent"])
+    tightest = windows[tightest_name]
+    parts = [
+        f"tightest {OPENCODE_GO_WINDOW_LABELS[tightest_name]} {tightest['used_percent']:.0f}% used"
+    ]
+    for name in OPENCODE_GO_WINDOW_NAMES:
+        status = windows[name]["status"]
+        if status != "ok":
+            parts.append(f"{OPENCODE_GO_WINDOW_LABELS[name]} status={status}")
+    return "; ".join(parts)
+
+
+def apply_opencode_go_observation(result: dict[str, Any], collected_at: datetime) -> dict[str, Any]:
+    if result.get("state") != "ok":
+        return result
+    try:
+        observation = opencode_go_observation(result.get("raw"), collected_at)
+    except ValueError as error:
+        return {**result, "state": "error", "summary": str(error)}
+    return {**result, "summary": opencode_go_summary(observation), "observation": observation}
+
+
 # --- Shared result cache + rate-limit backoff -------------------------------
 #
 # Every provider probe funnels through fetch_provider, so the cache lives here
@@ -2443,6 +2583,9 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
 
     if spec.kind == "fireworks":
         return fetch_fireworks(timeout_seconds)
+
+    if spec.kind == "opencode_go":
+        return fetch_opencode_go(timeout_seconds)
 
     if spec.kind == "antigravity_kit":
         result = fetch_antigravity_quota(spec, timeout_seconds)
@@ -2707,6 +2850,29 @@ def render_text(results: list[dict[str, Any]]) -> None:
                     parts.append(f"Key usage: ${key_usage:g}")
                 if parts:
                     print(f"  {FGY}{' · '.join(parts)}{R}")
+
+        elif item["provider"] == "opencode-go" and isinstance(raw, dict):
+            observation = item.get("observation") if isinstance(item.get("observation"), dict) else {}
+            windows = observation.get("windows") if isinstance(observation.get("windows"), dict) else {}
+            if windows:
+                for name in OPENCODE_GO_WINDOW_NAMES:
+                    window = windows.get(name)
+                    if not isinstance(window, dict):
+                        continue
+                    line = format_compact_quota_line(
+                        OPENCODE_GO_WINDOW_LABELS.get(name, name),
+                        {
+                            "usedPercent": window.get("used_percent"),
+                            "resetsAt": window.get("resets_at"),
+                        },
+                    )
+                    if line:
+                        status = window.get("status")
+                        if isinstance(status, str) and status and status != "ok":
+                            line += f"  {RD}{status}{R}"
+                        print(line)
+            else:
+                print_fitted_text(item["summary"], indent="  ", width=width)
 
         else:
             print_fitted_text(item["summary"], indent="  ", width=width)
@@ -2980,7 +3146,10 @@ if __name__ == "__main__":
 import importlib.machinery
 import importlib.util
 import io
+import json
+import os
 import re
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -3163,6 +3332,151 @@ class NeuralWattObservationTests(unittest.TestCase):
         failed = {"provider": "neuralwatt", "label": "NeuralWatt", "state": "error", "source": "api",
                   "summary": "https://api.neuralwatt.com/v1/quota returned HTTP 429", "raw": None}
         self.assertIs(self.ai_usage.apply_neuralwatt_observation(failed, self.now), failed)
+
+
+# Redacted fixture: the real 2026-09-25 GET /zen/go/v1/usage shape (keys/types
+# confirmed live), synthetic values, no identifiers. There is no per-model or
+# dollar field in this API: each window is percent used + ISO reset + status.
+OPENCODE_GO_FIXTURE = {
+    "usage": {
+        "rolling": {"percent": 17, "resetsAt": "2026-09-25T07:30:00Z", "status": "ok"},
+        "weekly": {"percent": 75, "resetsAt": "2026-09-28T00:00:00Z", "status": "ok"},
+        "monthly": {"percent": 91, "resetsAt": "2026-10-01T00:00:00Z", "status": "ok"},
+    }
+}
+
+
+class OpenCodeGoObservationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+        cls.now = datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)
+
+    def ok(self, raw):
+        return {"provider": "opencode-go", "label": "OpenCode Go", "state": "ok",
+                "source": "api", "summary": "", "raw": raw}
+
+    def test_window_fixture(self):
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(OPENCODE_GO_FIXTURE), self.now)
+        self.assertEqual(result["state"], "ok")
+        obs = result["observation"]
+        self.assertEqual(obs["schema"], "opencode-go.usage.v1")
+        self.assertEqual(obs["collected_at"], "2026-09-25T03:00:00+00:00")
+        self.assertEqual(obs["windows"]["rolling"]["used_percent"], 17)
+        self.assertEqual(obs["windows"]["rolling"]["remaining_percent"], 83)
+        self.assertEqual(obs["windows"]["monthly"]["resets_at"], "2026-10-01T00:00:00Z")
+        self.assertEqual(result["summary"], "tightest 30d 91% used")
+
+    def test_window_at_limit(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        raw["usage"]["rolling"] = {"percent": 100, "resetsAt": "2026-09-25T07:30:00Z", "status": "ok"}
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(result["observation"]["windows"]["rolling"]["remaining_percent"], 0)
+        self.assertEqual(result["summary"], "tightest 5h 100% used")
+
+    def test_non_ok_status_is_surfaced(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        raw["usage"]["monthly"]["status"] = "blocked"
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["summary"], "tightest 30d 91% used; 30d status=blocked")
+
+    def test_schema_drift_missing_window_is_an_error(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        del raw["usage"]["weekly"]
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("missing usage.weekly", result["summary"])
+        self.assertNotIn("observation", result)
+
+    def test_out_of_range_percent_is_an_error(self):
+        raw = json.loads(json.dumps(OPENCODE_GO_FIXTURE))
+        raw["usage"]["rolling"]["percent"] = 170
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("outside 0-100", result["summary"])
+
+    def test_non_ok_probe_passes_through(self):
+        failed = {"provider": "opencode-go", "label": "OpenCode Go", "state": "error",
+                  "source": "api", "summary": "HTTP 429", "raw": None}
+        self.assertIs(self.ai_usage.apply_opencode_go_observation(failed, self.now), failed)
+
+    def test_renderer_draws_all_three_windows(self):
+        fixed_now = datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return fixed_now if tz else fixed_now.replace(tzinfo=None)
+
+        result = self.ai_usage.apply_opencode_go_observation(self.ok(OPENCODE_GO_FIXTURE), fixed_now)
+        output = io.StringIO()
+        with patch.object(self.ai_usage, "datetime", FixedDateTime), redirect_stdout(output):
+            self.ai_usage.render_text([result])
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", output.getvalue())
+
+        self.assertRegex(plain, re.compile(r"5h\s+.*83%"))
+        self.assertRegex(plain, re.compile(r"wk\s+.*25%"))
+        self.assertRegex(plain, re.compile(r"30d\s+.*9%"))
+
+
+class OpenCodeGoCredentialTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def test_env_key_wins_over_auth_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = Path(tmp) / "auth.json"
+            auth.write_text(json.dumps({"opencode-go": {"type": "api", "key": "file-key"}}), encoding="utf-8")
+            captured = {}
+
+            def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+                captured["provider"] = provider
+                captured["token"] = token
+                captured["url"] = url
+                return {"provider": provider, "label": label, "state": "error", "source": "api",
+                        "summary": "stub", "raw": None}
+
+            with patch.dict(os.environ, {"OPENCODE_API_KEY": "env-key"}), \
+                 patch.object(self.ai_usage, "OPENCODE_AUTH_FILE", auth), \
+                 patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+                result = self.ai_usage.fetch_opencode_go(1.0)
+
+            self.assertEqual(captured["token"], "env-key")
+            self.assertEqual(captured["provider"], "opencode-go")
+            self.assertEqual(result["state"], "error")
+
+    def test_auth_file_key_used_when_env_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            auth = Path(tmp) / "auth.json"
+            auth.write_text(
+                json.dumps({"openai": {}, "opencode-go": {"type": "api", "key": "file-key"}}),
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+                captured["token"] = token
+                return {"provider": provider, "label": label, "state": "ok", "source": "api",
+                        "summary": "", "raw": json.loads(json.dumps(OPENCODE_GO_FIXTURE))}
+
+            with patch.dict(os.environ, {"OPENCODE_API_KEY": ""}), \
+                 patch.object(self.ai_usage, "OPENCODE_AUTH_FILE", auth), \
+                 patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+                result = self.ai_usage.fetch_opencode_go(1.0)
+
+            self.assertEqual(captured["token"], "file-key")
+            self.assertEqual(result["state"], "ok")
+
+    def test_no_credential_reports_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            missing = Path(tmp) / "auth.json"
+            with patch.dict(os.environ, {"OPENCODE_API_KEY": ""}), \
+                 patch.object(self.ai_usage, "OPENCODE_AUTH_FILE", missing):
+                result = self.ai_usage.fetch_opencode_go(1.0)
+        self.assertEqual(result["state"], "missing")
+        self.assertNotIn("token", result)
 
 
 if __name__ == "__main__":
