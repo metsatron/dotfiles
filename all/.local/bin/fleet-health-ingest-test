@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Deterministic tests for fleet-health-ingest against a scratch HOME; the real state dir is never touched.
+here="$(cd "$(dirname "$0")" && pwd)"
+ingest="${FLEET_HEALTH_INGEST:-$here/fleet-health-ingest}"
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+state="$scratch/.local/state/fleet-health"
+pass=0 fail=0
+
+doc() { # doc <generated_at> [python mutation on d]
+  python3 - "$1" "${2:-}" <<'PY'
+import json, sys
+d = {"schema": "honey.health.v1", "schema_version": 1, "host": "beelink", "generated_at": sys.argv[1],
+     "summary": {"verdict": "green", "counts": {"ok": 1, "warn": 0, "crit": 0, "unknown": 0}},
+     "checks": [{"id": "disk.root", "group": "disk", "status": "ok", "value": 40, "threshold": "warn>85",
+                 "detail": None, "scope": "host"}],
+     "cleared": [], "previous_run": None, "redactions": 0, "collector": {"name": "test", "duration_ms": 1}}
+exec(sys.argv[2])
+print(json.dumps(d))
+PY
+}
+expect() { # expect <name> <rc> <stdin-file> [args...]
+  local name="$1" want="$2" input="$3"; shift 3
+  local got=0
+  HOME="$scratch" "$ingest" "$@" < "$input" > /dev/null 2>&1 || got=$?
+  if [ "$got" -eq "$want" ]; then pass=$((pass + 1)); echo "ok   $name"; else fail=$((fail + 1)); echo "FAIL $name (rc $got, want $want)"; fi
+}
+
+now="$(date +%Y-%m-%dT%H:%M:%S%z | sed -E 's/([0-9]{2})([0-9]{2})$/\1:\2/')"
+doc "$now" > "$scratch/good.json"
+expect "stores a valid document" 0 "$scratch/good.json" --host beelink
+[ "$(stat -c %a "$state/beelink.json")" = 600 ] && { pass=$((pass + 1)); echo "ok   mode 600"; } || { fail=$((fail + 1)); echo "FAIL mode"; }
+expect "unknown pinned host is usage" 2 "$scratch/good.json" --host nosuchhost
+doc "$now" 'd["host"] = "t480s"' > "$scratch/bad-host.json";      expect "host must match the key" 4 "$scratch/bad-host.json" --host beelink
+doc "$now" 'd["schema"] = "evil.v1"' > "$scratch/bad-schema.json"; expect "schema must match" 4 "$scratch/bad-schema.json" --host beelink
+doc "$now" 'd["extra"] = 1' > "$scratch/extra.json";              expect "unknown top-level key" 4 "$scratch/extra.json" --host beelink
+doc "$now" 'd["checks"][0]["status"] = "fine"' > "$scratch/st.json"; expect "invalid check status" 4 "$scratch/st.json" --host beelink
+addr="$(printf '%d.%d.%d.%d' 10 0 0 1)"
+doc "$now" "d['checks'][0]['detail'] = 'via $addr'" > "$scratch/addr.json"; expect "refuses an address" 4 "$scratch/addr.json" --host beelink
+doc "$now" 'd["checks"][0]["detail"] = "/home/someone"' > "$scratch/home.json"; expect "refuses a home path" 4 "$scratch/home.json" --host beelink
+echo 'not json' > "$scratch/garbage";                             expect "refuses non-JSON" 4 "$scratch/garbage" --host beelink
+: > "$scratch/empty";                                             expect "refuses empty input" 4 "$scratch/empty" --host beelink
+head -c 300000 /dev/zero | tr '\0' ' ' > "$scratch/big";          expect "refuses oversized input" 3 "$scratch/big" --host beelink
+doc "2020-01-01T07:25:00+10:00" > "$scratch/old.json";            expect "refuses a replayed older document" 4 "$scratch/old.json" --host beelink
+doc "2999-01-01T07:25:00+10:00" > "$scratch/future.json";         expect "refuses a future document" 4 "$scratch/future.json" --host beelink
+doc "2026-09-25T07:25:00" > "$scratch/naive.json";                expect "refuses a naive timestamp" 4 "$scratch/naive.json" --host beelink
+rm -f "$state/beelink.json" "$state"/history/*.json
+for day in $(seq -w 1 16); do
+  doc "2026-01-${day}T07:25:00+10:00" > "$scratch/d.json"
+  HOME="$scratch" "$ingest" --host beelink < "$scratch/d.json" > /dev/null
+done
+n="$(ls "$state/history" | grep -c '^beelink-2026-01-')"
+[ "$n" -eq 14 ] && [ ! -e "$state/history/beelink-2026-01-01.json" ] && { pass=$((pass + 1)); echo "ok   history keeps 14"; } || { fail=$((fail + 1)); echo "FAIL history ($n kept)"; }
+grep -q 'REJECT' "$state/ingest.log" && ! grep -q "$addr" "$state/ingest.log" && { pass=$((pass + 1)); echo "ok   log has reasons, no content"; } || { fail=$((fail + 1)); echo "FAIL log"; }
+echo "fleet-health-ingest-test: $pass passed, $fail failed"
+[ "$fail" -eq 0 ]
