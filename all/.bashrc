@@ -20,23 +20,12 @@ fi
 # --------------------------------------------------
 # Source Modules
 # --------------------------------------------------
-# Private env vars (API keys, tokens) — lives outside the repo
-# Parses KEY=VALUE and export KEY=VALUE lines; skips invalid names (hyphens etc)
-if [ -f "$HOME/.env" ]; then
-  while IFS= read -r _line || [ -n "$_line" ]; do
-    _line="${_line%%#*}"                         # strip comments
-    case "$_line" in
-      export\ *) _line="${_line#export }" ;;
-    esac
-    case "$_line" in *=*) ;; *) continue ;; esac # skip non-assignments
-    _key="${_line%%=*}"
-    _key="${_key#"${_key%%[![:space:]]*}"}"       # trim leading whitespace
-    case "$_key" in *[!A-Za-z0-9_]*) continue ;; esac  # skip invalid names
-    [ -z "$_key" ] && continue
-    eval "export $_line"
-  done < "$HOME/.env"
-  unset _line _key
-fi
+# Private keys (~/.env) are NOT exported into the shell (2026-09-25): every
+# agent launched from a terminal inherited them, and one `env` in its tool
+# calls would ship them to its model provider. Tools load their own keys at
+# runtime. For one command: `withkeys NAME... -- cmd`. Into this shell, on
+# purpose: `loadkeys NAME...`. List names: `withkeys --list`.
+loadkeys() { eval "$(withkeys --emit "$@")"; }
 [ -f "$HOME/.bash_exports" ] && source "$HOME/.bash_exports"
 [ -f "$HOME/.bash_env" ] && source "$HOME/.bash_env"
 [ -f "$HOME/.bash_options" ] && source "$HOME/.bash_options"
