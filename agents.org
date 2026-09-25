@@ -317,6 +317,224 @@ Verify the seal with the agent itself, testing a *known world-readable path*, no
 just =ls= (which dir perms already block):
 =sudo -u agent-<tool> -H cat /home/<human>/.env=  → must be Permission denied.
 
+*** Script: agent-home-seal (dry-run by default)
+
+The recipe above has a third trap it did not name (found on kikin 2026-09-25):
+the traverse ACL opens the home to path-walking, and every top-level directory
+that is =o+rx= (=.config=, =.local=, =.claude=, =.codex=, …) then becomes
+walkable too, with every world-readable file inside it readable by its
+well-known name. So the seal strips =o= from every top-level entry *before* the
+ACL goes on. On a home that was =700= this changes nothing for any existing
+consumer — nothing outside the owner could enter it.
+
+What agents may reach is an explicit list (=AGENT_SEAL_REACH=, default
+=DotCortex .guix-extra-profiles=). The Guix profiles are store symlinks with
+nothing secret in them, and the rootless sanctuary containers bind-mount that
+directory directly — their mapped guest users are "other" on the host, so
+closing it would break the guests. Reach entries keep their mode: DotCortex is public source and stays
+read-only to agents (=o+rX=, no write). Write access is deliberately not granted —
+an agent that can write the operator's dotfiles can plant code the operator
+later runs as himself, which is exactly the wall this user split builds.
+Symlinks are never chmod-ed (chmod follows them to their target).
+
+Every =--apply= first writes a restore script (the exact prior mode of each
+entry it touches, plus the home's ACL) to =~/.local/state/agent-home-seal/=.
+=--check= proves the seal from the agent's side with a positive control: the
+agent must reach each reach entry AND be refused the home listing, =~/.env=,
+=~/.ssh=, and the known auth files.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-home-seal :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/bin/agent-home-seal
+# Seal the operator's home against agent users. DRY-RUN unless --apply.
+set -euo pipefail
+
+HOME_DIR="${AGENT_SEAL_HOME:-$HOME}"
+REACH="${AGENT_SEAL_REACH:-DotCortex .guix-extra-profiles}"
+STATE="${AGENT_SEAL_STATE:-$HOME/.local/state/agent-home-seal}"
+SECRETS=".env .netrc .pgpass .git-credentials"
+DENY=".env .ssh/id_ed25519 .codex/auth.json .claude/.credentials.json .local/share/opencode/auth.json"
+MODE=dry-run
+
+usage() {
+  cat <<'EOF'
+Usage: agent-home-seal [--apply|--check|--help]
+  (no flag)  print the seal plan; change nothing
+  --apply    write a restore script, strip other-access from every top-level
+             entry except AGENT_SEAL_REACH, set secret files 600, then give
+             group cortex traverse-only (--x) on the home
+  --check    verify as each existing agent user: reach entries reachable,
+             home listing / .env / .ssh / auth files refused
+EOF
+}
+
+case "${1:-}" in
+  "") ;;
+  --apply) MODE=apply ;;
+  --check) MODE=check ;;
+  -h|--help) usage; exit 0 ;;
+  *) usage >&2; exit 2 ;;
+esac
+
+in_reach() { case " $REACH " in *" $1 "*) return 0 ;; esac; return 1; }
+
+if [ "$MODE" = check ]; then
+  agents="$(getent group cortex | cut -d: -f4 | tr ',' '\n' | grep '^agent-' || true)"
+  [ -n "$agents" ] || { echo "no agent users in cortex on $(hostname)"; exit 1; }
+  fail=0
+  for u in $agents; do
+    as() { sudo -n -u "$u" -H "$@" >/dev/null 2>&1; }
+    for r in $REACH; do
+      if as test -r "$HOME_DIR/$r" -a -x "$HOME_DIR/$r"; then echo "OK   $u reaches ~/$r"
+      else echo "FAIL $u cannot reach ~/$r"; fail=1; fi
+    done
+    if as ls "$HOME_DIR"; then echo "FAIL $u can list the home"; fail=1
+    else echo "OK   $u cannot list the home"; fi
+    for d in $DENY; do
+      [ -e "$HOME_DIR/$d" ] || continue
+      if as cat "$HOME_DIR/$d"; then echo "FAIL $u can read ~/$d"; fail=1
+      else echo "OK   $u refused ~/$d"; fi
+    done
+  done
+  exit "$fail"
+fi
+
+run() {
+  if [ "$MODE" = apply ]; then echo "+ $*"; "$@"; else echo "DRY-RUN: $*"; fi
+}
+
+getent group cortex >/dev/null || { echo "FATAL: no cortex group (agent-users-bootstrap first)" >&2; exit 1; }
+for r in $REACH; do
+  [ -e "$HOME_DIR/$r" ] || { echo "FATAL: reach entry ~/$r does not exist" >&2; exit 1; }
+done
+
+# Entries to close: real (non-symlink) top-level entries with any other-bit.
+mapfile -t close < <(find "$HOME_DIR" -mindepth 1 -maxdepth 1 ! -type l -perm /o=rwx -printf '%f\n' | sort)
+todo=()
+for e in "${close[@]}"; do in_reach "$e" || todo+=("$e"); done
+
+if [ "$MODE" = apply ]; then
+  mkdir -p "$STATE"; chmod 700 "$STATE"
+  restore="$STATE/restore-$(date +%Y%m%d-%H%M%S).sh"
+  {
+    echo "#!/usr/bin/env bash"
+    echo "# agent-home-seal restore for $HOME_DIR, written $(date -Is)"
+    echo "set -euo pipefail"
+    for e in "${todo[@]}"; do printf 'chmod %s %q\n' "$(stat -c %a "$HOME_DIR/$e")" "$HOME_DIR/$e"; done
+    for s in $SECRETS; do [ -f "$HOME_DIR/$s" ] && printf 'chmod %s %q\n' "$(stat -c %a "$HOME_DIR/$s")" "$HOME_DIR/$s"; done
+    printf 'chmod %s %q\n' "$(stat -c %a "$HOME_DIR")" "$HOME_DIR"
+    printf 'setfacl --set-file=- %q <<'"'"'ACL'"'"'\n' "$HOME_DIR"
+    getfacl -cp "$HOME_DIR"
+    echo "ACL"
+  } > "$restore"
+  chmod 700 "$restore"
+  echo "restore script: $restore"
+fi
+
+echo "--- 1/3 close other-access on ${#todo[@]} top-level entries (reach kept: $REACH)"
+for e in "${todo[@]}"; do run chmod o-rwx "$HOME_DIR/$e"; done
+echo "--- 2/3 secret files to 600"
+for s in $SECRETS; do
+  f="$HOME_DIR/$s"
+  [ -f "$f" ] && [ ! -L "$f" ] && [ "$(stat -c %a "$f")" != 600 ] && run chmod 600 "$f"
+done
+echo "--- 3/3 home: owner only, plus cortex traverse (mask re-asserted after chmod)"
+run chmod o-rwx,g-rwx "$HOME_DIR"
+run setfacl -m g:cortex:--x -m mask::--x "$HOME_DIR"
+
+if [ "$MODE" = apply ]; then
+  echo "sealed. verify: agent-home-seal --check"
+  echo "NFS note: if this host exports the home, flush: sudo exportfs -f && echo 1 | sudo tee /proc/net/rpc/auth.unix.gid/flush"
+else
+  echo "(dry-run complete — re-run with --apply after approval)"
+fi
+#+END_SRC
+
+The test seals a scratch "home" (it needs only the =cortex= group, no sudo): the
+dry-run must change nothing, apply must close every non-reach entry and leave
+reach entries and symlink targets alone, and the restore script must put every
+mode back exactly.
+
+#+BEGIN_SRC python :tangle linux/.local/share/dotcortex/tests/test-agent-home-seal.py :shebang "#!/usr/bin/env python3" :comments no :noweb no
+from __future__ import annotations
+
+import grp
+import os
+import stat
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[5]
+SEAL = ROOT / "all/.local/bin/agent-home-seal"
+
+
+def mode(p: Path) -> int:
+    return stat.S_IMODE(p.lstat().st_mode)
+
+
+@unittest.skipUnless(any(g.gr_name == "cortex" for g in grp.getgrall()), "needs the cortex group")
+class AgentHomeSealTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        self.home = base / "home"
+        self.outside = base / "outside"
+        self.home.mkdir(mode=0o700)
+        self.outside.mkdir()
+        self.outside.chmod(0o755)  # explicit: mkdir modes are masked by umask
+        for name, m in ((".config", 0o775), ("DotCortex", 0o775), ("notes.log", 0o664)):
+            p = self.home / name
+            p.mkdir() if name != "notes.log" else p.write_text("x")
+            p.chmod(m)
+        env = self.home / ".env"
+        env.write_text("A=1\n")
+        env.chmod(0o664)
+        (self.home / "link").symlink_to(self.outside)
+        self.env = dict(
+            os.environ,
+            AGENT_SEAL_HOME=str(self.home),
+            AGENT_SEAL_STATE=str(base / "state"),
+            AGENT_SEAL_REACH="DotCortex",
+        )
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def seal(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run([str(SEAL), *args], env=self.env, text=True, capture_output=True, check=False)
+
+    def test_dry_run_apply_restore(self) -> None:
+        before = {p.name: mode(p) for p in self.home.iterdir()}
+        dry = self.seal()
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual({p.name: mode(p) for p in self.home.iterdir()}, before, "dry-run must not change modes")
+
+        done = self.seal("--apply")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(mode(self.home / ".config") & 0o007, 0)
+        self.assertEqual(mode(self.home / "notes.log") & 0o007, 0)
+        self.assertEqual(mode(self.home / ".env"), 0o600)
+        self.assertEqual(mode(self.home / "DotCortex"), 0o775, "reach entries keep their mode")
+        self.assertEqual(mode(self.outside), 0o755, "symlink targets are never touched")
+        acl = subprocess.run(["getfacl", "-cp", str(self.home)], text=True, capture_output=True).stdout
+        self.assertIn("group:cortex:--x", acl)
+
+        restore = sorted((Path(self.env["AGENT_SEAL_STATE"])).glob("restore-*.sh"))
+        self.assertEqual(len(restore), 1)
+        subprocess.run(["bash", str(restore[0])], check=True, capture_output=True)
+        self.assertEqual({p.name: mode(p) for p in self.home.iterdir()}, before, "restore puts every mode back")
+
+    def test_missing_reach_entry_is_fatal(self) -> None:
+        self.env["AGENT_SEAL_REACH"] = "NoSuchRepo"
+        self.assertEqual(self.seal().returncode, 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
 *** NFS gotchas for agent users (cost an hour; do not rediscover)
 - With =manage-gids=y= (mountd), the server IGNORES the client's AUTH_SYS group list
   and looks up groups *server-side by numeric uid*. The agent user (with matching
