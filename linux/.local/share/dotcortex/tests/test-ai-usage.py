@@ -115,5 +115,77 @@ class CodexAllowanceWindowTests(unittest.TestCase):
         self.assertNotRegex(plain, re.compile(r"wk\s+.*100%"))
 
 
+# Redacted fixture: the real 2026-09-25 /v1/quota shape (including the
+# undocumented legacy/new credit fields), synthetic values, key name removed.
+NEURALWATT_FIXTURE = {
+    "snapshot_at": "2026-09-25T02:50:00Z",
+    "balance": {
+        "credits_remaining_usd": 12.5,
+        "total_credits_usd": 20.0,
+        "credits_used_usd": 7.5,
+        "accounting_method": "token",
+        "legacy_credits_usd": 0.0,
+        "new_credits_usd": 12.5,
+    },
+    "usage": {
+        "lifetime": {"cost_usd": 7.5, "requests": 900, "tokens": 4000000, "energy_kwh": 1.2},
+        "current_month": {"cost_usd": 1.25, "requests": 100, "tokens": 500000, "energy_kwh": 0.2},
+    },
+    "limits": {"overage_limit_usd": None, "rate_limit_tier": "standard"},
+    "subscription": None,
+    "key": {"name": "REDACTED", "allowance": None},
+}
+
+
+class NeuralWattObservationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+        cls.now = datetime(2026, 9, 25, 3, 0, tzinfo=timezone.utc)
+
+    def ok(self, raw):
+        return {"provider": "neuralwatt", "label": "NeuralWatt", "state": "ok", "source": "api", "summary": "", "raw": raw}
+
+    def test_credit_account_fixture(self):
+        result = self.ai_usage.apply_neuralwatt_observation(self.ok(NEURALWATT_FIXTURE), self.now)
+        self.assertEqual(result["state"], "ok")
+        obs = result["observation"]
+        self.assertEqual(obs["schema"], "neuralwatt.quota.v1")
+        self.assertEqual(obs["observed_at"], "2026-09-25T02:50:00Z")
+        self.assertEqual(obs["collected_at"], "2026-09-25T03:00:00+00:00")
+        self.assertEqual(obs["balance"]["remaining_usd"], 12.5)
+        self.assertIsNone(obs["subscription"])
+        self.assertIsNone(obs["key_allowance"])
+        self.assertEqual(result["summary"], "balance $12.50; month $1.25; no subscription")
+
+    def test_subscription_and_key_allowance_stay_separate(self):
+        raw = dict(NEURALWATT_FIXTURE)
+        raw["subscription"] = {
+            "plan": "pro", "status": "active", "billing_interval": "month",
+            "current_period_start": "2026-09-01T00:00:00Z", "current_period_end": "2026-10-01T00:00:00Z",
+            "auto_renew": True, "kwh_included": 10.0, "kwh_used": 4.0, "kwh_remaining": 6.0, "in_overage": False,
+        }
+        raw["key"] = {"name": "REDACTED", "allowance": {
+            "limit_usd": 5.0, "period": "daily", "spent_usd": 1.0, "remaining_usd": 4.0, "blocked": False}}
+        result = self.ai_usage.apply_neuralwatt_observation(self.ok(raw), self.now)
+        obs = result["observation"]
+        self.assertEqual(obs["subscription"]["kwh_remaining"], 6.0)
+        self.assertEqual(obs["key_allowance"]["remaining_usd"], 4.0)
+        self.assertEqual(obs["balance"]["remaining_usd"], 12.5)
+        self.assertEqual(result["summary"], "balance $12.50; month $1.25; pro active 4/10 kWh; key daily $4.00 left")
+
+    def test_schema_drift_is_an_error_not_a_guess(self):
+        raw = {k: v for k, v in NEURALWATT_FIXTURE.items() if k != "balance"}
+        result = self.ai_usage.apply_neuralwatt_observation(self.ok(raw), self.now)
+        self.assertEqual(result["state"], "error")
+        self.assertIn("missing balance", result["summary"])
+        self.assertNotIn("observation", result)
+
+    def test_non_ok_probe_passes_through(self):
+        failed = {"provider": "neuralwatt", "label": "NeuralWatt", "state": "error", "source": "api",
+                  "summary": "https://api.neuralwatt.com/v1/quota returned HTTP 429", "raw": None}
+        self.assertIs(self.ai_usage.apply_neuralwatt_observation(failed, self.now), failed)
+
+
 if __name__ == "__main__":
     unittest.main()
