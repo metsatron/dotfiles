@@ -5,14 +5,17 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -22,6 +25,10 @@ DEFAULT_COOLDOWN = 15 * 60
 DEFAULT_CONFIRM_SECONDS = 120.0
 DEFAULT_ALERT_COOLDOWN = 6 * 60 * 60
 DEFAULT_MAX_FAILURES = 3
+DEFAULT_TURN_STALL_SECONDS = 20 * 60
+DEFAULT_STALL_ESCALATE_COUNT = 2
+DEFAULT_STALL_ESCALATE_WINDOW = 2 * 60 * 60
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
 
 
 def read_json(path: pathlib.Path) -> dict | None:
@@ -107,6 +114,225 @@ def api_probe(port: int, timeout: float) -> dict:
         return {"status": "unhealthy", "reason": "api-unreachable", "error": type(error).__name__}
 
 
+def api_json(port: int, path: str, timeout: float, method: str = "GET") -> tuple[int, object | None]:
+    """Bounded loopback JSON call; transport errors propagate to the caller."""
+    data = b"" if method != "GET" else None
+    request = Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        headers={"Accept": "application/json"},
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = int(response.status)
+    except HTTPError as error:
+        raw = error.read()
+        status = int(error.code)
+    if not raw:
+        return status, None
+    try:
+        return status, json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return status, None
+
+
+def owner_session(owner_state: pathlib.Path) -> str | None:
+    owner = read_json(owner_state)
+    if not isinstance(owner, dict):
+        return None
+    binding = owner.get("session_binding")
+    if not isinstance(binding, dict) or binding.get("status") != "bound":
+        return None
+    session_id = binding.get("session_id")
+    if not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
+        return None
+    return session_id
+
+
+def session_busy(payload: object, session_id: str) -> bool | None:
+    if not isinstance(payload, dict):
+        return None
+    if session_id not in payload:
+        return False
+    row = payload.get(session_id)
+    kind = row.get("type", row.get("status")) if isinstance(row, dict) else None
+    if not isinstance(kind, str):
+        return None
+    normalized = kind.lower()
+    if normalized == "idle":
+        return False
+    if normalized in {"busy", "retry", "working", "running", "compacting"}:
+        return True
+    return None
+
+
+def turn_state(payload: object) -> dict | None:
+    """Describe the newest incomplete assistant turn's progress fingerprint."""
+    if not isinstance(payload, list):
+        return None
+    latest = None
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        info = row.get("info") if isinstance(row.get("info"), dict) else row
+        if info.get("role") != "assistant":
+            continue
+        timing = info.get("time") if isinstance(info.get("time"), dict) else {}
+        if timing.get("completed") is not None:
+            continue
+        latest = (row, info)
+    if latest is None:
+        return None
+    row, info = latest
+    parts = row.get("parts") if isinstance(row.get("parts"), list) else []
+    material: list[list[object]] = []
+    running_tools = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        entry: list[object] = [kind]
+        if kind == "tool":
+            block = part.get("state") if isinstance(part.get("state"), dict) else {}
+            timing = block.get("time") if isinstance(block.get("time"), dict) else {}
+            entry.extend((part.get("tool"), block.get("status"), timing.get("start"), timing.get("end")))
+            if block.get("status") == "running":
+                running_tools += 1
+        elif kind in {"text", "reasoning"}:
+            entry.append(len(part.get("text") or ""))
+        else:
+            timing = part.get("time") if isinstance(part.get("time"), dict) else {}
+            entry.extend((timing.get("start"), timing.get("end")))
+        material.append(entry)
+    fingerprint = hashlib.sha256(
+        json.dumps([info.get("id"), material], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "message_id": info.get("id"),
+        "fingerprint": fingerprint,
+        "parts": len(parts),
+        "running_tools": running_tools,
+    }
+
+
+def assess_turn_stall(args: argparse.Namespace, state: dict, state_path: pathlib.Path) -> dict:
+    """Abort one confirmed stalled turn; escalate when stalls repeat."""
+    if not args.turn_stall:
+        return {"status": "disabled"}
+    session_id = owner_session(pathlib.Path(args.owner_state).expanduser())
+    if session_id is None:
+        return {"status": "skip", "reason": "session-binding-unavailable"}
+    try:
+        status_code, status_payload = api_json(args.port, "/session/status", args.api_timeout)
+        if status_code != 200:
+            return {"status": "skip", "reason": "session-status-unavailable"}
+        busy = session_busy(status_payload, session_id)
+        if busy is None:
+            return {"status": "skip", "reason": "session-status-unknown"}
+        if not busy:
+            cleared = any(
+                key in state for key in ("stall_fingerprint", "stall_since", "stall_message_id")
+            )
+            state.pop("stall_fingerprint", None)
+            state.pop("stall_since", None)
+            state.pop("stall_message_id", None)
+            if cleared and not args.dry_run:
+                atomic_json(state_path, state)
+            return {"status": "clear"}
+        message_code, messages = api_json(
+            args.port,
+            f"/session/{quote(session_id, safe='')}/message",
+            args.api_timeout,
+        )
+        if message_code != 200:
+            return {"status": "skip", "reason": "session-messages-unavailable"}
+        turn = turn_state(messages)
+    except (OSError, URLError, TimeoutError) as error:
+        return {"status": "skip", "reason": f"session-probe-{type(error).__name__}"}
+    if turn is None:
+        return {"status": "skip", "reason": "no-incomplete-assistant-message"}
+    now = time.time()
+    if state.get("stall_fingerprint") != turn["fingerprint"]:
+        state.update({
+            "stall_fingerprint": turn["fingerprint"],
+            "stall_since": now,
+            "stall_message_id": turn["message_id"],
+        })
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        return {
+            "status": "progress",
+            "message_id": turn["message_id"],
+            "running_tools": turn["running_tools"],
+        }
+    try:
+        first_seen = float(state.get("stall_since", 0) or 0)
+    except (TypeError, ValueError):
+        first_seen = now
+    stalled_for = max(0.0, now - first_seen)
+    if stalled_for < args.turn_stall_seconds:
+        return {
+            "status": "waiting",
+            "stalled_for": round(stalled_for, 1),
+            "threshold": args.turn_stall_seconds,
+        }
+    if args.dry_run:
+        return {
+            "status": "would-abort",
+            "stalled_for": round(stalled_for, 1),
+            "message_id": turn["message_id"],
+        }
+    try:
+        abort_code, _ = api_json(
+            args.port,
+            f"/session/{quote(session_id, safe='')}/abort",
+            args.api_timeout,
+            method="POST",
+        )
+    except (OSError, URLError, TimeoutError):
+        abort_code = None
+    window = args.stall_escalate_window
+    aborts = [
+        float(item)
+        for item in state.get("stall_aborts", [])
+        if isinstance(item, (int, float))
+        and not isinstance(item, bool)
+        and now - float(item) <= window
+    ]
+    aborts.append(now)
+    escalate = len(aborts) >= args.stall_escalate_count
+    state.update({
+        "stall_aborts": [] if escalate else aborts[-8:],
+        "last_stall_abort": now,
+        "last_stall_abort_status": abort_code,
+        "stall_since": now,
+    })
+    if escalate:
+        state["last_stall_escalation"] = now
+    atomic_json(state_path, state)
+    events = state_path.with_name("events.jsonl")
+    log_event(
+        events, action="turn-stall-abort", abort_status=abort_code,
+        stalled_for=round(stalled_for, 1), message_id=turn["message_id"],
+        running_tools=turn["running_tools"], escalate=escalate,
+    )
+    result = {
+        "status": "stalled-escalated" if escalate else "stalled-aborted",
+        "abort_status": abort_code,
+        "stalled_for": round(stalled_for, 1),
+        "message_id": turn["message_id"],
+        "running_tools": turn["running_tools"],
+    }
+    if escalate:
+        dispatch_worker(args, state_path.with_name("recovery.log"))
+        log_event(events, action="turn-stall-escalation", result="dispatched",
+                  message_id=turn["message_id"])
+        result["escalation"] = "worker-restart-dispatched"
+    return result
+
+
 def fingerprint(payload: dict, probe: dict) -> str:
     material = {
         "reasons": payload.get("reasons", []),
@@ -176,6 +402,28 @@ def worker(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
+def dispatch_worker(args: argparse.Namespace, log_path: pathlib.Path) -> None:
+    command = [
+        sys.executable, str(pathlib.Path(__file__).resolve()),
+        "--worker", "--expected-host", args.expected_host,
+        "--owner", args.owner, "--owner-state", args.owner_state,
+        "--manager", args.manager, "--project", args.project,
+        "--port", str(args.port), "--watchdog-state", args.watchdog_state,
+        "--api-timeout", str(args.api_timeout),
+        "--command-timeout", str(args.command_timeout),
+    ]
+    with log_path.open("a", encoding="utf-8") as stream:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=args.environment,
+        )
+
+
 def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> int:
     event_path = state_path.with_name("events.jsonl")
     state = read_json(state_path) or {"schema": SCHEMA, "failures": 0}
@@ -196,7 +444,20 @@ def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> i
         state.pop("last_alert", None)
         if not args.dry_run:
             atomic_json(state_path, state)
-        emit({"schema": SCHEMA, "status": "healthy", "reason": "owner-and-api-healthy", "probe": probe}, args.json)
+        turn = assess_turn_stall(args, state, state_path)
+        if turn.get("status") in {"stalled-aborted", "stalled-escalated"}:
+            emit({
+                "schema": SCHEMA,
+                "status": "turn-stall-escalated" if turn["status"] == "stalled-escalated" else "turn-stall-aborted",
+                "reason": "turn-stall",
+                "probe": probe,
+                "turn": turn,
+            }, args.json)
+            return 0
+        value = {"schema": SCHEMA, "status": "healthy", "reason": "owner-and-api-healthy", "probe": probe}
+        if turn.get("status") not in {"clear", "disabled", "skip"}:
+            value["turn"] = turn
+        emit(value, args.json)
         return 0
 
     if not reasons.issubset(SAFE_REASONS) or payload.get("status") == "stopped":
@@ -232,26 +493,7 @@ def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> i
 
     state.update({"last_attempt": now, "last_reason": sorted(reasons)})
     atomic_json(state_path, state)
-    command = [
-        sys.executable, str(pathlib.Path(__file__).resolve()),
-        "--worker", "--expected-host", args.expected_host,
-        "--owner", args.owner, "--owner-state", args.owner_state,
-        "--manager", args.manager, "--project", args.project,
-        "--port", str(args.port), "--watchdog-state", args.watchdog_state,
-        "--api-timeout", str(args.api_timeout),
-        "--command-timeout", str(args.command_timeout),
-    ]
-    log_path = state_path.with_name("recovery.log")
-    with log_path.open("a", encoding="utf-8") as stream:
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            env=args.environment,
-        )
+    dispatch_worker(args, state_path.with_name("recovery.log"))
     log_event(event_path, action="dispatch", result="dispatched", reasons=sorted(reasons), fingerprint=current_fingerprint)
     emit({"schema": SCHEMA, "status": "dispatched", "reason": "detached-recovery", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
     return 0
@@ -296,6 +538,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--watchdog-state", default=str(state_home / "opencode-watchdog/state.json"))
     p.add_argument("--api-timeout", type=float, default=3.0)
     p.add_argument("--command-timeout", type=float, default=120.0)
+    p.add_argument("--turn-stall", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--turn-stall-seconds", type=float, default=DEFAULT_TURN_STALL_SECONDS)
+    p.add_argument("--stall-escalate-count", type=int, default=DEFAULT_STALL_ESCALATE_COUNT)
+    p.add_argument("--stall-escalate-window", type=float, default=DEFAULT_STALL_ESCALATE_WINDOW)
     p.add_argument("--confirm-seconds", type=float, default=DEFAULT_CONFIRM_SECONDS)
     p.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN)
     p.add_argument("--alert-cooldown", type=float, default=DEFAULT_ALERT_COOLDOWN)
