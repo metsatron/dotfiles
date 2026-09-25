@@ -186,6 +186,22 @@
    (task 'stow:s24 "Safe stow S24 overlays (all termux s24)"
          (lambda () (stow-then-reload-tmux "STOW_PKGS='all termux s24' make safe-stow")))
 
+   ;; Registry-driven stow (layers.org). Resolves this host + invoking user through
+   ;; all/.config/dotcortex/{hosts,users}.ssv in the order all -> linux -> distro ->
+   ;; init -> host -> user -> local, then runs the same safe-stow as every verb above.
+   ;; The per-host verbs stay; layers:check proves they and stow:auto agree.
+   (task 'stow:auto "Safe stow the layer stack hosts.ssv/users.ssv resolve for this host and user"
+         (lambda () (stow-then-reload-tmux "set -euo pipefail; HELPER=\"$HOME/.local/bin/dotcortex-layers\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/all/.local/bin/dotcortex-layers\"; pkgs=$(\"$HELPER\" resolve --explain); printf '[loom] stow:auto -> %s\\n' \"$pkgs\"; STOW_PKGS=\"$pkgs\" make safe-stow")))
+
+   (task 'layers:show "Show the layer stack stow:auto would use here (no stow)"
+         (lambda () (sh "HELPER=\"$HOME/.local/bin/dotcortex-layers\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/all/.local/bin/dotcortex-layers\"; \"$HELPER\" show")))
+
+   (task 'layers:check "Lint hosts.ssv/users.ssv and prove every legacy stow verb is reproduced"
+         (lambda () (sh "HELPER=\"$HOME/.local/bin/dotcortex-layers\"; [ -x \"$HELPER\" ] || HELPER=\"$HOME/DotCortex/all/.local/bin/dotcortex-layers\"; \"$HELPER\" check")))
+
+   (task 'layers:test "Run the layer registry, resolver and guard fixture tests"
+         (lambda () (sh "python3 \"$HOME/DotCortex/all/.local/share/dotcortex/tests/test-dotcortex-layers.py\"")))
+
    (task 'odin:deploy "Deploy Odin Lite RetroArch config to the device over adb"
          (lambda () (sh "bash odin-config/deploy.sh")))
 
