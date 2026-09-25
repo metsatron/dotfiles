@@ -865,6 +865,16 @@ Recovery is dispatched with a new session and recorded under the private XDG
 state directory. The cron installer is explicit and dry-run capable; tangling
 does not install a privileged schedule.
 
+Turn health is assisted separately from process health. When the owner and API
+are healthy, the watchdog reads the bound session's status and newest
+incomplete assistant message over the same bounded loopback probe. A turn whose
+part fingerprint has not moved for the stall interval is aborted once — the
+line between thinking and wedged is time, so the interval is generous and the
+only default action is an abort. Escalation is deliberate: if stalls abort
+twice inside the escalation window, the same detached worker used for process
+faults is dispatched, because a poisoned turn can survive the abort inside the
+running process.
+
 #+BEGIN_SRC python :tangle all/.local/bin/opencode-watchdog :shebang "#!/usr/bin/env python3" :comments no
 """Guard the Kikin OpenCode pair from outside the OpenCode process tree."""
 
@@ -872,14 +882,17 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import hashlib
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
 import time
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -889,6 +902,10 @@ DEFAULT_COOLDOWN = 15 * 60
 DEFAULT_CONFIRM_SECONDS = 120.0
 DEFAULT_ALERT_COOLDOWN = 6 * 60 * 60
 DEFAULT_MAX_FAILURES = 3
+DEFAULT_TURN_STALL_SECONDS = 20 * 60
+DEFAULT_STALL_ESCALATE_COUNT = 2
+DEFAULT_STALL_ESCALATE_WINDOW = 2 * 60 * 60
+SESSION_RE = re.compile(r"^[A-Za-z0-9._:-]{1,240}$")
 
 
 def read_json(path: pathlib.Path) -> dict | None:
@@ -974,6 +991,225 @@ def api_probe(port: int, timeout: float) -> dict:
         return {"status": "unhealthy", "reason": "api-unreachable", "error": type(error).__name__}
 
 
+def api_json(port: int, path: str, timeout: float, method: str = "GET") -> tuple[int, object | None]:
+    """Bounded loopback JSON call; transport errors propagate to the caller."""
+    data = b"" if method != "GET" else None
+    request = Request(
+        f"http://127.0.0.1:{port}{path}",
+        data=data,
+        headers={"Accept": "application/json"},
+        method=method,
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read()
+            status = int(response.status)
+    except HTTPError as error:
+        raw = error.read()
+        status = int(error.code)
+    if not raw:
+        return status, None
+    try:
+        return status, json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return status, None
+
+
+def owner_session(owner_state: pathlib.Path) -> str | None:
+    owner = read_json(owner_state)
+    if not isinstance(owner, dict):
+        return None
+    binding = owner.get("session_binding")
+    if not isinstance(binding, dict) or binding.get("status") != "bound":
+        return None
+    session_id = binding.get("session_id")
+    if not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
+        return None
+    return session_id
+
+
+def session_busy(payload: object, session_id: str) -> bool | None:
+    if not isinstance(payload, dict):
+        return None
+    if session_id not in payload:
+        return False
+    row = payload.get(session_id)
+    kind = row.get("type", row.get("status")) if isinstance(row, dict) else None
+    if not isinstance(kind, str):
+        return None
+    normalized = kind.lower()
+    if normalized == "idle":
+        return False
+    if normalized in {"busy", "retry", "working", "running", "compacting"}:
+        return True
+    return None
+
+
+def turn_state(payload: object) -> dict | None:
+    """Describe the newest incomplete assistant turn's progress fingerprint."""
+    if not isinstance(payload, list):
+        return None
+    latest = None
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        info = row.get("info") if isinstance(row.get("info"), dict) else row
+        if info.get("role") != "assistant":
+            continue
+        timing = info.get("time") if isinstance(info.get("time"), dict) else {}
+        if timing.get("completed") is not None:
+            continue
+        latest = (row, info)
+    if latest is None:
+        return None
+    row, info = latest
+    parts = row.get("parts") if isinstance(row.get("parts"), list) else []
+    material: list[list[object]] = []
+    running_tools = 0
+    for part in parts:
+        if not isinstance(part, dict):
+            continue
+        kind = part.get("type")
+        entry: list[object] = [kind]
+        if kind == "tool":
+            block = part.get("state") if isinstance(part.get("state"), dict) else {}
+            timing = block.get("time") if isinstance(block.get("time"), dict) else {}
+            entry.extend((part.get("tool"), block.get("status"), timing.get("start"), timing.get("end")))
+            if block.get("status") == "running":
+                running_tools += 1
+        elif kind in {"text", "reasoning"}:
+            entry.append(len(part.get("text") or ""))
+        else:
+            timing = part.get("time") if isinstance(part.get("time"), dict) else {}
+            entry.extend((timing.get("start"), timing.get("end")))
+        material.append(entry)
+    fingerprint = hashlib.sha256(
+        json.dumps([info.get("id"), material], sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "message_id": info.get("id"),
+        "fingerprint": fingerprint,
+        "parts": len(parts),
+        "running_tools": running_tools,
+    }
+
+
+def assess_turn_stall(args: argparse.Namespace, state: dict, state_path: pathlib.Path) -> dict:
+    """Abort one confirmed stalled turn; escalate when stalls repeat."""
+    if not args.turn_stall:
+        return {"status": "disabled"}
+    session_id = owner_session(pathlib.Path(args.owner_state).expanduser())
+    if session_id is None:
+        return {"status": "skip", "reason": "session-binding-unavailable"}
+    try:
+        status_code, status_payload = api_json(args.port, "/session/status", args.api_timeout)
+        if status_code != 200:
+            return {"status": "skip", "reason": "session-status-unavailable"}
+        busy = session_busy(status_payload, session_id)
+        if busy is None:
+            return {"status": "skip", "reason": "session-status-unknown"}
+        if not busy:
+            cleared = any(
+                key in state for key in ("stall_fingerprint", "stall_since", "stall_message_id")
+            )
+            state.pop("stall_fingerprint", None)
+            state.pop("stall_since", None)
+            state.pop("stall_message_id", None)
+            if cleared and not args.dry_run:
+                atomic_json(state_path, state)
+            return {"status": "clear"}
+        message_code, messages = api_json(
+            args.port,
+            f"/session/{quote(session_id, safe='')}/message",
+            args.api_timeout,
+        )
+        if message_code != 200:
+            return {"status": "skip", "reason": "session-messages-unavailable"}
+        turn = turn_state(messages)
+    except (OSError, URLError, TimeoutError) as error:
+        return {"status": "skip", "reason": f"session-probe-{type(error).__name__}"}
+    if turn is None:
+        return {"status": "skip", "reason": "no-incomplete-assistant-message"}
+    now = time.time()
+    if state.get("stall_fingerprint") != turn["fingerprint"]:
+        state.update({
+            "stall_fingerprint": turn["fingerprint"],
+            "stall_since": now,
+            "stall_message_id": turn["message_id"],
+        })
+        if not args.dry_run:
+            atomic_json(state_path, state)
+        return {
+            "status": "progress",
+            "message_id": turn["message_id"],
+            "running_tools": turn["running_tools"],
+        }
+    try:
+        first_seen = float(state.get("stall_since", 0) or 0)
+    except (TypeError, ValueError):
+        first_seen = now
+    stalled_for = max(0.0, now - first_seen)
+    if stalled_for < args.turn_stall_seconds:
+        return {
+            "status": "waiting",
+            "stalled_for": round(stalled_for, 1),
+            "threshold": args.turn_stall_seconds,
+        }
+    if args.dry_run:
+        return {
+            "status": "would-abort",
+            "stalled_for": round(stalled_for, 1),
+            "message_id": turn["message_id"],
+        }
+    try:
+        abort_code, _ = api_json(
+            args.port,
+            f"/session/{quote(session_id, safe='')}/abort",
+            args.api_timeout,
+            method="POST",
+        )
+    except (OSError, URLError, TimeoutError):
+        abort_code = None
+    window = args.stall_escalate_window
+    aborts = [
+        float(item)
+        for item in state.get("stall_aborts", [])
+        if isinstance(item, (int, float))
+        and not isinstance(item, bool)
+        and now - float(item) <= window
+    ]
+    aborts.append(now)
+    escalate = len(aborts) >= args.stall_escalate_count
+    state.update({
+        "stall_aborts": [] if escalate else aborts[-8:],
+        "last_stall_abort": now,
+        "last_stall_abort_status": abort_code,
+        "stall_since": now,
+    })
+    if escalate:
+        state["last_stall_escalation"] = now
+    atomic_json(state_path, state)
+    events = state_path.with_name("events.jsonl")
+    log_event(
+        events, action="turn-stall-abort", abort_status=abort_code,
+        stalled_for=round(stalled_for, 1), message_id=turn["message_id"],
+        running_tools=turn["running_tools"], escalate=escalate,
+    )
+    result = {
+        "status": "stalled-escalated" if escalate else "stalled-aborted",
+        "abort_status": abort_code,
+        "stalled_for": round(stalled_for, 1),
+        "message_id": turn["message_id"],
+        "running_tools": turn["running_tools"],
+    }
+    if escalate:
+        dispatch_worker(args, state_path.with_name("recovery.log"))
+        log_event(events, action="turn-stall-escalation", result="dispatched",
+                  message_id=turn["message_id"])
+        result["escalation"] = "worker-restart-dispatched"
+    return result
+
+
 def fingerprint(payload: dict, probe: dict) -> str:
     material = {
         "reasons": payload.get("reasons", []),
@@ -1043,6 +1279,28 @@ def worker(args: argparse.Namespace) -> int:
     return 0 if healthy else 1
 
 
+def dispatch_worker(args: argparse.Namespace, log_path: pathlib.Path) -> None:
+    command = [
+        sys.executable, str(pathlib.Path(__file__).resolve()),
+        "--worker", "--expected-host", args.expected_host,
+        "--owner", args.owner, "--owner-state", args.owner_state,
+        "--manager", args.manager, "--project", args.project,
+        "--port", str(args.port), "--watchdog-state", args.watchdog_state,
+        "--api-timeout", str(args.api_timeout),
+        "--command-timeout", str(args.command_timeout),
+    ]
+    with log_path.open("a", encoding="utf-8") as stream:
+        subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=stream,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+            env=args.environment,
+        )
+
+
 def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> int:
     event_path = state_path.with_name("events.jsonl")
     state = read_json(state_path) or {"schema": SCHEMA, "failures": 0}
@@ -1063,7 +1321,20 @@ def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> i
         state.pop("last_alert", None)
         if not args.dry_run:
             atomic_json(state_path, state)
-        emit({"schema": SCHEMA, "status": "healthy", "reason": "owner-and-api-healthy", "probe": probe}, args.json)
+        turn = assess_turn_stall(args, state, state_path)
+        if turn.get("status") in {"stalled-aborted", "stalled-escalated"}:
+            emit({
+                "schema": SCHEMA,
+                "status": "turn-stall-escalated" if turn["status"] == "stalled-escalated" else "turn-stall-aborted",
+                "reason": "turn-stall",
+                "probe": probe,
+                "turn": turn,
+            }, args.json)
+            return 0
+        value = {"schema": SCHEMA, "status": "healthy", "reason": "owner-and-api-healthy", "probe": probe}
+        if turn.get("status") not in {"clear", "disabled", "skip"}:
+            value["turn"] = turn
+        emit(value, args.json)
         return 0
 
     if not reasons.issubset(SAFE_REASONS) or payload.get("status") == "stopped":
@@ -1099,26 +1370,7 @@ def assess_and_dispatch(args: argparse.Namespace, state_path: pathlib.Path) -> i
 
     state.update({"last_attempt": now, "last_reason": sorted(reasons)})
     atomic_json(state_path, state)
-    command = [
-        sys.executable, str(pathlib.Path(__file__).resolve()),
-        "--worker", "--expected-host", args.expected_host,
-        "--owner", args.owner, "--owner-state", args.owner_state,
-        "--manager", args.manager, "--project", args.project,
-        "--port", str(args.port), "--watchdog-state", args.watchdog_state,
-        "--api-timeout", str(args.api_timeout),
-        "--command-timeout", str(args.command_timeout),
-    ]
-    log_path = state_path.with_name("recovery.log")
-    with log_path.open("a", encoding="utf-8") as stream:
-        subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=stream,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            close_fds=True,
-            env=args.environment,
-        )
+    dispatch_worker(args, state_path.with_name("recovery.log"))
     log_event(event_path, action="dispatch", result="dispatched", reasons=sorted(reasons), fingerprint=current_fingerprint)
     emit({"schema": SCHEMA, "status": "dispatched", "reason": "detached-recovery", "owner_reasons": sorted(reasons), "probe": probe}, args.json)
     return 0
@@ -1163,6 +1415,10 @@ def parser() -> argparse.ArgumentParser:
     p.add_argument("--watchdog-state", default=str(state_home / "opencode-watchdog/state.json"))
     p.add_argument("--api-timeout", type=float, default=3.0)
     p.add_argument("--command-timeout", type=float, default=120.0)
+    p.add_argument("--turn-stall", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--turn-stall-seconds", type=float, default=DEFAULT_TURN_STALL_SECONDS)
+    p.add_argument("--stall-escalate-count", type=int, default=DEFAULT_STALL_ESCALATE_COUNT)
+    p.add_argument("--stall-escalate-window", type=float, default=DEFAULT_STALL_ESCALATE_WINDOW)
     p.add_argument("--confirm-seconds", type=float, default=DEFAULT_CONFIRM_SECONDS)
     p.add_argument("--cooldown", type=float, default=DEFAULT_COOLDOWN)
     p.add_argument("--alert-cooldown", type=float, default=DEFAULT_ALERT_COOLDOWN)
@@ -1250,6 +1506,182 @@ else
   run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
   echo "$TAG: installed $TARGET"
 fi
+#+END_SRC
+
+* OpenCode watchdog turn-stall tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-opencode-watchdog.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755) :comments no
+"""Deterministic fixture tests for the OpenCode watchdog turn-stall assist."""
+
+from __future__ import annotations
+
+import http.server
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+
+
+HERE = Path(__file__).resolve()
+WATCHDOG = HERE.parents[3] / "bin" / "opencode-watchdog"
+SESSION_ID = "ses_fixture00000000000000000000000"
+PROJECT = "/home/metsatron/HelmCortex"
+HOST = Path("/etc/hostname").read_text(encoding="utf-8").strip()
+
+
+def incomplete_turn() -> dict:
+    return {
+        "info": {"id": "msg_fixture", "role": "assistant", "time": {"created": 1}},
+        "parts": [
+            {"type": "text", "text": "working"},
+            {"type": "tool", "tool": "read", "state": {
+                "status": "running", "time": {"start": 1000},
+                "input": {"filePath": "/x"},
+            }},
+        ],
+    }
+
+
+class Fixture:
+    def __init__(self) -> None:
+        self.status: object = {SESSION_ID: {"type": "busy"}}
+        self.messages: object = [{"info": {"role": "user"}, "parts": []}, incomplete_turn()]
+        self.aborts = 0
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def send_json(self, code: int, payload: object = None) -> None:
+                body = b"" if payload is None else json.dumps(payload).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self) -> None:  # noqa: N802
+                if self.path == "/":
+                    self.send_json(200, {})
+                elif self.path == "/session/status":
+                    self.send_json(200, outer.status)
+                elif self.path.startswith(f"/session/{SESSION_ID}/message"):
+                    self.send_json(200, outer.messages)
+                else:
+                    self.send_json(404, {})
+
+            def do_POST(self) -> None:  # noqa: N802
+                if self.path == f"/session/{SESSION_ID}/abort":
+                    outer.aborts += 1
+                    self.send_json(200, {})
+                else:
+                    self.send_json(404, {})
+
+            def log_message(self, *args: object) -> None:
+                return
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+        self.port = self.server.server_address[1]
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class WatchdogTurnStallTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(prefix="opencode-watchdog-")
+        self.root = Path(self.temp.name)
+        self.fixture = Fixture()
+        self.addCleanup(self.fixture.close)
+        self.owner = self.root / "owner"
+        self.owner.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json\n"
+            "print(json.dumps({'status': 'running', 'reasons': [],\n"
+            "                  'backend': {'pid': 1, 'valid': True},\n"
+            "                  'poller': {'pid': 2, 'valid': True}}))\n",
+            encoding="utf-8",
+        )
+        os.chmod(self.owner, 0o755)
+        self.marker = self.root / "manager.calls"
+        self.manager = self.root / "manager"
+        self.manager.write_text(f"#!/bin/sh\necho \"$@\" >> {self.marker}\n", encoding="utf-8")
+        os.chmod(self.manager, 0o755)
+        self.owner_state = self.root / "opencode.json"
+        self.owner_state.write_text(json.dumps({
+            "schema": "helmcortex.opencode-owner.v2",
+            "session_binding": {"status": "bound", "session_id": SESSION_ID},
+        }), encoding="utf-8")
+        self.state = self.root / "state.json"
+
+    def tearDown(self) -> None:
+        self.temp.cleanup()
+
+    def run_watchdog(self, *extra: str) -> dict:
+        command = [
+            str(WATCHDOG), "--expected-host", HOST, "--json",
+            "--owner", str(self.owner), "--owner-state", str(self.owner_state),
+            "--manager", str(self.manager), "--project", PROJECT,
+            "--port", str(self.fixture.port), "--watchdog-state", str(self.state),
+            "--api-timeout", "1.0", *extra,
+        ]
+        result = subprocess.run(command, text=True, capture_output=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return json.loads(result.stdout)
+
+    def read_state(self) -> dict:
+        return json.loads(self.state.read_text(encoding="utf-8"))
+
+    def test_progressing_turn_is_not_aborted(self) -> None:
+        first = self.run_watchdog("--turn-stall-seconds", "0")
+        self.assertEqual(first["status"], "healthy")
+        self.assertEqual(first["turn"]["status"], "progress")
+        second = self.run_watchdog("--turn-stall-seconds", "99999")
+        self.assertEqual(second["turn"]["status"], "waiting")
+        self.assertEqual(self.fixture.aborts, 0)
+
+    def test_confirmed_stall_aborts_the_turn(self) -> None:
+        self.run_watchdog("--turn-stall-seconds", "99999")
+        event = self.run_watchdog("--turn-stall-seconds", "0")
+        self.assertEqual(event["status"], "turn-stall-aborted")
+        self.assertEqual(event["turn"]["abort_status"], 200)
+        self.assertEqual(self.fixture.aborts, 1)
+
+    def test_idle_session_clears_stall_state(self) -> None:
+        self.state.write_text(json.dumps({
+            "schema": "dotcortex.opencode-watchdog.v1",
+            "stall_fingerprint": "deadbeef",
+            "stall_since": time.time() - 5000,
+        }), encoding="utf-8")
+        self.fixture.status = {}
+        event = self.run_watchdog()
+        self.assertEqual(event["status"], "healthy")
+        self.assertNotIn("stall_fingerprint", self.read_state())
+        self.assertEqual(self.fixture.aborts, 0)
+
+    def test_repeated_stalls_escalate_to_recovery_worker(self) -> None:
+        self.run_watchdog("--turn-stall-seconds", "99999")
+        state = self.read_state()
+        state["stall_since"] = time.time() - 3600
+        state["stall_aborts"] = [time.time() - 60]
+        self.state.write_text(json.dumps(state), encoding="utf-8")
+        event = self.run_watchdog("--turn-stall-seconds", "0")
+        self.assertEqual(event["status"], "turn-stall-escalated")
+        self.assertEqual(self.fixture.aborts, 1)
+        deadline = time.time() + 15
+        while time.time() < deadline and not self.marker.exists():
+            time.sleep(0.1)
+        self.assertTrue(self.marker.exists(), "recovery worker never invoked the manager")
+        self.assertIn("stop opencode", self.marker.read_text(encoding="utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()
 #+END_SRC
 
 * Telegram agent boot owner
