@@ -123,9 +123,40 @@ class RefusalTests(unittest.TestCase):
     def test_planned_honey_shows_its_intended_stack(self):
         result = run([sys.executable, str(HELPER), "show", "--allow-planned"],
                      DOTCORTEX_LAYERS_HOSTNAME="beelink", DOTCORTEX_LAYERS_ACCOUNT="gille")
-        # honey/ does not exist yet, so even inspection stops at the missing layer.
-        self.assertEqual(result.returncode, 4, result.stdout + result.stderr)
-        self.assertIn("'honey'", result.stderr)
+        # honey/ exists since the metsatron row went active; gille's row is still planned.
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("(planned)", result.stdout)
+        self.assertIn("host     honey", result.stdout)
+
+    def test_metsatron_on_honey_resolves(self):
+        result = self.resolve(DOTCORTEX_LAYERS_HOSTNAME="beelink", DOTCORTEX_LAYERS_ACCOUNT="metsatron")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.split(), ["all", "linux", "debian", "honey"])
+
+    def test_honey_refuses_an_account_on_neither_row(self):
+        result = self.resolve(DOTCORTEX_LAYERS_HOSTNAME="beelink", DOTCORTEX_LAYERS_ACCOUNT="u0_a458")
+        # u0_a458 maps to metsatron, so it resolves; an unmapped account is refused.
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.resolve(DOTCORTEX_LAYERS_HOSTNAME="beelink", DOTCORTEX_LAYERS_ACCOUNT="agent-codex")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("maps to no user", result.stderr)
+
+    def test_per_user_rows_must_agree_and_stay_disjoint(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for pkg in ("all", "linux", "debian", "honey", "user-metsatron", "user-gille"):
+                (root / pkg).mkdir()
+            hosts = root / "hosts.ssv"
+            hosts.write_text(
+                'honey beelink planned linux debian - honey gille,metsatron - "x"\n'
+                'honey beelink active  linux debian - other metsatron - "x"\n')
+            users = root / "users.ssv"
+            users.write_text('metsatron metsatron inactive m "x"\ngille gille inactive s "x"\n')
+            result = run([sys.executable, str(HELPER), "check"], DOTCORTEX_ROOT=str(root),
+                         DOTCORTEX_HOSTS_SSV=str(hosts), DOTCORTEX_USERS_SSV=str(users))
+            self.assertEqual(result.returncode, 1, result.stdout)
+            self.assertIn("rows disagree on HOSTPKG", result.stdout)
+            self.assertIn("user 'metsatron' is in more than one of its rows", result.stdout)
 
     def test_user_not_assigned_to_host_is_refused(self):
         result = self.resolve("--user", "gille", DOTCORTEX_LAYERS_HOSTNAME="x230")
