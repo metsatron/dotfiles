@@ -76,6 +76,29 @@ class TelegramAgentBootTest(unittest.TestCase):
         self.assertEqual(receipt["schema"], "dotcortex.telegram-agent-boot.v2")
         self.assertEqual(receipt["agents"], {"ductor": "ready", "codex": "ready", "opencode": "ready"})
 
+    def test_children_inherit_group_umask_state_stays_private(self) -> None:
+        # Agents write cortex-shared repos: a 077 leaking from the boot script
+        # closed every file the bot fleet created (2026-09-25).
+        self.write_manager({})
+        text = self.manager.read_text()
+        self.manager.write_text(text.replace(
+            "agent = sys.argv[2]\n",
+            "agent = sys.argv[2]\n"
+            "import os\n"
+            "mask = os.umask(0); os.umask(mask)\n"
+            "(root / 'umask').write_text(oct(mask))\n", 1))
+        result = subprocess.run(
+            ["sh", "-c", 'umask 077; exec "$@"', "sh", str(BOOT), "--expected-host", HOST,
+             "--delay", "0", "--retry-seconds", "0", "--attempts", "1",
+             "--manager", str(self.manager), "--state-dir", str(self.state)],
+            text=True, capture_output=True, timeout=10,
+            env={"HOME": str(self.root), "PATH": "/usr/local/bin:/usr/bin:/bin",
+                 "TELEGRAM_AGENT_BOOT_NO_LOG": "1"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.root / "umask").read_text(), "0o2")
+        self.assertEqual(stat.S_IMODE(self.state.stat().st_mode), 0o700)
+
     def test_exhaustion_is_loud_and_durable(self) -> None:
         self.write_manager({"ductor": 9})
         result = self.run_boot("--attempts", "2")
