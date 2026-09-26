@@ -2307,6 +2307,146 @@ EOF2
 exit 0
 #+END_SRC
 
+** Agent voice spool (sandboxed agents speak without the operator's SSH key)
+
+An agent that runs as its own Unix user (Agent Boundaries phase 8: =agent-deepseek= first) cannot run the relay above: the relay ships audio to the phone over the operator's SSH identity, and holding that key is exactly what the separate user exists to prevent. So the relay is split at the user boundary (ruling 2026-09-26, "provided that the latency is the same"). The agent side only *drops* its hook payload into a spool directory; an operator-owned watcher picks each file up through inotify within milliseconds and feeds it to the unchanged =claude-hook-voice-reply=, so synthesis, voice choice, phone delivery, fallback host and play queue stay one code path.
+
+- Spool: =/var/spool/agent-voice=, owned by the operator, group =cortex=, mode =3730=. Agents (all in =cortex=) can create files but cannot list the directory or delete each other's files; the operator owns the directory and removes each file once spoken.
+- Identity comes from the file's owning uid, never from the payload: =agent-deepseek= speaks as =DeepSeek=, any other =agent-NAME= as =Name=, and files owned by anyone else are discarded. A sandboxed agent cannot make itself speak in another agent's voice.
+- Files older than two minutes are discarded rather than spoken (a watcher outage must not replay a backlog of stale replies), and a payload is capped at 64 KiB before the hook's own character cap applies.
+- Owner: =agent-voice-relay install= (run once as the operator; uses =sudo -n=) creates the spool and writes =/etc/cron.d/dotcortex-agent-voice-relay=: =@reboot= plus a three-minute self-heal, both calling =serve --daemon=, which is a no-op while a watcher holds the lock. Tangling does not deploy it.
+- Agent side: the DSH Telegram bridge's =media.voiceReply.command= points at this script by its DotCortex path (the operator's =~/.local= is closed to agents; =~/DotCortex= is not). The bridge spawns it with no arguments, so no arguments means =drop=.
+- Log: =~/.local/state/agent-voice-relay/serve.log= (one line per spoken, stale or rejected file).
+
+#+BEGIN_SRC bash :tangle all/.local/bin/agent-voice-relay :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/bin/agent-voice-relay
+# Split voice-reply relay across the agent user boundary. See agents-hooks.org.
+set -euo pipefail
+
+SPOOL="${AGENT_VOICE_SPOOL:-/var/spool/agent-voice}"
+SELF="$(readlink -f "$0")"
+MAX_BYTES=65536
+STALE_SECONDS=120
+
+usage() {
+    cat <<'EOF'
+usage: agent-voice-relay [drop]         agent side: hook JSON on stdin -> spool
+       agent-voice-relay serve [--daemon]
+                                        operator side: speak spooled replies
+       agent-voice-relay install        operator, once: spool dir + cron owner
+       agent-voice-relay status
+EOF
+}
+
+# Identity is derived from the file owner, never read from the payload.
+identity_for() {
+    case "$1" in
+        agent-deepseek) echo DeepSeek ;;
+        agent-?*) local n="${1#agent-}"; echo "${n^}" ;;
+        *) return 1 ;;
+    esac
+}
+
+cmd_drop() {
+    # Best effort: a missing spool must never fail the agent's turn.
+    [ -d "$SPOOL" ] && [ -w "$SPOOL" ] || { cat >/dev/null; exit 0; }
+    local name tmp
+    name="$(date +%s%N)-$$-$RANDOM"
+    tmp="$SPOOL/.$name.tmp"
+    umask 027
+    head -c "$MAX_BYTES" > "$tmp"
+    mv "$tmp" "$SPOOL/$name.json"
+}
+
+STATE="${XDG_STATE_HOME:-$HOME/.local/state}/agent-voice-relay"
+LOG="$STATE/serve.log"
+HOOK="${AGENT_VOICE_HOOK:-$HOME/.local/bin/claude-hook-voice-reply}"
+
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >> "$LOG"; }
+
+speak_one() {
+    local f="$1" owner id age bytes
+    [ -f "$f" ] || return 0
+    owner="$(stat -c %U "$f" 2>/dev/null)" || return 0
+    bytes="$(stat -c %s "$f")"
+    age=$(( $(date +%s) - $(stat -c %Y "$f") ))
+    if ! id="$(identity_for "$owner")"; then
+        log "REJECT owner=$owner bytes=$bytes"
+    elif [ "$age" -gt "$STALE_SECONDS" ]; then
+        log "STALE agent=$id age=${age}s bytes=$bytes"
+    elif env -u PVOX_REPLY_OFF CLAUDE_WARM_HERDR_AGENT="$id" "$HOOK" < "$f" >/dev/null 2>&1; then
+        log "SPOKE agent=$id bytes=$bytes"
+    else
+        log "HOOK-FAIL agent=$id bytes=$bytes"
+    fi
+    rm -f -- "$f"
+}
+
+cmd_serve() {
+    mkdir -p "$STATE"
+    if [ "${1:-}" = "--daemon" ]; then
+        nohup setsid "$SELF" serve </dev/null >>"$LOG" 2>&1 &
+        exit 0
+    fi
+    exec 9>"$STATE/serve.lock"
+    flock -n 9 || exit 0   # a watcher is already running
+    [ -d "$SPOOL" ] || { log "FATAL no spool at $SPOOL (run agent-voice-relay install)"; exit 1; }
+    command -v inotifywait >/dev/null || { log "FATAL inotifywait not on PATH"; exit 1; }
+    [ -x "$HOOK" ] || { log "FATAL hook not executable: $HOOK"; exit 1; }
+    log "START pid=$$ spool=$SPOOL"
+    # Watch first, then list the backlog into the same stream, so a drop that
+    # lands between the two is seen at least once (speak_one tolerates repeats).
+    {
+        inotifywait -m -q -e moved_to --format '%f' "$SPOOL" &
+        sleep 1
+        (cd "$SPOOL" && ls -1 -- *.json 2>/dev/null) || true
+        wait
+    } | while IFS= read -r n; do
+        case "$n" in *.json) speak_one "$SPOOL/$n" ;; esac
+    done
+    log "EXIT watcher ended (cron restarts it)"
+}
+
+cmd_install() {
+    local me cron tmp path
+    me="$(id -un)"
+    cron=/etc/cron.d/dotcortex-agent-voice-relay
+    path="$HOME/.guix-extra-profiles/core/core/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    sudo -n install -d -o "$me" -g cortex -m 3730 "$SPOOL"
+    tmp="$(mktemp)"
+    cat > "$tmp" <<EOF
+# DotCortex agent voice relay owner; managed by agent-voice-relay install.
+SHELL=/bin/sh
+@reboot $me HOME=$HOME PATH=$path $SELF serve --daemon
+*/3 * * * * $me HOME=$HOME PATH=$path $SELF serve --daemon
+EOF
+    sudo -n install -m 644 "$tmp" "$cron"
+    rm -f "$tmp"
+    echo "spool: $(stat -c '%A %U:%G' "$SPOOL") $SPOOL"
+    echo "cron:  $cron"
+}
+
+cmd_status() {
+    echo "spool: $(stat -c '%A %U:%G' "$SPOOL" 2>/dev/null || echo missing) $SPOOL"
+    if [ -e "$STATE/serve.lock" ] && ! flock -n "$STATE/serve.lock" true; then
+        echo "watcher: running"
+    else
+        echo "watcher: not running"
+    fi
+    [ -f "$LOG" ] && tail -n 5 "$LOG"
+    return 0
+}
+
+case "${1:-drop}" in
+    drop) cmd_drop ;;
+    serve) shift; cmd_serve "$@" ;;
+    install) cmd_install ;;
+    status) cmd_status ;;
+    -h|--help) usage ;;
+    *) usage >&2; exit 1 ;;
+esac
+#+END_SRC
+
 * Voice transcript relay
 
 Auto-transcribes Telegram voice/audio notes and relays the transcript both ways. The official Telegram plugin delivers voice notes as an =attachment_file_id= in the =<channel>= tag without downloading them — without this hook the agent must notice, call =download_attachment=, and transcribe by hand. This hook makes the flow structural, per Mètsàtron's ruling (2026-08-16): the same architecture must hold wherever the agent runs — kikin today, Termux on the phone later — so it lives here in the hooks source, not in any one session's habits.
