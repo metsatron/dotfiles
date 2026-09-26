@@ -544,6 +544,161 @@ make -f all/.mk/guix-substitutes.mk guix-sub-bench guix-sub-apply
 
 If the installer complains about guixbuild users, re-run it or create them with =addgroup guixbuild= and =adduser --system= 10 workers linked to that group, which the installer usually handles.
 
+** Foreign OpenRC hosts (Honey)
+
+The block above assumes systemd. On an OpenRC host (Devuan with OpenRC as its service manager) the upstream installer detects "sysv-init" and writes an LSB script that OpenRC never starts at boot, which is how T480's daemon stayed dead from 2026-06-28 to 2026-07-12. =guix-foreign-bootstrap= is the manual's binary installation made deterministic for these hosts: a signed release tarball verified in a throwaway keyring against the upstream release signers, the classic root daemon with =guixbuild= users, the native OpenRC service below, =/usr/local/bin/guix= for every user, and the fleet's substitute keys (ci and bordeaux from the release, nonguix from this checkout). It never prompts and edits no shell files. It refuses when Guix is already present, and =--dry-run= downloads and verifies without changing anything.
+
+After the bootstrap the operator account pulls the fleet channel pin (=guix pull -C all/.config/guix/channels.scm=), and =agent-guix-apply= builds each agent's node profile from that pinned guix, exactly as on kikin. Honey was bootstrapped this way on 2026-09-26, with Mètsàtron's go, for the tanuki bots' =agent-claude= node profile.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/guix-foreign-bootstrap :shebang "#!/usr/bin/env bash" :comments no
+# guix-foreign-bootstrap — install GNU Guix on a foreign OpenRC host from DotCortex.
+#
+# The upstream manual's binary installation, made deterministic: a verified
+# release tarball, the classic root daemon with guixbuild users, DotCortex's
+# OpenRC guix-daemon service (not the installer's LSB script, which OpenRC
+# never starts at boot; T480, 2026-07), the fleet's substitute keys. No prompts,
+# no shell-prompt or bashrc edits, nothing outside what Guix itself needs.
+set -euo pipefail
+
+GUIX_VERSION="${GUIX_VERSION:-1.5.0}"
+ARCH="x86_64-linux"
+MIRROR="https://ftp.gnu.org/gnu/guix"
+# Release signers, as listed in upstream etc/guix-install.sh.
+SIGNERS=(
+    3CE464558A84FDC69DB40CFB090B11993D9AEBB5   # Ludovic Courtès
+    27D586A4F8900854329FF09F1260E46482E63562   # Maxim Cournoyer
+    A28BF40C3E551372662D14F741AAE7DCCA3D8351   # Efraim Flashner
+)
+KEYSERVERS=(keys.openpgp.org pgpkeys.eu keyserver.ubuntu.com)
+
+DRY=0
+usage() {
+    cat <<'EOF'
+Usage: guix-foreign-bootstrap [--dry-run] <dotcortex-checkout>
+       guix-foreign-bootstrap -h|--help
+
+Run as root on an OpenRC host without Guix. Installs:
+  /gnu, /var/guix              from the signed guix-binary release tarball
+  guixbuild + guixbuilder01..10 build users
+  /etc/init.d/guix-daemon      DotCortex's OpenRC service (added to default)
+  /usr/local/bin/guix          root's current guix, for every user
+  substitute keys              ci + bordeaux (from the release), nonguix
+                               (from the DotCortex checkout)
+Refuses when /gnu/store or /var/guix already exists. --dry-run downloads and
+verifies the tarball, then prints the remaining steps without changing
+anything. GUIX_VERSION overrides the release (default 1.5.0).
+EOF
+}
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) DRY=1; shift ;;
+esac
+[ $# -eq 1 ] || { usage >&2; exit 2; }
+DC="$(cd "$1" && pwd)"
+SERVICE="$DC/all/.local/share/dotcortex/guix/openrc/guix-daemon"
+NONGUIX_KEY="$DC/all/.config/guix/nonguix-signing-key.pub"
+[ -r "$SERVICE" ] && [ -r "$NONGUIX_KEY" ] || { echo "not a DotCortex checkout with the Guix service: $DC" >&2; exit 2; }
+
+[ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+command -v openrc-run >/dev/null 2>&1 || [ -x /sbin/openrc-run ] || { echo "no OpenRC here" >&2; exit 1; }
+for c in wget gpg xz tar groupadd useradd rc-update rc-service; do
+    command -v "$c" >/dev/null 2>&1 || [ -x "/sbin/$c" ] || { echo "missing: $c" >&2; exit 1; }
+done
+if [ -e /gnu/store ] || [ -e /var/guix ]; then
+    echo "Guix is already present (/gnu/store or /var/guix); refusing" >&2
+    exit 1
+fi
+
+run() { if [ "$DRY" -eq 1 ]; then echo "would: $*"; else "$@"; fi; }
+
+work="$(mktemp -d /tmp/guix-bootstrap.XXXXXX)"
+trap 'rm -rf "$work"' EXIT
+tarball="guix-binary-${GUIX_VERSION}.${ARCH}.tar.xz"
+
+echo "== download $tarball"
+wget -q -O "$work/$tarball" "$MIRROR/$tarball"
+wget -q -O "$work/$tarball.sig" "$MIRROR/$tarball.sig"
+
+echo "== verify signature (throwaway keyring)"
+export GNUPGHOME="$work/gnupg"
+install -d -m 700 "$GNUPGHOME"
+for key in "${SIGNERS[@]}"; do
+    for server in "${KEYSERVERS[@]}"; do
+        gpg -q --keyserver "$server" --recv-keys "$key" 2>/dev/null && break
+    done
+done
+status="$(gpg --status-fd 1 --verify "$work/$tarball.sig" "$work/$tarball" 2>/dev/null || true)"
+signer="$(printf '%s\n' "$status" | awk '/^\[GNUPG:\] VALIDSIG/ {print $NF}')"
+good=0
+for key in "${SIGNERS[@]}"; do [ "$signer" = "$key" ] && good=1; done
+[ "$good" -eq 1 ] || { echo "signature did not verify against a release signer" >&2; exit 1; }
+echo "   signed by $signer"
+
+echo "== unpack into /gnu and /var/guix"
+if [ "$DRY" -eq 0 ]; then
+    tar --warning=no-timestamp -C "$work" -xf "$work/$tarball"
+    mv "$work/var/guix" /var/
+    mv "$work/gnu" /
+else
+    echo "would: unpack $tarball; mv var/guix /var/; mv gnu /"
+fi
+run install -d -m 755 /root/.config/guix
+run ln -sfn /var/guix/profiles/per-user/root/current-guix /root/.config/guix/current
+
+echo "== build users"
+if ! getent group guixbuild >/dev/null; then run groupadd --system guixbuild; fi
+nologin="$(command -v nologin || echo /usr/sbin/nologin)"
+for i in $(seq -w 1 10); do
+    id "guixbuilder$i" >/dev/null 2>&1 && continue
+    run useradd -g guixbuild -G guixbuild -d /var/empty -s "$nologin" \
+        -c "Guix build user $i" --system "guixbuilder$i"
+done
+
+echo "== commands for every user"
+run ln -sfn /var/guix/profiles/per-user/root/current-guix/bin/guix /usr/local/bin/guix
+run ln -sfn /var/guix/profiles/per-user/root/current-guix/bin/guix-daemon /usr/local/bin/guix-daemon
+
+echo "== OpenRC service"
+run install -m 755 -o root -g root "$SERVICE" /etc/init.d/guix-daemon
+run rc-update add guix-daemon default
+run rc-service guix-daemon start
+
+echo "== substitute keys"
+current=/var/guix/profiles/per-user/root/current-guix
+for pub in "$current/share/guix/ci.guix.gnu.org.pub" "$current/share/guix/bordeaux.guix.gnu.org.pub" "$NONGUIX_KEY"; do
+    if [ "$DRY" -eq 1 ]; then echo "would: guix archive --authorize < $pub"; continue; fi
+    [ -r "$pub" ] || { echo "missing key: $pub" >&2; exit 1; }
+    /usr/local/bin/guix archive --authorize < "$pub"
+done
+
+echo "== done: $(/usr/local/bin/guix --version 2>/dev/null | head -n1 || echo 'dry run')"
+#+END_SRC
+
+#+BEGIN_SRC sh :tangle all/.local/share/dotcortex/guix/openrc/guix-daemon :comments no
+#!/sbin/openrc-run
+# GNU Guix build daemon as a native OpenRC service (DotCortex).
+#
+# For OpenRC hosts (Devuan with OpenRC as the service manager: T480, Honey).
+# The upstream installer writes an LSB script there, which OpenRC never starts
+# at boot; this is the native form. depend() uses `after`, never `need`:
+# Devuan's OpenRC has no `localmount`, and a `need` on a missing service makes
+# OpenRC refuse to start this one. --substitute-urls must reach the daemon as
+# ONE argv element (a word-split list killed the daemon on T480, 2026-06-28).
+
+name="guix-daemon"
+description="GNU Guix build daemon"
+
+command="/var/guix/profiles/per-user/root/current-guix/bin/guix-daemon"
+command_args="--build-users-group=guixbuild --substitute-urls=\"https://bordeaux.guix.gnu.org https://ci.guix.gnu.org https://substitutes.nonguix.org\""
+command_background="yes"
+pidfile="/run/guix-daemon.pid"
+export GUIX_LOCPATH="/var/guix/profiles/per-user/root/guix-profile/lib/locale"
+
+depend() {
+    after mountall.sh net
+}
+#+END_SRC
+
 * Channels, manifests, profiles
 ** Channel pin (fleet-wide revision lock)
 The block was titled "seed only once" and carried no =(commit ...)= for its whole
