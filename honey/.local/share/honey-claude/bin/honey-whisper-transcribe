@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""The Honey subset of HelmCortex's whisper-transcribe, for hosts without HelmCortex.
+
+Same call shape as the canonical FORGE/bin/whisper-transcribe that
+claude-hook-voice-transcribe runs (--model TIER --out PATH AUDIO), so the hook
+reaches it through $WHISPER_TRANSCRIBE. It keeps the canonical model source,
+cache path and pinned SHA-256, the ffmpeg 16 kHz decode and the whisper-cli
+call with its CPU retry; it leaves out the resident daemon, loop detection and
+tier escalation. Output: a transcript file with the same YAML front matter.
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+MODEL_CACHE_DIR = Path.home() / ".cache" / "whisper-cpp" / "models"
+MODEL_BASE_URL = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main"
+# Pins copied from the canonical whisper-transcribe (verified 2026-07-03).
+MODEL_SHA256 = {"small": "1be3a9b2063867b937e64e2ec7483364a79917e157fa98c5d94b5c1fffea987b"}
+MODEL_FILENAMES = {"small": "ggml-small.bin"}
+
+
+def model_path(tier):
+    name = MODEL_FILENAMES[tier]
+    path = MODEL_CACHE_DIR / name
+    if path.exists():
+        return path
+    MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".part")
+    urllib.request.urlretrieve("%s/%s" % (MODEL_BASE_URL, name), tmp)
+    digest = hashlib.sha256(tmp.read_bytes()).hexdigest()
+    if digest != MODEL_SHA256[tier]:
+        tmp.unlink()
+        sys.exit("model %s failed its SHA-256 pin (got %s)" % (name, digest))
+    tmp.rename(path)
+    return path
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("audio")
+    ap.add_argument("--model", default="small", choices=sorted(MODEL_FILENAMES))
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--timeout", type=float, default=470)
+    args = ap.parse_args()
+    cli = shutil.which("whisper-cli")
+    if cli is None or shutil.which("ffmpeg") is None:
+        sys.exit("whisper-cli or ffmpeg missing (agent Guix profile / system ffmpeg)")
+    model = model_path(args.model)
+    with tempfile.TemporaryDirectory(prefix="honey-whisper-") as tmp:
+        wav = Path(tmp) / "in.wav"
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", args.audio, "-ar", "16000", "-ac", "1",
+                        "-c:a", "pcm_s16le", str(wav)], check=True, timeout=120)
+        stem = Path(tmp) / "out"
+        cmd = [cli, "-m", str(model), "-f", str(wav), "-otxt", "-of", str(stem), "-nt"]
+        try:
+            subprocess.run(cmd, check=True, timeout=args.timeout, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except subprocess.CalledProcessError as err:
+            if err.returncode >= 0:
+                raise
+            subprocess.run(cmd + ["-ng"], check=True, timeout=args.timeout,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        text = (stem.with_suffix(".txt")).read_text().strip()
+    front = "---\nsource: %s\nmodel: %s\ngenerated_at: %s\n---\n" % (
+        os.path.basename(args.audio), args.model, datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    Path(args.out).write_text(front + text + "\n")
+
+
+if __name__ == "__main__":
+    main()

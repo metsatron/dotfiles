@@ -34,7 +34,8 @@ honey_claude_launch() {
     local repo_bin=""
     [[ -n "${LIB_DIR:-}" ]] && repo_bin="$(cd -- "$LIB_DIR/../../../../../all/.local/bin" 2>/dev/null && pwd || true)"
     honey_claude_path_append "$HOME/.local/bin" "${NPM_CONFIG_PREFIX:-$HOME/.npm-global}/bin" \
-        "$HOME/.guix-extra-profiles/agent/agent/bin" ${repo_bin:+"$repo_bin"}
+        "$HOME/.guix-extra-profiles/agent/agent/bin" ${repo_bin:+"$repo_bin"} \
+        ${LIB_DIR:+"$LIB_DIR/../bin"}
 
     [[ -d "$work_dir" ]] || {
         printf '%s\n' "$name: refused: working directory $work_dir is missing (see agents-bots-honey.org)" >&2
@@ -56,10 +57,17 @@ honey_claude_launch() {
         printf '%s\n' "$$" > "$XDG_RUNTIME_DIR/$name.pid"
     fi
     if [[ "$telegram" -eq 1 ]]; then
+        # Voice lane (see "Voice lane"): each bot's Kitten seat, the Honey whisper
+        # subset for inbound notes, and the hooks in claude-settings.json.
+        local voice_var="HONEY_${bot^^}_VOICE" voice
+        case "$bot" in opus) voice=Jasper ;; sonnet) voice=Luna ;; haiku) voice=Kiki ;; esac
+        export HONEY_VOICE="${!voice_var:-$voice}"
+        [[ -n "${LIB_DIR:-}" ]] && export WHISPER_TRANSCRIBE="$LIB_DIR/../bin/honey-whisper-transcribe"
         # acceptEdits (auto) mode: plan mode blocks unattended bot work (as on kikin).
         exec env CLAUDE_WARM_HERDR_AGENT="$agent" TELEGRAM_STATE_DIR="$state_dir" \
             claude-warm --model "$model" --permission-mode acceptEdits \
             --allowedTools=mcp__plugin_telegram_telegram \
+            ${LIB_DIR:+--settings="$LIB_DIR/../claude-settings.json"} \
             --channels plugin:telegram@claude-plugins-official "${passthrough[@]+"${passthrough[@]}"}"
     fi
     exec env CLAUDE_WARM_HERDR_AGENT="$agent" \
