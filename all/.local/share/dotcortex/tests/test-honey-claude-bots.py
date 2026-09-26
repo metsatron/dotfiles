@@ -84,6 +84,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 rec = box.recorded()
                 self.assertEqual(rec["argv"], ["--model", model, "--permission-mode", "acceptEdits",
+                                               "--allowedTools=mcp__plugin_telegram_telegram",
                                                "--channels", "plugin:telegram@claude-plugins-official"])
                 self.assertEqual(rec["cwd"], str(box.home / "honey-work" / bot))
                 self.assertEqual(rec["state"], str(box.home / f".claude/channels/telegram-{bot}"))
