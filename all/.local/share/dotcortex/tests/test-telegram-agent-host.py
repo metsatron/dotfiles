@@ -71,8 +71,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "start_ticks": start_ticks if start_ticks is not None else self.read_start_ticks(pid),
             "profile": profile,
             "generation": generation,
-            "provider": "neuralwatt",
-            "model": "deepseek-v4-flash",
+            "provider": "helmcortex-opencode-go",
+            "model": "deepseek-v4.1-flash",
             "telegram_bot_identity_validated": True,
             "long_polling_owned": True,
             "ready_at": "2026-09-17T00:00:00Z",
@@ -198,8 +198,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                 {
                     "security": {"allowedChatIds": allowed_chat_ids},
                     "model": {
-                        "provider": "neuralwatt",
-                        "model": "deepseek-v4-flash",
+                        "provider": "helmcortex-opencode-go",
+                        "model": "deepseek-v4.1-flash",
                     },
                 }
             ),
@@ -209,7 +209,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         token.parent.mkdir(parents=True)
         token.write_text("fake-token\n", encoding="utf-8")
         token.chmod(0o600)
-        key = self.home / ".config/helmcortex/neuralwatt.key"
+        key = self.home / ".config/helmcortex/opencode-go.key"
         key.parent.mkdir(parents=True)
         key.write_text("fake-key\n", encoding="utf-8")
         key.chmod(0o600)
@@ -217,13 +217,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             [
                 "llm-pi-ai:",
                 "  providers:",
-                "    neuralwatt:",
-                "      displayName: HelmCortex NeuralWatt",
-                "      apiKeyEnv: NEURALWATT_API_KEY",
+                "    helmcortex-opencode-go:",
+                "      displayName: HelmCortex OpenCode Go",
+                "      apiKeyEnv: OPENCODE_GO_API_KEY",
                 "      api: openai-completions",
-                "      baseURL: https://api.neuralwatt.com/v1",
+                "      baseURL: https://opencode.ai/zen/go/v1",
                 "      models:",
-                "        - id: deepseek-v4-flash",
+                "        - id: deepseek-v4.1-flash",
                 "          contextWindow: 1048576",
                 "          compat:",
                 "            thinkingFormat: deepseek",
@@ -240,8 +240,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             [
                 "- id: agent-default-model",
                 "  config:",
-                "    provider: neuralwatt",
-                "    model: deepseek-v4-flash",
+                "    provider: helmcortex-opencode-go",
+                "    model: deepseek-v4.1-flash",
                 "",
                 "- id: llm-deepseek",
                 "  disabled: true",
@@ -265,14 +265,14 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "\n".join(
                 [
                     f"TELEGRAM_BOT_TOKEN_FILE={token}",
-                    f"NEURALWATT_API_KEY_FILE={key}",
+                    f"OPENCODE_GO_API_KEY_FILE={key}",
                     f"DSH_HOME={self.home / '.local/share/deepseek-harness-telegram/dsh-home'}",
                     "DSH_TELEGRAM_PROFILE=helmcortex-telegram",
                     f"DSH_TELEGRAM_WORKSPACE={workspace}",
                     f"DSH_TELEGRAM_PLUGIN_ROOT={plugin}",
-                    "DSH_TELEGRAM_MODEL_PROVIDER=neuralwatt",
-                    "DSH_TELEGRAM_MODEL=deepseek-v4-flash",
-                    "DSH_TELEGRAM_PROVIDER_BASE_URL=https://api.neuralwatt.com/v1",
+                    "DSH_TELEGRAM_MODEL_PROVIDER=helmcortex-opencode-go",
+                    "DSH_TELEGRAM_MODEL=deepseek-v4.1-flash",
+                    "DSH_TELEGRAM_PROVIDER_BASE_URL=https://opencode.ai/zen/go/v1",
                     "",
                 ]
             ),
@@ -415,7 +415,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "python3 - \"$DSH_TELEGRAM_READY_MARKER\" \"$pid\" \"$ticks\" <<'PY'\n"
             "import json, sys\n"
             "from pathlib import Path\n"
-            "Path(sys.argv[1]).write_text(json.dumps({'schema': 1, 'component': 'dsh-telegram', 'pid': int(sys.argv[2]), 'start_ticks': sys.argv[3], 'profile': 'helmcortex-telegram', 'provider': 'neuralwatt', 'model': 'deepseek-v4-flash', 'telegram_bot_identity_validated': True, 'long_polling_owned': True}), encoding='utf-8')\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'schema': 1, 'component': 'dsh-telegram', 'pid': int(sys.argv[2]), 'start_ticks': sys.argv[3], 'profile': 'helmcortex-telegram', 'provider': 'helmcortex-opencode-go', 'model': 'deepseek-v4.1-flash', 'telegram_bot_identity_validated': True, 'long_polling_owned': True}), encoding='utf-8')\n"
             "PY\n"
             "exit 0\n",
         )
@@ -554,7 +554,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.prepare_deepseek_harness([123])
         config = self.home / ".local/share/deepseek-harness-telegram/workspace/.pi/telegram.json"
         data = json.loads(config.read_text(encoding="utf-8"))
-        data["model"] = {"provider": "neuralwatt", "model": "deepseek-v4-flash-flex"}
+        data["model"] = {"provider": "helmcortex-opencode-go", "model": "deepseek-v4-flash"}
         config.write_text(json.dumps(data), encoding="utf-8")
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
@@ -570,8 +570,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         profile_patch.write_text(
             "- id: agent-default-model\n"
             "  config:\n"
-            "    provider: neuralwatt\n"
-            "    model: deepseek-v4-flash\n",
+            "    provider: helmcortex-opencode-go\n"
+            "    model: deepseek-v4.1-flash\n",
             encoding="utf-8",
         )
         result = self.run_manager("start", "deepseek-harness", timeout=2)
@@ -580,11 +580,11 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
 
     def test_deepseek_harness_scrubs_ambient_deepseek_credentials(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
-        provider_scrub = "-u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE -u NEURALWATT_API_KEY"
+        provider_scrub = "-u DEEPSEEK_API_KEY -u DEEPSEEK_API_KEY_FILE -u NEURALWATT_API_KEY -u OPENCODE_API_KEY -u OPENCODE_GO_API_KEY"
         self.assertGreaterEqual(manager_text.count(provider_scrub), 2)
         self.assertIn("env -u TELEGRAM_BOT_TOKEN " + provider_scrub, manager_text)
         self.assertNotIn('DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"', manager_text)
-        self.assertNotIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
+        self.assertNotIn('OPENCODE_GO_API_KEY="$OPENCODE_GO_API_KEY"', manager_text)
         self.assertNotIn('TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"', manager_text)
 
     def test_deepseek_harness_log_redactor_lives_in_detached_session(self) -> None:
@@ -597,7 +597,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
-        self.assertIn('NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE"', manager_text)
+        self.assertIn('OPENCODE_GO_API_KEY_FILE="$OPENCODE_GO_API_KEY_FILE"', manager_text)
 
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
