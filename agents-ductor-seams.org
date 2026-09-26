@@ -1,0 +1,777 @@
+#+TITLE: Ductor fleet seams
+#+DESCRIPTION: Fleet-wide ductor_bot seams (idle compaction) and their applier
+#+AUTHOR: Mètsàtron
+#+PROPERTY: header-args :mkdirp yes :comments no
+
+* Why this module exists
+
+Ductor (=package-pip.org=, pinned 0.20.1) runs on several hosts and users: Mètsàtron's Codex Ductor on kikin, Honey Badger (Claude) and Honey's Codex Ductor as =agent-codex=. Some seams belong to every one of them, whatever host or user runs it. Those live here, in DotCortex. Seams that only make sense inside HelmCortex (voice relay, continuity admission, task budget) stay in HelmCortex's =ductor-patch-apply=.
+
+A pip reinstall wipes site-packages, so =ductor-seam-apply= is idempotent and meant to run after every install and as a preflight before each daemon starts. It reads the interpreter from the =ductor= launcher's shebang, pins the target version, and fails loud when upstream drifts (the hook patch applies with =--fuzz=0=). It runs straight from a checkout as well as from a stowed =~/.local/bin=: it finds its seam files next to itself.
+
+* Idle compaction
+
+A resumed session whose provider cache has expired is re-read in full at the uncached price on the next turn. Ductor has no idle compaction of its own: its memory flush fires only when the CLI auto-compacts, which on a 1M-context model happens near 1M tokens (Honey Badger reached about 900k per call and spent a five-hour window in half an hour, 2026-09-26). Idle compaction runs the compaction while the cache is still warm, so the compaction turn is billed at the cached price and the next turn starts small.
+
+| Provider | Compact after | Cache expires | Mechanism |
+|----------+---------------+---------------+-----------|
+| Claude   | 55 min idle   | 60 min        | =/compact= through Ductor's own CLI path (=claude -p --resume=) |
+| Codex    | 25 min idle   | 30 min        | =thread/compact/start= through a short-lived =codex app-server= |
+
+Mètsàtron's ruling (2026-09-26): Codex compacts before 30 minutes idle and Claude before an hour, because that is when each cache expires; the context window size itself is not the concern, since a large window that stays cached can cost less than a small one that compacts and re-reads more often. The fleet's other Codex governors (=codex-warm=, the HelmAstra adapter) use 27 minutes; Ductor uses 25 by his ruling.
+
+Rules the seam keeps:
+
+- Main sessions only (=sessions.json=); background task workers are one-shot and are not compacted.
+- At most once per idle period: the =last_active= value a session was compacted at is persisted in =<ductor home>/idle_compaction.json=, so a restart never repeats it.
+- A session already past its cache window is skipped and marked; compacting it would pay the uncached price the seam exists to avoid.
+- The per-session lock is held for the whole compaction and a busy chat defers, so a user message waits instead of racing a second writer onto the transcript.
+- The compaction does not touch =last_active=, so Ductor's own session freshness still counts from the last real turn.
+- Settings come from an optional =idle_compaction= object in =config.json= (=AgentConfig= ignores unknown keys): =enabled=, =claude_idle_minutes=, =claude_cache_minutes=, =codex_idle_minutes=, =codex_cache_minutes=, =tick_seconds=, =timeout_seconds=.
+
+Both mechanisms were proven on throwaway sessions before this module was written (2026-09-26, kikin): Claude =/compact= in print mode emitted =compact_boundary= (22,638 → 2,856 tokens), kept the session id and still recalled a planted word; the Codex app-server compaction completed and the resumed thread still recalled its planted word.
+
+** Seam module
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/ductor-seams/idle_compact.py
+"""Idle compaction: compact a main session before its provider's prompt cache expires.
+
+A resumed session whose prompt cache has expired is re-read in full at the
+uncached price on the next turn.  Compacting shortly before the cache expires
+runs the compaction turn at the cached price and leaves a small context for
+the next turn.  The provider decides when the cache expires, so each provider
+has its own idle threshold:
+
+- Claude: ``/compact`` through the normal CLI path (``claude -p --resume``),
+  which keeps the session id.  Default 55 minutes idle (1-hour cache).
+- Codex: ``thread/compact/start`` through a short-lived ``codex app-server``.
+  Default 25 minutes idle (the Codex cache lasts about 30 minutes).
+
+A session is compacted at most once per idle period: the ``last_active``
+value it was compacted at is persisted, so a restart never repeats it.  A
+session that is already past its cache window is skipped (compacting it would
+pay the uncached price that idle compaction exists to avoid).  The per-session
+lock is held for the whole compaction, so a user message waits for it instead
+of racing a second writer onto the same transcript.
+
+Settings come from the optional ``idle_compaction`` object in config.json
+(AgentConfig ignores unknown keys, so no schema change is needed).
+"""
+
+from __future__ import annotations
+
+import asyncio
+import contextlib
+import json
+import logging
+import os
+import shutil
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+
+from ductor_bot.cli.types import AgentRequest
+
+if TYPE_CHECKING:
+    from ductor_bot.orchestrator.core import Orchestrator
+    from ductor_bot.session.manager import SessionData
+
+logger = logging.getLogger(__name__)
+
+_STATE_FILE = "idle_compaction.json"
+
+
+@dataclass(frozen=True, slots=True)
+class IdleCompactSettings:
+    enabled: bool = True
+    claude_idle_minutes: float = 55.0
+    claude_cache_minutes: float = 60.0
+    codex_idle_minutes: float = 25.0
+    codex_cache_minutes: float = 30.0
+    tick_seconds: float = 60.0
+    timeout_seconds: float = 900.0
+
+    @classmethod
+    def load(cls, config_path: Path) -> IdleCompactSettings:
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8")).get("idle_compaction")
+        except (OSError, ValueError):
+            raw = None
+        if not isinstance(raw, dict):
+            return cls()
+        values: dict[str, Any] = {}
+        for name in cls.__dataclass_fields__:
+            if name in raw:
+                values[name] = bool(raw[name]) if name == "enabled" else float(raw[name])
+        return cls(**values)
+
+    def window(self, provider: str) -> tuple[float, float] | None:
+        """Return (compact_after, cache_expires) in seconds, or None if unsupported."""
+        if provider == "claude":
+            return self.claude_idle_minutes * 60, self.claude_cache_minutes * 60
+        if provider == "codex":
+            return self.codex_idle_minutes * 60, self.codex_cache_minutes * 60
+        return None
+
+
+class IdleCompactor:
+    """Background loop that compacts idle main sessions per provider."""
+
+    def __init__(self, orch: Orchestrator) -> None:
+        self._orch = orch
+        self._home = orch._paths.sessions_path.parent
+        self._state_path = self._home / _STATE_FILE
+        self._task: asyncio.Task[None] | None = None
+
+    # -- lifecycle ------------------------------------------------------------
+
+    def start(self) -> None:
+        settings = self._settings()
+        if not settings.enabled:
+            logger.info("Idle compaction disabled in config")
+            return
+        self._task = asyncio.create_task(self._run())
+        logger.info(
+            "Idle compaction started (claude %.0fm/%.0fm, codex %.0fm/%.0fm)",
+            settings.claude_idle_minutes,
+            settings.claude_cache_minutes,
+            settings.codex_idle_minutes,
+            settings.codex_cache_minutes,
+        )
+
+    async def stop(self) -> None:
+        if self._task is None:
+            return
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._task
+        self._task = None
+
+    def _settings(self) -> IdleCompactSettings:
+        return IdleCompactSettings.load(self._orch._paths.config_path)
+
+    # -- state ----------------------------------------------------------------
+
+    def _load_state(self) -> dict[str, str]:
+        try:
+            data = json.loads(self._state_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+    def _save_state(self, state: dict[str, str]) -> None:
+        tmp = self._state_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(self._state_path)
+
+    # -- loop -----------------------------------------------------------------
+
+    async def _run(self) -> None:
+        while True:
+            settings = self._settings()
+            await asyncio.sleep(settings.tick_seconds)
+            if not settings.enabled:
+                continue
+            try:
+                await self._tick(settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Idle compaction tick failed")
+
+    async def _tick(self, settings: IdleCompactSettings) -> None:
+        state = self._load_state()
+        live_ids = set()
+        for session in await self._orch._sessions.list_all():
+            sid = session.session_id
+            if not sid:
+                continue
+            live_ids.add(sid)
+            if state.get(sid) == session.last_active:
+                continue  # already compacted for this idle period
+            window = settings.window(session.provider)
+            if window is None:
+                continue
+            compact_after, cache_expires = window
+            idle = (datetime.now(UTC) - datetime.fromisoformat(session.last_active)).total_seconds()
+            if idle < compact_after:
+                continue
+            if idle >= cache_expires:
+                logger.info(
+                    "Idle compaction skipped provider=%s session=%s reason=cache_expired idle=%ds",
+                    session.provider,
+                    sid,
+                    int(idle),
+                )
+                state[sid] = session.last_active
+                continue
+            done = await self._compact_locked(session, settings)
+            if done:
+                state[sid] = session.last_active
+        stale = [sid for sid in state if sid not in live_ids]
+        for sid in stale:
+            del state[sid]
+        self._save_state(state)
+
+    async def _compact_locked(self, session: SessionData, settings: IdleCompactSettings) -> bool:
+        orch = self._orch
+        key = session.session_key
+        if orch._lock_pool is None:
+            return False
+        if orch.is_chat_busy(key.chat_id, key.topic_id):
+            logger.debug("Idle compaction deferred: chat busy session=%s", session.session_id)
+            return False
+        lock = orch._lock_pool.get(key.lock_key)
+        if lock.locked():
+            return False
+        async with lock:
+            current = await orch._sessions.get_active(key)
+            if current is None or current.session_id != session.session_id:
+                return True  # replaced or reset: nothing left to compact
+            if current.last_active != session.last_active:
+                return False  # a turn landed meanwhile; re-evaluate next tick
+            logger.info(
+                "Idle compaction start provider=%s session=%s model=%s",
+                session.provider,
+                session.session_id,
+                session.model,
+            )
+            try:
+                if session.provider == "claude":
+                    ok = await self._compact_claude(session, settings)
+                else:
+                    ok = await self._compact_codex(session, settings)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Idle compaction failed session=%s", session.session_id)
+                return True  # do not retry a failing compaction every tick
+            logger.info(
+                "Idle compaction %s provider=%s session=%s",
+                "done" if ok else "failed",
+                session.provider,
+                session.session_id,
+            )
+            return True
+
+    # -- providers ------------------------------------------------------------
+
+    async def _compact_claude(self, session: SessionData, settings: IdleCompactSettings) -> bool:
+        key = session.session_key
+        request = AgentRequest(
+            prompt="/compact",
+            model_override=session.model or None,
+            provider_override="claude",
+            effort_override=session.reasoning_effort or None,
+            chat_id=key.chat_id,
+            topic_id=key.topic_id,
+            transport=key.transport,
+            process_label="idle-compact",
+            resume_session=session.session_id,
+            timeout_seconds=settings.timeout_seconds,
+        )
+        response = await self._orch._cli_service.execute(request)
+        if response.is_error:
+            logger.warning("Claude idle compaction error: %s", response.result[:200])
+            return False
+        if response.session_id and response.session_id != session.session_id:
+            logger.warning(
+                "Claude idle compaction returned a new session id %s (kept %s)",
+                response.session_id,
+                session.session_id,
+            )
+        return True
+
+    async def _compact_codex(self, session: SessionData, settings: IdleCompactSettings) -> bool:
+        cli = shutil.which("codex")
+        if cli is None:
+            logger.warning("Codex idle compaction skipped: codex CLI not on PATH")
+            return False
+        cwd = str(self._orch._paths.workspace)
+        client = _CodexAppServer(cli, cwd)
+        try:
+            await client.start()
+            resume: dict[str, Any] = {"threadId": session.session_id, "excludeTurns": True}
+            if session.model:
+                resume["model"] = session.model
+            if session.reasoning_effort:
+                resume["config"] = {"model_reasoning_effort": session.reasoning_effort}
+            await asyncio.wait_for(client.request("thread/resume", resume), 120)
+            await asyncio.wait_for(
+                client.request("thread/compact/start", {"threadId": session.session_id}), 120
+            )
+            return await asyncio.wait_for(
+                client.wait_compaction(session.session_id), settings.timeout_seconds
+            )
+        finally:
+            await client.close()
+
+
+class _CodexAppServer:
+    """Minimal JSON-RPC client for one ``codex app-server`` compaction."""
+
+    def __init__(self, cli: str, cwd: str) -> None:
+        self._cli = cli
+        self._cwd = cwd
+        self._proc: asyncio.subprocess.Process | None = None
+        self._next_id = 0
+        self._pending: dict[int, asyncio.Future[Any]] = {}
+        self._notes: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._reader: asyncio.Task[None] | None = None
+
+    async def start(self) -> None:
+        self._proc = await asyncio.create_subprocess_exec(
+            self._cli,
+            "app-server",
+            cwd=self._cwd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+            limit=64 * 1024 * 1024,
+        )
+        self._reader = asyncio.create_task(self._read())
+        await asyncio.wait_for(
+            self.request(
+                "initialize",
+                {"clientInfo": {"name": "ductor-idle-compact", "title": "Ductor", "version": "1"}},
+            ),
+            60,
+        )
+        await self._send({"jsonrpc": "2.0", "method": "initialized", "params": {}})
+
+    async def _send(self, message: dict[str, Any]) -> None:
+        assert self._proc is not None and self._proc.stdin is not None
+        self._proc.stdin.write((json.dumps(message) + "\n").encode())
+        await self._proc.stdin.drain()
+
+    async def request(self, method: str, params: dict[str, Any]) -> Any:
+        self._next_id += 1
+        rid = self._next_id
+        future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
+        self._pending[rid] = future
+        await self._send({"jsonrpc": "2.0", "id": rid, "method": method, "params": params})
+        return await future
+
+    async def _read(self) -> None:
+        assert self._proc is not None and self._proc.stdout is not None
+        while True:
+            line = await self._proc.stdout.readline()
+            if not line:
+                break
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if "id" in message and "method" not in message:
+                future = self._pending.pop(message["id"], None)
+                if future is not None and not future.done():
+                    if "error" in message:
+                        future.set_exception(RuntimeError(str(message["error"])))
+                    else:
+                        future.set_result(message.get("result"))
+            elif "id" in message and "method" in message:
+                # A server request (approval, elicitation): compaction needs none.
+                await self._send(
+                    {"jsonrpc": "2.0", "id": message["id"], "error": {"code": -32601, "message": "declined"}}
+                )
+            else:
+                await self._notes.put(message)
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(RuntimeError("codex app-server exited"))
+        await self._notes.put({"method": "__eof__", "params": {}})
+
+    async def wait_compaction(self, thread_id: str) -> bool:
+        """Wait for the compaction turn's completion, not only the start ACK."""
+        started = False
+        turn_id: str | None = None
+        while True:
+            message = await self._notes.get()
+            method = message.get("method", "")
+            if method == "__eof__":
+                return False
+            params = message.get("params") or {}
+            turn = params.get("turn") if isinstance(params.get("turn"), dict) else {}
+            if (params.get("threadId") or turn.get("threadId")) != thread_id:
+                continue
+            if method == "turn/started":
+                started = True
+                raw = params.get("turnId") or turn.get("id")
+                turn_id = str(raw) if raw is not None else None
+                continue
+            if not started or method not in {"turn/completed", "turn/failed", "turn/interrupted"}:
+                continue
+            raw = params.get("turnId") or turn.get("id")
+            if turn_id is not None and raw is not None and str(raw) != turn_id:
+                continue
+            error = params.get("error") or turn.get("error")
+            status = params.get("status") or turn.get("status")
+            if method != "turn/completed" or error or status in {"failed", "interrupted"}:
+                logger.warning("Codex compaction turn ended method=%s status=%s error=%s", method, status, error)
+                return False
+            return True
+
+    async def close(self) -> None:
+        if self._proc is not None and self._proc.returncode is None:
+            with contextlib.suppress(ProcessLookupError):
+                self._proc.terminate()
+            with contextlib.suppress(asyncio.TimeoutError, ProcessLookupError):
+                await asyncio.wait_for(self._proc.wait(), 10)
+            if self._proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    self._proc.kill()
+        if self._reader is not None:
+            self._reader.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._reader
+
+
+def start_idle_compaction(orch: Orchestrator) -> IdleCompactor:
+    compactor = IdleCompactor(orch)
+    compactor.start()
+    orch._idle_compactor = compactor  # type: ignore[attr-defined]
+    return compactor
+
+
+async def stop_idle_compaction(orch: Orchestrator) -> None:
+    compactor = getattr(orch, "_idle_compactor", None)
+    if compactor is not None:
+        await compactor.stop()
+#+END_SRC
+
+** Lifecycle hook
+Two hunks in =ductor_bot/orchestrator/lifecycle.py=: start the compactor after the observers start, stop it before they stop. No other HelmCortex seam touches this file.
+
+#+BEGIN_SRC diff :tangle all/.local/share/dotcortex/ductor-seams/idle_compact_lifecycle.patch
+--- a/ductor_bot/orchestrator/lifecycle.py
++++ b/ductor_bot/orchestrator/lifecycle.py
+@@ -112,6 +112,11 @@
+     orch._providers._codex_cache_fn = lambda: orch._observers.codex_cache
+     await orch._observers.start_all(docker_container=docker_container)
+ 
++    # DotCortex fleet seam: compact idle sessions before the provider cache expires.
++    from ductor_bot.orchestrator.idle_compact import start_idle_compaction
++
++    start_idle_compaction(orch)
++
+     # Direct API server (WebSocket, designed for Tailscale)
+     if config.api.enabled:
+         await start_api_server(orch, config, paths)
+@@ -200,6 +205,9 @@
+     if orch._api_stop is not None:
+         await orch._api_stop()
+     await asyncio.to_thread(cleanup_ductor_links, orch._paths)
++    from ductor_bot.orchestrator.idle_compact import stop_idle_compaction
++
++    await stop_idle_compaction(orch)
+     await orch._observers.stop_all()
+     if orch._docker:
+         await orch._docker.teardown()
+#+END_SRC
+
+* ductor-seam-apply
+#+BEGIN_SRC bash :tangle all/.local/bin/ductor-seam-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+# ductor-seam-apply — apply DotCortex's fleet-wide seams to an installed ductor_bot.
+#
+# DotCortex installs Ductor (package-pip.org, pinned). Seams that every Ductor on
+# the fleet needs, whatever host or user runs it, live here; HelmCortex-only
+# seams (voice, continuity, task budget) stay in HelmCortex's ductor-patch-apply.
+# A pip reinstall wipes site-packages, so run this after every install and as a
+# preflight before the daemon starts. Idempotent; fails loud on upstream drift.
+set -euo pipefail
+
+TARGET_VERSION="0.20.1"
+CHECK_ONLY=0
+SITE_OVERRIDE=""
+
+usage() {
+    cat <<'EOF'
+Usage: ductor-seam-apply [--check] [--site DIR] [-h|--help]
+
+Apply DotCortex's fleet-wide ductor_bot seams to the installed package.
+
+  (no args)     Apply missing seams idempotently, then byte-compile-verify.
+  --check       Report applied/missing per seam; change nothing. Exit 1 if any
+                seam is missing.
+  --site DIR    Operate on the site-packages root DIR instead of the one the
+                `ductor` launcher's interpreter uses.
+  -h, --help    Show this help and exit (no side effects).
+
+Seams:
+  idle_compact  compact idle main sessions before the provider cache expires
+                (Claude 55/60 min, Codex 25/30 min; config.json "idle_compaction")
+
+Seam files:  <dotcortex>/all/.local/share/dotcortex/ductor-seams/
+             (override with DOTCORTEX_DUCTOR_SEAMS)
+Target:      ductor 0.20.1 (drift fails loud; regenerate the seam)
+EOF
+}
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -h|--help) usage; exit 0 ;;
+        --check)   CHECK_ONLY=1; shift ;;
+        --site)    SITE_OVERRIDE="${2:-}"; [ -n "$SITE_OVERRIDE" ] || { usage >&2; exit 2; }; shift 2 ;;
+        *) echo "ductor-seam-apply: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+    esac
+done
+
+fail() { echo "ductor-seam-apply: ERROR: $*" >&2; exit 1; }
+command -v patch >/dev/null 2>&1 || fail "'patch' not found on PATH"
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+SEAMS_DIR="${DOTCORTEX_DUCTOR_SEAMS:-$(dirname "$self")/../share/dotcortex/ductor-seams}"
+[ -d "$SEAMS_DIR" ] || fail "seam dir not found: $SEAMS_DIR"
+SEAMS_DIR="$(cd "$SEAMS_DIR" && pwd)"
+
+# The interpreter that runs the daemon decides which site-packages matters.
+if [ -n "$SITE_OVERRIDE" ]; then
+    SITE="$SITE_OVERRIDE"
+    PYTHON_BIN="$(command -v python3)" || fail "python3 not found on PATH"
+else
+    launcher="$(command -v ductor)" || fail "ductor launcher not on PATH"
+    PYTHON_BIN="$(head -n1 "$launcher" | sed -n 's/^#!\s*//p' | awk '{print $1}')"
+    [ -x "$PYTHON_BIN" ] || fail "cannot read the interpreter from $launcher"
+    SITE="$(cd /tmp && "$PYTHON_BIN" -c 'import ductor_bot, os; print(os.path.dirname(os.path.dirname(ductor_bot.__file__)))')" \
+        || fail "ductor_bot not importable by $PYTHON_BIN"
+fi
+SITE="$(cd "$SITE" && pwd)" || fail "site not found: $SITE"
+PKG="$SITE/ductor_bot"
+[ -d "$PKG" ] || fail "ductor_bot not found under $SITE"
+
+version="$(cd /tmp && PYTHONPATH="$SITE" "$PYTHON_BIN" -c 'from importlib.metadata import version; print(version("ductor"))' 2>/dev/null || true)"
+if [ -n "$version" ] && [ "$version" != "$TARGET_VERSION" ]; then
+    fail "installed ductor $version, seams target $TARGET_VERSION: regenerate the seams first"
+fi
+
+missing=0
+changed=0
+
+seam_file_state() {  # $1 = seam source, $2 = installed path
+    if [ -f "$2" ] && cmp -s "$1" "$2"; then echo applied; else echo missing; fi
+}
+
+seam_patch_state() {  # $1 = patch file
+    if patch -d "$SITE" -p1 --fuzz=0 --dry-run --reverse --force -s <"$1" >/dev/null 2>&1; then
+        echo applied
+    elif patch -d "$SITE" -p1 --fuzz=0 --dry-run --forward --force -s <"$1" >/dev/null 2>&1; then
+        echo missing
+    else
+        echo drifted
+    fi
+}
+
+# --- idle_compact -----------------------------------------------------------
+module_src="$SEAMS_DIR/idle_compact.py"
+module_dst="$PKG/orchestrator/idle_compact.py"
+hook_patch="$SEAMS_DIR/idle_compact_lifecycle.patch"
+[ -f "$module_src" ] && [ -f "$hook_patch" ] || fail "idle_compact seam files missing in $SEAMS_DIR"
+
+module_state="$(seam_file_state "$module_src" "$module_dst")"
+hook_state="$(seam_patch_state "$hook_patch")"
+[ "$hook_state" != drifted ] || fail "idle_compact: orchestrator/lifecycle.py drifted from the seam; regenerate it"
+echo "idle_compact: module=$module_state hook=$hook_state"
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    [ "$module_state" = applied ] && [ "$hook_state" = applied ] || missing=1
+    exit "$missing"
+fi
+
+if [ "$module_state" = missing ]; then
+    install -m 0644 "$module_src" "$module_dst"
+    changed=1
+fi
+if [ "$hook_state" = missing ]; then
+    patch -d "$SITE" -p1 --fuzz=0 --forward -s <"$hook_patch"
+    changed=1
+fi
+
+(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$PKG/orchestrator/lifecycle.py") \
+    || fail "py_compile failed after applying seams"
+[ "$changed" -eq 1 ] && echo "ductor-seam-apply: seams applied to $SITE" || echo "ductor-seam-apply: already applied"
+#+END_SRC
+
+* Tests
+Unit tests use fake sessions, a fake lock pool and a fake CLI service: no network, no real CLI. Run: =python3 ~/.local/share/dotcortex/tests/test-ductor-idle-compact.py= with the installed =ductor_bot= importable.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-ductor-idle-compact.py
+"""Unit tests for the Ductor idle-compaction seam (no network, no real CLI).
+
+Loads idle_compact.py from the DotCortex seam directory (next to this tests
+directory, or DOTCORTEX_DUCTOR_SEAMS) against the installed ductor_bot.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import tempfile
+import unittest
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
+
+import importlib.util
+import os
+import sys
+
+try:
+    import ductor_bot  # noqa: F401  (the seam imports ductor_bot.cli.types)
+except ImportError:  # pragma: no cover
+    raise unittest.SkipTest("ductor_bot is not installed")
+
+_SEAMS = Path(os.environ.get("DOTCORTEX_DUCTOR_SEAMS", Path(__file__).resolve().parents[1] / "ductor-seams"))
+_spec = importlib.util.spec_from_file_location("ductor_idle_compact_seam", _SEAMS / "idle_compact.py")
+ic = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = ic
+_spec.loader.exec_module(ic)
+
+
+@dataclass
+class FakeSession:
+    session_id: str
+    provider: str
+    last_active: str
+    model: str = "m"
+    reasoning_effort: str = ""
+    chat_id: int = 1
+
+    @property
+    def session_key(self):
+        return SimpleNamespace(chat_id=self.chat_id, topic_id=None, transport="tg", lock_key=(self.chat_id, None))
+
+
+class FakeSessions:
+    def __init__(self, sessions):
+        self.sessions = sessions
+
+    async def list_all(self):
+        return list(self.sessions)
+
+    async def get_active(self, key):
+        for s in self.sessions:
+            if s.chat_id == key.chat_id:
+                return s
+        return None
+
+
+class FakeLockPool:
+    def __init__(self):
+        self.locks = {}
+
+    def get(self, key):
+        return self.locks.setdefault(key, asyncio.Lock())
+
+
+@dataclass
+class FakeCLI:
+    calls: list = field(default_factory=list)
+
+    async def execute(self, request):
+        self.calls.append(request)
+        return SimpleNamespace(is_error=False, result="", session_id=request.resume_session)
+
+
+def ago(minutes: float) -> str:
+    return (datetime.now(UTC) - timedelta(minutes=minutes)).isoformat()
+
+
+class IdleCompactTests(unittest.IsolatedAsyncioTestCase):
+    def make(self, sessions, config=None, busy=False):
+        tmp = Path(tempfile.mkdtemp())
+        (tmp / "config").mkdir()
+        (tmp / "config" / "config.json").write_text(json.dumps(config or {}))
+        cli = FakeCLI()
+        orch = SimpleNamespace(
+            _paths=SimpleNamespace(
+                sessions_path=tmp / "sessions.json",
+                config_path=tmp / "config" / "config.json",
+                workspace=tmp,
+            ),
+            _sessions=FakeSessions(sessions),
+            _lock_pool=FakeLockPool(),
+            _cli_service=cli,
+            is_chat_busy=lambda chat_id, topic_id=None: busy,
+        )
+        comp = ic.IdleCompactor(orch)
+        codex_calls = []
+
+        async def fake_codex(session, settings):
+            codex_calls.append(session.session_id)
+            return True
+
+        comp._compact_codex = fake_codex
+        return comp, cli, codex_calls, tmp
+
+    async def tick(self, comp):
+        await comp._tick(comp._settings())
+
+    async def test_claude_compacts_after_55_minutes_once(self):
+        s = FakeSession("c1", "claude", ago(56))
+        comp, cli, _, _ = self.make([s])
+        await self.tick(comp)
+        await self.tick(comp)
+        self.assertEqual([r.prompt for r in cli.calls], ["/compact"])
+        self.assertEqual(cli.calls[0].resume_session, "c1")
+
+    async def test_claude_not_before_threshold(self):
+        comp, cli, _, _ = self.make([FakeSession("c1", "claude", ago(40))])
+        await self.tick(comp)
+        self.assertEqual(cli.calls, [])
+
+    async def test_codex_compacts_after_25_not_claude_window(self):
+        comp, cli, codex, _ = self.make([FakeSession("x1", "codex", ago(26))])
+        await self.tick(comp)
+        self.assertEqual(codex, ["x1"])
+        self.assertEqual(cli.calls, [])
+
+    async def test_expired_cache_is_skipped_and_marked(self):
+        comp, cli, codex, tmp = self.make(
+            [FakeSession("x1", "codex", ago(31)), FakeSession("c1", "claude", ago(61), chat_id=2)]
+        )
+        await self.tick(comp)
+        self.assertEqual((codex, cli.calls), ([], []))
+        self.assertEqual(set(json.loads((tmp / "idle_compaction.json").read_text())), {"x1", "c1"})
+
+    async def test_new_activity_rearms(self):
+        s = FakeSession("c1", "claude", ago(56))
+        comp, cli, _, _ = self.make([s])
+        await self.tick(comp)
+        s.last_active = ago(57)  # a later turn, idle again
+        await self.tick(comp)
+        self.assertEqual(len(cli.calls), 2)
+
+    async def test_busy_chat_defers(self):
+        comp, cli, _, _ = self.make([FakeSession("c1", "claude", ago(56))], busy=True)
+        await self.tick(comp)
+        self.assertEqual(cli.calls, [])
+
+    async def test_config_overrides_and_disable(self):
+        comp, cli, codex, _ = self.make(
+            [FakeSession("x1", "codex", ago(21))], config={"idle_compaction": {"codex_idle_minutes": 20}}
+        )
+        await self.tick(comp)
+        self.assertEqual(codex, ["x1"])
+        comp2, cli2, _, _ = self.make([FakeSession("c1", "claude", ago(56))], config={"idle_compaction": {"enabled": False}})
+        comp2.start()
+        self.assertIsNone(comp2._task)
+
+    async def test_state_survives_restart(self):
+        s = FakeSession("c1", "claude", ago(56))
+        comp, cli, _, tmp = self.make([s])
+        await self.tick(comp)
+        comp_b = ic.IdleCompactor(comp._orch)
+        await self.tick(comp_b)
+        self.assertEqual(len(cli.calls), 1)
+
+    async def test_other_providers_ignored(self):
+        comp, cli, codex, _ = self.make([FakeSession("g1", "gemini", ago(500))])
+        await self.tick(comp)
+        self.assertEqual((codex, cli.calls), ([], []))
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
