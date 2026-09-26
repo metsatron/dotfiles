@@ -592,6 +592,160 @@ fi
 [ "$changed" -eq 1 ] && echo "ductor-seam-apply: seams applied to $SITE" || echo "ductor-seam-apply: already applied"
 #+END_SRC
 
+* OpenRC service for Ductor bots
+
+On OpenRC hosts (Honey) each Ductor bot was a hand-written =/etc/init.d= script outside DotCortex, so a pip upgrade there would drop the seams until someone re-ran the applier. One shared body replaces them: settings live in =/etc/conf.d/<svc>=, and =start_pre= re-applies the seams as the bot's own user before every start, refusing an unpatched start. =ductor-openrc-install= (root) puts the applier and seam files in =/usr/local/share/dotcortex/ductor-seams= (readable by every bot user, including agent users that cannot read an operator's checkout), installs the body and the conf file, and backs up whatever it replaces. It never starts or restarts anything.
+
+** Service body
+#+BEGIN_SRC sh :tangle all/.local/share/dotcortex/ductor-seams/openrc/ductor
+#!/sbin/openrc-run
+# Ductor Telegram bot as an OpenRC service (one body, one conf.d file per bot).
+#
+# Install: this body as /etc/init.d/<svc>, the bot's settings as
+# /etc/conf.d/<svc>. start_pre re-applies DotCortex's fleet seams
+# (ductor-seam-apply, idle compaction) as the bot's own user before every
+# start, so a pip upgrade can never silently drop them; a failing seam
+# refuses the start instead of running an unpatched daemon.
+#
+# Settings (conf.d):
+#   ductor_user        account that runs the bot (required)
+#   ductor_group       its group (default: ductor_user)
+#   ductor_home        DUCTOR_HOME (required)
+#   ductor_workdir     working directory (default: the user's home)
+#   ductor_port        DUCTOR_INTERAGENT_PORT (optional; pin it when several
+#                      Ductors share a host, or delegations land in the wrong hub)
+#   ductor_log_group   group that may read the log (default: ductor_group)
+#   ductor_seams       seam directory holding ductor-seam-apply, readable by
+#                      ductor_user (default /usr/local/share/dotcortex/ductor-seams)
+#   ductor_umask       default 027
+
+: "${ductor_group:=${ductor_user}}"
+: "${ductor_log_group:=${ductor_group}}"
+: "${ductor_seams:=/usr/local/share/dotcortex/ductor-seams}"
+: "${ductor_umask:=027}"
+
+user_home="$(getent passwd "${ductor_user}" | cut -d: -f6)"
+: "${ductor_workdir:=${user_home}}"
+
+name="${RC_SVCNAME}"
+description="${ductor_description:-Ductor Telegram bot (${ductor_user})}"
+command="${user_home}/.local/bin/ductor"
+command_user="${ductor_user}:${ductor_group}"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/${RC_SVCNAME}.log"
+error_log="/var/log/${RC_SVCNAME}.log"
+directory="${ductor_workdir}"
+umask="${ductor_umask}"
+
+export HOME="${user_home}"
+export DUCTOR_HOME="${ductor_home}"
+[ -n "${ductor_port}" ] && export DUCTOR_INTERAGENT_PORT="${ductor_port}"
+export PATH="${PATH}:${user_home}/.local/bin:${user_home}/.npm-global/bin"
+
+depend() {
+    # `use`, never `need`: Devuan's OpenRC has no hard `net` service.
+    use net dns
+    after net
+}
+
+start_pre() {
+    [ -n "${ductor_user}" ] && [ -n "${ductor_home}" ] \
+        || { eerror "ductor_user and ductor_home must be set in /etc/conf.d/${RC_SVCNAME}"; return 1; }
+    checkpath -f -m 0640 -o "${ductor_user}:${ductor_log_group}" "${output_log}"
+    ebegin "Applying DotCortex Ductor seams as ${ductor_user}"
+    su -s /bin/sh "${ductor_user}" -c "cd /tmp && env HOME='${user_home}' PATH='${PATH}' \
+        DOTCORTEX_DUCTOR_SEAMS='${ductor_seams}' bash '${ductor_seams}/ductor-seam-apply'" \
+        >>"${output_log}" 2>&1
+    eend $? "ductor-seam-apply failed (see ${output_log}); refusing an unpatched start"
+}
+#+END_SRC
+
+** Installer
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/ductor-seams/openrc/ductor-openrc-install :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# ductor-openrc-install — install a Ductor bot as an OpenRC service from DotCortex.
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: ductor-openrc-install [--dry-run] <svc> <conf-file>
+       ductor-openrc-install -h|--help
+
+Run as root. Installs, from this DotCortex checkout:
+  - the seam applier and seam files into /usr/local/share/dotcortex/ductor-seams
+    (root-owned, world-readable, so every bot user can re-apply them)
+  - the shared OpenRC body as /etc/init.d/<svc>
+  - <conf-file> as /etc/conf.d/<svc>
+Existing files are backed up next to themselves as <file>.bak-<timestamp>
+before they are replaced. Nothing is started or restarted.
+
+  --dry-run   print what would change; change nothing
+USAGE
+}
+
+DRY=0
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) DRY=1; shift ;;
+esac
+[ $# -eq 2 ] || { usage >&2; exit 2; }
+svc="$1"; conf="$2"
+case "$svc" in *[!a-z0-9-]*|"") echo "bad service name: $svc" >&2; exit 2 ;; esac
+[ -r "$conf" ] || { echo "conf file not readable: $conf" >&2; exit 2; }
+
+self="$(readlink -f "${BASH_SOURCE[0]}")"
+seams="$(dirname "$self")/.."
+seams="$(cd "$seams" && pwd)"
+applier="$(cd "$seams/../../../bin" && pwd)/ductor-seam-apply"
+body="$seams/openrc/ductor"
+dest=/usr/local/share/dotcortex/ductor-seams
+ts="$(date +%Y%m%d-%H%M%S)"
+for f in "$applier" "$body" "$seams/idle_compact.py" "$seams/idle_compact_lifecycle.patch"; do
+    [ -r "$f" ] || { echo "missing source: $f" >&2; exit 1; }
+done
+
+run() { if [ "$DRY" -eq 1 ]; then echo "would: $*"; else "$@"; fi; }
+place() {  # src dst mode
+    if [ -e "$2" ] && cmp -s "$1" "$2"; then echo "unchanged $2"; return; fi
+    [ -e "$2" ] && run cp -p "$2" "$2.bak-$ts"
+    run install -m "$3" -o root -g root "$1" "$2"
+    [ "$DRY" -eq 1 ] || echo "installed $2"
+}
+
+[ "$DRY" -eq 1 ] || [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
+run install -d -m 0755 -o root -g root "$dest"
+place "$applier" "$dest/ductor-seam-apply" 0755
+place "$seams/idle_compact.py" "$dest/idle_compact.py" 0644
+place "$seams/idle_compact_lifecycle.patch" "$dest/idle_compact_lifecycle.patch" 0644
+place "$body" "/etc/init.d/$svc" 0755
+place "$conf" "/etc/conf.d/$svc" 0644
+#+END_SRC
+
+** Honey instances
+Non-secret settings only; the bot tokens stay in each Ductor home's private config.
+
+#+BEGIN_SRC sh :tangle all/.local/share/dotcortex/ductor-seams/openrc/conf/honey-badger-opus
+# Honey Badger: Ductor (Claude) for Mètsàtron on Honey, as gille.
+ductor_description="Ductor (Claude+Codex) Telegram bot for Metsatron on Honey"
+ductor_user="gille"
+ductor_home="/home/gille/.ductor"
+ductor_workdir="/home/gille"
+ductor_umask="022"
+#+END_SRC
+
+#+BEGIN_SRC sh :tangle all/.local/share/dotcortex/ductor-seams/openrc/conf/honey-codex
+# Honey's Codex Ductor for Mètsàtron, as agent-codex (moved 2026-09-25).
+ductor_description="Ductor (Codex) Telegram bot for Metsatron on Honey"
+ductor_user="agent-codex"
+ductor_home="/home/agent-codex/.ductor-codex"
+ductor_workdir="/home/agent-codex"
+# Ductor's task tools default to port 8799 (Honey Badger's hub); pinning this
+# keeps honey-codex delegations in its own hub (incident 2026-09-16).
+ductor_port="8800"
+ductor_log_group="gille"
+#+END_SRC
+
 * Tests
 Unit tests use fake sessions, a fake lock pool and a fake CLI service: no network, no real CLI. Run: =python3 ~/.local/share/dotcortex/tests/test-ductor-idle-compact.py= with the installed =ductor_bot= importable.
 
