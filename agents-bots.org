@@ -102,6 +102,22 @@ working directory.
 - Bridge: =xqicxx/dsh-telegram=, built from the pinned sovereign checkout at
   =~/HelmCortex/NEXUS/git/dsh-telegram=
 - Runtime env: private =~/.config/deepseek-harness-telegram/env= only
+- Unix user (since 2026-09-26, Agent Boundaries phase 8): the bot runs as
+  =agent-deepseek= (uid 2012). The operator's non-secret
+  =~/.config/deepseek-harness-telegram/run-as= names that user; with it present,
+  =telegram-agent-host start|stop|status deepseek-harness= re-runs itself through
+  =sudo -n -u agent-deepseek= with a clean environment, so every =$HOME=-relative
+  path (env, token, Go key, DSH home, state, log, pid, readiness marker) is the
+  agent's own. Delete the file to run as the operator again. The agent gets a
+  =~/HelmCortex= link (helmcortex-anaconda resolves from =$HOME=), its own copy of
+  the built bridge under its DSH home (NEXUS stays closed to agents: it holds
+  keys and 2775 subdirs such as =clients=), and a copy of the operator's
+  known-good =dsh= tree: a fresh =npm install= of 0.1.5-rc.1 pulled rc.3
+  sub-packages, nested them, and dsh-sandbox-local no longer resolved from the dsh
+  root. Moving an existing DSH home between users means repointing the
+  =profiles/node_modules= symlink farm and the =.dsh-module-fallback= links, and
+  rewriting the session header's =cwd=; a =session.v3.jsonl.zstd= must keep the
+  header line alone in its first zstd frame or dsh refuses it as corrupt.
 - Provider: custom OpenAI-compatible =helmcortex-opencode-go= route (OpenCode Go,
   =https://opencode.ai/zen/go/v1=), never the native =deepseek= route and never
   pi-ai's built-in =opencode-go= catalog; the only declared model is
@@ -2758,6 +2774,25 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("refusing credential egress", result.stderr)
 
+    def test_deepseek_harness_run_as_missing_user_refuses(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        run_as = self.home / ".config/deepseek-harness-telegram/run-as"
+        run_as.parent.mkdir(parents=True, exist_ok=True)
+        run_as.write_text("agent-does-not-exist-2999\n", encoding="utf-8")
+        result = self.run_manager("start", "deepseek-harness", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run-as user is missing", result.stderr)
+
+    def test_deepseek_harness_run_as_self_runs_locally(self) -> None:
+        import getpass
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        run_as = self.home / ".config/deepseek-harness-telegram/run-as"
+        run_as.parent.mkdir(parents=True, exist_ok=True)
+        run_as.write_text(getpass.getuser() + "\n", encoding="utf-8")
+        result = self.run_manager("status", "deepseek-harness", timeout=2)
+        self.assertIn("deepseek-harness:", result.stdout)
+        self.assertNotIn("run-as user is missing", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
@@ -3111,6 +3146,33 @@ check_codex() {
     else
         echo "  codex-helmastra (--telegram): STOPPED"
     fi
+}
+
+# Privilege drop (Agent Boundaries phase 8, 2026-09-26). When the operator's
+# non-secret run-as file names an agent user, start/stop/status re-run this
+# script as that user, so every path it resolves from $HOME (env, token, key,
+# DSH home, state dir, log, pid, readiness marker) lives in the agent's home and
+# the operator's home stays sealed. Returns 3 when no delegation applies.
+deepseek_harness_delegate() {
+    local verb="$1" run_as_file target thome self runtime_path
+    run_as_file="${DSH_TELEGRAM_RUN_AS_FILE:-$HOME/.config/deepseek-harness-telegram/run-as}"
+    [ -r "$run_as_file" ] || return 3
+    target="$(head -n1 "$run_as_file" | tr -d '[:space:]')"
+    [ -n "$target" ] || return 3
+    [ "$(id -un)" != "$target" ] || return 3
+    thome="$(getent passwd "$target" | cut -d: -f6)"
+    if [ -z "$thome" ]; then
+        echo "DeepSeek Harness run-as user is missing: $target" >&2
+        return 1
+    fi
+    self="$(readlink -f "$0")"
+    runtime_path="$thome/.guix-extra-profiles/agent/agent/bin:$thome/.npm-global/bin:/usr/local/bin:/usr/bin:/bin"
+    # cwd /tmp: sudo keeps the caller's cwd, which the sealed home refuses.
+    (cd /tmp && sudo -n -u "$target" -H env -i \
+        HOME="$thome" USER="$target" LOGNAME="$target" LANG=C.UTF-8 \
+        PATH="$runtime_path" AGENT_RUNTIME_PATH="$runtime_path" \
+        DOTCORTEX_AGENTS_DIR="$AGENTS_DIR" \
+        bash "$self" "$verb" deepseek-harness)
 }
 
 deepseek_harness_config_file() {
@@ -3661,6 +3723,9 @@ PY
 }
 
 check_deepseek_harness() {
+    local delegated=0
+    deepseek_harness_delegate status || delegated=$?
+    [ "$delegated" -eq 3 ] || return "$delegated"
     if deepseek_harness_ready; then
         local pid
         pid="$(cat "$DSH_TELEGRAM_PID_FILE")"
@@ -4035,6 +4100,9 @@ start_agent() {
             fi
             ;;
         deepseek-harness)
+            local delegated=0
+            deepseek_harness_delegate start || delegated=$?
+            [ "$delegated" -eq 3 ] || return "$delegated"
             mkdir -p "$STATE_DIR"
             deepseek_harness_acquire_start_lock || return 1
             deepseek_harness_validate_private_config || { deepseek_harness_release_start_lock; return 1; }
@@ -4180,7 +4248,9 @@ stop_agent() {
             fi
             ;;
         deepseek-harness)
-            local dsh_pid dsh_ticks dsh_marker
+            local dsh_pid dsh_ticks dsh_marker delegated=0
+            deepseek_harness_delegate stop || delegated=$?
+            [ "$delegated" -eq 3 ] || return "$delegated"
             dsh_marker="$(deepseek_harness_marker_path 2>/dev/null || true)"
             if [ ! -e "$DSH_TELEGRAM_PID_FILE" ] && [ ! -e "$DSH_TELEGRAM_READY_MARKER" ] && \
                [ ! -e "$DSH_TELEGRAM_GENERATION_FILE" ] && \

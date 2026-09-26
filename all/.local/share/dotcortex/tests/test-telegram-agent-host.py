@@ -641,6 +641,25 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("refusing credential egress", result.stderr)
 
+    def test_deepseek_harness_run_as_missing_user_refuses(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        run_as = self.home / ".config/deepseek-harness-telegram/run-as"
+        run_as.parent.mkdir(parents=True, exist_ok=True)
+        run_as.write_text("agent-does-not-exist-2999\n", encoding="utf-8")
+        result = self.run_manager("start", "deepseek-harness", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("run-as user is missing", result.stderr)
+
+    def test_deepseek_harness_run_as_self_runs_locally(self) -> None:
+        import getpass
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")
+        run_as = self.home / ".config/deepseek-harness-telegram/run-as"
+        run_as.parent.mkdir(parents=True, exist_ok=True)
+        run_as.write_text(getpass.getuser() + "\n", encoding="utf-8")
+        result = self.run_manager("status", "deepseek-harness", timeout=2)
+        self.assertIn("deepseek-harness:", result.stdout)
+        self.assertNotIn("run-as user is missing", result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
