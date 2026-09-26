@@ -44,6 +44,8 @@ honey_claude_launch() {
     if [[ "$telegram" -eq 1 ]]; then
         honey_telegram_preflight "$name" "$state_dir" || return 1
     fi
+    # Gillean's usage guard (preservation.bash); inert with a reason if it cannot bind.
+    honey_claude_preservation_bindings "$name"
     # The OpenRC service finds this supervisor by pid: exec keeps the pid.
     if [[ -n "${XDG_RUNTIME_DIR:-}" && -d "$XDG_RUNTIME_DIR" ]]; then
         printf '%s\n' "$$" > "$XDG_RUNTIME_DIR/$name.pid"
