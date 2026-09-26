@@ -1359,3 +1359,151 @@ if __name__ == "__main__":
 #+BEGIN_SRC bash :tangle all/.local/bin/codex-warmctl :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
 exec codex-warm --control "$@"
 #+END_SRC
+
+* Multi-account boot owner on OpenRC hosts
+
+On a headless OpenRC host (Honey) warm consorts start from =/etc/init.d=, not XDG autostart. Until 2026-09-26 that meant one hand-written script per kind, =claude-warm= and =codex-warm=, both running as the operator (=gille=) and sharing one runtime dir =/run/warm=. The agent-user wall (=agents.org= "Agent User Bootstrap") wants consorts to run as the account that owns their auth, and the host is to be replaced (processes move to Milk), so the boot owner must be per account and host-agnostic.
+
+One body serves both kinds and every account, in OpenRC's own multi-instance idiom (the =net.lo= / =net.eth0= pattern): the body is installed as =/etc/init.d/claude-warm= and =/etc/init.d/codex-warm=, and each instance is a symlink =<kind>-warm.<account>= to it. =RC_SVCNAME= carries both halves:
+
+| Derived from =RC_SVCNAME= | =claude-warm.agent-claude= | bare =claude-warm= (compat) |
+|---|---|---|
+| kind (binary =<home>/.local/bin/<kind>-warm=) | =claude= | =claude= |
+| account (=su -l=, pid owner) | =agent-claude= | =warm_user= from conf.d, required |
+| tmux socket (=tmux -L=) and session | =claude-warm= / =claude-warm= | default socket / conf.d =warm_session= |
+| =XDG_RUNTIME_DIR= (0700, account-owned) | =/run/claude-warm.agent-claude= | conf.d =xdg= |
+| log (0640, account-owned) | =/var/log/claude-warm.agent-claude.log= | =/var/log/claude-warm.log= |
+| Herdr agent name (fleet-unique) | =<host>-claude-agent-claude= | conf.d =warm_agent= |
+
+Per-instance values (working directory, model, extra arguments, overrides) live in =/etc/conf.d/<kind>-warm.<account>=, which OpenRC sources automatically (falling back to =/etc/conf.d/<kind>-warm=). A bare =claude-warm= / =codex-warm= refuses to start unless its conf.d names a =warm_user=: that is the *compat path*. Today's two services keep their names, runlevel links, tmux sessions (=warm=, =codex=), shared =/run/warm= and Herdr name (=honey-opus=) by carrying those exact values in =/etc/conf.d/claude-warm= and =/etc/conf.d/codex-warm=, so replacing the hand-written scripts with the body is a no-op until an instance is switched. The body never runs as root and refuses uid 0.
+
+Which instances a host runs is declared in =fleet.ssv='s =warm= column (=agents.org=). *Next commit, specified here but not yet written:* =warm-openrc-apply= reads that row: =--dry-run= (default) prints the plan (body, symlinks, conf.d stubs it would create, runlevel links), =--check= compares the installed body, =--apply= needs =--host= equal to the live hostname and an OpenRC service manager, installs the body and symlinks, writes only *missing* conf.d files, adds runlevel links and verifies them in =/etc/runlevels/default=. It never starts, stops or restarts a consort (bounce via Nurse Joy) and never removes a link the row no longer lists (it prints the =rc-update del= for the operator). It supersedes the single-instance renderer proposed in MR !7 (=claude-warm-openrc-apply=) for hosts that need more than one account.
+
+#+BEGIN_SRC bash :tangle linux/.local/share/dotcortex/openrc/warm-consort :shebang "#!/sbin/openrc-run" :tangle-mode (identity #o755) :comments no
+# Warm consort boot owner, multi-account (agents-codex-idle-supervisor.org,
+# "Multi-account boot owner on OpenRC hosts"). Installed as
+# /etc/init.d/claude-warm and /etc/init.d/codex-warm; instances are symlinks
+# <kind>-warm.<account>. Per-instance values: /etc/conf.d/<kind>-warm.<account>.
+# Re-install from DotCortex instead of editing this file.
+
+warm_kind="${RC_SVCNAME%%-warm*}"
+warm_instance=""
+case "${RC_SVCNAME}" in
+    *.*) warm_instance="${RC_SVCNAME#*.}" ;;
+esac
+
+# Instance defaults, derived from the service name; conf.d wins.
+warm_user="${warm_user:-${warm_instance}}"
+warm_socket="${warm_socket:-${warm_instance:+${warm_kind}-warm}}"
+warm_session="${warm_session:-${warm_kind}-warm}"
+xdg="${xdg:-/run/${RC_SVCNAME}}"
+warm_log="${warm_log:-/var/log/${RC_SVCNAME}.log}"
+warm_log_mode="${warm_log_mode:-0640}"
+warm_host="${warm_host:-$(hostname -s 2>/dev/null || hostname)}"
+warm_agent="${warm_agent:-${warm_host}-${warm_kind}-${warm_user}}"
+warm_args="${warm_args:-}"
+
+name="${RC_SVCNAME}"
+description="Warm ${warm_kind} consort for ${warm_user:-?} (PTY supervisor + idle auto-compaction)"
+
+depend() {
+    # Soft deps: Honey has no hard `net` service; `need net` fails there.
+    use net dns
+    after net elogind dbus
+}
+
+warm_home() { getent passwd "${warm_user}" | cut -d: -f6; }
+
+warm_valid() {
+    case "${warm_kind}" in
+        claude|codex) ;;
+        *) eerror "${RC_SVCNAME}: kind must be claude or codex"; return 1 ;;
+    esac
+    [ -n "${warm_user}" ] || { eerror "${RC_SVCNAME}: no account (use ${warm_kind}-warm.<account>, or set warm_user in /etc/conf.d/${RC_SVCNAME})"; return 1; }
+    local uid
+    uid="$(getent passwd "${warm_user}" | cut -d: -f3)"
+    [ -n "${uid}" ] || { eerror "${RC_SVCNAME}: unknown account ${warm_user}"; return 1; }
+    [ "${uid}" != 0 ] || { eerror "${RC_SVCNAME}: refusing to run a consort as root"; return 1; }
+    warm_cwd="${warm_cwd:-$(warm_home)/metsatron-peer}"
+    [ -d "${warm_cwd}" ] || { eerror "${RC_SVCNAME}: working dir ${warm_cwd} missing (set warm_cwd)"; return 1; }
+    warm_bin="${warm_bin:-$(warm_home)/.local/bin/${warm_kind}-warm}"
+    return 0
+}
+
+warm_tmux() { printf 'tmux%s' "${warm_socket:+ -L '${warm_socket}'}"; }
+
+warm_pid() {
+    local bin
+    bin="${warm_bin:-$(warm_home)/.local/bin/${warm_kind}-warm}"
+    pgrep -u "${warm_user}" -f "${bin}" 2>/dev/null | head -n 1
+}
+
+start_pre() {
+    warm_valid || return 1
+    checkpath -d -m 0700 -o "${warm_user}:${warm_user}" "${xdg}"
+    checkpath -f -m "${warm_log_mode}" -o "${warm_user}:${warm_user}" "${warm_log}"
+}
+
+start() {
+    warm_valid || return 1
+    ebegin "Starting ${description} (tmux: ${warm_socket:-default}/${warm_session}, cwd: ${warm_cwd})"
+    # PATH is appended to, never replaced; exec makes the pane's process the supervisor.
+    su -l "${warm_user}" -c "export XDG_RUNTIME_DIR='${xdg}' PATH=\"\${PATH}:\${HOME}/.local/bin\" CLAUDE_WARM_HERDR_AGENT='${warm_agent}'; \
+        $(warm_tmux) new-session -d -s '${warm_session}' -c '${warm_cwd}' \
+        -e XDG_RUNTIME_DIR='${xdg}' -e PATH=\"\${PATH}\" -e CLAUDE_WARM_HERDR_AGENT='${warm_agent}' \
+        'exec ${warm_bin} ${warm_args} >> ${warm_log} 2>&1'"
+    eend $? "Failed to start ${RC_SVCNAME}"
+}
+
+stop() {
+    local pid i=0
+    ebegin "Stopping ${description}"
+    [ -n "${warm_user}" ] || { eend 1 "no account"; return 1; }
+    # The supervisor ignores SIGHUP and survives its pane: SIGTERM it by owner
+    # and exact binary path, then tear down this instance's tmux session only.
+    pid="$(warm_pid)"
+    if [ -n "${pid}" ]; then
+        kill -TERM "${pid}" 2>/dev/null
+        while kill -0 "${pid}" 2>/dev/null && [ $i -lt 10 ]; do sleep 1; i=$((i+1)); done
+        kill -0 "${pid}" 2>/dev/null && kill -KILL "${pid}" 2>/dev/null
+    fi
+    su -l "${warm_user}" -c "$(warm_tmux) kill-session -t '${warm_session}'" 2>/dev/null
+    eend 0
+}
+
+status() {
+    if [ -n "${warm_user}" ] && [ -n "$(warm_pid)" ]; then
+        einfo "${RC_SVCNAME} supervisor is running as ${warm_user} (pid $(warm_pid))"
+        return 0
+    fi
+    einfo "${RC_SVCNAME} is not running"
+    return 3
+}
+#+END_SRC
+
+** Compat conf.d for today's Honey services
+
+What =/etc/conf.d/claude-warm= and =/etc/conf.d/codex-warm= must say so the body reproduces the 2026-09-10 hand-written scripts exactly (same account, session, runtime dir, log mode, Herdr name, arguments). Tangled as reference copies; =warm-openrc-apply --apply= installs them only where no conf.d exists.
+
+#+BEGIN_SRC conf :tangle linux/.local/share/dotcortex/openrc/conf.d/claude-warm :comments no
+# /etc/conf.d/claude-warm: compat for the bare (pre-instance) service.
+warm_user="gille"
+warm_socket=""
+warm_session="warm"
+xdg="/run/warm"
+warm_log_mode="0644"
+warm_agent="honey-opus"
+warm_cwd="/home/gille/metsatron-peer"
+warm_args="--model claude-opus-4-8"
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.local/share/dotcortex/openrc/conf.d/codex-warm :comments no
+# /etc/conf.d/codex-warm: compat for the bare (pre-instance) service.
+warm_user="gille"
+warm_socket=""
+warm_session="codex"
+xdg="/run/warm"
+warm_log_mode="0644"
+warm_cwd="/home/gille/metsatron-peer"
+warm_args="--dangerously-bypass-hook-trust"
+#+END_SRC
