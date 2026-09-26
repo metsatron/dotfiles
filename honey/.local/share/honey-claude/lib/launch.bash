@@ -59,6 +59,7 @@ honey_claude_launch() {
         # acceptEdits (auto) mode: plan mode blocks unattended bot work (as on kikin).
         exec env CLAUDE_WARM_HERDR_AGENT="$agent" TELEGRAM_STATE_DIR="$state_dir" \
             claude-warm --model "$model" --permission-mode acceptEdits \
+            --allowedTools=mcp__plugin_telegram_telegram \
             --channels plugin:telegram@claude-plugins-official "${passthrough[@]+"${passthrough[@]}"}"
     fi
     exec env CLAUDE_WARM_HERDR_AGENT="$agent" \
