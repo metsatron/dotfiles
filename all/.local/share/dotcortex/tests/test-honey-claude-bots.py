@@ -14,12 +14,13 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[5]
 BIN = ROOT / "honey/.local/bin"
 OPENRC = ROOT / "honey/.local/share/honey-claude/openrc"
-BOUNDARY = ROOT / "honey/.local/share/honey-claude/CLAUDE.boundary.md"
-BOTS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-5", "haiku": "claude-haiku-4-5-20251001"}
+SHARE = ROOT / "honey/.local/share/honey-claude"
+BOTS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"}
+PERSONAS = {"opus": "Bunta", "sonnet": "Sasuke", "haiku": "Shoukichi"}
 
 
 class Home:
-    def __init__(self, plugin_enabled=True, boundary=True):
+    def __init__(self, plugin_enabled=True, boundary=True, account=True):
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
         self.bin = Path(self.tmp.name) / "bin"
@@ -28,6 +29,8 @@ class Home:
         for path in (self.home, self.bin, self.xdg):
             path.mkdir()
         (self.home / ".claude").mkdir()
+        if account:
+            (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "test-account"}}))
         (self.home / ".claude/settings.json").write_text(
             json.dumps({"enabledPlugins": {"telegram@claude-plugins-official": plugin_enabled}}))
         plugin = self.home / ".claude/plugins/cache/claude-plugins-official/telegram/0.0.6"
@@ -41,7 +44,8 @@ class Home:
             "import json, os, sys\n"
             f"json.dump({{'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid(),"
             " 'agent': os.environ.get('CLAUDE_WARM_HERDR_AGENT'),"
-            " 'state': os.environ.get('TELEGRAM_STATE_DIR'), 'path': os.environ['PATH']},"
+            " 'state': os.environ.get('TELEGRAM_STATE_DIR'), 'path': os.environ['PATH'],"
+            " 'guard': {k: v for k, v in os.environ.items() if k.startswith('CLAUDE_WARM_PRESERVATION_')}},"
             f" open({str(self.record)!r}, 'w'))\n"), shebang="#!/usr/bin/env python3\n")
         for bot in BOTS:
             state = self.home / f".claude/channels/telegram-{bot}"
@@ -50,7 +54,7 @@ class Home:
             work = self.home / "honey-work" / bot
             work.mkdir(parents=True)
             if boundary:
-                (work / "CLAUDE.md").write_text(BOUNDARY.read_text())
+                (work / "CLAUDE.md").write_text((SHARE / f"CLAUDE.{bot}.md").read_text())
 
     @staticmethod
     def script(path, body, shebang="#!/bin/sh\n"):
@@ -92,6 +96,43 @@ class LauncherTests(unittest.TestCase):
             self.assertNotIn("honey-opus", agents, "collides with Honey's existing warm consort")
         finally:
             box.close()
+
+    def test_gillean_usage_guard_is_bound(self):
+        import hashlib
+        box = Home()
+        try:
+            result = box.run("sonnet", "--telegram")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            guard = box.recorded()["guard"]
+            self.assertEqual(len(guard), 18, sorted(guard))
+            digest = "sha256:" + hashlib.sha256(b"test-account").hexdigest()
+            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_ACCOUNT_HASH"], digest)
+            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_AUTHORITY_IDENTITY"], "kikin-kushi")
+            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_TELEMETRY_HOST"], "honey-metsatron")
+            self.assertTrue(guard["CLAUDE_WARM_PRESERVATION_LEDGER_ROOT"].endswith("/claude-gillean"))
+            self.assertTrue(guard["CLAUDE_WARM_PRESERVATION_BRIDGE"].endswith(
+                "/skills-mirror/FORGE/bin/fleet-preservation"))
+            self.assertNotIn("test-account", json.dumps(guard))
+        finally:
+            box.close()
+
+    def test_guard_is_inert_but_bot_runs_before_login(self):
+        box = Home(account=False)
+        try:
+            result = box.run("haiku", "--telegram")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage guard inert", result.stderr)
+            self.assertEqual(box.recorded()["guard"], {})
+        finally:
+            box.close()
+
+    def test_personas_in_identity_files(self):
+        for bot, name in PERSONAS.items():
+            text = (SHARE / f"CLAUDE.{bot}.md").read_text()
+            self.assertTrue(text.startswith(f"# CLAUDE.md - {name} (honey-{bot}, @honey_{bot}_bot, {BOTS[bot]})"))
+            self.assertIn("## Identity", text)
+            self.assertIn("# Honey boundary law", text)
+            self.assertIn(name, (BIN / f"honey-{bot}").read_text())
 
     def test_plain_run_has_no_channel(self):
         box = Home()
@@ -156,7 +197,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_boundary_law_names_the_vault_and_no_addresses(self):
-        text = BOUNDARY.read_text()
+        text = "".join((SHARE / f"CLAUDE.{bot}.md").read_text() for bot in BOTS)
         self.assertIn("Secret Vault", text)
         self.assertIsNone(re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", text))
 
