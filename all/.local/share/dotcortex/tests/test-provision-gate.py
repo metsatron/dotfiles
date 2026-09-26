@@ -300,7 +300,7 @@ HONEY_NALA_LANE = ROOT / "debian/.nala/manifest/hosts/beelink.ssv"
 HONEY_NPM_LANE = ROOT / "all/.npm/manifest/hosts/beelink.ssv"
 HONEY_METSATRON_NPM_LANE = ROOT / "all/.npm/manifest/hosts/beelink@metsatron.ssv"
 HONEY_TO_INSTALL = {"python3-venv", "keychain", "tree", "pkg-config", "libfreetype-dev", "libfontconfig-dev",
-                    "nodejs", "npm"}
+                    "python3-cryptography"}
 
 
 def declared(path):
@@ -325,7 +325,9 @@ class HoneyLaneTests(unittest.TestCase):
 
     def test_metsatron_lane_is_claude_code_and_bun_only(self):
         self.assertEqual(declared(HONEY_METSATRON_NPM_LANE), {"@anthropic-ai/claude-code", "bun"})
-        self.assertTrue({"nodejs", "npm"} <= declared(HONEY_NALA_LANE))
+        self.assertIn("python3-cryptography", declared(HONEY_NALA_LANE))
+        # Node >= 22 comes from Guix in this fleet, never from Honey's apt lane.
+        self.assertFalse({"nodejs", "npm"} & declared(HONEY_NALA_LANE))
 
     @unittest.skipUnless(on_honey() and shutil.which("apt-mark"), "live drift check runs on Honey only")
     def test_every_manual_package_on_honey_is_declared(self):
@@ -342,7 +344,7 @@ class HoneyLaneTests(unittest.TestCase):
         self.assertEqual(sorted(live - declared(HONEY_NPM_LANE)), [])
 
     @unittest.skipUnless(on_honey(), "live dry-run runs on Honey only")
-    def test_honey_dry_run_installs_only_the_eight_and_removes_nothing(self):
+    def test_honey_dry_run_installs_only_the_seven_and_removes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             trap = Path(tmp) / "sudo"
             log = Path(tmp) / "sudo.log"
