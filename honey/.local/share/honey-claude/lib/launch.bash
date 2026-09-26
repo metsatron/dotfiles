@@ -28,8 +28,13 @@ honey_claude_launch() {
         esac
     done
 
-    # Metsatron's own npm prefix (claude, bun) and stowed bin; appended, never replacing PATH.
-    honey_claude_path_append "$HOME/.local/bin" "${NPM_CONFIG_PREFIX:-$HOME/.npm-global}/bin"
+    # The bot user's own npm prefix (claude, bun), agent Guix profile (node), stowed
+    # bin, and this checkout's all/.local/bin (claude-warm for an unstowed agent
+    # account); appended, never replacing PATH.
+    local repo_bin=""
+    [[ -n "${LIB_DIR:-}" ]] && repo_bin="$(cd -- "$LIB_DIR/../../../../../all/.local/bin" 2>/dev/null && pwd || true)"
+    honey_claude_path_append "$HOME/.local/bin" "${NPM_CONFIG_PREFIX:-$HOME/.npm-global}/bin" \
+        "$HOME/.guix-extra-profiles/agent/agent/bin" ${repo_bin:+"$repo_bin"}
 
     [[ -d "$work_dir" ]] || {
         printf '%s\n' "$name: refused: working directory $work_dir is missing (see agents-bots-honey.org)" >&2
