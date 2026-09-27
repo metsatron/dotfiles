@@ -442,6 +442,12 @@ done
 if [ $# -gt 0 ]; then TEXT="$*"; else TEXT="$(cat)"; fi
 [ -n "$TEXT" ] || exit 0
 
+emit_receipt() {
+  [ -n "${PVOX_SPEAKER_ID:-}" ] && [ -n "${PVOX_PLAYBACK_ID:-}" ] || return 0
+  command -v pvox-speech-receipt >/dev/null 2>&1 || return 0
+  pvox-speech-receipt "$1" "$PVOX_SPEAKER_ID" "$PVOX_PLAYBACK_ID" || true
+}
+
 if [ -n "${WAV_OUT:-}" ]; then
   W="$WAV_OUT"
   printf '%s' "$TEXT" | proot-distro login debian -- bash -lc \
@@ -471,9 +477,12 @@ else
   # A detached reply is no longer useful after waiting two minutes behind
   # another play. Expire it instead of building an unbounded stale queue.
   mkdir -p "$HOME/.cache" 2>/dev/null || true
-  exec 9>"$HOME/.cache/pvox-reply-play.lock"
+  # One lock for both the on-device Kitten and shipped-WAV relay lanes.
+  exec 9>"$HOME/.pvox-reply-play.lock"
+  emit_receipt queued
   LOCK_WAIT="${PVOX_REPLY_LOCK_WAIT:-120}"
   if ! flock -w "$LOCK_WAIT" 9; then
+    emit_receipt player_exited
     command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null || true
     printf '%s voice=%s speed=%s chars=%s status=expired wait=%ss\n' \
       "$(date '+%F %T')" "$VOICE" "$SPEED" "${#TEXT}" "$LOCK_WAIT" \
@@ -486,9 +495,11 @@ else
   # produced dead plays that never reached the truth log below, the exact
   # failures the log exists to catch.
   RC=0
+  emit_receipt player_started
   printf '%s' "$TEXT" | proot-distro login debian -- bash -lc \
     "\$HOME/kitten-venv/bin/python \$HOME/kitten-say.py --stream --voice '$VOICE' --speed '$SPEED'" \
     | sox -q -t raw -r 24000 -e signed -b 16 -c 1 - -d || RC=$?
+  emit_receipt player_exited
   command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock 2>/dev/null || true
   # phone-side truth log (silent-skip law): the fleet hook's "rendered=
   # on-device" only certifies text delivery + spawn — a render that dies
@@ -499,6 +510,65 @@ else
   printf '%s voice=%s speed=%s chars=%s rc=%s\n' "$(date '+%F %T')" "$VOICE" "$SPEED" "${#TEXT}" "$RC" >> "$HOME/.cache/kitten-say.log" 2>/dev/null || true
   exit $RC
 fi
+#+END_SRC
+
+* Phone-local playback receipts for the read-only StarFox HUD
+
+The caller supplies a generated opaque ID and a known speaker slug. This
+helper appends only lifecycle metadata, never voice text or audio. The fleet
+observes the phone-local journal by read-only SSH pull; no phone credential
+or inbound HTTP endpoint is needed.
+
+#+BEGIN_SRC bash :tangle termux/.local/bin/pvox-speech-receipt :shebang "#!/data/data/com.termux/files/usr/bin/bash"
+set -euo pipefail
+[ "$#" -eq 3 ] || exit 2
+KIND="$1"; SPEAKER="$2"; PLAYBACK="$3"
+case "$KIND" in queued|player_started|player_exited) ;; *) exit 2 ;; esac
+case "$SPEAKER" in
+  helmastra|helmductor|auryn|fable|claudeificus|haiku|orcinus-orca|ecco-dolphinus|hermes-agent|gemma) ;;
+  *) exit 2 ;;
+esac
+case "$PLAYBACK" in ""|*[!A-Za-z0-9_-]*) exit 2 ;; esac
+[ "${#PLAYBACK}" -le 96 ] || exit 2
+umask 077
+RECEIPT_DIR="${PVOX_RECEIPT_DIR:-$HOME/.cache}"
+mkdir -p "$RECEIPT_DIR"
+JOURNAL="$RECEIPT_DIR/pvox-speech-events.jsonl"
+[ ! -L "$JOURNAL" ] || exit 1
+printf '{"kind":"%s","agent":"%s","playback_id":"%s","recorded_at":%s}\n' \
+  "$KIND" "$SPEAKER" "$PLAYBACK" "$(date +%s)" >> "$JOURNAL"
+#+END_SRC
+
+* Detached S24 WAV player with truthful receipts
+
+SSH success means the complete WAV was received and a detached child was
+launched. The child alone emits player-start and player-exit receipts while
+holding the same persistent queue lock as termux-kitten-say.
+
+#+BEGIN_SRC bash :tangle termux/.local/bin/pvox-phone-play :shebang "#!/data/data/com.termux/files/usr/bin/bash"
+set -euo pipefail
+[ "$#" -eq 2 ] || exit 2
+SPEAKER="$1"; PLAYBACK="$2"
+# Validate the identity before accepting any audio.
+command -v pvox-speech-receipt >/dev/null 2>&1 || exit 2
+F="$(mktemp "${TMPDIR:-/tmp}/pvox-reply-XXXXXX.wav")" || exit 1
+if ! cat > "$F" || [ ! -s "$F" ]; then rm -f "$F"; exit 1; fi
+pvox-speech-receipt queued "$SPEAKER" "$PLAYBACK" || { rm -f "$F"; exit 2; }
+nohup bash -c '
+  F="$1"; SPEAKER="$2"; PLAYBACK="$3"
+  cleanup() {
+    pvox-speech-receipt player_exited "$SPEAKER" "$PLAYBACK" >/dev/null 2>&1 || true
+    command -v termux-wake-unlock >/dev/null 2>&1 && termux-wake-unlock >/dev/null 2>&1 || true
+    rm -f "$F"
+  }
+  trap cleanup EXIT
+  command -v termux-wake-lock >/dev/null 2>&1 && termux-wake-lock >/dev/null 2>&1 || true
+  exec 9>"$HOME/.pvox-reply-play.lock"
+  flock -w 120 9 || exit 0
+  pvox-speech-receipt player_started "$SPEAKER" "$PLAYBACK" >/dev/null 2>&1 || true
+  if command -v sox >/dev/null 2>&1; then sox -q "$F" -d
+  else exit 9; fi
+' _ "$F" "$SPEAKER" "$PLAYBACK" </dev/null >/dev/null 2>&1 &
 #+END_SRC
 
 * Android kill-vector check (Q5 requirement)
