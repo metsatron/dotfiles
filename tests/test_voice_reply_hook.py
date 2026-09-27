@@ -18,12 +18,13 @@ class VoiceReplyHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             fake_setsid = root / "setsid"
-            fake_setsid.write_text('#!/bin/sh\nprintf "%s\\n" "$1" > "$TEST_SETSID_LOG"\n')
+            fake_setsid.write_text('#!/bin/sh\nprintf "%s\\0" "$@" > "$TEST_SETSID_LOG"\n')
             fake_setsid.chmod(0o755)
             receipt = root / "setsid-args"
             env = {**os.environ, "PATH": f"{root}:{os.environ['PATH']}",
                    "XDG_CACHE_HOME": directory, "TEST_SETSID_LOG": str(receipt),
-                   "CLAUDE_WARM_HERDR_AGENT": "auryn"}
+                   "CLAUDE_WARM_HERDR_AGENT": "Default",
+                   "PVOX_HUD_AGENT": "helmastra"}
             result = subprocess.run(
                 [str(HOOK)], input=json.dumps({"tool_input": {"text": "Voice check"}}),
                 text=True, capture_output=True, env=env, check=False,
@@ -32,7 +33,10 @@ class VoiceReplyHookTests(unittest.TestCase):
             deadline = time.monotonic() + 2
             while not receipt.exists() and time.monotonic() < deadline:
                 time.sleep(0.01)
-            self.assertEqual(receipt.read_text().strip(), "bash")
+            arguments = receipt.read_bytes().split(b"\0")[:-1]
+            self.assertEqual(arguments[0], b"bash")
+            self.assertEqual(arguments[-1], b"helmastra")
+            self.assertEqual(arguments[4], b"Default")
 
 
 if __name__ == "__main__":
