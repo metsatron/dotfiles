@@ -166,6 +166,15 @@
    ;; --- Desktop applications (Guix equivalents of the nala desktop lane) ---
    ;; transmission is handled above via (list pkg "gui") — GTK4 in Guix,
    ;; no Qt build available.  GTK4 apps cannot export to the global menu.
+   ;; Cortex dock apps kept by the 2026-09-27 ruling.
+   "mousepad"
+   "xfce4-screenshooter"
+   "catfish"
+   "filezilla"
+   "calibre"
+   "gimp"
+   "krita"
+   "digikam"
    "pluma"
    "mate-calc"
    "mate-utils"
