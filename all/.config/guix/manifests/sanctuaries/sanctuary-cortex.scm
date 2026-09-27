@@ -169,7 +169,8 @@
    ;; Cortex dock apps kept by the 2026-09-27 ruling.
    "mousepad"
    "xfce4-screenshooter"
-   "catfish"
+   ;; catfish is left out: it propagates python-dbus 1.2.18, which conflicts
+   ;; with the python-dbus this profile declares, and the whole apply fails.
    "filezilla"
    "calibre"
    "gimp"
