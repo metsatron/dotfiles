@@ -4496,6 +4496,12 @@ esac
 This script runs on the target machine via SSH. It kills existing processes,
 starts new ones, waits for confirmation, then exits cleanly.
 
+On hosts without a user service manager, Hermes ownership is recorded in
+=telegram-agents/hermes.pid=.  A restart waits for every matching old gateway
+to exit, then requires the exact newly launched PID to remain a =gateway run=
+process for five consecutive checks.  A generic surviving Hermes process is
+not startup evidence, and failure returns a nonzero status to the caller.
+
 #+BEGIN_SRC bash :tangle all/.local/bin/telegram-agent-remote-start :shebang "#!/usr/bin/env bash"
 # ~/DotCortex/all/.local/bin/telegram-agent-remote-start
 # Run on target machine via SSH to start agents.
@@ -4506,6 +4512,8 @@ set -euo pipefail
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agents"
 KNOWN_AGENTS="ductor hermes"
 DUCTOR_HOME_DIR="${DUCTOR_HOME_DIR:-$HOME/HelmCortex/FORGE/brain/ductor}"
+HERMES_PID_FILE="$STATE_DIR/hermes.pid"
+overall_status=0
 mkdir -p "$STATE_DIR"
 
 validate_agent() {
@@ -4568,7 +4576,77 @@ hermes_running() {
     if hermes_service_installed && systemctl --user is-active --quiet hermes-gateway.service; then
         return 0
     fi
+    if hermes_gateway_pid_matches_file "$HERMES_PID_FILE"; then
+        return 0
+    fi
     pgrep -x hermes >/dev/null 2>&1
+}
+
+hermes_gateway_pid_matches() {
+    local pid="$1" argument saw_hermes=0 saw_gateway=0
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        if [ "$saw_hermes" -eq 0 ] && [ "${argument##*/}" = hermes ]; then
+            saw_hermes=1
+            continue
+        fi
+        if [ "$saw_hermes" -eq 1 ] && [ "$saw_gateway" -eq 0 ] && [ "$argument" = gateway ]; then
+            saw_gateway=1
+            continue
+        fi
+        if [ "$saw_gateway" -eq 1 ] && [ "$argument" = run ]; then
+            return 0
+        fi
+    done < "/proc/$pid/cmdline"
+    return 1
+}
+
+hermes_gateway_pid_matches_file() {
+    local pid_file="$1" pid
+    [ -r "$pid_file" ] || return 1
+    IFS= read -r pid < "$pid_file" || return 1
+    hermes_gateway_pid_matches "$pid"
+}
+
+stop_hermes_fallback_owned() {
+    local pid owned_pid remaining seen
+    local -a pids=()
+    if [ -r "$HERMES_PID_FILE" ]; then
+        IFS= read -r owned_pid < "$HERMES_PID_FILE" || owned_pid=
+        hermes_gateway_pid_matches "$owned_pid" && pids+=("$owned_pid")
+    fi
+    while IFS= read -r pid; do
+        hermes_gateway_pid_matches "$pid" || continue
+        seen=0
+        for owned_pid in "${pids[@]}"; do
+            [ "$owned_pid" = "$pid" ] && seen=1
+        done
+        [ "$seen" -eq 1 ] || pids+=("$pid")
+    done < <(pgrep -x hermes 2>/dev/null || true)
+
+    if [ "${#pids[@]}" -eq 0 ]; then
+        rm -f "$HERMES_PID_FILE"
+        return 0
+    fi
+
+    kill -TERM "${pids[@]}"
+    for _ in {1..30}; do
+        remaining=0
+        for pid in "${pids[@]}"; do
+            hermes_gateway_pid_matches "$pid" && remaining=1
+        done
+        [ "$remaining" -eq 0 ] && break
+        sleep 1
+    done
+
+    for pid in "${pids[@]}"; do
+        if hermes_gateway_pid_matches "$pid"; then
+            echo "hermes gateway: FAILED TO STOP OWNED PID $pid"
+            return 1
+        fi
+    done
+    rm -f "$HERMES_PID_FILE"
 }
 
 for agent in "$@"; do
@@ -4596,6 +4674,7 @@ for agent in "$@"; do
     hermes)
         if ! command -v hermes >/dev/null 2>&1; then
             echo "hermes not found in PATH"
+            overall_status=1
             continue
         fi
         if hermes_service_installed; then
@@ -4607,16 +4686,37 @@ for agent in "$@"; do
             hermes gateway install --start-now --start-on-login
         else
             echo "No user service manager available; restarting Hermes gateway with nohup..."
-            pkill -x hermes 2>/dev/null || true
-            sleep 1
-            nohup hermes gateway run > "$STATE_DIR/hermes.log" 2>&1 </dev/null &
+            if ! stop_hermes_fallback_owned; then
+                overall_status=1
+                continue
+            fi
+            nohup setsid hermes gateway run > "$STATE_DIR/hermes.log" 2>&1 </dev/null &
+            hermes_pid=$!
+            printf '%s\n' "$hermes_pid" > "$HERMES_PID_FILE"
             disown
         fi
-        sleep 3
-        if hermes_running; then
+        hermes_stable=0
+        for _ in {1..20}; do
+            if hermes_service_installed; then
+                if systemctl --user is-active --quiet hermes-gateway.service; then
+                    hermes_stable=$((hermes_stable + 1))
+                else
+                    hermes_stable=0
+                fi
+            elif hermes_gateway_pid_matches_file "$HERMES_PID_FILE"; then
+                hermes_stable=$((hermes_stable + 1))
+            else
+                hermes_stable=0
+            fi
+            [ "$hermes_stable" -ge 5 ] && break
+            sleep 1
+        done
+        if [ "$hermes_stable" -ge 5 ]; then
             echo "hermes gateway: STARTED OK"
         else
+            hermes_gateway_pid_matches_file "$HERMES_PID_FILE" || rm -f "$HERMES_PID_FILE"
             echo "hermes gateway: FAILED TO START"
+            overall_status=1
         fi
         ;;
     *)
@@ -4624,6 +4724,7 @@ for agent in "$@"; do
         ;;
     esac
 done
+exit "$overall_status"
 #+END_SRC
 
 * Sync Script for X230
