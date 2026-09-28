@@ -95,6 +95,352 @@ sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "${flags[@]}" sync
 }
 #+END_SRC
 
+* Maildir command surface
+
+The public command carries no fleet topology.  It maps a restricted RFC-style
+address onto an already-provisioned Maildir below =~/Mail=: a bare local part is
+a consort, while =seat+=, =machine+=, and =sanctuary+= select the other three
+namespaces.  The domain must end in =.helm=, but remains provenance rather than
+a network destination because Syncthing carries the entire tree.
+
+=send= refuses unknown Maildirs so a typo cannot silently create a new address.
+It writes a complete RFC 822 message under =tmp/=, fsyncs it, and atomically
+renames it into =new/=.  =inbox= is read-only; =read= moves a message from
+=new/= to =cur/= with the standard seen flag before rendering it.  Bodies may
+refer to HelmCortex paths, but the command has no attachment feature.
+
+#+BEGIN_SRC python :tangle all/.local/bin/mailcortex :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""MailCortex filesystem-native mail transport."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import socket
+import sys
+import time
+import uuid
+from email import policy
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import format_datetime, make_msgid
+from datetime import datetime
+from pathlib import Path
+
+
+ADDRESS_RE = re.compile(
+    r"^(?:(consort|seat|machine|sanctuary)\+)?"
+    r"([a-z0-9][a-z0-9._-]*)@"
+    r"([a-z0-9][a-z0-9.-]*\.helm)$"
+)
+NAMESPACE = {
+    None: "consorts",
+    "consort": "consorts",
+    "seat": "seats",
+    "machine": "machines",
+    "sanctuary": "sanctuaries",
+}
+
+
+class MailCortexError(Exception):
+    """Expected command failure suitable for a concise CLI diagnostic."""
+
+
+def mail_root() -> Path:
+    return Path(os.environ.get("MAILCORTEX_ROOT", "~/Mail")).expanduser()
+
+
+def address_maildir(address: str) -> Path:
+    match = ADDRESS_RE.fullmatch(address.lower())
+    if not match:
+        raise MailCortexError(
+            "invalid address; use name@machine.helm or "
+            "seat+name@machine.helm (also machine+ and sanctuary+)"
+        )
+    kind, name, _domain = match.groups()
+    return mail_root() / NAMESPACE[kind] / name
+
+
+def require_maildir(address: str) -> Path:
+    path = address_maildir(address)
+    missing = [name for name in ("tmp", "new", "cur") if not (path / name).is_dir()]
+    if missing:
+        raise MailCortexError(f"maildir is not provisioned for {address}: {path}")
+    return path
+
+
+def safe_name() -> str:
+    host = re.sub(r"[^A-Za-z0-9_-]", "_", socket.gethostname())
+    return f"{time.time_ns()}.{os.getpid()}_{uuid.uuid4().hex}.{host}"
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def deliver(args: argparse.Namespace) -> int:
+    target = require_maildir(args.to)
+    if args.body is not None:
+        body = args.body
+    else:
+        body = Path(args.body_file).read_text(encoding="utf-8")
+
+    message = EmailMessage(policy=policy.SMTP)
+    message["Date"] = format_datetime(datetime.now().astimezone())
+    message["From"] = args.sender
+    message["To"] = args.to
+    message["Subject"] = args.subject
+    message["Message-ID"] = make_msgid(domain=args.sender.rsplit("@", 1)[-1])
+    message.set_content(body)
+
+    name = safe_name()
+    temporary = target / "tmp" / name
+    delivered = target / "new" / name
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(message.as_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, delivered)
+        fsync_directory(target / "new")
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    print(name)
+    return 0
+
+
+def parse_message(path: Path) -> EmailMessage:
+    with path.open("rb") as stream:
+        return BytesParser(policy=policy.default).parse(stream)
+
+
+def messages(maildir: Path):
+    for state in ("new", "cur"):
+        for path in (maildir / state).iterdir():
+            if path.is_file():
+                yield state, path
+
+
+def show_inbox(args: argparse.Namespace) -> int:
+    maildir = require_maildir(args.address)
+    rows = sorted(messages(maildir), key=lambda item: (item[1].stat().st_mtime_ns, item[1].name))
+    for state, path in rows:
+        message = parse_message(path)
+        fields = (
+            state,
+            path.name,
+            str(message.get("Date", "")),
+            str(message.get("From", "")),
+            str(message.get("Subject", "")),
+        )
+        print("\t".join(value.replace("\t", " ").replace("\n", " ") for value in fields))
+    return 0
+
+
+def locate_message(maildir: Path, name: str) -> tuple[str, Path]:
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise MailCortexError("message must be an exact inbox filename")
+    for state in ("new", "cur"):
+        candidate = maildir / state / name
+        if candidate.is_file():
+            return state, candidate
+    raise MailCortexError(f"message not found: {name}")
+
+
+def read_message(args: argparse.Namespace) -> int:
+    maildir = require_maildir(args.address)
+    state, path = locate_message(maildir, args.message)
+    message = parse_message(path)
+    if state == "new":
+        seen_name = path.name if ":2," in path.name else path.name + ":2,S"
+        destination = maildir / "cur" / seen_name
+        if destination.exists():
+            raise MailCortexError(f"seen-message destination already exists: {seen_name}")
+        os.replace(path, destination)
+        fsync_directory(maildir / "new")
+        fsync_directory(maildir / "cur")
+
+    for header in ("Date", "From", "To", "Subject", "Message-ID"):
+        print(f"{header}: {message.get(header, '')}")
+    print()
+    body = message.get_body(preferencelist=("plain",))
+    print(body.get_content() if body is not None else "", end="")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mailcortex",
+        description="Deliver and read fleet-local RFC 822 messages through Maildir.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    send = subparsers.add_parser("send", help="atomically deliver one message")
+    send.add_argument("--from", dest="sender", required=True, type=validate_address)
+    send.add_argument("--to", required=True, type=validate_address)
+    send.add_argument("--subject", required=True)
+    body = send.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body")
+    body.add_argument("--body-file")
+    send.set_defaults(function=deliver)
+
+    inbox = subparsers.add_parser("inbox", help="list new and seen messages")
+    inbox.add_argument("address", type=validate_address)
+    inbox.set_defaults(function=show_inbox)
+
+    read = subparsers.add_parser("read", help="render one message and mark it seen")
+    read.add_argument("address", type=validate_address)
+    read.add_argument("message")
+    read.set_defaults(function=read_message)
+    return parser
+
+
+def validate_address(value: str) -> str:
+    address_maildir(value)
+    return value.lower()
+
+
+def main() -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args()
+        return args.function(args)
+    except (MailCortexError, OSError, ValueError) as error:
+        print(f"mailcortex: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-mailcortex.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+import unittest
+from email import policy
+from email.parser import BytesParser
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[5]
+COMMAND = ROOT / "all/.local/bin/mailcortex"
+
+
+class MailCortexTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.base = Path(self.temporary.name)
+        self.root = self.base / "Mail"
+        self.env = os.environ | {"MAILCORTEX_ROOT": str(self.root)}
+        self.address = "helmductor@x230.helm"
+        self.maildir = self.root / "consorts/helmductor"
+        for leaf in ("tmp", "new", "cur"):
+            (self.maildir / leaf).mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def run_command(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(COMMAND), *args],
+            env=self.env,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def test_help_is_side_effect_free(self) -> None:
+        empty_root = self.base / "absent"
+        result = subprocess.run(
+            [str(COMMAND), "--help"],
+            env=self.env | {"MAILCORTEX_ROOT": str(empty_root)},
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(empty_root.exists())
+
+    def test_send_is_atomic_rfc822_delivery(self) -> None:
+        result = self.run_command(
+            "send",
+            "--from", "fable@kikin.helm",
+            "--to", self.address,
+            "--subject", "First post",
+            "--body", "Read LOGS/handoffs/example.md\n",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(list((self.maildir / "tmp").iterdir()), [])
+        delivered = list((self.maildir / "new").iterdir())
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0].name, result.stdout.strip())
+        self.assertEqual(delivered[0].stat().st_mode & 0o777, 0o600)
+        message = BytesParser(policy=policy.default).parsebytes(delivered[0].read_bytes())
+        self.assertEqual(message["From"], "fable@kikin.helm")
+        self.assertEqual(message["To"], self.address)
+        self.assertEqual(message["Subject"], "First post")
+        self.assertTrue(message["Message-ID"])
+        self.assertEqual(message.get_content().strip(), "Read LOGS/handoffs/example.md")
+        self.assertFalse(message.is_multipart())
+
+    def test_inbox_lists_and_read_moves_to_cur(self) -> None:
+        sent = self.run_command(
+            "send",
+            "--from", "fable@kikin.helm",
+            "--to", self.address,
+            "--subject", "Move me",
+            "--body", "hello",
+        )
+        name = sent.stdout.strip()
+        listing = self.run_command("inbox", self.address)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertIn(f"new\t{name}\t", listing.stdout)
+        read = self.run_command("read", self.address, name)
+        self.assertEqual(read.returncode, 0, read.stderr)
+        self.assertIn("Subject: Move me", read.stdout)
+        self.assertIn("\n\nhello\n", read.stdout)
+        self.assertFalse((self.maildir / "new" / name).exists())
+        self.assertTrue((self.maildir / "cur" / (name + ":2,S")).exists())
+
+    def test_namespaces_and_input_guards(self) -> None:
+        for address, expected in (
+            ("fable@kikin.helm", "consorts/fable"),
+            ("consort+fable@kikin.helm", "consorts/fable"),
+            ("seat+builder@kikin.helm", "seats/builder"),
+            ("machine+x230@kikin.helm", "machines/x230"),
+            ("sanctuary+cde@kikin.helm", "sanctuaries/cde"),
+        ):
+            target = self.root / expected
+            for leaf in ("tmp", "new", "cur"):
+                (target / leaf).mkdir(parents=True, exist_ok=True)
+            result = self.run_command("inbox", address)
+            self.assertEqual(result.returncode, 0, (address, result.stderr))
+        bad = self.run_command("inbox", "../../escape")
+        self.assertEqual(bad.returncode, 2)
+        missing = self.run_command("inbox", "unknown@kikin.helm")
+        self.assertEqual(missing.returncode, 2)
+        traversal = self.run_command("read", self.address, "../message")
+        self.assertEqual(traversal.returncode, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
 ** Boot owner
 
 X230 uses a dedicated systemd user unit and lingering for login-independent
