@@ -14,6 +14,9 @@ STOW_PKGS ?= all
 # the persistent guest home because the DotCortex checkout is a host-visible
 # symlink from inside Distrobox.
 STOW_TARGET ?= $(HOME)
+# Stow conflict policy (layers.org "Adopting an existing account"): backup = legacy
+# <file>.bak.<ts> and stow over it; adopt = dotcortex-stow-adopt (identical/skel only, else STOP).
+STOW_CONFLICTS ?= backup
 STOW_FLAGS = --target="$(STOW_TARGET)"
 
 .PHONY: toc tangle all guix-pull guix-core guix-dev guix-gc guix-dirs \
@@ -78,6 +81,12 @@ safe-stow:
 | [ -x "$$STOW_GUARD" ] || STOW_GUARD="$(HOME)/DotCortex/all/.local/bin/dotcortex-stow-target-guard"; \
 | [ -x "$$STOW_GUARD" ] || { echo "safe-stow: missing dotcortex-stow-target-guard — refusing to continue" >&2; exit 1; }; \
 | "$$STOW_GUARD" --packages "$(STOW_PKGS)"; \
+| if [ "$(STOW_CONFLICTS)" = adopt ]; then \
+|   ADOPT="$(HOME)/.local/bin/dotcortex-stow-adopt"; \
+|   [ -x "$$ADOPT" ] || ADOPT="$(HOME)/DotCortex/all/.local/bin/dotcortex-stow-adopt"; \
+|   echo ">> adopt pre-existing files (STOW_CONFLICTS=adopt)"; \
+|   "$$ADOPT" --apply --dir "$(HOME)/DotCortex" --target "$(STOW_TARGET)" --packages "$(STOW_PKGS)"; \
+| fi; \
 | repair_mutable_agent_dir() { \
 |   local rel="$$1" target="$(HOME)/$$1" resolved entry name rel_entry ts backup; \
 |   [ -L "$$target" ] || return 0; \
