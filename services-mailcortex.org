@@ -1,5 +1,5 @@
 #+TITLE: MailCortex Transport Services
-#+DESCRIPTION: Narrow Syncthing package and boot ownership for the first three MailCortex hosts
+#+DESCRIPTION: Narrow Syncthing package and boot ownership for MailCortex
 #+AUTHOR: Mètsàtron
 #+LANGUAGE: en
 #+PROPERTY: header-args :mkdirp yes :results silent
@@ -9,11 +9,13 @@
 * Boundary
 
 The package manifest is sourced in =package-nala.org=. This module only plans
-and applies that small manifest, then owns Syncthing's boot lifecycle on the
-three initial MailCortex hosts. Private device IDs, credentials, peer addresses,
+and applies that small manifest, then owns Syncthing's boot lifecycle on each
+configured node. Private device IDs, credentials, peer addresses,
 and folder membership stay in a dedicated per-host Syncthing home at
-=~/.config/mailcortex/syncthing/=. This isolation prevents MailCortex privacy
-settings from rewriting or disabling an older general-purpose Syncthing profile.
+=~/.config/mailcortex/syncthing/=. Configuration isolation prevents MailCortex
+settings from rewriting an older general-purpose Syncthing profile. Both
+profiles may claim the same network ports, so runtime startup refuses a second
+Syncthing owner until the private port plan is reviewed.
 Activation requires an explicit local readiness marker at
 =~/.config/mailcortex/syncthing-ready=, a complete private identity/config, and
 an existing =~/Mail/= directory; these are provisioned only after private
@@ -43,12 +45,6 @@ case "${1:---dry-run}" in
   *) usage >&2; exit 2 ;;
 esac
 [ "$#" -le 1 ] || { usage >&2; exit 2; }
-
-host="${MAILCORTEX_TEST_HOSTNAME:-$(hostname -s)}"
-case "$host" in
-  kikin-kushi|ThinkPad-T1700|ThinkPad-X230|x230|ThinkPad-T480s|t480s) ;;
-  *) echo "mailcortex-syncthing-package: unsupported host: $host" >&2; exit 2 ;;
-esac
 
 manifest="${MAILCORTEX_TEST_MANIFEST:-$HOME/.nala/manifest/mailcortex.ssv}"
 [ -r "$manifest" ] || { echo "mailcortex-syncthing-package: missing manifest: $manifest" >&2; exit 1; }
@@ -103,6 +99,7 @@ a consort, while =seat+=, =machine+=, and =sanctuary+= select the other three
 namespaces.  The domain must end in =.helm=, but remains provenance rather than
 a network destination because Syncthing carries the entire tree.
 
+=provision= creates validated Maildirs with private directory permissions;
 =send= refuses unknown Maildirs so a typo cannot silently create a new address.
 It writes a complete RFC 822 message under =tmp/=, fsyncs it, and atomically
 renames it into =new/=.  =inbox= is read-only; =read= moves a message from
@@ -168,6 +165,28 @@ def require_maildir(address: str) -> Path:
     if missing:
         raise MailCortexError(f"maildir is not provisioned for {address}: {path}")
     return path
+
+
+def provision(args: argparse.Namespace) -> int:
+    # Validate every address before creating any directory.
+    paths = list(dict.fromkeys(address_maildir(address) for address in args.addresses))
+    root = mail_root()
+    for path in paths:
+        for component in (root, path.parent, path):
+            if component.is_symlink():
+                raise MailCortexError(f"refusing symlink in maildir path: {component}")
+    old_umask = os.umask(0o077)
+    try:
+        for path in paths:
+            for directory in (root, path.parent, path, *(path / leaf for leaf in ("tmp", "new", "cur"))):
+                directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+                if directory.is_symlink() or not directory.is_dir():
+                    raise MailCortexError(f"unsafe maildir path: {directory}")
+                directory.chmod(0o700)
+            print(path)
+    finally:
+        os.umask(old_umask)
+    return 0
 
 
 def safe_name() -> str:
@@ -285,6 +304,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    create = subparsers.add_parser("provision", help="create private Maildirs for validated addresses")
+    create.add_argument("addresses", nargs="+", type=validate_address)
+    create.set_defaults(function=provision)
+
     send = subparsers.add_parser("send", help="atomically deliver one message")
     send.add_argument("--from", dest="sender", required=True, type=validate_address)
     send.add_argument("--to", required=True, type=validate_address)
@@ -346,8 +369,8 @@ class MailCortexTests(unittest.TestCase):
         self.base = Path(self.temporary.name)
         self.root = self.base / "Mail"
         self.env = os.environ | {"MAILCORTEX_ROOT": str(self.root)}
-        self.address = "helmductor@x230.helm"
-        self.maildir = self.root / "consorts/helmductor"
+        self.address = "reader@node-b.helm"
+        self.maildir = self.root / "consorts/reader"
         for leaf in ("tmp", "new", "cur"):
             (self.maildir / leaf).mkdir(parents=True, exist_ok=True)
 
@@ -375,10 +398,48 @@ class MailCortexTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(empty_root.exists())
 
+    def test_provision_is_private_idempotent_and_validates_before_writing(self) -> None:
+        root = self.base / "fresh-mail"
+        self.env["MAILCORTEX_ROOT"] = str(root)
+        invalid = self.run_command("provision", "reader@node-b.helm", "../../escape")
+        self.assertEqual(invalid.returncode, 2)
+        self.assertFalse(root.exists())
+        for _ in range(2):
+            result = self.run_command(
+                "provision", "reader@node-b.helm", "seat+builder@node-a.helm"
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+        for directory in (
+            root, root / "consorts", root / "consorts/reader",
+            root / "seats", root / "seats/builder",
+            *(root / "consorts/reader" / leaf for leaf in ("tmp", "new", "cur")),
+            *(root / "seats/builder" / leaf for leaf in ("tmp", "new", "cur")),
+        ):
+            self.assertTrue(directory.is_dir(), directory)
+            self.assertEqual(directory.stat().st_mode & 0o777, 0o700, directory)
+        self.assertEqual(list((root / "consorts/reader/new").iterdir()), [])
+        sent = self.run_command(
+            "send", "--from", "writer@node-a.helm", "--to", "reader@node-b.helm",
+            "--subject", "Provisioned", "--body", "hello",
+        )
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        self.assertEqual(len(list((root / "consorts/reader/new").iterdir())), 1)
+
+    def test_provision_refuses_symlink_address(self) -> None:
+        outside = self.base / "outside"
+        outside.mkdir()
+        for leaf in ("tmp", "new", "cur"):
+            (self.maildir / leaf).rmdir()
+        self.maildir.rmdir()
+        self.maildir.symlink_to(outside, target_is_directory=True)
+        result = self.run_command("provision", self.address)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_send_is_atomic_rfc822_delivery(self) -> None:
         result = self.run_command(
             "send",
-            "--from", "fable@kikin.helm",
+            "--from", "sender@node-a.helm",
             "--to", self.address,
             "--subject", "First post",
             "--body", "Read LOGS/handoffs/example.md\n",
@@ -390,7 +451,7 @@ class MailCortexTests(unittest.TestCase):
         self.assertEqual(delivered[0].name, result.stdout.strip())
         self.assertEqual(delivered[0].stat().st_mode & 0o777, 0o600)
         message = BytesParser(policy=policy.default).parsebytes(delivered[0].read_bytes())
-        self.assertEqual(message["From"], "fable@kikin.helm")
+        self.assertEqual(message["From"], "sender@node-a.helm")
         self.assertEqual(message["To"], self.address)
         self.assertEqual(message["Subject"], "First post")
         self.assertTrue(message["Message-ID"])
@@ -400,7 +461,7 @@ class MailCortexTests(unittest.TestCase):
     def test_inbox_lists_and_read_moves_to_cur(self) -> None:
         sent = self.run_command(
             "send",
-            "--from", "fable@kikin.helm",
+            "--from", "sender@node-a.helm",
             "--to", self.address,
             "--subject", "Move me",
             "--body", "hello",
@@ -418,11 +479,11 @@ class MailCortexTests(unittest.TestCase):
 
     def test_namespaces_and_input_guards(self) -> None:
         for address, expected in (
-            ("fable@kikin.helm", "consorts/fable"),
-            ("consort+fable@kikin.helm", "consorts/fable"),
-            ("seat+builder@kikin.helm", "seats/builder"),
-            ("machine+x230@kikin.helm", "machines/x230"),
-            ("sanctuary+cde@kikin.helm", "sanctuaries/cde"),
+            ("writer@node-a.helm", "consorts/writer"),
+            ("consort+writer@node-a.helm", "consorts/writer"),
+            ("seat+builder@node-a.helm", "seats/builder"),
+            ("machine+node-b@node-a.helm", "machines/node-b"),
+            ("sanctuary+cde@node-a.helm", "sanctuaries/cde"),
         ):
             target = self.root / expected
             for leaf in ("tmp", "new", "cur"):
@@ -431,7 +492,7 @@ class MailCortexTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, (address, result.stderr))
         bad = self.run_command("inbox", "../../escape")
         self.assertEqual(bad.returncode, 2)
-        missing = self.run_command("inbox", "unknown@kikin.helm")
+        missing = self.run_command("inbox", "unknown@node-a.helm")
         self.assertEqual(missing.returncode, 2)
         traversal = self.run_command("read", self.address, "../message")
         self.assertEqual(traversal.returncode, 2)
@@ -443,13 +504,13 @@ if __name__ == "__main__":
 
 ** Boot owner
 
-X230 uses a dedicated systemd user unit and lingering for login-independent
-startup. MailCortex has its own unit and Syncthing home; it never takes over the
-distro's generic =syncthing.service= or the legacy default profile. Kikin and
-T480s use one managed cron entry at reboot and every three
-minutes. The launcher holds a =flock= for its entire Syncthing lifetime, so
-the self-heal cannot create a second owned process. An already-running,
-non-owned Syncthing process causes a refusal rather than a duplicate.
+A systemd node uses a dedicated user unit and lingering for login-independent
+startup. A SysV node uses one managed cron entry at reboot and every three
+minutes. Both invoke the same launcher, which checks private readiness at each
+start, holds a =flock= for Syncthing's lifetime, and records the exact PID and
+process start time. =--check= verifies that record and the private command line.
+An already-running Syncthing process causes a refusal while port isolation is
+unsettled. The generic =syncthing.service= and legacy profile are untouched.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/mailcortex-syncthing-service :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 set -euo pipefail
@@ -460,7 +521,7 @@ Usage: mailcortex-syncthing-service [--dry-run|--check|--apply|--run|-h|--help]
 --dry-run  print the host's boot contract without changing it (default)
 --check    verify the installed boot contract and daemon
 --apply    install/enable the boot contract after private setup is ready
---run      SysV cron's singleton foreground daemon entrypoint
+--run      singleton foreground daemon entrypoint
 EOF
 }
 
@@ -471,18 +532,12 @@ case "${1:---dry-run}" in
 esac
 [ "$#" -le 1 ] || { usage >&2; exit 2; }
 
-host="${MAILCORTEX_TEST_HOSTNAME:-$(hostname -s)}"
-case "$host" in
-  kikin-kushi|ThinkPad-T1700|ThinkPad-T480s|t480s) expected=sysv ;;
-  ThinkPad-X230|x230) expected=systemd ;;
-  *) echo "mailcortex-syncthing-service: unsupported host: $host" >&2; exit 2 ;;
-esac
 observed="${MAILCORTEX_TEST_INIT:-$(ps -p 1 -o comm= | tr -d '[:space:]')}"
-case "$observed" in init) observed=sysv ;; esac
-[ "$observed" = "$expected" ] || {
-  echo "mailcortex-syncthing-service: expected $expected init on $host, observed $observed" >&2
-  exit 2
-}
+case "$observed" in
+  systemd) expected=systemd ;;
+  init|sysv) expected=sysv ;;
+  *) echo "mailcortex-syncthing-service: unsupported init: $observed" >&2; exit 2 ;;
+esac
 
 owner="$HOME/.local/bin/mailcortex-syncthing-service"
 bin="${MAILCORTEX_TEST_SYNCTHING_BIN:-/usr/bin/syncthing}"
@@ -491,6 +546,7 @@ cron_target="${MAILCORTEX_TEST_CRON_TARGET:-/etc/cron.d/mailcortex-syncthing}"
 state="$HOME/.local/state/mailcortex"
 config="$HOME/.config/mailcortex/syncthing"
 unit=mailcortex-syncthing.service
+pid_record="$state/syncthing.pid"
 
 require_ready() {
   [ -f "$ready" ] && [ -d "$HOME/Mail" ] && [ -x "$bin" ] \
@@ -498,6 +554,33 @@ require_ready() {
     echo 'mailcortex-syncthing-service: private readiness marker, Mail directory, identity/config, or Syncthing binary missing' >&2
     exit 1
   }
+}
+
+private_owner_running() {
+  local pid started current argv
+  local -a args
+  [ -r "$pid_record" ] || return 1
+  read -r pid started < "$pid_record" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$started" =~ ^[0-9]+$ ]] || return 1
+  [ -r "/proc/$pid/stat" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+  [ "$(stat -c %u "/proc/$pid")" = "$(id -u)" ] || return 1
+  current="$(awk '{print $22}' "/proc/$pid/stat")"
+  [ "$current" = "$started" ] || return 1
+  mapfile -d '' -t args < "/proc/$pid/cmdline"
+  # A shebang fixture has an interpreter before the binary path.
+  if [ "${args[0]:-}" = "$bin" ]; then
+    args=("${args[@]:1}")
+  elif [ "${args[1]:-}" = "$bin" ]; then
+    args=("${args[@]:2}")
+  else
+    return 1
+  fi
+  [ "${args[0]:-}" = serve ] && [ "${args[1]:-}" = "--home=$config" ] \
+    && [ "${args[2]:-}" = --no-browser ] \
+    && [ "${args[3]:-}" = --no-upgrade ] \
+    && [ "${args[4]:-}" = --no-restart ] \
+    && [ "${args[5]:-}" = --no-default-folder ] \
+    && [ "${#args[@]}" -eq 6 ]
 }
 
 render_cron() {
@@ -511,43 +594,53 @@ render_cron() {
 }
 
 if [ "$expected" = systemd ]; then
-  [ "$mode" != --run ] || { echo 'mailcortex-syncthing-service: --run is SysV only' >&2; exit 2; }
   if [ "$mode" = --dry-run ]; then
     printf '%s\n' "systemctl --user cat $unit" \
       "systemctl --user show -P FragmentPath $unit" \
       'sudo -n loginctl enable-linger CURRENT_USER' \
+      'systemctl --user daemon-reload' \
       "systemctl --user enable --now $unit"
     exit 0
   fi
-  command -v systemctl >/dev/null || { echo 'mailcortex-syncthing-service: systemctl missing' >&2; exit 1; }
-  fragment="$(systemctl --user show -P FragmentPath "$unit")"
-  [ "$fragment" = "$HOME/.config/systemd/user/$unit" ] || {
-    echo "mailcortex-syncthing-service: unexpected user unit: $fragment" >&2; exit 1;
-  }
-  systemctl --user cat "$unit" >/dev/null
-  if [ "$mode" = --check ]; then
-    [ "$(loginctl show-user "$(id -un)" -p Linger --value)" = yes ]
-    systemctl --user is-enabled --quiet "$unit"
-    systemctl --user is-active --quiet "$unit"
-    echo 'mailcortex-syncthing-service: X230 MailCortex user unit active, enabled, and lingering'
+  if [ "$mode" != --run ]; then
+    command -v systemctl >/dev/null || { echo 'mailcortex-syncthing-service: systemctl missing' >&2; exit 1; }
+    fragment="$(systemctl --user show -P FragmentPath "$unit")"
+    [ "$fragment" = "$HOME/.config/systemd/user/$unit" ] || {
+      echo "mailcortex-syncthing-service: unexpected user unit: $fragment" >&2; exit 1;
+    }
+    systemctl --user cat "$unit" >/dev/null
+    if [ "$mode" = --check ]; then
+      require_ready
+      [ "$(loginctl show-user "$(id -un)" -p Linger --value)" = yes ]
+      systemctl --user is-enabled --quiet "$unit"
+      systemctl --user is-active --quiet "$unit"
+      private_owner_running || { echo 'mailcortex-syncthing-service: private Syncthing owner absent' >&2; exit 1; }
+      read -r owned_pid _ < "$pid_record"
+      [ "$(systemctl --user show -P MainPID "$unit")" = "$owned_pid" ] || {
+        echo 'mailcortex-syncthing-service: user unit owns a different PID' >&2; exit 1;
+      }
+      echo 'mailcortex-syncthing-service: MailCortex user unit and private daemon verified'
+      exit 0
+    fi
+    require_ready
+    sudo -n loginctl enable-linger "$(id -un)"
+    systemctl --user daemon-reload
+    systemctl --user enable --now "$unit"
     exit 0
   fi
-  require_ready
-  sudo -n loginctl enable-linger "$(id -un)"
-  systemctl --user enable --now "$unit"
-  exit 0
 fi
 
 case "$mode" in
   --dry-run) render_cron ;;
   --check)
+    require_ready
     render_cron | cmp -s - "$cron_target" || {
       echo "mailcortex-syncthing-service: cron contract missing or drifted: $cron_target" >&2; exit 1;
     }
-    pgrep -u "$(id -u)" -x syncthing >/dev/null || {
-      echo 'mailcortex-syncthing-service: Syncthing is not running' >&2; exit 1;
+    private_owner_running || {
+      echo 'mailcortex-syncthing-service: private Syncthing owner absent' >&2; exit 1;
     }
-    echo 'mailcortex-syncthing-service: SysV cron contract and daemon present'
+    echo 'mailcortex-syncthing-service: SysV cron contract and private daemon verified'
     ;;
   --apply)
     require_ready
@@ -566,13 +659,15 @@ case "$mode" in
     ;;
   --run)
     require_ready
-    mkdir -p "$state"
+    umask 077
+    mkdir -p -m 0700 "$state"
     exec 9>"$state/syncthing.lock"
     flock -n 9 || exit 0
     if pgrep -u "$(id -u)" -x syncthing >/dev/null; then
       echo 'mailcortex-syncthing-service: another Syncthing owner is running' >&2
       exit 3
     fi
+    printf '%s %s\n' "$$" "$(awk '{print $22}' "/proc/$$/stat")" > "$pid_record"
     exec "$bin" serve --home="$config" --no-browser --no-upgrade --no-restart --no-default-folder
     ;;
 esac
@@ -586,7 +681,7 @@ Wants=network-online.target
 After=network-online.target tailscaled.service
 
 [Service]
-ExecStart=/usr/bin/syncthing serve --home=%h/.config/mailcortex/syncthing --no-browser --no-upgrade --no-restart --no-default-folder
+ExecStart=%h/.local/bin/mailcortex-syncthing-service --run
 Restart=on-failure
 RestartSec=10
 SuccessExitStatus=3 4
@@ -627,7 +722,6 @@ class MailCortexSyncthingTests(unittest.TestCase):
         self.env.update(
             HOME=str(self.base),
             PATH=f"{self.fakebin}:/usr/bin:/bin",
-            MAILCORTEX_TEST_HOSTNAME="kikin-kushi",
             MAILCORTEX_TEST_INIT="sysv",
             MAILCORTEX_TEST_MANIFEST=str(self.manifest),
             MAILCORTEX_TEST_CRON_TARGET=str(self.base / "cron"),
@@ -670,29 +764,30 @@ class MailCortexSyncthingTests(unittest.TestCase):
         result = self.run_cmd(PACKAGE, "--apply")
         self.assertEqual(result.returncode, 2)
 
-    def test_package_refuses_unknown_host_and_help_has_no_effect(self) -> None:
-        result = self.run_cmd(PACKAGE, "--apply", env=self.env | {"MAILCORTEX_TEST_HOSTNAME": "other"})
-        self.assertEqual(result.returncode, 2)
+    def test_package_requires_manifest_and_help_has_no_effect(self) -> None:
+        result = self.run_cmd(PACKAGE, "--apply", env=self.env | {"MAILCORTEX_TEST_MANIFEST": str(self.base / "absent")})
+        self.assertEqual(result.returncode, 1)
         self.assertFalse(self.calls.exists())
         result = self.run_cmd(PACKAGE, "-h")
         self.assertEqual(result.returncode, 0)
         self.assertFalse(self.calls.exists())
 
-    def test_service_render_and_host_refusal(self) -> None:
+    def test_service_render_and_init_selection(self) -> None:
         result = self.run_cmd(SERVICE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("@reboot", result.stdout)
         self.assertIn("*/3 * * * *", result.stdout)
         self.assertIn("--run", result.stdout)
         self.assertFalse((self.base / "cron").exists())
-        x230 = self.env | {"MAILCORTEX_TEST_HOSTNAME": "ThinkPad-X230", "MAILCORTEX_TEST_INIT": "systemd"}
-        result = self.run_cmd(SERVICE, "--dry-run", env=x230)
+        systemd = self.env | {"MAILCORTEX_TEST_INIT": "systemd"}
+        result = self.run_cmd(SERVICE, "--dry-run", env=systemd)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("systemctl --user enable --now mailcortex-syncthing.service", result.stdout)
-        refused = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_HOSTNAME": "unknown"})
+        refused = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_INIT": "unknown"})
         self.assertEqual(refused.returncode, 2)
-        mismatch = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_INIT": "systemd"})
-        self.assertEqual(mismatch.returncode, 2)
+        init = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_INIT": "init"})
+        self.assertEqual(init.returncode, 0)
+        self.assertIn("@reboot", init.stdout)
 
     def test_service_apply_paths_are_fixture_bound(self) -> None:
         (self.base / "Mail").mkdir()
@@ -722,11 +817,12 @@ class MailCortexSyncthingTests(unittest.TestCase):
             f'case " $* " in *" show "*) echo {self.base}/.config/systemd/user/mailcortex-syncthing.service ;; esac\n'
         )
         systemctl.chmod(0o755)
-        x230 = env | {"MAILCORTEX_TEST_HOSTNAME": "ThinkPad-X230", "MAILCORTEX_TEST_INIT": "systemd"}
-        result = self.run_cmd(SERVICE, "--apply", env=x230)
+        systemd = env | {"MAILCORTEX_TEST_INIT": "systemd"}
+        result = self.run_cmd(SERVICE, "--apply", env=systemd)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text()
         self.assertIn("sudo -n loginctl enable-linger", calls)
+        self.assertIn("systemctl --user daemon-reload", calls)
         self.assertIn("systemctl --user enable --now mailcortex-syncthing.service", calls)
 
     def test_sysv_singleton_owner(self) -> None:
@@ -742,6 +838,13 @@ class MailCortexSyncthingTests(unittest.TestCase):
         binary.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\nsleep 20\n')
         binary.chmod(0o755)
         env = self.env | {"MAILCORTEX_TEST_SYNCTHING_BIN": str(binary)}
+        owner = self.base / ".local/bin/mailcortex-syncthing-service"
+        owner.parent.mkdir(parents=True)
+        owner.symlink_to(SERVICE)
+        applied = self.run_cmd(SERVICE, "--apply", env=env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        absent = self.run_cmd(SERVICE, "--check", env=env)
+        self.assertEqual(absent.returncode, 1)
         first = subprocess.Popen([str(SERVICE), "--run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             for _ in range(40):
@@ -749,6 +852,26 @@ class MailCortexSyncthingTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertTrue(self.calls.exists(), "first owner did not start")
+            checked = self.run_cmd(SERVICE, "--check", env=env)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertIn("private daemon verified", checked.stdout)
+            owned_pid = (self.base / ".local/state/mailcortex/syncthing.pid").read_text().split()[0]
+            systemctl = self.fakebin / "systemctl"
+            systemctl.write_text(
+                "#!/bin/sh\n"
+                f'case " $* " in *" show -P FragmentPath "*) echo {self.base}/.config/systemd/user/mailcortex-syncthing.service ;; '
+                f'*" show -P MainPID "*) echo {owned_pid} ;; esac\n'
+            )
+            systemctl.chmod(0o755)
+            loginctl = self.fakebin / "loginctl"
+            loginctl.write_text("#!/bin/sh\necho yes\n")
+            loginctl.chmod(0o755)
+            systemd_env = env | {"MAILCORTEX_TEST_INIT": "systemd"}
+            systemd_check = self.run_cmd(SERVICE, "--check", env=systemd_env)
+            self.assertEqual(systemd_check.returncode, 0, systemd_check.stderr)
+            systemctl.write_text(systemctl.read_text().replace(f"echo {owned_pid}", "echo 1"))
+            wrong_unit_pid = self.run_cmd(SERVICE, "--check", env=systemd_env)
+            self.assertEqual(wrong_unit_pid.returncode, 1)
             second = self.run_cmd(SERVICE, "--run", env=env)
             self.assertEqual(second.returncode, 0, second.stderr)
             starts = self.calls.read_text().splitlines()
@@ -757,6 +880,43 @@ class MailCortexSyncthingTests(unittest.TestCase):
         finally:
             first.terminate()
             first.wait(timeout=5)
+        stale = self.run_cmd(SERVICE, "--check", env=env)
+        self.assertEqual(stale.returncode, 1)
+
+    def test_runtime_rechecks_readiness_and_rejects_unrelated_process(self) -> None:
+        (self.base / "Mail").mkdir()
+        config = self.base / ".config/mailcortex/syncthing"
+        config.mkdir(parents=True)
+        for name in ("config.xml", "cert.pem", "key.pem"):
+            (config / name).write_text(name)
+        binary = self.base / "syncthing"
+        binary.write_text('#!/bin/sh\necho launched >> "$CALLS"\nsleep 20\n')
+        binary.chmod(0o755)
+        env = self.env | {"MAILCORTEX_TEST_SYNCTHING_BIN": str(binary)}
+        blocked = self.run_cmd(SERVICE, "--run", env=env)
+        self.assertEqual(blocked.returncode, 1)
+        self.assertFalse(self.calls.exists())
+        systemd_blocked = self.run_cmd(SERVICE, "--run", env=env | {"MAILCORTEX_TEST_INIT": "systemd"})
+        self.assertEqual(systemd_blocked.returncode, 1)
+        ready = self.base / ".config/mailcortex/syncthing-ready"
+        ready.touch()
+        pgrep = self.fakebin / "pgrep"
+        pgrep.write_text("#!/bin/sh\nexit 0\n")
+        pgrep.chmod(0o755)
+        unrelated = self.run_cmd(SERVICE, "--run", env=env)
+        self.assertEqual(unrelated.returncode, 3)
+        self.assertFalse(self.calls.exists())
+        record = self.base / ".local/state/mailcortex/syncthing.pid"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(f"{os.getpid()} 0\n")
+        owner = self.base / ".local/bin/mailcortex-syncthing-service"
+        owner.parent.mkdir(parents=True)
+        owner.symlink_to(SERVICE)
+        applied = self.run_cmd(SERVICE, "--apply", env=env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        checked = self.run_cmd(SERVICE, "--check", env=env)
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("private Syncthing owner absent", checked.stderr)
 
 
 if __name__ == "__main__":

@@ -28,7 +28,6 @@ class MailCortexSyncthingTests(unittest.TestCase):
         self.env.update(
             HOME=str(self.base),
             PATH=f"{self.fakebin}:/usr/bin:/bin",
-            MAILCORTEX_TEST_HOSTNAME="kikin-kushi",
             MAILCORTEX_TEST_INIT="sysv",
             MAILCORTEX_TEST_MANIFEST=str(self.manifest),
             MAILCORTEX_TEST_CRON_TARGET=str(self.base / "cron"),
@@ -71,29 +70,30 @@ class MailCortexSyncthingTests(unittest.TestCase):
         result = self.run_cmd(PACKAGE, "--apply")
         self.assertEqual(result.returncode, 2)
 
-    def test_package_refuses_unknown_host_and_help_has_no_effect(self) -> None:
-        result = self.run_cmd(PACKAGE, "--apply", env=self.env | {"MAILCORTEX_TEST_HOSTNAME": "other"})
-        self.assertEqual(result.returncode, 2)
+    def test_package_requires_manifest_and_help_has_no_effect(self) -> None:
+        result = self.run_cmd(PACKAGE, "--apply", env=self.env | {"MAILCORTEX_TEST_MANIFEST": str(self.base / "absent")})
+        self.assertEqual(result.returncode, 1)
         self.assertFalse(self.calls.exists())
         result = self.run_cmd(PACKAGE, "-h")
         self.assertEqual(result.returncode, 0)
         self.assertFalse(self.calls.exists())
 
-    def test_service_render_and_host_refusal(self) -> None:
+    def test_service_render_and_init_selection(self) -> None:
         result = self.run_cmd(SERVICE)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("@reboot", result.stdout)
         self.assertIn("*/3 * * * *", result.stdout)
         self.assertIn("--run", result.stdout)
         self.assertFalse((self.base / "cron").exists())
-        x230 = self.env | {"MAILCORTEX_TEST_HOSTNAME": "ThinkPad-X230", "MAILCORTEX_TEST_INIT": "systemd"}
-        result = self.run_cmd(SERVICE, "--dry-run", env=x230)
+        systemd = self.env | {"MAILCORTEX_TEST_INIT": "systemd"}
+        result = self.run_cmd(SERVICE, "--dry-run", env=systemd)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("systemctl --user enable --now mailcortex-syncthing.service", result.stdout)
-        refused = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_HOSTNAME": "unknown"})
+        refused = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_INIT": "unknown"})
         self.assertEqual(refused.returncode, 2)
-        mismatch = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_INIT": "systemd"})
-        self.assertEqual(mismatch.returncode, 2)
+        init = self.run_cmd(SERVICE, "--dry-run", env=self.env | {"MAILCORTEX_TEST_INIT": "init"})
+        self.assertEqual(init.returncode, 0)
+        self.assertIn("@reboot", init.stdout)
 
     def test_service_apply_paths_are_fixture_bound(self) -> None:
         (self.base / "Mail").mkdir()
@@ -123,11 +123,12 @@ class MailCortexSyncthingTests(unittest.TestCase):
             f'case " $* " in *" show "*) echo {self.base}/.config/systemd/user/mailcortex-syncthing.service ;; esac\n'
         )
         systemctl.chmod(0o755)
-        x230 = env | {"MAILCORTEX_TEST_HOSTNAME": "ThinkPad-X230", "MAILCORTEX_TEST_INIT": "systemd"}
-        result = self.run_cmd(SERVICE, "--apply", env=x230)
+        systemd = env | {"MAILCORTEX_TEST_INIT": "systemd"}
+        result = self.run_cmd(SERVICE, "--apply", env=systemd)
         self.assertEqual(result.returncode, 0, result.stderr)
         calls = self.calls.read_text()
         self.assertIn("sudo -n loginctl enable-linger", calls)
+        self.assertIn("systemctl --user daemon-reload", calls)
         self.assertIn("systemctl --user enable --now mailcortex-syncthing.service", calls)
 
     def test_sysv_singleton_owner(self) -> None:
@@ -143,6 +144,13 @@ class MailCortexSyncthingTests(unittest.TestCase):
         binary.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "$CALLS"\nsleep 20\n')
         binary.chmod(0o755)
         env = self.env | {"MAILCORTEX_TEST_SYNCTHING_BIN": str(binary)}
+        owner = self.base / ".local/bin/mailcortex-syncthing-service"
+        owner.parent.mkdir(parents=True)
+        owner.symlink_to(SERVICE)
+        applied = self.run_cmd(SERVICE, "--apply", env=env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        absent = self.run_cmd(SERVICE, "--check", env=env)
+        self.assertEqual(absent.returncode, 1)
         first = subprocess.Popen([str(SERVICE), "--run"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         try:
             for _ in range(40):
@@ -150,6 +158,26 @@ class MailCortexSyncthingTests(unittest.TestCase):
                     break
                 time.sleep(0.05)
             self.assertTrue(self.calls.exists(), "first owner did not start")
+            checked = self.run_cmd(SERVICE, "--check", env=env)
+            self.assertEqual(checked.returncode, 0, checked.stderr)
+            self.assertIn("private daemon verified", checked.stdout)
+            owned_pid = (self.base / ".local/state/mailcortex/syncthing.pid").read_text().split()[0]
+            systemctl = self.fakebin / "systemctl"
+            systemctl.write_text(
+                "#!/bin/sh\n"
+                f'case " $* " in *" show -P FragmentPath "*) echo {self.base}/.config/systemd/user/mailcortex-syncthing.service ;; '
+                f'*" show -P MainPID "*) echo {owned_pid} ;; esac\n'
+            )
+            systemctl.chmod(0o755)
+            loginctl = self.fakebin / "loginctl"
+            loginctl.write_text("#!/bin/sh\necho yes\n")
+            loginctl.chmod(0o755)
+            systemd_env = env | {"MAILCORTEX_TEST_INIT": "systemd"}
+            systemd_check = self.run_cmd(SERVICE, "--check", env=systemd_env)
+            self.assertEqual(systemd_check.returncode, 0, systemd_check.stderr)
+            systemctl.write_text(systemctl.read_text().replace(f"echo {owned_pid}", "echo 1"))
+            wrong_unit_pid = self.run_cmd(SERVICE, "--check", env=systemd_env)
+            self.assertEqual(wrong_unit_pid.returncode, 1)
             second = self.run_cmd(SERVICE, "--run", env=env)
             self.assertEqual(second.returncode, 0, second.stderr)
             starts = self.calls.read_text().splitlines()
@@ -158,6 +186,43 @@ class MailCortexSyncthingTests(unittest.TestCase):
         finally:
             first.terminate()
             first.wait(timeout=5)
+        stale = self.run_cmd(SERVICE, "--check", env=env)
+        self.assertEqual(stale.returncode, 1)
+
+    def test_runtime_rechecks_readiness_and_rejects_unrelated_process(self) -> None:
+        (self.base / "Mail").mkdir()
+        config = self.base / ".config/mailcortex/syncthing"
+        config.mkdir(parents=True)
+        for name in ("config.xml", "cert.pem", "key.pem"):
+            (config / name).write_text(name)
+        binary = self.base / "syncthing"
+        binary.write_text('#!/bin/sh\necho launched >> "$CALLS"\nsleep 20\n')
+        binary.chmod(0o755)
+        env = self.env | {"MAILCORTEX_TEST_SYNCTHING_BIN": str(binary)}
+        blocked = self.run_cmd(SERVICE, "--run", env=env)
+        self.assertEqual(blocked.returncode, 1)
+        self.assertFalse(self.calls.exists())
+        systemd_blocked = self.run_cmd(SERVICE, "--run", env=env | {"MAILCORTEX_TEST_INIT": "systemd"})
+        self.assertEqual(systemd_blocked.returncode, 1)
+        ready = self.base / ".config/mailcortex/syncthing-ready"
+        ready.touch()
+        pgrep = self.fakebin / "pgrep"
+        pgrep.write_text("#!/bin/sh\nexit 0\n")
+        pgrep.chmod(0o755)
+        unrelated = self.run_cmd(SERVICE, "--run", env=env)
+        self.assertEqual(unrelated.returncode, 3)
+        self.assertFalse(self.calls.exists())
+        record = self.base / ".local/state/mailcortex/syncthing.pid"
+        record.parent.mkdir(parents=True, exist_ok=True)
+        record.write_text(f"{os.getpid()} 0\n")
+        owner = self.base / ".local/bin/mailcortex-syncthing-service"
+        owner.parent.mkdir(parents=True)
+        owner.symlink_to(SERVICE)
+        applied = self.run_cmd(SERVICE, "--apply", env=env)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        checked = self.run_cmd(SERVICE, "--check", env=env)
+        self.assertEqual(checked.returncode, 1)
+        self.assertIn("private Syncthing owner absent", checked.stderr)
 
 
 if __name__ == "__main__":
