@@ -1,0 +1,367 @@
+#!/usr/bin/env python3
+#!/usr/bin/env python3
+"""Emit local fleet-health transitions into the notification spool."""
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import uuid
+
+SOURCE = "fleet_health"
+SCHEMA = "helmcortex.notification.v1"
+WARN_BYTES = 20 * 1000 * 1000 * 1000
+CRIT_BYTES = 10 * 1000 * 1000 * 1000
+EMERGENCY_BYTES = 5 * 1000 * 1000 * 1000
+WARN_INODE_PERCENT = 85.0
+CRIT_INODE_PERCENT = 90.0
+EMERGENCY_INODE_PERCENT = 95.0
+DEFAULT_TELEMETRY_AGE = 15 * 60
+
+
+class ProbeError(Exception):
+    """A local probe could not establish a trustworthy result."""
+
+
+def env_path(name: str, default: Path) -> Path:
+    value = os.environ.get(name)
+    return Path(value) if value else default
+
+
+def now_local() -> dt.datetime:
+    return dt.datetime.now().astimezone()
+
+
+def iso(value: dt.datetime) -> str:
+    return value.isoformat(timespec="seconds")
+
+
+def parse_number(value: str, label: str) -> int:
+    if not re.fullmatch(r"[0-9]+", value):
+        raise ProbeError("invalid %s value" % label)
+    return int(value)
+
+
+def parse_df(text: str, inode: bool) -> dict[str, dict[str, float | int]]:
+    """Parse POSIX -P output; mountpoints with spaces are retained."""
+    rows: dict[str, dict[str, float | int]] = {}
+    lines = [line for line in text.splitlines() if line.strip()]
+    if not lines:
+        raise ProbeError("df returned zero lines")
+    for line in lines[1:]:
+        fields = line.split()
+        if len(fields) < 6 or not fields[4].endswith("%"):
+            raise ProbeError("unparseable df row")
+        mount = " ".join(fields[5:])
+        if not mount.startswith("/"):
+            raise ProbeError("df row has no absolute mountpoint")
+        used_percent = float(fields[4][:-1])
+        if not 0 <= used_percent <= 100:
+            raise ProbeError("df percentage out of range")
+        if inode:
+            rows[mount] = {"inode_percent": used_percent}
+        else:
+            rows[mount] = {
+                "available_bytes": parse_number(fields[3], "available bytes"),
+                "free_percent": 100.0 - used_percent,
+            }
+    if not rows:
+        raise ProbeError("df returned zero filesystems")
+    return rows
+
+
+def run_df(args: list[str], fixture_name: str, label: str) -> str:
+    fixture = os.environ.get(fixture_name)
+    if fixture:
+        try:
+            return Path(fixture).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ProbeError("%s fixture unreadable: %s" % (label, type(exc).__name__)) from exc
+    binary = os.environ.get("FLEET_ALERTS_DF_BIN", "df")
+    try:
+        result = subprocess.run(
+            [binary, *args], text=True, capture_output=True, timeout=10, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ProbeError("%s command failed: %s" % (label, type(exc).__name__)) from exc
+    if result.returncode != 0:
+        raise ProbeError("%s command exit %d" % (label, result.returncode))
+    return result.stdout
+
+
+def filesystem_metrics() -> dict[str, dict[str, float | int]]:
+    bytes_rows = parse_df(
+        run_df(["-P", "-B1", "-l"], "FLEET_ALERTS_DF_FILE", "byte df"), False
+    )
+    inode_rows = parse_df(
+        run_df(["-P", "-i", "-l"], "FLEET_ALERTS_DF_INODE_FILE", "inode df"), True
+    )
+    if set(bytes_rows) != set(inode_rows):
+        raise ProbeError("byte and inode df mount sets differ")
+    metrics: dict[str, dict[str, float | int]] = {}
+    for mount in sorted(bytes_rows):
+        metrics[mount] = {**bytes_rows[mount], **inode_rows[mount]}
+    if "/" not in metrics:
+        raise ProbeError("root filesystem is absent from df")
+    return metrics
+
+
+def tmp_metric(metrics: dict[str, dict[str, float | int]]) -> dict[str, float | int]:
+    if "/tmp" in metrics:
+        return metrics["/tmp"]
+    candidates = [mount for mount in metrics if mount == "/" or "/tmp".startswith(mount.rstrip("/") + "/")]
+    if not candidates:
+        raise ProbeError("filesystem containing /tmp is absent from df")
+    return metrics[max(candidates, key=len)]
+
+
+def telemetry_file(host: str) -> Path | None:
+    explicit = os.environ.get("FLEET_ALERTS_TELEMETRY_FILE")
+    if explicit:
+        return Path(explicit)
+    state_dir = os.environ.get("AGENT_SESSIOND_STATE_DIR")
+    candidates = []
+    if state_dir:
+        candidates.append(Path(state_dir) / ("state.%s.json" % host))
+    candidates.extend(
+        [
+            Path.home() / (".local/state/agent-sessiond/state.%s.json" % host),
+            Path.home() / ("HelmCortex/ROOTS/DotRoot/agent-session/state.%s.json" % host),
+        ]
+    )
+    return next((candidate for candidate in candidates if candidate.exists()), None)
+
+
+def telemetry_status(host: str, now: dt.datetime) -> tuple[str, int | None]:
+    path = telemetry_file(host)
+    if path is None:
+        return "stale", None
+    try:
+        raw = path.read_text(encoding="utf-8")
+        document = json.loads(raw)
+        stamp = document.get("timestamp") or document.get("last_success_at")
+        observed = dt.datetime.fromisoformat(stamp) if isinstance(stamp, str) else None
+        if observed is None:
+            observed = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=now.tzinfo)
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=now.tzinfo)
+        age = max(0, int((now - observed.astimezone(now.tzinfo)).total_seconds()))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise ProbeError("telemetry read failed: %s" % type(exc).__name__) from exc
+    try:
+        max_age = int(os.environ.get("FLEET_ALERTS_TELEMETRY_MAX_AGE", DEFAULT_TELEMETRY_AGE))
+    except ValueError as exc:
+        raise ProbeError("telemetry max age is not an integer") from exc
+    if max_age < 0:
+        raise ProbeError("telemetry max age is negative")
+    return ("fresh" if age <= max_age else "stale"), age
+
+
+def classify(metric: dict[str, float | int]) -> str:
+    free_bytes = int(metric["available_bytes"])
+    free_percent = float(metric["free_percent"])
+    inode_percent = float(metric["inode_percent"])
+    if free_bytes <= 5_000_000_000 or free_percent <= 5.0 or inode_percent >= EMERGENCY_INODE_PERCENT:
+        return "emergency"
+    if free_bytes <= 10_000_000_000 or free_percent <= 10.0 or inode_percent >= CRIT_INODE_PERCENT:
+        return "critical"
+    if free_bytes <= WARN_BYTES or free_percent <= 15.0 or inode_percent >= WARN_INODE_PERCENT:
+        return "warning"
+    return "normal"
+
+
+def event_for(host: str, condition: str, state: str, previous: str, metric: dict[str, float | int] | None, when: dt.datetime) -> dict:
+    is_recovery = (state == "normal" and previous != "normal") or (
+        condition == "telemetry" and state == "fresh" and previous == "stale"
+    )
+    if condition == "telemetry":
+        kind = "telemetry_recovered" if is_recovery else "telemetry_stale"
+        title = "Agent telemetry recovered" if is_recovery else "Agent telemetry is stale"
+        body = "agent-sessiond telemetry is fresh again" if is_recovery else "agent-sessiond telemetry is stale or unavailable"
+        severity = "notice" if is_recovery else "warning"
+        key = "fleet_health:telemetry:%s:%s" % (host, "recovery" if is_recovery else "stale")
+        payload = {"host": host, "condition": "agent_sessiond", "state": state, "previous_state": previous}
+    else:
+        mount = condition.removeprefix("disk:")
+        if condition == "tmp":
+            kind = "tmp_recovered" if is_recovery else ("tmp_emergency" if state == "emergency" else "tmp_headroom")
+            label = "/tmp"
+        else:
+            kind = "disk_recovered" if is_recovery else ("disk_emergency" if state == "emergency" else "disk_headroom")
+            label = mount
+        if metric:
+            body = "%s: %s free, %.1f%% free, %.1f%% inodes used" % (
+                label, metric["available_bytes"], metric["free_percent"], metric["inode_percent"]
+            )
+        else:
+            body = "%s headroom recovered" % label
+        title = "%s %s" % (label, "headroom recovered" if is_recovery else state)
+        severity = "notice" if is_recovery else ("critical" if state in ("critical", "emergency") else "warning")
+        key = "fleet_health:%s:%s:%s" % (
+            "tmp" if condition == "tmp" else "disk:%s" % mount,
+            "recovery" if is_recovery else state,
+            host,
+        )
+        payload = {
+            "host": host,
+            "mount": label,
+            "state": state,
+            "previous_state": previous,
+            "available_bytes": metric["available_bytes"] if metric else None,
+            "free_percent": metric["free_percent"] if metric else None,
+            "inode_percent": metric["inode_percent"] if metric else None,
+        }
+    return {
+        "schema": SCHEMA,
+        "source": SOURCE,
+        "kind": kind,
+        "severity": severity,
+        "dedupe_key": key,
+        "title": title,
+        "body": body,
+        "link": None,
+        "audience": ["metsatron"],
+        "occurred_at": iso(when),
+        "expires_at": None,
+        "payload": payload,
+    }
+
+
+def atomic_write(path: Path, data: bytes, prefix: str) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=prefix, dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def publish(event: dict, spool: Path, when: dt.datetime) -> None:
+    spool.mkdir(mode=0o700, parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    temporary = spool / (".tmp-%s.json" % token)
+    final = spool / ("%s-%s-%s.json" % (SOURCE, when.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"), token))
+    encoded = (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+    atomic_write(temporary, encoded, ".tmp-")
+    os.replace(temporary, final)
+
+
+def state_path(host: str) -> Path:
+    return env_path(
+        "FLEET_ALERTS_STATE_FILE",
+        Path.home() / (".local/state/helmcortex-notifications/fleet/%s.json" % host),
+    )
+
+
+def load_state(path: Path) -> dict:
+    if not path.exists():
+        return {"schema": "fleet_health.state.v1", "conditions": {}}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ProbeError("fleet state read failed: %s" % type(exc).__name__) from exc
+    if not isinstance(value, dict) or not isinstance(value.get("conditions", {}), dict):
+        raise ProbeError("fleet state is not an object")
+    return value
+
+
+def main(argv: list[str]) -> int:
+    if any(arg in ("-h", "--help") for arg in argv[1:]):
+        print("Usage: fleet-health-alerts [--once]\n\nCollect local filesystem and telemetry health and publish v1 events.")
+        return 0
+    if any(arg != "--once" for arg in argv[1:]):
+        print("Usage: fleet-health-alerts [--once]", file=sys.stderr)
+        return 2
+    os.umask(0o077)
+    host = os.environ.get("FLEET_ALERTS_HOSTNAME") or socket.gethostname()
+    when = now_local()
+    spool = env_path("FLEET_ALERTS_SPOOL", Path.home() / ".local/state/helmcortex-notifications/spool")
+    heartbeat_dir = env_path("FLEET_ALERTS_HEARTBEAT_DIR", Path.home() / ".local/state/helmcortex-notifications/heartbeat")
+    state = state_path(host)
+    try:
+        metrics = filesystem_metrics()
+        previous = load_state(state)
+        conditions = dict(previous.get("conditions", {}))
+        events: list[dict] = []
+        for mount, metric in metrics.items():
+            current = classify(metric)
+            key = "disk:%s" % mount
+            old = str(conditions.get(key, "normal"))
+            if current != old:
+                events.append(event_for(host, key, current, old, metric, when))
+            conditions[key] = current
+        tmp = tmp_metric(metrics)
+        current_tmp = classify(tmp)
+        old_tmp = str(conditions.get("tmp", "normal"))
+        if current_tmp != old_tmp:
+            events.append(event_for(host, "tmp", current_tmp, old_tmp, tmp, when))
+        conditions["tmp"] = current_tmp
+        telemetry, age = telemetry_status(host, when)
+        old_telemetry = str(conditions.get("telemetry", "fresh"))
+        if telemetry != old_telemetry:
+            events.append(event_for(host, "telemetry", telemetry, old_telemetry, None, when))
+        conditions["telemetry"] = telemetry
+        for event in events:
+            publish(event, spool, when)
+        atomic_write(
+            state,
+            (json.dumps({"schema": "fleet_health.state.v1", "host": host, "updated_at": iso(when), "conditions": conditions}, sort_keys=True) + "\n").encode("utf-8"),
+            ".fleet-state-",
+        )
+        heartbeat = {
+            "source": SOURCE,
+            "last_success_at": iso(when),
+            "detail": {"host": host, "mounts": len(metrics), "telemetry": telemetry, "telemetry_age_s": age},
+        }
+        atomic_write(
+            heartbeat_dir / (SOURCE + ".json"),
+            (json.dumps(heartbeat, sort_keys=True) + "\n").encode("utf-8"),
+            ".heartbeat-",
+        )
+        return 0
+    except ProbeError as exc:
+        try:
+            publish(
+                {
+                    "schema": SCHEMA,
+                    "source": SOURCE,
+                    "kind": "source_failed",
+                    "severity": "critical",
+                    "dedupe_key": "fleet_health:source_failed:%s" % host,
+                    "title": "Fleet health source failed",
+                    "body": "Fleet health probe failed: %s" % exc,
+                    "link": None,
+                    "audience": ["metsatron"],
+                    "occurred_at": iso(when),
+                    "expires_at": None,
+                    "payload": {"host": host, "error": str(exc)},
+                },
+                spool,
+                when,
+            )
+        except OSError as publish_error:
+            print("fleet-health-alerts: source failure and spool failure: %s" % type(publish_error).__name__, file=sys.stderr)
+        print("fleet-health-alerts: %s" % exc, file=sys.stderr)
+        return 1
+    except OSError as exc:
+        print("fleet-health-alerts: write failure: %s" % type(exc).__name__, file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
