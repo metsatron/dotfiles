@@ -758,6 +758,19 @@
    (task 'pip:health "Show DotCortex Python/pip env and versions"
          (lambda () (sh "~/.local/bin/pip-health")))
 
+   ;; --- Nanobot (isolated uv runtime) ---
+   (task 'nanobot:apply
+         "Install or update the pinned HelmCortex Nano runtime"
+         (lambda () (sh "~/.local/bin/nanobot-apply")))
+
+   (task 'nanobot:update
+         "Update HelmCortex Nano to the version pinned in DotCortex"
+         (lambda () (sh "~/.local/bin/nanobot-apply")))
+
+   (task 'nanobot:health
+         "Show the HelmCortex Nano runtime and config health"
+         (lambda () (sh "~/.local/bin/nanobot-health")))
+
    ;; --- HelmCortex shims (see helmcortex-shims.org) ---
    ;; capture needs the mount; apply and diff work from the local cache without it.
    (task 'hx:capture "Scan HelmCortex FORGE bins and write the shim manifest"
