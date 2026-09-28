@@ -9,6 +9,13 @@ const REFERENCE = /^continuity:\/\/[A-Za-z0-9._:/-]{1,150}$/;
 const execute = promisify(execFile);
 const RECEIPT_MAX_AGE_MS = 1800 * 1000;
 const CLOCK_SKEW_MS = 10 * 1000;
+const idleTimers = new Map();
+
+const idleDelayMs = () => {
+  const value = Number(process.env.OPENCODE_WARM_IDLE_DELAY_SECONDS ?? 900);
+  if (!Number.isFinite(value) || value < 0) return 900 * 1000;
+  return Math.min(value, 24 * 60 * 60) * 1000;
+};
 
 const stateRoot = () => {
   if (process.env.OPENCODE_WARM_STATE_DIR) return process.env.OPENCODE_WARM_STATE_DIR;
@@ -76,15 +83,34 @@ const dispatchController = async (sessionID, eventType) => {
   }
 };
 
+const dispatchAfterQuietPeriod = async (sessionID) => {
+  const previous = idleTimers.get(sessionID);
+  if (previous) clearTimeout(previous);
+  const delay = idleDelayMs();
+  if (delay === 0) {
+    await dispatchController(sessionID, "session.idle");
+    return;
+  }
+  const timer = setTimeout(() => {
+    idleTimers.delete(sessionID);
+    void dispatchController(sessionID, "session.idle");
+  }, delay);
+  timer.unref?.();
+  idleTimers.set(sessionID, timer);
+};
+
 export const OpenCodeContinuityPlugin = async () => ({
   event: async ({ event }) => {
     const sessionID = event?.properties?.sessionID;
     if (typeof sessionID !== "string") return;
     if (event?.type === "session.compacted") {
+      const pending = idleTimers.get(sessionID);
+      if (pending) clearTimeout(pending);
+      idleTimers.delete(sessionID);
       await writeEvent(sessionID);
       await dispatchController(sessionID, "session.compacted");
     } else if (event?.type === "session.idle") {
-      await dispatchController(sessionID, "session.idle");
+      await dispatchAfterQuietPeriod(sessionID);
     }
   },
   "experimental.session.compacting": async ({ sessionID }, output) => {
