@@ -4,6 +4,7 @@
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,9 +13,9 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[5]
-BIN = ROOT / "honey/.local/bin"
-OPENRC = ROOT / "honey/.local/share/honey-claude/openrc"
-SHARE = ROOT / "honey/.local/share/honey-claude"
+SHARE = ROOT / "all/.local/share/dotcortex/honey-claude"
+BIN = SHARE / "bin"
+OPENRC = SHARE / "openrc"
 BOTS = {"opus": "claude-opus-5-5", "sonnet": "claude-sonnet-4-6", "haiku": "claude-haiku-4-5-20251001"}
 PERSONAS = {"opus": "Bunta", "sonnet": "Sasuke", "haiku": "Shoukichi"}
 
@@ -91,6 +92,7 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(rec["state"], str(box.home / f".claude/channels/telegram-{bot}"))
                 self.assertEqual(rec["agent"], f"honey-{bot}-bot")
                 self.assertIn(str(box.home / ".npm-global/bin"), rec["path"].split(":"))
+                self.assertIn(str(ROOT / "all/.local/bin"), rec["path"].split(":"), "fleet bin of the lane checkout")
                 self.assertTrue(rec["path"].startswith(str(box.bin)), "PATH must be appended to")
                 pidfile = box.xdg / f"honey-{bot}.pid"
                 self.assertEqual(pidfile.read_text().strip(), str(rec["pid"]))
@@ -179,25 +181,69 @@ class LauncherTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
-    def scripts(self):
-        return {bot: (OPENRC / f"honey-{bot}").read_text() for bot in BOTS}
-
-    def test_three_identical_scripts(self):
-        texts = set(self.scripts().values())
-        self.assertEqual(len(texts), 1)
+    def test_one_body_for_the_three_services(self):
+        self.assertEqual(sorted(p.name for p in OPENRC.iterdir()), ["honey-bot", "honey-claude-install"])
 
     def test_script_rules(self):
-        text = next(iter(self.scripts().values()))
+        text = (OPENRC / "honey-bot").read_text()
         self.assertTrue(text.startswith("#!/sbin/openrc-run\n"))
         self.assertNotRegex(text, r"\bneed\s+net\b")
         self.assertIn("use net dns", text)
         self.assertNotRegex(text, r"(^|[\s;'\"])PATH=['\"]?/", "PATH must only be appended to")
         self.assertIn('PATH=\\"\\${PATH}:', text)
         self.assertIn(': "${bot_user:=agent-claude}"', text)
-        self.assertIn("/DotCortex/honey/.local/bin/", text)
+        self.assertIn(': "${honey_claude_checkout:=/usr/local/share/dotcortex/DotCortex}"', text)
+        self.assertIn('bot_launcher="${bot_lane}/bin/${RC_SVCNAME}"', text)
+        self.assertIn("-perm /022", text, "must refuse a checkout the bot could edit")
+        self.assertNotIn("${bot_home}/DotCortex", text, "never the bot's own checkout")
         self.assertNotIn("/home/gille", text)
-        result = subprocess.run(["sh", "-n", str(OPENRC / "honey-opus")], capture_output=True, text=True)
+        result = subprocess.run(["sh", "-n", str(OPENRC / "honey-bot")], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_installer_dry_run_changes_nothing_and_refuses_a_user_checkout(self):
+        result = subprocess.run([str(OPENRC / "honey-claude-install"), "--dry-run"],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("a real run would refuse", result.stderr)
+        for bot in BOTS:
+            self.assertRegex(result.stdout, rf"(would: install -m 0755 -o root -g root \S+/openrc/honey-bot /etc/init.d/honey-{bot}|unchanged /etc/init.d/honey-{bot})")
+        if os.getuid() != 0:
+            real = subprocess.run([str(OPENRC / "honey-claude-install")], capture_output=True, text=True)
+            self.assertNotEqual(real.returncode, 0)
+
+
+class LaneTests(unittest.TestCase):
+    """The lane is a host service: never stowed, never on anyone's PATH."""
+
+    def test_no_honey_overlay_launchers(self):
+        self.assertFalse((ROOT / "honey/.local/bin").exists())
+        self.assertFalse((ROOT / "honey/.local/share/honey-claude").exists())
+
+    def test_lane_is_stow_ignored(self):
+        self.assertIn("^/\\.local/share/dotcortex/honey-claude(/|$)",
+                      (ROOT / "all/.stow-local-ignore").read_text().splitlines())
+
+    @unittest.skipUnless(shutil.which("stow"), "GNU Stow is not installed")
+    def test_no_active_stack_links_the_lane(self):
+        layers = ROOT / "all/.local/bin/dotcortex-layers"
+        for host in ("beelink", "x230", "t480s", "t480", "kikin-kushi"):
+            pkgs = subprocess.run([str(layers), "resolve", "--host", host, "--user", "metsatron"],
+                                  capture_output=True, text=True, check=True).stdout.split()
+            with tempfile.TemporaryDirectory() as target:
+                out = subprocess.run(["stow", "-n", "-v", f"--target={target}", "--ignore=\\.bak\\.", *pkgs],
+                                     cwd=ROOT, capture_output=True, text=True)
+            planned = out.stdout + out.stderr
+            self.assertNotIn("All operations aborted", planned, host)
+            links = {}  # replay the plan: stow reverts a fold with UNLINK when it must unfold
+            for line in planned.splitlines():
+                if m := re.match(r"UNLINK: (\S+)", line):
+                    links.pop(m.group(1), None)
+                elif m := re.match(r"LINK: (\S+) => (\S+)", line):
+                    links[m.group(1)] = m.group(2)
+            for rel, dest in links.items():
+                self.assertNotIn("/dotcortex/honey-claude", dest, (host, rel))
+                self.assertNotIn(rel, (".local", ".local/share", ".local/share/dotcortex"),
+                                 (host, "a folded parent would expose the lane", dest))
 
     def test_boundary_law_names_the_vault_and_no_addresses(self):
         text = "".join((SHARE / f"CLAUDE.{bot}.md").read_text() for bot in BOTS)
