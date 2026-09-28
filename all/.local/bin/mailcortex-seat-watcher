@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Idle-only, exactly-once MailCortex seat wake watcher."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+import re
+import socket
+import subprocess
+import sys
+import time
+from email.parser import BytesParser
+from pathlib import Path
+
+import importlib.machinery
+import importlib.util
+
+HERE = Path(__file__).resolve().parent
+LOADER = importlib.machinery.SourceFileLoader("mailcortex", str(HERE / "mailcortex"))
+SPEC = importlib.util.spec_from_loader("mailcortex", LOADER)
+MAILCORTEX = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+SPEC.loader.exec_module(MAILCORTEX)
+
+SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
+
+
+class WatcherError(Exception):
+    pass
+
+
+def load_registry(path: Path, host: str) -> dict:
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise WatcherError("registry is not a private regular file")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WatcherError("registry is unreadable") from error
+    if data.get("schema") != "mailcortex.seats.v1" or data.get("host") != host:
+        raise WatcherError("registry is not owned by this host")
+    seats = data.get("seats")
+    if not isinstance(seats, dict) or not seats:
+        raise WatcherError("registry seats must be a non-empty object")
+    for seat, record in seats.items():
+        if not isinstance(seat, str) or not SAFE.fullmatch(seat) or not isinstance(record, dict):
+            raise WatcherError("invalid seat registry entry")
+        required = {"host", "mailbox", "harness", "transport", "herdr_session", "herdr_target", "rate_limit_seconds"}
+        if set(record) != required:
+            raise WatcherError("seat registry fields are not exact")
+        if record["host"] != host or record["mailbox"] != f"seats/{seat}" or record["harness"] not in {"claude", "codex"} or record["transport"] != "herdr":
+            raise WatcherError("seat registry ownership or transport mismatch")
+        if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 128 for key in ("herdr_session", "herdr_target")):
+            raise WatcherError("invalid Herdr target")
+        if not isinstance(record["rate_limit_seconds"], (int, float)) or record["rate_limit_seconds"] < 0 or record["rate_limit_seconds"] > 86400:
+            raise WatcherError("invalid rate limit")
+    return data
+
+
+def message_id(path: Path) -> str:
+    try:
+        message = BytesParser().parsebytes(path.read_bytes())
+    except (OSError, ValueError):
+        raise WatcherError("malformed mail")
+    value = str(message.get("Message-ID", "")).strip()
+    if not re.fullmatch(r"<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+>", value):
+        raise WatcherError("mail has no valid Message-ID")
+    return value
+
+
+def safe_receipt(seat: str, mid: str) -> dict | None:
+    try:
+        return MAILCORTEX.load_receipt(seat, mid)
+    except MAILCORTEX.MailCortexError as error:
+        raise WatcherError(str(error)) from error
+
+
+def latest_injection(seat: str) -> float:
+    latest = 0.0
+    directory = MAILCORTEX.runtime_root() / "receipts" / seat
+    if not directory.is_dir():
+        return latest
+    for path in directory.glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WatcherError("receipt is unreadable") from error
+        if value.get("schema") != "mailcortex.receipt.v2":
+            raise WatcherError("receipt is invalid")
+        if value.get("wake_state") == "injected":
+            latest = max(latest, float(value.get("wake_updated_at", 0)))
+    return latest
+
+
+class HerdrAdapter:
+    def __init__(self, runner=subprocess.run):
+        self.runner = runner
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        command = ["herdr", "--session", record["herdr_session"],
+                   "agent", "get", record["herdr_target"]]
+        result = self.runner(command, text=True, capture_output=True,
+                             check=False, timeout=15)
+        if result.returncode != 0:
+            raise WatcherError("Herdr target lookup failed")
+        try:
+            agent = json.loads(result.stdout)["result"]["agent"]
+        except json.JSONDecodeError as error:
+            raise WatcherError("Herdr target response is not JSON") from error
+        except (KeyError, TypeError) as error:
+            raise WatcherError("Herdr target response is invalid") from error
+        if agent.get("name") != record["herdr_target"]:
+            raise WatcherError("Herdr resolved a different target")
+        if agent.get("agent_status") not in {"idle", "done"}:
+            return None
+        pane_id = agent.get("pane_id")
+        if not isinstance(pane_id, str) or not PANE.fullmatch(pane_id):
+            raise WatcherError("Herdr target has no valid pane")
+        return pane_id
+
+    def deliver(self, record: dict, pane_id: str, prompt: str) -> None:
+        command = ["herdr", "--session", record["herdr_session"],
+                   "pane", "run", pane_id, prompt]
+        result = self.runner(command, text=True, capture_output=True,
+                             check=False, timeout=60)
+        if result.returncode != 0:
+            raise WatcherError("Herdr delivery outcome is unknown")
+
+
+def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
+    now = time.time() if now is None else now
+    count = 0
+    seen: set[tuple[str, str]] = set()
+    for seat, record in registry["seats"].items():
+        if record.get("mailbox") != f"seats/{seat}":
+            raise WatcherError("seat mailbox is not canonical")
+        mailbox = MAILCORTEX.mail_root() / record["mailbox"]
+        components = (MAILCORTEX.mail_root(), MAILCORTEX.mail_root() / "seats", mailbox)
+        if any(item.is_symlink() for item in components) or not all(item.is_dir() for item in components) or not (mailbox / "new").is_dir():
+            raise WatcherError("canonical seat mailbox is absent or unsafe")
+        last_injected = latest_injection(seat)
+        for path in sorted(mailbox.joinpath("new").iterdir(), key=lambda p: p.name):
+            if not path.is_file() or path.is_symlink():
+                continue
+            mid = message_id(path)
+            if (seat, mid) in seen:
+                continue
+            seen.add((seat, mid))
+            old = safe_receipt(seat, mid)
+            if old and old["wake_state"] in {"injecting", "injected", "delivery_unknown"}:
+                continue
+            if last_injected and last_injected + record["rate_limit_seconds"] > now:
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="rate_limited",
+                                              wake_updated_at=now)
+                continue
+            MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
+                                          wake_updated_at=now)
+            pane_id = adapter.resolve_idle_pane(record)
+            if pane_id is None:
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="busy",
+                                              wake_updated_at=now)
+                continue
+            MAILCORTEX.write_wake_receipt(seat, mid, "injecting", filename=path.name,
+                                          pane_id=pane_id, wake_updated_at=now)
+            try:
+                adapter.deliver(record, pane_id, "/inbox")
+            except Exception as error:
+                MAILCORTEX.write_wake_receipt(
+                    seat, mid, "delivery_unknown", filename=path.name,
+                    pane_id=pane_id, reason="delivery_error", wake_updated_at=now,
+                )
+                if isinstance(error, WatcherError):
+                    raise
+                raise WatcherError("Herdr delivery outcome is unknown") from error
+            MAILCORTEX.write_wake_receipt(seat, mid, "injected", filename=path.name,
+                                          pane_id=pane_id, wake_updated_at=now)
+            count += 1
+    return count
+
+
+def locked_scan(registry: dict, adapter: object, now: float | None = None) -> int:
+    lock_path = MAILCORTEX.runtime_root() / "watcher.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise WatcherError("another watcher owns the scan lock") from error
+        try:
+            return scan_once(registry, adapter, now=now)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Wake owned idle MailCortex seats exactly once.")
+    parser.add_argument("--registry", default=os.environ.get("MAILCORTEX_SEAT_REGISTRY", "~/.config/mailcortex/seats.json"))
+    parser.add_argument("--once", action="store_true", help="scan once; otherwise poll")
+    parser.add_argument("--interval", type=float, default=2.0)
+    args = parser.parse_args()
+    try:
+        registry = load_registry(Path(args.registry).expanduser(), os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
+        while True:
+            locked_scan(registry, HerdrAdapter())
+            if args.once:
+                return 0
+            time.sleep(max(args.interval, 0.1))
+    except (WatcherError, OSError, ValueError) as error:
+        print(f"mailcortex-seat-watcher: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
