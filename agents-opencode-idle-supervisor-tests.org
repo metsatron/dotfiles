@@ -14,6 +14,7 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import tempfile
@@ -30,6 +31,9 @@ WARM_EVENT = REPO / "all/.local/bin/opencode-warm-event"
 WARMCTL = REPO / "all/.local/bin/opencode-warmctl"
 WAKEUP = REPO / "all/.local/bin/opencode-wakeup"
 PLUGIN = REPO / "all/.config/opencode/plugins/continuity.js"
+CONFIG = REPO / "all/.config/opencode/opencode.json"
+POLICY_INSTALLER = REPO / "all/.local/bin/opencode-continuity-policy-install"
+BOT_MANAGER = REPO / "all/.local/bin/telegram-agent-host"
 
 
 class FixtureState:
@@ -119,10 +123,17 @@ print(json.dumps({
 POLICY_HELPER = """#!/usr/bin/env python3
 import json, os, sys
 request = json.load(sys.stdin)
+def argument(name):
+    try:
+        return sys.argv[sys.argv.index(name) + 1]
+    except (ValueError, IndexError):
+        return None
 print(json.dumps({
     'schema': 'helmcortex.opencode-continuity-policy-decision.v1',
     'action': os.environ.get('FIXTURE_POLICY_ACTION', 'CONTINUE_LOCAL'),
     'session_id': request['session_id'],
+    'provider': argument('--provider'),
+    'model_pool': argument('--model-pool'),
     'reset': {'reset_at': float(os.environ.get('FIXTURE_RESET_AT', str(__import__('time').time() + 60)))},
 }))
 """
@@ -268,9 +279,9 @@ class OpenCodeWarmFixture(unittest.TestCase):
             "OPENCODE_WARM_POLICY_ROOT": str(self.root / "authority"),
             "OPENCODE_WARM_POLICY_AUTHORITY_IDENTITY": "kikin-kushi",
             "OPENCODE_WARM_POLICY_TELEMETRY_HOST": "t480s",
-            "OPENCODE_WARM_POLICY_PROVIDER": "codex",
+            "OPENCODE_WARM_POLICY_PROVIDER": "opencode-go",
             "OPENCODE_WARM_POLICY_ACCOUNT_HASH": "sha256:fixture",
-            "OPENCODE_WARM_POLICY_MODEL_POOL": "shared",
+            "OPENCODE_WARM_POLICY_MODEL_POOL": "deepseek-v4.1-flash",
             "OPENCODE_WARM_POLICY_ESTIMATED_PRESERVATION_PERCENT": "3",
             "OPENCODE_WARM_POLICY_ESTIMATE_UNCERTAINTY_PERCENT": "1",
             "OPENCODE_WARM_POLICY_IN_FLIGHT_RESERVE_PERCENT": "0.5",
@@ -312,9 +323,9 @@ class OpenCodeWarmFixture(unittest.TestCase):
             "OPENCODE_WARM_POLICY_ROOT": str(self.root / "authority"),
             "OPENCODE_WARM_POLICY_AUTHORITY_IDENTITY": "fixture-host",
             "OPENCODE_WARM_POLICY_TELEMETRY_HOST": "fixture-sensor",
-            "OPENCODE_WARM_POLICY_PROVIDER": "codex",
+            "OPENCODE_WARM_POLICY_PROVIDER": "opencode-go",
             "OPENCODE_WARM_POLICY_ACCOUNT_HASH": "sha256:fixture",
-            "OPENCODE_WARM_POLICY_MODEL_POOL": "shared",
+            "OPENCODE_WARM_POLICY_MODEL_POOL": "deepseek-v4.1-flash",
             "OPENCODE_WARM_POLICY_ESTIMATED_PRESERVATION_PERCENT": "3",
             "OPENCODE_WARM_POLICY_ESTIMATE_UNCERTAINTY_PERCENT": "1",
             "OPENCODE_WARM_POLICY_IN_FLIGHT_RESERVE_PERCENT": "0.5",
@@ -341,6 +352,63 @@ class OpenCodeWarmFixture(unittest.TestCase):
         self.write_messages(tokens={"input": 10, "cache": {"read": 0, "write": 0}})
         self.assertEqual(self.call().returncode, 0)
         self.assertEqual(self.fixture.posts, [])
+
+    def test_opencode_model_limit_and_reserved_headroom_are_declared(self) -> None:
+        config = json.loads(CONFIG.read_text(encoding="utf-8"))
+        self.assertTrue(config["compaction"]["auto"])
+        self.assertEqual(config["compaction"]["reserved"], 16000)
+        model = config["provider"]["opencode-go"]["models"]["deepseek-v4.1-flash"]
+        self.assertEqual(model["limit"]["context"], 1000000)
+        self.assertEqual(model["limit"]["output"], 384000)
+
+    def test_ecco_overlay_is_instance_scoped_and_targets_800k(self) -> None:
+        manager = BOT_MANAGER.read_text(encoding="utf-8")
+        self.assertIn("OPENCODE_CONFIG_CONTENT", manager)
+        self.assertIn('"context":832000', manager)
+        self.assertIn('"output":384000', manager)
+        self.assertIn('"reserved":16000', manager)
+        # OpenCode 1.18.30 caps the declared output at 32k for this path.
+        runtime_output = min(384000, 32000)
+        self.assertEqual(832000 - runtime_output, 800000)
+        self.assertEqual(1000000 - runtime_output, 968000)
+        self.assertEqual(200000 - runtime_output, 168000)
+
+    def test_go_provider_policy_identity_reaches_authority_helper(self) -> None:
+        self.write_receipts()
+        decided = self.call(**self.policy_env("CONTINUE_LOCAL"))
+        self.assertEqual(decided.returncode, 0, decided.stderr)
+        payload = json.loads(decided.stdout)
+        self.assertEqual(payload["policy"]["provider"], "opencode-go")
+        self.assertEqual(payload["policy"]["model_pool"], "deepseek-v4.1-flash")
+
+    def test_public_policy_template_has_no_codex_binding(self) -> None:
+        template = (REPO / "all/.bots/templates/opencode-continuity.env").read_text(encoding="utf-8")
+        self.assertIn("OPENCODE_WARM_POLICY_ROOT=YOUR_AUTHORITY_STATE_ROOT", template)
+        self.assertIn("OPENCODE_WARM_POLICY_PROVIDER=YOUR_POLICY_PROVIDER", template)
+        self.assertIn("OPENCODE_WARM_POLICY_ACCOUNT_HASH=YOUR_OPAQUE_ACCOUNT_HASH", template)
+        self.assertIn("OPENCODE_WARM_POLICY_MODEL_POOL=YOUR_MODEL_POOL", template)
+        self.assertNotIn("fleet-preservation/codex", template)
+
+    def test_policy_installer_rejects_placeholders_and_dry_runs_rendered_file(self) -> None:
+        public = REPO / "all/.bots/templates/opencode-continuity.env"
+        rejected = subprocess.run(
+            [str(POLICY_INSTALLER), "--source", str(public)],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn("unresolved placeholder", rejected.stderr)
+        source = self.root / "rendered-policy.env"
+        values = self.nudge_env()
+        source.write_text(
+            "\n".join(f"{key}={value}" for key, value in values.items() if key.startswith("OPENCODE_WARM_")) + "\n",
+            encoding="utf-8",
+        )
+        accepted = subprocess.run(
+            [str(POLICY_INSTALLER), "--source", str(source), "--user", pwd.getpwuid(os.getuid()).pw_name],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("DRY-RUN", accepted.stdout)
 
     def test_stale_owner(self) -> None:
         self.write_receipts()
@@ -710,6 +778,7 @@ console.log(JSON.stringify({{context: compacting.context, enabled: continuation.
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_EVENT_BIN": str(dispatcher),
             "OPENCODE_TEST_DISPATCH_LOG": str(dispatch_log),
+            "OPENCODE_WARM_IDLE_DELAY_SECONDS": "0",
         })
         script = f'''import {{ OpenCodeContinuityPlugin }} from {json.dumps(PLUGIN.as_uri())};
 const hooks = await OpenCodeContinuityPlugin();
@@ -725,6 +794,36 @@ await hooks.event({{event: {{type: "session.compacted", properties: {{sessionID:
         self.assertIn("--session session-1 --event session.compacted --observed-at", lines[1])
         event = json.loads((self.state_dir / "events/session-1.json").read_text(encoding="utf-8"))
         self.assertEqual(event["type"], "session.compacted")
+
+    def test_plugin_resets_idle_timer_after_each_quiet_boundary(self) -> None:
+        dispatch_log = self.root / "delayed-dispatch.log"
+        dispatcher = self.root / "delayed-dispatcher"
+        dispatcher.write_text(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$OPENCODE_TEST_DISPATCH_LOG\"\n",
+            encoding="utf-8",
+        )
+        dispatcher.chmod(0o700)
+        environment = os.environ.copy()
+        environment.update({
+            "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
+            "OPENCODE_WARM_EVENT_BIN": str(dispatcher),
+            "OPENCODE_TEST_DISPATCH_LOG": str(dispatch_log),
+            "OPENCODE_WARM_IDLE_DELAY_SECONDS": "0.05",
+        })
+        script = f'''import {{ OpenCodeContinuityPlugin }} from {json.dumps(PLUGIN.as_uri())};
+const hooks = await OpenCodeContinuityPlugin();
+await hooks.event({{event: {{type: "session.idle", properties: {{sessionID: "session-1"}}}}}});
+await new Promise(resolve => setTimeout(resolve, 20));
+await hooks.event({{event: {{type: "session.idle", properties: {{sessionID: "session-1"}}}}}});
+await new Promise(resolve => setTimeout(resolve, 80));'''
+        invoked = subprocess.run(
+            ["node", "--input-type=module", "-e", script],
+            capture_output=True, text=True, env=environment, timeout=10,
+        )
+        self.assertEqual(invoked.returncode, 0, invoked.stderr)
+        lines = dispatch_log.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertIn("--event session.idle", lines[0])
 
 
 def load_module():
