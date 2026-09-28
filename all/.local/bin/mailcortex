@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import re
 import socket
@@ -36,8 +38,98 @@ class MailCortexError(Exception):
     """Expected command failure suitable for a concise CLI diagnostic."""
 
 
+WAKE_STATES = {
+    "manual", "observed", "queued", "injecting", "injected", "delivery_unknown",
+}
+HANDLING_STATES = {
+    "handling_completed", "handling_deferred", "handling_rejected", "handling_failed",
+}
+
+
 def mail_root() -> Path:
     return Path(os.environ.get("MAILCORTEX_ROOT", "~/Mail")).expanduser()
+
+
+def runtime_root() -> Path:
+    return Path(os.environ.get("MAILCORTEX_RUNTIME", "~/.local/state/mailcortex")).expanduser()
+
+
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def receipt_path(seat: str, message_id: str) -> Path:
+    if not message_id.startswith("<") or not message_id.endswith(">") or "@" not in message_id:
+        raise MailCortexError("invalid Message-ID")
+    key = hashlib.sha256(message_id.encode("utf-8")).hexdigest()
+    return runtime_root() / "receipts" / seat / f"{key}.json"
+
+
+def load_receipt(seat: str, message_id: str) -> dict[str, object] | None:
+    path = receipt_path(seat, message_id)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise MailCortexError("receipt is not a regular file")
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise MailCortexError("receipt is unreadable") from error
+    if (
+        not isinstance(current, dict)
+        or current.get("schema") != "mailcortex.receipt.v2"
+        or current.get("seat") != seat
+        or current.get("message_id") != message_id
+        or current.get("wake_state") not in WAKE_STATES
+        or current.get("handling_state") not in HANDLING_STATES | {None}
+    ):
+        raise MailCortexError("receipt is invalid")
+    return current
+
+
+def write_wake_receipt(seat: str, message_id: str, state: str, **extra: object) -> None:
+    if state not in WAKE_STATES - {"manual"}:
+        raise MailCortexError(f"unknown wake state: {state}")
+    path = receipt_path(seat, message_id)
+    current = load_receipt(seat, message_id) or {
+        "schema": "mailcortex.receipt.v2", "seat": seat,
+        "message_id": message_id, "handling_state": None,
+    }
+    current.update({"wake_state": state, "wake_updated_at": time.time(), **extra})
+    atomic_json(path, current)
+
+
+def write_handling_receipt(seat: str, message_id: str, state: str) -> None:
+    if state not in HANDLING_STATES:
+        raise MailCortexError(f"unknown handling state: {state}")
+    path = receipt_path(seat, message_id)
+    current = load_receipt(seat, message_id) or {
+        "schema": "mailcortex.receipt.v2", "seat": seat,
+        "message_id": message_id, "wake_state": "manual",
+    }
+    current.update({"handling_state": state, "handling_updated_at": time.time()})
+    atomic_json(path, current)
+
+
+def receipt(args: argparse.Namespace) -> int:
+    write_handling_receipt(args.seat, args.message_id, args.state)
+    return 0
 
 
 def address_maildir(address: str) -> Path:
@@ -217,7 +309,18 @@ def build_parser() -> argparse.ArgumentParser:
     read.add_argument("address", type=validate_address)
     read.add_argument("message")
     read.set_defaults(function=read_message)
+    acknowledge = subparsers.add_parser("receipt", help="record a durable handling receipt")
+    acknowledge.add_argument("seat", type=validate_component)
+    acknowledge.add_argument("message_id")
+    acknowledge.add_argument("state", choices=sorted(HANDLING_STATES))
+    acknowledge.set_defaults(function=receipt)
     return parser
+
+
+def validate_component(value: str) -> str:
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,63}", value):
+        raise argparse.ArgumentTypeError("invalid seat")
+    return value
 
 
 def validate_address(value: str) -> str:
