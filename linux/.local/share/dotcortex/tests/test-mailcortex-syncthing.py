@@ -162,10 +162,17 @@ class MailCortexSyncthingTests(unittest.TestCase):
             self.assertEqual(checked.returncode, 0, checked.stderr)
             self.assertIn("private daemon verified", checked.stdout)
             owned_pid = (self.base / ".local/state/mailcortex/syncthing.pid").read_text().split()[0]
+            fragment = self.base / ".config/systemd/user/mailcortex-syncthing.service"
+            fragment.parent.mkdir(parents=True, exist_ok=True)
+            fragment.write_text("[Install]\nWantedBy=default.target\n")
+            wants = self.base / ".config/systemd/user/default.target.wants/mailcortex-syncthing.service"
+            wants.parent.mkdir(parents=True)
+            wants.symlink_to(fragment)
             systemctl = self.fakebin / "systemctl"
             systemctl.write_text(
                 "#!/bin/sh\n"
-                f'case " $* " in *" show -P FragmentPath "*) echo {self.base}/.config/systemd/user/mailcortex-syncthing.service ;; '
+                f'case " $* " in *" is-enabled "*) echo linked; exit 1 ;; '
+                f'*" show -P FragmentPath "*) echo {fragment} ;; '
                 f'*" show -P MainPID "*) echo {owned_pid} ;; esac\n'
             )
             systemctl.chmod(0o755)
@@ -175,6 +182,11 @@ class MailCortexSyncthingTests(unittest.TestCase):
             systemd_env = env | {"MAILCORTEX_TEST_INIT": "systemd"}
             systemd_check = self.run_cmd(SERVICE, "--check", env=systemd_env)
             self.assertEqual(systemd_check.returncode, 0, systemd_check.stderr)
+            wants.unlink()
+            disabled_linked_unit = self.run_cmd(SERVICE, "--check", env=systemd_env)
+            self.assertEqual(disabled_linked_unit.returncode, 1)
+            self.assertIn("not enabled for default.target", disabled_linked_unit.stderr)
+            wants.symlink_to(fragment)
             systemctl.write_text(systemctl.read_text().replace(f"echo {owned_pid}", "echo 1"))
             wrong_unit_pid = self.run_cmd(SERVICE, "--check", env=systemd_env)
             self.assertEqual(wrong_unit_pid.returncode, 1)
