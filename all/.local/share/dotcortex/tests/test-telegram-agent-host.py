@@ -168,6 +168,65 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertRegex(status.stdout, r"^pi-agent: RUNNING pid=\d+ \(gemma-pi-telegram\)\n$")
         self.assertNotIn("opencode", status.stdout)
 
+    def prepare_nanobot_wrapper(self) -> None:
+        workspace = self.home / "HelmCortex/FORGE/brain/nanobot"
+        workspace.mkdir(parents=True)
+        config_dir = self.home / ".config/nanobot-telegram"
+        config_dir.mkdir(parents=True)
+        config_dir.joinpath("config.json").write_text("{}\n", encoding="utf-8")
+        config_dir.joinpath("env").write_text(
+            "TELEGRAM_BOT_TOKEN=123456789:abcdefghijklmnopqrstuvwxyzABCDE\n",
+            encoding="utf-8",
+        )
+        log_file = config_dir / "gateway.log"
+        running = config_dir / "running"
+        self.write_executable(
+            "nanobot-telegram",
+            "#!/bin/sh\n"
+            f"running={str(running)!r}\n"
+            f"log={str(log_file)!r}\n"
+            "case \"$1:$2\" in\n"
+            "  gateway:status)\n"
+            "    if [ -f \"$running\" ]; then printf 'Running: yes\\nPID: 4242\\n'; else printf 'Running: no\\n'; fi\n"
+            "    printf 'Logs: %s\\n' \"$log\"\n"
+            "    ;;\n"
+            "  gateway:--background)\n"
+            "    : >\"$running\"\n"
+            "    printf '%s\\n' 'telegram | bot @helmcortex_nano_bot connected' >>\"$log\"\n"
+            "    ;;\n"
+            "  gateway:stop) rm -f \"$running\" ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n",
+        )
+
+    def test_nanobot_targeted_lifecycle_uses_scoped_wrapper(self) -> None:
+        self.prepare_nanobot_wrapper()
+        started = self.run_manager("start", "nanobot", timeout=2)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        self.assertIn("connected as @helmcortex_nano_bot", started.stdout)
+
+        status = self.run_manager("status", "nanobot", timeout=2)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertEqual(
+            status.stdout,
+            "nanobot: RUNNING pid=4242 (@helmcortex_nano_bot)\n",
+        )
+
+        stopped = self.run_manager("stop", "nanobot", timeout=2)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        status = self.run_manager("status", "nanobot", timeout=2)
+        self.assertEqual(status.returncode, 1)
+        self.assertIn("nanobot: STOPPED", status.stdout)
+
+    def test_nanobot_refuses_unprovisioned_token(self) -> None:
+        self.prepare_nanobot_wrapper()
+        (self.home / ".config/nanobot-telegram/env").write_text(
+            "# TELEGRAM_BOT_TOKEN=\n", encoding="utf-8"
+        )
+        result = self.run_manager("start", "nanobot", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("TELEGRAM_BOT_TOKEN is not provisioned", result.stderr)
+
     def test_sanitized_boot_binds_core_node_before_opencode_preflight(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|opencode\n", encoding="utf-8")
         marker = self.root / "resolved-node"
