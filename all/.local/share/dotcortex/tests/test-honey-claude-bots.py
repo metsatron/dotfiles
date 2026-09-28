@@ -251,5 +251,79 @@ class LaneTests(unittest.TestCase):
         self.assertIsNone(re.search(r"\b\d{1,3}(\.\d{1,3}){3}\b", text))
 
 
+class SparseTests(unittest.TestCase):
+    """The sparse system checkout carries everything the lane runs from DotCortex."""
+
+    PROSE_WORDS = {"agent", "launch"}  # all/.local/bin names that occur here only as English
+
+    def patterns(self):
+        return [l.strip() for l in (SHARE / "SPARSE").read_text().splitlines() if l.strip()]
+
+    def covered(self, rel):
+        for pat in self.patterns():
+            pat = pat.lstrip("/")
+            if rel == pat.rstrip("/") or (pat.endswith("/") and rel.startswith(pat)):
+                return True
+        return False
+
+    def carried_files(self):
+        files = [p for p in SHARE.rglob("*") if p.is_file()]
+        for pat in self.patterns():
+            path = ROOT / pat.strip("/")
+            if path.is_file():
+                files.append(path)
+        return files
+
+    def test_every_pattern_exists(self):
+        for pat in self.patterns():
+            self.assertTrue(pat.startswith("/"), pat)
+            self.assertTrue((ROOT / pat.strip("/")).exists(), pat)
+        self.assertIn("/all/.local/share/dotcortex/honey-claude/", self.patterns())
+
+    def test_no_fleet_command_outside_the_sparse_set(self):
+        fleet = {p.name for p in (ROOT / "all/.local/bin").iterdir()}
+        for path in self.carried_files():
+            tokens = set(re.findall(r"[A-Za-z0-9][A-Za-z0-9._+-]*", path.read_text(errors="replace")))
+            for name in sorted((tokens & fleet) - self.PROSE_WORDS):
+                self.assertTrue(self.covered(f"all/.local/bin/{name}"),
+                                f"{path.relative_to(ROOT)} names all/.local/bin/{name}, which SPARSE does not carry")
+
+    def test_no_repo_path_outside_the_sparse_set(self):
+        for path in self.carried_files():
+            for ref in re.findall(r"\ball/\.local/[A-Za-z0-9._/-]+", path.read_text(errors="replace")):
+                ref = ref.rstrip("/.")
+                if (ROOT / ref).is_dir():
+                    ok = any(p.lstrip("/").startswith(ref + "/") for p in self.patterns()) or self.covered(ref + "/")
+                else:
+                    ok = self.covered(ref)
+                self.assertTrue(ok, f"{path.relative_to(ROOT)} names {ref}, which SPARSE does not carry")
+
+    def test_launcher_fleet_bin_is_the_sparse_bin(self):
+        text = (SHARE / "lib/launch.bash").read_text()
+        rel = re.search(r'repo_bin="\$\(cd -- "\$LIB_DIR/([./]+bin)"', text).group(1)
+        self.assertEqual((SHARE / "lib" / rel).resolve(), (ROOT / "all/.local/bin").resolve())
+
+    def test_settings_hooks_resolve_inside_the_set(self):
+        settings = json.loads((SHARE / "claude-settings.json").read_text())
+        for groups in settings["hooks"].values():
+            for group in groups:
+                for hook in group["hooks"]:
+                    name = hook["command"].split()[0]
+                    self.assertTrue((BIN / name).is_file() or self.covered(f"all/.local/bin/{name}"), name)
+
+    def test_sync_dry_run_is_sparse_blobless_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            dest = Path(tmp) / "DotCortex"
+            out = subprocess.run([str(OPENRC / "honey-claude-install"), "--dry-run", "sync"], capture_output=True,
+                                 text=True, env=dict(os.environ, HONEY_CLAUDE_CHECKOUT=str(dest)))
+            self.assertEqual(out.returncode, 0, out.stderr)
+            self.assertIn("--filter=blob:none --no-checkout", out.stdout)
+            self.assertIn("sparse-checkout init --no-cone", out.stdout)
+            for pat in self.patterns():
+                self.assertIn(pat, out.stdout)
+            self.assertFalse(dest.exists())
+            self.assertEqual(os.listdir(tmp), [])
+
+
 if __name__ == "__main__":
     unittest.main()
