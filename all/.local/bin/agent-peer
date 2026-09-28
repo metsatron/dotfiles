@@ -310,7 +310,7 @@ def start_peer(
         raise PeerError("peer-start requires an explicit command after --")
     if workspace and tab:
         raise PeerError("peer-start takes --workspace or --tab, not both")
-    snapshot_for_session(herdr_session)
+    session_bootstrap = ensure_herdr_session(herdr_session)
     start_style = herdr_start_style()
     created_workspace: str | None = None
     warm_note: str | None = None
@@ -443,6 +443,7 @@ def start_peer(
         "workspace": created_workspace or workspace,
         "tab": tab,
         "start_style": start_style,
+        "session_bootstrap": session_bootstrap,
         "warm_note": warm_note,
         "intro": intro_delivery,
         "next": "run agent-peer inventory, then register the exact endpoint",
@@ -677,6 +678,122 @@ def snapshot_for_session(session: str) -> dict[str, object]:
     if not isinstance(current, dict) or not isinstance(current.get("agents"), list):
         raise PeerError("Herdr snapshot does not contain an agent inventory")
     return current
+
+
+def herdr_session_rows(payload: object) -> list[dict[str, object]]:
+    rows: object = payload.get("sessions", payload) if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise PeerError("Herdr session inventory has an unsupported shape")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def herdr_session_running(record: dict[str, object]) -> bool:
+    return record.get("running") is True or record.get("status") == "running"
+
+
+def herdr_session_record(session: str) -> dict[str, object] | None:
+    result = run([herdr_binary(), "session", "list", "--json"], timeout=15)
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        raise PeerError(f"Herdr session inventory is unavailable: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise PeerError("Herdr session inventory returned invalid JSON") from error
+    for record in herdr_session_rows(payload):
+        if record.get("name") == session:
+            return record
+    return None
+
+
+def herdr_session_lock(session: str):
+    runtime = pathlib.Path(
+        os.environ.get("XDG_RUNTIME_DIR", f"/tmp/agent-peer-{os.getuid()}")
+    ) / "agent-peer"
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    handle = (runtime / f"herdr-session-{session}.lock").open("a+", encoding="utf-8")
+    os.chmod(handle.name, 0o600)
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+    return handle
+
+
+def ensure_herdr_session(session: str) -> dict[str, object]:
+    """Return a live named Herdr session, starting a dedicated one if stopped."""
+    validate_component(session, "herdr_session")
+    try:
+        snapshot_for_session(session)
+        return {"started": False, "state": "already-running"}
+    except PeerError as initial_error:
+        if session == "default":
+            raise PeerError(
+                "the default Herdr session is unavailable; agent-peer will not "
+                "start or repurpose the operator's session"
+            ) from initial_error
+
+    lock = herdr_session_lock(session)
+    try:
+        # Another requester may have won the race while this process waited.
+        try:
+            snapshot_for_session(session)
+            return {"started": False, "state": "race-won-elsewhere"}
+        except PeerError as snapshot_error:
+            record = herdr_session_record(session)
+            if isinstance(record, dict) and herdr_session_running(record):
+                raise PeerError(
+                    f"Herdr session {session!r} is marked running but its API is "
+                    f"unavailable: {snapshot_error}"
+                ) from snapshot_error
+
+        try:
+            timeout_ms = int(
+                os.environ.get("AGENT_PEER_HERDR_START_TIMEOUT_MS", "10000")
+            )
+        except ValueError as error:
+            raise PeerError("AGENT_PEER_HERDR_START_TIMEOUT_MS must be an integer") from error
+
+        try:
+            process = subprocess.Popen(
+                [herdr_binary(), "--session", session, "server"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+        except OSError as error:
+            raise PeerError(f"could not start Herdr session {session!r}: {error}") from error
+
+        deadline = time.monotonic() + max(timeout_ms, 100) / 1000
+        last_error: PeerError | None = None
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise PeerError(
+                    f"Herdr session {session!r} server exited during startup "
+                    f"with status {process.returncode}; inspect its Herdr server log"
+                )
+            try:
+                snapshot_for_session(session)
+                return {
+                    "started": True,
+                    "state": "started-headless",
+                    "server_pid": process.pid,
+                }
+            except PeerError as error:
+                last_error = error
+                time.sleep(0.1)
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+        raise PeerError(
+            f"Herdr session {session!r} did not become ready before the deadline: "
+            f"{last_error}"
+        )
+    finally:
+        lock.close()
 
 
 def agent_identity_values(agent: dict[str, object]) -> set[str]:
@@ -1747,11 +1864,8 @@ def command_inventory(session: str | None) -> int:
             payload = json.loads(result.stdout)
         except json.JSONDecodeError as error:
             raise PeerError("Herdr session list returned invalid JSON") from error
-        rows: object = payload.get("sessions", payload) if isinstance(payload, dict) else payload
-        if not isinstance(rows, list):
-            raise PeerError("Herdr session list has an unsupported shape")
-        for row in rows:
-            if isinstance(row, dict) and row.get("status") == "running" and row.get("name"):
+        for row in herdr_session_rows(payload):
+            if herdr_session_running(row) and row.get("name"):
                 sessions.append(str(row["name"]))
     found: list[dict[str, object]] = []
     for session_name in sessions:
@@ -1854,6 +1968,7 @@ def command_selftest() -> int:
                 "AGENT_PEER_TEST_CAPTURE",
                 "AGENT_PEER_TEST_CALLS",
                 "AGENT_PEER_DELIVERY_READY_TIMEOUT_MS",
+                "AGENT_PEER_HERDR_START_TIMEOUT_MS",
                 "AGENT_PEER_ORIGIN_HOST",
             )
         }
@@ -2087,6 +2202,75 @@ def command_selftest() -> int:
                 ],
             )
             os.environ["AGENT_PEER_HERDR_STYLE"] = "cwd"
+
+            # A stopped dedicated session is bootstrapped headlessly. The
+            # operator-owned default session remains a hard boundary.
+            ensure_state = root / "ensure-state"
+            ensure_fake = root / "herdr-ensure"
+            ensure_fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, pathlib, sys, time\n"
+                f"state = pathlib.Path({str(ensure_state)!r})\n"
+                "args = sys.argv[1:]\n"
+                "if args[-2:] == ['api', 'snapshot']:\n"
+                " if not state.exists():\n"
+                "  print('server unavailable', file=sys.stderr); raise SystemExit(2)\n"
+                " print(json.dumps({'result': {'snapshot': {'agents': []}}}))\n"
+                "elif args == ['session', 'list', '--json']:\n"
+                " print(json.dumps({'sessions': []}))\n"
+                "elif args[-1:] == ['server']:\n"
+                " state.write_text(str(os.getpid()), encoding='utf-8')\n"
+                " time.sleep(2)\n"
+                "else:\n"
+                " print('unsupported', file=sys.stderr); raise SystemExit(2)\n",
+                encoding="utf-8",
+            )
+            ensure_fake.chmod(0o755)
+            os.environ["AGENT_PEER_HERDR_BIN"] = str(ensure_fake)
+            os.environ["AGENT_PEER_HERDR_START_TIMEOUT_MS"] = "1500"
+            check(
+                "session-inventory-envelope-compatibility",
+                herdr_session_rows({"sessions": [{"name": "a"}]})
+                == [{"name": "a"}]
+                and herdr_session_rows([{"name": "b"}]) == [{"name": "b"}],
+            )
+            check(
+                "session-running-field-compatibility",
+                herdr_session_running({"name": "a", "running": True})
+                and herdr_session_running({"name": "b", "status": "running"})
+                and not herdr_session_running({"name": "c", "running": False}),
+            )
+            ensured = ensure_herdr_session("peer-auto")
+            check(
+                "stopped-dedicated-session-starts-headless",
+                ensured.get("started") is True
+                and ensured.get("state") == "started-headless"
+                and ensure_state.exists(),
+            )
+            ensure_state.unlink()
+            try:
+                ensure_herdr_session("default")
+            except PeerError as error:
+                check(
+                    "default-session-never-auto-starts",
+                    "operator's session" in str(error),
+                    str(error),
+                )
+            else:
+                check("default-session-never-auto-starts", False, "started")
+            os.environ["AGENT_PEER_HERDR_START_TIMEOUT_MS"] = "invalid"
+            try:
+                ensure_herdr_session("peer-invalid-timeout")
+            except PeerError as error:
+                check(
+                    "invalid-timeout-does-not-spawn",
+                    "must be an integer" in str(error) and not ensure_state.exists(),
+                    str(error),
+                )
+            else:
+                check("invalid-timeout-does-not-spawn", False, "started")
+            os.environ["AGENT_PEER_HERDR_BIN"] = str(fake)
+            os.environ["AGENT_PEER_HERDR_START_TIMEOUT_MS"] = "1500"
             mismatched_handoff = json.loads(json.dumps(handoff))
             mismatched_handoff["constraints"]["allow_git"] = "none"
             try:
