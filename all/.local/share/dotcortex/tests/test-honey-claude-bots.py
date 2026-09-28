@@ -319,6 +319,7 @@ class SparseTests(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stderr)
             self.assertIn("--filter=blob:none --no-checkout", out.stdout)
             self.assertIn("sparse-checkout init --no-cone", out.stdout)
+            self.assertIn("config index.version 4", out.stdout)
             for pat in self.patterns():
                 self.assertIn(pat, out.stdout)
             self.assertFalse(dest.exists())
