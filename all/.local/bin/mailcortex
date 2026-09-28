@@ -1,0 +1,213 @@
+#!/usr/bin/env python3
+"""MailCortex filesystem-native mail transport."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import socket
+import sys
+import time
+import uuid
+from email import policy
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import format_datetime, make_msgid
+from datetime import datetime
+from pathlib import Path
+
+
+ADDRESS_RE = re.compile(
+    r"^(?:(consort|seat|machine|sanctuary)\+)?"
+    r"([a-z0-9][a-z0-9._-]*)@"
+    r"([a-z0-9][a-z0-9.-]*\.helm)$"
+)
+NAMESPACE = {
+    None: "consorts",
+    "consort": "consorts",
+    "seat": "seats",
+    "machine": "machines",
+    "sanctuary": "sanctuaries",
+}
+
+
+class MailCortexError(Exception):
+    """Expected command failure suitable for a concise CLI diagnostic."""
+
+
+def mail_root() -> Path:
+    return Path(os.environ.get("MAILCORTEX_ROOT", "~/Mail")).expanduser()
+
+
+def address_maildir(address: str) -> Path:
+    match = ADDRESS_RE.fullmatch(address.lower())
+    if not match:
+        raise MailCortexError(
+            "invalid address; use name@machine.helm or "
+            "seat+name@machine.helm (also machine+ and sanctuary+)"
+        )
+    kind, name, _domain = match.groups()
+    return mail_root() / NAMESPACE[kind] / name
+
+
+def require_maildir(address: str) -> Path:
+    path = address_maildir(address)
+    missing = [name for name in ("tmp", "new", "cur") if not (path / name).is_dir()]
+    if missing:
+        raise MailCortexError(f"maildir is not provisioned for {address}: {path}")
+    return path
+
+
+def safe_name() -> str:
+    host = re.sub(r"[^A-Za-z0-9_-]", "_", socket.gethostname())
+    return f"{time.time_ns()}.{os.getpid()}_{uuid.uuid4().hex}.{host}"
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def deliver(args: argparse.Namespace) -> int:
+    target = require_maildir(args.to)
+    if args.body is not None:
+        body = args.body
+    else:
+        body = Path(args.body_file).read_text(encoding="utf-8")
+
+    message = EmailMessage(policy=policy.SMTP)
+    message["Date"] = format_datetime(datetime.now().astimezone())
+    message["From"] = args.sender
+    message["To"] = args.to
+    message["Subject"] = args.subject
+    message["Message-ID"] = make_msgid(domain=args.sender.rsplit("@", 1)[-1])
+    message.set_content(body)
+
+    name = safe_name()
+    temporary = target / "tmp" / name
+    delivered = target / "new" / name
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(message.as_bytes())
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, delivered)
+        fsync_directory(target / "new")
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    print(name)
+    return 0
+
+
+def parse_message(path: Path) -> EmailMessage:
+    with path.open("rb") as stream:
+        return BytesParser(policy=policy.default).parse(stream)
+
+
+def messages(maildir: Path):
+    for state in ("new", "cur"):
+        for path in (maildir / state).iterdir():
+            if path.is_file():
+                yield state, path
+
+
+def show_inbox(args: argparse.Namespace) -> int:
+    maildir = require_maildir(args.address)
+    rows = sorted(messages(maildir), key=lambda item: (item[1].stat().st_mtime_ns, item[1].name))
+    for state, path in rows:
+        message = parse_message(path)
+        fields = (
+            state,
+            path.name,
+            str(message.get("Date", "")),
+            str(message.get("From", "")),
+            str(message.get("Subject", "")),
+        )
+        print("\t".join(value.replace("\t", " ").replace("\n", " ") for value in fields))
+    return 0
+
+
+def locate_message(maildir: Path, name: str) -> tuple[str, Path]:
+    if not name or name in {".", ".."} or Path(name).name != name:
+        raise MailCortexError("message must be an exact inbox filename")
+    for state in ("new", "cur"):
+        candidate = maildir / state / name
+        if candidate.is_file():
+            return state, candidate
+    raise MailCortexError(f"message not found: {name}")
+
+
+def read_message(args: argparse.Namespace) -> int:
+    maildir = require_maildir(args.address)
+    state, path = locate_message(maildir, args.message)
+    message = parse_message(path)
+    if state == "new":
+        seen_name = path.name if ":2," in path.name else path.name + ":2,S"
+        destination = maildir / "cur" / seen_name
+        if destination.exists():
+            raise MailCortexError(f"seen-message destination already exists: {seen_name}")
+        os.replace(path, destination)
+        fsync_directory(maildir / "new")
+        fsync_directory(maildir / "cur")
+
+    for header in ("Date", "From", "To", "Subject", "Message-ID"):
+        print(f"{header}: {message.get(header, '')}")
+    print()
+    body = message.get_body(preferencelist=("plain",))
+    print(body.get_content() if body is not None else "", end="")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="mailcortex",
+        description="Deliver and read fleet-local RFC 822 messages through Maildir.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    send = subparsers.add_parser("send", help="atomically deliver one message")
+    send.add_argument("--from", dest="sender", required=True, type=validate_address)
+    send.add_argument("--to", required=True, type=validate_address)
+    send.add_argument("--subject", required=True)
+    body = send.add_mutually_exclusive_group(required=True)
+    body.add_argument("--body")
+    body.add_argument("--body-file")
+    send.set_defaults(function=deliver)
+
+    inbox = subparsers.add_parser("inbox", help="list new and seen messages")
+    inbox.add_argument("address", type=validate_address)
+    inbox.set_defaults(function=show_inbox)
+
+    read = subparsers.add_parser("read", help="render one message and mark it seen")
+    read.add_argument("address", type=validate_address)
+    read.add_argument("message")
+    read.set_defaults(function=read_message)
+    return parser
+
+
+def validate_address(value: str) -> str:
+    address_maildir(value)
+    return value.lower()
+
+
+def main() -> int:
+    parser = build_parser()
+    try:
+        args = parser.parse_args()
+        return args.function(args)
+    except (MailCortexError, OSError, ValueError) as error:
+        print(f"mailcortex: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
