@@ -22,6 +22,7 @@ PERSONAS = {"opus": "Bunta", "sonnet": "Sasuke", "haiku": "Shoukichi"}
 
 class Home:
     def __init__(self, plugin_enabled=True, boundary=True, account=True):
+        self.plugin_enabled = plugin_enabled
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
         self.bin = Path(self.tmp.name) / "bin"
@@ -32,8 +33,10 @@ class Home:
         (self.home / ".claude").mkdir()
         if account:
             (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "test-account"}}))
-        (self.home / ".claude/settings.json").write_text(
-            json.dumps({"enabledPlugins": {"telegram@claude-plugins-official": plugin_enabled}}))
+        # No ~/.claude/settings.json: the lane's claude-settings.json enables the plugin.
+        # A disabled plugin is simulated by pointing the preflight at a settings file that says so.
+        self.settings = Path(self.tmp.name) / "settings.json"
+        self.settings.write_text(json.dumps({"enabledPlugins": {"telegram@claude-plugins-official": plugin_enabled}}))
         plugin = self.home / ".claude/plugins/cache/claude-plugins-official/telegram/0.0.6"
         plugin.mkdir(parents=True)
         (plugin / ".mcp.json").write_text(json.dumps({"mcpServers": {"telegram": {"command": "bun"}}}))
@@ -65,6 +68,8 @@ class Home:
     def run(self, bot, *args):
         env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
                "XDG_RUNTIME_DIR": str(self.xdg)}
+        if not self.plugin_enabled:
+            env["CLAUDE_SETTINGS_FILE"] = str(self.settings)
         return subprocess.run([str(BIN / f"honey-{bot}"), *args], capture_output=True,
                               text=True, env=env)
 
@@ -316,6 +321,13 @@ class SparseTests(unittest.TestCase):
         settings = json.loads((SHARE / "claude-settings.json").read_text())
         stop = [h["command"] for g in settings["hooks"].get("Stop", []) for h in g["hooks"]]
         self.assertIn("claude-hook-telegram-delivery-guard", stop)
+
+    def test_settings_enable_the_telegram_plugin(self):
+        # The preflight reads this file, not the agent account's ~/.claude/settings.json.
+        settings = json.loads((SHARE / "claude-settings.json").read_text())
+        self.assertIs(settings["enabledPlugins"]["telegram@claude-plugins-official"], True)
+        self.assertEqual(settings["extraKnownMarketplaces"]["claude-plugins-official"]["source"],
+                         {"source": "github", "repo": "anthropics/claude-plugins-official"})
 
     def test_sync_dry_run_is_sparse_blobless_and_changes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
