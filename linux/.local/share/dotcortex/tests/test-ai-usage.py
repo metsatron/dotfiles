@@ -56,16 +56,16 @@ class CodexAllowanceWindowTests(unittest.TestCase):
 
         self.assertRegex(plain, re.compile(r"pace\s+.*83% of 30d cycle"))
 
-    def test_weekly_pacing_keeps_week_semantics(self):
+    def test_weekly_pacing_uses_pace_label_and_keeps_week_semantics(self):
         now = datetime(2026, 9, 15, tzinfo=timezone.utc)
         reset_at = now + timedelta(days=3, hours=12)
-        line = self.ai_usage.format_window_left_line("wk", reset_at.isoformat(), 10080, now)
+        line = self.ai_usage.format_window_left_line("pace", reset_at.isoformat(), 10080, now)
         plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", line)
 
-        self.assertRegex(plain, re.compile(r"wk\s+.*50% of week \d+"))
-        fallback = self.ai_usage.format_window_left_line("wk", reset_at.isoformat(), now=now)
+        self.assertRegex(plain, re.compile(r"pace\s+.*50% of week \d+"))
+        fallback = self.ai_usage.format_window_left_line("pace", reset_at.isoformat(), now=now)
         fallback_plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", fallback)
-        self.assertRegex(fallback_plain, re.compile(r"wk\s+.*50% of week \d+"))
+        self.assertRegex(fallback_plain, re.compile(r"pace\s+.*50% of week \d+"))
 
         result = self.ai_usage.build_codex_native_result(
             next(spec for spec in self.ai_usage.PROVIDERS if spec.key == "codex"),
@@ -80,6 +80,18 @@ class CodexAllowanceWindowTests(unittest.TestCase):
             },
         )
         self.assertEqual(result["summary"], "weekly 7%")
+
+        class FixedDateTime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now if tz else now.replace(tzinfo=None)
+
+        output = io.StringIO()
+        with patch.object(self.ai_usage, "datetime", FixedDateTime), redirect_stdout(output):
+            self.ai_usage.render_text([result])
+        rendered = self.ai_usage.ANSI_ESCAPE_RE.sub("", output.getvalue())
+        self.assertRegex(rendered, re.compile(r"1w\s+.*93%"))
+        self.assertRegex(rendered, re.compile(r"pace\s+.*50% of week \d+"))
 
     def test_renderer_never_calls_monthly_allowance_a_week(self):
         fixed_now = datetime(2026, 9, 15, tzinfo=timezone.utc)
@@ -273,7 +285,9 @@ class OpenCodeGoObservationTests(unittest.TestCase):
 
         self.assertRegex(plain, re.compile(r"5h\s+.*83%"))
         self.assertRegex(plain, re.compile(r"wk\s+.*25%"))
+        self.assertRegex(plain, re.compile(r"wk pace\s+.*41% of week \d+"))
         self.assertRegex(plain, re.compile(r"30d\s+.*9%"))
+        self.assertRegex(plain, re.compile(r"30d pace\s+.*20% of 30d cycle"))
 
 
 class OpenCodeGoCredentialTests(unittest.TestCase):
