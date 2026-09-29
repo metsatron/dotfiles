@@ -10,7 +10,10 @@
 honey_telegram_preflight() {
     local wrapper_name="${1:-}"
     local state_dir="${2:-}"
-    local settings="${CLAUDE_SETTINGS_FILE:-$HOME/.claude/settings.json}"
+    # The lane's own settings (passed with --settings) enable the plugin, so the
+    # agent account needs no hand-kept ~/.claude/settings.json.
+    local settings="${CLAUDE_SETTINGS_FILE:-${LIB_DIR:+$LIB_DIR/../claude-settings.json}}"
+    settings="${settings:-$HOME/.claude/settings.json}"
     local plugin_cache="$HOME/.claude/plugins/cache/claude-plugins-official/telegram"
     local plugin_root="" candidate plugin_command pid pid_command pid_state_dir
     local runtime_root lock_path token_fingerprint
