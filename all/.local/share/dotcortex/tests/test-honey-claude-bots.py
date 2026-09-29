@@ -311,6 +311,12 @@ class SparseTests(unittest.TestCase):
                     name = hook["command"].split()[0]
                     self.assertTrue((BIN / name).is_file() or self.covered(f"all/.local/bin/{name}"), name)
 
+    def test_settings_carry_the_telegram_delivery_guard(self):
+        # The bots are unstowed: --settings is their only hook source, so the guard must live here.
+        settings = json.loads((SHARE / "claude-settings.json").read_text())
+        stop = [h["command"] for g in settings["hooks"].get("Stop", []) for h in g["hooks"]]
+        self.assertIn("claude-hook-telegram-delivery-guard", stop)
+
     def test_sync_dry_run_is_sparse_blobless_and_changes_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:
             dest = Path(tmp) / "DotCortex"
