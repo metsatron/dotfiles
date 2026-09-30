@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Relaunch dead enabled Telegram agents and publish alerts to the notification spool."""
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+SOURCE = "agent_watchdog"
+SCHEMA = "helmcortex.notification.v1"
+STATE_SCHEMA = "dotcortex.telegram-agent-watchdog.v1"
+REQUEST_SCHEMA = "dotcortex.telegram-agent-revive-request.v1"
+
+# Agents whose supervisor exposes a pid file: the request records that
+# process's identity (pid and start-time) as the generation fence. Agents not
+# listed here are unfenced and are revived only while they read as up.
+PID_FILES = {
+    "codex": "codex-helmastra-telegram.pid",
+}
+
+# Enabled-agent name -> the status line that reports its liveness.
+STATUS_LABELS = {
+    "opencode": r"opencode:",
+    "ductor": r"ductor:",
+    "claudecode": r"claudecode \(",
+    "hermes": r"hermes gateway run:",
+    "codex": r"codex-helmastra",
+    "deepseek-harness": r"deepseek-harness:",
+    "pi-agent": r"pi-agent:",
+    "nanobot": r"nanobot:",
+}
+
+
+def state_home() -> Path:
+    return Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="telegram-agent-watchdog",
+        description="Relaunch dead enabled Telegram agents and alert through the notification spool.",
+    )
+    parser.add_argument("--expected-host", required=True, help="refuse to run on any other host")
+    parser.add_argument("--manager", default=str(Path.home() / ".local/bin/telegram-agent-host"))
+    parser.add_argument("--state-dir", default=str(state_home() / "telegram-agent-watchdog"))
+    parser.add_argument("--intent-dir", default=str(state_home() / "telegram-agents/intentional-stop"))
+    parser.add_argument("--boot-lock", default=str(state_home() / "telegram-agent-boot/boot.lock"))
+    parser.add_argument("--spool", default=str(state_home() / "helmcortex-notifications/spool"))
+    parser.add_argument("--pid-dir", default=str(state_home() / "telegram-agents"))
+    parser.add_argument("--revive-cooldown", type=int, default=600, help="seconds between self-revives of one agent")
+    parser.add_argument("--request-timeout", type=int, default=900, help="drop a revive request whose requester never detaches")
+    parser.add_argument("--max-attempts", type=int, default=3, help="relaunch attempts per down episode")
+    parser.add_argument("--backoff", type=int, default=120, help="base seconds between attempts; doubles each attempt")
+    parser.add_argument("--start-timeout", type=int, default=240)
+    parser.add_argument("--dry-run", action="store_true", help="report decisions without relaunching or publishing")
+    return parser.parse_args(argv)
+
+
+def atomic_write(path: Path, data: bytes) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+
+
+def load_state(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"schema": STATE_SCHEMA, "agents": {}}
+    except (OSError, ValueError):
+        return {"schema": STATE_SCHEMA, "agents": {}}
+    if not isinstance(value, dict) or not isinstance(value.get("agents"), dict):
+        return {"schema": STATE_SCHEMA, "agents": {}}
+    return value
+
+
+def run_manager(manager: str, args: list[str], timeout: int) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [manager, *args],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+        close_fds=True,
+    )
+
+
+def classify(agent: str, status_text: str) -> str:
+    """Return up, down, or unknown from the agent's own status line."""
+    pattern = STATUS_LABELS.get(agent)
+    if pattern is None:
+        return "unknown"
+    verdicts = set()
+    for line in status_text.splitlines():
+        if re.match(r"^\s*" + pattern, line):
+            if re.search(r"\bRUNNING\b", line):
+                verdicts.add("up")
+            elif re.search(r"\bSTOPPED\b", line):
+                verdicts.add("down")
+    return verdicts.pop() if len(verdicts) == 1 else "unknown"
+
+
+def make_event(host: str, agent: str, kind: str, severity: str, title: str, body: str, payload: dict, when: dt.datetime) -> dict:
+    return {
+        "schema": SCHEMA,
+        "source": SOURCE,
+        "kind": kind,
+        "severity": severity,
+        "dedupe_key": "agent_watchdog:%s:%s:%s:%s" % (host, agent, kind, when.strftime("%Y%m%dT%H%M%S")),
+        "title": title,
+        "body": body,
+        "link": None,
+        "audience": ["metsatron"],
+        "occurred_at": when.isoformat(timespec="seconds"),
+        "expires_at": None,
+        "payload": dict(payload, host=host, agent=agent),
+    }
+
+
+def publish(event: dict, spool: Path, when: dt.datetime) -> None:
+    token = uuid.uuid4().hex
+    # Nanoseconds after the second keep same-second events in emission order for a consumer that sorts by name.
+    name = "%s-%s-%09d-%s.json" % (SOURCE, when.astimezone(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ"), time.time_ns() % 10**9, token)
+    atomic_write(spool / name, (json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+def boot_owns_lock(path: Path) -> bool:
+    try:
+        fd = os.open(str(path), os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True
+    finally:
+        os.close(fd)
+    return False
+
+
+def generation_of(agent: str, pid_dir: Path) -> str | None:
+    """Identity of the agent's supervisor: pid plus kernel start-time, or None when unfenced."""
+    name = PID_FILES.get(agent)
+    if name is None:
+        return None
+    try:
+        pid = int((pid_dir / name).read_text().strip())
+        stat = Path("/proc/%d/stat" % pid).read_text()
+    except (OSError, ValueError):
+        return "absent"
+    # Field 22 (starttime) counted after the parenthesised command name.
+    fields = stat.rsplit(")", 1)[1].split()
+    return "%d:%s" % (pid, fields[19])
+
+
+def pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def request_main(argv: list[str]) -> int:
+    """Agent-side entry: ask the external watchdog to restart an agent, then return."""
+    parser = argparse.ArgumentParser(
+        prog="telegram-agent-watchdog request",
+        description="Request an external restart of an agent. Returns immediately and never signals any process group.",
+    )
+    parser.add_argument("agent", nargs="?", default=os.environ.get("TELEGRAM_AGENT_SELF"),
+                        help="agent to restart; defaults to $TELEGRAM_AGENT_SELF")
+    parser.add_argument("--other", action="store_true", help="allow targeting an agent other than $TELEGRAM_AGENT_SELF")
+    parser.add_argument("--requester-pid", type=int, default=os.getppid(),
+                        help="process whose exit means the requesting turn has detached (default: parent)")
+    parser.add_argument("--state-dir", default=str(state_home() / "telegram-agent-watchdog"))
+    parser.add_argument("--pid-dir", default=str(state_home() / "telegram-agents"))
+    args = parser.parse_args(argv)
+    if not args.agent or args.agent not in STATUS_LABELS:
+        print("telegram-agent-watchdog request: name a known agent (%s) or set TELEGRAM_AGENT_SELF" % ", ".join(sorted(STATUS_LABELS)), file=sys.stderr)
+        return 2
+    self_name = os.environ.get("TELEGRAM_AGENT_SELF")
+    if self_name and args.agent != self_name and not args.other:
+        print("telegram-agent-watchdog request: %s is not this agent (%s); pass --other to target it" % (args.agent, self_name), file=sys.stderr)
+        return 2
+    os.umask(0o077)
+    path = Path(args.state_dir) / "requests" / ("%s.json" % args.agent)
+    if path.exists():
+        print("telegram-agent-watchdog request: revive of %s already pending" % args.agent)
+        return 0
+    body = {
+        "schema": REQUEST_SCHEMA,
+        "id": uuid.uuid4().hex,
+        "agent": args.agent,
+        "requester_pid": args.requester_pid,
+        "generation": generation_of(args.agent, Path(args.pid_dir)),
+        "requested_at": int(time.time()),
+    }
+    atomic_write(path, (json.dumps(body, sort_keys=True) + "\n").encode("utf-8"))
+    print("telegram-agent-watchdog request: revive of %s queued; the watchdog restarts it after this turn detaches" % args.agent)
+    return 0
+
+
+def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.datetime, now: float) -> list[dict]:
+    """Execute pending self-revive requests from outside the requesting process group."""
+    events: list[dict] = []
+    request_dir = Path(args.state_dir) / "requests"
+    revive = state.setdefault("revive", {})
+    for path in sorted(request_dir.glob("*.json")):
+        try:
+            request = json.loads(path.read_text(encoding="utf-8"))
+            agent = request["agent"]
+            if request.get("schema") != REQUEST_SCHEMA or agent not in STATUS_LABELS:
+                raise ValueError("bad request")
+        except (OSError, ValueError, KeyError):
+            path.unlink(missing_ok=True)
+            events.append(make_event(host, "*", "revive_rejected", "warning", "Malformed revive request dropped",
+                                     "A revive request in the watchdog queue was unreadable and was dropped", {}, when))
+            continue
+        requester = int(request.get("requester_pid") or 0)
+        age = now - float(request.get("requested_at", now))
+        if requester > 1 and pid_alive(requester):
+            if age > args.request_timeout:
+                path.unlink(missing_ok=True)
+                events.append(make_event(host, agent, "revive_rejected", "warning", "%s revive request timed out" % agent,
+                                         "The requesting turn never detached within %ss; nothing was restarted" % args.request_timeout,
+                                         {"request": request.get("id")}, when))
+            continue  # wait until the requesting turn has detached
+        fence = request.get("generation")
+        if fence is not None and fence != generation_of(agent, Path(args.pid_dir)):
+            path.unlink(missing_ok=True)
+            events.append(make_event(host, agent, "revive_stale", "notice", "%s revive request is stale" % agent,
+                                     "%s was already restarted since the request; no second restart" % agent,
+                                     {"request": request.get("id")}, when))
+            continue
+        if now - float(revive.get(agent, 0)) < args.revive_cooldown:
+            path.unlink(missing_ok=True)
+            events.append(make_event(host, agent, "revive_rejected", "warning", "%s revive is cooling down" % agent,
+                                     "%s was self-revived less than %ss ago; request refused" % (agent, args.revive_cooldown),
+                                     {"request": request.get("id")}, when))
+            continue
+        if args.dry_run:
+            continue
+        path.unlink(missing_ok=True)
+        revive[agent] = int(now)
+        marker = Path(args.intent_dir) / agent
+        try:
+            stopped = run_manager(args.manager, ["stop", agent], args.start_timeout)
+            started = run_manager(args.manager, ["start", agent], args.start_timeout) if stopped.returncode == 0 else stopped
+            ok = stopped.returncode == 0 and started.returncode == 0
+            detail = (started.stdout or "").strip()[-300:]
+        except (OSError, subprocess.SubprocessError) as exc:
+            ok, detail = False, type(exc).__name__
+        if ok:
+            probe = run_manager(args.manager, ["status"], 60)
+            ok = classify(agent, probe.stdout) == "up"
+            detail = detail or "readiness not confirmed by status"
+        if not ok:
+            marker.unlink(missing_ok=True)  # a failed revive must not leave the agent parked as operator-stopped
+        events.append(make_event(host, agent, "revive_done" if ok else "revive_failed",
+                                 "notice" if ok else "critical",
+                                 "%s self-revive %s" % (agent, "completed" if ok else "failed"),
+                                 "%s was restarted externally on request and verified up" % agent if ok else
+                                 "%s self-revive did not verify; the normal relaunch loop takes over: %s" % (agent, detail),
+                                 {"request": request.get("id"), "requester_pid": requester}, when))
+    return events
+
+
+def main(argv: list[str]) -> int:
+    if argv and argv[0] == "request":
+        return request_main(argv[1:])
+    args = parse_args(argv)
+    host = socket.gethostname()
+    if host != args.expected_host:
+        print("telegram-agent-watchdog: refusing host %s; expected %s" % (host, args.expected_host), file=sys.stderr)
+        return 1
+    os.umask(0o077)
+    state_dir = Path(args.state_dir)
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_fd = os.open(str(state_dir / "watchdog.lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("telegram-agent-watchdog: another run owns the lock")
+        return 0
+    if boot_owns_lock(Path(args.boot_lock)):
+        print("telegram-agent-watchdog: boot owner is running; standing down")
+        return 0
+
+    when = dt.datetime.now().astimezone()
+    now = time.time()
+    spool = Path(args.spool)
+    state_path = state_dir / "state.json"
+    state = load_state(state_path)
+    agents_state: dict = state["agents"]
+    outcomes: dict[str, str] = {}
+    events: list[dict] = []
+    try:
+        events.extend(process_requests(args, host, state, when, now))
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("telegram-agent-watchdog: revive request processing failed: %s" % type(exc).__name__, file=sys.stderr)
+
+    try:
+        enabled_run = run_manager(args.manager, ["enabled"], 30)
+        status_run = run_manager(args.manager, ["status"], 60)
+    except (OSError, subprocess.SubprocessError) as exc:
+        enabled_run = status_run = None
+        print("telegram-agent-watchdog: manager probe failed: %s" % type(exc).__name__, file=sys.stderr)
+    if enabled_run is None or enabled_run.returncode != 0 or not enabled_run.stdout.split():
+        events.append(make_event(host, "*", "probe_failed", "warning", "Agent watchdog cannot read the enabled list",
+                                 "telegram-agent-host enabled failed or returned nothing on %s" % host, {}, when))
+        enabled = []
+    else:
+        enabled = enabled_run.stdout.split()
+    status_text = status_run.stdout if status_run is not None and status_run.returncode == 0 else ""
+
+    for agent in enabled:
+        entry = agents_state.setdefault(agent, {})
+        verdict = classify(agent, status_text)
+        marker = Path(args.intent_dir) / agent
+        if verdict == "up":
+            if entry.get("down_since"):
+                events.append(make_event(host, agent, "recovered", "notice", "%s is back" % agent,
+                                         "%s is running again on %s after %s relaunch attempt(s)" % (agent, host, entry.get("attempts", 0)),
+                                         {"attempts": entry.get("attempts", 0), "down_since": entry["down_since"]}, when))
+            agents_state[agent] = {}
+            outcomes[agent] = "up"
+            continue
+        if verdict == "unknown":
+            if entry.get("probe") != "unknown":
+                events.append(make_event(host, agent, "probe_unknown", "warning", "%s liveness unreadable" % agent,
+                                         "The watchdog could not read a liveness line for %s on %s; it did not relaunch anything" % (agent, host), {}, when))
+            entry["probe"] = "unknown"
+            outcomes[agent] = "unknown"
+            continue
+        entry.pop("probe", None)
+        if marker.exists():
+            outcomes[agent] = "stopped-by-operator"
+            continue
+        if not entry.get("down_since"):
+            entry.update(down_since=int(now), attempts=0, last_attempt=0, gave_up=False)
+            events.append(make_event(host, agent, "down", "warning", "%s is down" % agent,
+                                     "%s is enabled but not running on %s; the watchdog will relaunch it" % (agent, host), {}, when))
+        attempts = int(entry.get("attempts", 0))
+        if attempts >= args.max_attempts:
+            if not entry.get("gave_up"):
+                entry["gave_up"] = True
+                events.append(make_event(host, agent, "relaunch_failed", "critical", "%s will not come back" % agent,
+                                         "%s stayed down after %s relaunch attempts on %s; it needs a hand" % (agent, attempts, host),
+                                         {"attempts": attempts}, when))
+            outcomes[agent] = "gave-up"
+            continue
+        wait = args.backoff * (2 ** attempts)
+        if now - float(entry.get("last_attempt", 0)) < wait:
+            outcomes[agent] = "backing-off"
+            continue
+        if args.dry_run:
+            outcomes[agent] = "would-relaunch"
+            continue
+        entry["attempts"] = attempts + 1
+        entry["last_attempt"] = int(now)
+        try:
+            started = run_manager(args.manager, ["start", agent], args.start_timeout)
+            outcomes[agent] = "relaunched" if started.returncode == 0 else "relaunch-failed"
+            entry["last_result"] = started.returncode
+        except (OSError, subprocess.SubprocessError) as exc:
+            outcomes[agent] = "relaunch-failed"
+            entry["last_result"] = type(exc).__name__
+
+    agents_state_out = {name: value for name, value in agents_state.items() if name in enabled or value}
+    if not args.dry_run:
+        for event in events:
+            try:
+                publish(event, spool, when)
+            except OSError as exc:
+                print("telegram-agent-watchdog: spool write failed: %s" % type(exc).__name__, file=sys.stderr)
+        atomic_write(state_path, (json.dumps({"schema": STATE_SCHEMA, "agents": agents_state_out, "revive": state.get("revive", {})}, sort_keys=True) + "\n").encode("utf-8"))
+        atomic_write(state_dir / "receipt.json", (json.dumps({"schema": STATE_SCHEMA, "host": host, "timestamp": int(now), "outcomes": outcomes, "events": [e["kind"] + ":" + e["payload"]["agent"] for e in events]}, sort_keys=True) + "\n").encode("utf-8"))
+    for name, outcome in sorted(outcomes.items()):
+        print("telegram-agent-watchdog: %s=%s" % (name, outcome))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
