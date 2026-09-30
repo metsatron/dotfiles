@@ -66,6 +66,7 @@ NANOBOT_WORKSPACE="${NANOBOT_WORKSPACE:-$HOME/HelmCortex/FORGE/brain/nanobot}"
 NANOBOT_CONFIG_DIR="${NANOBOT_CONFIG_DIR:-$HOME/.config/nanobot-telegram}"
 NANOBOT_CONFIG="${NANOBOT_CONFIG:-$NANOBOT_CONFIG_DIR/config.json}"
 NANOBOT_ENV_FILE="${NANOBOT_ENV_FILE:-$NANOBOT_CONFIG_DIR/env}"
+NANOBOT_RUN_AS_FILE="${NANOBOT_RUN_AS_FILE:-$NANOBOT_CONFIG_DIR/run-as}"
 
 load_opencode_continuity_policy() {
     local policy_file="${OPENCODE_WARM_POLICY_ENV:-$HOME/.config/opencode-continuity/policy.env}"
@@ -99,7 +100,7 @@ Commands:
   enabled           Print enabled agents for this host
   enable <agent>    Enable agent on this machine
   disable <agent>   Disable agent on this machine
-  sync              Sync configs to this machine from DotCortex
+  sync [agent]      Sync configs from DotCortex (scoped: deepseek-harness)
   start             Start all enabled agents independently
   stop              Stop all agents
   switch <machine>  Switch to another machine's agents (disables local, enables remote)
@@ -408,6 +409,14 @@ opencode_delegate() {
         OPENCODE_CONFIG_CONTENT="$ecco_config_content"
 }
 
+# Nano normally shares the trusted OpenAI operator lane with HelmAstra and
+# HelmDuctor. A private run-as file moves the whole gateway into a sealed agent
+# home before a global-model endpoint is enabled. The target home must be
+# provisioned separately; absence of the file intentionally keeps today's lane.
+nanobot_delegate() {
+    agent_run_as_delegate "$1" nanobot "$NANOBOT_RUN_AS_FILE" "$CORE_PROFILE_BIN"
+}
+
 deepseek_harness_config_file() {
     printf '%s\n' "$DSH_TELEGRAM_WORKSPACE/.pi/telegram.json"
 }
@@ -712,6 +721,44 @@ deepseek_harness_load_env() {
     done < "$env_file"
 }
 
+deepseek_harness_render_profile_patch() {
+    local output="$1" recall_url tailnet_ip
+    if grep -q '@DSH_RECALL_MCP_URL@' "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"; then
+        recall_url="${DSH_RECALL_MCP_URL:-}"
+        if [ -z "$recall_url" ]; then
+            tailnet_ip="$(tailscale ip -4 2>/dev/null | grep -m1 -E '^[0-9.]+$' || true)"
+            [ -n "$tailnet_ip" ] && recall_url="http://$tailnet_ip:3004/mcp"
+        fi
+        if [ -z "$recall_url" ]; then
+            echo "DeepSeek Harness cannot resolve the Recall MCP URL (set DSH_RECALL_MCP_URL in the private env file, or bring the tailnet up)" >&2
+            return 1
+        fi
+        sed "s|@DSH_RECALL_MCP_URL@|$recall_url|g" "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" > "$output"
+    else
+        cp "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" "$output"
+    fi
+}
+
+deepseek_harness_sync_profile_patch() {
+    local profile_dir profile_patch rendered
+    deepseek_harness_load_env || return 1
+    if [ ! -r "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" ]; then
+        echo "DeepSeek Harness credential-containment patch template is missing: $DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" >&2
+        return 1
+    fi
+    profile_dir="$DSH_HOME/profiles/$DSH_TELEGRAM_PROFILE"
+    profile_patch="$profile_dir/cordis.patch.yml"
+    mkdir -p "$profile_dir"
+    rendered="$(mktemp "$profile_dir/.cordis.patch.yml.XXXXXX")"
+    if ! deepseek_harness_render_profile_patch "$rendered"; then
+        rm -f "$rendered"
+        return 1
+    fi
+    chmod 600 "$rendered"
+    mv "$rendered" "$profile_patch"
+    echo "DeepSeek Harness managed profile patch refreshed"
+}
+
 deepseek_harness_validate_private_config() {
     local token_file key_file config settings profile_patch
     deepseek_harness_load_env || return 1
@@ -782,27 +829,18 @@ deepseek_harness_validate_private_config() {
         echo "DeepSeek Harness profile patch is missing: $profile_patch (copy the credential-containment template exactly)" >&2
         return 1
     fi
-    local expected_patch recall_url tailnet_ip
-    expected_patch="$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"
-    if grep -q '@DSH_RECALL_MCP_URL@' "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE"; then
-        recall_url="${DSH_RECALL_MCP_URL:-}"
-        if [ -z "$recall_url" ]; then
-            tailnet_ip="$(tailscale ip -4 2>/dev/null | grep -m1 -E '^[0-9.]+$' || true)"
-            [ -n "$tailnet_ip" ] && recall_url="http://$tailnet_ip:3004/mcp"
-        fi
-        if [ -z "$recall_url" ]; then
-            echo "DeepSeek Harness cannot resolve the Recall MCP URL (set DSH_RECALL_MCP_URL in the private env file, or bring the tailnet up)" >&2
-            return 1
-        fi
-        expected_patch="$(mktemp)"
-        sed "s|@DSH_RECALL_MCP_URL@|$recall_url|g" "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" > "$expected_patch"
+    local expected_patch
+    expected_patch="$(mktemp)"
+    if ! deepseek_harness_render_profile_patch "$expected_patch"; then
+        rm -f "$expected_patch"
+        return 1
     fi
     if ! cmp -s "$profile_patch" "$expected_patch"; then
-        [ "$expected_patch" = "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" ] || rm -f "$expected_patch"
+        rm -f "$expected_patch"
         echo "DeepSeek Harness profile patch does not disable native DeepSeek chat/search routes; refusing credential egress" >&2
         return 1
     fi
-    [ "$expected_patch" = "$DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE" ] || rm -f "$expected_patch"
+    rm -f "$expected_patch"
 
     config="$(deepseek_harness_config_file)"
     if [ ! -r "$config" ]; then
@@ -972,22 +1010,47 @@ check_deepseek_harness() {
     fi
 }
 
+codex_telegram_start_ticks() {
+    python3 - "$1" <<'PY'
+from pathlib import Path
+import sys
+
+try:
+    stat = Path("/proc", sys.argv[1], "stat").read_text(encoding="utf-8")
+    fields = stat[stat.rfind(")") + 2:].split()
+    print(fields[19])
+except (OSError, IndexError, ValueError):
+    raise SystemExit(1)
+PY
+}
+
+codex_telegram_supervisor_matches() {
+    local pid="${1:-}" expected_ticks="${2:-}" current_ticks argument supervisor_match=0
+    case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ -r "/proc/$pid/cmdline" ] || return 1
+    while IFS= read -r -d '' argument; do
+        case "$argument" in */FORGE/scripts/codex_supervisor.py) supervisor_match=1 ;; esac
+    done < "/proc/$pid/cmdline"
+    [ "$supervisor_match" = 1 ] || return 1
+    if [ -n "$expected_ticks" ]; then
+        current_ticks="$(codex_telegram_start_ticks "$pid" 2>/dev/null)" || return 1
+        [ "$current_ticks" = "$expected_ticks" ] || return 1
+    fi
+}
+
 codex_telegram_running() {
     local pid_file="$STATE_DIR/codex-helmastra-telegram.pid"
     local ready_file="$STATE_DIR/codex-helmastra-telegram.ready"
     local child_file="$STATE_DIR/codex-helmastra-telegram.child.ready"
-    local pid ready child parent argument supervisor_match=0 adapter_match=0
+    local pid ready child parent argument adapter_match=0
     [ -r "$pid_file" ] && [ -r "$ready_file" ] && [ -r "$child_file" ] || return 1
     pid=$(cat "$pid_file")
     ready=$(cat "$ready_file")
     child=$(cat "$child_file")
     case "$pid:$child" in *[!0-9:]*|:*|*:) return 1 ;; esac
     [ "$ready" = "$pid" ] || return 1
-    [ -r "/proc/$pid/cmdline" ] && [ -r "/proc/$child/cmdline" ] || return 1
-    while IFS= read -r -d '' argument; do
-        case "$argument" in */FORGE/scripts/codex_supervisor.py) supervisor_match=1 ;; esac
-    done < "/proc/$pid/cmdline"
-    [ "$supervisor_match" = 1 ] || return 1
+    codex_telegram_supervisor_matches "$pid" || return 1
+    [ -r "/proc/$child/cmdline" ] || return 1
     while IFS= read -r -d '' argument; do
         case "$argument" in */FORGE/scripts/codex_telegram.py) adapter_match=1 ;; esac
     done < "/proc/$child/cmdline"
@@ -1110,7 +1173,10 @@ nanobot_running() {
 nanobot_log_file() {
     local status
     status="$(nanobot_gateway_status 2>/dev/null || true)"
-    printf '%s\n' "$status" | sed -n 's/^Logs: //p' | head -n1
+    printf '%s\n' "$status" | awk '
+        /^Logs: / { sub(/^Logs: /, ""); print; exit }
+        /^Logs:$/ { if (getline > 0) print; exit }
+    '
 }
 
 check_nanobot() {
@@ -1126,21 +1192,33 @@ check_nanobot() {
 }
 
 start_nanobot() {
-    local log_file
+    local log_file log_start=0 log_size
     nanobot_private_config_ready || return 1
     if nanobot_running; then
         echo "nanobot is already running"
         return 0
+    fi
+    # Bind readiness to this launch. Gateway logs are append-only, so an old
+    # successful connection must not make a new broken launch look healthy.
+    log_file="$(nanobot_log_file 2>/dev/null || true)"
+    if [ -n "$log_file" ] && [ -r "$log_file" ]; then
+        log_start="$(wc -c < "$log_file" | tr -d '[:space:]')"
+        case "$log_start" in ''|*[!0-9]*) log_start=0 ;; esac
     fi
     echo "Starting HelmCortex Nano Telegram gateway..."
     "$NANOBOT_WRAPPER" gateway --background
     for _ in {1..30}; do
         if nanobot_running; then
             log_file="$(nanobot_log_file 2>/dev/null || true)"
-            if [ -n "$log_file" ] && [ -r "$log_file" ] && \
-               tail -n 200 "$log_file" | grep -q 'telegram | bot @helmcortex_nano_bot connected'; then
-                echo "nanobot connected as @helmcortex_nano_bot"
-                return 0
+            if [ -n "$log_file" ] && [ -r "$log_file" ]; then
+                log_size="$(wc -c < "$log_file" | tr -d '[:space:]')"
+                case "$log_size" in ''|*[!0-9]*) log_size=0 ;; esac
+                [ "$log_size" -ge "$log_start" ] || log_start=0
+                if grep -q 'telegram | bot @helmcortex_nano_bot connected' \
+                    < <(tail -c "+$((log_start + 1))" "$log_file"); then
+                    echo "nanobot connected as @helmcortex_nano_bot"
+                    return 0
+                fi
             fi
         fi
         sleep 1
@@ -1181,6 +1259,9 @@ status_cmd() {
         return
     fi
     if [ "$requested" = "nanobot" ]; then
+        local delegated=0
+        nanobot_delegate status || delegated=$?
+        [ "$delegated" -eq 3 ] || return "$delegated"
         check_nanobot
         return
     fi
@@ -1285,6 +1366,21 @@ disable_agent() {
 }
 
 sync_configs() {
+    local requested="${1:-}" delegated=0
+    if [ -n "$requested" ]; then
+        case "$requested" in
+            deepseek-harness)
+                deepseek_harness_delegate sync || delegated=$?
+                [ "$delegated" -eq 3 ] || return "$delegated"
+                deepseek_harness_sync_profile_patch
+                return
+                ;;
+            *)
+                echo "No scoped config sync exists for agent: $requested" >&2
+                return 1
+                ;;
+        esac
+    fi
     echo "Syncing agent configs from DotCortex..."
     local repo="$HOME/DotCortex"
 
@@ -1529,6 +1625,9 @@ start_agent() {
             start_pi_agent
             ;;
         nanobot)
+            local delegated=0
+            nanobot_delegate start || delegated=$?
+            [ "$delegated" -eq 3 ] || return "$delegated"
             start_nanobot
             ;;
         *)
@@ -1567,20 +1666,44 @@ stop_agent() {
             stop_hermes
             ;;
         codex)
-            local codex_pid codex_pgid
-            if codex_telegram_running; then
-                codex_pid=$(cat "$STATE_DIR/codex-helmastra-telegram.pid")
+            local codex_pid codex_pgid codex_ticks
+            codex_pid="$(cat "$STATE_DIR/codex-helmastra-telegram.pid" 2>/dev/null || true)"
+            if codex_telegram_supervisor_matches "$codex_pid"; then
+                codex_ticks="$(codex_telegram_start_ticks "$codex_pid" 2>/dev/null)" || {
+                    echo "HelmAstra Telegram supervisor start ticks unavailable; refusing stop" >&2
+                    return 1
+                }
                 codex_pgid=$(ps -o pgid= -p "$codex_pid" 2>/dev/null | tr -d ' ' || true)
+                codex_telegram_supervisor_matches "$codex_pid" "$codex_ticks" || {
+                    echo "HelmAstra Telegram supervisor identity changed before signal; refusing stop" >&2
+                    return 1
+                }
+                # Self-kill guard (2026-09-30): the stop signals the supervisor's
+                # whole process group, and a HelmAstra turn runs its tools inside
+                # that group. A stop issued from within the group kills its own
+                # caller before the matching start can run. Refuse instead.
+                local guard_pid="$$" guard_pgid
+                while [ -n "$guard_pid" ] && [ "$guard_pid" -gt 1 ] 2>/dev/null; do
+                    guard_pgid=$(ps -o pgid= -p "$guard_pid" 2>/dev/null | tr -d ' ' || true)
+                    if [ "$guard_pid" = "$codex_pid" ] || { [ "$codex_pgid" = "$codex_pid" ] && [ "$guard_pgid" = "$codex_pgid" ]; }; then
+                        echo "HelmAstra Telegram host cannot stop itself from inside its own turn; run the stop from outside it (another session or Nurse Joy)" >&2
+                        return 1
+                    fi
+                    guard_pid=$(ps -o ppid= -p "$guard_pid" 2>/dev/null | tr -d ' ' || true)
+                done
                 if [ "$codex_pgid" = "$codex_pid" ]; then
                     kill -TERM -- "-$codex_pgid" 2>/dev/null || true
                 else
                     kill -TERM "$codex_pid" 2>/dev/null || true
                 fi
+                # Readiness can disappear before the supervisor releases its
+                # exclusive launch lock. Wait for the exact captured process,
+                # not the composite ready predicate, before permitting restart.
                 for _ in {1..20}; do
-                    codex_telegram_running || break
+                    codex_telegram_supervisor_matches "$codex_pid" "$codex_ticks" || break
                     sleep 0.25
                 done
-                if codex_telegram_running; then
+                if codex_telegram_supervisor_matches "$codex_pid" "$codex_ticks"; then
                     echo "HelmAstra Telegram did not stop gracefully; forcing its verified process group" >&2
                     if [ "$codex_pgid" = "$codex_pid" ]; then
                         kill -KILL -- "-$codex_pgid" 2>/dev/null || true
@@ -1588,14 +1711,14 @@ stop_agent() {
                         kill -KILL "$codex_pid" 2>/dev/null || true
                     fi
                     for _ in {1..20}; do
-                        codex_telegram_running || break
+                        codex_telegram_supervisor_matches "$codex_pid" "$codex_ticks" || break
                         sleep 0.25
                     done
                 fi
-            fi
-            if codex_telegram_running; then
-                echo "HelmAstra Telegram failed to stop" >&2
-                return 1
+                if codex_telegram_supervisor_matches "$codex_pid" "$codex_ticks"; then
+                    echo "HelmAstra Telegram failed to stop its verified supervisor" >&2
+                    return 1
+                fi
             fi
             ;;
         deepseek-harness)
@@ -1629,6 +1752,9 @@ stop_agent() {
             stop_pi_agent
             ;;
         nanobot)
+            local delegated=0
+            nanobot_delegate stop || delegated=$?
+            [ "$delegated" -eq 3 ] || return "$delegated"
             stop_nanobot
             ;;
         *)
@@ -1653,7 +1779,9 @@ start_all() {
     echo "Starting enabled agents for $host: $agents"
     local failed=0
     for agent in $agents; do
-        if ! start_agent "$agent"; then
+        if start_agent "$agent"; then
+            clear_intentional_stop "$agent"
+        else
             echo "Failed to start enabled agent: $agent" >&2
             failed=1
         fi
@@ -1661,9 +1789,16 @@ start_all() {
     return "$failed"
 }
 
+# Intentional-stop markers: telegram-agent-watchdog skips an enabled agent whose
+# marker exists, so an operator stop is not fought. Written only after a
+# successful stop, cleared by a successful start.
+INTENT_DIR="$STATE_DIR/intentional-stop"
+mark_intentional_stop() { mkdir -p "$INTENT_DIR" && : > "$INTENT_DIR/$1"; }
+clear_intentional_stop() { rm -f "$INTENT_DIR/$1"; }
+
 stop_all() {
     for agent in opencode ductor claudecode hermes codex deepseek-harness pi-agent nanobot; do
-        stop_agent "$agent" 2>/dev/null || true
+        { stop_agent "$agent" 2>/dev/null && mark_intentional_stop "$agent"; } || true
     done
     echo "All agents stopped"
 }
@@ -1758,11 +1893,16 @@ case "$COMMAND" in
     status) status_cmd "${1:-}" ;;
     enable) enable_agent "${1:-}" ;;
     disable) disable_agent "${1:-}" ;;
-    sync) sync_configs ;;
+    sync) sync_configs "${1:-}" ;;
     enabled) get_enabled_agents "$(get_hostname)" ;;
     start)
         if [ -n "${1:-}" ]; then
+            # Standalone call, not an && list: set -e is ignored inside a
+            # function that runs in an && context, which changes start_agent.
             start_agent "$1"
+            start_rc=$?
+            [ "$start_rc" -ne 0 ] || clear_intentional_stop "$1"
+            exit "$start_rc"
         else
             start_all
         fi
@@ -1770,6 +1910,9 @@ case "$COMMAND" in
     stop)
         if [ -n "${1:-}" ]; then
             stop_agent "$1"
+            stop_rc=$?
+            [ "$stop_rc" -ne 0 ] || mark_intentional_stop "$1"
+            exit "$stop_rc"
         else
             stop_all
         fi
