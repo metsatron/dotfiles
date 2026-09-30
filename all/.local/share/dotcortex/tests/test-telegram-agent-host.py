@@ -326,6 +326,52 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(status.returncode, 1)
         self.assertIn("nanobot: STOPPED", status.stdout)
 
+    def start_gateway_stand_in(self, *, ticks: str | None = None, record: bool = True) -> subprocess.Popen[bytes]:
+        gateway = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (gateway.poll() is None and gateway.kill(), gateway.wait()))
+        if record:
+            hermes_home = self.home / ".hermes"
+            hermes_home.mkdir(exist_ok=True)
+            (hermes_home / "gateway.pid").write_text(json.dumps({
+                "pid": gateway.pid,
+                "kind": "hermes-gateway",
+                "argv": ["hermes_cli/main.py", "gateway", "run"],
+                "start_time": ticks if ticks is not None else self.read_start_ticks(gateway.pid),
+            }), encoding="utf-8")
+        return gateway
+
+    def start_process_named_hermes(self) -> subprocess.Popen[bytes]:
+        impostor = self.bin / "hermes"
+        impostor.write_bytes(Path("/bin/sleep").read_bytes())
+        impostor.chmod(0o755)
+        process = subprocess.Popen([str(impostor), "60"])
+        self.addCleanup(lambda: (process.poll() is None and process.kill(), process.wait()))
+        return process
+
+    def hermes_status_line(self) -> str:
+        result = self.run_manager("status", timeout=20)
+        return next(line for line in result.stdout.splitlines() if "hermes gateway run" in line)
+
+    def test_hermes_status_trusts_the_gateway_pid_record(self) -> None:
+        self.start_gateway_stand_in()
+        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: RUNNING")
+
+    def test_hermes_status_rejects_a_recycled_pid(self) -> None:
+        self.start_gateway_stand_in(ticks="1")
+        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: STOPPED")
+
+    def test_hermes_status_ignores_other_processes_named_hermes(self) -> None:
+        self.start_process_named_hermes()
+        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: STOPPED")
+
+    def test_hermes_stop_signals_only_the_recorded_gateway(self) -> None:
+        gateway = self.start_gateway_stand_in()
+        session = self.start_process_named_hermes()
+        stopped = self.run_manager("stop", "hermes", timeout=20)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        gateway.wait(timeout=5)
+        self.assertIsNone(session.poll(), "an interactive hermes process must survive a gateway stop")
+
     def test_nanobot_wrapper_imports_only_allowlisted_env_keys(self) -> None:
         self.prepare_nanobot_wrapper()
         venv_bin = self.home / "HelmCortex/FORGE/brain/nanobot/.venv/bin"
