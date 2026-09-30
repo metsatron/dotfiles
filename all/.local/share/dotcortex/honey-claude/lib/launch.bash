@@ -10,6 +10,26 @@ honey_claude_path_append() {
     export PATH
 }
 
+# honey_claude_idle_hooks_preflight <name> <settings>
+# The bots are unstowed, so --settings is their only hook source.  Without
+# claude-hook-idle-event on SessionStart and Stop, claude-warm never learns a
+# session or a turn ended and never compacts (2026-09-30: never once, for days).
+honey_claude_idle_hooks_preflight() {
+    local name="$1" settings="${2:-$HOME/.claude/settings.json}" event
+    for event in SessionStart Stop; do
+        jq -e --arg e "$event" \
+            '[.hooks[$e][]?.hooks[]?.command | split(" ")[0]] | index("claude-hook-idle-event") != null' \
+            "$settings" >/dev/null 2>&1 || {
+            printf '%s\n' "$name: refused: $settings does not register claude-hook-idle-event on $event (idle compaction would never run)" >&2
+            return 1
+        }
+    done
+    command -v claude-hook-idle-event >/dev/null 2>&1 || {
+        printf '%s\n' "$name: refused: claude-hook-idle-event is not on PATH (is it in the lane's SPARSE?)" >&2
+        return 1
+    }
+}
+
 # honey_claude_launch <bot> <model> [--telegram] [claude args...]
 honey_claude_launch() {
     local bot="$1" model="$2"
@@ -50,6 +70,8 @@ honey_claude_launch() {
 
     if [[ "$telegram" -eq 1 ]]; then
         honey_telegram_preflight "$name" "$state_dir" || return 1
+        honey_claude_idle_hooks_preflight "$name" \
+            "${CLAUDE_SETTINGS_FILE:-${LIB_DIR:+$LIB_DIR/../claude-settings.json}}" || return 1
     fi
     # Gillean's usage guard (preservation.bash); inert with a reason if it cannot bind.
     honey_claude_preservation_bindings "$name"
