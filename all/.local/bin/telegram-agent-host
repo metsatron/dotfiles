@@ -302,11 +302,38 @@ hermes_service_installed() {
     command -v systemctl >/dev/null 2>&1 && [ -f "$(hermes_service_unit)" ]
 }
 
+# Hermes records its own gateway identity as JSON (pid, kernel start-time ticks,
+# argv) in $HERMES_HOME/gateway.pid. That record, checked against /proc, is the
+# authority for "is the gateway up": matching the process name (pgrep -x hermes)
+# misses a gateway launched through the managed Python launcher (it runs as
+# python3) and false-positives on any other process named hermes, such as an
+# interactive session.
+HERMES_GATEWAY_PID_FILE="${HERMES_GATEWAY_PID_FILE:-${HERMES_HOME:-$HOME/.hermes}/gateway.pid}"
+
+hermes_gateway_pid() {
+    python3 - "$HERMES_GATEWAY_PID_FILE" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        record = json.load(handle)
+    pid = int(record["pid"])
+    with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
+        fields = handle.read().rsplit(")", 1)[1].split()
+    # A zombie has exited; only its parent has yet to reap it.
+    if fields[0] != "Z" and str(record["start_time"]) == fields[19]:
+        print(pid)
+except (OSError, ValueError, KeyError, IndexError, TypeError):
+    pass
+PY
+}
+
 hermes_running() {
     if hermes_service_installed && systemctl --user is-active --quiet hermes-gateway.service; then
         return 0
     fi
-    pgrep -x hermes >/dev/null 2>&1
+    [ -n "$(hermes_gateway_pid)" ]
 }
 
 start_hermes() {
@@ -321,18 +348,31 @@ start_hermes() {
     elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         echo "Installing supervised Hermes gateway service..."
         hermes gateway install --start-now --start-on-login
+    elif hermes_running; then
+        echo "hermes gateway is already running"
     else
-        echo "No user service manager available; starting Hermes gateway with nohup..."
-        nohup hermes gateway run > "$STATE_DIR/hermes.log" 2>&1 </dev/null &
+        echo "No user service manager available; starting Hermes gateway detached..."
+        nohup setsid hermes gateway run > "$STATE_DIR/hermes.log" 2>&1 </dev/null &
     fi
 }
 
 stop_hermes() {
     if hermes_service_installed; then
         systemctl --user stop hermes-gateway.service
-    else
-        pkill -x hermes 2>/dev/null || true
+        return
     fi
+    # Signal only the gateway Hermes recorded for itself; never every process
+    # named hermes, which would also end interactive sessions.
+    local pid
+    pid=$(hermes_gateway_pid)
+    [ -n "$pid" ] || return 0
+    kill -TERM "$pid" 2>/dev/null || true
+    for _ in {1..30}; do
+        [ "$(hermes_gateway_pid)" = "$pid" ] || return 0
+        sleep 1
+    done
+    echo "hermes gateway did not stop gracefully; forcing pid $pid" >&2
+    kill -KILL "$pid" 2>/dev/null || true
 }
 
 check_claudecode() {
