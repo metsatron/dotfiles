@@ -35,6 +35,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
     def tearDown(self) -> None:
         for pid_file in (
             self.state / "telegram-agents/ductor-supervise.pid",
+            self.state / "telegram-agents/codex-helmastra-telegram.pid",
             self.state / "gemma-pi-telegram/adapter.pid",
         ):
             if pid_file.exists():
@@ -99,6 +100,103 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
     def run_manager(self, *args: str, timeout: int = 10) -> subprocess.CompletedProcess[str]:
         return subprocess.run([str(MANAGER), *args], text=True, capture_output=True,
                               env=self.environment(timeout), timeout=timeout + 5)
+
+    def prepare_codex_supervisor(self, stop_delay: float = 1.5) -> subprocess.Popen[bytes]:
+        scripts = self.home / "HelmCortex/FORGE/scripts"
+        scripts.mkdir(parents=True)
+        adapter = scripts / "codex_telegram.py"
+        adapter.write_text(
+            "import signal, time\n"
+            "signal.signal(signal.SIGTERM, lambda *_: exit(0))\n"
+            "while True: time.sleep(1)\n",
+            encoding="utf-8",
+        )
+        supervisor = scripts / "codex_supervisor.py"
+        supervisor.write_text(
+            "import fcntl, os, pathlib, signal, subprocess, sys, time\n"
+            "state = pathlib.Path(os.environ['XDG_STATE_HOME']) / 'telegram-agents'\n"
+            "state.mkdir(parents=True, exist_ok=True)\n"
+            "pid_file = state / 'codex-helmastra-telegram.pid'\n"
+            "ready_file = state / 'codex-helmastra-telegram.ready'\n"
+            "child_file = state / 'codex-helmastra-telegram.child.ready'\n"
+            "lock = (state / 'codex-helmastra-telegram.supervisor.lock').open('a+')\n"
+            "fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "child = subprocess.Popen([sys.executable, str(pathlib.Path(__file__).with_name('codex_telegram.py'))])\n"
+            "pid_file.write_text(str(os.getpid()) + '\\n')\n"
+            "ready_file.write_text(str(os.getpid()) + '\\n')\n"
+            "child_file.write_text(str(child.pid) + '\\n')\n"
+            "def stop(*_):\n"
+            "    ready_file.unlink(missing_ok=True)\n"
+            "    child_file.unlink(missing_ok=True)\n"
+            "    child.terminate()\n"
+            "    time.sleep(float(os.environ.get('CODEX_TEST_STOP_DELAY', '0.1')))\n"
+            "    raise SystemExit(0)\n"
+            "signal.signal(signal.SIGTERM, stop)\n"
+            "while child.poll() is None: time.sleep(0.1)\n",
+            encoding="utf-8",
+        )
+        wrapper = self.forge_bin / "codex-helmastra"
+        wrapper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import fcntl, os, pathlib, subprocess, sys, time\n"
+            "state = pathlib.Path(os.environ['XDG_STATE_HOME']) / 'telegram-agents'\n"
+            "lock_path = state / 'codex-helmastra-telegram.supervisor.lock'\n"
+            "with lock_path.open('a+') as lock:\n"
+            "    try: fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    except BlockingIOError:\n"
+            "        print('supervisor lock is still held', file=sys.stderr)\n"
+            "        raise SystemExit(73)\n"
+            f"supervisor = {str(supervisor)!r}\n"
+            "process = subprocess.Popen([sys.executable, supervisor], stdin=subprocess.DEVNULL, "
+            "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)\n"
+            "pid_file = state / 'codex-helmastra-telegram.pid'\n"
+            "ready_file = state / 'codex-helmastra-telegram.ready'\n"
+            "child_file = state / 'codex-helmastra-telegram.child.ready'\n"
+            "for _ in range(100):\n"
+            "    if (pid_file.exists() and ready_file.exists() and child_file.exists() "
+            "and pid_file.read_text().strip() == str(process.pid) "
+            "and ready_file.read_text().strip() == str(process.pid)):\n"
+            "        raise SystemExit(0)\n"
+            "    if process.poll() is not None: break\n"
+            "    time.sleep(0.02)\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+        env = self.environment(2)
+        env["CODEX_TEST_STOP_DELAY"] = str(stop_delay)
+        process = subprocess.Popen(
+            ["python3", str(supervisor)], env=env, start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        ready_file = self.state / "telegram-agents/codex-helmastra-telegram.ready"
+        child_file = self.state / "telegram-agents/codex-helmastra-telegram.child.ready"
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and not (ready_file.exists() and child_file.exists()):
+            time.sleep(0.02)
+        self.assertTrue(ready_file.exists() and child_file.exists(), "fixture supervisor did not become ready")
+        return process
+
+    def test_codex_stop_waits_for_supervisor_after_readiness_disappears(self) -> None:
+        old_supervisor = self.prepare_codex_supervisor()
+        try:
+            stopped = self.run_manager("stop", "codex", timeout=4)
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+
+            # The supervisor removes readiness immediately on TERM but deliberately
+            # retains its exclusive launch lock while winding down. A correct stop
+            # must wait for that exact process, so an immediate start can acquire it.
+            started = self.run_manager("start", "codex", timeout=4)
+            self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+            old_supervisor.wait(timeout=2)
+            replacement = int(
+                (self.state / "telegram-agents/codex-helmastra-telegram.pid").read_text()
+            )
+            self.assertNotEqual(replacement, old_supervisor.pid)
+        finally:
+            if old_supervisor.poll() is None:
+                os.killpg(old_supervisor.pid, signal.SIGKILL)
+                old_supervisor.wait(timeout=5)
 
     def test_cold_supervisor_waits_for_delayed_child(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|ductor\n", encoding="utf-8")
@@ -168,7 +266,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertRegex(status.stdout, r"^pi-agent: RUNNING pid=\d+ \(gemma-pi-telegram\)\n$")
         self.assertNotIn("opencode", status.stdout)
 
-    def prepare_nanobot_wrapper(self) -> None:
+    def prepare_nanobot_wrapper(self, *, emit_ready: bool = True, stale_ready: bool = False) -> None:
         workspace = self.home / "HelmCortex/FORGE/brain/nanobot"
         workspace.mkdir(parents=True)
         config_dir = self.home / ".config/nanobot-telegram"
@@ -179,7 +277,15 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             encoding="utf-8",
         )
         log_file = config_dir / "gateway.log"
+        if stale_ready:
+            log_file.write_text(
+                "telegram | bot @helmcortex_nano_bot connected\n", encoding="utf-8"
+            )
         running = config_dir / "running"
+        ready_command = (
+            "printf '%s\\n' 'telegram | bot @helmcortex_nano_bot connected' >>\"$log\""
+            if emit_ready else ":"
+        )
         self.write_executable(
             "nanobot-telegram",
             "#!/bin/sh\n"
@@ -188,11 +294,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "case \"$1:$2\" in\n"
             "  gateway:status)\n"
             "    if [ -f \"$running\" ]; then printf 'Running: yes\\nPID: 4242\\n'; else printf 'Running: no\\n'; fi\n"
-            "    printf 'Logs: %s\\n' \"$log\"\n"
+            # Nanobot's rich renderer wraps long paths beneath the label in a
+            # narrow terminal; reproduce that real output shape here.
+            "    printf 'Logs:\\n%s\\n' \"$log\"\n"
             "    ;;\n"
             "  gateway:--background)\n"
             "    : >\"$running\"\n"
-            "    printf '%s\\n' 'telegram | bot @helmcortex_nano_bot connected' >>\"$log\"\n"
+            f"    {ready_command}\n"
             "    ;;\n"
             "  gateway:stop) rm -f \"$running\" ;;\n"
             "  *) exit 2 ;;\n"
@@ -218,6 +326,41 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(status.returncode, 1)
         self.assertIn("nanobot: STOPPED", status.stdout)
 
+    def test_nanobot_wrapper_imports_only_allowlisted_env_keys(self) -> None:
+        self.prepare_nanobot_wrapper()
+        venv_bin = self.home / "HelmCortex/FORGE/brain/nanobot/.venv/bin"
+        venv_bin.mkdir(parents=True)
+        probe = venv_bin / "nanobot"
+        probe.write_text(
+            "#!/bin/sh\n"
+            "printf 'url=%s cidr=%s other=%s\\n' \"$NANOBOT_RECALL_MCP_URL\" \"$NANOBOT_TAILNET_CIDR\" \"${NANOBOT_UNLISTED-unset}\"\n",
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        env_file = self.home / ".config/nanobot-telegram/env"
+        env_file.write_text(
+            "TELEGRAM_BOT_TOKEN=123456789:abcdefghijklmnopqrstuvwxyzABCDE\n"
+            "NANOBOT_RECALL_MCP_URL=http://recall.example:3004/mcp\n"
+            "NANOBOT_TAILNET_CIDR=192.0.2.0/24\n"
+            "NANOBOT_UNLISTED=leaked\n",
+            encoding="utf-8",
+        )
+        wrapper = Path(__file__).resolve().parents[3] / "bin" / "nanobot-telegram"
+        result = subprocess.run(
+            [str(wrapper), "gateway"],
+            env={"PATH": os.environ["PATH"], "HOME": str(self.home)},
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "url=http://recall.example:3004/mcp cidr=192.0.2.0/24 other=unset")
+
+    def test_managed_nanobot_template_holds_no_network_addresses(self) -> None:
+        template = Path(__file__).resolve().parents[4] / ".bots" / "templates" / "nanobot-config.json"
+        text = template.read_text(encoding="utf-8")
+        self.assertIn("${NANOBOT_RECALL_MCP_URL}", text)
+        self.assertIn("${NANOBOT_TAILNET_CIDR}", text)
+        self.assertIsNone(re.search(r"\b100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+", text))
+
     def test_nanobot_refuses_unprovisioned_token(self) -> None:
         self.prepare_nanobot_wrapper()
         (self.home / ".config/nanobot-telegram/env").write_text(
@@ -226,6 +369,31 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         result = self.run_manager("start", "nanobot", timeout=2)
         self.assertEqual(result.returncode, 1)
         self.assertIn("TELEGRAM_BOT_TOKEN is not provisioned", result.stderr)
+
+    def test_nanobot_rejects_stale_readiness_from_an_earlier_launch(self) -> None:
+        self.prepare_nanobot_wrapper(emit_ready=False, stale_ready=True)
+        self.write_executable("sleep", "#!/bin/sh\nexit 0\n")
+        result = self.run_manager("start", "nanobot", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("failed Telegram readiness", result.stderr)
+        self.assertFalse((self.home / ".config/nanobot-telegram/running").exists())
+
+    def test_nanobot_run_as_missing_user_refuses(self) -> None:
+        self.prepare_nanobot_wrapper()
+        run_as = self.home / ".config/nanobot-telegram/run-as"
+        run_as.write_text("agent-does-not-exist-2999\n", encoding="utf-8")
+        result = self.run_manager("start", "nanobot", timeout=2)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("nanobot run-as user is missing", result.stderr)
+
+    def test_nanobot_run_as_self_runs_locally(self) -> None:
+        import getpass
+        self.prepare_nanobot_wrapper()
+        run_as = self.home / ".config/nanobot-telegram/run-as"
+        run_as.write_text(getpass.getuser() + "\n", encoding="utf-8")
+        result = self.run_manager("status", "nanobot", timeout=2)
+        self.assertIn("nanobot: STOPPED", result.stdout)
+        self.assertNotIn("run-as user is missing", result.stderr)
 
     def test_sanitized_boot_binds_core_node_before_opencode_preflight(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|opencode\n", encoding="utf-8")
@@ -354,6 +522,21 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
         self.assertIn("private env file is missing", result.stderr)
+
+    def test_deepseek_harness_sync_refreshes_only_managed_profile_patch(self) -> None:
+        self.prepare_deepseek_harness([123])
+        template = self.agents / "templates/deepseek-harness-cordis.patch.yml"
+        template.write_text(template.read_text(encoding="utf-8") + "# refreshed\n", encoding="utf-8")
+
+        result = self.run_manager("sync", "deepseek-harness", timeout=2)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        profile = (
+            self.home
+            / ".local/share/deepseek-harness-telegram/dsh-home/profiles/helmcortex-telegram/cordis.patch.yml"
+        )
+        self.assertEqual(profile.read_text(encoding="utf-8"), template.read_text(encoding="utf-8"))
+        self.assertEqual(profile.stat().st_mode & 0o777, 0o600)
 
     def test_deepseek_harness_refuses_empty_allowlist(self) -> None:
         self.agents.joinpath("hosts.conf").write_text(f"{HOST}|deepseek-harness\n", encoding="utf-8")

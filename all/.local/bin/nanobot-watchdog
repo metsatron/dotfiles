@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Recover only an owned Nano gateway stuck in an NFS/RPC wait."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import socket
+import subprocess
+import time
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
+
+OWNER_NAME = re.compile(r"gateway\.[0-9a-f]+\.json\Z")
+NFS_WAIT = re.compile(r"(?:^|_)(?:nfs|rpc)(?:_|$)", re.I)
+SCHEMA = "dotcortex.nanobot-watchdog.v1"
+
+
+def read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_json(path: Path, value: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as stream:
+        json.dump(value, stream, sort_keys=True)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+
+
+def ledger(path: Path, action: str, **fields: object) -> None:
+    entry = {"schema": SCHEMA, "at": time.time(), "action": action,
+             **fields}
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(descriptor, "a", encoding="utf-8") as stream:
+        stream.write(json.dumps(entry, sort_keys=True) + "\n")
+
+
+def alert_route(config_dir: Path) -> tuple[str, str]:
+    config = read_json(config_dir / "config.json")
+    channels = config.get("channels", {})
+    telegram = channels.get("telegram", {}) if isinstance(channels, dict) else {}
+    pairing = read_json(config_dir / "pairing.json")
+    approved_map = pairing.get("approved", {})
+    approved = approved_map.get("telegram") if isinstance(approved_map, dict) else None
+    if not isinstance(telegram, dict) or telegram.get("enabled") is not True:
+        raise ValueError("telegram-disabled")
+    token = telegram.get("token")
+    if token == "${TELEGRAM_BOT_TOKEN}":
+        token = None
+        try:
+            for raw_line in (config_dir / "env").read_text(encoding="utf-8").splitlines():
+                key, separator, value = raw_line.partition("=")
+                if separator and key.strip() == "TELEGRAM_BOT_TOKEN" and value.strip():
+                    token = value.strip()
+                    break
+        except OSError:
+            token = None
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("telegram-token-unavailable")
+    if not isinstance(approved, list) or len(approved) != 1:
+        raise ValueError("telegram-recipient-cardinality")
+    recipient = approved[0]
+    if isinstance(recipient, bool) or not isinstance(recipient, (str, int)) or not str(recipient).strip():
+        raise ValueError("telegram-recipient-invalid")
+    return token, str(recipient)
+
+
+def send_alert(config_dir: Path, message: str, timeout: float) -> None:
+    token, recipient = alert_route(config_dir)
+    payload = urlencode({"chat_id": recipient, "text": message}).encode("utf-8")
+    request = Request(f"https://api.telegram.org/bot{token}/sendMessage",
+                      data=payload, method="POST")
+    with urlopen(request, timeout=timeout) as response:
+        if response.status != 200 or json.load(response).get("ok") is not True:
+            raise ValueError("telegram-send-rejected")
+
+
+def alert(args: argparse.Namespace, state: dict, event_path: Path,
+          kind: str, message: str) -> None:
+    # Record the attempt before network I/O so failed delivery is rate-limited.
+    now = time.time()
+    recent = state.get("last_alert", {})
+    if not isinstance(recent, dict):
+        recent = {}
+    try:
+        last = float(recent.get(kind, 0))
+    except (TypeError, ValueError):
+        last = 0
+    if now - last < args.alert_cooldown:
+        return
+    recent[kind] = now
+    state["last_alert"] = recent
+    try:
+        save_json(args.state_path, state)
+        ledger(event_path, "alert-attempted", kind=kind, telegram_delivery="attempted")
+        send_alert(args.config_dir, message, args.alert_timeout)
+    except Exception as exc:
+        # Never serialize exception text: HTTP errors can embed the token URL.
+        try:
+            ledger(event_path, "alert-failed", kind=kind, telegram_delivery="failed",
+                   error_class=type(exc).__name__)
+        except OSError:
+            pass
+    else:
+        try:
+            ledger(event_path, "alert-sent", kind=kind, telegram_delivery="sent")
+        except OSError:
+            pass
+
+
+def proc_start_ticks(stat_text: str) -> int:
+    # /proc/<pid>/stat field 22; comm can contain spaces and parentheses.
+    return int(stat_text.rsplit(") ", 1)[1].split()[19])
+
+
+def proc_identity(proc: Path) -> dict:
+    fields = (proc / "stat").read_text(encoding="utf-8").rsplit(") ", 1)[1].split()
+    return {
+        "pid": int(proc.name),
+        "ppid": int(fields[1]),
+        "pgrp": int(fields[2]),
+        "session": int(fields[3]),
+        "ticks": int(fields[19]),
+    }
+
+
+def blocked_task(proc: Path) -> dict | None:
+    task_root = proc / "task"
+    tasks = sorted((entry for entry in task_root.iterdir() if entry.name.isdigit()),
+                   key=lambda entry: int(entry.name))
+    for task in tasks:
+        status = (task / "status").read_text(encoding="utf-8")
+        state_match = re.search(r"^State:\s*([A-Z])", status, re.M)
+        wchan = (task / "wchan").read_text(encoding="utf-8").strip()
+        if state_match and state_match.group(1) == "D" and NFS_WAIT.search(wchan):
+            return {"tid": int(task.name), "state": "D", "wchan": wchan}
+    return None
+
+
+def descendant_of(pid: int, root_pid: int, parents: dict[int, int]) -> bool:
+    seen: set[int] = set()
+    current = pid
+    while current > 1 and current not in seen:
+        seen.add(current)
+        current = parents.get(current, 0)
+        if current == root_pid:
+            return True
+    return False
+
+
+def blocked_search_workers(proc_root: Path, gateway_pid: int) -> list[dict]:
+    identities: dict[int, dict] = {}
+    for proc in proc_root.iterdir():
+        if not proc.name.isdigit():
+            continue
+        try:
+            identity = proc_identity(proc)
+        except (OSError, ValueError):
+            continue
+        identities[identity["pid"]] = identity
+    parents = {pid: value["ppid"] for pid, value in identities.items()}
+    blocked = []
+    for pid, identity in identities.items():
+        proc = proc_root / str(pid)
+        try:
+            comm = (proc / "comm").read_text(encoding="utf-8").strip()
+            wait = blocked_task(proc)
+        except OSError:
+            continue
+        if (comm != "nanobot-search" or identity["pgrp"] != pid
+                or identity["session"] != pid
+                or not descendant_of(pid, gateway_pid, parents) or wait is None):
+            continue
+        blocked.append({**identity, **wait})
+    return sorted(blocked, key=lambda value: (value["ticks"], value["pid"], value["tid"]))
+
+
+def inspect(config_dir: Path, proc_root: Path) -> tuple[dict | None, str]:
+    if (config_dir / "run-as").exists():
+        return None, "run-as-lane"
+    run_dir = config_dir / "run"
+    owners = [p for p in run_dir.iterdir() if OWNER_NAME.fullmatch(p.name)] if run_dir.is_dir() else []
+    if len(owners) != 1:
+        return None, "owner-cardinality"
+    owner = read_json(owners[0])
+    try:
+        pid = int(owner["pid"])
+        if pid <= 1:
+            raise ValueError("invalid pid")
+        command = owner["command"]
+        expected_config = str(config_dir / "config.json")
+        expected_log = config_dir / "logs" / (owners[0].stem + ".log")
+        if (not isinstance(command, list) or command[:3] != [
+                command[0], "-m", "nanobot"] or "gateway" not in command
+                or "--foreground" not in command or "--config" not in command
+                or command[command.index("--config") + 1] != expected_config
+                or owner["config_path"] != expected_config
+                or owner["log_path"] != str(expected_log)):
+            return None, "owner-command-mismatch"
+        proc = proc_root / str(pid)
+        ticks = proc_start_ticks((proc / "stat").read_text(encoding="utf-8"))
+        if owner["identity"] != f"{pid}:{ticks}":
+            return None, "owner-pid-reused"
+        cmdline = (proc / "cmdline").read_bytes().replace(b"\0", b" ").strip()
+        if cmdline != b"nanobot-gateway":
+            return None, "process-command-mismatch"
+        status = (proc / "task" / str(pid) / "status").read_text(encoding="utf-8")
+        state_match = re.search(r"^State:\s*([A-Z])", status, re.M)
+        wchan = (proc / "task" / str(pid) / "wchan").read_text(encoding="utf-8").strip()
+        log = expected_log.stat()
+    except (KeyError, IndexError, OSError, TypeError, ValueError):
+        return None, "owner-or-proc-unreadable"
+    if not state_match:
+        return None, "process-state-unreadable"
+    workers = blocked_search_workers(proc_root, pid)
+    return {"pid": pid, "ticks": ticks, "state": state_match.group(1),
+            "wchan": wchan, "log_mtime_ns": log.st_mtime_ns,
+            "log_size": log.st_size, "log_inode": log.st_ino,
+            "blocked_worker": workers[0] if workers else None,
+            "owner": str(owners[0])}, "ok"
+
+
+def fingerprint(value: dict) -> list[object]:
+    worker = value.get("blocked_worker")
+    if isinstance(worker, dict):
+        return ["worker", value["pid"], value["ticks"], *[
+            worker[key] for key in ("pid", "ticks", "pgrp", "session", "tid", "wchan")
+        ]]
+    return ["gateway", *[value[key] for key in (
+        "pid", "ticks", "log_inode", "log_mtime_ns", "log_size"
+    )]]
+
+
+def assess(current: dict | None, reason: str, state: dict, now: float,
+           confirm_seconds: float, cooldown: float, max_failures: int) -> tuple[dict, dict]:
+    if current is None:
+        state.pop("suspect", None)
+        return {"status": "skip", "reason": reason}, state
+    blocked_worker = current.get("blocked_worker")
+    gateway_blocked = current["state"] == "D" and NFS_WAIT.search(current["wchan"])
+    if not isinstance(blocked_worker, dict) and not gateway_blocked:
+        state.pop("suspect", None)
+        return {"status": "healthy", "reason": "no-nfs-d-state"}, state
+    mark = fingerprint(current)
+    suspect = state.get("suspect")
+    if not isinstance(suspect, dict) or suspect.get("fingerprint") != mark:
+        state["suspect"] = {"fingerprint": mark, "since": now}
+        return {"status": "suspect", "reason": "confirmation-pending"}, state
+    if now - float(suspect["since"]) < confirm_seconds:
+        return {"status": "suspect", "reason": "confirmation-pending"}, state
+    if now - float(state.get("last_attempt", 0)) < cooldown:
+        return {"status": "skip", "reason": "cooldown"}, state
+    if int(state.get("failures", 0)) >= max_failures:
+        return {"status": "alert", "reason": "failure-cap"}, state
+    return {"status": "terminate-worker" if isinstance(blocked_worker, dict) else "recover",
+            "reason": "confirmed-search-worker-wedge" if isinstance(blocked_worker, dict)
+                      else "confirmed-nfs-wedge",
+            "pid": blocked_worker["pid"] if isinstance(blocked_worker, dict) else current["pid"],
+            "fingerprint": mark}, state
+
+
+def run_manager(manager: Path, verb: str, timeout: float) -> subprocess.CompletedProcess[str]:
+    return subprocess.run([str(manager), verb, "nanobot"], capture_output=True,
+                          text=True, timeout=timeout, check=False)
+
+
+def terminate_worker(args: argparse.Namespace, before: dict, state: dict,
+                     event_path: Path) -> dict:
+    fresh, reason = inspect(args.config_dir, args.proc_root)
+    worker = fresh.get("blocked_worker") if isinstance(fresh, dict) else None
+    if (fresh is None or fingerprint(fresh) != fingerprint(before)
+            or not isinstance(worker, dict)):
+        return {"status": "skip", "reason": f"worker-changed-before-signal:{reason}"}
+    state["last_attempt"] = time.time()
+    state.pop("suspect", None)
+    try:
+        os.killpg(worker["pgrp"], signal.SIGKILL)
+    except OSError as exc:
+        state["failures"] = int(state.get("failures", 0)) + 1
+        save_json(args.state_path, state)
+        ledger(event_path, "worker-termination-failed", pid=worker["pid"],
+               error_class=type(exc).__name__)
+        alert(args, state, event_path, "worker-termination-failed",
+              f"Nano watchdog on {socket.gethostname()}: isolated search worker could not be signalled; operator review needed.")
+        return {"status": "alert", "reason": "search-worker-signal-failed"}
+    state["failures"] = 0
+    save_json(args.state_path, state)
+    ledger(event_path, "worker-termination-requested", pid=worker["pid"],
+           pgrp=worker["pgrp"], tid=worker["tid"], gateway_pid=before["pid"])
+    alert(args, state, event_path, "worker-termination-requested",
+          f"Nano watchdog on {socket.gethostname()}: isolated search worker termination requested; gateway left online.")
+    return {"status": "worker-termination-requested",
+            "reason": "confirmed-search-worker-wedge", "pid": worker["pid"]}
+
+
+def recover(args: argparse.Namespace, before: dict, state: dict, event_path: Path) -> dict:
+    fresh, reason = inspect(args.config_dir, args.proc_root)
+    if fresh is None or fingerprint(fresh) != fingerprint(before) or fresh["state"] != "D" or not NFS_WAIT.search(fresh["wchan"]):
+        return {"status": "skip", "reason": f"changed-before-restart:{reason}"}
+    state["last_attempt"] = time.time()
+    save_json(args.state_path, state)
+    ledger(event_path, "recovery-attempt", pid=before["pid"])
+    try:
+        stopped = run_manager(args.manager, "stop", args.command_timeout)
+    except subprocess.TimeoutExpired:
+        stopped = None
+    if stopped is None or stopped.returncode != 0 or (args.proc_root / str(before["pid"])).exists():
+        state["failures"] = int(state.get("failures", 0)) + 1
+        save_json(args.state_path, state)
+        ledger(event_path, "recovery-failed", pid=before["pid"], phase="stop")
+        alert(args, state, event_path, "recovery-failed",
+              f"Nano watchdog on {socket.gethostname()}: recovery failed at stop; operator review needed.")
+        return {"status": "alert", "reason": "nano-did-not-stop"}
+    try:
+        started = run_manager(args.manager, "start", args.command_timeout)
+    except subprocess.TimeoutExpired:
+        started = None
+    after, _ = inspect(args.config_dir, args.proc_root)
+    success = (started is not None and started.returncode == 0 and after is not None
+               and [after["pid"], after["ticks"]] != [before["pid"], before["ticks"]])
+    state["failures"] = 0 if success else int(state.get("failures", 0)) + 1
+    state.pop("suspect", None)
+    save_json(args.state_path, state)
+    ledger(event_path, "recovered" if success else "recovery-failed",
+           old_pid=before["pid"], new_pid=after["pid"] if after else None,
+           phase="start")
+    alert(args, state, event_path, "recovered" if success else "recovery-failed",
+          f"Nano watchdog on {socket.gethostname()}: "
+          + ("nanobot recovered." if success else "recovery failed at start; operator review needed."))
+    return {"status": "recovered" if success else "alert",
+            "reason": "nano-restarted" if success else "nano-did-not-start"}
+
+
+def run(args: argparse.Namespace, now: float | None = None) -> dict:
+    if socket.gethostname() != args.expected_host:
+        return {"status": "skip", "reason": "wrong-host"}
+    now = time.time() if now is None else now
+    if not args.dry_run:
+        args.state_path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock_path = args.state_path.with_name("watchdog.lock")
+    with lock_path.open("a+", encoding="utf-8") if not args.dry_run else open(os.devnull) as lock:
+        if not args.dry_run:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return {"status": "skip", "reason": "already-running"}
+        before, reason = inspect(args.config_dir, args.proc_root)
+        state = read_json(args.state_path)
+        decision, state = assess(before, reason, state, now, args.confirm_seconds,
+                                 args.cooldown, args.max_failures)
+        if args.dry_run:
+            return {**decision, "status": "dry-run" if decision["status"] == "recover" else decision["status"]}
+        save_json(args.state_path, state)
+        if decision["status"] == "terminate-worker" and before is not None:
+            return terminate_worker(args, before, state,
+                                    args.state_path.with_name("events.jsonl"))
+        if decision["status"] == "recover" and before is not None:
+            return recover(args, before, state, args.state_path.with_name("events.jsonl"))
+        if decision["status"] == "alert":
+            event_path = args.state_path.with_name("events.jsonl")
+            ledger(event_path, "failure-cap")
+            alert(args, state, event_path, "failure-cap",
+                  f"Nano watchdog on {socket.gethostname()}: recovery failure cap reached; operator review needed.")
+        return decision
+
+
+def parser() -> argparse.ArgumentParser:
+    home = Path.home()
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--expected-host")
+    p.add_argument("--config-dir", type=Path, default=home / ".config/nanobot-telegram")
+    p.add_argument("--proc-root", type=Path, default=Path("/proc"))
+    p.add_argument("--state-path", type=Path, default=home / ".local/state/nanobot-watchdog/state.json")
+    p.add_argument("--manager", type=Path, default=home / ".local/bin/telegram-agent-host")
+    p.add_argument("--confirm-seconds", type=float, default=300)
+    p.add_argument("--cooldown", type=float, default=900)
+    p.add_argument("--max-failures", type=int, default=3)
+    p.add_argument("--command-timeout", type=float, default=75)
+    p.add_argument("--alert-timeout", type=float, default=5)
+    p.add_argument("--alert-cooldown", type=float, default=900)
+    p.add_argument("--check-alert-route", action="store_true")
+    p.add_argument("--dry-run", action="store_true")
+    return p
+
+
+if __name__ == "__main__":
+    args = parser().parse_args()
+    if args.check_alert_route:
+        try:
+            alert_route(args.config_dir)
+        except ValueError as exc:
+            print(json.dumps({"schema": SCHEMA, "status": "blocked", "reason": str(exc)}, sort_keys=True))
+            raise SystemExit(1)
+        print(json.dumps({"schema": SCHEMA, "status": "ready"}, sort_keys=True))
+    else:
+        if not args.expected_host:
+            raise SystemExit("--expected-host EXACT_HOST is required")
+        print(json.dumps({"schema": SCHEMA, **run(args)}, sort_keys=True))
