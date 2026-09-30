@@ -21,8 +21,9 @@ PERSONAS = {"opus": "Bunta", "sonnet": "Sasuke", "haiku": "Shoukichi"}
 
 
 class Home:
-    def __init__(self, plugin_enabled=True, boundary=True, account=True):
+    def __init__(self, plugin_enabled=True, boundary=True, account=True, idle_hooks=True):
         self.plugin_enabled = plugin_enabled
+        self.idle_hooks = idle_hooks
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
         self.bin = Path(self.tmp.name) / "bin"
@@ -34,7 +35,8 @@ class Home:
         if account:
             (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "test-account"}}))
         # No ~/.claude/settings.json: the lane's claude-settings.json enables the plugin.
-        # A disabled plugin is simulated by pointing the preflight at a settings file that says so.
+        # A disabled plugin, or settings without the idle hooks, is simulated by pointing the
+        # preflights at a settings file that says so.
         self.settings = Path(self.tmp.name) / "settings.json"
         self.settings.write_text(json.dumps({"enabledPlugins": {"telegram@claude-plugins-official": plugin_enabled}}))
         plugin = self.home / ".claude/plugins/cache/claude-plugins-official/telegram/0.0.6"
@@ -68,7 +70,7 @@ class Home:
     def run(self, bot, *args):
         env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
                "XDG_RUNTIME_DIR": str(self.xdg)}
-        if not self.plugin_enabled:
+        if not self.plugin_enabled or not self.idle_hooks:
             env["CLAUDE_SETTINGS_FILE"] = str(self.settings)
         return subprocess.run([str(BIN / f"honey-{bot}"), *args], capture_output=True,
                               text=True, env=env)
@@ -180,6 +182,17 @@ class LauncherTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("not enabled", result.stderr)
             self.assertNotIn("dummy-test-value", result.stdout + result.stderr)
+            self.assertFalse(box.record.exists())
+        finally:
+            box.close()
+
+    def test_refuses_without_idle_hooks(self):
+        # 2026-09-30: a bot that cannot tell claude-warm its turns ended never compacts.
+        box = Home(idle_hooks=False)
+        try:
+            result = box.run("sonnet", "--telegram")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("claude-hook-idle-event", result.stderr)
             self.assertFalse(box.record.exists())
         finally:
             box.close()
@@ -321,6 +334,29 @@ class SparseTests(unittest.TestCase):
         settings = json.loads((SHARE / "claude-settings.json").read_text())
         stop = [h["command"] for g in settings["hooks"].get("Stop", []) for h in g["hooks"]]
         self.assertIn("claude-hook-telegram-delivery-guard", stop)
+
+    def test_settings_register_the_idle_hook_wherever_the_fleet_does(self):
+        # 2026-09-30: the lane shipped without it and no bot ever compacted.  The bots are
+        # unstowed, so the fleet's ~/.claude/settings.json never reaches them: mirror it here.
+        # The fleet's settings are a gitignored tangle output: read their org source block.
+        org = (ROOT / "agents-hooks.org").read_text()
+        block = re.search(r"#\+BEGIN_SRC json :tangle all/\.claude/settings\.shared\.json[^\n]*\n(.*?)\n#\+END_SRC",
+                          org, re.S)
+        fleet = json.loads(block.group(1))
+        lane = json.loads((SHARE / "claude-settings.json").read_text())
+
+        def idle_matchers(settings, event):
+            return {g.get("matcher") for g in settings["hooks"].get(event, [])
+                    if any(h["command"].split()[0] == "claude-hook-idle-event" for h in g["hooks"])}
+
+        events = [e for e in fleet["hooks"] if idle_matchers(fleet, e)]
+        self.assertTrue({"SessionStart", "Stop", "PostCompact"} <= set(events), events)
+        for event in events:
+            lane_matchers = idle_matchers(lane, event)
+            if None in lane_matchers:
+                continue  # an unmatched group sees every occurrence of the event
+            self.assertTrue(idle_matchers(fleet, event) <= lane_matchers,
+                            f"{event}: the lane does not register claude-hook-idle-event where the fleet does")
 
     def test_settings_enable_the_telegram_plugin(self):
         # The preflight reads this file, not the agent account's ~/.claude/settings.json.
