@@ -239,8 +239,10 @@ class Session:
         compact_timeout=900,
         preservation=False,
         preservation_mode="directive",
+        lifecycle_wait=180,
     ):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
+        self.environment = None
         self.fake = self.root / "fake-claude"
         self.fake.write_text(FAKE_CLAUDE, encoding="utf-8")
         self.fake.chmod(0o700)
@@ -271,8 +273,10 @@ class Session:
                 "CLAUDE_IDLE_CHANNEL_RECOVERY_CONFIRM_SECONDS": str(recovery_confirm),
                 "CLAUDE_IDLE_COMPACT_RETRY_SECONDS": str(retry),
                 "CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS": str(compact_timeout),
+                "CLAUDE_IDLE_LIFECYCLE_WAIT_SECONDS": str(lifecycle_wait),
             }
         )
+        self.environment = environment
         if preservation:
             environment.update({
                 "CLAUDE_WARM_PRESERVATION_BRIDGE": str(self.preservation_bridge),
@@ -494,6 +498,39 @@ class ClaudeWarmTests(unittest.TestCase):
         session = Session(**kwargs)
         self.sessions.append(session)
         return session
+
+    def test_session_without_lifecycle_hooks_is_flagged_loudly(self):
+        """No hook event after launch means the idle timer can never arm (2026-09-30)."""
+        session = self.make_session(lifecycle_wait=1)
+        alarm = session.root / "state" / "claude-idle-compaction" / f"{session.channel}.LIFECYCLE-HOOKS-MISSING"
+        wait_until(lambda: (session.read_state() or {}).get("lifecycle_health") == "missing",
+                   message="an unwired session was not flagged")
+        state = session.read_state()
+        self.assertEqual(state["last_state_transition"], "lifecycle-hooks-missing")
+        self.assertTrue(alarm.is_file())
+        self.assertEqual(json.loads(alarm.read_text())["channel"], session.channel)
+        listed = subprocess.run([str(WARM), "--control", "list"], capture_output=True, text=True,
+                                env=session.environment, timeout=10)
+        self.assertIn("claude-hook-idle-event is not wired", listed.stderr)
+        # A late first event (hooks fixed, or Claude got past a blocking prompt) clears it.
+        session.event("session-start", transcript_path=str(session.transcript))
+        self.assertEqual(session.read_state()["lifecycle_health"], "wired")
+        self.assertFalse(alarm.exists())
+
+    def test_channel_session_records_missing_lifecycle_hooks_in_guard_log(self):
+        session = self.make_session(channel=True, spawn_channel=True, lifecycle_wait=1)
+        wait_until(lambda: any(e.get("event") == "lifecycle-hooks-missing" for e in session.guard_events()),
+                   message="the guard log did not record the unwired session")
+        session.event("session-start", transcript_path=str(session.transcript))
+        wait_until(lambda: any(e.get("event") == "lifecycle-hooks-recovered" for e in session.guard_events()),
+                   message="the guard log did not record the recovery")
+
+    def test_wired_session_is_never_flagged(self):
+        session = self.make_session(lifecycle_wait=1)
+        session.event("session-start", transcript_path=str(session.transcript))
+        time.sleep(1.5)
+        self.assertEqual(session.read_state()["lifecycle_health"], "wired")
+        self.assertFalse(any(e.get("event") == "lifecycle-hooks-missing" for e in session.guard_events()))
 
     def test_herdr_registration_uses_supported_pane_contract(self):
         """The PTY owner reports logical identity and releases it cleanly."""
