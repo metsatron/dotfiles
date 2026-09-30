@@ -948,6 +948,21 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertIn("deepseek-harness:", result.stdout)
         self.assertNotIn("run-as user is missing", result.stderr)
 
+    def test_codex_managed_start_clears_inherited_runtime_policy(self) -> None:
+        source = MANAGER.read_text(encoding="utf-8")
+        codex_start = source.split("        codex)\n", 1)[1].split(
+            "        deepseek-harness)", 1
+        )[0]
+        for name in (
+            "CODEX_HELMASTRA_MODEL",
+            "CODEX_TELEGRAM_MODEL",
+            "CODEX_HELMASTRA_EFFORT",
+            "CODEX_TELEGRAM_EFFORT",
+            "CODEX_TELEGRAM_APPROVAL_POLICY",
+            "CODEX_TELEGRAM_APPROVALS_REVIEWER",
+        ):
+            self.assertIn(f"-u {name}", codex_start)
+
 
 if __name__ == "__main__":
     unittest.main()
