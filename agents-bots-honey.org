@@ -160,6 +160,26 @@ honey_claude_path_append() {
     export PATH
 }
 
+# honey_claude_idle_hooks_preflight <name> <settings>
+# The bots are unstowed, so --settings is their only hook source.  Without
+# claude-hook-idle-event on SessionStart and Stop, claude-warm never learns a
+# session or a turn ended and never compacts (2026-09-30: never once, for days).
+honey_claude_idle_hooks_preflight() {
+    local name="$1" settings="${2:-$HOME/.claude/settings.json}" event
+    for event in SessionStart Stop; do
+        jq -e --arg e "$event" \
+            '[.hooks[$e][]?.hooks[]?.command | split(" ")[0]] | index("claude-hook-idle-event") != null' \
+            "$settings" >/dev/null 2>&1 || {
+            printf '%s\n' "$name: refused: $settings does not register claude-hook-idle-event on $event (idle compaction would never run)" >&2
+            return 1
+        }
+    done
+    command -v claude-hook-idle-event >/dev/null 2>&1 || {
+        printf '%s\n' "$name: refused: claude-hook-idle-event is not on PATH (is it in the lane's SPARSE?)" >&2
+        return 1
+    }
+}
+
 # honey_claude_launch <bot> <model> [--telegram] [claude args...]
 honey_claude_launch() {
     local bot="$1" model="$2"
@@ -200,6 +220,8 @@ honey_claude_launch() {
 
     if [[ "$telegram" -eq 1 ]]; then
         honey_telegram_preflight "$name" "$state_dir" || return 1
+        honey_claude_idle_hooks_preflight "$name" \
+            "${CLAUDE_SETTINGS_FILE:-${LIB_DIR:+$LIB_DIR/../claude-settings.json}}" || return 1
     fi
     # Gillean's usage guard (preservation.bash); inert with a reason if it cannot bind.
     honey_claude_preservation_bindings "$name"
@@ -559,15 +581,40 @@ if __name__ == "__main__":
   },
   "enabledPlugins": {"telegram@claude-plugins-official": true},
   "hooks": {
+    "SessionStart": [
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
+    ],
     "UserPromptSubmit": [
-      {"hooks": [{"type": "command", "command": "claude-hook-voice-transcribe", "timeout": 600}]}
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10},
+                 {"type": "command", "command": "claude-hook-voice-transcribe", "timeout": 600}]}
+    ],
+    "PreCompact": [
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
+    ],
+    "PostCompact": [
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
+    ],
+    "Notification": [
+      {"matcher": "permission_prompt|elicitation_dialog",
+       "hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
+    ],
+    "PreToolUse": [
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
     ],
     "PostToolUse": [
       {"matcher": "mcp__plugin_telegram_telegram__reply",
-       "hooks": [{"type": "command", "command": "honey-claude-voice-reply", "timeout": 10}]}
+       "hooks": [{"type": "command", "command": "honey-claude-voice-reply", "timeout": 10}]},
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
     ],
     "Stop": [
-      {"hooks": [{"type": "command", "command": "claude-hook-telegram-delivery-guard", "timeout": 10}]}
+      {"hooks": [{"type": "command", "command": "claude-hook-telegram-delivery-guard", "timeout": 10},
+                 {"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
+    ],
+    "StopFailure": [
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
+    ],
+    "SessionEnd": [
+      {"hooks": [{"type": "command", "command": "claude-hook-idle-event", "timeout": 10}]}
     ]
   }
 }
@@ -702,6 +749,9 @@ The lane declares its own path list, =<lane>/SPARSE=, traced from what the launc
 - =claude-warmctl=, the control command the OpenRC body's header names (=claude-warm --control=);
 - =claude-hook-voice-transcribe=, the =UserPromptSubmit= hook in =claude-settings.json= (standard library only; it runs =$WHISPER_TRANSCRIBE=, which the launcher points at the lane's own =honey-whisper-transcribe=).
 - =claude-hook-telegram-delivery-guard=, the =Stop= hook in =claude-settings.json= (bash and =python3= only): a bot whose turn ends without calling the Telegram reply tool gets one more turn, so an answer never stays in a transcript nobody reads. Its first gate is =CLAUDE_IDLE_CHANNEL=, which =claude-warm= exports to the session.
+- =claude-hook-idle-event=, the lifecycle adapter every =claude-warm= session needs (bash, =jq= and =python3= only). It is registered on every event where the fleet's own settings register it ([[file:agents-hooks.org][agents-hooks.org]], =all/.claude/settings.shared.json=); without it =claude-warm= never sees a session start or a turn end, so its idle timer never arms and the bots never compact.
+
+*Incident, 2026-09-30.* The lane shipped without this hook: =SPARSE= did not carry it and =claude-settings.json= did not register it. On a stowed host the hook reaches Claude through =~/.claude/settings.json=; the bots are unstowed, their =~/.claude/settings.json= is empty, and =--settings= is their only hook source. All three supervisors sat at =status: starting= from their first launch (2026-09-26) and never compacted once. Three guards now stop a repeat: the tests require every idle-event registration of the fleet's settings in the lane's settings; the launcher refuses to start a Telegram bot whose settings lack the hook or whose =PATH= cannot find it; and =claude-warm= itself records =lifecycle-hooks-missing= when a supervised session sends no lifecycle event after launch ([[file:agents-claude-idle-supervisor.org][agents-claude-idle-supervisor.org]]).
 
 Everything else the bots call comes from the host or =agent-claude='s own profiles, never from DotCortex: =jq=, =sha256sum=, =ffmpeg=, =whisper-cli=, =~/kitten-venv=, =claude= and =bun= (=~/.npm-global=), node (agent Guix profile), and the preservation bridge from the HelmCortex skills mirror. The tests fail if a lane file names an =all/.local/bin= command or an =all/= path that =SPARSE= does not carry, so widening the lane means widening this list.
 
@@ -712,6 +762,7 @@ Everything else the bots call comes from the host or =agent-claude='s own profil
 /all/.local/bin/claude-warmctl
 /all/.local/bin/claude-hook-voice-transcribe
 /all/.local/bin/claude-hook-telegram-delivery-guard
+/all/.local/bin/claude-hook-idle-event
 #+END_SRC
 
 ** Installer
@@ -980,7 +1031,8 @@ Agent accounts get rows (or an agent-user registry) only once the agent-user wal
 Run with =python3 all/.local/share/dotcortex/tests/test-honey-claude-bots.py -v= from the repo root. No root, no network, no stow into =$HOME=: each launcher runs against a scratch home with a fake =claude-warm= that records its arguments and environment, and a dummy token file.
 
 - The three launchers pass the right model, =--permission-mode acceptEdits=, a standing allow for the Telegram plugin's tools (Haiku has no auto mode, so without it every reply waited for a human approval; 2026-09-26), the official Telegram channel, =TELEGRAM_STATE_DIR= and a distinct herdr agent name, start in =~/honey-work/<bot>=, and write their pid file.
-- They refuse without the boundary =CLAUDE.md=, and without an enabled Telegram plugin.
+- They refuse without the boundary =CLAUDE.md=, without an enabled Telegram plugin, and without =claude-hook-idle-event= registered on =SessionStart= and =Stop=.
+- =claude-settings.json= registers =claude-hook-idle-event= on every event (and matcher) where the fleet's =all/.claude/settings.shared.json= ([[file:agents-hooks.org][agents-hooks.org]]) does, so the bots' idle compaction can never again be silently unwired (2026-09-30).
 - One OpenRC body serves the three services; it parses under =sh -n=, never =need net=, never assigns =PATH= outright, runs the launcher from the system checkout and refuses one the bot could edit. The installer's dry-run changes nothing, and a real run refuses a user's checkout.
 - =SPARSE= carries every =all/.local/bin= command and =all/= path a carried file names (so a launcher can never reach outside the sparse checkout), the launcher's fleet =bin= is the sparse one, the settings hooks resolve inside it, and =sync --dry-run= plans a blobless, non-cone sparse clone and creates nothing.
 - The lane is never stowed: no =honey/= launchers remain, =all/.stow-local-ignore= names the lane, and no active host's resolved stack plans a link into it (or a folded parent that would expose it).
@@ -1008,8 +1060,9 @@ PERSONAS = {"opus": "Bunta", "sonnet": "Sasuke", "haiku": "Shoukichi"}
 
 
 class Home:
-    def __init__(self, plugin_enabled=True, boundary=True, account=True):
+    def __init__(self, plugin_enabled=True, boundary=True, account=True, idle_hooks=True):
         self.plugin_enabled = plugin_enabled
+        self.idle_hooks = idle_hooks
         self.tmp = tempfile.TemporaryDirectory()
         self.home = Path(self.tmp.name) / "home"
         self.bin = Path(self.tmp.name) / "bin"
@@ -1021,7 +1074,8 @@ class Home:
         if account:
             (self.home / ".claude.json").write_text(json.dumps({"oauthAccount": {"accountUuid": "test-account"}}))
         # No ~/.claude/settings.json: the lane's claude-settings.json enables the plugin.
-        # A disabled plugin is simulated by pointing the preflight at a settings file that says so.
+        # A disabled plugin, or settings without the idle hooks, is simulated by pointing the
+        # preflights at a settings file that says so.
         self.settings = Path(self.tmp.name) / "settings.json"
         self.settings.write_text(json.dumps({"enabledPlugins": {"telegram@claude-plugins-official": plugin_enabled}}))
         plugin = self.home / ".claude/plugins/cache/claude-plugins-official/telegram/0.0.6"
@@ -1055,7 +1109,7 @@ class Home:
     def run(self, bot, *args):
         env = {"HOME": str(self.home), "PATH": f"{self.bin}:/usr/bin:/bin",
                "XDG_RUNTIME_DIR": str(self.xdg)}
-        if not self.plugin_enabled:
+        if not self.plugin_enabled or not self.idle_hooks:
             env["CLAUDE_SETTINGS_FILE"] = str(self.settings)
         return subprocess.run([str(BIN / f"honey-{bot}"), *args], capture_output=True,
                               text=True, env=env)
@@ -1167,6 +1221,17 @@ class LauncherTests(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("not enabled", result.stderr)
             self.assertNotIn("dummy-test-value", result.stdout + result.stderr)
+            self.assertFalse(box.record.exists())
+        finally:
+            box.close()
+
+    def test_refuses_without_idle_hooks(self):
+        # 2026-09-30: a bot that cannot tell claude-warm its turns ended never compacts.
+        box = Home(idle_hooks=False)
+        try:
+            result = box.run("sonnet", "--telegram")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("claude-hook-idle-event", result.stderr)
             self.assertFalse(box.record.exists())
         finally:
             box.close()
@@ -1308,6 +1373,29 @@ class SparseTests(unittest.TestCase):
         settings = json.loads((SHARE / "claude-settings.json").read_text())
         stop = [h["command"] for g in settings["hooks"].get("Stop", []) for h in g["hooks"]]
         self.assertIn("claude-hook-telegram-delivery-guard", stop)
+
+    def test_settings_register_the_idle_hook_wherever_the_fleet_does(self):
+        # 2026-09-30: the lane shipped without it and no bot ever compacted.  The bots are
+        # unstowed, so the fleet's ~/.claude/settings.json never reaches them: mirror it here.
+        # The fleet's settings are a gitignored tangle output: read their org source block.
+        org = (ROOT / "agents-hooks.org").read_text()
+        block = re.search(r"#\+BEGIN_SRC json :tangle all/\.claude/settings\.shared\.json[^\n]*\n(.*?)\n#\+END_SRC",
+                          org, re.S)
+        fleet = json.loads(block.group(1))
+        lane = json.loads((SHARE / "claude-settings.json").read_text())
+
+        def idle_matchers(settings, event):
+            return {g.get("matcher") for g in settings["hooks"].get(event, [])
+                    if any(h["command"].split()[0] == "claude-hook-idle-event" for h in g["hooks"])}
+
+        events = [e for e in fleet["hooks"] if idle_matchers(fleet, e)]
+        self.assertTrue({"SessionStart", "Stop", "PostCompact"} <= set(events), events)
+        for event in events:
+            lane_matchers = idle_matchers(lane, event)
+            if None in lane_matchers:
+                continue  # an unmatched group sees every occurrence of the event
+            self.assertTrue(idle_matchers(fleet, event) <= lane_matchers,
+                            f"{event}: the lane does not register claude-hook-idle-event where the fleet does")
 
     def test_settings_enable_the_telegram_plugin(self):
         # The preflight reads this file, not the agent account's ~/.claude/settings.json.
