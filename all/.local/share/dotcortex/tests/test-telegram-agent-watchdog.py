@@ -95,11 +95,18 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.starts(), [])
         self.assertEqual({e["kind"] for e in self.events()}, {"probe_unknown"})
 
-    def test_failed_status_call_never_relaunches(self) -> None:
-        self.set_status("STOPPED", "STOPPED")
+    def test_empty_status_output_never_relaunches(self) -> None:
+        (self.root / "status").write_text("")
         (self.root / "status_fail").write_text("")
         self.run_watchdog()
         self.assertEqual(self.starts(), [])
+
+    def test_status_lines_are_read_even_when_the_status_call_exits_nonzero(self) -> None:
+        # The real host exits 1 when any agent is degraded; the other agents' lines still count.
+        self.set_status("RUNNING", "STOPPED")
+        (self.root / "status_fail").write_text("")
+        self.run_watchdog()
+        self.assertEqual(self.starts(), ["codex"])
 
     def test_attempt_cap_holds_and_alerts_once(self) -> None:
         self.set_status("RUNNING", "STOPPED")
