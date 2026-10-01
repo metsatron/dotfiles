@@ -56,6 +56,10 @@ class FakeHost:
             Path(argv[-1]).mkdir(parents=True, exist_ok=True)
         elif argv[:2] == ["install", "-m"] or argv[:2] == ["cp", "-a"]:
             shutil.copyfile(argv[-2], argv[-1])
+            if argv[0] == "install":
+                Path(argv[-1]).chmod(int(argv[2], 8))
+        elif argv[0] in ("run-parts", "sh"):
+            return subprocess.run(argv, text=True, capture_output=True, check=True).stdout
         elif argv == ["nmcli", "general", "reload", "dns-rc"]:
             if self.rewrite:
                 self.resolver.write_text(NM_HEADER + "\nchanged\n")
@@ -218,6 +222,65 @@ class DnsOwnershipTests(unittest.TestCase):
         result = subprocess.run([str(SCRIPT), "--help"], text=True, capture_output=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--apply", result.stdout)
+
+
+class DhclientOwnershipTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.host = FakeHost(self.root)
+        self.host.target = self.root / "etc/dhcp/dhclient-enter-hooks.d/zz-dotcortex-tailscale-dns"
+        self.host.target.parent.mkdir(parents=True)
+        self.host.template.write_text(MODULE["DHCLIENT_EXPECTED"])
+        self.host.resolver.write_text(TS_HEADER + "\n")
+        script = self.root / "sbin/dhclient-script"
+        script.parent.mkdir()
+        script.write_text("make_resolv_conf() { :; }\nrun_hookdir /etc/dhcp/dhclient-enter-hooks.d\n")
+        self.setup = Setup(self.root, self.host, self.host.template, owner="dhclient")
+        self.output = contextlib.redirect_stdout(io.StringIO())
+        self.output.__enter__()
+        self.addCleanup(self.output.__exit__, None, None, None)
+
+    def test_dhclient_hook_installed_without_nm_or_dns_toggle(self):
+        before = self.host.resolver.read_bytes()
+        self.setup.apply()
+        self.assertEqual(self.host.target.read_text(), MODULE["DHCLIENT_EXPECTED"])
+        self.assertEqual(self.host.resolver.read_bytes(), before)
+        self.assertFalse(any(cmd[0] == "nmcli" or cmd[:2] == ["tailscale", "set"] for cmd, _ in self.host.calls))
+        self.assertTrue(any(cmd[0] == "sh" for cmd, _ in self.host.calls))
+        self.assertEqual((self.setup.checkpoint / "resolv.conf").read_bytes(), before)
+
+    def test_dhclient_hook_overrides_a_failing_writer(self):
+        code = 'make_resolv_conf() { return 71; }; make_resolv_conf'
+        baseline = subprocess.run(["sh", "-c", code], capture_output=True)
+        self.assertEqual(baseline.returncode, 71)
+        self.setup.apply()
+        subprocess.run(["sh", "-c", 'make_resolv_conf() { return 71; }; . "$1"; make_resolv_conf', "check", str(self.host.target)], check=True)
+
+    def test_dhclient_repeat_apply_has_no_mutations(self):
+        self.setup.apply()
+        self.host.calls.clear()
+        self.setup.apply()
+        self.assertFalse(any(cmd[0] in ("install", "cp", "nmcli") or cmd[:2] == ["tailscale", "set"] for cmd, _ in self.host.calls))
+
+    def test_nm_surface_prevents_dhclient_selection(self):
+        (self.root / "etc/NetworkManager").mkdir()
+        with self.assertRaisesRegex(ContractError, "reconcile substrate"):
+            self.setup.apply()
+        self.assertFalse(self.host.target.exists())
+
+    def test_incompatible_packaged_script_is_not_modified(self):
+        (self.root / "sbin/dhclient-script").write_text("unknown contract\n")
+        with self.assertRaisesRegex(ContractError, "verified enter-hook contract"):
+            self.setup.apply()
+        self.assertFalse(self.host.target.exists())
+
+    def test_later_hook_is_a_blocker_before_mutation(self):
+        (self.host.target.parent / "zzz-other-owner").write_text("competing owner\n")
+        with self.assertRaisesRegex(ContractError, "later dhclient hook"):
+            self.setup.apply()
+        self.assertFalse(self.host.target.exists())
 
 
 if __name__ == "__main__":
