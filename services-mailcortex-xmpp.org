@@ -1,0 +1,829 @@
+#+TITLE: MailCortex XMPP Face
+#+DESCRIPTION: Private Prosody server and the XMPP to MailCortex seat bridge
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments no
+#+PROPERTY: header-args:python :comments no
+
+* Boundary
+
+XMPP is a face on MailCortex, not a second messaging backbone. MailCortex keeps the one seat registry, the durable Maildir record and the only agent wake path (=services-mailcortex.org=). This module adds two things on the single host that serves the fleet's XMPP:
+
+- A private Prosody server running as the user, not as the Debian system service. Server-to-server federation is disabled, in-band registration is off, client connections require TLS, and the component port listens on loopback only. Mobile clients (Conversations on Android) connect over the tailnet; the TLS certificate is the host's own Tailscale certificate, so there is no public domain and no public CA dependency beyond Tailscale's.
+- =mailcortex-xmpp-bridge=, a Prosody external component (XEP-0114). Every mapped seat gets an address =<seat>@<component>=. A chat message from an allowlisted owner becomes one MailCortex mail into that seat's Maildir, and mail delivered to the bridge's own seat goes back out as a chat message from the agent that sent it.
+
+Why a component: the server stamps the sender of every stanza after SASL authentication, federation is off and registration is closed, so the =from= address the bridge sees is authenticated by the server itself. One connection serves every seat address, and no seat needs a password.
+
+No hostnames, addresses, domains, owner identities or secrets live in this public file. The private site layer lives only on the serving host:
+
+- =~/.config/mailcortex/xmpp-private/local.cfg.lua=: the =VirtualHost=, the =Component= with its secret, and the client listen interfaces.
+- =~/.config/mailcortex/xmpp-private/bridge.json=: the owner allowlist, the seat map, the bridge's own MailCortex address and the path of the component secret file.
+- =~/.config/mailcortex/xmpp-private/certs/=: the Tailscale certificate and key, named =<domain>.crt= and =<domain>.key=.
+
+The private layer is a sibling directory, never inside =~/.config/mailcortex/xmpp/=: stow folds that directory into a symlink to this repository's tangled tree, so anything written there would land in the public working tree. Nothing starts until both private files exist (the readiness gate in =mailcortex-xmpp-service=).
+
+Push notifications: no push module is enabled. Conversations holds its own connection, so no message metadata reaches a third-party push relay. This is a deliberate first-slice choice, not an omission.
+
+* Narrow additive package apply
+
+The manifest is sourced in =package-nala.org= (=debian/.nala/manifest/mailcortex-xmpp.ssv=). The default is a read-only apt simulation. =--apply= installs only the two manifest packages, refuses removals and upgrades, then stops and disables the Debian =prosody= system service: the fleet's Prosody runs as the user under =mailcortex-xmpp-service=, and the packaged default configuration (federation on, all interfaces) must never stay running. The package's postinst may start that service for a few seconds before it is stopped; it has no accounts in that window.
+
+#+BEGIN_SRC bash :tangle debian/.local/bin/mailcortex-xmpp-package :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: mailcortex-xmpp-package [--dry-run|--apply|-h|--help]
+Plan the isolated MailCortex XMPP package transaction (default).
+--apply explicitly authorizes the simulated, additive transaction, then
+stops and disables the Debian prosody system service.
+EOF
+}
+
+case "${1:---dry-run}" in
+  -h|--help) usage; exit 0 ;;
+  --dry-run) mode=dry-run ;;
+  --apply) mode=apply ;;
+  *) usage >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
+
+manifest="${MAILCORTEX_TEST_MANIFEST:-$HOME/.nala/manifest/mailcortex-xmpp.ssv}"
+[ -r "$manifest" ] || { echo "mailcortex-xmpp-package: missing manifest: $manifest" >&2; exit 1; }
+expected=" prosody python3-slixmpp "
+packages=()
+while read -r pkg version category scope extra trailing; do
+  case "${pkg:-}" in ''|\#*) continue ;; esac
+  if [ "${expected#* "$pkg" }" = "$expected" ] || [ "$version" != '""' ] \
+     || [ "$category" != network ] || [ "$scope" != mailcortex-xmpp ] \
+     || [ "$extra" != '""' ] || [ -n "${trailing:-}" ]; then
+    echo "mailcortex-xmpp-package: unexpected manifest row: $pkg" >&2
+    exit 2
+  fi
+  packages+=("$pkg")
+done < "$manifest"
+[ "${#packages[@]}" -eq 2 ] || { echo "mailcortex-xmpp-package: expected exactly the prosody and python3-slixmpp rows" >&2; exit 2; }
+
+flags=(--no-remove --no-upgrade --no-install-recommends -o APT::Get::AutomaticRemove=false)
+if ! simulation="$(apt-get -s "${flags[@]}" install "${packages[@]}" 2>&1)"; then
+  printf '%s\n' "$simulation" >&2
+  echo 'mailcortex-xmpp-package: apt simulation failed' >&2
+  exit 3
+fi
+printf '%s\n' "$simulation"
+if printf '%s\n' "$simulation" | grep -Eq '^(Remv|Purg) '; then
+  echo 'mailcortex-xmpp-package: refused removal or purge' >&2
+  exit 3
+fi
+while read -r installed_name; do
+  [ -n "$installed_name" ] || continue
+  if [ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$installed_name" 2>/dev/null || true)" = 'ii ' ]; then
+    echo "mailcortex-xmpp-package: refused upgrade of $installed_name" >&2
+    exit 3
+  fi
+done < <(printf '%s\n' "$simulation" | awk '$1 == "Inst" {print $2}')
+
+if [ "$mode" = dry-run ]; then
+  echo 'mailcortex-xmpp-package: dry-run only; use --apply for this exact manifest'
+  exit 0
+fi
+sudo -n env DEBIAN_FRONTEND=noninteractive apt-get install -y "${flags[@]}" "${packages[@]}"
+for pkg in "${packages[@]}"; do
+  [ "$(dpkg-query -W -f='${db:Status-Abbrev}' "$pkg" 2>/dev/null || true)" = 'ii ' ] || {
+    echo "mailcortex-xmpp-package: install returned but $pkg is not installed" >&2
+    exit 1
+  }
+done
+# The fleet Prosody is user-owned; the packaged system instance must not run.
+if [ -x /etc/init.d/prosody ]; then
+  sudo -n /etc/init.d/prosody stop >/dev/null 2>&1 || true
+  sudo -n update-rc.d prosody disable >/dev/null
+fi
+if pgrep -u prosody -x lua5.4 >/dev/null 2>&1 || pgrep -u prosody prosody >/dev/null 2>&1; then
+  echo 'mailcortex-xmpp-package: system prosody is still running after stop' >&2
+  exit 1
+fi
+echo 'mailcortex-xmpp-package: installed; system prosody stopped and disabled'
+#+END_SRC
+
+* Prosody configuration (public layer)
+
+Prosody evaluates its configuration as Lua; =Lua.os.getenv= reaches the process environment. Every path is derived from =$HOME= so the file carries no user or host. The private =local.cfg.lua= is included last and must declare the =VirtualHost=, the =Component= and =c2s_interfaces=.
+
+#+BEGIN_SRC lua :tangle linux/.config/mailcortex/xmpp/prosody.cfg.lua :comments no
+-- MailCortex private XMPP server. Public layer, tangled from DotCortex
+-- services-mailcortex-xmpp.org. Site values live in local.cfg.lua.
+local home = Lua.os.getenv("HOME")
+local site = home .. "/.config/mailcortex/xmpp-private"
+local state = home .. "/.local/share/mailcortex/xmpp"
+
+pidfile = state .. "/prosody.pid"
+data_path = state .. "/data"
+certificates = site .. "/certs"
+log = {
+  info = state .. "/prosody.log";
+  error = state .. "/prosody.err";
+}
+
+-- Closed, unfederated, encrypted.
+allow_registration = false
+c2s_require_encryption = true
+authentication = "internal_hashed"
+storage = "internal"
+modules_disabled = { "s2s" }
+s2s_ports = {}
+
+-- Loopback by default; local.cfg.lua adds the tailnet interface for clients.
+interfaces = { "127.0.0.1" }
+c2s_ports = { 5222 }
+component_interfaces = { "127.0.0.1" }
+component_ports = { 5347 }
+
+modules_enabled = {
+  "roster"; "saslauth"; "tls"; "disco"; "carbons"; "pep"; "private";
+  "blocklist"; "vcard4"; "vcard_legacy"; "version"; "uptime"; "time";
+  "ping"; "smacks"; "csi_simple"; "mam"; "bookmarks";
+  -- Local unix socket for prosodyctl adduser/passwd/shell; no network listener.
+  "admin_shell"; "admin_socket";
+}
+archive_expires_after = "never"
+
+Include(site .. "/local.cfg.lua")
+#+END_SRC
+
+* Certificate refresh
+
+=tailscale cert= needs root on this fleet, so the helper writes through =sudo -n= into a private temporary directory, then installs the pair into the certs directory owned by the user with mode 600. =--check= reports the days left without touching anything. The bridge does not use TLS (loopback component), so only the client-facing domain needs a certificate.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/mailcortex-xmpp-cert :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: mailcortex-xmpp-cert DOMAIN [--check]
+Fetch or renew the host's Tailscale TLS certificate for DOMAIN into
+~/.config/mailcortex/xmpp-private/certs/DOMAIN.{crt,key} (mode 600).
+--check prints the days of validity left and changes nothing.
+EOF
+}
+
+case "${1:-}" in
+  ''|-h|--help) usage; [ -n "${1:-}" ]; exit $? ;;
+esac
+domain="$1"; shift
+case "$domain" in
+  *[!a-z0-9.-]*|.*|*..*) echo "mailcortex-xmpp-cert: invalid domain" >&2; exit 2 ;;
+esac
+certs="$HOME/.config/mailcortex/xmpp-private/certs"
+crt="$certs/$domain.crt"; key="$certs/$domain.key"
+
+if [ "${1:-}" = --check ]; then
+  [ -r "$crt" ] || { echo "mailcortex-xmpp-cert: no certificate for $domain" >&2; exit 1; }
+  end="$(openssl x509 -noout -enddate -in "$crt" | cut -d= -f2)"
+  echo "$(( ( $(date -d "$end" +%s) - $(date +%s) ) / 86400 )) days left ($end)"
+  exit 0
+fi
+[ "$#" -eq 0 ] || { usage >&2; exit 2; }
+
+install -d -m 700 "$certs"
+work="$(mktemp -d)"
+trap 'sudo -n rm -rf "$work" 2>/dev/null || rm -rf "$work"' EXIT
+sudo -n tailscale cert --cert-file "$work/c" --key-file "$work/k" "$domain"
+sudo -n chown "$(id -u):$(id -g)" "$work/c" "$work/k"
+install -m 600 "$work/c" "$crt.new"
+install -m 600 "$work/k" "$key.new"
+mv -f "$crt.new" "$crt"
+mv -f "$key.new" "$key"
+echo "mailcortex-xmpp-cert: installed certificate for $domain"
+#+END_SRC
+
+* The bridge
+
+=mailcortex-xmpp-bridge= imports =slixmpp= only when it runs, so =-h= and the fixture tests work on machines without it. All mailbox state changes go through the =mailcortex= CLI (=send=, =inbox=, =read=, =receipt=); the bridge never writes a Maildir itself.
+
+Inbound (chat to mail):
+1. The server-stamped sender must be an allowlisted owner (bare address). Anyone else gets no mail, only an error stanza and a log line.
+2. A sliding-window rate limit per owner (default 20 per minute) and a persisted stanza-id dedupe stop floods and reconnect replays.
+3. The target local part must be a mapped seat; unknown addresses get =item-not-found=.
+4. One mail is sent from the bridge's own seat address to the seat's MailCortex address. The body carries the XMPP sender and the reply instruction, so a woken agent answers with =mailcortex send --to <bridge address>=.
+
+Outbound (mail to chat):
+1. The bridge polls its own seat (=mailcortex inbox=) and handles only =new= messages, oldest first.
+2. The mail's =From= must be a mapped seat address; the chat message is sent from that seat's XMPP address to every owner. Mail from an unmapped address is marked =handling_rejected= and never relayed.
+3. After the message is sent, =mailcortex read= marks it seen and =mailcortex receipt= records =handling_completed=. A message that failed to send stays in =new= and is retried on the next poll.
+
+#+BEGIN_SRC python :tangle all/.local/bin/mailcortex-xmpp-bridge :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""MailCortex XMPP face: a Prosody component bridging seat addresses to Maildir."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import logging
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from email import policy
+from email.parser import Parser
+from email.utils import parseaddr
+from pathlib import Path
+
+LOG = logging.getLogger("mailcortex-xmpp-bridge")
+LOCAL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+ADDRESS_RE = re.compile(
+    r"^(?:(consort|seat|machine|sanctuary)\+)?"
+    r"([a-z0-9][a-z0-9._-]*)@"
+    r"([a-z0-9][a-z0-9.-]*\.helm)$"
+)
+MAX_BODY = 16000
+SEEN_CAP = 4000
+
+
+class BridgeError(Exception):
+    """Configuration or routing failure with a concise diagnostic."""
+
+
+def config_path() -> Path:
+    return Path(os.environ.get(
+        "MAILCORTEX_XMPP_CONFIG", "~/.config/mailcortex/xmpp-private/bridge.json")).expanduser()
+
+
+def state_root() -> Path:
+    return Path(os.environ.get(
+        "MAILCORTEX_XMPP_STATE", "~/.local/state/mailcortex/xmpp")).expanduser()
+
+
+def bare(jid: str) -> str:
+    return str(jid).split("/", 1)[0].strip().lower()
+
+
+def is_bare_jid(value: str) -> bool:
+    if not isinstance(value, str) or value.count("@") != 1 or "/" in value:
+        return False
+    local, host = value.split("@")
+    return bool(LOCAL_RE.match(local)) and bool(HOST_RE.match(host))
+
+
+def load_config(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BridgeError(f"cannot read config {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise BridgeError("config must be a JSON object")
+    component = data.get("component_jid")
+    if not isinstance(component, str) or "@" in component or not HOST_RE.match(component):
+        raise BridgeError("component_jid must be a bare domain")
+    owners = data.get("owner_jids")
+    if not isinstance(owners, list) or not owners or not all(is_bare_jid(o) for o in owners):
+        raise BridgeError("owner_jids must be a non-empty list of bare JIDs")
+    address = data.get("bridge_address")
+    match = ADDRESS_RE.match(address) if isinstance(address, str) else None
+    if not match or match.group(1) != "seat":
+        raise BridgeError("bridge_address must be a seat+NAME@HOST.helm address")
+    seats = data.get("seats")
+    if not isinstance(seats, dict) or not seats:
+        raise BridgeError("seats must map XMPP local parts to MailCortex addresses")
+    reverse: dict[str, str] = {}
+    for local, target in seats.items():
+        if not isinstance(local, str) or not LOCAL_RE.match(local):
+            raise BridgeError(f"invalid seat local part: {local!r}")
+        if not isinstance(target, str) or not ADDRESS_RE.match(target):
+            raise BridgeError(f"invalid MailCortex address for {local}: {target!r}")
+        if target == address:
+            raise BridgeError("a seat may not map to the bridge's own address")
+        if target in reverse:
+            raise BridgeError(f"address mapped twice: {target}")
+        reverse[target] = local
+    secret_file = Path(str(data.get("component_secret_file", ""))).expanduser()
+    if not str(data.get("component_secret_file", "")):
+        raise BridgeError("component_secret_file is required")
+    rate = data.get("rate_per_minute", 20)
+    poll = data.get("poll_seconds", 2)
+    port = data.get("port", 5347)
+    if not isinstance(rate, int) or not 1 <= rate <= 600:
+        raise BridgeError("rate_per_minute must be an integer from 1 to 600")
+    if not isinstance(poll, (int, float)) or not 0.5 <= poll <= 60:
+        raise BridgeError("poll_seconds must be between 0.5 and 60")
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise BridgeError("port must be a TCP port")
+    return {
+        "component_jid": component,
+        "owner_jids": [bare(o) for o in owners],
+        "bridge_address": address,
+        "bridge_seat": match.group(2),
+        "seats": dict(seats),
+        "reverse": reverse,
+        "component_secret_file": secret_file,
+        "server": str(data.get("server", "127.0.0.1")),
+        "port": port,
+        "rate_per_minute": rate,
+        "poll_seconds": float(poll),
+    }
+
+
+def read_secret(path: Path) -> str:
+    try:
+        info = path.stat()
+    except OSError as error:
+        raise BridgeError(f"component secret missing: {error}") from error
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise BridgeError("component secret must be a regular file with mode 600")
+    secret = path.read_text(encoding="utf-8").strip()
+    if len(secret) < 24:
+        raise BridgeError("component secret is too short")
+    return secret
+
+
+class Gate:
+    """Owner allowlist plus a per-sender sliding-window rate limit."""
+
+    def __init__(self, owners: list[str], per_minute: int) -> None:
+        self.owners = set(owners)
+        self.per_minute = per_minute
+        self.windows: dict[str, collections.deque] = {}
+
+    def admit(self, sender: str, now: float) -> str | None:
+        sender = bare(sender)
+        if sender not in self.owners:
+            return "unauthorized"
+        window = self.windows.setdefault(sender, collections.deque())
+        while window and now - window[0] >= 60:
+            window.popleft()
+        if len(window) >= self.per_minute:
+            return "rate_limited"
+        window.append(now)
+        return None
+
+
+class Seen:
+    """Persisted stanza-id dedupe so reconnect replays never send mail twice."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.keys: list[str] = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    self.keys = [str(k) for k in loaded][-SEEN_CAP:]
+            except (OSError, json.JSONDecodeError):
+                LOG.warning("dedupe state unreadable; starting empty")
+        self.index = set(self.keys)
+
+    def check_and_add(self, key: str | None) -> bool:
+        """Return True when the key is new (and record it)."""
+        if not key:
+            return True
+        if key in self.index:
+            return False
+        self.keys.append(key)
+        self.index.add(key)
+        if len(self.keys) > SEEN_CAP:
+            dropped = self.keys[:-SEEN_CAP]
+            self.keys = self.keys[-SEEN_CAP:]
+            self.index.difference_update(dropped)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(self.keys), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+        return True
+
+
+def mailcortex(args: list[str], run=subprocess.run) -> str:
+    result = run(["mailcortex", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise BridgeError(f"mailcortex {args[0]} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def inbound_mail(cfg: dict, sender: str, local: str, body: str, run=subprocess.run) -> str:
+    """Deliver one owner chat message into a seat's Maildir; return the filename."""
+    target = cfg["seats"].get(local)
+    if target is None:
+        raise BridgeError(f"unknown seat: {local}")
+    text = body.strip()
+    if not text:
+        raise BridgeError("empty message")
+    if len(text) > MAX_BODY:
+        raise BridgeError("message too long")
+    first = text.splitlines()[0].strip()
+    subject = "[xmpp] " + (first[:70] + "…" if len(first) > 70 else first)
+    framed = (
+        f"XMPP-From: {bare(sender)}\n"
+        f"XMPP-To: {local}@{cfg['component_jid']}\n"
+        f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
+        "\n"
+        f"{text}\n"
+    )
+    return mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
+                       "--subject", subject, "--body", framed], run).strip()
+
+
+def pending_outbound(cfg: dict, run=subprocess.run) -> list[str]:
+    rows = mailcortex(["inbox", cfg["bridge_address"]], run).splitlines()
+    return [row.split("\t")[1] for row in rows if row.startswith("new\t")]
+
+
+def render_outbound(cfg: dict, rendered: str) -> tuple[str | None, str, str]:
+    """Parse `mailcortex read` output into (seat local part, chat text, Message-ID)."""
+    message = Parser(policy=policy.default).parsestr(rendered)
+    sender = parseaddr(str(message.get("From", "")))[1].lower()
+    local = cfg["reverse"].get(sender)
+    subject = str(message.get("Subject", "")).strip()
+    body = (message.get_payload() or "").strip()
+    if subject and not subject.lower().startswith(("re: [xmpp]", "[xmpp]")):
+        text = f"{subject}\n\n{body}" if body else subject
+    else:
+        text = body or subject
+    return local, text[:MAX_BODY], str(message.get("Message-ID", "")).strip()
+
+
+def run_bridge(cfg: dict) -> int:
+    try:
+        import asyncio
+        import slixmpp
+    except ImportError:
+        raise BridgeError("python3-slixmpp is not installed (mailcortex-xmpp-package)")
+
+    secret = read_secret(cfg["component_secret_file"])
+    gate = Gate(cfg["owner_jids"], cfg["rate_per_minute"])
+    seen = Seen(state_root() / "seen.json")
+
+    class Component(slixmpp.ComponentXMPP):
+        def __init__(self) -> None:
+            super().__init__(cfg["component_jid"], secret, cfg["server"], cfg["port"])
+            self.register_plugin("xep_0030")
+            self.register_plugin("xep_0199")
+            self.add_event_handler("session_start", self.on_start)
+            self.add_event_handler("message", self.on_message)
+            self.add_event_handler("presence_subscribe", self.on_subscribe)
+            self.add_event_handler("presence_probe", self.on_probe)
+            self.poller = None
+
+        def seat_jid(self, local: str) -> str:
+            return f"{local}@{cfg['component_jid']}"
+
+        async def on_start(self, _event) -> None:
+            LOG.info("component online: %s (%d seats)", cfg["component_jid"], len(cfg["seats"]))
+            for local in cfg["seats"]:
+                for owner in cfg["owner_jids"]:
+                    self.send_presence(pfrom=self.seat_jid(local), pto=owner)
+            if self.poller is None:
+                self.poller = asyncio.ensure_future(self.poll_outbound())
+
+        def on_subscribe(self, presence) -> None:
+            local = presence["to"].user
+            if bare(presence["from"]) in gate.owners and local in cfg["seats"]:
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare, ptype="subscribed")
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
+            else:
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare, ptype="unsubscribed")
+
+        def on_probe(self, presence) -> None:
+            if bare(presence["from"]) in gate.owners and presence["to"].user in cfg["seats"]:
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
+
+        def on_message(self, msg) -> None:
+            if msg["type"] not in ("chat", "normal") or not msg["body"]:
+                return
+            sender = bare(msg["from"])
+            local = msg["to"].user
+            refusal = gate.admit(sender, time.monotonic())
+            if refusal:
+                LOG.warning("refused %s from %s to %s", refusal, sender, local)
+                if refusal == "rate_limited":
+                    msg.reply("Rate limited; message not delivered.").send()
+                return
+            if local not in cfg["seats"]:
+                LOG.warning("unknown seat %s from %s", local, sender)
+                msg.reply("No such seat.").send()
+                return
+            key = f"{sender}|{local}|{msg['id']}" if msg["id"] else None
+            if not seen.check_and_add(key):
+                LOG.info("duplicate stanza %s ignored", key)
+                return
+            try:
+                name = inbound_mail(cfg, sender, local, msg["body"])
+            except BridgeError as error:
+                LOG.error("delivery failed for %s: %s", local, error)
+                msg.reply(f"Not delivered: {error}").send()
+                return
+            LOG.info("delivered %s -> %s as %s", sender, local, name)
+
+        async def poll_outbound(self) -> None:
+            while True:
+                try:
+                    self.relay_outbound()
+                except BridgeError as error:
+                    LOG.error("outbound poll failed: %s", error)
+                await asyncio.sleep(cfg["poll_seconds"])
+
+        def relay_outbound(self) -> None:
+            for name in pending_outbound(cfg):
+                rendered = mailcortex(["read", cfg["bridge_address"], name])
+                local, text, message_id = render_outbound(cfg, rendered)
+                if local is None:
+                    LOG.warning("rejected outbound mail %s from an unmapped sender", name)
+                    if message_id:
+                        mailcortex(["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
+                    continue
+                for owner in cfg["owner_jids"]:
+                    self.send_message(mto=owner, mfrom=self.seat_jid(local), mbody=text, mtype="chat")
+                if message_id:
+                    mailcortex(["receipt", cfg["bridge_seat"], message_id, "handling_completed"])
+                LOG.info("relayed %s from %s", name, local)
+
+    component = Component()
+    component.connect()
+    asyncio.get_event_loop().run_until_complete(component.disconnected)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mailcortex-xmpp-bridge",
+        description="Bridge MailCortex seats to XMPP through a Prosody component.")
+    parser.add_argument("--check", action="store_true",
+                        help="validate the private config and secret, then exit")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="bridge.json path (default ~/.config/mailcortex/xmpp-private/bridge.json)")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        cfg = load_config(args.config or config_path())
+        if args.check:
+            read_secret(cfg["component_secret_file"])
+            print(f"ok: {len(cfg['seats'])} seats, {len(cfg['owner_jids'])} owners, "
+                  f"component {cfg['component_jid']}")
+            return 0
+        return run_bridge(cfg)
+    except BridgeError as error:
+        print(f"mailcortex-xmpp-bridge: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+* Service owner
+
+=mailcortex-xmpp-service= owns both processes on the serving host: Prosody (user instance, this module's configuration) and the bridge. =ensure= is idempotent and is what the boot and self-heal cron lines call; it starts only what is not running and refuses to start anything until the private site files exist. Processes are identified by pidfile plus a command-line check, never by name alone. =install-cron= adds the tagged =@reboot= and five-minute self-heal lines to the user crontab once; =remove-cron= deletes only those tagged lines.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/mailcortex-xmpp-service :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: mailcortex-xmpp-service {start|stop|status|ensure|install-cron|remove-cron|-h|--help}
+Own the user Prosody instance and mailcortex-xmpp-bridge on this host.
+ensure starts whatever is not running (boot and self-heal entrypoint).
+Nothing starts until ~/.config/mailcortex/xmpp-private/{local.cfg.lua,bridge.json} exist.
+EOF
+}
+
+base="$HOME/.config/mailcortex/xmpp"
+site="$HOME/.config/mailcortex/xmpp-private"
+data="$HOME/.local/share/mailcortex/xmpp"
+state="$HOME/.local/state/mailcortex/xmpp"
+config="$base/prosody.cfg.lua"
+prosody_pid="$data/prosody.pid"
+bridge_pid="$state/bridge.pid"
+tag="# dotcortex:mailcortex-xmpp"
+
+ready() {
+  [ -r "$config" ] && [ -r "$site/local.cfg.lua" ] && [ -r "$site/bridge.json" ] || {
+    echo "mailcortex-xmpp-service: not ready (private site files missing in $site)" >&2
+    return 1
+  }
+}
+
+alive() { # pidfile pattern
+  local pid
+  [ -r "$1" ] || return 1
+  pid="$(cat "$1" 2>/dev/null)"
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q -- "$2"
+}
+
+start_prosody() {
+  alive "$prosody_pid" "$config" && return 0
+  install -d -m 700 "$data" "$data/data"
+  nohup prosody --config "$config" >>"$data/prosody.stdout" 2>&1 &
+  for _ in $(seq 1 20); do alive "$prosody_pid" "$config" && return 0; sleep 0.5; done
+  echo "mailcortex-xmpp-service: prosody did not come up (see $data/prosody.err)" >&2
+  return 1
+}
+
+start_bridge() {
+  alive "$bridge_pid" mailcortex-xmpp-bridge && return 0
+  install -d -m 700 "$state"
+  mailcortex-xmpp-bridge --check >/dev/null
+  nohup mailcortex-xmpp-bridge >>"$state/bridge.log" 2>&1 &
+  echo $! > "$bridge_pid"
+  sleep 1
+  alive "$bridge_pid" mailcortex-xmpp-bridge || {
+    echo "mailcortex-xmpp-service: bridge exited (see $state/bridge.log)" >&2
+    return 1
+  }
+}
+
+stop_one() { # pidfile pattern
+  if alive "$1" "$2"; then kill "$(cat "$1")"; fi
+  rm -f "$1"
+}
+
+status() {
+  local rc=0
+  if alive "$prosody_pid" "$config"; then echo "prosody: running ($(cat "$prosody_pid"))"; else echo "prosody: stopped"; rc=1; fi
+  if alive "$bridge_pid" mailcortex-xmpp-bridge; then echo "bridge: running ($(cat "$bridge_pid"))"; else echo "bridge: stopped"; rc=1; fi
+  return $rc
+}
+
+case "${1:-}" in
+  -h|--help) usage ;;
+  start|ensure) ready; start_prosody; start_bridge ;;
+  stop) stop_one "$bridge_pid" mailcortex-xmpp-bridge; stop_one "$prosody_pid" "$config" ;;
+  status) status ;;
+  install-cron)
+    ready
+    self="$HOME/.local/bin/mailcortex-xmpp-service"
+    env="HOME=$HOME PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    current="$(crontab -l 2>/dev/null || true)"
+    if printf '%s\n' "$current" | grep -qF "$tag"; then echo "cron already installed"; exit 0; fi
+    { printf '%s\n' "$current" | sed '/^$/d'
+      echo "@reboot $env $self ensure >>$state/cron.log 2>&1 $tag"
+      echo "*/5 * * * * $env $self ensure >>$state/cron.log 2>&1 $tag"
+    } | crontab -
+    echo "cron installed" ;;
+  remove-cron)
+    (crontab -l 2>/dev/null || true) | grep -vF "$tag" | crontab -
+    echo "cron removed" ;;
+  *) usage >&2; exit 2 ;;
+esac
+#+END_SRC
+
+* Fixtures
+
+The fixtures exercise the bridge's pure parts with a fake =mailcortex= runner: config validation, the owner gate and rate limit, dedupe persistence, inbound framing, outbound parsing and the unmapped-sender rejection. They do not need =slixmpp= or a server.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-mailcortex-xmpp-bridge.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Fixture tests for mailcortex-xmpp-bridge (no network, no slixmpp)."""
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+BRIDGE = Path(os.environ.get("MAILCORTEX_XMPP_BRIDGE", "~/.local/bin/mailcortex-xmpp-bridge")).expanduser()
+loader = importlib.machinery.SourceFileLoader("bridge", str(BRIDGE))
+spec = importlib.util.spec_from_loader("bridge", loader)
+bridge = importlib.util.module_from_spec(spec)
+loader.exec_module(bridge)
+
+
+def base_config(tmp: Path) -> dict:
+    secret = tmp / "secret"
+    secret.write_text("s" * 32)
+    os.chmod(secret, 0o600)
+    return {
+        "component_jid": "seats.example.test",
+        "owner_jids": ["owner@example.test"],
+        "bridge_address": "seat+xmpp-bridge@host.helm",
+        "component_secret_file": str(secret),
+        "seats": {"fable": "fable@host.helm", "worker": "seat+worker@host.helm"},
+    }
+
+
+class FakeRun:
+    def __init__(self, outputs=None):
+        self.calls = []
+        self.outputs = outputs or {}
+
+    def __call__(self, argv, capture_output, text):
+        self.calls.append(argv)
+        out = self.outputs.get(argv[1], "")
+        return subprocess.CompletedProcess(argv, 0, out, "")
+
+
+class ConfigTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+
+    def write(self, data):
+        path = self.tmp / "bridge.json"
+        path.write_text(json.dumps(data))
+        return path
+
+    def test_valid_config_builds_reverse_map(self):
+        cfg = bridge.load_config(self.write(base_config(self.tmp)))
+        self.assertEqual(cfg["bridge_seat"], "xmpp-bridge")
+        self.assertEqual(cfg["reverse"]["fable@host.helm"], "fable")
+
+    def test_bridge_address_must_be_a_seat(self):
+        data = base_config(self.tmp)
+        data["bridge_address"] = "bridge@host.helm"
+        with self.assertRaises(bridge.BridgeError):
+            bridge.load_config(self.write(data))
+
+    def test_duplicate_target_refused(self):
+        data = base_config(self.tmp)
+        data["seats"]["other"] = "fable@host.helm"
+        with self.assertRaises(bridge.BridgeError):
+            bridge.load_config(self.write(data))
+
+    def test_owner_must_be_bare_jid(self):
+        data = base_config(self.tmp)
+        data["owner_jids"] = ["owner@example.test/phone"]
+        with self.assertRaises(bridge.BridgeError):
+            bridge.load_config(self.write(data))
+
+    def test_secret_mode_enforced(self):
+        cfg = bridge.load_config(self.write(base_config(self.tmp)))
+        os.chmod(cfg["component_secret_file"], 0o644)
+        with self.assertRaises(bridge.BridgeError):
+            bridge.read_secret(cfg["component_secret_file"])
+
+
+class GateTests(unittest.TestCase):
+    def test_stranger_refused(self):
+        gate = bridge.Gate(["owner@example.test"], 3)
+        self.assertEqual(gate.admit("evil@example.test/x", 0), "unauthorized")
+
+    def test_resource_stripped_and_rate_limited(self):
+        gate = bridge.Gate(["owner@example.test"], 2)
+        self.assertIsNone(gate.admit("Owner@example.test/phone", 0))
+        self.assertIsNone(gate.admit("owner@example.test/laptop", 1))
+        self.assertEqual(gate.admit("owner@example.test", 2), "rate_limited")
+        self.assertIsNone(gate.admit("owner@example.test", 61))
+
+
+class SeenTests(unittest.TestCase):
+    def test_dedupe_persists_across_instances(self):
+        path = Path(tempfile.mkdtemp()) / "seen.json"
+        self.assertTrue(bridge.Seen(path).check_and_add("k1"))
+        again = bridge.Seen(path)
+        self.assertFalse(again.check_and_add("k1"))
+        self.assertTrue(again.check_and_add(None))
+
+
+class RoutingTests(unittest.TestCase):
+    def setUp(self):
+        tmp = Path(tempfile.mkdtemp())
+        path = tmp / "bridge.json"
+        path.write_text(json.dumps(base_config(tmp)))
+        self.cfg = bridge.load_config(path)
+
+    def test_inbound_sends_from_bridge_to_seat(self):
+        run = FakeRun({"send": "123.msg\n"})
+        name = bridge.inbound_mail(self.cfg, "owner@example.test/phone", "fable", "Hello there\nsecond line", run)
+        self.assertEqual(name, "123.msg")
+        argv = run.calls[0]
+        self.assertEqual(argv[:6], ["mailcortex", "send", "--from", "seat+xmpp-bridge@host.helm", "--to", "fable@host.helm"])
+        self.assertEqual(argv[argv.index("--subject") + 1], "[xmpp] Hello there")
+        body = argv[argv.index("--body") + 1]
+        self.assertIn("XMPP-From: owner@example.test\n", body)
+        self.assertIn("--to seat+xmpp-bridge@host.helm", body)
+
+    def test_inbound_unknown_seat_sends_nothing(self):
+        run = FakeRun()
+        with self.assertRaises(bridge.BridgeError):
+            bridge.inbound_mail(self.cfg, "owner@example.test", "ghost", "hi", run)
+        self.assertEqual(run.calls, [])
+
+    def test_pending_only_new(self):
+        run = FakeRun({"inbox": "cur\told\td\tf\ts\nnew\tfresh\td\tf\ts\n"})
+        self.assertEqual(bridge.pending_outbound(self.cfg, run), ["fresh"])
+
+    def test_outbound_maps_sender_and_keeps_subject(self):
+        rendered = ("Date: x\nFrom: fable@host.helm\nTo: seat+xmpp-bridge@host.helm\n"
+                    "Subject: Build finished\nMessage-ID: <1@host.helm>\n\nAll green.\n")
+        local, text, mid = bridge.render_outbound(self.cfg, rendered)
+        self.assertEqual((local, mid), ("fable", "<1@host.helm>"))
+        self.assertEqual(text, "Build finished\n\nAll green.")
+
+    def test_outbound_reply_subject_dropped(self):
+        rendered = ("From: seat+worker@host.helm\nSubject: Re: [xmpp] Hello\n"
+                    "Message-ID: <2@host.helm>\n\nDone.\n")
+        self.assertEqual(bridge.render_outbound(self.cfg, rendered)[:2], ("worker", "Done."))
+
+    def test_outbound_unmapped_sender(self):
+        rendered = "From: stranger@host.helm\nSubject: x\nMessage-ID: <3@host.helm>\n\nhi\n"
+        self.assertIsNone(bridge.render_outbound(self.cfg, rendered)[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC

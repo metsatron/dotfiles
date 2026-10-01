@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""MailCortex XMPP face: a Prosody component bridging seat addresses to Maildir."""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import json
+import logging
+import os
+import re
+import stat
+import subprocess
+import sys
+import time
+from email import policy
+from email.parser import Parser
+from email.utils import parseaddr
+from pathlib import Path
+
+LOG = logging.getLogger("mailcortex-xmpp-bridge")
+LOCAL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+ADDRESS_RE = re.compile(
+    r"^(?:(consort|seat|machine|sanctuary)\+)?"
+    r"([a-z0-9][a-z0-9._-]*)@"
+    r"([a-z0-9][a-z0-9.-]*\.helm)$"
+)
+MAX_BODY = 16000
+SEEN_CAP = 4000
+
+
+class BridgeError(Exception):
+    """Configuration or routing failure with a concise diagnostic."""
+
+
+def config_path() -> Path:
+    return Path(os.environ.get(
+        "MAILCORTEX_XMPP_CONFIG", "~/.config/mailcortex/xmpp-private/bridge.json")).expanduser()
+
+
+def state_root() -> Path:
+    return Path(os.environ.get(
+        "MAILCORTEX_XMPP_STATE", "~/.local/state/mailcortex/xmpp")).expanduser()
+
+
+def bare(jid: str) -> str:
+    return str(jid).split("/", 1)[0].strip().lower()
+
+
+def is_bare_jid(value: str) -> bool:
+    if not isinstance(value, str) or value.count("@") != 1 or "/" in value:
+        return False
+    local, host = value.split("@")
+    return bool(LOCAL_RE.match(local)) and bool(HOST_RE.match(host))
+
+
+def load_config(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise BridgeError(f"cannot read config {path}: {error}") from error
+    if not isinstance(data, dict):
+        raise BridgeError("config must be a JSON object")
+    component = data.get("component_jid")
+    if not isinstance(component, str) or "@" in component or not HOST_RE.match(component):
+        raise BridgeError("component_jid must be a bare domain")
+    owners = data.get("owner_jids")
+    if not isinstance(owners, list) or not owners or not all(is_bare_jid(o) for o in owners):
+        raise BridgeError("owner_jids must be a non-empty list of bare JIDs")
+    address = data.get("bridge_address")
+    match = ADDRESS_RE.match(address) if isinstance(address, str) else None
+    if not match or match.group(1) != "seat":
+        raise BridgeError("bridge_address must be a seat+NAME@HOST.helm address")
+    seats = data.get("seats")
+    if not isinstance(seats, dict) or not seats:
+        raise BridgeError("seats must map XMPP local parts to MailCortex addresses")
+    reverse: dict[str, str] = {}
+    for local, target in seats.items():
+        if not isinstance(local, str) or not LOCAL_RE.match(local):
+            raise BridgeError(f"invalid seat local part: {local!r}")
+        if not isinstance(target, str) or not ADDRESS_RE.match(target):
+            raise BridgeError(f"invalid MailCortex address for {local}: {target!r}")
+        if target == address:
+            raise BridgeError("a seat may not map to the bridge's own address")
+        if target in reverse:
+            raise BridgeError(f"address mapped twice: {target}")
+        reverse[target] = local
+    secret_file = Path(str(data.get("component_secret_file", ""))).expanduser()
+    if not str(data.get("component_secret_file", "")):
+        raise BridgeError("component_secret_file is required")
+    rate = data.get("rate_per_minute", 20)
+    poll = data.get("poll_seconds", 2)
+    port = data.get("port", 5347)
+    if not isinstance(rate, int) or not 1 <= rate <= 600:
+        raise BridgeError("rate_per_minute must be an integer from 1 to 600")
+    if not isinstance(poll, (int, float)) or not 0.5 <= poll <= 60:
+        raise BridgeError("poll_seconds must be between 0.5 and 60")
+    if not isinstance(port, int) or not 1 <= port <= 65535:
+        raise BridgeError("port must be a TCP port")
+    return {
+        "component_jid": component,
+        "owner_jids": [bare(o) for o in owners],
+        "bridge_address": address,
+        "bridge_seat": match.group(2),
+        "seats": dict(seats),
+        "reverse": reverse,
+        "component_secret_file": secret_file,
+        "server": str(data.get("server", "127.0.0.1")),
+        "port": port,
+        "rate_per_minute": rate,
+        "poll_seconds": float(poll),
+    }
+
+
+def read_secret(path: Path) -> str:
+    try:
+        info = path.stat()
+    except OSError as error:
+        raise BridgeError(f"component secret missing: {error}") from error
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise BridgeError("component secret must be a regular file with mode 600")
+    secret = path.read_text(encoding="utf-8").strip()
+    if len(secret) < 24:
+        raise BridgeError("component secret is too short")
+    return secret
+
+
+class Gate:
+    """Owner allowlist plus a per-sender sliding-window rate limit."""
+
+    def __init__(self, owners: list[str], per_minute: int) -> None:
+        self.owners = set(owners)
+        self.per_minute = per_minute
+        self.windows: dict[str, collections.deque] = {}
+
+    def admit(self, sender: str, now: float) -> str | None:
+        sender = bare(sender)
+        if sender not in self.owners:
+            return "unauthorized"
+        window = self.windows.setdefault(sender, collections.deque())
+        while window and now - window[0] >= 60:
+            window.popleft()
+        if len(window) >= self.per_minute:
+            return "rate_limited"
+        window.append(now)
+        return None
+
+
+class Seen:
+    """Persisted stanza-id dedupe so reconnect replays never send mail twice."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.keys: list[str] = []
+        if path.exists():
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, list):
+                    self.keys = [str(k) for k in loaded][-SEEN_CAP:]
+            except (OSError, json.JSONDecodeError):
+                LOG.warning("dedupe state unreadable; starting empty")
+        self.index = set(self.keys)
+
+    def check_and_add(self, key: str | None) -> bool:
+        """Return True when the key is new (and record it)."""
+        if not key:
+            return True
+        if key in self.index:
+            return False
+        self.keys.append(key)
+        self.index.add(key)
+        if len(self.keys) > SEEN_CAP:
+            dropped = self.keys[:-SEEN_CAP]
+            self.keys = self.keys[-SEEN_CAP:]
+            self.index.difference_update(dropped)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(self.keys), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+        return True
+
+
+def mailcortex(args: list[str], run=subprocess.run) -> str:
+    result = run(["mailcortex", *args], capture_output=True, text=True)
+    if result.returncode != 0:
+        raise BridgeError(f"mailcortex {args[0]} failed: {result.stderr.strip()}")
+    return result.stdout
+
+
+def inbound_mail(cfg: dict, sender: str, local: str, body: str, run=subprocess.run) -> str:
+    """Deliver one owner chat message into a seat's Maildir; return the filename."""
+    target = cfg["seats"].get(local)
+    if target is None:
+        raise BridgeError(f"unknown seat: {local}")
+    text = body.strip()
+    if not text:
+        raise BridgeError("empty message")
+    if len(text) > MAX_BODY:
+        raise BridgeError("message too long")
+    first = text.splitlines()[0].strip()
+    subject = "[xmpp] " + (first[:70] + "…" if len(first) > 70 else first)
+    framed = (
+        f"XMPP-From: {bare(sender)}\n"
+        f"XMPP-To: {local}@{cfg['component_jid']}\n"
+        f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
+        "\n"
+        f"{text}\n"
+    )
+    return mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
+                       "--subject", subject, "--body", framed], run).strip()
+
+
+def pending_outbound(cfg: dict, run=subprocess.run) -> list[str]:
+    rows = mailcortex(["inbox", cfg["bridge_address"]], run).splitlines()
+    return [row.split("\t")[1] for row in rows if row.startswith("new\t")]
+
+
+def render_outbound(cfg: dict, rendered: str) -> tuple[str | None, str, str]:
+    """Parse `mailcortex read` output into (seat local part, chat text, Message-ID)."""
+    message = Parser(policy=policy.default).parsestr(rendered)
+    sender = parseaddr(str(message.get("From", "")))[1].lower()
+    local = cfg["reverse"].get(sender)
+    subject = str(message.get("Subject", "")).strip()
+    body = (message.get_payload() or "").strip()
+    if subject and not subject.lower().startswith(("re: [xmpp]", "[xmpp]")):
+        text = f"{subject}\n\n{body}" if body else subject
+    else:
+        text = body or subject
+    return local, text[:MAX_BODY], str(message.get("Message-ID", "")).strip()
+
+
+def run_bridge(cfg: dict) -> int:
+    try:
+        import asyncio
+        import slixmpp
+    except ImportError:
+        raise BridgeError("python3-slixmpp is not installed (mailcortex-xmpp-package)")
+
+    secret = read_secret(cfg["component_secret_file"])
+    gate = Gate(cfg["owner_jids"], cfg["rate_per_minute"])
+    seen = Seen(state_root() / "seen.json")
+
+    class Component(slixmpp.ComponentXMPP):
+        def __init__(self) -> None:
+            super().__init__(cfg["component_jid"], secret, cfg["server"], cfg["port"])
+            self.register_plugin("xep_0030")
+            self.register_plugin("xep_0199")
+            self.add_event_handler("session_start", self.on_start)
+            self.add_event_handler("message", self.on_message)
+            self.add_event_handler("presence_subscribe", self.on_subscribe)
+            self.add_event_handler("presence_probe", self.on_probe)
+            self.poller = None
+
+        def seat_jid(self, local: str) -> str:
+            return f"{local}@{cfg['component_jid']}"
+
+        async def on_start(self, _event) -> None:
+            LOG.info("component online: %s (%d seats)", cfg["component_jid"], len(cfg["seats"]))
+            for local in cfg["seats"]:
+                for owner in cfg["owner_jids"]:
+                    self.send_presence(pfrom=self.seat_jid(local), pto=owner)
+            if self.poller is None:
+                self.poller = asyncio.ensure_future(self.poll_outbound())
+
+        def on_subscribe(self, presence) -> None:
+            local = presence["to"].user
+            if bare(presence["from"]) in gate.owners and local in cfg["seats"]:
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare, ptype="subscribed")
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
+            else:
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare, ptype="unsubscribed")
+
+        def on_probe(self, presence) -> None:
+            if bare(presence["from"]) in gate.owners and presence["to"].user in cfg["seats"]:
+                self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
+
+        def on_message(self, msg) -> None:
+            if msg["type"] not in ("chat", "normal") or not msg["body"]:
+                return
+            sender = bare(msg["from"])
+            local = msg["to"].user
+            refusal = gate.admit(sender, time.monotonic())
+            if refusal:
+                LOG.warning("refused %s from %s to %s", refusal, sender, local)
+                if refusal == "rate_limited":
+                    msg.reply("Rate limited; message not delivered.").send()
+                return
+            if local not in cfg["seats"]:
+                LOG.warning("unknown seat %s from %s", local, sender)
+                msg.reply("No such seat.").send()
+                return
+            key = f"{sender}|{local}|{msg['id']}" if msg["id"] else None
+            if not seen.check_and_add(key):
+                LOG.info("duplicate stanza %s ignored", key)
+                return
+            try:
+                name = inbound_mail(cfg, sender, local, msg["body"])
+            except BridgeError as error:
+                LOG.error("delivery failed for %s: %s", local, error)
+                msg.reply(f"Not delivered: {error}").send()
+                return
+            LOG.info("delivered %s -> %s as %s", sender, local, name)
+
+        async def poll_outbound(self) -> None:
+            while True:
+                try:
+                    self.relay_outbound()
+                except BridgeError as error:
+                    LOG.error("outbound poll failed: %s", error)
+                await asyncio.sleep(cfg["poll_seconds"])
+
+        def relay_outbound(self) -> None:
+            for name in pending_outbound(cfg):
+                rendered = mailcortex(["read", cfg["bridge_address"], name])
+                local, text, message_id = render_outbound(cfg, rendered)
+                if local is None:
+                    LOG.warning("rejected outbound mail %s from an unmapped sender", name)
+                    if message_id:
+                        mailcortex(["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
+                    continue
+                for owner in cfg["owner_jids"]:
+                    self.send_message(mto=owner, mfrom=self.seat_jid(local), mbody=text, mtype="chat")
+                if message_id:
+                    mailcortex(["receipt", cfg["bridge_seat"], message_id, "handling_completed"])
+                LOG.info("relayed %s from %s", name, local)
+
+    component = Component()
+    component.connect()
+    asyncio.get_event_loop().run_until_complete(component.disconnected)
+    return 1
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="mailcortex-xmpp-bridge",
+        description="Bridge MailCortex seats to XMPP through a Prosody component.")
+    parser.add_argument("--check", action="store_true",
+                        help="validate the private config and secret, then exit")
+    parser.add_argument("--config", type=Path, default=None,
+                        help="bridge.json path (default ~/.config/mailcortex/xmpp-private/bridge.json)")
+    args = parser.parse_args(argv)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    try:
+        cfg = load_config(args.config or config_path())
+        if args.check:
+            read_secret(cfg["component_secret_file"])
+            print(f"ok: {len(cfg['seats'])} seats, {len(cfg['owner_jids'])} owners, "
+                  f"component {cfg['component_jid']}")
+            return 0
+        return run_bridge(cfg)
+    except BridgeError as error:
+        print(f"mailcortex-xmpp-bridge: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
