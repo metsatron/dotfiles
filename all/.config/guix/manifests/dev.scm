@@ -41,5 +41,12 @@
    ;; installed via DotCortex").
    "adb"
    "fastboot"
+   ;; WebSocket-to-TCP gateway for Aura Rail: the OpenTTD WebAssembly client can only
+   ;; open WebSockets, so websockify fronts the native dedicated server on kikin
+   ;; (upstream's os/emscripten/pre.js prescribes exactly this proxy for self-hosted
+   ;; servers). Approved by Mètsàtron 2026-10-01 (Telegram, "Please start building").
+   ;; Pinned to the local 0.11.0-1 variant below: Guix main's 0.11.0 fails its own
+   ;; check phase at the fleet pin.
+   "websockify@0.11.0-1"
    ))
 ;; Guix User profile manifests:2 ends here
