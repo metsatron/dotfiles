@@ -32,6 +32,7 @@ class FakeHost:
         self.plugin = "default"
         self.override = False
         self.reenabled_fails = False
+        self.disable_fails = False
         self.rewrite = False
         self.health = []
         self.target = root / "etc/NetworkManager/conf.d/90-dotcortex-tailscale-dns.conf"
@@ -62,6 +63,8 @@ class FakeHost:
             pass
         elif argv == ["tailscale", "set", "--accept-dns=false"]:
             self.accept = False
+            if self.disable_fails:
+                raise ContractError("fixture failure after disabling DNS")
         elif argv == ["tailscale", "set", "--accept-dns=true"]:
             if self.reenabled_fails:
                 raise ContractError("fixture re-enable failure")
@@ -101,6 +104,7 @@ class DnsOwnershipTests(unittest.TestCase):
         self.assertLess(next(i for i, cmd in enumerate(calls) if cmd[:2] == ["cp", "-a"]), next(i for i, cmd in enumerate(calls) if cmd[:2] == ["install", "-m"]))
         self.assertIn(["nmcli", "general", "reload", "conf"], calls)
         self.assertIn(["nmcli", "general", "reload", "dns-rc"], calls)
+        self.assertLess(calls.index(["nmcli", "general", "reload", "conf"]), calls.index(["tailscale", "set", "--accept-dns=false"]))
         self.assertFalse(any("restart" in cmd or "down" in cmd for cmd in calls))
 
     def test_healthy_direct_host_is_protected_without_dns_toggle(self):
@@ -202,6 +206,13 @@ class DnsOwnershipTests(unittest.TestCase):
         self.assertFalse(self.host.accept)
         self.assertTrue((self.setup.checkpoint / "resolv.conf").exists())
         self.assertEqual(self.host.target.read_text(), EXPECTED)
+
+    def test_disable_failure_still_reenables_dns_and_fails_loud(self):
+        self.host.disable_fails = True
+        with self.assertRaisesRegex(ContractError, "disable failed; re-enable command succeeded"):
+            self.setup.apply()
+        self.assertTrue(self.host.accept)
+        self.assertTrue((self.setup.checkpoint / "resolv.conf").exists())
 
     def test_help_does_not_touch_host(self):
         result = subprocess.run([str(SCRIPT), "--help"], text=True, capture_output=True, timeout=5)
