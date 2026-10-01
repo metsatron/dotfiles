@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 REPO = Path(__file__).resolve().parents[5]
 SCRIPT = REPO / "linux/.local/bin/tailscale-dns-setup"
@@ -217,6 +218,13 @@ class DnsOwnershipTests(unittest.TestCase):
             self.setup.apply()
         self.assertTrue(self.host.accept)
         self.assertTrue((self.setup.checkpoint / "resolv.conf").exists())
+
+    def test_cli_retains_standard_paths_without_an_inherited_path(self):
+        for initial in ({}, {"PATH": ""}):
+            with self.subTest(initial=initial), mock.patch.dict(MODULE["os"].environ, initial, clear=True), mock.patch.object(MODULE["sys"], "argv", ["tailscale-dns-setup", "--plan"]), mock.patch.dict(MODULE["main"].__globals__, {"Setup": lambda **kwargs: self.setup}), mock.patch.object(MODULE["shutil"], "which", return_value="/fixture"):
+                self.assertEqual(MODULE["main"](), 0)
+                self.assertIn("/usr/bin", MODULE["os"].environ["PATH"].split(":"))
+                self.assertIn("/usr/sbin", MODULE["os"].environ["PATH"].split(":"))
 
     def test_help_does_not_touch_host(self):
         result = subprocess.run([str(SCRIPT), "--help"], text=True, capture_output=True, timeout=5)
