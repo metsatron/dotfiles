@@ -9,6 +9,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+import runpy
 
 ROOT = Path(__file__).resolve().parents[5]
 COLLECTOR = ROOT / "all/.local/bin/fleet-health-alerts"
@@ -16,6 +17,19 @@ INSTALLER = ROOT / "linux/.local/bin/fleet-health-alerts-cron-apply"
 
 
 class FleetAlertsTests(unittest.TestCase):
+    def test_small_filesystem_reserves_are_capacity_capped(self) -> None:
+        classify = runpy.run_path(str(COLLECTOR))["classify"]
+        for capacity in (5_242_880, 2_500_000_000, 12_000_000_000):
+            with self.subTest(capacity=capacity):
+                metric = {"total_bytes": capacity, "available_bytes": capacity * 9 // 10,
+                          "free_percent": 90, "inode_percent": 1}
+                self.assertEqual(classify(metric), "normal")
+                for free_percent, expected in ((19, "warning"), (10, "critical"), (5, "emergency")):
+                    metric.update(available_bytes=capacity * free_percent // 100, free_percent=free_percent)
+                    self.assertEqual(classify(metric), expected)
+                metric.update(available_bytes=capacity, free_percent=100, inode_percent=96)
+                self.assertEqual(classify(metric), "emergency")
+
     def run_collector(self, root: Path, bytes_free: int, used_percent: int, inode_percent: int, stale: bool = False) -> subprocess.CompletedProcess[str]:
         df = root / "df.txt"
         inode = root / "df-inode.txt"
@@ -121,8 +135,8 @@ class FleetAlertsTests(unittest.TestCase):
             target.write_text(
                 "# HelmCortex fleet health; managed by fleet-health-alerts-cron-apply.\n"
                 "SHELL=/bin/sh\nPATH=%s\n"
-                "*/5 * * * * test-user HOME=%s PATH=%s %s --once >>%s/.local/state/helmcortex-notifications/fleet/cron.log 2>&1\n"
-                % (path, root, path, COLLECTOR, root),
+                "*/5 * * * * test-user umask 077; mkdir -p %s/.local/state/helmcortex-notifications/fleet && HOME=%s PATH=%s %s --once >>%s/.local/state/helmcortex-notifications/fleet/cron.log 2>&1\n"
+                % (path, root, root, path, COLLECTOR, root),
                 encoding="utf-8",
             )
             before = target.read_bytes()
@@ -140,6 +154,22 @@ class FleetAlertsTests(unittest.TestCase):
             result = subprocess.run([INSTALLER, "--check"], env=env, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(target.read_bytes(), before)
+            self.assertFalse((root / ".local/state").exists())
+
+    def test_cron_command_bootstraps_log_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = os.environ.copy()
+            env.update(FLEET_ALERTS_HOSTNAME="kikin-kushi", FLEET_ALERTS_HOME=str(root),
+                       FLEET_ALERTS_COLLECTOR="/bin/true", FLEET_ALERTS_USER="test-user")
+            result = subprocess.run([INSTALLER, "--dry-run"], env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            command = result.stdout.splitlines()[-1].split(maxsplit=6)[6]
+            result = subprocess.run(["/bin/sh", "-c", command], env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            log = root / ".local/state/helmcortex-notifications/fleet/cron.log"
+            self.assertTrue(log.exists())
+            self.assertEqual(log.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":
