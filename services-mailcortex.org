@@ -504,6 +504,25 @@ deliveries remain queued and are replayed on the next scan; an injection
 already started is never retried automatically because its delivery outcome
 may be ambiguous.
 
+DeepSeek mail-back correlates the persisted prompt request ID with durable
+=user/message= and =turn/end= events. Only a completed, single-request turn's
+last committed assistant text is returned to the original From address, with
+=In-Reply-To= and =References=. Automatic mail never triggers another DeepSeek
+turn; Herdr seats still receive the normal inbox wake for a returned reply. Return
+addresses are frozen before injection; neither model text nor Reply-To can
+redirect delivery. A separate reply state records pending, ready, delivered,
+or failed, without claiming handling completion or knowledge acceptance.
+Deterministic publication survives receipt-write failure without duplicate
+mail. Legacy injections without correlation remain untouched. Snapshot reads
+use Node and the declared DSH installation's ws dependency, with bounded
+timeouts and pagination; no new package or private registry field is required.
+Mail-back failures are isolated per receipt and per DeepSeek seat. An unsafe or
+unprovisioned return address disables only that message's return path: the
+agent still receives the mail with an explicit no-mail-back notice. Snapshot
+errors retain pending state and an error timestamp; publication retries retain
+ready bytes. Diagnostics do not stop unrelated seats. Skipped automatic mail
+gets an observed receipt with reason =auto_submitted=, never a handling claim.
+
 #+BEGIN_SRC python :tangle all/.local/bin/mailcortex-seat-watcher :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 """Idle-only, exactly-once MailCortex seat wake watcher."""
 from __future__ import annotations
@@ -515,6 +534,7 @@ import json
 import os
 import re
 import socket
+import shutil
 import subprocess
 import sys
 import time
@@ -523,7 +543,10 @@ import urllib.parse
 import urllib.request
 import uuid
 from email import policy
+from email.message import EmailMessage
 from email.parser import BytesParser
+from email.utils import format_datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import importlib.machinery
@@ -611,7 +634,7 @@ def message_id(path: Path) -> str:
 WAKE_BODY_LIMIT = 8000
 
 
-def wake_prompt(record: dict, path: Path) -> str:
+def wake_prompt(record: dict, path: Path, mailback_error: str | None = None) -> str:
     """Herdr seats read their own Maildir, so they get the /inbox command.
     A DeepSeek seat runs as its own Unix user and cannot read this Maildir,
     so the mail itself rides in the prompt."""
@@ -625,6 +648,16 @@ def wake_prompt(record: dict, path: Path) -> str:
         raise WatcherError("malformed mail") from error
     if len(body) > WAKE_BODY_LIMIT:
         body = body[:WAKE_BODY_LIMIT] + "\n[truncated by MailCortex]"
+    footer = (
+        "No mail-back is possible for this message. The return path failed "
+        f"validation: {mailback_error}\n"
+        "You may still handle this mail and reply via Telegram; no automatic "
+        "mail reply will be published."
+        if mailback_error else
+        "Write your final reply normally. MailCortex will return the final "
+        "text of this completed turn to the original sender. Delivery is "
+        "not acceptance of a knowledge proposal."
+    )
     return (
         "MailCortex delivered this mail to you. The full message is below; "
         "you cannot open the Maildir yourself.\n"
@@ -632,9 +665,131 @@ def wake_prompt(record: dict, path: Path) -> str:
         f"Subject: {message.get('Subject', '')}\n"
         f"Message-ID: {message.get('Message-ID', '')}\n\n"
         f"{body.strip()}\n\n"
-        "Reply to the Admiral on Telegram; MailCortex replies from your "
-        "account are not wired yet."
+        f"{footer}"
     )
+
+
+def reply_context(record: dict, path: Path) -> dict:
+    message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+    addresses = {}
+    for header in ("From", "To"):
+        values = message.get_all(header, [])
+        if len(values) != 1:
+            raise WatcherError("mail-back requires exactly one From and To")
+        addresses[header] = MAILCORTEX.validate_address(str(values[0]).strip())
+    target = MAILCORTEX.address_maildir(addresses["To"])
+    if target != MAILCORTEX.mail_root() / record["mailbox"]:
+        raise WatcherError("mail-back recipient does not match the owned mailbox")
+    destination = MAILCORTEX.require_maildir(addresses["From"])
+    if destination == target:
+        raise WatcherError("mail-back refuses a self-addressed request")
+    for component in (MAILCORTEX.mail_root(), destination.parent, destination,
+                      *(destination / leaf for leaf in ("tmp", "new", "cur"))):
+        if component.is_symlink():
+            raise WatcherError("unsafe mail-back destination")
+    return {"sender": addresses["To"], "to": addresses["From"],
+            "subject": str(message.get("Subject", "")),
+            "request_id": uuid.uuid4().hex, "session": record["deepseek_session"]}
+
+
+SNAPSHOT_JS = r"""
+const fs = require('fs'), path = require('path');
+const W = require(require.resolve('ws', {paths: [path.dirname(fs.realpathSync(process.argv[1]))]}));
+const c = JSON.parse(fs.readFileSync(0, 'utf8')), u = new URL(c.url);
+u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+u.pathname = '/api/remote.mux'; u.search = ''; u.hash = '';
+const s = new W(u, {headers: {Cookie: c.cookie}, maxPayload: 2097152});
+const timer = setTimeout(() => process.exit(2), 10000);
+s.on('open', () => s.send(JSON.stringify({type: 'open', streamId: 'mailback',
+  endpoint: 'session/follow', payload: {args: {request: {
+    address: {kind: 'session', sessionId: c.session}, maxMessages: 50}}}})));
+s.on('message', raw => {
+  const m = JSON.parse(raw);
+  if (m.streamId !== 'mailback') return;
+  if (m.type === 'item' && m.value.type === 'snapshot') {
+    process.stdout.write(JSON.stringify(m.value)); clearTimeout(timer); s.close();
+  } else if (m.type === 'error' || m.type === 'end') process.exit(3);
+});
+s.on('error', () => process.exit(4));
+"""
+
+
+def completed_reply(records: list, request_id: str) -> tuple[str, str | None]:
+    events = [item.get("event", {}) for item in records if item.get("type") == "event"]
+    events.sort(key=lambda event: event["seq"])
+    matches = [event for event in events if event.get("type") == "user/message"
+               and event.get("data", {}).get("source", {}).get("kind") == "user"
+               and event.get("data", {}).get("source", {}).get("rpcId") == request_id]
+    if not matches:
+        return "pending", None
+    if len(matches) != 1:
+        raise WatcherError("mail-back request identity is ambiguous")
+    starts = [event for event in events if event["type"] == "turn/start"
+              and event["seq"] < matches[0]["seq"]]
+    if not starts:
+        return "pending", None
+    start = starts[-1]
+    later = [event["seq"] for event in events if event["type"] == "turn/start"
+             and event["seq"] > matches[0]["seq"]]
+    stop = min(later) if later else float("inf")
+    same = [event for event in events if start["seq"] <= event["seq"] < stop]
+    if any(b["seq"] != a["seq"] + 1 for a, b in zip(same, same[1:])):
+        raise WatcherError("mail-back history is not contiguous")
+    users = [event for event in same if event["type"] == "user/message"
+             and event["data"].get("source", {}).get("kind") == "user"]
+    if len(users) != 1:
+        return "failed", None
+    ends = [event for event in same if event["type"] == "turn/end"]
+    if not ends:
+        return "pending", None
+    if (len(ends) != 1 or ends[0]["data"].get("turn") != start["data"].get("turn")
+            or ends[0]["data"].get("reason", {}).get("kind") != "completed"):
+        return "failed", None
+    messages = [event for event in same if event["type"] == "assistant/message"
+                and matches[0]["seq"] < event["seq"] < ends[0]["seq"]]
+    if not messages or messages[-1]["data"].get("interrupted"):
+        return "failed", None
+    content = messages[-1]["data"].get("message", {}).get("content", [])
+    body = "\n".join(part["text"] for part in content
+                     if part.get("type") == "text" and isinstance(part.get("text"), str))
+    return ("ready", body) if body.strip() else ("failed", None)
+
+
+def publish_reply(seat: str, mid: str, receipt: dict) -> str:
+    context = receipt["reply_context"]
+    target = MAILCORTEX.require_maildir(context["to"])
+    for component in (MAILCORTEX.mail_root(), target.parent, target,
+                      *(target / leaf for leaf in ("tmp", "new", "cur"))):
+        if component.is_symlink():
+            raise WatcherError("unsafe mail-back destination")
+    key = MAILCORTEX.hashlib.sha256(f"{seat}\n{mid}\n{context['request_id']}".encode()).hexdigest()
+    name = f"{key}.mailcortex-reply"
+    message = EmailMessage(policy=policy.SMTP)
+    message["Date"] = format_datetime(datetime.fromtimestamp(receipt["reply_ready_at"], timezone.utc))
+    message["From"], message["To"] = context["sender"], context["to"]
+    message["Subject"] = "Re: " + context["subject"]
+    message["Message-ID"] = f"<{key}@{context['sender'].rsplit('@', 1)[-1]}>"
+    message["In-Reply-To"] = mid
+    message["References"] = mid
+    message["Auto-Submitted"] = "auto-replied"
+    message.set_content(receipt["reply_body"])
+    raw = message.as_bytes()
+    existing = [p for leaf in ("new", "cur") for p in (target / leaf).iterdir()
+                if p.name.split(":2,", 1)[0] == name]
+    if existing:
+        if any(p.is_symlink() or p.read_bytes() != raw for p in existing):
+            raise WatcherError("mail-back publication collision")
+        return name
+    temporary = target / "tmp" / MAILCORTEX.safe_name()
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        os.link(temporary, target / "new" / name)
+        MAILCORTEX.fsync_directory(target / "new")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return name
 
 
 def safe_receipt(seat: str, mid: str) -> dict | None:
@@ -789,13 +944,48 @@ class DeepSeekAdapter:
             return record["deepseek_session"]
         raise WatcherError("DeepSeek session was not found")
 
-    def deliver(self, record: dict, target: str, prompt: str) -> None:
+    def reply(self, record: dict, request_id: str) -> tuple[str, str | None]:
+        base = loopback_url(record["deepseek_url"], "DeepSeek URL")
+        cookie_path = private_file(Path(record["deepseek_cookie_file"]).expanduser(), "DeepSeek cookie")
+        dsh = shutil.which("dsh")
+        if not dsh:
+            raise WatcherError("mail-back requires the declared DSH installation")
+        try:
+            result = subprocess.run(
+                ["node", "-e", SNAPSHOT_JS, dsh], text=True, capture_output=True,
+                input=json.dumps({"url": base, "cookie": cookie_path.read_text().strip(),
+                                  "session": record["deepseek_session"]}), timeout=15,
+            )
+            if result.returncode:
+                raise WatcherError("DeepSeek mail-back snapshot failed")
+            snapshot = json.loads(result.stdout)
+            if snapshot.get("type") != "snapshot" or snapshot.get("header", {}).get("id") != record["deepseek_session"]:
+                raise WatcherError("DeepSeek mail-back snapshot target mismatch")
+            records = list(snapshot["records"])
+            page = snapshot
+            for _ in range(10):
+                outcome = completed_reply(records, request_id)
+                if outcome[0] != "pending" or not page["hasMore"]:
+                    return outcome
+                before = min(item["event"]["seq"] for item in records)
+                page = self._rpc(record, "session/page", {"request": {
+                    "address": {"kind": "session", "sessionId": record["deepseek_session"]},
+                    "throughSeq": snapshot["cursor"], "beforeSeq": before, "maxMessages": 50,
+                }})
+                if not page["records"] or min(item["event"]["seq"] for item in page["records"]) >= before:
+                    raise WatcherError("DeepSeek mail-back history made no progress")
+                records.extend(page["records"])
+            raise WatcherError("DeepSeek mail-back exceeded its bounded history window")
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
+            raise WatcherError("DeepSeek mail-back history is unavailable or malformed") from error
+
+    def deliver(self, record: dict, target: str, prompt: str, request_id: str | None = None) -> None:
         value = self._rpc(
             record,
             "session/prompt",
             {
                 "request": {
-                    "requestId": uuid.uuid4().hex,
+                    "requestId": request_id or uuid.uuid4().hex,
                     "sessionId": target,
                     "mode": "queue",
                     "content": [{"type": "text", "text": prompt}],
@@ -826,7 +1016,82 @@ def record_adapter(adapter: object, record: dict) -> object:
     return factory(record) if factory is not None else adapter
 
 
-def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
+def diagnostic(error: Exception) -> str:
+    # Arbitrary transport exception text may contain credentials. Only our
+    # intentionally concise diagnostics may enter logs or receipts.
+    if isinstance(error, (WatcherError, MAILCORTEX.MailCortexError)):
+        return str(error)[:240]
+    return type(error).__name__
+
+
+def report_error(seat: str, subject: str, error: Exception) -> None:
+    print(f"mailcortex-seat-watcher: seat={seat} item={subject}: {diagnostic(error)}", file=sys.stderr)
+
+
+def reconcile_reply(seat: str, record: dict, adapter: object, now: float, path: Path) -> bool:
+    if path.is_symlink():
+        raise WatcherError("unsafe reply receipt")
+    value = json.loads(path.read_text())
+    mid = value["message_id"]
+    receipt = safe_receipt(seat, mid)
+    if not receipt or path != MAILCORTEX.receipt_path(seat, mid):
+        raise WatcherError("reply receipt identity mismatch")
+    context = receipt.get("reply_context")
+    if not context or receipt["wake_state"] != "injected":
+        return False
+    if context["session"] != record["deepseek_session"]:
+        raise WatcherError("reply receipt session mismatch")
+    state = receipt.get("reply_state")
+    if state in {"delivered", "failed"}:
+        return False
+    if state == "pending":
+        state, body = adapter.reply(record, context["request_id"])
+        if state == "pending":
+            return True
+        receipt.update(reply_state=state, reply_ready_at=now)
+        if state == "ready":
+            receipt["reply_body"] = body
+        elif state == "failed":
+            receipt["reply_reason"] = "turn_not_unambiguously_completed_with_text"
+        else:
+            raise WatcherError("invalid mail-back settlement")
+        MAILCORTEX.atomic_json(path, receipt)
+    elif state != "ready":
+        raise WatcherError("invalid mail-back receipt state")
+    if state == "ready":
+        name = publish_reply(seat, mid, receipt)
+        receipt.update(reply_state="delivered", reply_filename=name, reply_delivered_at=now)
+        receipt.pop("reply_error", None)
+        MAILCORTEX.atomic_json(path, receipt)
+    return False
+
+
+def reconcile_replies(seat: str, record: dict, adapter: object, now: float) -> bool:
+    directory = MAILCORTEX.runtime_root() / "receipts" / seat
+    pending = False
+    if not directory.is_dir():
+        return pending
+    for path in sorted(directory.glob("*.json")):
+        try:
+            pending = reconcile_reply(seat, record, adapter, now, path) or pending
+        except Exception as error:
+            pending = True
+            report_error(seat, path.name, error)
+            try:
+                if path.is_symlink():
+                    raise WatcherError("unsafe reply receipt")
+                mid = json.loads(path.read_text())["message_id"]
+                receipt = safe_receipt(seat, mid)
+                if not receipt or path != MAILCORTEX.receipt_path(seat, mid):
+                    raise WatcherError("reply receipt identity mismatch")
+                receipt.update(reply_error=diagnostic(error), reply_error_at=now)
+                MAILCORTEX.atomic_json(path, receipt)
+            except Exception as receipt_error:
+                report_error(seat, path.name, receipt_error)
+    return pending
+
+
+def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int:
     now = time.time() if now is None else now
     count = 0
     seen: set[tuple[str, str]] = set()
@@ -839,16 +1104,25 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
         components = (MAILCORTEX.mail_root(), MAILCORTEX.mail_root() / namespace, mailbox)
         if any(item.is_symlink() for item in components) or not all(item.is_dir() for item in components) or not (mailbox / "new").is_dir():
             raise WatcherError("canonical mailbox is absent or unsafe")
+        transport_adapter = record_adapter(adapter, record)
+        pending_reply = (reconcile_replies(seat, record, transport_adapter, now)
+                         if record["transport"] == "deepseek" else False)
         last_injected = latest_injection(seat)
         for path in sorted(mailbox.joinpath("new").iterdir(), key=lambda p: p.name):
             if not path.is_file() or path.is_symlink() or path.name.startswith("."):
                 continue
             mid = message_id(path)
+            parsed = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
             if (seat, mid) in seen:
                 continue
             seen.add((seat, mid))
             old = safe_receipt(seat, mid)
             if old and old["wake_state"] in {"injecting", "injected", "delivery_unknown"}:
+                continue
+            if record["transport"] == "deepseek" and str(parsed.get("Auto-Submitted", "no")).lower() != "no":
+                if not old or old.get("reason") != "auto_submitted":
+                    MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
+                                                  reason="auto_submitted", wake_updated_at=now)
                 continue
             if last_injected and last_injected + record["rate_limit_seconds"] > now:
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="rate_limited",
@@ -856,27 +1130,72 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
                 continue
             MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
                                           wake_updated_at=now)
-            transport_adapter = record_adapter(adapter, record)
-            pane_id = transport_adapter.resolve_idle_pane(record)
+            if pending_reply:
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="reply_pending", wake_updated_at=now)
+                continue
+            try:
+                pane_id = transport_adapter.resolve_idle_pane(record)
+            except Exception as error:
+                if record["transport"] != "deepseek":
+                    raise
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
+                                              wake_error=diagnostic(error), wake_updated_at=now)
+                report_error(seat, path.name, error)
+                continue
             if pane_id is None:
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="busy",
                                               wake_updated_at=now)
                 continue
+            extra = {}
+            mailback_error = None
+            request_id = None
+            if record["transport"] == "deepseek":
+                request_id = uuid.uuid4().hex
+                try:
+                    context = reply_context(record, path)
+                    request_id = context["request_id"]
+                    extra = {"reply_context": context, "reply_state": "pending"}
+                except Exception as error:
+                    mailback_error = diagnostic(error)
+                    report_error(seat, path.name, error)
+                    extra = {"reply_state": "failed", "reply_reason": "return_path_unavailable",
+                             "reply_error": mailback_error, "reply_error_at": now}
             MAILCORTEX.write_wake_receipt(seat, mid, "injecting", filename=path.name,
-                                          pane_id=pane_id, wake_updated_at=now)
+                                          pane_id=pane_id, wake_updated_at=now, **extra)
             try:
-                transport_adapter.deliver(record, pane_id, wake_prompt(record, path))
+                if extra:
+                    transport_adapter.deliver(record, pane_id, wake_prompt(record, path, mailback_error),
+                                              request_id=request_id)
+                else:
+                    transport_adapter.deliver(record, pane_id, wake_prompt(record, path))
             except Exception as error:
                 MAILCORTEX.write_wake_receipt(
                     seat, mid, "delivery_unknown", filename=path.name,
                     pane_id=pane_id, reason="delivery_error", wake_updated_at=now,
                 )
+                if record["transport"] == "deepseek":
+                    report_error(seat, path.name, error)
+                    continue
                 if isinstance(error, WatcherError):
                     raise
                 raise WatcherError("transport delivery outcome is unknown") from error
             MAILCORTEX.write_wake_receipt(seat, mid, "injected", filename=path.name,
                                           pane_id=pane_id, wake_updated_at=now)
             count += 1
+            if extra.get("reply_context"):
+                pending_reply = True
+    return count
+
+
+def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
+    count = 0
+    for seat, record in registry["seats"].items():
+        try:
+            count += scan_seats({"seats": {seat: record}}, adapter, now=now)
+        except Exception as error:
+            if record.get("transport") != "deepseek":
+                raise
+            report_error(seat, "scan", error)
     return count
 
 
@@ -907,7 +1226,7 @@ def main() -> int:
             if args.once:
                 return 0
             time.sleep(max(args.interval, 0.1))
-    except (WatcherError, OSError, ValueError) as error:
+    except (WatcherError, MAILCORTEX.MailCortexError, OSError, ValueError, KeyError, TypeError) as error:
         print(f"mailcortex-seat-watcher: {error}", file=sys.stderr)
         return 2
 
@@ -1136,6 +1455,7 @@ import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -1398,6 +1718,286 @@ class WatcherTests(unittest.TestCase):
         self.assertIn("Wolf, reply with Fox.", prompt)
         self.assertNotEqual(prompt, "/inbox")
         self.assertEqual(self.watcher.wake_prompt({"transport": "herdr"}, mail), "/inbox")
+
+    def deep_fixture(self):
+        record = {"host": "test-host", "mailbox": "seats/builder", "harness": "deepseek",
+                  "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
+                  "deepseek_cookie_file": str(self.base / "cookie"),
+                  "deepseek_session": "deep-session", "rate_limit_seconds": 0}
+        self.registry["seats"]["builder"] = record
+        for leaf in ("tmp", "new", "cur"):
+            (self.root / "consorts/sender" / leaf).mkdir(parents=True)
+        class Adapter:
+            def __init__(self):
+                self.calls = []; self.result = ("pending", None)
+            def resolve_idle_pane(self, record):
+                return record["deepseek_session"]
+            def deliver(self, record, target, prompt, request_id=None):
+                self.calls.append((target, prompt, request_id))
+            def reply(self, record, request_id):
+                assert request_id == self.calls[0][2]
+                return self.result
+        return record, Adapter()
+
+    def reply_events(self, request="ours", reason="completed"):
+        def e(seq, kind, data):
+            return {"type": "event", "event": {"seq": seq, "type": kind, "data": data}}
+        return [e(0, "turn/start", {"turn": 1}),
+                e(1, "user/message", {"source": {"kind": "user", "rpcId": request}}),
+                e(2, "assistant/message", {"turn": 1, "message": {"content": [
+                    {"type": "thinking", "text": "private reasoning"},
+                    {"type": "text", "text": "Fox"}]}}),
+                e(3, "turn/end", {"turn": 1, "reason": {"kind": reason}})]
+
+    def test_mailback_matches_request_not_latest_turn_and_requires_completion(self):
+        records = self.reply_events()
+        later = self.reply_events("unrelated")
+        for row in later:
+            row["event"]["seq"] += 4
+            if "turn" in row["event"]["data"]:
+                row["event"]["data"]["turn"] = 2
+        later[2]["event"]["data"]["message"]["content"] = [{"type": "text", "text": "wrong reply"}]
+        self.assertEqual(self.watcher.completed_reply(records + later, "ours"), ("ready", "Fox"))
+        self.assertEqual(self.watcher.completed_reply(records[:-1], "ours"), ("pending", None))
+        self.assertEqual(self.watcher.completed_reply(records[1:], "ours"), ("pending", None))
+        for reason in ("aborted", "error", "interrupted", "max-tokens"):
+            self.assertEqual(self.watcher.completed_reply(self.reply_events(reason=reason), "ours"), ("failed", None))
+        records[2]["event"]["type"] = "user/message"
+        records[2]["event"]["data"] = {"source": {"kind": "user", "rpcId": "other"}}
+        self.assertEqual(self.watcher.completed_reply(records, "ours"), ("failed", None))
+
+    def test_mailback_roundtrip_is_threaded_private_and_does_not_claim_handling(self):
+        record, adapter = self.deep_fixture()
+        mid = "<request@node.helm>"
+        self.mail(mid, "a"); self.mail("<second@node.helm>", "b")
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 1)
+        self.assertEqual(self.receipt(mid)["reply_context"]["request_id"], adapter.calls[0][2])
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=11), 0)
+        self.assertEqual(self.receipt("<second@node.helm>")["reason"], "reply_pending")
+        adapter.result = ("ready", "Fox")
+        (self.mailbox / "new/b").unlink()
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=12), 0)
+        from email import policy
+        from email.parser import BytesParser
+        files = list((self.root / "consorts/sender/new").iterdir())
+        self.assertEqual(len(files), 1)
+        msg = BytesParser(policy=policy.default).parsebytes(files[0].read_bytes())
+        self.assertEqual(msg["From"], "seat+builder@node.helm")
+        self.assertEqual(msg["To"], "sender@node.helm")
+        self.assertEqual(msg["In-Reply-To"], mid)
+        self.assertEqual(msg["References"], mid)
+        self.assertEqual(msg["Auto-Submitted"], "auto-replied")
+        self.assertEqual(msg.get_content().strip(), "Fox")
+        self.assertEqual(files[0].stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.receipt(mid)["reply_state"], "delivered")
+        self.assertIsNone(self.receipt(mid)["handling_state"])
+        self.assertEqual(self.receipt(mid)["wake_state"], "injected")
+        self.watcher.locked_scan(self.registry, adapter, now=13)
+        self.assertEqual(len(list(files[0].parent.iterdir())), 1)
+
+    def test_mailback_recovers_after_publish_before_receipt_even_when_seen(self):
+        record, adapter = self.deep_fixture()
+        mid = "<crash@node.helm>"; self.mail(mid, "a")
+        self.watcher.locked_scan(self.registry, adapter, now=10)
+        adapter.result = ("ready", "Fox")
+        atomic = self.watcher.MAILCORTEX.atomic_json
+        def fail_after_publish(path, value):
+            if value.get("reply_state") == "delivered":
+                raise OSError("fixture crash after publication")
+            atomic(path, value)
+        with mock.patch.object(self.watcher.MAILCORTEX, "atomic_json", fail_after_publish):
+            with mock.patch("sys.stderr"):
+                self.watcher.locked_scan(self.registry, adapter, now=11)
+        self.assertEqual(self.receipt(mid)["reply_state"], "ready")
+        target = self.root / "consorts/sender"
+        path = next((target / "new").iterdir())
+        path.rename(target / "cur" / (path.name + ":2,S"))
+        self.watcher.locked_scan(self.registry, adapter, now=12)
+        self.assertEqual(list((target / "new").iterdir()), [])
+        self.assertEqual(len(list((target / "cur").iterdir())), 1)
+        self.assertEqual(self.receipt(mid)["reply_state"], "delivered")
+
+    def test_mailback_refuses_redirects_unknown_senders_and_automatic_loops(self):
+        record, adapter = self.deep_fixture()
+        cases = (("From", "outside@example.com"), ("From", "unknown@node.helm"),
+                 ("To", "other@node.helm"), ("From", "seat+builder@node.helm"))
+        for index, (header, value) in enumerate(cases):
+            mid = f"<bad{index}@node.helm>"
+            self.mail(mid, str(index))
+            path = self.mailbox / "new" / str(index)
+            message = self.watcher.MAILCORTEX.parse_message(path)
+            message.replace_header(header, value); path.write_bytes(message.as_bytes())
+            with mock.patch("sys.stderr"):
+                self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10 + index), 1)
+            self.assertEqual(self.receipt(mid)["reply_state"], "failed")
+            self.assertNotIn("reply_context", self.receipt(mid))
+            self.assertIn("No mail-back is possible", adapter.calls[-1][1])
+        self.mail("<auto@node.helm>", "auto")
+        path = self.mailbox / "new/auto"
+        message = self.watcher.MAILCORTEX.parse_message(path)
+        message.replace_header("From", "sender@node.helm")
+        message["Auto-Submitted"] = "auto-replied"; path.write_bytes(message.as_bytes())
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=20), 0)
+        self.assertEqual(len(adapter.calls), len(cases))
+        self.assertEqual(self.receipt("<auto@node.helm>")["reason"], "auto_submitted")
+        self.assertIsNone(self.receipt("<auto@node.helm>")["handling_state"])
+        receipt_path = self.watcher.MAILCORTEX.receipt_path("builder", "<auto@node.helm>")
+        unchanged = receipt_path.read_bytes()
+        self.watcher.locked_scan(self.registry, adapter, now=21)
+        self.assertEqual(receipt_path.read_bytes(), unchanged)
+
+    def add_herdr_seat(self):
+        mailbox = self.root / "seats/fox"
+        for leaf in ("tmp", "new", "cur"):
+            (mailbox / leaf).mkdir(parents=True)
+        self.registry["seats"]["fox"] = {
+            "host": "test-host", "mailbox": "seats/fox", "harness": "codex",
+            "transport": "herdr", "herdr_session": "fox-session",
+            "herdr_target": "fox-agent", "rate_limit_seconds": 0}
+        msg = EmailMessage()
+        msg["From"] = "sender@node.helm"; msg["To"] = "seat+fox@node.helm"
+        msg["Message-ID"] = "<fox@node.helm>"; msg.set_content("hello fox")
+        (mailbox / "new/a").write_bytes(msg.as_bytes())
+        return FakeAdapter()
+
+    def adapters(self, deep, herdr):
+        class Factory:
+            def for_record(self, record):
+                return deep if record["transport"] == "deepseek" else herdr
+        return Factory()
+
+    def test_missing_sender_mailbox_wakes_orca_and_herdr_in_same_scan(self):
+        record, deep = self.deep_fixture()
+        herdr = self.add_herdr_seat()
+        mid = "<nano@node.helm>"; self.mail(mid, "a")
+        path = self.mailbox / "new/a"
+        message = self.watcher.MAILCORTEX.parse_message(path)
+        message.replace_header("From", "nano@node.helm"); path.write_bytes(message.as_bytes())
+        factory = self.adapters(deep, herdr)
+        with mock.patch("sys.stderr") as diagnostic:
+            self.assertEqual(self.watcher.locked_scan(self.registry, factory, now=10), 2)
+            self.assertTrue(diagnostic.write.called)
+        receipt = self.receipt(mid)
+        self.assertEqual(receipt["wake_state"], "injected")
+        self.assertEqual(receipt["reply_state"], "failed")
+        self.assertEqual(receipt["reply_reason"], "return_path_unavailable")
+        self.assertIn("not provisioned", receipt["reply_error"])
+        self.assertIn("No mail-back is possible", deep.calls[0][1])
+        self.assertEqual(len(herdr.deliveries), 1)
+        self.assertFalse((self.root / "consorts/nano").exists())
+        self.assertEqual(self.watcher.locked_scan(self.registry, factory, now=11), 0)
+        self.assertEqual(len(deep.calls), 1)
+
+    def test_broken_snapshot_retains_pending_receipt_and_herdr_still_wakes(self):
+        record, deep = self.deep_fixture()
+        mid = "<snapshot@node.helm>"; self.mail(mid, "a")
+        self.watcher.locked_scan(self.registry, deep, now=10)
+        herdr = self.add_herdr_seat()
+        factory = self.adapters(deep, herdr)
+        with mock.patch.object(deep, "reply", side_effect=self.watcher.WatcherError("snapshot unavailable")), \
+             mock.patch("sys.stderr") as diagnostic:
+            self.assertEqual(self.watcher.locked_scan(self.registry, factory, now=11), 1)
+            self.assertTrue(diagnostic.write.called)
+        receipt = self.receipt(mid)
+        self.assertEqual(receipt["reply_state"], "pending")
+        self.assertEqual(receipt["reply_error"], "snapshot unavailable")
+        self.assertEqual(receipt["reply_error_at"], 11)
+        self.assertEqual(len(herdr.deliveries), 1)
+        deep.result = ("ready", "Fox")
+        self.watcher.locked_scan(self.registry, factory, now=12)
+        self.assertEqual(self.receipt(mid)["reply_state"], "delivered")
+
+    def test_expired_transport_cookie_only_queues_its_message(self):
+        record, deep = self.deep_fixture()
+        herdr = self.add_herdr_seat()
+        mid = "<cookie@node.helm>"; self.mail(mid, "a")
+        with mock.patch.object(deep, "resolve_idle_pane", side_effect=self.watcher.WatcherError("DeepSeek RPC returned an error")), \
+             mock.patch("sys.stderr"):
+            self.assertEqual(self.watcher.locked_scan(self.registry, self.adapters(deep, herdr), now=10), 1)
+        self.assertEqual(self.receipt(mid)["wake_state"], "queued")
+        self.assertEqual(self.receipt(mid)["reason"], "transport_unavailable")
+        self.assertEqual(deep.calls, [])
+        self.assertEqual(len(herdr.deliveries), 1)
+
+    def test_one_bad_reply_does_not_block_another_receipt_settlement(self):
+        record, deep = self.deep_fixture()
+        for index in range(2):
+            mid = f"<separate{index}@node.helm>"
+            self.watcher.MAILCORTEX.write_wake_receipt("builder", mid, "injected",
+                reply_context={"session": "deep-session", "request_id": str(index),
+                               "sender": "seat+builder@node.helm", "to": "sender@node.helm", "subject": "test"},
+                reply_state="pending")
+        def reply(record, request_id):
+            if request_id == "0":
+                raise self.watcher.WatcherError("one bad history")
+            return "ready", "Fox"
+        with mock.patch.object(deep, "reply", side_effect=reply), mock.patch("sys.stderr"):
+            self.watcher.locked_scan(self.registry, deep, now=10)
+        self.assertEqual(self.receipt("<separate0@node.helm>")["reply_state"], "pending")
+        self.assertEqual(self.receipt("<separate1@node.helm>")["reply_state"], "delivered")
+
+    def test_mailback_failed_turn_and_legacy_receipts_never_publish(self):
+        record, adapter = self.deep_fixture()
+        mid = "<failed@node.helm>"; self.mail(mid, "a")
+        self.watcher.locked_scan(self.registry, adapter, now=10)
+        adapter.result = ("failed", None)
+        self.watcher.locked_scan(self.registry, adapter, now=11)
+        self.assertEqual(self.receipt(mid)["reply_state"], "failed")
+        self.assertEqual(list((self.root / "consorts/sender/new").iterdir()), [])
+        self.mail("<legacy@node.helm>", "b")
+        self.watcher.MAILCORTEX.write_wake_receipt("builder", "<legacy@node.helm>", "injected")
+        self.watcher.locked_scan(self.registry, adapter, now=12)
+        self.assertEqual(len(adapter.calls), 1)
+
+    def test_returned_mail_still_wakes_herdr_without_an_autoreply_loop(self):
+        self.mail("<reply@node.helm>", "a")
+        path = self.mailbox / "new/a"
+        message = self.watcher.MAILCORTEX.parse_message(path)
+        message["Auto-Submitted"] = "auto-replied"
+        path.write_bytes(message.as_bytes())
+        adapter = FakeAdapter()
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 1)
+        self.assertEqual(adapter.deliveries[0][-1], "/inbox")
+
+    def test_mailback_collision_fails_without_overwriting_and_symlinks_are_refused(self):
+        record, adapter = self.deep_fixture()
+        mid = "<collision@node.helm>"; self.mail(mid, "a")
+        self.watcher.locked_scan(self.registry, adapter, now=10)
+        receipt = self.receipt(mid)
+        receipt.update(reply_body="Fox", reply_ready_at=11)
+        name = self.watcher.publish_reply("builder", mid, receipt)
+        path = self.root / "consorts/sender/new" / name
+        path.write_text("different bytes")
+        with self.assertRaisesRegex(self.watcher.WatcherError, "collision"):
+            self.watcher.publish_reply("builder", mid, receipt)
+        self.assertEqual(path.read_text(), "different bytes")
+        path.unlink()
+        path.symlink_to(self.base / "outside")
+        with self.assertRaisesRegex(self.watcher.WatcherError, "collision"):
+            self.watcher.publish_reply("builder", mid, receipt)
+
+    def test_mailback_snapshot_paginates_to_turn_start_and_rejects_wrong_session(self):
+        record, adapter = self.deep_fixture()
+        cookie = self.base / "cookie"; cookie.write_text("test-cookie"); cookie.chmod(0o600)
+        records = self.reply_events()
+        snapshot = {"type": "snapshot", "header": {"id": "deep-session"},
+                    "cursor": 3, "records": records[1:], "hasMore": True}
+        calls = []
+        def rpc(record, method, args):
+            calls.append((method, args))
+            return {"records": records[:1], "hasMore": False}
+        real = self.watcher.DeepSeekAdapter()
+        with mock.patch.object(self.watcher.shutil, "which", return_value="fixture-dsh"), \
+             mock.patch.object(self.watcher.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(snapshot), "")), \
+             mock.patch.object(real, "_rpc", side_effect=rpc):
+            self.assertEqual(real.reply(record, "ours"), ("ready", "Fox"))
+            self.assertEqual(calls[0][0], "session/page")
+            self.assertEqual(calls[0][1]["request"]["beforeSeq"], 1)
+            self.assertEqual(calls[0][1]["request"]["throughSeq"], 3)
+            snapshot["header"]["id"] = "wrong-session"
+            with mock.patch.object(self.watcher.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(snapshot), "")):
+                with self.assertRaisesRegex(self.watcher.WatcherError, "target mismatch"):
+                    real.reply(record, "ours")
 
     def test_production_adapter_uses_verified_herdr_shape_and_commands(self):
         calls = []
