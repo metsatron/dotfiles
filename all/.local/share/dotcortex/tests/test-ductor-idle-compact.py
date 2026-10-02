@@ -19,6 +19,7 @@ import importlib.util
 import os
 import sys
 from unittest import mock
+from ductor_bot.session.key import SessionKey
 
 try:
     import ductor_bot  # noqa: F401  (the seam imports ductor_bot.cli.types)
@@ -43,7 +44,7 @@ class FakeSession:
 
     @property
     def session_key(self):
-        return SimpleNamespace(chat_id=self.chat_id, topic_id=None, transport="tg", lock_key=(self.chat_id, None))
+        return SessionKey(chat_id=self.chat_id)
 
 
 class FakeSessions:

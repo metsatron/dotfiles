@@ -110,6 +110,7 @@ class IdleCompactor:
         self._home = orch._paths.sessions_path.parent
         self._state_path = self._home / _STATE_FILE
         self._task: asyncio.Task[None] | None = None
+        self._compacting: set[str] = set()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -225,6 +226,7 @@ class IdleCompactor:
                 session.session_id,
                 session.model,
             )
+            self._compacting.add(key.storage_key)
             try:
                 if session.provider == "claude":
                     ok = await self._compact_claude(session, settings)
@@ -235,6 +237,8 @@ class IdleCompactor:
             except Exception:
                 logger.exception("Idle compaction failed session=%s", session.session_id)
                 return True  # do not retry a failing compaction every tick
+            finally:
+                self._compacting.discard(key.storage_key)
             logger.info(
                 "Idle compaction %s provider=%s session=%s",
                 "done" if ok else "failed",
