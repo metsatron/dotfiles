@@ -256,7 +256,9 @@ class WatcherTests(unittest.TestCase):
         adapter.deliver(record, "deepbot-session", "/inbox")
         self.assertEqual([call[2]["method"] for call in calls],
                          ["session/list", "session/list", "session/prompt"])
-        self.assertEqual(calls[-1][2]["payload"]["args"]["mode"], "queue")
+        self.assertTrue(all(call[2]["type"] == "client-request" for call in calls))
+        self.assertEqual(calls[0][2]["payload"]["args"], {"_request": {}})
+        self.assertEqual(calls[-1][2]["payload"]["args"]["request"]["mode"], "queue")
         self.assertEqual(calls[-1][0].headers["Cookie"], "session=YOUR_COOKIE")
 
     def test_production_adapter_uses_verified_herdr_shape_and_commands(self):
