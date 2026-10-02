@@ -145,6 +145,7 @@ class IdleCompactor:
         self._home = orch._paths.sessions_path.parent
         self._state_path = self._home / _STATE_FILE
         self._task: asyncio.Task[None] | None = None
+        self._compacting: set[str] = set()
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -260,6 +261,7 @@ class IdleCompactor:
                 session.session_id,
                 session.model,
             )
+            self._compacting.add(key.storage_key)
             try:
                 if session.provider == "claude":
                     ok = await self._compact_claude(session, settings)
@@ -270,6 +272,8 @@ class IdleCompactor:
             except Exception:
                 logger.exception("Idle compaction failed session=%s", session.session_id)
                 return True  # do not retry a failing compaction every tick
+            finally:
+                self._compacting.discard(key.storage_key)
             logger.info(
                 "Idle compaction %s provider=%s session=%s",
                 "done" if ok else "failed",
@@ -493,6 +497,140 @@ Two hunks in =ductor_bot/orchestrator/lifecycle.py=: start the compactor after t
          await orch._docker.teardown()
 #+END_SRC
 
+* Main-session busy status
+
+The pinned 0.20.1 prompt API is encrypted WebSocket =/ws=, not an HTTP prompt endpoint. Its token is =api.token=; the internal interagent HTTP API has no authentication and is not used here. =GET /busy= uses the direct API's existing Bearer check and is admitted only on a loopback-configured listener from a loopback peer, with proxy headers refused. No extra listener, credential, address or port is introduced.
+
+The target is exactly the direct API's default flat Telegram session (the same =SessionKey= as default WebSocket authentication). Query parameters are refused: clients cannot silently select another session. The response includes its =session_key= so the watcher must compare it with its intended private seat identity. Active processes for the chat are conservatively busy, as are its orchestrator lock, the API's separate lock, and the idle compactor's explicit in-flight marker. Missing authority or a missing/mismatched session is unknown and busy; authority exceptions return an explicit HTTP error with busy=true. State is sampled after session lookup without another await.
+
+Contract: =GET http://YOUR_LOOPBACK_HOST:YOUR_API_PORT/busy= with =Authorization: Bearer YOUR_API_TOKEN=. HTTP 200 returns ={busy: BOOLEAN, known: BOOLEAN, session_key: STRING, reasons: ARRAY}=. Only =known=true,busy=false= is idle. HTTP 401 is authentication refusal; 403 is listener/peer/proxy refusal; 400 refuses query parameters; 503 is missing wiring or authority failure, with =busy=true,known=false,error= and no delivery admission. Responses are not cacheable. Empty configured tokens are refused.
+
+This is an observation, not a reservation. A turn can start after the response. Watcher delivery must remain gated until a conditional prompt admission path rechecks authority and acquires the same per-session lock without yielding between the busy decision and acquisition, then holds it throughout dispatch. Pinned API startup currently creates a separate API lock pool; ordinary WebSocket messages wait on that pool, and interagent messages select named sessions. Merely checking =/busy= then sending an ordinary WebSocket message or interagent request does not guarantee safe main-session delivery. Conditional delivery requires reconciling the API/bus lock owners and an explicit encrypted WebSocket admission/result contract; this read-only seam makes no race-safe delivery claim. Shared watcher work and live acceptance remain with Fable.
+
+** Status module
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/ductor-seams/busy_state.py
+"""Read-only main-session status for the direct API, never prompt admission."""
+from __future__ import annotations
+
+import ipaddress
+import logging
+
+from aiohttp import web
+from ductor_bot.session.key import SessionKey
+
+logger = logging.getLogger(__name__)
+
+
+async def main_busy_state(orch, server):
+    key = SessionKey(chat_id=server._default_chat_id)
+    result = {"busy": True, "known": False, "session_key": key.storage_key, "reasons": []}
+    pool = getattr(orch, "_lock_pool", None)
+    registry = getattr(orch, "_process_registry", None)
+    sessions = getattr(orch, "_sessions", None)
+    compactor = getattr(orch, "_idle_compactor", None)
+    api_pool = getattr(server, "_lock_pool", None)
+    if (key.chat_id <= 0 or pool is None or registry is None or sessions is None
+            or api_pool is None or compactor is None
+            or not isinstance(getattr(compactor, "_compacting", None), set)):
+        result["reasons"] = ["authority_missing"]
+        return result
+    session = await sessions.get_active(key)
+    if session is None or not session.session_id or session.session_key != key:
+        result["reasons"] = ["session_unknown"]
+        return result
+    # All live signals are read synchronously after the asynchronous lookup.
+    signals = {
+        "active_turn": registry.has_active(key.chat_id),
+        "session_lock": pool.is_locked(key.lock_key),
+        "api_lock": api_pool.is_locked(key.lock_key),
+        "compaction": key.storage_key in compactor._compacting,
+    }
+    if any(type(value) is not bool for value in signals.values()):
+        raise RuntimeError("invalid busy authority result")
+    result["reasons"] = [name for name, active in signals.items() if active]
+    result["known"] = True
+    result["busy"] = any(signals.values())
+    return result
+
+
+def _loopback(value):
+    try:
+        return ipaddress.ip_address(value).is_loopback
+    except ValueError:
+        return False
+
+
+async def handle_busy_request(server, request):
+    headers = {"Cache-Control": "no-store"}
+    def reply(body, status=200):
+        return web.json_response(body, status=status, headers=headers)
+    if not server._config.token or not server._verify_bearer(request):
+        return reply({"error": "unauthorized"}, 401)
+    if (not _loopback(server._config.host) or not _loopback(request.remote or "")
+            or any(name.lower() == "forwarded" or name.lower().startswith("x-forwarded-")
+                   for name in request.headers)):
+        return reply({"error": "loopback_required"}, 403)
+    if request.query:
+        return reply({"error": "default_session_only"}, 400)
+    handler = server._busy_state_handler
+    if handler is None:
+        return reply({"busy": True, "known": False, "error": "authority_missing"}, 503)
+    try:
+        return reply(await handler())
+    except Exception:
+        logger.exception("Main-session busy authority failed")
+        return reply({"busy": True, "known": False, "error": "busy_state_unavailable"}, 503)
+#+END_SRC
+
+** Direct API wiring patch
+#+BEGIN_SRC diff :tangle all/.local/share/dotcortex/ductor-seams/busy_state_api.patch
+--- a/ductor_bot/api/server.py
++++ b/ductor_bot/api/server.py
+@@ -197,4 +197,5 @@
+         self._provider_info: list[dict[str, object]] = []
+         self._active_state_getter: Callable[[], tuple[str, str]] | None = None
++        self._busy_state_handler: Callable[[], Awaitable[dict[str, object]]] | None = None
+
+     # -- Handler wiring --------------------------------------------------------
+@@ -226,4 +227,8 @@
+         """Set a callback that returns (active_provider, active_model)."""
+         self._active_state_getter = getter
++
++    def set_busy_state_handler(self, handler: Callable[[], Awaitable[dict[str, object]]]) -> None:
++        self._busy_state_handler = handler
++
+
+     # -- Lifecycle -------------------------------------------------------------
+@@ -241,5 +246,6 @@
+         app = web.Application(client_max_size=_MAX_UPLOAD_BYTES)
+         app.router.add_get("/health", self._handle_health)
++        app.router.add_get("/busy", self._handle_busy)
+         app.router.add_get("/ws", self._handle_websocket)
+         app.router.add_get("/files", self._handle_file_download)
+         app.router.add_post("/upload", self._handle_file_upload)
+@@ -282,3 +288,8 @@
++    async def _handle_busy(self, request: web.Request) -> web.Response:
++        from ductor_bot.api.busy_state import handle_busy_request
++
++        return await handle_busy_request(self, request)
++
+     async def _handle_health(self, _request: web.Request) -> web.Response:
+         return web.json_response(
+             {
+--- a/ductor_bot/orchestrator/lifecycle.py
++++ b/ductor_bot/orchestrator/lifecycle.py
+@@ -155,6 +155,9 @@
+     server = ApiServer(config.api, default_chat_id=default_chat_id)
+     server.set_message_handler(orch.handle_message_streaming)
+     server.set_abort_handler(orch.abort)
++    from ductor_bot.api.busy_state import main_busy_state
++
++    server.set_busy_state_handler(lambda: main_busy_state(orch, server))
+     server.set_file_context(
+         allowed_roots=resolve_allowed_roots(config.file_access, paths.workspace),
+         upload_dir=paths.api_files_dir,
+#+END_SRC
+
 * ductor-seam-apply
 #+BEGIN_SRC bash :tangle all/.local/bin/ductor-seam-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 # ductor-seam-apply — apply DotCortex's fleet-wide seams to an installed ductor_bot.
@@ -524,6 +662,7 @@ Apply DotCortex's fleet-wide ductor_bot seams to the installed package.
 Seams:
   idle_compact  compact idle main sessions before the provider cache expires
                 (Claude 55/60 min, Codex 25/30 min; config.json "idle_compaction")
+  busy_state    authenticated loopback GET /busy for the default main session
 
 Seam files:  <dotcortex>/all/.local/share/dotcortex/ductor-seams/
              (override with DOTCORTEX_DUCTOR_SEAMS)
@@ -596,10 +735,36 @@ hook_state="$(seam_patch_state "$hook_patch")"
 [ "$hook_state" != drifted ] || fail "idle_compact: orchestrator/lifecycle.py drifted from the seam; regenerate it"
 echo "idle_compact: module=$module_state hook=$hook_state"
 
+busy_src="$SEAMS_DIR/busy_state.py"
+busy_dst="$PKG/api/busy_state.py"
+busy_patch="$SEAMS_DIR/busy_state_api.patch"
+[ -f "$busy_src" ] && [ -f "$busy_patch" ] || fail "busy_state seam files missing in $SEAMS_DIR"
+busy_module_state="$(seam_file_state "$busy_src" "$busy_dst")"
+busy_hook_state="$(seam_patch_state "$busy_patch")"
+[ "$busy_hook_state" != drifted ] || fail "busy_state: API/lifecycle upstream drift; regenerate it"
+echo "busy_state: module=$busy_module_state hook=$busy_hook_state"
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
     [ "$module_state" = applied ] && [ "$hook_state" = applied ] || missing=1
+    [ "$busy_module_state" = applied ] && [ "$busy_hook_state" = applied ] || missing=1
     exit "$missing"
 fi
+
+# Validate the complete ordered series on a disposable staged copy first.
+preflight="$(mktemp -d)"
+trap 'rm -rf "$preflight"' EXIT
+mkdir -p "$preflight/ductor_bot/orchestrator" "$preflight/ductor_bot/api"
+cp "$PKG/orchestrator/lifecycle.py" "$preflight/ductor_bot/orchestrator/"
+cp "$PKG/api/server.py" "$preflight/ductor_bot/api/"
+install -m 0644 "$module_src" "$preflight/ductor_bot/orchestrator/idle_compact.py"
+install -m 0644 "$busy_src" "$preflight/ductor_bot/api/busy_state.py"
+if [ "$hook_state" = missing ]; then
+    patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$hook_patch" || fail "idle_compact preflight failed"
+fi
+if [ "$busy_hook_state" = missing ]; then
+    patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$busy_patch" || fail "busy_state preflight failed"
+fi
+"$PYTHON_BIN" -m compileall -q "$preflight/ductor_bot" || fail "complete series preflight compile failed"
 
 if [ "$module_state" = missing ]; then
     install -m 0644 "$module_src" "$module_dst"
@@ -610,7 +775,16 @@ if [ "$hook_state" = missing ]; then
     changed=1
 fi
 
-(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$PKG/orchestrator/lifecycle.py") \
+if [ "$busy_module_state" = missing ]; then
+    install -m 0644 "$busy_src" "$busy_dst"
+    changed=1
+fi
+if [ "$busy_hook_state" = missing ]; then
+    patch -d "$SITE" -p1 --fuzz=0 --forward -s <"$busy_patch"
+    changed=1
+fi
+
+(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$busy_dst" "$PKG/api/server.py" "$PKG/orchestrator/lifecycle.py") \
     || fail "py_compile failed after applying seams"
 [ "$changed" -eq 1 ] && echo "ductor-seam-apply: seams applied to $SITE" || echo "ductor-seam-apply: already applied"
 #+END_SRC
@@ -724,7 +898,7 @@ applier="$(cd "$seams/../../../bin" && pwd)/ductor-seam-apply"
 body="$seams/openrc/ductor"
 dest=/usr/local/share/dotcortex/ductor-seams
 ts="$(date +%Y%m%d-%H%M%S)"
-for f in "$applier" "$body" "$seams/idle_compact.py" "$seams/idle_compact_lifecycle.patch"; do
+for f in "$applier" "$body" "$seams/idle_compact.py" "$seams/idle_compact_lifecycle.patch" "$seams/busy_state.py" "$seams/busy_state_api.patch"; do
     [ -r "$f" ] || { echo "missing source: $f" >&2; exit 1; }
 done
 
@@ -741,6 +915,8 @@ run install -d -m 0755 -o root -g root "$dest"
 place "$applier" "$dest/ductor-seam-apply" 0755
 place "$seams/idle_compact.py" "$dest/idle_compact.py" 0644
 place "$seams/idle_compact_lifecycle.patch" "$dest/idle_compact_lifecycle.patch" 0644
+place "$seams/busy_state.py" "$dest/busy_state.py" 0644
+place "$seams/busy_state_api.patch" "$dest/busy_state_api.patch" 0644
 place "$body" "/etc/init.d/$svc" 0755
 place "$conf" "/etc/conf.d/$svc" 0644
 #+END_SRC
@@ -770,6 +946,8 @@ ductor_log_group="gille"
 #+END_SRC
 
 * Tests
+Busy-state checks run against a disposable copy of the installed pinned package, never the daemon: =python3 all/.local/share/dotcortex/tests/test-ductor-busy-state.py -v=. They reverse the existing lifecycle hook in the copy, apply the complete series, check idempotence and drift refusal, invoke handlers without a listening socket, and run a forced-idle mutant in a separate process. Live API/network prompts are never sent.
+
 Unit tests use fake sessions, a fake lock pool and a fake CLI service: no network, no real CLI. Run: =python3 ~/.local/share/dotcortex/tests/test-ductor-idle-compact.py= with the installed =ductor_bot= importable.
 
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-ductor-idle-compact.py
@@ -794,6 +972,7 @@ import importlib.util
 import os
 import sys
 from unittest import mock
+from ductor_bot.session.key import SessionKey
 
 try:
     import ductor_bot  # noqa: F401  (the seam imports ductor_bot.cli.types)
@@ -818,7 +997,7 @@ class FakeSession:
 
     @property
     def session_key(self):
-        return SimpleNamespace(chat_id=self.chat_id, topic_id=None, transport="tg", lock_key=(self.chat_id, None))
+        return SessionKey(chat_id=self.chat_id)
 
 
 class FakeSessions:
@@ -966,4 +1145,291 @@ class IdleCompactTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-ductor-busy-state.py
+"""Disposable copied-package busy API/applier tests; no sockets or real CLI."""
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import importlib
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+import ductor_bot
+
+SEAMS = Path(__file__).resolve().parents[1] / "ductor-seams"
+APPLIER = SEAMS.parents[2] / "bin/ductor-seam-apply"
+INSTALLED = Path(ductor_bot.__file__).resolve().parent
+TEMP = tempfile.TemporaryDirectory(prefix="ductor-busy-test-")
+SITE = Path(TEMP.name)
+
+
+def snapshot(root):
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+            for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+
+
+def pristine(site):
+    shutil.copytree(INSTALLED, site / "ductor_bot", ignore=shutil.ignore_patterns("__pycache__"))
+    patch = SEAMS / "idle_compact_lifecycle.patch"
+    command = ["patch", "-d", str(site), "-p1", "--fuzz=0", "--reverse", "--force", "-s"]
+    dry = subprocess.run(command + ["--dry-run"], input=patch.read_bytes(), capture_output=True)
+    if dry.returncode == 0:
+        subprocess.run(command, input=patch.read_bytes(), capture_output=True, check=True)
+    return site
+
+
+def apply(site, *args):
+    env = dict(os.environ, DOTCORTEX_DUCTOR_SEAMS=str(SEAMS), PYTHONDONTWRITEBYTECODE="1")
+    return subprocess.run(["bash", str(APPLIER), "--site", str(site), *args],
+                          env=env, text=True, capture_output=True)
+
+
+pristine(SITE)
+applied = apply(SITE)
+if applied.returncode:
+    raise RuntimeError(applied.stdout + applied.stderr)
+print("FIXTURE CLEAN APPLY:\n" + applied.stdout, flush=True)
+if os.environ.get("DUCTOR_BUSY_MUTANT"):
+    target = SITE / "ductor_bot/api/busy_state.py"
+    source = target.read_text()
+    needle = 'result["busy"] = any(signals.values())'
+    assert source.count(needle) == 1
+    target.write_text(source.replace(needle, 'result["busy"] = False'))
+
+del sys.modules["ductor_bot"]
+sys.path.insert(0, str(SITE))
+importlib.invalidate_caches()
+from ductor_bot.api import busy_state as bs
+from ductor_bot.api.server import ApiServer
+from ductor_bot.bus.lock_pool import LockPool
+from ductor_bot.cli.process_registry import ProcessRegistry
+from ductor_bot.orchestrator.idle_compact import IdleCompactor, IdleCompactSettings
+from ductor_bot.session.key import SessionKey
+from aiohttp.test_utils import make_mocked_request
+
+assert Path(bs.__file__).resolve().is_relative_to(SITE)
+LOOPBACK = socket.gethostbyname("localhost")
+KEY = SessionKey(chat_id=1)  # synthetic fixture identity
+
+
+class BusyTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.session = SimpleNamespace(session_id="fixture-session", session_key=KEY)
+        self.sessions = SimpleNamespace(get_active=mock.AsyncMock(return_value=self.session))
+        self.orch = SimpleNamespace(_sessions=self.sessions, _lock_pool=LockPool(),
+                                    _process_registry=ProcessRegistry(),
+                                    _idle_compactor=SimpleNamespace(_compacting=set()))
+        self.server = ApiServer(SimpleNamespace(token="YOUR_API_TOKEN", host=LOOPBACK,
+                                                allow_public=True, port=0), default_chat_id=1)
+        self.server.set_busy_state_handler(lambda: bs.main_busy_state(self.orch, self.server))
+
+    def request(self, token="YOUR_API_TOKEN", peer=LOOPBACK, query="", extra=None):
+        headers = {"Authorization": "Bearer " + token} if token is not None else {}
+        headers.update(extra or {})
+        request = make_mocked_request("GET", "/busy" + query, headers=headers)
+        request._cache["remote"] = peer
+        return request
+
+    async def state(self):
+        response = await self.server._handle_busy(self.request())
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        return json.loads(response.text)
+
+    async def test_idle_and_exact_identity(self):
+        self.assertEqual(await self.state(), {"busy": False, "known": True,
+                         "session_key": KEY.storage_key, "reasons": []})
+
+    async def test_active_turn(self):
+        self.orch._process_registry.register(1, SimpleNamespace(returncode=None, pid=1), "fixture")
+        state = await self.state()
+        self.assertTrue(state["busy"])
+        self.assertIn("active_turn", state["reasons"])
+
+    async def test_held_session_lock(self):
+        lock = self.orch._lock_pool.get(KEY.lock_key)
+        async with lock:
+            state = await self.state()
+            self.assertTrue(state["busy"])
+            self.assertIn("session_lock", state["reasons"])
+        self.assertFalse((await self.state())["busy"])
+
+    async def test_api_lock(self):
+        async with self.server._lock_pool.get(KEY.lock_key):
+            self.assertTrue((await self.state())["busy"])
+
+    async def test_compaction_marker(self):
+        self.orch._idle_compactor._compacting.add(KEY.storage_key)
+        state = await self.state()
+        self.assertTrue(state["busy"])
+        self.assertIn("compaction", state["reasons"])
+
+    async def test_real_compaction_lifecycle_and_cancellation(self):
+        with tempfile.TemporaryDirectory() as home:
+            self.orch._paths = SimpleNamespace(sessions_path=Path(home) / "sessions.json")
+            self.orch.is_chat_busy = lambda *args: False
+            comp = IdleCompactor(self.orch)
+            self.orch._idle_compactor = comp
+            self.session.last_active = "fixture-time"
+            self.session.provider = "claude"
+            self.session.model = "fixture-model"
+            entered = asyncio.Event()
+            async def wait(*args):
+                entered.set()
+                await asyncio.Event().wait()
+            comp._compact_claude = wait
+            task = asyncio.create_task(comp._compact_locked(self.session, IdleCompactSettings()))
+            await entered.wait()
+            self.assertIn(KEY.storage_key, comp._compacting)
+            state = await self.state()
+            self.assertTrue(state["busy"])
+            self.assertIn("compaction", state["reasons"])
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+            self.assertEqual(comp._compacting, set())
+            self.assertFalse((await self.state())["busy"])
+
+    async def test_missing_authorities_are_busy(self):
+        for name in ("_sessions", "_lock_pool", "_process_registry", "_idle_compactor"):
+            with self.subTest(name=name), mock.patch.object(self.orch, name, None):
+                state = await self.state()
+                self.assertTrue(state["busy"])
+                self.assertFalse(state["known"])
+
+    async def test_unknown_or_wrong_session_is_busy(self):
+        for session in (None, SimpleNamespace(session_id="", session_key=KEY),
+                        SimpleNamespace(session_id="wrong", session_key=SessionKey(transport="mx", chat_id=1))):
+            self.sessions.get_active.return_value = session
+            state = await self.state()
+            self.assertTrue(state["busy"])
+            self.assertFalse(state["known"])
+
+    async def test_busy_signal_after_session_lookup(self):
+        async def lookup(key):
+            await self.orch._lock_pool.get(key.lock_key).acquire()
+            return self.session
+        self.sessions.get_active.side_effect = lookup
+        self.assertTrue((await self.state())["busy"])
+        self.orch._lock_pool.get(KEY.lock_key).release()
+
+    async def test_auth_refusal(self):
+        for token in (None, "wrong", ""):
+            response = await self.server._handle_busy(self.request(token=token))
+            self.assertEqual(response.status, 401)
+        self.sessions.get_active.assert_not_awaited()
+        self.server._config.token = ""
+        self.assertEqual((await self.server._handle_busy(self.request(token=""))).status, 401)
+
+    async def test_loopback_and_proxy_refusal(self):
+        for request in (self.request(peer="invalid-peer"), self.request(peer=None),
+                        self.request(extra={"Forwarded": "for=YOUR_PEER"}),
+                        self.request(extra={"X-Forwarded-For": "YOUR_PEER"})):
+            self.assertEqual((await self.server._handle_busy(request)).status, 403)
+        self.server._config.host = "YOUR_NON_LOOPBACK_HOST"
+        self.assertEqual((await self.server._handle_busy(self.request())).status, 403)
+        self.sessions.get_active.assert_not_awaited()
+
+    async def test_query_refused(self):
+        self.assertEqual((await self.server._handle_busy(self.request(query="?chat_id=2"))).status, 400)
+
+    async def test_errors_fail_loud(self):
+        self.sessions.get_active.side_effect = RuntimeError("fixture authority failure")
+        with self.assertLogs(bs.logger, level="ERROR"):
+            response = await self.server._handle_busy(self.request())
+        self.assertEqual(response.status, 503)
+        self.assertEqual(json.loads(response.text), {"busy": True, "known": False,
+                         "error": "busy_state_unavailable"})
+        self.server._busy_state_handler = None
+        self.assertEqual((await self.server._handle_busy(self.request())).status, 503)
+
+    async def test_route_registered_without_socket(self):
+        with mock.patch("ductor_bot.api.server.web.AppRunner") as runner, \
+             mock.patch("ductor_bot.api.server.web.TCPSite") as site:
+            runner.return_value.setup = mock.AsyncMock()
+            site.return_value.start = mock.AsyncMock()
+            await self.server.start()
+            app = runner.call_args.args[0]
+            route = [r for r in app.router.routes() if r.method == "GET"
+                     and r.resource.canonical == "/busy"]
+            self.assertEqual(len(route), 1)
+            self.assertEqual(route[0].handler, self.server._handle_busy)
+
+    async def test_lifecycle_wires_real_authority(self):
+        from ductor_bot.orchestrator.lifecycle import start_api_server
+        self.server._config.chat_id = KEY.chat_id
+        self.orch.handle_message_streaming = mock.AsyncMock()
+        self.orch.abort = mock.AsyncMock()
+        self.orch._providers = SimpleNamespace(
+            build_provider_info=lambda observer: [], resolve_runtime_target=lambda model: ("codex", model))
+        self.orch._observers = SimpleNamespace(codex_cache_obs=None)
+        self.orch._config = SimpleNamespace(model="fixture-model")
+        config = SimpleNamespace(api=self.server._config, allowed_user_ids=[], file_access="workspace")
+        paths = SimpleNamespace(workspace=SITE, api_files_dir=SITE / "files")
+        with mock.patch.object(ApiServer, "start", new=mock.AsyncMock()):
+            await start_api_server(self.orch, config, paths)
+        wired = self.orch._api_stop.__self__
+        response = await wired._handle_busy(self.request())
+        self.assertEqual(response.status, 200)
+        self.assertFalse(json.loads(response.text)["busy"])
+
+    async def test_malformed_authority_fails_loud(self):
+        with mock.patch.object(self.orch._process_registry, "has_active", return_value=None), \
+             self.assertLogs(bs.logger, level="ERROR"):
+            response = await self.server._handle_busy(self.request())
+        self.assertEqual(response.status, 503)
+
+
+class ApplyTests(unittest.TestCase):
+    def test_idempotence_and_check(self):
+        before = snapshot(SITE)
+        result = apply(SITE)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("already applied", result.stdout)
+        self.assertEqual(snapshot(SITE), before)
+        checked = apply(SITE, "--check")
+        self.assertEqual(checked.returncode, 0, checked.stdout + checked.stderr)
+        print("IDEMPOTENCE/CHECK:\n" + result.stdout + checked.stdout)
+
+    def test_drift_refusal_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            site = pristine(Path(root))
+            target = site / "ductor_bot/api/server.py"
+            target.write_text(target.read_text().replace(
+                'app.router.add_get("/health", self._handle_health)',
+                'app.router.add_get("/upstream-change", self._handle_health)'))
+            before = snapshot(site)
+            result = apply(site)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("upstream drift", result.stderr)
+            self.assertEqual(snapshot(site), before)
+            print("DRIFT REFUSAL:\n" + result.stdout + result.stderr)
+
+    def test_forced_idle_mutant_fails_active_turn_test(self):
+        env = dict(os.environ, DUCTOR_BUSY_MUTANT="1", PYTHONDONTWRITEBYTECODE="1")
+        result = subprocess.run([sys.executable, __file__, "BusyTests.test_active_turn", "-v"],
+                                env=env, text=True, capture_output=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("FAIL: test_active_turn", result.stderr)
+        self.assertIn("AssertionError: False is not true", result.stderr)
+        print("EXPECTED RED MUTANT:\n" + result.stdout + result.stderr)
+
+
+if __name__ == "__main__":
+    try:
+        unittest.main()
+    finally:
+        TEMP.cleanup()
 #+END_SRC
