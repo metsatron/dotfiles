@@ -261,6 +261,17 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(calls[-1][2]["payload"]["args"]["request"]["mode"], "queue")
         self.assertEqual(calls[-1][0].headers["Cookie"], "session=YOUR_COOKIE")
 
+    def test_deepseek_wake_carries_the_mail_herdr_keeps_inbox(self):
+        mail = self.base / "mail.eml"
+        mail.write_bytes(b"From: fable@test-host.helm\r\nTo: deepbot@test-host.helm\r\n"
+                         b"Subject: Comms check\r\nMessage-ID: <1.2@test-host.helm>\r\n\r\n"
+                         b"Wolf, reply with Fox.\r\n")
+        prompt = self.watcher.wake_prompt({"transport": "deepseek"}, mail)
+        self.assertIn("Subject: Comms check", prompt)
+        self.assertIn("Wolf, reply with Fox.", prompt)
+        self.assertNotEqual(prompt, "/inbox")
+        self.assertEqual(self.watcher.wake_prompt({"transport": "herdr"}, mail), "/inbox")
+
     def test_production_adapter_uses_verified_herdr_shape_and_commands(self):
         calls = []
 
