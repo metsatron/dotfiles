@@ -140,10 +140,19 @@ c2s_ports = { 5222 }
 component_interfaces = { "127.0.0.1" }
 component_ports = { 5347 }
 
+-- No cleartext HTTP and no HTTPS listener until the private tailnet bind exists.
+http_ports = {}
+https_ports = {}
+http_file_share_size_limit = 25 * 1024 * 1024
+http_file_share_expires_after = "1d"
+http_file_share_daily_quota = 250 * 1024 * 1024
+http_file_share_global_quota = 1024 * 1024 * 1024
+http_file_share_allowed_file_types = { "audio/*"; "application/ogg" }
+
 modules_enabled = {
   "roster"; "saslauth"; "tls"; "disco"; "carbons"; "pep"; "private";
   "blocklist"; "vcard4"; "vcard_legacy"; "version"; "uptime"; "time";
-  "ping"; "smacks"; "csi_simple"; "mam"; "bookmarks";
+  "ping"; "smacks"; "csi_simple"; "mam"; "bookmarks"; "http_file_share";
   -- Local unix socket for prosodyctl adduser/passwd/shell; no network listener.
   "admin_shell"; "admin_socket";
 }
@@ -151,6 +160,39 @@ archive_expires_after = "never"
 
 Include(site .. "/local.cfg.lua")
 #+END_SRC
+
+** Voice upload activation (C2)
+
+The bundled =http_file_share= module stores uploads locally with a 25 MiB
+per-file cap, one-day expiry, 250 MiB daily and 1 GiB global quotas. HTTP is
+disabled; HTTPS is disabled until the private layer binds only the tailnet
+interface and supplies the existing Tailscale certificate. Do not set
+=http_file_share_base_url=: that switches off the built-in storage HTTP
+provider and pruning. Advertise the local service with =http_external_url=.
+
+The following is a proposed additive private =local.cfg.lua= stanza, not a
+live apply. Keep existing VirtualHost/component/room declarations; put the
+listener settings in global scope and the host settings inside the existing
+VirtualHost. Replace every =YOUR_*= value privately before activation.
+
+#+BEGIN_SRC lua :tangle no
+-- Global scope, before VirtualHost / Component declarations:
+https_ports = { YOUR_UPLOAD_HTTPS_PORT }
+https_interfaces = { "YOUR_TAILNET_IP" }
+https_ssl = {
+  certificate = "YOUR_PRIVATE_CERT_DIRECTORY/YOUR_UPLOAD_HOST.crt";
+  key = "YOUR_PRIVATE_CERT_DIRECTORY/YOUR_UPLOAD_HOST.key";
+}
+-- Inside the existing VirtualHost (not a duplicate declaration):
+http_host = "YOUR_UPLOAD_HOST"
+http_external_url = "https://YOUR_UPLOAD_HOST:YOUR_UPLOAD_HTTPS_PORT/"
+#+END_SRC
+
+Add ="upload_base_url": "https://YOUR_UPLOAD_HOST:YOUR_UPLOAD_HTTPS_PORT/file_share/"=
+to the private =bridge.json=. Absent that key, plain chat still works but voice
+is refused. This is an exact HTTPS origin and upload-path allowlist, not just
+a hostname match; redirects and environment proxies are disabled. Uploaded
+GET URLs are bearer capabilities: keep them on the tailnet and out of logs.
 
 * Certificate refresh
 
@@ -207,6 +249,19 @@ Inbound (chat to mail):
 2. A sliding-window rate limit per owner (default 20 per minute) and a persisted stanza-id dedupe stop floods and reconnect replays.
 3. The target local part must be a mapped seat; unknown addresses get =item-not-found=.
 4. One mail is sent from the bridge's own seat address to the seat's MailCortex address. The body carries the XMPP sender and the reply instruction, so a woken agent answers with =mailcortex send --to <bridge address>=.
+5. XEP-0066 OOB URLs (including bodyless stanzas) enter the voice lane and
+   retain strict refusal for foreign URLs, HTTP or an unconfigured upload.
+   A URL-only body enters that lane only if the configured HTTPS upload
+   origin/path accepts it; all other bare links remain ordinary text mail.
+   The upload allowlist is checked again before fetching; redirects are refused.
+   Downloads have a 25 MiB streaming cap, 5-second socket timeout and
+   30-second elapsed budget (at most one socket timeout to observe expiry).
+   =~/HelmCortex/FORGE/bin/whisper-transcribe= runs in a worker thread with a
+   600-second subprocess timeout (absolute path, independent of cron's PATH). Only nonempty, clean transcripts are mailed with =[xmpp voice]=
+   subjects and the original audio via =mailcortex send --attach=.
+   Private temporary copies are removed on success and failure. At most two
+   voice jobs run concurrently; excess jobs receive a resend diagnostic.
+   Failures log and reply once to the owner, never mail an empty transcript.
 
 Outbound (mail to chat):
 1. The bridge polls its own seat (=mailcortex inbox=) and handles only =new= messages, oldest first.
@@ -219,6 +274,7 @@ Outbound (mail to chat):
 from __future__ import annotations
 
 import argparse
+import asyncio
 import collections
 import json
 import logging
@@ -227,7 +283,11 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
@@ -243,6 +303,10 @@ ADDRESS_RE = re.compile(
 )
 MAX_BODY = 16000
 SEEN_CAP = 4000
+VOICE_LIMIT = 25 * 1024 * 1024
+VOICE_JOBS = 2
+DOWNLOAD_SECONDS = 30
+TRANSCRIBE_SECONDS = 600
 
 
 class BridgeError(Exception):
@@ -314,7 +378,15 @@ def load_config(path: Path) -> dict:
         raise BridgeError("poll_seconds must be between 0.5 and 60")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise BridgeError("port must be a TCP port")
+    upload = data.get("upload_base_url", "")
+    if not isinstance(upload, str):
+        raise BridgeError("upload_base_url must be an HTTPS upload directory")
+    if upload:
+        parsed = split_upload_url(upload)
+        if not parsed.path.endswith("/") or parsed.path == "/":
+            raise BridgeError("upload_base_url must name an upload directory")
     return {
+        "upload_base_url": upload,
         "component_jid": component,
         "owner_jids": [bare(o) for o in owners],
         "bridge_address": address,
@@ -428,6 +500,153 @@ def inbound_mail(cfg: dict, sender: str, local: str, body: str, run=subprocess.r
                        "--subject", subject, "--body", framed], run).strip()
 
 
+def split_upload_url(value: str):
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise BridgeError("invalid upload URL") from error
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+            or parsed.password or parsed.query or parsed.fragment
+            or any(c.isspace() or ord(c) < 32 for c in value)):
+        raise BridgeError("upload URL must be HTTPS without credentials or query")
+    return parsed
+
+
+def validate_upload_url(cfg: dict, url: str) -> None:
+    base = cfg.get("upload_base_url", "")
+    if not base:
+        raise BridgeError("voice upload is not configured")
+    allowed, candidate = split_upload_url(base), split_upload_url(url)
+    if ((candidate.hostname, candidate.port or 443) !=
+            (allowed.hostname, allowed.port or 443)):
+        raise BridgeError("foreign upload host or port refused")
+    path = urllib.parse.unquote(candidate.path)
+    if (not path.startswith(allowed.path) or path == allowed.path
+            or "\\" in path or any(p in {".", ".."} for p in path.split("/"))):
+        raise BridgeError("URL is outside the upload directory")
+
+
+def voice_url(cfg: dict, msg) -> str | None:
+    """OOB declares an upload; a bare link needs the upload allowlist first."""
+    element = msg.xml.find("{jabber:x:oob}x/{jabber:x:oob}url")
+    if element is not None and element.text:
+        return element.text.strip()
+    body = str(msg["body"]).strip()
+    if re.fullmatch(r"https?://\S+", body):
+        try:
+            validate_upload_url(cfg, body)
+        except BridgeError:
+            return None  # Ordinary links keep the pre-voice text-mail route.
+        return body
+    return None
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise BridgeError("upload redirects refused")
+
+
+def download_voice(cfg: dict, url: str, destination: Path, opener=None) -> None:
+    validate_upload_url(cfg, url)
+    opener = opener or urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()).open
+    deadline = time.monotonic() + DOWNLOAD_SECONDS
+    request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
+    try:
+        with opener(request, timeout=5) as response:
+            if response.status != 200:
+                raise BridgeError("upload fetch returned a non-success status")
+            length = response.headers.get("Content-Length")
+            if length is not None and (int(length) < 0 or int(length) > VOICE_LIMIT):
+                raise BridgeError("voice upload exceeds 25 MiB")
+            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                total = 0
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise BridgeError("voice download timed out")
+                    # read1 does not wait to fill a large buffer on trickle streams.
+                    chunk = response.read1(min(65536, VOICE_LIMIT - total + 1))
+                    if time.monotonic() >= deadline:
+                        raise BridgeError("voice download timed out")
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > VOICE_LIMIT:
+                        raise BridgeError("voice upload exceeds 25 MiB")
+                    stream.write(chunk)
+                if not total or (length is not None and total != int(length)):
+                    raise BridgeError("voice upload is empty or incomplete")
+    except BridgeError:
+        raise
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        raise BridgeError("voice download failed (network, TLS or invalid response)") from error
+
+
+def transcribe_voice(audio: Path, run=subprocess.run) -> str:
+    output = audio.parent / "transcript.md"
+    try:
+        command = Path.home() / "HelmCortex/FORGE/bin/whisper-transcribe"
+        result = run([str(command), str(audio), "--out", str(output)],
+                     capture_output=True, text=True, timeout=TRANSCRIBE_SECONDS)
+        if result.returncode != 0:
+            raise BridgeError("whisper transcription failed or was quality-suspect")
+        raw = output.read_text(encoding="utf-8")
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError("whisper transcription timed out") from error
+    except (OSError, UnicodeError) as error:
+        raise BridgeError("whisper-transcribe or its transcript is unavailable") from error
+    metadata, separator, text = raw.partition("\n---\n")
+    text = text.strip()
+    if (not metadata.startswith("---\n") or not separator
+            or "whisper_quality: clean" not in metadata.splitlines()
+            or not text or text in {"[non-speech audio]", "[transcription unavailable]"}):
+        raise BridgeError("whisper returned no clean speech transcript")
+    if len(text) > MAX_BODY:
+        raise BridgeError("voice transcript exceeds the message limit")
+    return text
+
+
+def inbound_voice(cfg: dict, sender: str, local: str, url: str,
+                  run=subprocess.run, download=None, transcribe=None) -> str:
+    target = cfg["seats"].get(local)
+    if target is None:
+        raise BridgeError("unknown seat")
+    validate_upload_url(cfg, url)  # Before even an injected downloader is called.
+    filename = re.sub(r"[^A-Za-z0-9._-]", "_",
+                      urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]))
+    filename = "voice-" + filename[-100:]
+    with tempfile.TemporaryDirectory(prefix="mailcortex-voice.") as directory:
+        audio = Path(directory) / filename
+        (download or download_voice)(cfg, url, audio)
+        text = (transcribe or transcribe_voice)(audio).strip()
+        if not text or len(text) > MAX_BODY:
+            raise BridgeError("voice transcript is empty or too long")
+        framed = (f"XMPP-From: {bare(sender)}\n"
+                  f"XMPP-To: {local}@{cfg['component_jid']}\n"
+                  f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
+                  "Voice-Note: original audio attached\n\n" + text + "\n")
+        return mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
+                           "--subject", "[xmpp voice] " + text.splitlines()[0][:70],
+                           "--body", framed, "--attach", str(audio)], run).strip()
+
+
+async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | None) -> None:
+    try:
+        if url is not None:
+            name = await asyncio.to_thread(inbound_voice, cfg, sender, local, url)
+        else:
+            name = inbound_mail(cfg, sender, local, msg["body"])
+    except (BridgeError, OSError) as error:
+        diagnostic = " ".join(str(error).split())[:200]
+        LOG.error("delivery failed for %s: %s", local, diagnostic)
+        prefix = "Voice note could not be transcribed: " if url is not None else "Not delivered: "
+        msg.reply(prefix + diagnostic).send()
+        return
+    LOG.info("delivered %s -> %s as %s", sender, local, name)
+
+
 def pending_outbound(cfg: dict, run=subprocess.run) -> list[str]:
     rows = mailcortex(["inbox", cfg["bridge_address"]], run).splitlines()
     return [row.split("\t")[1] for row in rows if row.startswith("new\t")]
@@ -468,6 +687,7 @@ def run_bridge(cfg: dict) -> int:
             self.add_event_handler("presence_subscribe", self.on_subscribe)
             self.add_event_handler("presence_probe", self.on_probe)
             self.poller = None
+            self.voice_jobs = 0
 
         def seat_jid(self, local: str) -> str:
             return f"{local}@{cfg['component_jid']}"
@@ -492,8 +712,11 @@ def run_bridge(cfg: dict) -> int:
             if bare(presence["from"]) in gate.owners and presence["to"].user in cfg["seats"]:
                 self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
 
-        def on_message(self, msg) -> None:
-            if msg["type"] not in ("chat", "normal") or not msg["body"]:
+        async def on_message(self, msg) -> None:
+            if msg["type"] not in ("chat", "normal"):
+                return
+            url = voice_url(cfg, msg)
+            if not msg["body"] and url is None:
                 return
             sender = bare(msg["from"])
             local = msg["to"].user
@@ -511,13 +734,17 @@ def run_bridge(cfg: dict) -> int:
             if not seen.check_and_add(key):
                 LOG.info("duplicate stanza %s ignored", key)
                 return
-            try:
-                name = inbound_mail(cfg, sender, local, msg["body"])
-            except BridgeError as error:
-                LOG.error("delivery failed for %s: %s", local, error)
-                msg.reply(f"Not delivered: {error}").send()
+            if url is not None and self.voice_jobs >= VOICE_JOBS:
+                LOG.warning("voice capacity reached for %s", local)
+                msg.reply("Voice note not delivered: transcription capacity reached; resend later.").send()
                 return
-            LOG.info("delivered %s -> %s as %s", sender, local, name)
+            if url is not None:
+                self.voice_jobs += 1
+            try:
+                await deliver_inbound(cfg, msg, sender, local, url)
+            finally:
+                if url is not None:
+                    self.voice_jobs -= 1
 
         async def poll_outbound(self) -> None:
             while True:
@@ -694,14 +921,22 @@ The fixtures exercise the bridge's pure parts with a fake =mailcortex= runner: c
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-mailcortex-xmpp-bridge.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 """Fixture tests for mailcortex-xmpp-bridge (no network, no slixmpp)."""
 
+import asyncio
 import importlib.machinery
 import importlib.util
+import io
 import json
 import os
 import subprocess
 import tempfile
+import threading
+import types
 import unittest
+import xml.etree.ElementTree as ET
+from email import policy
+from email.parser import BytesParser
 from pathlib import Path
+from unittest.mock import patch
 
 BRIDGE = Path(os.environ.get("MAILCORTEX_XMPP_BRIDGE", "~/.local/bin/mailcortex-xmpp-bridge")).expanduser()
 loader = importlib.machinery.SourceFileLoader("bridge", str(BRIDGE))
@@ -771,6 +1006,324 @@ class ConfigTests(unittest.TestCase):
         os.chmod(cfg["component_secret_file"], 0o644)
         with self.assertRaises(bridge.BridgeError):
             bridge.read_secret(cfg["component_secret_file"])
+
+
+class VoiceTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.tmp = Path(temporary.name)
+        data = base_config(self.tmp) | {"upload_base_url": "https://uploads.example.test/file_share/"}
+        config = self.tmp / "bridge.json"
+        config.write_text(json.dumps(data))
+        self.cfg = bridge.load_config(config)
+        self.url = self.cfg["upload_base_url"] + "slot/note.ogg"
+        self.audio_paths = []
+        self.raw = b"OggS\x00original voice"
+
+    def download(self, cfg, url, path):
+        self.audio_paths.append(path)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        path.write_bytes(self.raw)
+        path.chmod(0o600)
+
+    def test_oob_and_url_only_detection(self):
+        for body in ("", "caption", self.url):
+            self.assertEqual(bridge.voice_url(self.cfg, FakeMessage(body, self.url)), self.url)
+        self.assertEqual(bridge.voice_url(self.cfg, FakeMessage(self.url)), self.url)
+        self.assertIsNone(bridge.voice_url(self.cfg, FakeMessage("See " + self.url)))
+        self.assertIsNone(bridge.voice_url(self.cfg, FakeMessage("hello")))
+
+    def test_plain_foreign_http_and_unconfigured_links_arrive_as_text_mail(self):
+        root = self.tmp / "Mail"
+        maildir = root / "consorts/fable"
+        for leaf in ("tmp", "new", "cur"):
+            (maildir / leaf).mkdir(parents=True)
+        command = Path(__file__).resolve().parents[5] / "all/.local/bin/mailcortex"
+        original = bridge.inbound_mail
+        def run(argv, **kwargs):
+            self.assertNotIn("--attach", argv)
+            return subprocess.run([str(command), *argv[1:]],
+                                  env=os.environ | {"MAILCORTEX_ROOT": str(root)}, **kwargs)
+        def text_mail(cfg, sender, local, body):
+            return original(cfg, sender, local, body, run)
+        cases = ((self.cfg, "https://foreign.example.test/article"),
+                 (self.cfg, self.url.replace("https:", "http:")),
+                 (self.cfg | {"upload_base_url": ""}, self.url))
+        for cfg, link in cases:
+            with self.subTest(link=link, configured=bool(cfg["upload_base_url"])):
+                msg = FakeMessage(link)
+                before = set((maildir / "new").iterdir())
+                with patch.object(bridge, "inbound_mail", side_effect=text_mail), \
+                        patch.object(bridge, "inbound_voice", side_effect=AssertionError("plain link entered voice lane")):
+                    asyncio.run(bridge.deliver_inbound(cfg, msg, "owner@example.test", "fable",
+                                                      bridge.voice_url(cfg, msg)))
+                delivered, = set((maildir / "new").iterdir()) - before
+                message = BytesParser(policy=policy.default).parsebytes(delivered.read_bytes())
+                self.assertFalse(message.is_multipart())
+                self.assertTrue(str(message["Subject"]).startswith("[xmpp] "))
+                self.assertEqual(message["To"], "fable@host.helm")
+                body = message.get_content().replace("\r\n", "\n")
+                self.assertIn("\n\n" + link + "\n", body)
+                self.assertEqual(msg.replies, [])
+
+    def test_oob_foreign_http_and_unconfigured_links_keep_refusal(self):
+        cases = ((self.cfg, "https://foreign.example.test/file_share/slot/note.ogg"),
+                 (self.cfg, self.url.replace("https:", "http:")),
+                 (self.cfg | {"upload_base_url": ""}, self.url))
+        for cfg, link in cases:
+            msg = FakeMessage(self.url, link)
+            with patch.object(bridge, "download_voice") as download, \
+                    patch.object(bridge, "transcribe_voice", return_value="fixture words") as transcribe, \
+                    patch.object(bridge, "mailcortex", return_value="fixture.msg") as mail:
+                self.assertEqual(bridge.voice_url(cfg, msg), link)
+                with self.assertLogs(bridge.LOG, level="ERROR"):
+                    asyncio.run(bridge.deliver_inbound(cfg, msg, "owner@example.test", "fable",
+                                                      bridge.voice_url(cfg, msg)))
+                download.assert_not_called()
+                transcribe.assert_not_called()
+                mail.assert_not_called()
+            self.assertEqual(len(msg.replies), 1)
+            self.assertTrue(msg.replies[0].startswith("Voice note could not be transcribed: "))
+
+    def test_foreign_host_refused_before_fetch_transcribe_or_mail(self):
+        run = FakeRun()
+        for url in ("https://evil.example.test/file_share/slot/note.ogg",
+                    "https://uploads.example.test.evil.test/file_share/slot/note.ogg"):
+            with self.assertRaisesRegex(bridge.BridgeError, "foreign upload host"):
+                bridge.inbound_voice(self.cfg, "owner@example.test", "fable", url,
+                                     run, self.download, lambda _: "hello")
+        self.assertEqual(self.audio_paths, [])
+        self.assertEqual(run.calls, [])
+
+    def test_https_port_path_and_config_guards(self):
+        for url in (self.url.replace("https:", "http:"),
+                    self.url.replace("uploads.example.test", "uploads.example.test:444"),
+                    self.url.replace("/file_share/", "/private/"),
+                    self.url.replace("slot/", "../"),
+                    self.url.replace("slot/", "%2e%2e/"),
+                    self.url + "?token=fixture", self.url + "#fragment",
+                    self.url.replace("https://", "https://user:password@")):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.validate_upload_url(self.cfg, url)
+        with self.assertRaisesRegex(bridge.BridgeError, "not configured"):
+            bridge.validate_upload_url(self.cfg | {"upload_base_url": ""}, self.url)
+        for base in ("http://uploads.example.test/file_share/", "https://uploads.example.test/",
+                     "https://uploads.example.test/file_share", 42):
+            path = self.tmp / "invalid.json"
+            path.write_text(json.dumps(base_config(self.tmp) | {"upload_base_url": base}))
+            with self.assertRaises(bridge.BridgeError):
+                bridge.load_config(path)
+
+    def test_download_stream_size_headers_permissions_and_failures(self):
+        class Response(io.BytesIO):
+            status = 200
+            def __init__(self, payload, length=None):
+                super().__init__(payload)
+                self.headers = {} if length is None else {"Content-Length": str(length)}
+        def opener(response):
+            def open_(request, timeout):
+                self.assertEqual(request.full_url, self.url)
+                self.assertEqual(timeout, 5)
+                return response
+            return open_
+        good = self.tmp / "good.ogg"
+        bridge.download_voice(self.cfg, self.url, good, opener(Response(self.raw, len(self.raw))))
+        self.assertEqual(good.read_bytes(), self.raw)
+        self.assertEqual(good.stat().st_mode & 0o777, 0o600)
+        for response in (Response(b"", bridge.VOICE_LIMIT + 1), Response(b""),
+                         Response(b"a", 10), Response(b"a", "not-a-number")):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.download_voice(self.cfg, self.url, self.tmp / "bad", opener(response))
+            if (self.tmp / "bad").exists():
+                (self.tmp / "bad").unlink()
+        with patch.object(bridge, "VOICE_LIMIT", 4):
+            with self.assertRaisesRegex(bridge.BridgeError, "exceeds"):
+                bridge.download_voice(self.cfg, self.url, self.tmp / "stream-cap", opener(Response(b"abcde")))
+        with patch.object(bridge.time, "monotonic", side_effect=[0, 31]):
+            with self.assertRaisesRegex(bridge.BridgeError, "timed out"):
+                bridge.download_voice(self.cfg, self.url, self.tmp / "timeout", opener(Response(b"a")))
+        with self.assertRaisesRegex(bridge.BridgeError, "redirects refused"):
+            bridge.NoRedirect().redirect_request(None, None, 302, "", {}, "https://evil.example.test/")
+        with patch.object(bridge.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = OSError("TLS failed")
+            with self.assertRaisesRegex(bridge.BridgeError, "download failed"):
+                bridge.download_voice(self.cfg, self.url, self.tmp / "tls-failure")
+            self.assertEqual(build.call_args.args[0].proxies, {})
+            self.assertIsInstance(build.call_args.args[1], bridge.NoRedirect)
+
+    def test_transcriber_cli_quality_and_empty_refusals(self):
+        audio = self.tmp / "voice.ogg"
+        audio.write_bytes(self.raw)
+        def runner(raw, status=0):
+            def run(argv, **kwargs):
+                self.assertEqual(argv[:2], [str(Path.home() / "HelmCortex/FORGE/bin/whisper-transcribe"), str(audio)])
+                self.assertEqual(kwargs["timeout"], 600)
+                Path(argv[argv.index("--out") + 1]).write_text(raw)
+                return subprocess.CompletedProcess(argv, status, "", "")
+            return run
+        self.assertEqual(bridge.transcribe_voice(audio, runner("---\nwhisper_quality: clean\n---\n\nSpoken words.\n")), "Spoken words.")
+        for raw, status in (("---\nwhisper_quality: clean\n---\n\n", 0),
+                            ("---\nwhisper_quality: suspect\n---\nwords", 4),
+                            ("---\nwhisper_quality: non-speech\n---\n[non-speech audio]", 0),
+                            ("words without provenance", 0)):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.transcribe_voice(audio, runner(raw, status))
+        for error in (subprocess.TimeoutExpired("whisper", 600), FileNotFoundError("whisper")):
+            with patch.object(bridge.subprocess, "run", side_effect=error) as run:
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.transcribe_voice(audio, run)
+
+    def test_voice_mail_real_mime_roundtrip_and_temp_cleanup(self):
+        root = self.tmp / "Mail"
+        maildir = root / "consorts/fable"
+        for leaf in ("tmp", "new", "cur"):
+            (maildir / leaf).mkdir(parents=True)
+        command = Path(__file__).resolve().parents[5] / "all/.local/bin/mailcortex"
+        calls = []
+        def run(argv, **kwargs):
+            calls.append(argv)
+            self.assertEqual(Path(argv[argv.index("--attach") + 1]).read_bytes(), self.raw)
+            return subprocess.run([str(command), *argv[1:]], env=os.environ | {"MAILCORTEX_ROOT": str(root)}, **kwargs)
+        name = bridge.inbound_voice(self.cfg, "owner@example.test/phone", "fable",
+                                    self.url, run, self.download, lambda _: "Spoken words.")
+        self.assertEqual(len(calls), 1)
+        message = BytesParser(policy=policy.default).parsebytes((maildir / "new" / name).read_bytes())
+        self.assertEqual(message["Subject"], "[xmpp voice] Spoken words.")
+        self.assertEqual(message["To"], "fable@host.helm")
+        self.assertEqual(message["From"], self.cfg["bridge_address"])
+        body = message.get_body(preferencelist=("plain",)).get_content().replace("\r\n", "\n")
+        self.assertIn("\n\nSpoken words.\n", body)
+        self.assertIn("XMPP-From: owner@example.test", message.get_body().get_content())
+        part, = message.iter_attachments()
+        self.assertEqual(part.get_filename(), "voice-note.ogg")
+        self.assertEqual(part.get_payload(decode=True), self.raw)
+        self.assertFalse(self.audio_paths[0].parent.exists())
+        self.assertEqual(list((maildir / "tmp").iterdir()), [])
+
+    def test_empty_and_failed_transcription_cleanup_without_mail(self):
+        run = FakeRun()
+        for transcriber in (lambda _: "", lambda _: (_ for _ in ()).throw(bridge.BridgeError("whisper failed"))):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.inbound_voice(self.cfg, "owner@example.test", "fable", self.url,
+                                     run, self.download, transcriber)
+            self.assertFalse(self.audio_paths[-1].parent.exists())
+        self.assertEqual(run.calls, [])
+        def failed_download(cfg, url, path):
+            self.download(cfg, url, path)
+            raise bridge.BridgeError("fetch failed after partial write")
+        with self.assertRaises(bridge.BridgeError):
+            bridge.inbound_voice(self.cfg, "owner@example.test", "fable", self.url,
+                                 run, failed_download, lambda _: "should not run")
+        self.assertFalse(self.audio_paths[-1].parent.exists())
+        self.assertEqual(run.calls, [])
+
+    def test_failure_replies_once_and_worker_leaves_loop_responsive(self):
+        msg = FakeMessage(self.url)
+        async def failure():
+            with patch.object(bridge, "inbound_voice", side_effect=bridge.BridgeError("whisper failed\nretry")):
+                with self.assertLogs(bridge.LOG, level="ERROR"):
+                    await bridge.deliver_inbound(self.cfg, msg, "owner@example.test", "fable", self.url)
+        asyncio.run(failure())
+        self.assertEqual(msg.replies, ["Voice note could not be transcribed: whisper failed retry"])
+        started, release = threading.Event(), threading.Event()
+        def slow(*args):
+            started.set()
+            if not release.wait(2):
+                raise bridge.BridgeError("test worker was not released")
+            return "delivered.msg"
+        async def responsive():
+            with patch.object(bridge, "inbound_voice", side_effect=slow):
+                job = asyncio.create_task(bridge.deliver_inbound(self.cfg, FakeMessage(self.url),
+                                          "owner@example.test", "fable", self.url))
+                try:
+                    for _ in range(100):
+                        if started.is_set():
+                            break
+                        await asyncio.sleep(0.005)
+                    self.assertTrue(started.is_set())
+                    self.assertFalse(job.done())
+                finally:
+                    release.set()
+                    await job
+        asyncio.run(responsive())
+
+
+class FakeMessage:
+    def __init__(self, body, oob=None, sender="owner@example.test/phone", local="fable", mid="fixture-id"):
+        self.xml = ET.Element("message")
+        if oob:
+            ET.SubElement(ET.SubElement(self.xml, "{jabber:x:oob}x"), "{jabber:x:oob}url").text = oob
+        self.values = {"body": body, "type": "chat", "from": sender,
+                       "to": types.SimpleNamespace(user=local), "id": mid}
+        self.replies = []
+    def __getitem__(self, key):
+        return self.values[key]
+    def reply(self, text):
+        self.replies.append(text)
+        return self
+    def send(self):
+        pass
+
+
+class ComponentVoiceTests(unittest.TestCase):
+    setUp = VoiceTests.setUp
+
+    # Exercise the registered production handler, not only helper calls.
+    def test_production_handler_bodyless_owner_dedupe_unknown_and_capacity(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        asyncio.set_event_loop(loop)
+        self.addCleanup(asyncio.set_event_loop, None)
+        instances = []
+        class ComponentBase:
+            def __init__(self, *args):
+                self.disconnected = loop.create_future()
+                self.handlers = {}
+                instances.append(self)
+            def register_plugin(self, name):
+                pass
+            def add_event_handler(self, name, handler):
+                self.handlers[name] = handler
+            def connect(self):
+                self.disconnected.set_result(None)
+        with patch.dict("sys.modules", {"slixmpp": types.SimpleNamespace(ComponentXMPP=ComponentBase)}), \
+                patch.object(bridge, "state_root", return_value=self.tmp / "state"):
+            self.assertEqual(bridge.run_bridge(self.cfg), 1)
+        component, = instances
+        async def exercise():
+            with patch.object(bridge, "inbound_voice", return_value="voice.msg") as worker:
+                owner = FakeMessage("", self.url)
+                await component.handlers["message"](owner)
+                worker.assert_called_once_with(self.cfg, "owner@example.test", "fable", self.url)
+                await component.handlers["message"](owner)
+                self.assertEqual(worker.call_count, 1)
+                await component.handlers["message"](FakeMessage("", self.url, sender="evil@example.test"))
+                self.assertEqual(worker.call_count, 1)
+                ghost = FakeMessage("", self.url, local="ghost")
+                await component.handlers["message"](ghost)
+                self.assertEqual(ghost.replies, ["No such seat."])
+                component.voice_jobs = bridge.VOICE_JOBS
+                full = FakeMessage("", self.url, mid="new-id")
+                await component.handlers["message"](full)
+                self.assertEqual(worker.call_count, 1)
+                self.assertIn("capacity reached", full.replies[0])
+                # Plain links stay deliverable even when voice workers are full.
+                with patch.object(bridge, "inbound_mail", return_value="text.msg") as text:
+                    for index, link in enumerate(("https://foreign.example.test/article",
+                                                  self.url.replace("https:", "http:"))):
+                        plain = FakeMessage(link, mid=f"plain-{index}")
+                        await component.handlers["message"](plain)
+                        text.assert_called_with(self.cfg, "owner@example.test", "fable", link)
+                        self.assertEqual(plain.replies, [])
+                    self.cfg["upload_base_url"] = ""
+                    unconfigured = FakeMessage(self.url, mid="plain-unconfigured")
+                    await component.handlers["message"](unconfigured)
+                    text.assert_called_with(self.cfg, "owner@example.test", "fable", self.url)
+                    self.assertEqual(unconfigured.replies, [])
+                    self.assertEqual(text.call_count, 3)
+                self.assertEqual(worker.call_count, 1)
+        loop.run_until_complete(exercise())
 
 
 class GateTests(unittest.TestCase):

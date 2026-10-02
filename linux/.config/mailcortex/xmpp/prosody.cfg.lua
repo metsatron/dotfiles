@@ -26,10 +26,19 @@ c2s_ports = { 5222 }
 component_interfaces = { "127.0.0.1" }
 component_ports = { 5347 }
 
+-- No cleartext HTTP and no HTTPS listener until the private tailnet bind exists.
+http_ports = {}
+https_ports = {}
+http_file_share_size_limit = 25 * 1024 * 1024
+http_file_share_expires_after = "1d"
+http_file_share_daily_quota = 250 * 1024 * 1024
+http_file_share_global_quota = 1024 * 1024 * 1024
+http_file_share_allowed_file_types = { "audio/*"; "application/ogg" }
+
 modules_enabled = {
   "roster"; "saslauth"; "tls"; "disco"; "carbons"; "pep"; "private";
   "blocklist"; "vcard4"; "vcard_legacy"; "version"; "uptime"; "time";
-  "ping"; "smacks"; "csi_simple"; "mam"; "bookmarks";
+  "ping"; "smacks"; "csi_simple"; "mam"; "bookmarks"; "http_file_share";
   -- Local unix socket for prosodyctl adduser/passwd/shell; no network listener.
   "admin_shell"; "admin_socket";
 }
