@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import collections
 import json
 import logging
@@ -12,7 +13,11 @@ import re
 import stat
 import subprocess
 import sys
+import tempfile
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
@@ -28,6 +33,10 @@ ADDRESS_RE = re.compile(
 )
 MAX_BODY = 16000
 SEEN_CAP = 4000
+VOICE_LIMIT = 25 * 1024 * 1024
+VOICE_JOBS = 2
+DOWNLOAD_SECONDS = 30
+TRANSCRIBE_SECONDS = 600
 
 
 class BridgeError(Exception):
@@ -99,7 +108,15 @@ def load_config(path: Path) -> dict:
         raise BridgeError("poll_seconds must be between 0.5 and 60")
     if not isinstance(port, int) or not 1 <= port <= 65535:
         raise BridgeError("port must be a TCP port")
+    upload = data.get("upload_base_url", "")
+    if not isinstance(upload, str):
+        raise BridgeError("upload_base_url must be an HTTPS upload directory")
+    if upload:
+        parsed = split_upload_url(upload)
+        if not parsed.path.endswith("/") or parsed.path == "/":
+            raise BridgeError("upload_base_url must name an upload directory")
     return {
+        "upload_base_url": upload,
         "component_jid": component,
         "owner_jids": [bare(o) for o in owners],
         "bridge_address": address,
@@ -213,6 +230,153 @@ def inbound_mail(cfg: dict, sender: str, local: str, body: str, run=subprocess.r
                        "--subject", subject, "--body", framed], run).strip()
 
 
+def split_upload_url(value: str):
+    try:
+        parsed = urllib.parse.urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise BridgeError("invalid upload URL") from error
+    if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+            or parsed.password or parsed.query or parsed.fragment
+            or any(c.isspace() or ord(c) < 32 for c in value)):
+        raise BridgeError("upload URL must be HTTPS without credentials or query")
+    return parsed
+
+
+def validate_upload_url(cfg: dict, url: str) -> None:
+    base = cfg.get("upload_base_url", "")
+    if not base:
+        raise BridgeError("voice upload is not configured")
+    allowed, candidate = split_upload_url(base), split_upload_url(url)
+    if ((candidate.hostname, candidate.port or 443) !=
+            (allowed.hostname, allowed.port or 443)):
+        raise BridgeError("foreign upload host or port refused")
+    path = urllib.parse.unquote(candidate.path)
+    if (not path.startswith(allowed.path) or path == allowed.path
+            or "\\" in path or any(p in {".", ".."} for p in path.split("/"))):
+        raise BridgeError("URL is outside the upload directory")
+
+
+def voice_url(cfg: dict, msg) -> str | None:
+    """OOB declares an upload; a bare link needs the upload allowlist first."""
+    element = msg.xml.find("{jabber:x:oob}x/{jabber:x:oob}url")
+    if element is not None and element.text:
+        return element.text.strip()
+    body = str(msg["body"]).strip()
+    if re.fullmatch(r"https?://\S+", body):
+        try:
+            validate_upload_url(cfg, body)
+        except BridgeError:
+            return None  # Ordinary links keep the pre-voice text-mail route.
+        return body
+    return None
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise BridgeError("upload redirects refused")
+
+
+def download_voice(cfg: dict, url: str, destination: Path, opener=None) -> None:
+    validate_upload_url(cfg, url)
+    opener = opener or urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()).open
+    deadline = time.monotonic() + DOWNLOAD_SECONDS
+    request = urllib.request.Request(url, headers={"Accept-Encoding": "identity"})
+    try:
+        with opener(request, timeout=5) as response:
+            if response.status != 200:
+                raise BridgeError("upload fetch returned a non-success status")
+            length = response.headers.get("Content-Length")
+            if length is not None and (int(length) < 0 or int(length) > VOICE_LIMIT):
+                raise BridgeError("voice upload exceeds 25 MiB")
+            descriptor = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                total = 0
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise BridgeError("voice download timed out")
+                    # read1 does not wait to fill a large buffer on trickle streams.
+                    chunk = response.read1(min(65536, VOICE_LIMIT - total + 1))
+                    if time.monotonic() >= deadline:
+                        raise BridgeError("voice download timed out")
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > VOICE_LIMIT:
+                        raise BridgeError("voice upload exceeds 25 MiB")
+                    stream.write(chunk)
+                if not total or (length is not None and total != int(length)):
+                    raise BridgeError("voice upload is empty or incomplete")
+    except BridgeError:
+        raise
+    except (OSError, ValueError, urllib.error.URLError) as error:
+        raise BridgeError("voice download failed (network, TLS or invalid response)") from error
+
+
+def transcribe_voice(audio: Path, run=subprocess.run) -> str:
+    output = audio.parent / "transcript.md"
+    try:
+        command = Path.home() / "HelmCortex/FORGE/bin/whisper-transcribe"
+        result = run([str(command), str(audio), "--out", str(output)],
+                     capture_output=True, text=True, timeout=TRANSCRIBE_SECONDS)
+        if result.returncode != 0:
+            raise BridgeError("whisper transcription failed or was quality-suspect")
+        raw = output.read_text(encoding="utf-8")
+    except subprocess.TimeoutExpired as error:
+        raise BridgeError("whisper transcription timed out") from error
+    except (OSError, UnicodeError) as error:
+        raise BridgeError("whisper-transcribe or its transcript is unavailable") from error
+    metadata, separator, text = raw.partition("\n---\n")
+    text = text.strip()
+    if (not metadata.startswith("---\n") or not separator
+            or "whisper_quality: clean" not in metadata.splitlines()
+            or not text or text in {"[non-speech audio]", "[transcription unavailable]"}):
+        raise BridgeError("whisper returned no clean speech transcript")
+    if len(text) > MAX_BODY:
+        raise BridgeError("voice transcript exceeds the message limit")
+    return text
+
+
+def inbound_voice(cfg: dict, sender: str, local: str, url: str,
+                  run=subprocess.run, download=None, transcribe=None) -> str:
+    target = cfg["seats"].get(local)
+    if target is None:
+        raise BridgeError("unknown seat")
+    validate_upload_url(cfg, url)  # Before even an injected downloader is called.
+    filename = re.sub(r"[^A-Za-z0-9._-]", "_",
+                      urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]))
+    filename = "voice-" + filename[-100:]
+    with tempfile.TemporaryDirectory(prefix="mailcortex-voice.") as directory:
+        audio = Path(directory) / filename
+        (download or download_voice)(cfg, url, audio)
+        text = (transcribe or transcribe_voice)(audio).strip()
+        if not text or len(text) > MAX_BODY:
+            raise BridgeError("voice transcript is empty or too long")
+        framed = (f"XMPP-From: {bare(sender)}\n"
+                  f"XMPP-To: {local}@{cfg['component_jid']}\n"
+                  f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
+                  "Voice-Note: original audio attached\n\n" + text + "\n")
+        return mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
+                           "--subject", "[xmpp voice] " + text.splitlines()[0][:70],
+                           "--body", framed, "--attach", str(audio)], run).strip()
+
+
+async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | None) -> None:
+    try:
+        if url is not None:
+            name = await asyncio.to_thread(inbound_voice, cfg, sender, local, url)
+        else:
+            name = inbound_mail(cfg, sender, local, msg["body"])
+    except (BridgeError, OSError) as error:
+        diagnostic = " ".join(str(error).split())[:200]
+        LOG.error("delivery failed for %s: %s", local, diagnostic)
+        prefix = "Voice note could not be transcribed: " if url is not None else "Not delivered: "
+        msg.reply(prefix + diagnostic).send()
+        return
+    LOG.info("delivered %s -> %s as %s", sender, local, name)
+
+
 def pending_outbound(cfg: dict, run=subprocess.run) -> list[str]:
     rows = mailcortex(["inbox", cfg["bridge_address"]], run).splitlines()
     return [row.split("\t")[1] for row in rows if row.startswith("new\t")]
@@ -253,6 +417,7 @@ def run_bridge(cfg: dict) -> int:
             self.add_event_handler("presence_subscribe", self.on_subscribe)
             self.add_event_handler("presence_probe", self.on_probe)
             self.poller = None
+            self.voice_jobs = 0
 
         def seat_jid(self, local: str) -> str:
             return f"{local}@{cfg['component_jid']}"
@@ -277,8 +442,11 @@ def run_bridge(cfg: dict) -> int:
             if bare(presence["from"]) in gate.owners and presence["to"].user in cfg["seats"]:
                 self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
 
-        def on_message(self, msg) -> None:
-            if msg["type"] not in ("chat", "normal") or not msg["body"]:
+        async def on_message(self, msg) -> None:
+            if msg["type"] not in ("chat", "normal"):
+                return
+            url = voice_url(cfg, msg)
+            if not msg["body"] and url is None:
                 return
             sender = bare(msg["from"])
             local = msg["to"].user
@@ -296,13 +464,17 @@ def run_bridge(cfg: dict) -> int:
             if not seen.check_and_add(key):
                 LOG.info("duplicate stanza %s ignored", key)
                 return
-            try:
-                name = inbound_mail(cfg, sender, local, msg["body"])
-            except BridgeError as error:
-                LOG.error("delivery failed for %s: %s", local, error)
-                msg.reply(f"Not delivered: {error}").send()
+            if url is not None and self.voice_jobs >= VOICE_JOBS:
+                LOG.warning("voice capacity reached for %s", local)
+                msg.reply("Voice note not delivered: transcription capacity reached; resend later.").send()
                 return
-            LOG.info("delivered %s -> %s as %s", sender, local, name)
+            if url is not None:
+                self.voice_jobs += 1
+            try:
+                await deliver_inbound(cfg, msg, sender, local, url)
+            finally:
+                if url is not None:
+                    self.voice_jobs -= 1
 
         async def poll_outbound(self) -> None:
             while True:
