@@ -83,6 +83,12 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(adapter.deliveries, [("builder-agent", "wT:p1", "/inbox")])
         self.assertEqual(self.receipt("<same@node.helm>")["wake_state"], "injected")
 
+    def test_in_flight_sync_temp_file_is_not_a_wake(self):
+        self.mail("<partial@node.helm>", ".syncthing.123.host.tmp")
+        adapter = FakeAdapter()
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 0)
+        self.assertEqual(adapter.deliveries, [])
+
     def test_busy_and_rate_limit_defer_without_drop(self):
         self.mail("<busy@node.helm>", "a")
         adapter = FakeAdapter(busy=True)

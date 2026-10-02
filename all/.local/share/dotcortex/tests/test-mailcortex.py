@@ -128,6 +128,12 @@ class MailCortexTests(unittest.TestCase):
         self.assertFalse((self.maildir / "new" / name).exists())
         self.assertTrue((self.maildir / "cur" / (name + ":2,S")).exists())
 
+    def test_inbox_skips_in_flight_sync_temp_files(self) -> None:
+        (self.maildir / "new" / ".syncthing.123.host.tmp").write_bytes(b"Subject: partial\n\n")
+        listing = self.run_command("inbox", self.address)
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertNotIn(".syncthing", listing.stdout)
+
     def test_namespaces_and_input_guards(self) -> None:
         for address, expected in (
             ("writer@node-a.helm", "consorts/writer"),
