@@ -53,7 +53,7 @@ class ConfigTests(unittest.TestCase):
     def test_valid_config_builds_reverse_map(self):
         cfg = bridge.load_config(self.write(base_config(self.tmp)))
         self.assertEqual(cfg["bridge_seat"], "xmpp-bridge")
-        self.assertEqual(cfg["reverse"]["fable@host.helm"], "fable")
+        self.assertEqual(cfg["reverse"]["fable"], "fable")
 
     def test_bridge_address_must_be_a_seat(self):
         data = base_config(self.tmp)
@@ -141,6 +141,11 @@ class RoutingTests(unittest.TestCase):
         rendered = ("From: seat+worker@host.helm\nSubject: Re: [xmpp] Hello\n"
                     "Message-ID: <2@host.helm>\n\nDone.\n")
         self.assertEqual(bridge.render_outbound(self.cfg, rendered)[:2], ("worker", "Done."))
+
+    def test_outbound_sender_from_another_machine_maps(self):
+        rendered = ("From: seat+worker@other-node.helm\nSubject: Re: [xmpp] Hey\n"
+                    "Message-ID: <4@other-node.helm>\n\nOn it.\n")
+        self.assertEqual(bridge.render_outbound(self.cfg, rendered)[:2], ("worker", "On it."))
 
     def test_outbound_unmapped_sender(self):
         rendered = "From: stranger@host.helm\nSubject: x\nMessage-ID: <3@host.helm>\n\nhi\n"
