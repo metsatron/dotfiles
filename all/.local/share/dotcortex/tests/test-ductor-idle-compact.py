@@ -18,6 +18,7 @@ from types import SimpleNamespace
 import importlib.util
 import os
 import sys
+from unittest import mock
 
 try:
     import ductor_bot  # noqa: F401  (the seam imports ductor_bot.cli.types)
@@ -172,6 +173,20 @@ class IdleCompactTests(unittest.IsolatedAsyncioTestCase):
         comp, cli, codex, _ = self.make([FakeSession("g1", "gemini", ago(500))])
         await self.tick(comp)
         self.assertEqual((codex, cli.calls), ([], []))
+
+    def test_window_resolves_current_model_and_preserves_fallback(self):
+        settings = ic.IdleCompactSettings()
+        decision = {
+            "compact_before_seconds": 7080,
+            "cache_expires_seconds": 7200,
+        }
+        completed = SimpleNamespace(stdout=json.dumps(decision))
+        with mock.patch.object(ic.subprocess, "run", return_value=completed) as run:
+            self.assertEqual(settings.window("codex", "gpt-5.6-sol"), (7080.0, 7200.0))
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], "gpt-5.6-sol")
+        with mock.patch.object(ic.subprocess, "run", side_effect=OSError("offline")):
+            self.assertEqual(settings.window("codex", "gpt-5.6-sol"), (1500.0, 1800.0))
 
 
 if __name__ == "__main__":
