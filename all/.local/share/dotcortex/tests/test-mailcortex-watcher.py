@@ -40,6 +40,21 @@ class FakeAdapter:
             raise RuntimeError("ambiguous transport failure")
 
 
+class FakeHTTPResponse:
+    def __init__(self, payload, status=200):
+        self.payload = json.dumps(payload).encode("utf-8")
+        self.status = status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self):
+        return self.payload
+
+
 class WatcherTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -154,6 +169,95 @@ class WatcherTests(unittest.TestCase):
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             with self.assertRaisesRegex(self.watcher.WatcherError, "owns the scan lock"):
                 self.watcher.locked_scan(self.registry, FakeAdapter())
+
+    def test_registry_accepts_exact_transport_shapes_and_consort_mailboxes(self):
+        records = {
+            "builder": self.registry["seats"]["builder"],
+            "ductbot": {
+                "host": "test-host", "mailbox": "consorts/ductbot", "harness": "ductor",
+                "transport": "ductor", "ductor_config": "YOUR_DUCTOR_CONFIG",
+                "rate_limit_seconds": 0,
+            },
+            "deepbot": {
+                "host": "test-host", "mailbox": "consorts/deepbot", "harness": "deepseek",
+                "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
+                "deepseek_cookie_file": "YOUR_DEEPSEEK_COOKIE_FILE",
+                "deepseek_session": "deepbot-session", "rate_limit_seconds": 0,
+            },
+        }
+        registry_path = self.base / "registry.json"
+        registry_path.write_text(json.dumps({"schema": "mailcortex.seats.v1", "host": "test-host", "seats": records}))
+        registry_path.chmod(0o600)
+        loaded = self.watcher.load_registry(registry_path, "test-host")
+        self.assertEqual(loaded["seats"]["ductbot"]["mailbox"], "consorts/ductbot")
+        for name, record in records.items():
+            invalid = dict(record)
+            invalid["unexpected"] = True
+            registry_path.write_text(json.dumps({"schema": "mailcortex.seats.v1", "host": "test-host", "seats": {name: invalid}}))
+            with self.assertRaisesRegex(self.watcher.WatcherError, "fields are not exact"):
+                self.watcher.load_registry(registry_path, "test-host")
+
+    def test_consort_mailbox_is_delivered_and_path_guards_remain_canonical(self):
+        mailbox = self.root / "consorts/ductbot"
+        for leaf in ("tmp", "new", "cur"):
+            (mailbox / leaf).mkdir(parents=True)
+        record = dict(self.registry["seats"]["builder"], mailbox="consorts/ductbot")
+        registry = {"schema": "mailcortex.seats.v1", "host": "test-host", "seats": {"ductbot": record}}
+        message = EmailMessage()
+        message["From"] = "sender@node.helm"
+        message["To"] = "consort+ductbot@node.helm"
+        message["Subject"] = "wake"
+        message["Message-ID"] = "<consort@node.helm>"
+        message.set_content("hello")
+        (mailbox / "new/message").write_bytes(message.as_bytes())
+        adapter = FakeAdapter()
+        self.assertEqual(self.watcher.locked_scan(registry, adapter, now=10), 1)
+        self.assertEqual(adapter.deliveries, [("builder-agent", "wT:p1", "/inbox")])
+        (mailbox / "new/message").unlink()
+        (mailbox / "new").rmdir()
+        (mailbox / "cur").rmdir()
+        (mailbox / "tmp").rmdir()
+        mailbox.rmdir()
+        mailbox.symlink_to(self.base / "outside", target_is_directory=True)
+        (self.base / "outside").mkdir()
+        with self.assertRaisesRegex(self.watcher.WatcherError, "absent or unsafe"):
+            self.watcher.locked_scan(registry, FakeAdapter(), now=11)
+
+    def test_ductor_fails_loud_without_a_safe_busy_status_query(self):
+        with self.assertRaisesRegex(self.watcher.WatcherError, "no safe local busy-status injection point"):
+            self.watcher.DuctorAdapter().resolve_idle_pane(self.registry["seats"]["builder"])
+
+    def test_deepseek_busy_detection_prevents_prompt_until_session_is_idle(self):
+        cookie = self.base / "deepseek.cookie"
+        cookie.write_text("session=YOUR_COOKIE")
+        cookie.chmod(0o600)
+        record = {
+            "host": "test-host", "mailbox": "consorts/deepbot", "harness": "deepseek",
+            "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
+            "deepseek_cookie_file": str(cookie), "deepseek_session": "deepbot-session",
+            "rate_limit_seconds": 0,
+        }
+        running = iter((True, False))
+        calls = []
+
+        def opener(request, timeout):
+            body = json.loads(request.data)
+            calls.append((request, timeout, body))
+            if body["method"] == "session/list":
+                value = {"items": [{"sessionId": "deepbot-session", "running": next(running)}]}
+            else:
+                value = {"accepted": True}
+            return FakeHTTPResponse({"type": "server-response", "rpcId": body["rpcId"],
+                                     "result": {"ok": True, "value": value}})
+
+        adapter = self.watcher.DeepSeekAdapter(opener=opener)
+        self.assertIsNone(adapter.resolve_idle_pane(record))
+        self.assertEqual(adapter.resolve_idle_pane(record), "deepbot-session")
+        adapter.deliver(record, "deepbot-session", "/inbox")
+        self.assertEqual([call[2]["method"] for call in calls],
+                         ["session/list", "session/list", "session/prompt"])
+        self.assertEqual(calls[-1][2]["payload"]["args"]["mode"], "queue")
+        self.assertEqual(calls[-1][0].headers["Cookie"], "session=YOUR_COOKIE")
 
     def test_production_adapter_uses_verified_herdr_shape_and_commands(self):
         calls = []

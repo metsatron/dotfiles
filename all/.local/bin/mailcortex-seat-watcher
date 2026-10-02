@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import ipaddress
 import json
 import os
 import re
@@ -11,6 +12,10 @@ import socket
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from email.parser import BytesParser
 from pathlib import Path
 
@@ -26,6 +31,7 @@ SPEC.loader.exec_module(MAILCORTEX)
 
 SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
+TRANSPORTS = {"herdr", "ductor", "deepseek"}
 
 
 class WatcherError(Exception):
@@ -47,13 +53,38 @@ def load_registry(path: Path, host: str) -> dict:
     for seat, record in seats.items():
         if not isinstance(seat, str) or not SAFE.fullmatch(seat) or not isinstance(record, dict):
             raise WatcherError("invalid seat registry entry")
-        required = {"host", "mailbox", "harness", "transport", "herdr_session", "herdr_target", "rate_limit_seconds"}
+        transport = record.get("transport")
+        if transport not in TRANSPORTS:
+            raise WatcherError("unsupported seat registry transport")
+        required = {
+            "host", "mailbox", "harness", "transport", "rate_limit_seconds",
+        } | {
+            "herdr": {"herdr_session", "herdr_target"},
+            "ductor": {"ductor_config"},
+            "deepseek": {"deepseek_url", "deepseek_cookie_file", "deepseek_session"},
+        }[transport]
         if set(record) != required:
             raise WatcherError("seat registry fields are not exact")
-        if record["host"] != host or record["mailbox"] != f"seats/{seat}" or record["harness"] not in {"claude", "codex"} or record["transport"] != "herdr":
+        if (
+            record["host"] != host
+            or record["mailbox"] not in {f"seats/{seat}", f"consorts/{seat}"}
+            or not isinstance(record["harness"], str)
+            or record["harness"] not in {"claude", "codex", "ductor", "deepseek"}
+        ):
             raise WatcherError("seat registry ownership or transport mismatch")
-        if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 128 for key in ("herdr_session", "herdr_target")):
-            raise WatcherError("invalid Herdr target")
+        if transport == "herdr":
+            if record["harness"] not in {"claude", "codex"}:
+                raise WatcherError("seat registry ownership or transport mismatch")
+            if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 128 for key in ("herdr_session", "herdr_target")):
+                raise WatcherError("invalid Herdr target")
+        elif transport == "ductor":
+            if record["harness"] != "ductor" or not isinstance(record["ductor_config"], str) or not record["ductor_config"] or len(record["ductor_config"]) > 512:
+                raise WatcherError("invalid Ductor configuration path")
+        elif record["harness"] != "deepseek":
+            raise WatcherError("seat registry ownership or transport mismatch")
+        else:
+            if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 512 for key in ("deepseek_url", "deepseek_cookie_file", "deepseek_session")):
+                raise WatcherError("invalid DeepSeek target")
         if not isinstance(record["rate_limit_seconds"], (int, float)) or record["rate_limit_seconds"] < 0 or record["rate_limit_seconds"] > 86400:
             raise WatcherError("invalid rate limit")
     return data
@@ -129,17 +160,142 @@ class HerdrAdapter:
             raise WatcherError("Herdr delivery outcome is unknown")
 
 
+def private_file(path: Path, label: str) -> Path:
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise WatcherError(f"{label} is not a private regular file")
+    return path
+
+
+def loopback_url(value: str, label: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
+        raise WatcherError(f"{label} is not a loopback URL")
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname.lower() == "localhost"
+    if not loopback:
+        raise WatcherError(f"{label} is not a loopback URL")
+    return value.rstrip("/")
+
+
+class DuctorAdapter:
+    """Ductor has a local prompt API but no safe remote busy-status query."""
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        raise WatcherError(
+            "Ductor transport has no safe local busy-status injection point; refusing delivery"
+        )
+
+    def deliver(self, record: dict, target: str, prompt: str) -> None:
+        raise WatcherError(
+            "Ductor transport has no safe local busy-status injection point; refusing delivery"
+        )
+
+
+class DeepSeekAdapter:
+    """Authenticated local DeepSeek RPC adapter with authoritative busy checks."""
+
+    def __init__(self, opener=urllib.request.urlopen):
+        self.opener = opener
+
+    def _rpc(self, record: dict, method: str, args: dict) -> dict:
+        base = loopback_url(record["deepseek_url"], "DeepSeek URL")
+        cookie_path = private_file(Path(record["deepseek_cookie_file"]).expanduser(), "DeepSeek cookie")
+        cookie = cookie_path.read_text(encoding="utf-8").strip()
+        if not cookie:
+            raise WatcherError("DeepSeek cookie is empty")
+        payload = {
+            "rpcId": uuid.uuid4().hex,
+            "method": method,
+            "payload": {"args": args},
+        }
+        request = urllib.request.Request(
+            f"{base}/api/{method}",
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Cookie": cookie},
+            method="POST",
+        )
+        try:
+            with self.opener(request, timeout=15) as response:
+                if response.status != 200:
+                    raise WatcherError("DeepSeek RPC request failed")
+                result = json.loads(response.read().decode("utf-8"))
+        except WatcherError:
+            raise
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            raise WatcherError("DeepSeek RPC request failed") from error
+        try:
+            rpc_result = result["result"]
+            if not rpc_result["ok"]:
+                raise WatcherError("DeepSeek RPC returned an error")
+            value = rpc_result["value"]
+        except (KeyError, TypeError) as error:
+            raise WatcherError("DeepSeek RPC response is invalid") from error
+        if not isinstance(value, dict):
+            raise WatcherError("DeepSeek RPC response is invalid")
+        return value
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        value = self._rpc(record, "session/list", {})
+        for item in value.get("items", []):
+            if not isinstance(item, dict) or item.get("sessionId") != record["deepseek_session"]:
+                continue
+            if item.get("running") is True:
+                return None
+            if item.get("running") is not False:
+                raise WatcherError("DeepSeek session has no authoritative busy state")
+            return record["deepseek_session"]
+        raise WatcherError("DeepSeek session was not found")
+
+    def deliver(self, record: dict, target: str, prompt: str) -> None:
+        value = self._rpc(
+            record,
+            "session/prompt",
+            {
+                "requestId": uuid.uuid4().hex,
+                "sessionId": target,
+                "mode": "queue",
+                "content": [{"type": "text", "text": prompt}],
+            },
+        )
+        if value.get("accepted") is not True:
+            raise WatcherError("DeepSeek prompt was not accepted")
+
+
+class TransportAdapters:
+    def __init__(self):
+        self.adapters = {
+            "herdr": HerdrAdapter(),
+            "ductor": DuctorAdapter(),
+            "deepseek": DeepSeekAdapter(),
+        }
+
+    def for_record(self, record: dict) -> object:
+        try:
+            return self.adapters[record["transport"]]
+        except KeyError as error:
+            raise WatcherError("unsupported transport") from error
+
+
+def record_adapter(adapter: object, record: dict) -> object:
+    factory = getattr(adapter, "for_record", None)
+    return factory(record) if factory is not None else adapter
+
+
 def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
     now = time.time() if now is None else now
     count = 0
     seen: set[tuple[str, str]] = set()
     for seat, record in registry["seats"].items():
-        if record.get("mailbox") != f"seats/{seat}":
+        mailbox_name = record.get("mailbox")
+        if mailbox_name not in {f"seats/{seat}", f"consorts/{seat}"}:
             raise WatcherError("seat mailbox is not canonical")
         mailbox = MAILCORTEX.mail_root() / record["mailbox"]
-        components = (MAILCORTEX.mail_root(), MAILCORTEX.mail_root() / "seats", mailbox)
+        namespace = mailbox_name.split("/", 1)[0]
+        components = (MAILCORTEX.mail_root(), MAILCORTEX.mail_root() / namespace, mailbox)
         if any(item.is_symlink() for item in components) or not all(item.is_dir() for item in components) or not (mailbox / "new").is_dir():
-            raise WatcherError("canonical seat mailbox is absent or unsafe")
+            raise WatcherError("canonical mailbox is absent or unsafe")
         last_injected = latest_injection(seat)
         for path in sorted(mailbox.joinpath("new").iterdir(), key=lambda p: p.name):
             if not path.is_file() or path.is_symlink() or path.name.startswith("."):
@@ -157,7 +313,8 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
                 continue
             MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
                                           wake_updated_at=now)
-            pane_id = adapter.resolve_idle_pane(record)
+            transport_adapter = record_adapter(adapter, record)
+            pane_id = transport_adapter.resolve_idle_pane(record)
             if pane_id is None:
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="busy",
                                               wake_updated_at=now)
@@ -165,7 +322,7 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
             MAILCORTEX.write_wake_receipt(seat, mid, "injecting", filename=path.name,
                                           pane_id=pane_id, wake_updated_at=now)
             try:
-                adapter.deliver(record, pane_id, "/inbox")
+                transport_adapter.deliver(record, pane_id, "/inbox")
             except Exception as error:
                 MAILCORTEX.write_wake_receipt(
                     seat, mid, "delivery_unknown", filename=path.name,
@@ -173,7 +330,7 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
                 )
                 if isinstance(error, WatcherError):
                     raise
-                raise WatcherError("Herdr delivery outcome is unknown") from error
+                raise WatcherError("transport delivery outcome is unknown") from error
             MAILCORTEX.write_wake_receipt(seat, mid, "injected", filename=path.name,
                                           pane_id=pane_id, wake_updated_at=now)
             count += 1
@@ -203,7 +360,7 @@ def main() -> int:
     try:
         registry = load_registry(Path(args.registry).expanduser(), os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
         while True:
-            locked_scan(registry, HerdrAdapter())
+            locked_scan(registry, TransportAdapters())
             if args.once:
                 return 0
             time.sleep(max(args.interval, 0.1))
