@@ -108,6 +108,54 @@ class MailCortexTests(unittest.TestCase):
         self.assertTrue(message["Message-ID"])
         self.assertEqual(message.get_content().strip(), "Read LOGS/handoffs/example.md")
         self.assertFalse(message.is_multipart())
+        legacy = type(message)(policy=policy.SMTP)
+        for key in ("Date", "From", "To", "Subject", "Message-ID"):
+            legacy[key] = message[key]
+        legacy.set_content("Read LOGS/handoffs/example.md\n")
+        self.assertEqual(delivered[0].read_bytes(), legacy.as_bytes())
+
+    def test_attachments_roundtrip_and_plain_body_remains_readable(self) -> None:
+        audio = self.base / "note.ogg"
+        unknown = self.base / "raw.unknown-mailcortex"
+        audio.write_bytes(b"OggS\x00original")
+        unknown.write_bytes(b"\x00\xffraw")
+        sent = self.run_command("send", "--from", "sender@node-a.helm",
+                                "--to", self.address, "--subject", "voice",
+                                "--body", "transcript", "--attach", str(audio),
+                                "--attach", str(unknown))
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        path = self.maildir / "new" / sent.stdout.strip()
+        msg = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+        self.assertEqual(msg.get_content_type(), "multipart/mixed")
+        self.assertEqual(list(msg.iter_parts())[0].get_content_type(), "text/plain")
+        parts = list(msg.iter_attachments())
+        self.assertEqual([p.get_filename() for p in parts], [audio.name, unknown.name])
+        self.assertEqual(parts[0].get_payload(decode=True), audio.read_bytes())
+        self.assertEqual(parts[1].get_payload(decode=True), unknown.read_bytes())
+        self.assertEqual(parts[1].get_content_type(), "application/octet-stream")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(list((self.maildir / "tmp").iterdir()), [])
+        read = self.run_command("read", self.address, path.name)
+        self.assertIn("\n\ntranscript\n", read.stdout)
+
+    def test_attachment_refusals_never_deliver_partial_mail(self) -> None:
+        regular = self.base / "small"
+        regular.write_bytes(b"a")
+        link = self.base / "link"
+        link.symlink_to(regular)
+        fifo = self.base / "fifo"
+        os.mkfifo(fifo)
+        huge = self.base / "huge"
+        with huge.open("wb") as stream:
+            stream.truncate(25 * 1024 * 1024)
+        for bad in (self.base / "absent", link, self.base, fifo, huge):
+            sent = self.run_command("send", "--from", "sender@node-a.helm",
+                                    "--to", self.address, "--subject", "bad",
+                                    "--body", "hello", "--attach", str(regular),
+                                    "--attach", str(bad))
+            self.assertEqual(sent.returncode, 2, (bad, sent.stderr))
+            for leaf in ("tmp", "new"):
+                self.assertEqual(list((self.maildir / leaf).iterdir()), [])
 
     def test_inbox_lists_and_read_moves_to_cur(self) -> None:
         sent = self.run_command(
