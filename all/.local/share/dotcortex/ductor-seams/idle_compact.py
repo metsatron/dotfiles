@@ -30,6 +30,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -70,13 +71,35 @@ class IdleCompactSettings:
                 values[name] = bool(raw[name]) if name == "enabled" else float(raw[name])
         return cls(**values)
 
-    def window(self, provider: str) -> tuple[float, float] | None:
+    def window(self, provider: str, model: str = "unknown") -> tuple[float, float] | None:
         """Return (compact_after, cache_expires) in seconds, or None if unsupported."""
         if provider == "claude":
-            return self.claude_idle_minutes * 60, self.claude_cache_minutes * 60
-        if provider == "codex":
-            return self.codex_idle_minutes * 60, self.codex_cache_minutes * 60
-        return None
+            fallback = (self.claude_idle_minutes * 60, self.claude_cache_minutes * 60)
+            policy_provider, endpoint = "anthropic", "anthropic-default"
+        elif provider == "codex":
+            fallback = (self.codex_idle_minutes * 60, self.codex_cache_minutes * 60)
+            policy_provider, endpoint = "openai", "openai-codex-oauth"
+        else:
+            return None
+        helper = Path(os.environ.get(
+            "FLEET_CACHE_POLICY_HELPER", str(Path.home() / "HelmCortex/FORGE/bin/cache-policy")
+        )).expanduser()
+        policy = Path(os.environ.get(
+            "FLEET_CACHE_POLICY_PATH",
+            str(Path.home() / "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json"),
+        )).expanduser()
+        try:
+            completed = subprocess.run(
+                [str(helper), "resolve", "--policy", str(policy), "--harness", "ductor",
+                 "--provider", policy_provider, "--endpoint", endpoint, "--model", model,
+                 "--fallback-compact", str(int(fallback[0])),
+                 "--fallback-cache", str(int(fallback[1]))],
+                capture_output=True, text=True, timeout=5, check=True,
+            )
+            decision = json.loads(completed.stdout)
+            return float(decision["compact_before_seconds"]), float(decision["cache_expires_seconds"])
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+            return fallback
 
 
 class IdleCompactor:
@@ -155,7 +178,7 @@ class IdleCompactor:
             live_ids.add(sid)
             if state.get(sid) == session.last_active:
                 continue  # already compacted for this idle period
-            window = settings.window(session.provider)
+            window = settings.window(session.provider, session.model or "unknown")
             if window is None:
                 continue
             compact_after, cache_expires = window
