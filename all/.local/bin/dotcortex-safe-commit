@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# dotcortex-safe-commit — exact-path commits that cannot sweep or corrupt
+
+# Born 2026-10-03, when Kikin Kushi's non-ECC RAM began flipping bits. The shared =.git/index= of DotCortex is a 30 MB file that every lane rewrites constantly, so it was the first casualty: three corrupt indexes in four days, ghost paths like =linux/.themes/Underwatar= and =linux/>local= (each one flipped bit), and a checkpoint commit that silently recorded the deletion of an unrelated =logseq.org= because the index it was written from was already damaged. Git's own checksum cannot catch this, because the flip happens in memory before git hashes what it writes.
+
+# A commit is only as sound as the index it is written from, so this tool never uses the shared one. It builds a private index from =HEAD=, stages exactly the paths it was given, and refuses to land anything unless every check agrees:
+
+# - each file on disk hashes the same twice in a row (a flipping read shows up as disagreement);
+# - the staged change set is exactly the named paths, nothing more and nothing less;
+# - each staged blob equals the file on disk;
+# - the repo's own =pre-commit= hook passes against the private index;
+# - =HEAD= has not moved: the ref is updated with compare-and-swap, so a concurrent commit from another lane is never reverted;
+# - after the commit, the commit's change set and blobs are re-verified against disk.
+
+# It sets =DOTCORTEX_GUARD_ALLOW_DIRTY=1= for the hook, because the dirty-tree guard exists to stop sweeps and an exact-path commit cannot sweep. Every other guard (generated output without Org source, junk, bulk, stash, addresses) still applies, and its overrides still come from the caller's environment. Afterwards it refreshes just those paths in the shared index with =git reset -- <paths>=, so a later bare =git commit= from another lane cannot stage a silent revert; if the shared index is too damaged to read, it says so and the commit still stands.
+
+# It is not RAM-specific: an exact-path, hash-verified, compare-and-swap commit is the right gate for any multi-writer repo, so it stays useful after the ECC swap. It works in any git repo, not only DotCortex.
+
+
+# [[file:../../../tools.org::*dotcortex-safe-commit — exact-path commits that cannot sweep or corrupt][dotcortex-safe-commit — exact-path commits that cannot sweep or corrupt:1]]
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: dotcortex-safe-commit [-C <repo>] (-m <message> | -F <file>) -- <path>...
+
+Commit exactly <path>... from a private index built fresh from HEAD.
+Refuses (and lands nothing) unless: disk reads are stable, the staged set
+is exactly <path>..., staged blobs match disk, the pre-commit hook passes,
+and HEAD has not moved. Re-verifies the commit afterwards.
+A path missing from disk but tracked in HEAD is committed as a deletion.
+EOF
+}
+
+die() { echo "dotcortex-safe-commit: $*" >&2; exit 1; }
+
+repo=. msg= msgfile=
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -C) [ $# -ge 2 ] || die "-C needs a path"; repo=$2; shift 2 ;;
+    -m) [ $# -ge 2 ] || die "-m needs a message"; msg=$2; shift 2 ;;
+    -F) [ $# -ge 2 ] || die "-F needs a file"; msgfile=$2; shift 2 ;;
+    --) shift; break ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+[ -n "$msg" ] || [ -n "$msgfile" ] || die "a message is required (-m or -F)"
+[ -z "$msg" ] || [ -z "$msgfile" ] || die "use -m or -F, not both"
+if [ -n "$msgfile" ]; then
+  [ -r "$msgfile" ] || die "cannot read message file $msgfile"
+  msgfile=$(cd "$(dirname "$msgfile")" && pwd)/$(basename "$msgfile")
+fi
+
+cd "$repo"
+top=$(git rev-parse --show-toplevel) || die "not inside a git repository"
+cd "$top"
+gitdir=$(git rev-parse --absolute-git-dir)
+branch=$(git symbolic-ref -q HEAD) || die "HEAD is detached; check out a branch first"
+old=$(git rev-parse --verify HEAD) || die "HEAD has no commit yet"
+
+declare -A seen=()
+paths=()
+for p in "$@"; do
+  case "$p" in /*|../*|*/../*|..) die "path must be repo-relative: $p" ;; esac
+  p=${p#./}
+  [ -z "${seen[$p]+x}" ] || continue
+  seen[$p]=1
+  paths+=("$p")
+done
+
+work=$(mktemp -d "$gitdir/safe-commit.XXXXXX")
+trap 'rm -rf "$work"' EXIT
+export GIT_INDEX_FILE="$work/index"
+
+# 1. Stable reads: every file must hash identically twice.
+declare -A want=()
+for p in "${paths[@]}"; do
+  if [ -e "$p" ] || [ -L "$p" ]; then
+    [ ! -d "$p" ] || [ -L "$p" ] || die "$p is a directory; name files"
+    a=$(git hash-object --no-filters -- "$p") || die "cannot hash $p"
+    b=$(git hash-object --no-filters -- "$p") || die "cannot hash $p"
+    [ "$a" = "$b" ] || die "unstable read of $p ($a vs $b): suspect memory, nothing committed"
+    want[$p]=$a
+  else
+    git cat-file -e "$old:$p" 2>/dev/null || die "$p is neither on disk nor tracked in HEAD"
+    want[$p]=deleted
+  fi
+done
+
+# 2. Private index from HEAD, then exactly the named paths.
+git read-tree "$old" || die "cannot build a private index from HEAD"
+for p in "${paths[@]}"; do
+  if [ "${want[$p]}" = deleted ]; then
+    git update-index --force-remove -- "$p" || die "cannot stage deletion of $p"
+  else
+    git add -f -- "$p" || die "cannot stage $p"
+  fi
+done
+
+# 3. Staged set must be exactly the named paths.
+expected=$(printf '%s\n' "${paths[@]}" | LC_ALL=C sort)
+staged=$(git diff --cached --name-only --no-renames "$old" | LC_ALL=C sort)
+if [ "$staged" != "$expected" ]; then
+  echo "dotcortex-safe-commit: staged set differs from the requested paths:" >&2
+  diff <(echo "$expected") <(echo "$staged") >&2 || true
+  die "nothing committed (an unchanged path, or a stray entry)"
+fi
+
+# 4. Staged blobs must equal disk.
+for p in "${paths[@]}"; do
+  if [ "${want[$p]}" = deleted ]; then
+    [ -z "$(git ls-files -s -- "$p")" ] || die "deletion of $p did not stage"
+  else
+    got=$(git ls-files -s -- "$p" | awk '{print $2}')
+    [ "$got" = "${want[$p]}" ] || die "staged blob for $p ($got) differs from disk (${want[$p]})"
+  fi
+done
+
+# 5. The repo's own pre-commit hook, against the private index.
+DOTCORTEX_GUARD_ALLOW_DIRTY=1 git hook run --ignore-missing pre-commit \
+  || die "pre-commit hook refused; nothing committed"
+
+# 6. Write the commit and move the branch only if HEAD is still $old.
+tree=$(git write-tree) || die "cannot write tree"
+if [ -n "$msgfile" ]; then
+  git stripspace --strip-comments < "$msgfile" > "$work/msg"
+else
+  printf '%s\n' "$msg" | git stripspace --strip-comments > "$work/msg"
+fi
+[ -s "$work/msg" ] || die "empty commit message"
+new=$(git commit-tree "$tree" -p "$old" -F "$work/msg") || die "cannot create commit"
+git update-ref -m "dotcortex-safe-commit: $(head -n1 "$work/msg")" "$branch" "$new" "$old" \
+  || die "HEAD moved during the commit (another lane committed); nothing landed, rerun"
+
+# 7. Re-verify what landed.
+landed=$(git diff-tree -r --no-commit-id --name-only --no-renames "$old" "$new" | LC_ALL=C sort)
+[ "$landed" = "$expected" ] || die "VERIFY FAILED after commit $new: it touches a different set. Inspect before anything else."
+for p in "${paths[@]}"; do
+  if [ "${want[$p]}" = deleted ]; then
+    ! git cat-file -e "$new:$p" 2>/dev/null || die "VERIFY FAILED: $p still present in $new"
+  else
+    [ "$(git rev-parse "$new:$p")" = "$(git hash-object --no-filters -- "$p")" ] \
+      || die "VERIFY FAILED: $p in $new differs from disk. Inspect before anything else."
+  fi
+done
+
+# 8. Refresh just these paths in the shared index so no lane commits a revert.
+unset GIT_INDEX_FILE
+if ! git reset -q "$new" -- "${paths[@]}" 2>"$work/reset.err"; then
+  echo "dotcortex-safe-commit: WARNING: shared index could not be refreshed ($(head -n1 "$work/reset.err"))." >&2
+  echo "dotcortex-safe-commit: other lanes may see these paths as staged reverts until it is rebuilt." >&2
+fi
+git log --oneline -1 "$new"
+# dotcortex-safe-commit — exact-path commits that cannot sweep or corrupt:1 ends here
