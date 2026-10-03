@@ -22,6 +22,7 @@ from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
 from pathlib import Path
+import xml.etree.ElementTree as ET
 
 LOG = logging.getLogger("mailcortex-xmpp-bridge")
 LOCAL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
@@ -37,6 +38,11 @@ VOICE_LIMIT = 25 * 1024 * 1024
 VOICE_JOBS = 2
 DOWNLOAD_SECONDS = 30
 TRANSCRIBE_SECONDS = 600
+VOICE_TEXT_LIMIT = 4000
+RENDER_SECONDS = 600
+ENCODE_SECONDS = 60
+UPLOAD_SECONDS = 30
+UPLOAD_NS = "urn:xmpp:http:upload:0"
 
 
 class BridgeError(Exception):
@@ -115,7 +121,21 @@ def load_config(path: Path) -> dict:
         parsed = split_upload_url(upload)
         if not parsed.path.endswith("/") or parsed.path == "/":
             raise BridgeError("upload_base_url must name an upload directory")
+    voices = data.get("voices", {})
+    if (not isinstance(voices, dict) or any(
+            local not in seats or not isinstance(agent, str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,63}", agent)
+            or agent != agent.strip() for local, agent in voices.items())):
+        raise BridgeError("voices must map known seat local parts to pvox agent names")
+    service = data.get("upload_service_jid", "")
+    if (not isinstance(service, str) or (service and (
+            not HOST_RE.fullmatch(service) or service == component))):
+        raise BridgeError("upload_service_jid must be the upload VirtualHost domain")
+    if voices and (not upload or not service):
+        raise BridgeError("voices requires upload_base_url and upload_service_jid")
     return {
+        "voices": dict(voices),
+        "upload_service_jid": service,
         "upload_base_url": upload,
         "component_jid": component,
         "owner_jids": [bare(o) for o in owners],
@@ -200,10 +220,18 @@ class Seen:
         return True
 
 
+def diagnostic(error) -> str:
+    """One line, no bearer URLs or Authorization values in owner replies/logs."""
+    text = re.sub(r"https?://\S+", "[upload URL redacted]", str(error))
+    text = re.sub(r"(?i)\bBearer\s+\S+", "Bearer [redacted]", text)
+    return " ".join(text.split())[:200] or "unspecified error"
+
+
 def mailcortex(args: list[str], run=subprocess.run) -> str:
     result = run(["mailcortex", *args], capture_output=True, text=True)
     if result.returncode != 0:
-        raise BridgeError(f"mailcortex {args[0]} failed: {result.stderr.strip()}")
+        reason = result.stderr.strip() or f"exit status {result.returncode} (no stderr)"
+        raise BridgeError(f"mailcortex {args[0]} failed: {diagnostic(reason)}")
     return result.stdout
 
 
@@ -339,7 +367,7 @@ def transcribe_voice(audio: Path, run=subprocess.run) -> str:
 
 
 def inbound_voice(cfg: dict, sender: str, local: str, url: str,
-                  run=subprocess.run, download=None, transcribe=None) -> str:
+                  run=subprocess.run, download=None, transcribe=None) -> tuple[str, str]:
     target = cfg["seats"].get(local)
     if target is None:
         raise BridgeError("unknown seat")
@@ -357,24 +385,31 @@ def inbound_voice(cfg: dict, sender: str, local: str, url: str,
                   f"XMPP-To: {local}@{cfg['component_jid']}\n"
                   f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
                   "Voice-Note: original audio attached\n\n" + text + "\n")
-        return mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
-                           "--subject", "[xmpp voice] " + text.splitlines()[0][:70],
-                           "--body", framed, "--attach", str(audio)], run).strip()
+        name = mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
+                          "--subject", "[xmpp voice] " + text.splitlines()[0][:70],
+                          "--body", framed, "--attach", str(audio)], run).strip()
+        return name, text  # Expose the transcript only after MailCortex succeeds.
 
 
 async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | None) -> None:
     try:
         if url is not None:
-            name = await asyncio.to_thread(inbound_voice, cfg, sender, local, url)
+            name, transcript = await asyncio.to_thread(inbound_voice, cfg, sender, local, url)
         else:
-            name = inbound_mail(cfg, sender, local, msg["body"])
+            name = await asyncio.to_thread(inbound_mail, cfg, sender, local, msg["body"])
     except (BridgeError, OSError) as error:
-        diagnostic = " ".join(str(error).split())[:200]
-        LOG.error("delivery failed for %s: %s", local, diagnostic)
+        reason = diagnostic(error)
+        LOG.error("delivery failed for %s: %s", local, reason)
         prefix = "Voice note could not be transcribed: " if url is not None else "Not delivered: "
-        msg.reply(prefix + diagnostic).send()
+        msg.reply(prefix + reason).send()
         return
     LOG.info("delivered %s -> %s as %s", sender, local, name)
+    if url is not None:
+        # slixmpp Message.reply swaps the original seat/owner and preserves thread.
+        try:
+            msg.reply("\n".join("> " + line for line in transcript.split("\n"))).send()
+        except Exception as error:
+            LOG.error("transcript delivered but echo failed for %s: %s", local, diagnostic(error))
 
 
 def pending_outbound(cfg: dict, run=subprocess.run) -> list[str]:
@@ -396,6 +431,183 @@ def render_outbound(cfg: dict, rendered: str) -> tuple[str | None, str, str]:
     return local, text[:MAX_BODY], str(message.get("Message-ID", "")).strip()
 
 
+def markdown_to_styling(text: str) -> str:
+    """Conservative Markdown -> XEP-0393, with code and escapes opaque."""
+    def inline(line, bold_context=False):
+        if "\x00" in line:
+            return line
+        protected, pieces, index = [], [], 0
+        while index < len(line):
+            start = index
+            if line[index] == "\\" and index + 1 < len(line):
+                index += 2
+            elif line[index] == "`":
+                run = re.match(r"`+", line[index:])[0]
+                end = re.search(r"(?<!`)" + re.escape(run) + r"(?!`)", line[index + len(run):])
+                if end is None:
+                    return line  # Unclosed code: do not guess where prose resumes.
+                index += len(run) + end.end()
+            else:
+                pieces.append(line[index])
+                index += 1
+                continue
+            pieces.append(f"\x00{len(protected)}\x00")
+            protected.append(line[start:index])
+        line = "".join(pieces)
+        line = re.sub(r"\[([^\[\]\n\x00]+)\]\(([^()\s\x00]+)\)", r"\1 (\2)", line)
+        # Single-star italics first, so newly converted bold is not restyled.
+        line = re.sub(r"(?<![\w*])\*([^\s*](?:[^*\n]*?[^\s*])?)\*(?![\w*])", r"_\1_", line)
+        for token, replacement in (("**", "*"), ("__", "*"), ("~~", "~")):
+            marker = re.escape(token)
+            char = re.escape(token[0])
+            pattern = (rf"(?<![\w{char}]){marker}([^\s{char}]"
+                       rf"(?:[^{char}\n]*?[^\s{char}])?){marker}(?![\w{char}])")
+            wrapper = "" if bold_context and token in {"**", "__"} else replacement
+            line = re.sub(pattern, lambda m: wrapper + m[1] + wrapper, line)
+        return re.sub(r"\x00(\d+)\x00", lambda m: protected[int(m[1])], line)
+
+    result, fence = [], None
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})([^\r\n]*)", line)
+        if fence:
+            result.append(line)
+            if (marker and marker[1][0] == fence[0] and len(marker[1]) >= fence[1]
+                    and not marker[2].strip()):
+                fence = None
+            continue
+        if marker:
+            fence = (marker[1][0], len(marker[1]))
+            result.append(line)
+            continue
+        if line.startswith(("    ", "\t")):
+            result.append(line)  # Indented code, not a guessed nested list.
+            continue
+        heading = re.match(r"^( {0,3})#{1,6} +([^\r\n]+)(\r?\n)?$", line)
+        if heading:
+            content = re.sub(r" +#+ *$", "", heading[2])
+            result.append(heading[1] + "*" + inline(content, bold_context=True) + "*" + (heading[3] or ""))
+        else:
+            styled = inline(line)
+            styled = re.sub(r"^( {0,3})[-+*] +(?!\[[ xX]\])(?=\S)", r"\1• ", styled)
+            result.append(styled)
+    return "".join(result)
+
+
+def render_voice(text: str, agent: str, directory: Path, run=subprocess.run) -> Path:
+    """Worker-only rendering/encoding. Never play audio, never invoke a rule."""
+    if len(text) > VOICE_TEXT_LIMIT:
+        LOG.info("voice reply truncated from %d to %d characters", len(text), VOICE_TEXT_LIMIT)
+    source, wav, ogg = (directory / name for name in ("reply.md", "reply.wav", "reply.ogg"))
+    source.write_text(text[:VOICE_TEXT_LIMIT], encoding="utf-8")
+    source.chmod(0o600)
+    pvox = Path.home() / "HelmCortex/FORGE/VoxForge/bin/pvox"
+    commands = (
+        ("render", [str(pvox), "render", "--agent", agent, "--no-play", str(source), str(wav)], RENDER_SECONDS, wav),
+        ("encode", ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-n", "-i", str(wav),
+                    "-vn", "-ac", "1", "-c:a", "libopus", "-b:a", "24k", "-application", "voip", str(ogg)], ENCODE_SECONDS, ogg),
+    )
+    for stage, argv, timeout, output in commands:
+        try:
+            result = run(argv, capture_output=True, text=True, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            raise BridgeError(f"{stage} timed out") from error
+        except OSError as error:
+            raise BridgeError(f"{stage} unavailable: {diagnostic(error)}") from error
+        if result.returncode:
+            reason = result.stderr.strip() or f"exit status {result.returncode} (no stderr)"
+            raise BridgeError(f"{stage} failed: {diagnostic(reason)}")
+        if not output.is_file() or not output.stat().st_size:
+            raise BridgeError(f"{stage} produced no audio")
+        output.chmod(0o600)
+    if ogg.stat().st_size > VOICE_LIMIT:
+        raise BridgeError("encoded voice exceeds 25 MiB")
+    return ogg
+
+
+def parse_slot(cfg: dict, iq) -> tuple[str, str, dict]:
+    slot = iq.xml.find("{" + UPLOAD_NS + "}slot")
+    put = slot.find("{" + UPLOAD_NS + "}put") if slot is not None else None
+    get = slot.find("{" + UPLOAD_NS + "}get") if slot is not None else None
+    if put is None or get is None:
+        raise BridgeError("upload service returned an incomplete slot")
+    put_url, get_url = put.get("url", ""), get.get("url", "")
+    validate_upload_url(cfg, put_url)
+    validate_upload_url(cfg, get_url)
+    headers = {}
+    for header in put.findall("{" + UPLOAD_NS + "}header"):
+        name, value = header.get("name", ""), header.text or ""
+        if (name.lower() not in {"authorization", "cookie", "expires"}
+                or name.lower() in headers or "\r" in value or "\n" in value):
+            raise BridgeError("upload slot contains an unsafe header")
+        headers[name.lower()] = value
+    return put_url, get_url, headers
+
+
+def put_voice(cfg: dict, url: str, audio: Path, headers: dict, opener=None) -> None:
+    validate_upload_url(cfg, url)
+    payload = audio.read_bytes()
+    if not 0 < len(payload) <= VOICE_LIMIT:
+        raise BridgeError("voice upload is empty or exceeds 25 MiB")
+    request = urllib.request.Request(url, data=payload, method="PUT", headers={
+        **headers, "Content-Type": "audio/ogg", "Content-Length": str(len(payload))})
+    opener = opener or urllib.request.build_opener(
+        urllib.request.ProxyHandler({}), NoRedirect()).open
+    try:
+        with opener(request, timeout=UPLOAD_SECONDS) as response:
+            if not 200 <= response.status < 300:
+                raise BridgeError(f"upload PUT failed: HTTP {response.status}")
+    except urllib.error.HTTPError as error:
+        raise BridgeError(f"upload PUT failed: HTTP {error.code}") from error
+    except (OSError, urllib.error.URLError) as error:
+        raise BridgeError("upload PUT failed (network or TLS)") from error
+
+
+async def voice_worker(function, *args):
+    # Cancellation must not remove private audio while a thread still owns it.
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
+
+
+async def relay_reply(component, cfg: dict, local: str, text: str) -> None:
+    """Text first for every owner; optional voice failure never loses that text."""
+    jid = f"{local}@{cfg['component_jid']}"
+    for owner in cfg["owner_jids"]:
+        component.send_message(mto=owner, mfrom=jid, mbody=markdown_to_styling(text), mtype="chat")
+    agent = cfg.get("voices", {}).get(local)
+    if agent is None:
+        return
+    try:
+        with tempfile.TemporaryDirectory(prefix="mailcortex-reply.") as directory:
+            audio = await voice_worker(render_voice, text, agent, Path(directory))
+            try:
+                iq = await component["xep_0363"].request_slot(
+                    cfg["upload_service_jid"], audio.name, audio.stat().st_size,
+                    "audio/ogg", ifrom=jid, timeout=UPLOAD_SECONDS)
+            except Exception as error:
+                # IqError.__str__ includes the whole XML (and potentially bearer URLs).
+                condition = getattr(error, "condition", "") or type(error).__name__
+                raise BridgeError("upload slot request failed: " + diagnostic(condition)) from error
+            put_url, get_url, headers = parse_slot(cfg, iq)
+            await voice_worker(put_voice, cfg, put_url, audio, headers)
+            for owner in cfg["owner_jids"]:
+                message = component.make_message(mto=owner, mfrom=jid, mbody=get_url, mtype="chat")
+                ET.SubElement(ET.SubElement(message.xml, "{jabber:x:oob}x"),
+                              "{jabber:x:oob}url").text = get_url
+                message.send()
+    except Exception as error:
+        reason = diagnostic(error)
+        LOG.error("voice reply failed for %s: %s", local, reason)
+        for owner in cfg["owner_jids"]:
+            component.send_message(mto=owner, mfrom=jid,
+                                   mbody="Voice reply failed: " + reason, mtype="chat")
+
+
 def run_bridge(cfg: dict) -> int:
     try:
         import asyncio
@@ -412,6 +624,7 @@ def run_bridge(cfg: dict) -> int:
             super().__init__(cfg["component_jid"], secret, cfg["server"], cfg["port"])
             self.register_plugin("xep_0030")
             self.register_plugin("xep_0199")
+            self.register_plugin("xep_0363")
             self.add_event_handler("session_start", self.on_start)
             self.add_event_handler("message", self.on_message)
             self.add_event_handler("presence_subscribe", self.on_subscribe)
@@ -479,24 +692,23 @@ def run_bridge(cfg: dict) -> int:
         async def poll_outbound(self) -> None:
             while True:
                 try:
-                    self.relay_outbound()
-                except BridgeError as error:
-                    LOG.error("outbound poll failed: %s", error)
+                    await self.relay_outbound()
+                except (BridgeError, OSError) as error:
+                    LOG.error("outbound poll failed: %s", diagnostic(error))
                 await asyncio.sleep(cfg["poll_seconds"])
 
-        def relay_outbound(self) -> None:
-            for name in pending_outbound(cfg):
-                rendered = mailcortex(["read", cfg["bridge_address"], name])
+        async def relay_outbound(self) -> None:
+            for name in await asyncio.to_thread(pending_outbound, cfg):
+                rendered = await asyncio.to_thread(mailcortex, ["read", cfg["bridge_address"], name])
                 local, text, message_id = render_outbound(cfg, rendered)
                 if local is None:
                     LOG.warning("rejected outbound mail %s from an unmapped sender", name)
                     if message_id:
-                        mailcortex(["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
+                        await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
                     continue
-                for owner in cfg["owner_jids"]:
-                    self.send_message(mto=owner, mfrom=self.seat_jid(local), mbody=text, mtype="chat")
+                await relay_reply(self, cfg, local, text)
                 if message_id:
-                    mailcortex(["receipt", cfg["bridge_seat"], message_id, "handling_completed"])
+                    await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_completed"])
                 LOG.info("relayed %s from %s", name, local)
 
     component = Component()
