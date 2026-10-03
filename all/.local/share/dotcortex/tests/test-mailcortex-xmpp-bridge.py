@@ -427,6 +427,8 @@ class StylingTests(unittest.TestCase):
             ("~~~~\n~~strike~~\n~~~\n**still code**\n~~~~\n*x*", "~~~~\n~~strike~~\n~~~\n**still code**\n~~~~\n_x_"),
             ("    **indented code**\n\t*x*\n**prose**", "    **indented code**\n\t*x*\n*prose*"),
             ("`unclosed **code**", "`unclosed **code**"),
+            ("before `multi\n**literal**\nend`\n**yes**", "before `multi\n**literal**\nend`\n*yes*"),
+            ("[x](https://example.test/**raw**) ![alt](url)", "x (https://example.test/**raw**) ![alt](url)"),
             ("```\n**unclosed fence**", "```\n**unclosed fence**"),
             (r"\*literal* \**literal**", r"\*literal* \**literal**"),
             ("foo_bar_baz foo**bar**baz ***ambiguous***", "foo_bar_baz foo**bar**baz ***ambiguous***"),
@@ -442,6 +444,7 @@ class StylingTests(unittest.TestCase):
 
 class ReplyVoiceTests(unittest.TestCase):
     setUp = VoiceTests.setUp
+    download = VoiceTests.download
 
     def slot(self, put=None, get=None, header="Authorization", value="Bearer fixture"):
         iq = ET.Element("iq")
@@ -576,6 +579,11 @@ class ReplyVoiceTests(unittest.TestCase):
                 return result
             with self.assertRaisesRegex(bridge.BridgeError, "encoder refused|exit status 9"):
                 bridge.render_voice("reply", "FixtureAgent", self.tmp, fail)
+        def encode_fail(argv, **kwargs):
+            Path(argv[-1]).write_bytes(b"fixture")
+            return subprocess.CompletedProcess(argv, 3 if argv[0] == "ffmpeg" else 0, "", "encode refused")
+        with self.assertRaisesRegex(bridge.BridgeError, "encode failed: encode refused"):
+            bridge.render_voice("reply", "FixtureAgent", self.tmp, encode_fail)
         for error in (subprocess.TimeoutExpired("pvox", 600), FileNotFoundError("pvox")):
             with self.assertRaises(bridge.BridgeError):
                 bridge.render_voice("reply", "FixtureAgent", self.tmp, lambda *a, **k: (_ for _ in ()).throw(error))
