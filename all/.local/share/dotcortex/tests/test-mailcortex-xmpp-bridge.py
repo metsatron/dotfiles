@@ -265,9 +265,10 @@ class VoiceTests(unittest.TestCase):
             calls.append(argv)
             self.assertEqual(Path(argv[argv.index("--attach") + 1]).read_bytes(), self.raw)
             return subprocess.run([str(command), *argv[1:]], env=os.environ | {"MAILCORTEX_ROOT": str(root)}, **kwargs)
-        name = bridge.inbound_voice(self.cfg, "owner@example.test/phone", "fable",
+        name, transcript = bridge.inbound_voice(self.cfg, "owner@example.test/phone", "fable",
                                     self.url, run, self.download, lambda _: "Spoken words.")
         self.assertEqual(len(calls), 1)
+        self.assertEqual(transcript, "Spoken words.")
         message = BytesParser(policy=policy.default).parsebytes((maildir / "new" / name).read_bytes())
         self.assertEqual(message["Subject"], "[xmpp voice] Spoken words.")
         self.assertEqual(message["To"], "fable@host.helm")
@@ -311,7 +312,7 @@ class VoiceTests(unittest.TestCase):
             started.set()
             if not release.wait(2):
                 raise bridge.BridgeError("test worker was not released")
-            return "delivered.msg"
+            return "delivered.msg", "fixture transcript"
         async def responsive():
             with patch.object(bridge, "inbound_voice", side_effect=slow):
                 job = asyncio.create_task(bridge.deliver_inbound(self.cfg, FakeMessage(self.url),
@@ -372,7 +373,7 @@ class ComponentVoiceTests(unittest.TestCase):
             self.assertEqual(bridge.run_bridge(self.cfg), 1)
         component, = instances
         async def exercise():
-            with patch.object(bridge, "inbound_voice", return_value="voice.msg") as worker:
+            with patch.object(bridge, "inbound_voice", return_value=("voice.msg", "heard words")) as worker:
                 owner = FakeMessage("", self.url)
                 await component.handlers["message"](owner)
                 worker.assert_called_once_with(self.cfg, "owner@example.test", "fable", self.url)
@@ -404,6 +405,280 @@ class ComponentVoiceTests(unittest.TestCase):
                     self.assertEqual(text.call_count, 3)
                 self.assertEqual(worker.call_count, 1)
         loop.run_until_complete(exercise())
+        rendered = "From: fable@host.helm\nSubject: Re: [xmpp] hi\nMessage-ID: <fixture>\n\n**reply**"
+        with patch.object(bridge, "pending_outbound", return_value=["reply.msg"]), \
+                patch.object(bridge, "mailcortex", return_value=rendered) as mail, \
+                patch.object(bridge, "relay_reply") as relay:
+            loop.run_until_complete(component.relay_outbound())
+        relay.assert_awaited_once_with(component, self.cfg, "fable", "**reply**")
+        self.assertEqual(mail.call_args_list[-1].args[0],
+                         ["receipt", self.cfg["bridge_seat"], "<fixture>", "handling_completed"])
+
+
+class StylingTests(unittest.TestCase):
+    def test_table_and_adversarial_code(self):
+        cases = (
+            ("**bold** __b__ *italic* _i_ ~~gone~~", "*bold* *b* _italic_ _i_ ~gone~"),
+            ("# Heading\n## **Bold** and *italic*\n", "*Heading*\n*Bold and _italic_*\n"),
+            ("[site](https://example.test/a)\n- one\n+ two\n* three", "site (https://example.test/a)\n• one\n• two\n• three"),
+            ("**use `**literal** *x*`**", "*use `**literal** *x*`*"),
+            ("``a ` **bold** ~~x~~`` and **yes**", "``a ` **bold** ~~x~~`` and *yes*"),
+            ("```md\n# literal\n**b** *i* [x](url)\n```\n**yes**", "```md\n# literal\n**b** *i* [x](url)\n```\n*yes*"),
+            ("~~~~\n~~strike~~\n~~~\n**still code**\n~~~~\n*x*", "~~~~\n~~strike~~\n~~~\n**still code**\n~~~~\n_x_"),
+            ("    **indented code**\n\t*x*\n**prose**", "    **indented code**\n\t*x*\n*prose*"),
+            ("`unclosed **code**", "`unclosed **code**"),
+            ("```\n**unclosed fence**", "```\n**unclosed fence**"),
+            (r"\*literal* \**literal**", r"\*literal* \**literal**"),
+            ("foo_bar_baz foo**bar**baz ***ambiguous***", "foo_bar_baz foo**bar**baz ***ambiguous***"),
+            ("[nested](https://example.test/a(b)) - [x] task", "[nested](https://example.test/a(b)) - [x] task"),
+            ("- [ ] checkbox\n---\n** spaced **\n", "- [ ] checkbox\n---\n** spaced **\n"),
+            ("# Header ###\r\n**b**\r\n", "*Header*\r\n*b*\r\n"),
+            ("\x000\x00 **literal**", "\x000\x00 **literal**"),
+        )
+        for raw, expected in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(bridge.markdown_to_styling(raw), expected)
+
+
+class ReplyVoiceTests(unittest.TestCase):
+    setUp = VoiceTests.setUp
+
+    def slot(self, put=None, get=None, header="Authorization", value="Bearer fixture"):
+        iq = ET.Element("iq")
+        slot = ET.SubElement(iq, "{" + bridge.UPLOAD_NS + "}slot")
+        upload = ET.SubElement(slot, "{" + bridge.UPLOAD_NS + "}put", {"url": put or self.url})
+        ET.SubElement(upload, "{" + bridge.UPLOAD_NS + "}header", {"name": header}).text = value
+        ET.SubElement(slot, "{" + bridge.UPLOAD_NS + "}get", {"url": get or self.url})
+        return types.SimpleNamespace(xml=iq)
+
+    def component(self, slot_error=None):
+        fixture = self
+        class Component:
+            def __init__(self):
+                self.messages, self.slots = [], []
+            def send_message(self, **kwargs):
+                self.messages.append(types.SimpleNamespace(xml=ET.Element("message"), values=kwargs))
+            def make_message(self, **kwargs):
+                message = types.SimpleNamespace(xml=ET.Element("message"), values=kwargs)
+                message.send = lambda: self.messages.append(message)
+                return message
+            def __getitem__(self, key):
+                fixture.assertEqual(key, "xep_0363")
+                return self
+            async def request_slot(self, *args, **kwargs):
+                self.slots.append((args, kwargs))
+                if slot_error:
+                    raise slot_error
+                return fixture.slot()
+        return Component()
+
+    def voiced_config(self):
+        return self.cfg | {"voices": {"fable": "FixtureAgent"}, "upload_service_jid": "example.test"}
+
+    def test_config_optional_map_and_required_host(self):
+        self.assertEqual(self.cfg["voices"], {})
+        valid = base_config(self.tmp) | {
+            "upload_base_url": self.cfg["upload_base_url"],
+            "voices": {"fable": "FixtureAgent"}, "upload_service_jid": "example.test"}
+        path = self.tmp / "voices.json"
+        path.write_text(json.dumps(valid))
+        self.assertEqual(bridge.load_config(path)["voices"], valid["voices"])
+        for change in ({"voices": []}, {"voices": {"ghost": "FixtureAgent"}},
+                       {"voices": {"fable": "--rule"}}, {"voices": {"fable": ""}},
+                       {"voices": {"fable": 5}}, {"upload_service_jid": ""},
+                       {"upload_service_jid": self.cfg["component_jid"]},
+                       {"upload_service_jid": "user@example.test"}, {"upload_base_url": ""}):
+            with self.subTest(change=change):
+                path.write_text(json.dumps(valid | change))
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.load_config(path)
+
+    def test_echo_only_after_delivery_and_preserves_every_line(self):
+        msg = FakeMessage(self.url)
+        def mail(args, run):
+            self.assertEqual(msg.replies, [])
+            return "delivered.msg"
+        with patch.object(bridge, "download_voice", side_effect=self.download), \
+                patch.object(bridge, "transcribe_voice", return_value="one\n\n**two**"), \
+                patch.object(bridge, "mailcortex", side_effect=mail):
+            asyncio.run(bridge.deliver_inbound(self.cfg, msg, "owner@example.test", "fable", self.url))
+        self.assertEqual(msg.replies, ["> one\n> \n> **two**"])
+        for failure in ("transcribe", "mail"):
+            msg = FakeMessage(self.url)
+            with patch.object(bridge, "download_voice", side_effect=self.download), \
+                    patch.object(bridge, "transcribe_voice", return_value="one") as transcribe, \
+                    patch.object(bridge, "mailcortex", return_value="delivered.msg") as mail:
+                (transcribe if failure == "transcribe" else mail).side_effect = bridge.BridgeError(failure + " failed")
+                with self.assertLogs(bridge.LOG, level="ERROR"):
+                    asyncio.run(bridge.deliver_inbound(self.cfg, msg, "owner@example.test", "fable", self.url))
+            self.assertEqual(len(msg.replies), 1)
+            self.assertFalse(msg.replies[0].startswith("> "))
+
+    def test_text_only_without_mapping_never_renders_or_requests_slot(self):
+        for cfg in (self.cfg, self.voiced_config() | {"voices": {"worker": "OtherAgent"}}):
+            component = self.component()
+            with patch.object(bridge, "render_voice", side_effect=AssertionError("unmapped seat rendered")):
+                asyncio.run(bridge.relay_reply(component, cfg, "fable", "**reply**"))
+            self.assertEqual([m.values["mbody"] for m in component.messages], ["*reply*"])
+            self.assertEqual(component.slots, [])
+
+    def test_voice_end_to_end_stubs_shape_order_and_cleanup(self):
+        component, cfg, calls, directories = self.component(), self.voiced_config(), [], []
+        main_thread = threading.get_ident()
+        def run(argv, **kwargs):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            self.assertEqual([m.values["mbody"] for m in component.messages], ["*reply*"])
+            calls.append((argv, kwargs))
+            Path(argv[-1]).write_bytes(b"OggS fixture" if argv[0] == "ffmpeg" else b"RIFF fixture")
+            directories.append(Path(argv[-1]).parent)
+            if argv[0] != "ffmpeg":
+                self.assertEqual(Path(argv[-2]).read_text(), "**reply**")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        def put(cfg_, url, audio, headers):
+            self.assertNotEqual(threading.get_ident(), main_thread)
+            self.assertEqual(audio.read_bytes(), b"OggS fixture")
+            self.assertEqual(headers, {"authorization": "Bearer fixture"})
+            self.assertEqual(url, self.url)
+        render = bridge.render_voice
+        with patch.object(bridge, "render_voice", side_effect=lambda *args: render(*args, run=run)), \
+                patch.object(bridge, "put_voice", side_effect=put):
+            asyncio.run(bridge.relay_reply(component, cfg, "fable", "**reply**"))
+        self.assertEqual(calls[0][0][1:5], ["render", "--agent", "FixtureAgent", "--no-play"])
+        self.assertEqual(calls[0][1]["timeout"], bridge.RENDER_SECONDS)
+        self.assertIn("-nostdin", calls[1][0])
+        for option, value in (("-ac", "1"), ("-c:a", "libopus"), ("-b:a", "24k"), ("-application", "voip")):
+            self.assertEqual(calls[1][0][calls[1][0].index(option) + 1], value)
+        self.assertEqual(component.slots, [(("example.test", "reply.ogg", 12, "audio/ogg"),
+                                          {"ifrom": "fable@seats.example.test", "timeout": 30})])
+        text, voice = component.messages
+        self.assertEqual(voice.values["mbody"], self.url)
+        self.assertEqual(voice.values["mfrom"], "fable@seats.example.test")
+        self.assertEqual(voice.values["mto"], "owner@example.test")
+        self.assertEqual(voice.xml.find("{jabber:x:oob}x/{jabber:x:oob}url").text, self.url)
+        self.assertTrue(all(not path.exists() for path in directories))
+
+    def test_render_cap_timeout_empty_encode_and_stderr(self):
+        paths = []
+        def run(argv, **kwargs):
+            paths.append(Path(argv[-1]))
+            if argv[0] != "ffmpeg":
+                self.assertEqual(len(Path(argv[-2]).read_text()), bridge.VOICE_TEXT_LIMIT)
+                self.assertEqual(Path(argv[-2]).stat().st_mode & 0o777, 0o600)
+            Path(argv[-1]).write_bytes(b"fixture")
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        with self.assertLogs(bridge.LOG, level="INFO") as logs:
+            audio = bridge.render_voice("x" * (bridge.VOICE_TEXT_LIMIT + 1), "FixtureAgent", self.tmp, run)
+        self.assertIn("truncated", " ".join(logs.output))
+        self.assertEqual(audio.stat().st_mode & 0o777, 0o600)
+        for result in (subprocess.CompletedProcess([], 2, "", "encoder refused\n"),
+                       subprocess.CompletedProcess([], 9, "", "")):
+            def fail(argv, **kwargs):
+                return result
+            with self.assertRaisesRegex(bridge.BridgeError, "encoder refused|exit status 9"):
+                bridge.render_voice("reply", "FixtureAgent", self.tmp, fail)
+        for error in (subprocess.TimeoutExpired("pvox", 600), FileNotFoundError("pvox")):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.render_voice("reply", "FixtureAgent", self.tmp, lambda *a, **k: (_ for _ in ()).throw(error))
+        with tempfile.TemporaryDirectory() as empty:
+            with self.assertRaisesRegex(bridge.BridgeError, "produced no audio"):
+                bridge.render_voice("reply", "FixtureAgent", Path(empty), lambda *a, **k: subprocess.CompletedProcess([], 0, "", ""))
+
+    def test_failures_keep_text_reply_once_and_hide_capabilities(self):
+        audio = self.tmp / "reply.ogg"
+        audio.write_bytes(b"fixture")
+        for stage in ("render", "encode", "slot", "put"):
+            component = self.component(BridgeSlotFailure() if stage == "slot" else None)
+            error = bridge.BridgeError(stage + " failed " + self.url + " Bearer private-token")
+            with patch.object(bridge, "render_voice", return_value=audio) as render, \
+                    patch.object(bridge, "put_voice") as put:
+                if stage in {"render", "encode"}:
+                    render.side_effect = error
+                if stage == "put":
+                    put.side_effect = error
+                with self.assertLogs(bridge.LOG, level="ERROR") as logs:
+                    asyncio.run(bridge.relay_reply(component, self.voiced_config(), "fable", "**reply**"))
+            self.assertEqual(len(component.messages), 2)
+            self.assertEqual(component.messages[0].values["mbody"], "*reply*")
+            self.assertTrue(component.messages[1].values["mbody"].startswith("Voice reply failed: "))
+            output = " ".join(logs.output) + component.messages[1].values["mbody"]
+            self.assertNotIn(self.url, output)
+            self.assertNotIn("private-token", output)
+            if stage == "slot":
+                self.assertIn("forbidden", output)
+
+    def test_slot_allowlist_headers_and_worker_put(self):
+        for iq in (self.slot(put="https://evil.example.test/file_share/x"),
+                   self.slot(get="https://evil.example.test/file_share/x"),
+                   self.slot(header="Host"), self.slot(value="Bearer fixture\r\ninjected"),
+                   types.SimpleNamespace(xml=ET.Element("iq"))):
+            with self.assertRaises(bridge.BridgeError):
+                bridge.parse_slot(self.cfg, iq)
+        audio = self.tmp / "put.ogg"
+        audio.write_bytes(b"OggS fixture")
+        class Response(io.BytesIO):
+            status = 201
+        def opener(request, timeout):
+            self.assertEqual(request.method, "PUT")
+            self.assertEqual(request.full_url, self.url)
+            self.assertEqual(request.data, audio.read_bytes())
+            self.assertEqual(request.get_header("Content-type"), "audio/ogg")
+            self.assertEqual(request.get_header("Content-length"), str(len(request.data)))
+            self.assertEqual(request.get_header("Authorization"), "Bearer fixture")
+            self.assertEqual(timeout, 30)
+            return Response()
+        bridge.put_voice(self.cfg, self.url, audio, {"authorization": "Bearer fixture"}, opener)
+        with patch.object(bridge.urllib.request, "build_opener") as build:
+            build.return_value.open.side_effect = OSError(self.url)
+            with self.assertRaisesRegex(bridge.BridgeError, "network or TLS"):
+                bridge.put_voice(self.cfg, self.url, audio, {})
+            self.assertEqual(build.call_args.args[0].proxies, {})
+            self.assertIsInstance(build.call_args.args[1], bridge.NoRedirect)
+
+    def test_workers_leave_loop_responsive_and_cancel_before_cleanup(self):
+        started, release = threading.Event(), threading.Event()
+        directories = []
+        def render(text, agent, directory):
+            directories.append(directory)
+            started.set()
+            if not release.wait(2):
+                raise bridge.BridgeError("fixture worker not released")
+            self.assertTrue(directory.exists())
+            audio = directory / "reply.ogg"
+            audio.write_bytes(b"fixture")
+            return audio
+        async def exercise():
+            component = self.component()
+            with patch.object(bridge, "render_voice", side_effect=render), patch.object(bridge, "put_voice"):
+                job = asyncio.create_task(bridge.relay_reply(component, self.voiced_config(), "fable", "reply"))
+                try:
+                    for _ in range(100):
+                        if started.is_set():
+                            break
+                        await asyncio.sleep(0.005)
+                    self.assertTrue(started.is_set())
+                    self.assertFalse(job.done())
+                    job.cancel()
+                    await asyncio.sleep(0.005)
+                    self.assertTrue(directories[0].exists())
+                finally:
+                    release.set()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await job
+            self.assertFalse(directories[0].exists())
+            self.assertEqual(len(component.messages), 1)
+        asyncio.run(exercise())
+
+    def test_mailcortex_stderr_and_empty_fallback(self):
+        for stderr, expected in ((" failure details\n", "failure details"), (" \n", "exit status 7 (no stderr)")):
+            result = subprocess.CompletedProcess([], 7, "must not leak stdout", stderr)
+            with self.assertRaises(bridge.BridgeError) as error:
+                bridge.mailcortex(["inbox", "fixture"], lambda *a, **k: result)
+            self.assertIn(expected, str(error.exception))
+            self.assertNotIn("must not leak", str(error.exception))
+
+
+class BridgeSlotFailure(Exception):
+    condition = "forbidden"
 
 
 class GateTests(unittest.TestCase):
