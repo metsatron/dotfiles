@@ -1,0 +1,968 @@
+#+TITLE: MailCortex Seat Watcher
+#+DESCRIPTION: Idle seat wake, reply correlation, and watcher lifecycle ownership
+#+AUTHOR: Mètsàtron
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments no
+#+PROPERTY: header-args:python :comments no
+
+* Seat wake watcher
+
+The watcher is a deliberately small, private-runtime consumer.  Its registry
+is an operator-provisioned JSON contract, never inferred from mailbox paths or
+from a neighbouring host.  A record is eligible only when its exact host,
+canonical Maildir, harness, transport, and transport-specific target validate.
+Herdr retains its exact target lookup and rest-state rules.  The DeepSeek
+adapter uses the harness's authenticated local RPC seam and refuses a running
+session before using =session/prompt= in queue mode.  Ductor's local API can
+accept a prompt, but exposes no remote busy-status query; its adapter therefore
+fails loud until the daemon provides one rather than risking delivery into an
+active turn.  Receipts are keyed by a SHA-256 digest of the complete RFC
+Message-ID and retain separate wake and handling state.  Busy and rate-limited
+deliveries remain queued and are replayed on the next scan; an injection
+already started is never retried automatically because its delivery outcome
+may be ambiguous.
+
+DeepSeek mail-back correlates the persisted prompt request ID with durable
+=user/message= and =turn/end= events. Only a completed, single-request turn's
+last committed assistant text is returned to the original From address, with
+=In-Reply-To= and =References=. Automatic mail never triggers another DeepSeek
+turn; Herdr seats still receive the normal inbox wake for a returned reply. Return
+addresses are frozen before injection; neither model text nor Reply-To can
+redirect delivery. A separate reply state records pending, ready, delivered,
+or failed, without claiming handling completion or knowledge acceptance.
+Deterministic publication survives receipt-write failure without duplicate
+mail. Legacy injections without correlation remain untouched. Snapshot reads
+use Node and the declared DSH installation's ws dependency, with bounded
+timeouts and pagination; no new package or private registry field is required.
+Mail-back failures are isolated per receipt and per DeepSeek seat. An unsafe or
+unprovisioned return address disables only that message's return path: the
+agent still receives the mail with an explicit no-mail-back notice. Snapshot
+errors retain pending state and an error timestamp; publication retries retain
+ready bytes. Diagnostics do not stop unrelated seats. Skipped automatic mail
+gets an observed receipt with reason =auto_submitted=, never a handling claim.
+
+#+BEGIN_SRC python :tangle all/.local/bin/mailcortex-seat-watcher :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Idle-only, exactly-once MailCortex seat wake watcher."""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import ipaddress
+import json
+import os
+import re
+import socket
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from email import policy
+from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import format_datetime
+from datetime import datetime, timezone
+from pathlib import Path
+
+import importlib.machinery
+import importlib.util
+
+HERE = Path(__file__).resolve().parent
+LOADER = importlib.machinery.SourceFileLoader("mailcortex", str(HERE / "mailcortex"))
+SPEC = importlib.util.spec_from_loader("mailcortex", LOADER)
+MAILCORTEX = importlib.util.module_from_spec(SPEC)
+assert SPEC and SPEC.loader
+SPEC.loader.exec_module(MAILCORTEX)
+
+SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
+PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
+TRANSPORTS = {"herdr", "ductor", "deepseek"}
+
+
+class WatcherError(Exception):
+    pass
+
+
+def load_registry(path: Path, host: str) -> dict:
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise WatcherError("registry is not a private regular file")
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WatcherError("registry is unreadable") from error
+    if data.get("schema") != "mailcortex.seats.v1" or data.get("host") != host:
+        raise WatcherError("registry is not owned by this host")
+    seats = data.get("seats")
+    if not isinstance(seats, dict) or not seats:
+        raise WatcherError("registry seats must be a non-empty object")
+    for seat, record in seats.items():
+        if not isinstance(seat, str) or not SAFE.fullmatch(seat) or not isinstance(record, dict):
+            raise WatcherError("invalid seat registry entry")
+        transport = record.get("transport")
+        if transport not in TRANSPORTS:
+            raise WatcherError("unsupported seat registry transport")
+        required = {
+            "host", "mailbox", "harness", "transport", "rate_limit_seconds",
+        } | {
+            "herdr": {"herdr_session", "herdr_target"},
+            "ductor": {"ductor_config"},
+            "deepseek": {"deepseek_url", "deepseek_cookie_file", "deepseek_session"},
+        }[transport]
+        if set(record) != required:
+            raise WatcherError("seat registry fields are not exact")
+        if (
+            record["host"] != host
+            or record["mailbox"] not in {f"seats/{seat}", f"consorts/{seat}"}
+            or not isinstance(record["harness"], str)
+            or record["harness"] not in {"claude", "codex", "ductor", "deepseek"}
+        ):
+            raise WatcherError("seat registry ownership or transport mismatch")
+        if transport == "herdr":
+            if record["harness"] not in {"claude", "codex"}:
+                raise WatcherError("seat registry ownership or transport mismatch")
+            if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 128 for key in ("herdr_session", "herdr_target")):
+                raise WatcherError("invalid Herdr target")
+        elif transport == "ductor":
+            if record["harness"] != "ductor" or not isinstance(record["ductor_config"], str) or not record["ductor_config"] or len(record["ductor_config"]) > 512:
+                raise WatcherError("invalid Ductor configuration path")
+        elif record["harness"] != "deepseek":
+            raise WatcherError("seat registry ownership or transport mismatch")
+        else:
+            if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 512 for key in ("deepseek_url", "deepseek_cookie_file", "deepseek_session")):
+                raise WatcherError("invalid DeepSeek target")
+        if not isinstance(record["rate_limit_seconds"], (int, float)) or record["rate_limit_seconds"] < 0 or record["rate_limit_seconds"] > 86400:
+            raise WatcherError("invalid rate limit")
+    return data
+
+
+def message_id(path: Path) -> str:
+    try:
+        message = BytesParser().parsebytes(path.read_bytes())
+    except (OSError, ValueError):
+        raise WatcherError("malformed mail")
+    value = str(message.get("Message-ID", "")).strip()
+    if not re.fullmatch(r"<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+>", value):
+        raise WatcherError("mail has no valid Message-ID")
+    return value
+
+
+WAKE_BODY_LIMIT = 8000
+
+
+def wake_prompt(record: dict, path: Path, mailback_error: str | None = None) -> str:
+    """Herdr seats read their own Maildir, so they get the /inbox command.
+    A DeepSeek seat runs as its own Unix user and cannot read this Maildir,
+    so the mail itself rides in the prompt."""
+    if record["transport"] != "deepseek":
+        return "/inbox"
+    try:
+        message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+        part = message.get_body(preferencelist=("plain",))
+        body = part.get_content() if part is not None else ""
+    except (OSError, ValueError, LookupError) as error:
+        raise WatcherError("malformed mail") from error
+    if len(body) > WAKE_BODY_LIMIT:
+        body = body[:WAKE_BODY_LIMIT] + "\n[truncated by MailCortex]"
+    footer = (
+        "No mail-back is possible for this message. The return path failed "
+        f"validation: {mailback_error}\n"
+        "You may still handle this mail and reply via Telegram; no automatic "
+        "mail reply will be published."
+        if mailback_error else
+        "Write your final reply normally. MailCortex will return the final "
+        "text of this completed turn to the original sender. Delivery is "
+        "not acceptance of a knowledge proposal."
+    )
+    return (
+        "MailCortex delivered this mail to you. The full message is below; "
+        "you cannot open the Maildir yourself.\n"
+        f"From: {message.get('From', '')}\n"
+        f"Subject: {message.get('Subject', '')}\n"
+        f"Message-ID: {message.get('Message-ID', '')}\n\n"
+        f"{body.strip()}\n\n"
+        f"{footer}"
+    )
+
+
+def reply_context(record: dict, path: Path) -> dict:
+    message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+    addresses = {}
+    for header in ("From", "To"):
+        values = message.get_all(header, [])
+        if len(values) != 1:
+            raise WatcherError("mail-back requires exactly one From and To")
+        addresses[header] = MAILCORTEX.validate_address(str(values[0]).strip())
+    target = MAILCORTEX.address_maildir(addresses["To"])
+    if target != MAILCORTEX.mail_root() / record["mailbox"]:
+        raise WatcherError("mail-back recipient does not match the owned mailbox")
+    destination = MAILCORTEX.require_maildir(addresses["From"])
+    if destination == target:
+        raise WatcherError("mail-back refuses a self-addressed request")
+    for component in (MAILCORTEX.mail_root(), destination.parent, destination,
+                      *(destination / leaf for leaf in ("tmp", "new", "cur"))):
+        if component.is_symlink():
+            raise WatcherError("unsafe mail-back destination")
+    return {"sender": addresses["To"], "to": addresses["From"],
+            "subject": str(message.get("Subject", "")),
+            "request_id": uuid.uuid4().hex, "session": record["deepseek_session"]}
+
+
+SNAPSHOT_JS = r"""
+const fs = require('fs'), path = require('path');
+const W = require(require.resolve('ws', {paths: [path.dirname(fs.realpathSync(process.argv[1]))]}));
+const c = JSON.parse(fs.readFileSync(0, 'utf8')), u = new URL(c.url);
+u.protocol = u.protocol === 'https:' ? 'wss:' : 'ws:';
+u.pathname = '/api/remote.mux'; u.search = ''; u.hash = '';
+const s = new W(u, {headers: {Cookie: c.cookie}, maxPayload: 2097152});
+const timer = setTimeout(() => process.exit(2), 10000);
+s.on('open', () => s.send(JSON.stringify({type: 'open', streamId: 'mailback',
+  endpoint: 'session/follow', payload: {args: {request: {
+    address: {kind: 'session', sessionId: c.session}, maxMessages: 50}}}})));
+s.on('message', raw => {
+  const m = JSON.parse(raw);
+  if (m.streamId !== 'mailback') return;
+  if (m.type === 'item' && m.value.type === 'snapshot') {
+    process.stdout.write(JSON.stringify(m.value)); clearTimeout(timer); s.close();
+  } else if (m.type === 'error' || m.type === 'end') process.exit(3);
+});
+s.on('error', () => process.exit(4));
+"""
+
+
+def completed_reply(records: list, request_id: str) -> tuple[str, str | None]:
+    events = [item.get("event", {}) for item in records if item.get("type") == "event"]
+    events.sort(key=lambda event: event["seq"])
+    matches = [event for event in events if event.get("type") == "user/message"
+               and event.get("data", {}).get("source", {}).get("kind") == "user"
+               and event.get("data", {}).get("source", {}).get("rpcId") == request_id]
+    if not matches:
+        return "pending", None
+    if len(matches) != 1:
+        raise WatcherError("mail-back request identity is ambiguous")
+    starts = [event for event in events if event["type"] == "turn/start"
+              and event["seq"] < matches[0]["seq"]]
+    if not starts:
+        return "pending", None
+    start = starts[-1]
+    later = [event["seq"] for event in events if event["type"] == "turn/start"
+             and event["seq"] > matches[0]["seq"]]
+    stop = min(later) if later else float("inf")
+    same = [event for event in events if start["seq"] <= event["seq"] < stop]
+    if any(b["seq"] != a["seq"] + 1 for a, b in zip(same, same[1:])):
+        raise WatcherError("mail-back history is not contiguous")
+    users = [event for event in same if event["type"] == "user/message"
+             and event["data"].get("source", {}).get("kind") == "user"]
+    if len(users) != 1:
+        return "failed", None
+    ends = [event for event in same if event["type"] == "turn/end"]
+    if not ends:
+        return "pending", None
+    if (len(ends) != 1 or ends[0]["data"].get("turn") != start["data"].get("turn")
+            or ends[0]["data"].get("reason", {}).get("kind") != "completed"):
+        return "failed", None
+    messages = [event for event in same if event["type"] == "assistant/message"
+                and matches[0]["seq"] < event["seq"] < ends[0]["seq"]]
+    if not messages or messages[-1]["data"].get("interrupted"):
+        return "failed", None
+    content = messages[-1]["data"].get("message", {}).get("content", [])
+    body = "\n".join(part["text"] for part in content
+                     if part.get("type") == "text" and isinstance(part.get("text"), str))
+    return ("ready", body) if body.strip() else ("failed", None)
+
+
+def publish_reply(seat: str, mid: str, receipt: dict) -> str:
+    context = receipt["reply_context"]
+    target = MAILCORTEX.require_maildir(context["to"])
+    for component in (MAILCORTEX.mail_root(), target.parent, target,
+                      *(target / leaf for leaf in ("tmp", "new", "cur"))):
+        if component.is_symlink():
+            raise WatcherError("unsafe mail-back destination")
+    key = MAILCORTEX.hashlib.sha256(f"{seat}\n{mid}\n{context['request_id']}".encode()).hexdigest()
+    name = f"{key}.mailcortex-reply"
+    message = EmailMessage(policy=policy.SMTP)
+    message["Date"] = format_datetime(datetime.fromtimestamp(receipt["reply_ready_at"], timezone.utc))
+    message["From"], message["To"] = context["sender"], context["to"]
+    message["Subject"] = "Re: " + context["subject"]
+    message["Message-ID"] = f"<{key}@{context['sender'].rsplit('@', 1)[-1]}>"
+    message["In-Reply-To"] = mid
+    message["References"] = mid
+    message["Auto-Submitted"] = "auto-replied"
+    message.set_content(receipt["reply_body"])
+    raw = message.as_bytes()
+    existing = [p for leaf in ("new", "cur") for p in (target / leaf).iterdir()
+                if p.name.split(":2,", 1)[0] == name]
+    if existing:
+        if any(p.is_symlink() or p.read_bytes() != raw for p in existing):
+            raise WatcherError("mail-back publication collision")
+        return name
+    temporary = target / "tmp" / MAILCORTEX.safe_name()
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(raw); stream.flush(); os.fsync(stream.fileno())
+        os.link(temporary, target / "new" / name)
+        MAILCORTEX.fsync_directory(target / "new")
+    finally:
+        temporary.unlink(missing_ok=True)
+    return name
+
+
+def safe_receipt(seat: str, mid: str) -> dict | None:
+    try:
+        return MAILCORTEX.load_receipt(seat, mid)
+    except MAILCORTEX.MailCortexError as error:
+        raise WatcherError(str(error)) from error
+
+
+def latest_injection(seat: str) -> float:
+    latest = 0.0
+    directory = MAILCORTEX.runtime_root() / "receipts" / seat
+    if not directory.is_dir():
+        return latest
+    for path in directory.glob("*.json"):
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WatcherError("receipt is unreadable") from error
+        if value.get("schema") != "mailcortex.receipt.v2":
+            raise WatcherError("receipt is invalid")
+        if value.get("wake_state") == "injected":
+            latest = max(latest, float(value.get("wake_updated_at", 0)))
+    return latest
+
+
+class HerdrAdapter:
+    def __init__(self, runner=subprocess.run):
+        self.runner = runner
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        command = ["herdr", "--session", record["herdr_session"],
+                   "agent", "get", record["herdr_target"]]
+        result = self.runner(command, text=True, capture_output=True,
+                             check=False, timeout=15)
+        if result.returncode != 0:
+            raise WatcherError("Herdr target lookup failed")
+        try:
+            agent = json.loads(result.stdout)["result"]["agent"]
+        except json.JSONDecodeError as error:
+            raise WatcherError("Herdr target response is not JSON") from error
+        except (KeyError, TypeError) as error:
+            raise WatcherError("Herdr target response is invalid") from error
+        if agent.get("name") != record["herdr_target"]:
+            raise WatcherError("Herdr resolved a different target")
+        if agent.get("agent_status") not in {"idle", "done"}:
+            return None
+        pane_id = agent.get("pane_id")
+        if not isinstance(pane_id, str) or not PANE.fullmatch(pane_id):
+            raise WatcherError("Herdr target has no valid pane")
+        return pane_id
+
+    def deliver(self, record: dict, pane_id: str, prompt: str) -> None:
+        command = ["herdr", "--session", record["herdr_session"],
+                   "pane", "run", pane_id, prompt]
+        result = self.runner(command, text=True, capture_output=True,
+                             check=False, timeout=60)
+        if result.returncode != 0:
+            raise WatcherError("Herdr delivery outcome is unknown")
+
+
+def private_file(path: Path, label: str) -> Path:
+    if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+        raise WatcherError(f"{label} is not a private regular file")
+    return path
+
+
+def loopback_url(value: str, label: str) -> str:
+    parsed = urllib.parse.urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or not parsed.hostname:
+        raise WatcherError(f"{label} is not a loopback URL")
+    try:
+        loopback = ipaddress.ip_address(parsed.hostname).is_loopback
+    except ValueError:
+        loopback = parsed.hostname.lower() == "localhost"
+    if not loopback:
+        raise WatcherError(f"{label} is not a loopback URL")
+    return value.rstrip("/")
+
+
+class DuctorAdapter:
+    """Ductor has a local prompt API but no safe remote busy-status query."""
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        raise WatcherError(
+            "Ductor transport has no safe local busy-status injection point; refusing delivery"
+        )
+
+    def deliver(self, record: dict, target: str, prompt: str) -> None:
+        raise WatcherError(
+            "Ductor transport has no safe local busy-status injection point; refusing delivery"
+        )
+
+
+class DeepSeekAdapter:
+    """Authenticated local DeepSeek RPC adapter with authoritative busy checks."""
+
+    def __init__(self, opener=urllib.request.urlopen):
+        self.opener = opener
+
+    def _rpc(self, record: dict, method: str, args: dict) -> dict:
+        base = loopback_url(record["deepseek_url"], "DeepSeek URL")
+        cookie_path = private_file(Path(record["deepseek_cookie_file"]).expanduser(), "DeepSeek cookie")
+        cookie = cookie_path.read_text(encoding="utf-8").strip()
+        if not cookie:
+            raise WatcherError("DeepSeek cookie is empty")
+        # Wire shape verified live against dsh's typert gateway: the envelope
+        # needs type "client-request", and args are keyed by each method's
+        # declared parameter wire name (_request for session/list, request
+        # for session/prompt).
+        payload = {
+            "type": "client-request",
+            "rpcId": uuid.uuid4().hex,
+            "method": method,
+            "payload": {"args": args},
+        }
+        request = urllib.request.Request(
+            f"{base}/api/{method}",
+            data=json.dumps(payload, separators=(",", ":")).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Cookie": cookie},
+            method="POST",
+        )
+        try:
+            with self.opener(request, timeout=15) as response:
+                if response.status != 200:
+                    raise WatcherError("DeepSeek RPC request failed")
+                result = json.loads(response.read().decode("utf-8"))
+        except WatcherError:
+            raise
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+            raise WatcherError("DeepSeek RPC request failed") from error
+        try:
+            rpc_result = result["result"]
+            if not rpc_result["ok"]:
+                raise WatcherError("DeepSeek RPC returned an error")
+            value = rpc_result["value"]
+        except (KeyError, TypeError) as error:
+            raise WatcherError("DeepSeek RPC response is invalid") from error
+        if not isinstance(value, dict):
+            raise WatcherError("DeepSeek RPC response is invalid")
+        return value
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        value = self._rpc(record, "session/list", {"_request": {}})
+        for item in value.get("items", []):
+            if not isinstance(item, dict) or item.get("sessionId") != record["deepseek_session"]:
+                continue
+            if item.get("running") is True:
+                return None
+            if item.get("running") is not False:
+                raise WatcherError("DeepSeek session has no authoritative busy state")
+            return record["deepseek_session"]
+        raise WatcherError("DeepSeek session was not found")
+
+    def reply(self, record: dict, request_id: str) -> tuple[str, str | None]:
+        base = loopback_url(record["deepseek_url"], "DeepSeek URL")
+        cookie_path = private_file(Path(record["deepseek_cookie_file"]).expanduser(), "DeepSeek cookie")
+        dsh = shutil.which("dsh")
+        if not dsh:
+            raise WatcherError("mail-back requires the declared DSH installation")
+        try:
+            result = subprocess.run(
+                ["node", "-e", SNAPSHOT_JS, dsh], text=True, capture_output=True,
+                input=json.dumps({"url": base, "cookie": cookie_path.read_text().strip(),
+                                  "session": record["deepseek_session"]}), timeout=15,
+            )
+            if result.returncode:
+                raise WatcherError("DeepSeek mail-back snapshot failed")
+            snapshot = json.loads(result.stdout)
+            if snapshot.get("type") != "snapshot" or snapshot.get("header", {}).get("id") != record["deepseek_session"]:
+                raise WatcherError("DeepSeek mail-back snapshot target mismatch")
+            records = list(snapshot["records"])
+            page = snapshot
+            for _ in range(10):
+                outcome = completed_reply(records, request_id)
+                if outcome[0] != "pending" or not page["hasMore"]:
+                    return outcome
+                before = min(item["event"]["seq"] for item in records)
+                page = self._rpc(record, "session/page", {"request": {
+                    "address": {"kind": "session", "sessionId": record["deepseek_session"]},
+                    "throughSeq": snapshot["cursor"], "beforeSeq": before, "maxMessages": 50,
+                }})
+                if not page["records"] or min(item["event"]["seq"] for item in page["records"]) >= before:
+                    raise WatcherError("DeepSeek mail-back history made no progress")
+                records.extend(page["records"])
+            raise WatcherError("DeepSeek mail-back exceeded its bounded history window")
+        except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
+            raise WatcherError("DeepSeek mail-back history is unavailable or malformed") from error
+
+    def deliver(self, record: dict, target: str, prompt: str, request_id: str | None = None) -> None:
+        value = self._rpc(
+            record,
+            "session/prompt",
+            {
+                "request": {
+                    "requestId": request_id or uuid.uuid4().hex,
+                    "sessionId": target,
+                    "mode": "queue",
+                    "content": [{"type": "text", "text": prompt}],
+                },
+            },
+        )
+        if value.get("accepted") is not True:
+            raise WatcherError("DeepSeek prompt was not accepted")
+
+
+class TransportAdapters:
+    def __init__(self):
+        self.adapters = {
+            "herdr": HerdrAdapter(),
+            "ductor": DuctorAdapter(),
+            "deepseek": DeepSeekAdapter(),
+        }
+
+    def for_record(self, record: dict) -> object:
+        try:
+            return self.adapters[record["transport"]]
+        except KeyError as error:
+            raise WatcherError("unsupported transport") from error
+
+
+def record_adapter(adapter: object, record: dict) -> object:
+    factory = getattr(adapter, "for_record", None)
+    return factory(record) if factory is not None else adapter
+
+
+def diagnostic(error: Exception) -> str:
+    # Arbitrary transport exception text may contain credentials. Only our
+    # intentionally concise diagnostics may enter logs or receipts.
+    if isinstance(error, (WatcherError, MAILCORTEX.MailCortexError)):
+        return str(error)[:240]
+    return type(error).__name__
+
+
+def report_error(seat: str, subject: str, error: Exception) -> None:
+    print(f"mailcortex-seat-watcher: seat={seat} item={subject}: {diagnostic(error)}", file=sys.stderr)
+
+
+def reconcile_reply(seat: str, record: dict, adapter: object, now: float, path: Path) -> bool:
+    if path.is_symlink():
+        raise WatcherError("unsafe reply receipt")
+    value = json.loads(path.read_text())
+    mid = value["message_id"]
+    receipt = safe_receipt(seat, mid)
+    if not receipt or path != MAILCORTEX.receipt_path(seat, mid):
+        raise WatcherError("reply receipt identity mismatch")
+    context = receipt.get("reply_context")
+    if not context or receipt["wake_state"] != "injected":
+        return False
+    if context["session"] != record["deepseek_session"]:
+        raise WatcherError("reply receipt session mismatch")
+    state = receipt.get("reply_state")
+    if state in {"delivered", "failed"}:
+        return False
+    if state == "pending":
+        state, body = adapter.reply(record, context["request_id"])
+        if state == "pending":
+            return True
+        receipt.update(reply_state=state, reply_ready_at=now)
+        if state == "ready":
+            receipt["reply_body"] = body
+        elif state == "failed":
+            receipt["reply_reason"] = "turn_not_unambiguously_completed_with_text"
+        else:
+            raise WatcherError("invalid mail-back settlement")
+        MAILCORTEX.atomic_json(path, receipt)
+    elif state != "ready":
+        raise WatcherError("invalid mail-back receipt state")
+    if state == "ready":
+        name = publish_reply(seat, mid, receipt)
+        receipt.update(reply_state="delivered", reply_filename=name, reply_delivered_at=now)
+        receipt.pop("reply_error", None)
+        MAILCORTEX.atomic_json(path, receipt)
+    return False
+
+
+def reconcile_replies(seat: str, record: dict, adapter: object, now: float) -> bool:
+    directory = MAILCORTEX.runtime_root() / "receipts" / seat
+    pending = False
+    if not directory.is_dir():
+        return pending
+    for path in sorted(directory.glob("*.json")):
+        try:
+            pending = reconcile_reply(seat, record, adapter, now, path) or pending
+        except Exception as error:
+            pending = True
+            report_error(seat, path.name, error)
+            try:
+                if path.is_symlink():
+                    raise WatcherError("unsafe reply receipt")
+                mid = json.loads(path.read_text())["message_id"]
+                receipt = safe_receipt(seat, mid)
+                if not receipt or path != MAILCORTEX.receipt_path(seat, mid):
+                    raise WatcherError("reply receipt identity mismatch")
+                receipt.update(reply_error=diagnostic(error), reply_error_at=now)
+                MAILCORTEX.atomic_json(path, receipt)
+            except Exception as receipt_error:
+                report_error(seat, path.name, receipt_error)
+    return pending
+
+
+def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int:
+    now = time.time() if now is None else now
+    count = 0
+    seen: set[tuple[str, str]] = set()
+    for seat, record in registry["seats"].items():
+        mailbox_name = record.get("mailbox")
+        if mailbox_name not in {f"seats/{seat}", f"consorts/{seat}"}:
+            raise WatcherError("seat mailbox is not canonical")
+        mailbox = MAILCORTEX.mail_root() / record["mailbox"]
+        namespace = mailbox_name.split("/", 1)[0]
+        components = (MAILCORTEX.mail_root(), MAILCORTEX.mail_root() / namespace, mailbox)
+        if any(item.is_symlink() for item in components) or not all(item.is_dir() for item in components) or not (mailbox / "new").is_dir():
+            raise WatcherError("canonical mailbox is absent or unsafe")
+        transport_adapter = record_adapter(adapter, record)
+        pending_reply = (reconcile_replies(seat, record, transport_adapter, now)
+                         if record["transport"] == "deepseek" else False)
+        last_injected = latest_injection(seat)
+        for path in sorted(mailbox.joinpath("new").iterdir(), key=lambda p: p.name):
+            if not path.is_file() or path.is_symlink() or path.name.startswith("."):
+                continue
+            mid = message_id(path)
+            parsed = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+            if (seat, mid) in seen:
+                continue
+            seen.add((seat, mid))
+            old = safe_receipt(seat, mid)
+            if old and old["wake_state"] in {"injecting", "injected", "delivery_unknown"}:
+                continue
+            if record["transport"] == "deepseek" and str(parsed.get("Auto-Submitted", "no")).lower() != "no":
+                if not old or old.get("reason") != "auto_submitted":
+                    MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
+                                                  reason="auto_submitted", wake_updated_at=now)
+                continue
+            if last_injected and last_injected + record["rate_limit_seconds"] > now:
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="rate_limited",
+                                              wake_updated_at=now)
+                continue
+            MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
+                                          wake_updated_at=now)
+            if pending_reply:
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="reply_pending", wake_updated_at=now)
+                continue
+            try:
+                pane_id = transport_adapter.resolve_idle_pane(record)
+            except Exception as error:
+                if record["transport"] != "deepseek":
+                    raise
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
+                                              wake_error=diagnostic(error), wake_updated_at=now)
+                report_error(seat, path.name, error)
+                continue
+            if pane_id is None:
+                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="busy",
+                                              wake_updated_at=now)
+                continue
+            extra = {}
+            mailback_error = None
+            request_id = None
+            if record["transport"] == "deepseek":
+                request_id = uuid.uuid4().hex
+                try:
+                    context = reply_context(record, path)
+                    request_id = context["request_id"]
+                    extra = {"reply_context": context, "reply_state": "pending"}
+                except Exception as error:
+                    mailback_error = diagnostic(error)
+                    report_error(seat, path.name, error)
+                    extra = {"reply_state": "failed", "reply_reason": "return_path_unavailable",
+                             "reply_error": mailback_error, "reply_error_at": now}
+            MAILCORTEX.write_wake_receipt(seat, mid, "injecting", filename=path.name,
+                                          pane_id=pane_id, wake_updated_at=now, **extra)
+            try:
+                if extra:
+                    transport_adapter.deliver(record, pane_id, wake_prompt(record, path, mailback_error),
+                                              request_id=request_id)
+                else:
+                    transport_adapter.deliver(record, pane_id, wake_prompt(record, path))
+            except Exception as error:
+                MAILCORTEX.write_wake_receipt(
+                    seat, mid, "delivery_unknown", filename=path.name,
+                    pane_id=pane_id, reason="delivery_error", wake_updated_at=now,
+                )
+                if record["transport"] == "deepseek":
+                    report_error(seat, path.name, error)
+                    continue
+                if isinstance(error, WatcherError):
+                    raise
+                raise WatcherError("transport delivery outcome is unknown") from error
+            MAILCORTEX.write_wake_receipt(seat, mid, "injected", filename=path.name,
+                                          pane_id=pane_id, wake_updated_at=now)
+            count += 1
+            if extra.get("reply_context"):
+                pending_reply = True
+    return count
+
+
+def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
+    count = 0
+    for seat, record in registry["seats"].items():
+        try:
+            count += scan_seats({"seats": {seat: record}}, adapter, now=now)
+        except Exception as error:
+            if record.get("transport") != "deepseek":
+                raise
+            report_error(seat, "scan", error)
+    return count
+
+
+def locked_scan(registry: dict, adapter: object, now: float | None = None) -> int:
+    lock_path = MAILCORTEX.runtime_root() / "watcher.lock"
+    lock_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with lock_path.open("a+", encoding="utf-8") as lock:
+        try:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise WatcherError("another watcher owns the scan lock") from error
+        try:
+            return scan_once(registry, adapter, now=now)
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Wake owned idle MailCortex seats exactly once.")
+    parser.add_argument("--registry", default=os.environ.get("MAILCORTEX_SEAT_REGISTRY", "~/.config/mailcortex/seats.json"))
+    parser.add_argument("--once", action="store_true", help="scan once; otherwise poll")
+    parser.add_argument("--interval", type=float, default=2.0)
+    args = parser.parse_args()
+    try:
+        registry = load_registry(Path(args.registry).expanduser(), os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
+        while True:
+            locked_scan(registry, TransportAdapters())
+            if args.once:
+                return 0
+            time.sleep(max(args.interval, 0.1))
+    except (WatcherError, MAILCORTEX.MailCortexError, OSError, ValueError, KeyError, TypeError) as error:
+        print(f"mailcortex-seat-watcher: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+* Seat watcher boot owner
+
+The seat watcher has a separate, opt-in boot contract. A systemd host uses a
+user unit; a SysV host uses a managed cron entry. Both start the existing
+watcher with its default private registry. The launcher validates that registry
+before activation and at every start. A missing or invalid registry exits
+without a retry loop; the user unit also limits other restart failures. Private
+seat names and Herdr targets remain solely in =~/.config/mailcortex/seats.json=.
+Systemd activation is declared per approved host by a tracked stow-layer
+=default.target.wants= symlink; capability-only hosts omit that link and remain
+disabled even though the shared unit and launcher are installed.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/mailcortex-seat-watcher-service :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: mailcortex-seat-watcher-service [--dry-run|--check|--apply|--run|-h|--help]
+--dry-run  print the host's boot contract without changing it (default)
+--check    verify the installed boot contract and private registry
+--apply    install/enable the boot contract after private setup is ready
+--run      singleton foreground watcher entrypoint
+EOF
+}
+
+case "${1:---dry-run}" in
+  -h|--help) usage; exit 0 ;;
+  --dry-run|--check|--apply|--run) mode="${1:---dry-run}" ;;
+  *) usage >&2; exit 2 ;;
+esac
+[ "$#" -le 1 ] || { usage >&2; exit 2; }
+
+observed="${MAILCORTEX_TEST_INIT:-$(ps -p 1 -o comm= | tr -d '[:space:]')}"
+case "$observed" in
+  systemd) expected=systemd ;;
+  init|sysv) expected=sysv ;;
+  *) echo "mailcortex-seat-watcher-service: unsupported init: $observed" >&2; exit 2 ;;
+esac
+
+owner="$HOME/.local/bin/mailcortex-seat-watcher-service"
+watcher="$HOME/.local/bin/mailcortex-seat-watcher"
+registry="$HOME/.config/mailcortex/seats.json"
+unit=mailcortex-seat-watcher.service
+cron_target="${MAILCORTEX_TEST_CRON_TARGET:-/etc/cron.d/mailcortex-seat-watcher}"
+state="$HOME/.local/state/mailcortex"
+pid_record="$state/seat-watcher.pid"
+
+require_ready() {
+  [ -x "$watcher" ] || {
+    echo 'mailcortex-seat-watcher-service: stowed watcher is absent' >&2
+    return 2
+  }
+  MAILCORTEX_WATCHER_PATH="$watcher" MAILCORTEX_REGISTRY_PATH="$registry" python3 - <<'PY' || return 2
+import importlib.machinery
+import importlib.util
+import os
+import socket
+import sys
+from pathlib import Path
+
+path = Path(os.environ["MAILCORTEX_WATCHER_PATH"])
+loader = importlib.machinery.SourceFileLoader("mailcortex_seat_watcher_service", str(path))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(module)
+    module.load_registry(Path(os.environ["MAILCORTEX_REGISTRY_PATH"]),
+                         os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
+except (module.WatcherError, OSError, ValueError, TypeError, AttributeError) as error:
+    print(f"mailcortex-seat-watcher-service: registry is not ready: {error}", file=sys.stderr)
+    sys.exit(2)
+PY
+}
+
+render_cron() {
+  local cron_path="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin" user_name
+  user_name="$(id -un)"
+  case "$HOME:$user_name" in *[[:space:]]*) echo 'mailcortex-seat-watcher-service: invalid cron identity' >&2; exit 2 ;; esac
+  printf '# MailCortex seat watcher boot owner; generated by mailcortex-seat-watcher-service.\n'
+  printf 'SHELL=/bin/sh\n'
+  printf '@reboot %s HOME=%s PATH=%s %s --run 2>&1 | /usr/bin/logger -t mailcortex-seat-watcher\n' "$user_name" "$HOME" "$cron_path" "$owner"
+  printf '*/3 * * * * %s HOME=%s PATH=%s %s --run 2>&1 | /usr/bin/logger -t mailcortex-seat-watcher\n' "$user_name" "$HOME" "$cron_path" "$owner"
+}
+
+systemd_owner_enabled() {
+  local state wants
+  state="$(systemctl --user is-enabled "$unit" 2>/dev/null || true)"
+  case "$state" in
+    enabled) return 0 ;;
+    linked)
+      wants="$HOME/.config/systemd/user/default.target.wants/$unit"
+      [ -L "$wants" ] \
+        && [ "$(readlink -f "$wants")" = "$(readlink -f "$fragment")" ]
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+private_owner_running() {
+  local pid started current
+  local -a args
+  [ -r "$pid_record" ] || return 1
+  read -r pid started < "$pid_record" || return 1
+  [[ "$pid" =~ ^[1-9][0-9]*$ && "$started" =~ ^[0-9]+$ ]] || return 1
+  [ -r "/proc/$pid/stat" ] && [ -r "/proc/$pid/cmdline" ] || return 1
+  [ "$(stat -c %u "/proc/$pid")" = "$(id -u)" ] || return 1
+  current="$(awk '{print $22}' "/proc/$pid/stat")"
+  [ "$current" = "$started" ] || return 1
+  mapfile -d '' -t args < "/proc/$pid/cmdline"
+  if [ "${args[0]:-}" = "$watcher" ]; then
+    args=("${args[@]:1}")
+  elif [ "${args[1]:-}" = "$watcher" ]; then
+    args=("${args[@]:2}")
+  else
+    return 1
+  fi
+  [ "${args[0]:-}" = --registry ] && [ "${args[1]:-}" = "$registry" ] \
+    && [ "${#args[@]}" -eq 2 ]
+}
+
+if [ "$expected" = systemd ]; then
+  if [ "$mode" = --dry-run ]; then
+    printf '%s\n' "systemctl --user cat $unit" \
+      "systemctl --user show -P FragmentPath $unit" \
+      'sudo -n loginctl enable-linger CURRENT_USER' \
+      'systemctl --user daemon-reload' \
+      "systemctl --user enable --now $unit"
+    exit 0
+  fi
+  if [ "$mode" != --run ]; then
+    command -v systemctl >/dev/null || { echo 'mailcortex-seat-watcher-service: systemctl missing' >&2; exit 2; }
+    fragment="$(systemctl --user show -P FragmentPath "$unit")"
+    [ "$fragment" = "$HOME/.config/systemd/user/$unit" ] || {
+      echo "mailcortex-seat-watcher-service: unexpected user unit: $fragment" >&2; exit 2;
+    }
+    systemctl --user cat "$unit" >/dev/null
+    require_ready
+    if [ "$mode" = --check ]; then
+      [ "$(loginctl show-user "$(id -un)" -p Linger --value)" = yes ] || exit 2
+      systemd_owner_enabled || exit 2
+      systemctl --user is-active --quiet "$unit" || exit 2
+      private_owner_running || { echo 'mailcortex-seat-watcher-service: private watcher absent' >&2; exit 2; }
+      read -r owned_pid _ < "$pid_record"
+      [ "$(systemctl --user show -P MainPID "$unit")" = "$owned_pid" ] || {
+        echo 'mailcortex-seat-watcher-service: user unit owns a different PID' >&2; exit 2;
+      }
+      echo 'mailcortex-seat-watcher-service: user unit and private watcher verified'
+      exit 0
+    fi
+    [ -x "$owner" ] || { echo 'mailcortex-seat-watcher-service: stowed owner is absent' >&2; exit 2; }
+    sudo -n loginctl enable-linger "$(id -un)"
+    systemctl --user daemon-reload
+    if ! systemd_owner_enabled || ! systemctl --user is-active --quiet "$unit"; then
+      systemctl --user enable --now "$unit"
+    fi
+    exit 0
+  fi
+fi
+
+case "$mode" in
+  --dry-run) render_cron ;;
+  --check)
+    require_ready
+    render_cron | cmp -s - "$cron_target" || {
+      echo "mailcortex-seat-watcher-service: cron contract missing or drifted: $cron_target" >&2; exit 2;
+    }
+    private_owner_running || { echo 'mailcortex-seat-watcher-service: private watcher absent' >&2; exit 2; }
+    echo 'mailcortex-seat-watcher-service: SysV cron contract and private watcher verified'
+    ;;
+  --apply)
+    require_ready
+    [ -x "$owner" ] || { echo 'mailcortex-seat-watcher-service: stowed owner is absent' >&2; exit 2; }
+    tmp="$(mktemp)"
+    trap 'rm -f "$tmp"' EXIT
+    render_cron > "$tmp"
+    if ! cmp -s "$tmp" "$cron_target"; then
+      if [ "$cron_target" = /etc/cron.d/mailcortex-seat-watcher ]; then
+        sudo -n install -m 0644 "$tmp" "$cron_target"
+      else
+        install -m 0644 "$tmp" "$cron_target"
+      fi
+    fi
+    ;;
+  --run)
+    require_ready
+    umask 077
+    mkdir -p -m 0700 "$state"
+    exec 9>"$state/seat-watcher-service.lock"
+    flock -n 9 || exit 0
+    printf '%s %s\n' "$$" "$(awk '{print $22}' "/proc/$$/stat")" > "$pid_record"
+    exec "$watcher" --registry "$registry"
+    ;;
+esac
+#+END_SRC
+
+#+BEGIN_SRC conf :tangle linux/.config/systemd/user/mailcortex-seat-watcher.service :comments no
+[Unit]
+Description=MailCortex idle seat watcher
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=3
+
+[Service]
+ExecStart=%h/.local/bin/mailcortex-seat-watcher-service --run
+Restart=on-failure
+RestartSec=30
+RestartPreventExitStatus=2
+
+[Install]
+WantedBy=default.target
+#+END_SRC
