@@ -343,6 +343,9 @@ class FakeMessage:
     def reply(self, text):
         self.replies.append(text)
         return self
+    def chat(self):
+        self.values["type"] = "chat"
+        return self
     def send(self):
         pass
 
@@ -665,6 +668,8 @@ class ReplyVoiceTests(unittest.TestCase):
                         await asyncio.sleep(0.005)
                     self.assertTrue(started.is_set())
                     self.assertFalse(job.done())
+                    job.cancel()
+                    await asyncio.sleep(0.005)
                     job.cancel()
                     await asyncio.sleep(0.005)
                     self.assertTrue(directories[0].exists())
