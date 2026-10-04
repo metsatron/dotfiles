@@ -2,6 +2,7 @@
 """Fixture tests for mailcortex-xmpp-bridge (no network, no slixmpp)."""
 
 import asyncio
+import hashlib
 import importlib.machinery
 import importlib.util
 import io
@@ -10,6 +11,7 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import types
 import unittest
 import xml.etree.ElementTree as ET
@@ -86,6 +88,56 @@ class ConfigTests(unittest.TestCase):
         os.chmod(cfg["component_secret_file"], 0o644)
         with self.assertRaises(bridge.BridgeError):
             bridge.read_secret(cfg["component_secret_file"])
+
+    def test_optional_permission_and_bot_maps_validate(self):
+        data = base_config(self.tmp) | {
+            "permission_secrets": {"fable": str(self.tmp / "permission.secret")},
+            "bots": {"fable": "FixtureBot"},
+        }
+        (self.tmp / "permission.secret").write_text("p" * 32)
+        os.chmod(self.tmp / "permission.secret", 0o600)
+        cfg = bridge.load_config(self.write(data))
+        self.assertEqual(cfg["bots"], {"fable": "FixtureBot"})
+        self.assertEqual(cfg["permission_secrets"]["fable"], self.tmp / "permission.secret")
+        for change in ({"permission_secrets": {"ghost": "YOUR_SECRET_FILE"}},
+                       {"bots": {"ghost": "FixtureBot"}},
+                       {"bots": {"fable": "bad bot"}}):
+            with self.subTest(change=change):
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.load_config(self.write(base_config(self.tmp) | change))
+
+
+class PermissionTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.secret = self.tmp / "secret"
+        self.secret.write_text("s" * 32)
+        os.chmod(self.secret, 0o600)
+        data = base_config(self.tmp) | {
+            "permission_secrets": {"fable": str(self.secret)},
+        }
+        path = self.tmp / "bridge.json"
+        path.write_text(json.dumps(data))
+        self.cfg = bridge.load_config(path)
+
+    def test_normalized_replies_and_request_shape(self):
+        self.assertEqual(bridge.normalize_permission_text("Yes, A B C D E."), "yes abcde")
+        self.assertEqual(bridge.permission_reply("YES, A B C D E."), ("allow", "abcde"))
+        self.assertEqual(bridge.permission_reply("no abcde"), ("deny", "abcde"))
+        self.assertIsNone(bridge.permission_reply("yes abcde please"))
+        rendered = ("From: fable@host.helm\nSubject: [permission] Bash\n"
+                    "Message-ID: <permission@host.helm>\n\nrequest_id: abcde\n")
+        self.assertEqual(bridge.permission_request(rendered),
+                         ("abcde", "Bash", "request_id: abcde"))
+
+    def test_decision_mail_uses_fixed_auth_header(self):
+        run = FakeRun({"send": "decision.msg\n"})
+        name = bridge.decision_mail(self.cfg, "fable", "abcde", "allow",
+                                    "s" * 32, 123, run)
+        self.assertEqual(name, "decision.msg")
+        argv = run.calls[0]
+        self.assertEqual(argv[argv.index("--permission-auth") + 1],
+                         bridge.permission_auth_value("s" * 32, "fable", "abcde", "allow", 123))
 
 
 class VoiceTests(unittest.TestCase):
@@ -353,8 +405,7 @@ class FakeMessage:
 class ComponentVoiceTests(unittest.TestCase):
     setUp = VoiceTests.setUp
 
-    # Exercise the registered production handler, not only helper calls.
-    def test_production_handler_bodyless_owner_dedupe_unknown_and_capacity(self):
+    def test_adhoc_commands_are_fixed_and_mutations_need_confirmation(self):
         loop = asyncio.new_event_loop()
         self.addCleanup(loop.close)
         asyncio.set_event_loop(loop)
@@ -371,6 +422,62 @@ class ComponentVoiceTests(unittest.TestCase):
                 self.handlers[name] = handler
             def connect(self):
                 self.disconnected.set_result(None)
+        cfg = self.cfg | {"bots": {"fable": "FixtureBot"}}
+        with patch.dict("sys.modules", {"slixmpp": types.SimpleNamespace(ComponentXMPP=ComponentBase)}), \
+                patch.object(bridge, "state_root", return_value=self.tmp / "state"):
+            self.assertEqual(bridge.run_bridge(cfg), 1)
+        component, = instances
+        with patch.object(bridge.shutil, "which", return_value="/bin/claude-warmctl"):
+            self.assertEqual(component.command_names("fable"),
+                             ["status", "seats", "revive", "compact"])
+            self.assertEqual(component.command_names("worker"), ["status", "seats"])
+            with patch.object(bridge.subprocess, "run",
+                              return_value=subprocess.CompletedProcess([], 0, "queued", "")) as run:
+                ok, result = component.execute_command("owner@example.test", "fable", "compact")
+            self.assertTrue(ok)
+            self.assertEqual(run.call_args.args[0], ["claude-warmctl", "inject", "FixtureBot", "/compact"])
+            self.assertEqual(result, "queued")
+        class Iq:
+            def __init__(self, sender):
+                self.values = {"from": sender}
+            def __getitem__(self, key):
+                return self.values[key]
+        session = {"payload": [], "next": None}
+        loop.run_until_complete(component.begin_command(Iq("owner@example.test"), session,
+                                                        "fable", "revive"))
+        self.assertTrue(session["has_next"])
+        with self.assertRaises(Exception):
+            loop.run_until_complete(component.begin_command(Iq("evil@example.test"), {},
+                                                            "fable", "revive"))
+        with patch.object(bridge.subprocess, "run", side_effect=AssertionError("not confirmed")):
+            loop.run_until_complete(component.finish_command(session["payload"][0], session))
+        self.assertFalse(session["has_next"])
+
+    # Exercise the registered production handler, not only helper calls.
+    def test_production_handler_bodyless_owner_dedupe_unknown_and_capacity(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        asyncio.set_event_loop(loop)
+        self.addCleanup(asyncio.set_event_loop, None)
+        instances = []
+        class ComponentBase:
+            def __init__(self, *args):
+                self.disconnected = loop.create_future()
+                self.handlers = {}
+                instances.append(self)
+            def register_plugin(self, name):
+                pass
+            def add_event_handler(self, name, handler):
+                self.handlers[name] = handler
+            def send_message(self, **kwargs):
+                self.sent_messages = getattr(self, "sent_messages", [])
+                self.sent_messages.append(kwargs)
+            def connect(self):
+                self.disconnected.set_result(None)
+        permission = self.tmp / "permission.secret"
+        permission.write_text("p" * 32)
+        permission.chmod(0o600)
+        self.cfg["permission_secrets"] = {"fable": permission}
         with patch.dict("sys.modules", {"slixmpp": types.SimpleNamespace(ComponentXMPP=ComponentBase)}), \
                 patch.object(bridge, "state_root", return_value=self.tmp / "state"):
             self.assertEqual(bridge.run_bridge(self.cfg), 1)
@@ -407,6 +514,15 @@ class ComponentVoiceTests(unittest.TestCase):
                     self.assertEqual(unconfigured.replies, [])
                     self.assertEqual(text.call_count, 3)
                 self.assertEqual(worker.call_count, 1)
+                unknown = FakeMessage("yes abcde", mid="permission-unknown")
+                await component.handlers["message"](unknown)
+                self.assertEqual(component.sent_messages[-1]["mbody"],
+                                 "Unknown permission request abcde.")
+                component.answered_permissions.add(("fable", "bcdef"))
+                replay = FakeMessage("yes bcdef", mid="permission-replay")
+                await component.handlers["message"](replay)
+                self.assertEqual(component.sent_messages[-1]["mbody"],
+                                 "Permission request bcdef was already answered.")
         loop.run_until_complete(exercise())
         rendered = "From: fable@host.helm\nSubject: Re: [xmpp] hi\nMessage-ID: <fixture>\n\n**reply**"
         with patch.object(bridge, "pending_outbound", return_value=["reply.msg"]), \

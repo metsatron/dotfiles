@@ -45,6 +45,21 @@ class MailCortexCoreTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid Message-ID", result.stderr)
 
+    def test_permission_auth_header_roundtrip_and_validation(self):
+        auth = ("seat=fable;request_id=abcde;behavior=allow;timestamp=123;"
+                + "hmac=" + "a" * 64)
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE,
+                        "--subject", "permission", "--body", "decision",
+                        "--permission-auth", auth, "--print-id"])
+        filename, _message_id = sent.stdout.strip().split("\t")
+        rendered = self.mc(["read", FACE, filename]).stdout
+        self.assertIn("X-MailCortex-Permission: " + auth, rendered)
+        invalid = self.mc(["send", "--from", OWNER, "--to", FACE,
+                           "--subject", "bad", "--body", "no",
+                           "--permission-auth", "forged"], check=False)
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("invalid permission authentication", invalid.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

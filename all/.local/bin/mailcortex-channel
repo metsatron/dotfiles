@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import threading
@@ -14,6 +17,7 @@ import time
 from email import policy
 from email.parser import Parser
 from email.utils import parseaddr
+from pathlib import Path
 
 ADDRESS_RE = re.compile(
     r"^(?:(consort|seat|machine|sanctuary)\+)?"
@@ -22,6 +26,15 @@ ADDRESS_RE = re.compile(
 )
 HANDLING = ("handling_completed", "handling_deferred", "handling_rejected", "handling_failed")
 PROTOCOL = "2025-06-18"
+PERMISSION_WINDOW = 600
+PERMISSION_ID_RE = re.compile(r"^[a-km-z]{5}$", re.IGNORECASE)
+PERMISSION_AUTH_RE = re.compile(
+    r"^seat=(?P<seat>[a-z0-9][a-z0-9._-]{0,63});"
+    r"request_id=(?P<request_id>[a-km-z]{5});"
+    r"behavior=(?P<behavior>allow|deny);"
+    r"timestamp=(?P<timestamp>[0-9]{1,12});"
+    r"hmac=(?P<hmac>[0-9a-f]{64})$"
+)
 
 INSTRUCTIONS = (
     "MailCortex mail for this agent arrives as <channel source=\"mailcortex\" from=\"...\" "
@@ -36,6 +49,41 @@ INSTRUCTIONS = (
 
 class ChannelError(Exception):
     pass
+
+
+def read_permission_secret(path: str) -> bytes:
+    secret_path = Path(path).expanduser()
+    try:
+        info = secret_path.lstat()
+    except OSError as error:
+        raise ChannelError(f"permission secret missing: {error}") from error
+    if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
+        raise ChannelError("permission secret must be a regular file with mode 600")
+    try:
+        value = secret_path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise ChannelError(f"permission secret unreadable: {error}") from error
+    if len(value) < 24:
+        raise ChannelError("permission secret is too short")
+    return value.encode("utf-8")
+
+
+def permission_digest(secret: bytes, seat: str, request_id: str,
+                      behavior: str, timestamp: str) -> str:
+    material = f"{seat} | {request_id} | {behavior} | {timestamp}".encode("utf-8")
+    return hmac.new(secret, material, hashlib.sha256).hexdigest()
+
+
+def permission_auth_value(secret: bytes, seat: str, request_id: str,
+                          behavior: str, timestamp: int) -> str:
+    stamp = str(timestamp)
+    return (f"seat={seat};request_id={request_id};behavior={behavior};"
+            f"timestamp={stamp};hmac={permission_digest(secret, seat, request_id, behavior, stamp)}")
+
+
+def parse_permission_auth(value: str) -> dict[str, str] | None:
+    match = PERMISSION_AUTH_RE.fullmatch(value.strip())
+    return match.groupdict() if match else None
 
 
 def mailcortex(args: list[str]) -> str:
@@ -53,11 +101,18 @@ def receipt_seat(address: str) -> str:
 
 
 class Server:
-    def __init__(self, address: str, allow_from: list[str], poll: float) -> None:
+    def __init__(self, address: str, allow_from: list[str], poll: float,
+                 permission_secret: bytes | None = None,
+                 bridge_address: str | None = None) -> None:
         self.address = address
         self.seat = receipt_seat(address)
         self.allow = set(allow_from)
         self.poll = poll
+        self.permission_secret = permission_secret
+        self.bridge_address = bridge_address
+        self.pending_permissions: dict[str, dict[str, str]] = {}
+        self.answered_permissions: set[str] = set()
+        self.permission_receipts: list[dict[str, str | int]] = []
         self.lock = threading.Lock()
         self.ready = threading.Event()
         self.skipped: set[str] = set()
@@ -87,6 +142,10 @@ class Server:
                 continue
             rendered = mailcortex(["read", self.address, name])
             message = Parser(policy=policy.default).parsestr(rendered)
+            auth = message.get("X-MailCortex-Permission")
+            if auth and self.accept_permission(message, sender, auth):
+                pushed += 1
+                continue
             self.write({
                 "jsonrpc": "2.0",
                 "method": "notifications/claude/channel",
@@ -103,6 +162,89 @@ class Server:
             })
             pushed += 1
         return pushed
+
+    def accept_permission(self, message, sender: str, value: str) -> bool:
+        """Accept one authenticated decision, or leave it on the ordinary-mail path."""
+        refusal = "invalid authentication"
+        parsed = parse_permission_auth(value)
+        if self.permission_secret is None:
+            refusal = "permission relay is not enabled"
+        elif parsed is None:
+            pass
+        elif self.bridge_address and sender != self.bridge_address:
+            refusal = "unexpected decision sender"
+        else:
+            seat = parsed["seat"]
+            request_id = parsed["request_id"].lower()
+            behavior = parsed["behavior"]
+            timestamp = parsed["timestamp"]
+            try:
+                age = abs(time.time() - int(timestamp))
+            except ValueError:
+                age = PERMISSION_WINDOW + 1
+            expected = permission_digest(self.permission_secret, seat, request_id,
+                                         behavior, timestamp)
+            if seat != self.seat:
+                refusal = "decision names another seat"
+            elif request_id in self.answered_permissions:
+                refusal = "permission request was already answered"
+            elif request_id not in self.pending_permissions:
+                refusal = "permission request is not pending"
+            elif age > PERMISSION_WINDOW:
+                refusal = "permission decision is stale"
+            elif not hmac.compare_digest(expected, parsed["hmac"]):
+                refusal = "permission authentication failed"
+            else:
+                self.pending_permissions.pop(request_id, None)
+                self.answered_permissions.add(request_id)
+                receipt = {
+                    "request_id": request_id,
+                    "behavior": behavior,
+                    "timestamp": int(timestamp),
+                }
+                self.permission_receipts.append(receipt)
+                self.write({
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel/permission",
+                    "params": {"request_id": request_id, "behavior": behavior},
+                })
+                self.log(f"permission receipt: {behavior} {request_id}")
+                return True
+        self.log(f"permission decision refused ({refusal}); treated as ordinary mail")
+        return False
+
+    def permission_request(self, params: dict) -> None:
+        if self.permission_secret is None or not self.bridge_address:
+            self.log("permission_request refused: permission relay is not enabled")
+            return
+        request_id = str(params.get("request_id", "")).lower()
+        tool_name = str(params.get("tool_name", "")).strip()
+        description = str(params.get("description", "")).strip()
+        input_preview = str(params.get("input_preview", "")).strip()
+        if not PERMISSION_ID_RE.fullmatch(request_id):
+            self.log("permission_request refused: invalid request_id")
+            return
+        if not tool_name or "\n" in tool_name or "\r" in tool_name:
+            self.log("permission_request refused: invalid tool_name")
+            return
+        input_preview = input_preview[:2000]
+        self.pending_permissions[request_id] = {
+            "tool_name": tool_name,
+            "description": description,
+            "input_preview": input_preview,
+        }
+        body = (f"request_id: {request_id}\n"
+                f"tool_name: {tool_name}\n"
+                f"description:\n{description}\n"
+                f"input_preview:\n{input_preview}\n"
+                f"reply: yes {request_id} / no {request_id}\n")
+        try:
+            mailcortex(["send", "--from", self.address, "--to", self.bridge_address,
+                        "--subject", f"[permission] {tool_name}", "--body", body])
+        except ChannelError:
+            self.pending_permissions.pop(request_id, None)
+            raise
+        self.log(f"permission request mailed to bridge: {request_id}")
 
     def watch(self) -> None:
         self.ready.wait()
@@ -175,14 +317,22 @@ class Server:
     def handle(self, message: dict) -> None:
         method, ident = message.get("method"), message.get("id")
         if method == "initialize":
+            experimental = {"claude/channel": {}}
+            if self.permission_secret is not None:
+                experimental["claude/channel/permission"] = {}
             self.write({"jsonrpc": "2.0", "id": ident, "result": {
                 "protocolVersion": message.get("params", {}).get("protocolVersion", PROTOCOL),
-                "capabilities": {"tools": {}, "experimental": {"claude/channel": {}}},
+                "capabilities": {"tools": {}, "experimental": experimental},
                 "serverInfo": {"name": "mailcortex", "version": "1.0.0"},
                 "instructions": INSTRUCTIONS,
             }})
         elif method == "notifications/initialized":
             self.ready.set()
+        elif method == "notifications/claude/channel/permission_request":
+            try:
+                self.permission_request(message.get("params") or {})
+            except ChannelError as error:
+                self.log(str(error))
         elif method == "ping":
             self.write({"jsonrpc": "2.0", "id": ident, "result": {}})
         elif method == "tools/list":
@@ -223,13 +373,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--allow-from", action="append", default=[], required=True,
                         help="sender address whose mail is pushed (repeatable)")
     parser.add_argument("--poll", type=float, default=2.0, help="seconds between mailbox scans")
+    parser.add_argument("--permission-secret", metavar="FILE",
+                        help="private mode-600 secret enabling authenticated permission relay")
+    parser.add_argument("--bridge-address",
+                        help="MailCortex address that receives this seat's permission requests")
     args = parser.parse_args(argv)
     try:
         for address in [args.address, *args.allow_from]:
             receipt_seat(address)
+        if args.bridge_address:
+            receipt_seat(args.bridge_address)
+        if args.permission_secret and not args.bridge_address:
+            raise ChannelError("--bridge-address is required with --permission-secret")
+        if args.bridge_address and not args.permission_secret:
+            raise ChannelError("--permission-secret is required with --bridge-address")
+        if args.permission_secret and args.bridge_address.lower() not in {
+                address.lower() for address in args.allow_from}:
+            raise ChannelError("--bridge-address must also appear in --allow-from")
         if not 0.2 <= args.poll <= 60:
             raise ChannelError("--poll must be between 0.2 and 60")
-        return Server(args.address, [a.lower() for a in args.allow_from], args.poll).serve()
+        secret = read_permission_secret(args.permission_secret) if args.permission_secret else None
+        return Server(args.address, [a.lower() for a in args.allow_from], args.poll,
+                      secret, args.bridge_address.lower() if args.bridge_address else None).serve()
     except ChannelError as error:
         print(f"mailcortex-channel: {error}", file=sys.stderr)
         return 2
