@@ -6,10 +6,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import collections
+import hashlib
+import hmac
 import json
 import logging
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -46,6 +49,15 @@ UPLOAD_SECONDS = 30
 UPLOAD_NS = "urn:xmpp:http:upload:0"
 MUC_NS = "http://jabber.org/protocol/muc"
 MUC_USER_NS = "http://jabber.org/protocol/muc#user"
+PERMISSION_WINDOW = 600
+PERMISSION_ID_RE = re.compile(r"^[a-km-z]{5}$", re.IGNORECASE)
+PERMISSION_AUTH_RE = re.compile(
+    r"^seat=(?P<seat>[a-z0-9][a-z0-9._-]{0,63});"
+    r"request_id=(?P<request_id>[a-km-z]{5});"
+    r"behavior=(?P<behavior>allow|deny);"
+    r"timestamp=(?P<timestamp>[0-9]{1,12});"
+    r"hmac=(?P<hmac>[0-9a-f]{64})$")
+BOT_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 
 class BridgeError(Exception):
@@ -149,6 +161,16 @@ def load_config(path: Path) -> dict:
             or not re.fullmatch(r"[^\x00-\x1f\x7f]{1,64}", name)
             or name != name.strip() for jid, name in names.items())):
         raise BridgeError("display_names must map owner JIDs to one-line names")
+    permission_data = data.get("permission_secrets", {})
+    if (not isinstance(permission_data, dict) or any(
+            local not in seats or not isinstance(path, str) or not path.strip()
+            for local, path in permission_data.items())):
+        raise BridgeError("permission_secrets must map known seats to secret files")
+    bots_data = data.get("bots", {})
+    if (not isinstance(bots_data, dict) or any(
+            local not in seats or not isinstance(bot, str) or not BOT_RE.fullmatch(bot)
+            for local, bot in bots_data.items())):
+        raise BridgeError("bots must map known seats to one-line bot names")
     rooms_data = data.get("rooms", {})
     if not isinstance(rooms_data, dict):
         raise BridgeError("rooms must map room names to room definitions")
@@ -217,6 +239,10 @@ def load_config(path: Path) -> dict:
         "reverse": reverse,
         "rooms": rooms,
         "room_by_jid": room_by_jid,
+        "permission_secrets": {
+            local: Path(path).expanduser() for local, path in permission_data.items()
+        },
+        "bots": dict(bots_data),
         "component_secret_file": secret_file,
         "server": str(data.get("server", "127.0.0.1")),
         "port": port,
@@ -225,17 +251,97 @@ def load_config(path: Path) -> dict:
     }
 
 
-def read_secret(path: Path) -> str:
+def read_secret(path: Path, label: str = "component secret") -> str:
     try:
-        info = path.stat()
+        info = path.lstat()
     except OSError as error:
-        raise BridgeError(f"component secret missing: {error}") from error
+        raise BridgeError(f"{label} missing: {error}") from error
     if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077:
-        raise BridgeError("component secret must be a regular file with mode 600")
-    secret = path.read_text(encoding="utf-8").strip()
+        raise BridgeError(f"{label} must be a regular file with mode 600")
+    try:
+        secret = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise BridgeError(f"{label} is unreadable: {error}") from error
     if len(secret) < 24:
-        raise BridgeError("component secret is too short")
+        raise BridgeError(f"{label} is too short")
     return secret
+
+
+def permission_digest(secret: str, seat: str, request_id: str,
+                      behavior: str, timestamp: str) -> str:
+    material = f"{seat} | {request_id} | {behavior} | {timestamp}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), material, hashlib.sha256).hexdigest()
+
+
+def permission_auth_value(secret: str, seat: str, request_id: str,
+                          behavior: str, timestamp: int) -> str:
+    stamp = str(timestamp)
+    return (f"seat={seat};request_id={request_id};behavior={behavior};"
+            f"timestamp={stamp};hmac={permission_digest(secret, seat, request_id, behavior, stamp)}")
+
+
+def parse_permission_auth(value: str) -> dict[str, str] | None:
+    match = PERMISSION_AUTH_RE.fullmatch(value.strip())
+    return match.groupdict() if match else None
+
+
+def normalize_permission_text(text: str) -> str:
+    """Normalize deterministic voice/text replies without guessing words."""
+    words = re.sub(r"[^a-z0-9]+", " ", text.casefold()).split()
+    normalized: list[str] = []
+    letters: list[str] = []
+    for word in words:
+        if len(word) == 1 and word.isalpha():
+            letters.append(word)
+            continue
+        if letters:
+            normalized.append("".join(letters))
+            letters = []
+        normalized.append(word)
+    if letters:
+        normalized.append("".join(letters))
+    return " ".join(normalized)
+
+
+def permission_reply(text: str) -> tuple[str, str] | None:
+    match = re.fullmatch(r"(yes|no) ([a-km-z]{5})", normalize_permission_text(text))
+    if not match:
+        return None
+    return ("allow" if match[1] == "yes" else "deny", match[2])
+
+
+def permission_request(rendered: str) -> tuple[str, str, str] | None:
+    message = Parser(policy=policy.default).parsestr(rendered)
+    subject = str(message.get("Subject", "")).strip()
+    if not subject.startswith("[permission] "):
+        return None
+    body = (message.get_payload() or "").strip()
+    match = re.search(r"(?m)^request_id:\s*([a-km-z]{5})\s*$", body, re.IGNORECASE)
+    if not match:
+        raise BridgeError("permission request has no valid request_id")
+    request_id = match[1].lower()
+    if not PERMISSION_ID_RE.fullmatch(request_id):
+        raise BridgeError("permission request has an invalid request_id")
+    tool_name = subject[len("[permission] "):].strip()
+    if not tool_name or any(ord(char) < 32 for char in tool_name):
+        raise BridgeError("permission request has an invalid tool name")
+    return request_id, tool_name, body
+
+
+def decision_mail(cfg: dict, local: str, request_id: str, behavior: str,
+                  secret: str, timestamp: int,
+                  run=subprocess.run) -> str:
+    target = cfg["seats"].get(local)
+    if target is None:
+        raise BridgeError(f"unknown seat: {local}")
+    auth = permission_auth_value(secret, local, request_id, behavior, timestamp)
+    text = (f"Permission decision: {'Allowed' if behavior == 'allow' else 'Denied'} "
+            f"{request_id}\n")
+    return mailcortex([
+        "send", "--from", cfg["bridge_address"], "--to", target,
+        "--subject", f"[permission] {'Allowed' if behavior == 'allow' else 'Denied'} {request_id}",
+        "--body", text, "--permission-auth", auth,
+    ], run).strip()
 
 
 class Gate:
@@ -533,6 +639,18 @@ def inbound_voice(cfg: dict, sender: str, local: str, url: str,
             return name, text, message_id
         name = mailcortex(args, run).strip()
         return name, text  # Expose the transcript only after MailCortex succeeds.
+
+
+def transcribe_permission_voice(cfg: dict, url: str) -> str:
+    """Transcribe a pending approval without delivering audio as conversation mail."""
+    validate_upload_url(cfg, url)
+    filename = re.sub(r"[^A-Za-z0-9._-]", "_",
+                      urllib.parse.unquote(urllib.parse.urlsplit(url).path.rsplit("/", 1)[-1]))
+    filename = "permission-voice-" + filename[-100:]
+    with tempfile.TemporaryDirectory(prefix="mailcortex-permission.") as directory:
+        audio = Path(directory) / filename
+        download_voice(cfg, url, audio)
+        return transcribe_voice(audio)
 
 
 def echo_quote(cfg: dict, sender: str, transcript: str) -> str:
@@ -937,10 +1055,35 @@ def run_bridge(cfg: dict) -> int:
     try:
         import asyncio
         import slixmpp
+        try:
+            from slixmpp.exceptions import XMPPError
+            from slixmpp.plugins.xep_0004 import Form
+        except ImportError:
+            # The no-network fixtures replace slixmpp with a tiny fake module.
+            class XMPPError(Exception):
+                pass
+
+            class Form:
+                def __init__(self):
+                    self.values = {}
+
+                def __setitem__(self, key, value):
+                    if key == "type":
+                        self.form_type = value
+
+                def add_field(self, var, **kwargs):
+                    self.values[var] = kwargs.get("value", False)
+
+                def get_values(self):
+                    return self.values
     except ImportError:
         raise BridgeError("python3-slixmpp is not installed (mailcortex-xmpp-package)")
 
     secret = read_secret(cfg["component_secret_file"])
+    permission_secrets = {
+        local: read_secret(path, f"permission secret for {local}")
+        for local, path in cfg["permission_secrets"].items()
+    }
     gate = Gate(cfg["owner_jids"], cfg["rate_per_minute"])
     seen = Seen(state_root() / "seen.json")
     room_map = RoomMap(state_root() / "room-map.json")
@@ -951,6 +1094,7 @@ def run_bridge(cfg: dict) -> int:
             self.register_plugin("xep_0030")
             self.register_plugin("xep_0199")
             self.register_plugin("xep_0363")
+            self.register_plugin("xep_0050")
             self.add_event_handler("session_start", self.on_start)
             self.add_event_handler("message", self.on_message)
             self.add_event_handler("presence", self.on_presence)
@@ -961,9 +1105,184 @@ def run_bridge(cfg: dict) -> int:
             self.joined: set[tuple[str, str]] = set()
             self.room_occupants: dict[str, dict[str, str]] = {}
             self.join_failures: set[tuple[str, str]] = set()
+            self.pending_permissions: dict[tuple[str, str], dict[str, str]] = {}
+            self.answered_permissions: set[tuple[str, str]] = set()
+            self.add_event_handler("command", self.authorize_command)
 
         def seat_jid(self, local: str) -> str:
             return f"{local}@{cfg['component_jid']}"
+
+        def command_names(self, local: str) -> list[str]:
+            names = ["status", "seats"]
+            if local in cfg["bots"]:
+                names.append("revive")
+                if shutil.which("claude-warmctl"):
+                    names.append("compact")
+            return names
+
+        def authorize_command(self, iq) -> None:
+            sender = bare(str(iq["from"]))
+            session_id = str(iq["command"]["sessionid"] or "")
+            if sender not in gate.owners:
+                LOG.warning("adhoc owner=%s seat=%s command=%s result=unauthorized",
+                            sender, recipient_local(iq), iq["command"]["node"])
+                raise XMPPError("forbidden")
+            if session_id:
+                session = self["xep_0050"].sessions.get(session_id)
+                if session and bare(str(session.get("from", ""))) != sender:
+                    LOG.warning("adhoc owner=%s seat=%s command=%s result=session-owner-mismatch",
+                                sender, recipient_local(iq), iq["command"]["node"])
+                    raise XMPPError("forbidden")
+
+        def install_commands(self) -> None:
+            adhoc = self["xep_0050"]
+            for local in cfg["seats"]:
+                for name in self.command_names(local):
+                    node = f"mailcortex-{name}"
+
+                    async def handler(iq, session, local=local, name=name):
+                        return await self.begin_command(iq, session, local, name)
+
+                    adhoc.add_command(jid=self.seat_jid(local), node=node,
+                                      name=name, handler=handler)
+
+        @staticmethod
+        def command_text(output: str, fallback: str = "no output") -> str:
+            text = output.strip() or fallback
+            return " ".join(text.split())[:2000]
+
+        def nurse_status(self, local: str) -> tuple[bool, str]:
+            bot = cfg["bots"].get(local)
+            if bot is None:
+                return True, f"seat={local} watcher=unmapped warm_supervisor=unavailable"
+            try:
+                result = subprocess.run(["nurse-joy", "status", "--json"],
+                                        capture_output=True, text=True, timeout=30)
+            except (OSError, subprocess.TimeoutExpired) as error:
+                return False, f"nurse-joy status failed: {diagnostic(error)}"
+            if result.returncode:
+                return False, f"nurse-joy status failed: {self.command_text(result.stderr, f'exit status {result.returncode}') }"
+            try:
+                roster = json.loads(result.stdout)
+            except json.JSONDecodeError:
+                return False, "nurse-joy status returned invalid JSON"
+            member = next((item for item in roster.get("members", [])
+                           if str(item.get("name", "")).casefold() == bot.casefold()), None)
+            if member is None:
+                return False, f"seat={local} bot={bot} watcher=not-found"
+            projection = {
+                "seat": local,
+                "bot": bot,
+                "watcher": {
+                    "verdict": member.get("verdict"),
+                    "reasons": member.get("reasons", []),
+                },
+                "warm_supervisor": member.get("supervisor", {}),
+            }
+            return True, json.dumps(projection, separators=(",", ":"))[:2000]
+
+        def seats_status(self) -> tuple[bool, str]:
+            rows = []
+            failed = False
+            for local, target in cfg["seats"].items():
+                try:
+                    output = mailcortex(["inbox", target])
+                    deliveries = [line.split("\t") for line in output.splitlines()
+                                  if len(line.split("\t")) >= 3]
+                    last = deliveries[-1][2] if deliveries else "never"
+                    rows.append(f"{local}: {last}")
+                except (BridgeError, OSError) as error:
+                    failed = True
+                    rows.append(f"{local}: unavailable ({diagnostic(error)})")
+            return not failed, "\n".join(rows)
+
+        def execute_command(self, owner: str, local: str, name: str) -> tuple[bool, str]:
+            if name == "status":
+                success, output = self.nurse_status(local)
+            elif name == "seats":
+                success, output = self.seats_status()
+            elif name == "revive":
+                bot = cfg["bots"].get(local)
+                if bot is None:
+                    success, output = False, "revive is not mapped for this seat"
+                else:
+                    argv = ["nurse-joy", "revive", bot, "--no-visit"]
+                    try:
+                        result = subprocess.run(argv, capture_output=True, text=True, timeout=900)
+                        success = result.returncode == 0
+                        output = self.command_text(result.stdout or result.stderr,
+                                                   f"exit status {result.returncode}")
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        success, output = False, f"revive failed: {diagnostic(error)}"
+            elif name == "compact":
+                bot = cfg["bots"].get(local)
+                if bot is None or not shutil.which("claude-warmctl"):
+                    success, output = False, "compact has no safe control path for this seat"
+                else:
+                    argv = ["claude-warmctl", "inject", bot, "/compact"]
+                    try:
+                        result = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+                        success = result.returncode == 0
+                        output = self.command_text(result.stdout or result.stderr,
+                                                   f"exit status {result.returncode}")
+                    except (OSError, subprocess.TimeoutExpired) as error:
+                        success, output = False, f"compact failed: {diagnostic(error)}"
+            else:
+                success, output = False, f"unknown command {name}"
+            LOG.info("adhoc owner=%s seat=%s command=%s result=%s",
+                     owner, local, name, "ok: " + self.command_text(output))
+            return success, output
+
+        @staticmethod
+        def confirmation_form(name: str, bot: str) -> Form:
+            form = Form()
+            form["type"] = "form"
+            form["title"] = f"Confirm {name}"
+            form["instructions"] = f"Run {name} for {bot}. Set confirm to true to continue."
+            form.add_field(var="confirm", ftype="boolean", label="Confirm",
+                           desc="This command changes state.", required=True, value=False)
+            return form
+
+        async def begin_command(self, iq, session: dict, local: str, name: str) -> dict:
+            owner = bare(str(iq["from"]))
+            if owner not in gate.owners:
+                raise XMPPError("forbidden")
+            if name not in self.command_names(local):
+                raise XMPPError("item-not-found")
+            if name in {"revive", "compact"}:
+                bot = cfg["bots"].get(local)
+                session.update({"seat": local, "command_name": name, "owner": owner,
+                                "payload": [self.confirmation_form(name, bot)],
+                                "has_next": True, "allow_complete": False,
+                                "next": self.finish_command})
+                return session
+            success, output = await asyncio.to_thread(self.execute_command, owner, local, name)
+            session.update({"payload": [], "notes": [("info" if success else "error", output)],
+                            "has_next": False, "next": None})
+            return session
+
+        async def finish_command(self, payload, session: dict) -> dict:
+            confirmed = False
+            try:
+                values = payload.get_values()
+                confirmed = bool(values.get("confirm"))
+            except (AttributeError, TypeError, ValueError):
+                confirmed = False
+            owner = session["owner"]
+            local = session["seat"]
+            name = session["command_name"]
+            if not confirmed:
+                output = "cancelled: confirmation was not given"
+                LOG.info("adhoc owner=%s seat=%s command=%s result=%s",
+                         owner, local, name, output)
+                session.update({"payload": [], "notes": [("warning", output)],
+                                "has_next": False, "next": None})
+                return session
+            success, output = await asyncio.to_thread(
+                self.execute_command, owner, local, name)
+            session.update({"payload": [], "notes": [("info" if success else "error", output)],
+                            "has_next": False, "next": None})
+            return session
 
         def room_send(self, room: dict, local: str, body: str) -> None:
             self.send_message(mto=room["jid"], mfrom=room_occupant(room, local),
@@ -989,6 +1308,64 @@ def run_bridge(cfg: dict) -> int:
             for owner in cfg["owner_jids"]:
                 self.send_message(mto=owner, mfrom=self.seat_jid(room["lead"]),
                                   mbody=message, mtype="chat")
+
+        async def permission_text(self, msg, local: str, url: str | None) -> str | None:
+            if local not in permission_secrets:
+                return None
+            if url is not None:
+                try:
+                    return await asyncio.to_thread(transcribe_permission_voice, cfg, url)
+                except (BridgeError, OSError) as error:
+                    LOG.warning("permission voice was not transcribed for %s: %s",
+                                local, diagnostic(error))
+                    return None
+            return str(msg["body"] or "")
+
+        async def handle_permission(self, msg, sender: str, local: str,
+                                    url: str | None) -> bool:
+            text = await self.permission_text(msg, local, url)
+            if text is None:
+                return False
+            decision = permission_reply(text)
+            if decision is None:
+                return False
+            behavior, request_id = decision
+            key = (local, request_id)
+            if key in self.answered_permissions:
+                self.send_message(mto=sender, mfrom=self.seat_jid(local),
+                                  mbody=f"Permission request {request_id} was already answered.",
+                                  mtype="chat")
+                LOG.warning("permission owner=%s seat=%s request=%s result=already-answered",
+                            sender, local, request_id)
+                return True
+            pending = self.pending_permissions.get(key)
+            if pending is None:
+                self.send_message(mto=sender, mfrom=self.seat_jid(local),
+                                  mbody=f"Unknown permission request {request_id}.",
+                                  mtype="chat")
+                LOG.warning("permission owner=%s seat=%s request=%s result=unknown",
+                            sender, local, request_id)
+                return True
+            timestamp = int(time.time())
+            try:
+                await asyncio.to_thread(
+                    decision_mail, cfg, local, request_id, behavior,
+                    permission_secrets[local], timestamp)
+            except (BridgeError, OSError) as error:
+                LOG.error("permission owner=%s seat=%s request=%s result=mail-failed: %s",
+                          sender, local, request_id, diagnostic(error))
+                self.send_message(mto=sender, mfrom=self.seat_jid(local),
+                                  mbody=f"Permission decision {request_id} failed; it remains pending.",
+                                  mtype="chat")
+                return True
+            self.pending_permissions.pop(key, None)
+            self.answered_permissions.add(key)
+            label = "Allowed" if behavior == "allow" else "Denied"
+            self.send_message(mto=sender, mfrom=self.seat_jid(local),
+                              mbody=f"{label} {request_id}", mtype="chat")
+            LOG.info("permission owner=%s seat=%s request=%s result=%s",
+                     sender, local, request_id, behavior)
+            return True
 
         def on_presence(self, presence) -> None:
             room_jid = bare(str(presence["from"]))
@@ -1077,6 +1454,7 @@ def run_bridge(cfg: dict) -> int:
             self.joined.clear()
             self.room_occupants.clear()
             self.join_failures.clear()
+            self.install_commands()
             for local in cfg["seats"]:
                 for owner in cfg["owner_jids"]:
                     self.send_presence(pfrom=self.seat_jid(local), pto=owner)
@@ -1122,6 +1500,8 @@ def run_bridge(cfg: dict) -> int:
                 LOG.warning("unknown seat %s from %s", local, sender)
                 msg.reply("No such seat.").send()
                 return
+            if await self.handle_permission(msg, sender, local, url):
+                return
             key = f"{sender}|{local}|{msg['id']}" if msg["id"] else None
             if not seen.check_and_add(key):
                 LOG.info("duplicate stanza %s ignored", key)
@@ -1155,6 +1535,27 @@ def run_bridge(cfg: dict) -> int:
                     if message_id:
                         await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
                     continue
+                if local in permission_secrets:
+                    try:
+                        permission = permission_request(rendered)
+                    except BridgeError as error:
+                        LOG.error("permission mail %s refused: %s", name, diagnostic(error))
+                        if message_id:
+                            await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
+                        continue
+                    if permission is not None:
+                        request_id, tool_name, body = permission
+                        key = (local, request_id)
+                        self.pending_permissions[key] = {
+                            "tool_name": tool_name,
+                            "body": body,
+                        }
+                        owner_text = f"Permission request {request_id}\n{body}"
+                        await relay_reply(self, cfg, local, owner_text)
+                        if message_id:
+                            await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_completed"])
+                        LOG.info("permission request owner relay seat=%s request=%s", local, request_id)
+                        continue
                 parent = reply_parent(rendered)
                 mapped_room_jid = room_map.get(parent) if parent else None
                 room = cfg["room_by_jid"].get(mapped_room_jid) if mapped_room_jid else None
@@ -1188,6 +1589,8 @@ def main(argv: list[str] | None = None) -> int:
         cfg = load_config(args.config or config_path())
         if args.check:
             read_secret(cfg["component_secret_file"])
+            for local, path in cfg["permission_secrets"].items():
+                read_secret(path, f"permission secret for {local}")
             print(f"ok: {len(cfg['seats'])} seats, {len(cfg['owner_jids'])} owners, "
                   f"component {cfg['component_jid']}")
             return 0
