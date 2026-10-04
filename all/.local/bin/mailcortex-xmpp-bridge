@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 LOG = logging.getLogger("mailcortex-xmpp-bridge")
 LOCAL_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
 HOST_RE = re.compile(r"^[a-z0-9][a-z0-9.-]*[a-z0-9]$")
+MESSAGE_ID_RE = re.compile(r"^<[^<>\s@]+@[^<>\s@]+>$")
 ADDRESS_RE = re.compile(
     r"^(?:(consort|seat|machine|sanctuary)\+)?"
     r"([a-z0-9][a-z0-9._-]*)@"
@@ -43,6 +44,8 @@ RENDER_SECONDS = 600
 ENCODE_SECONDS = 60
 UPLOAD_SECONDS = 30
 UPLOAD_NS = "urn:xmpp:http:upload:0"
+MUC_NS = "http://jabber.org/protocol/muc"
+MUC_USER_NS = "http://jabber.org/protocol/muc#user"
 
 
 class BridgeError(Exception):
@@ -68,6 +71,12 @@ def is_bare_jid(value: str) -> bool:
         return False
     local, host = value.split("@")
     return bool(LOCAL_RE.match(local)) and bool(HOST_RE.match(host))
+
+
+def one_line(value: object, limit: int = 64) -> bool:
+    return (isinstance(value, str) and 1 <= len(value) <= limit
+            and value == value.strip()
+            and not any(ord(char) < 32 or ord(char) == 127 for char in value))
 
 
 def load_config(path: Path) -> dict:
@@ -140,6 +149,61 @@ def load_config(path: Path) -> dict:
             or not re.fullmatch(r"[^\x00-\x1f\x7f]{1,64}", name)
             or name != name.strip() for jid, name in names.items())):
         raise BridgeError("display_names must map owner JIDs to one-line names")
+    rooms_data = data.get("rooms", {})
+    if not isinstance(rooms_data, dict):
+        raise BridgeError("rooms must map room names to room definitions")
+    nick_overrides = data.get("nicks", {})
+    if not isinstance(nick_overrides, dict) or any(
+            local not in seats or not one_line(nick) or "/" in nick
+            for local, nick in nick_overrides.items()):
+        raise BridgeError("nicks must map known seat local parts to one-line nicknames")
+    room_domains: set[str] = set()
+    rooms: dict[str, dict] = {}
+    room_by_jid: dict[str, dict] = {}
+    for room_name, definition in rooms_data.items():
+        if not one_line(room_name):
+            raise BridgeError(f"invalid room name: {room_name!r}")
+        if not isinstance(definition, dict):
+            raise BridgeError(f"room {room_name} must be an object")
+        room_jid = definition.get("jid")
+        if not is_bare_jid(room_jid):
+            raise BridgeError(f"room {room_name} jid must be a bare JID")
+        room_jid = bare(room_jid)
+        room_domain = room_jid.split("@", 1)[1]
+        room_domains.add(room_domain)
+        room_seats = definition.get("seats")
+        if (not isinstance(room_seats, list) or not room_seats
+                or any(not isinstance(local, str) for local in room_seats)
+                or len(set(room_seats)) != len(room_seats)
+                or any(local not in seats for local in room_seats)):
+            raise BridgeError(f"room {room_name} seats must be known and unique")
+        lead = definition.get("lead")
+        if lead not in room_seats:
+            raise BridgeError(f"room {room_name} lead must be one of its seats")
+        if room_jid in room_by_jid:
+            raise BridgeError(f"room JID used twice: {room_jid}")
+        effective_nicks = {
+            local: nick_overrides.get(local, voices.get(local, local))
+            for local in room_seats
+        }
+        if any(not one_line(nick) or "/" in nick for nick in effective_nicks.values()):
+            raise BridgeError(f"room {room_name} has an invalid nickname")
+        folded = [nick.casefold() for nick in effective_nicks.values()]
+        if len(set(folded)) != len(folded):
+            raise BridgeError(f"room {room_name} has duplicate nicknames")
+        room = {
+            "name": room_name,
+            "jid": room_jid,
+            "domain": room_domain,
+            "lead": lead,
+            "seats": list(room_seats),
+            "nicks": effective_nicks,
+            "nick_to_seat": {nick.casefold(): local for local, nick in effective_nicks.items()},
+        }
+        rooms[room_name] = room
+        room_by_jid[room_jid] = room
+    if len(room_domains) > 1:
+        raise BridgeError("all rooms must use one MUC domain")
     return {
         "display_names": {bare(jid): name for jid, name in names.items()},
         "voices": dict(voices),
@@ -151,6 +215,8 @@ def load_config(path: Path) -> dict:
         "bridge_seat": match.group(2),
         "seats": dict(seats),
         "reverse": reverse,
+        "rooms": rooms,
+        "room_by_jid": room_by_jid,
         "component_secret_file": secret_file,
         "server": str(data.get("server", "127.0.0.1")),
         "port": port,
@@ -228,6 +294,50 @@ class Seen:
         return True
 
 
+class RoomMap:
+    """Persisted Message-ID -> room JID routing for room replies."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.entries: dict[str, str] = {}
+        self.order: list[str] = []
+        if path.exists():
+            try:
+                if path.is_symlink() or not path.is_file():
+                    raise OSError("room map is not a regular file")
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    for message_id, room_jid in loaded.items():
+                        if (isinstance(message_id, str) and MESSAGE_ID_RE.fullmatch(message_id)
+                                and isinstance(room_jid, str) and is_bare_jid(room_jid)):
+                            self.entries[message_id] = bare(room_jid)
+                    self.order = list(self.entries)[-SEEN_CAP:]
+                    self.entries = {key: self.entries[key] for key in self.order}
+            except (OSError, json.JSONDecodeError):
+                LOG.warning("room map unreadable; starting empty")
+
+    def get(self, message_id: str) -> str | None:
+        return self.entries.get(message_id)
+
+    def add(self, message_id: str, room_jid: str) -> None:
+        if not MESSAGE_ID_RE.fullmatch(message_id) or not is_bare_jid(room_jid):
+            raise BridgeError("cannot persist an invalid room mapping")
+        if message_id in self.entries:
+            self.order.remove(message_id)
+        self.entries[message_id] = bare(room_jid)
+        self.order.append(message_id)
+        while len(self.order) > SEEN_CAP:
+            dropped = self.order.pop(0)
+            self.entries.pop(dropped, None)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(
+            {key: self.entries[key] for key in self.order},
+            separators=(",", ":")), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, self.path)
+
+
 def diagnostic(error) -> str:
     """One line, no bearer URLs or Authorization values in owner replies/logs."""
     text = re.sub(r"https?://\S+", "[upload URL redacted]", str(error))
@@ -243,7 +353,16 @@ def mailcortex(args: list[str], run=subprocess.run) -> str:
     return result.stdout
 
 
-def inbound_mail(cfg: dict, sender: str, local: str, body: str, run=subprocess.run) -> str:
+def parse_print_id(output: str) -> tuple[str, str]:
+    filename, separator, message_id = output.strip().partition("\t")
+    if not separator or not filename or not MESSAGE_ID_RE.fullmatch(message_id):
+        raise BridgeError("mailcortex send --print-id returned an invalid Message-ID")
+    return filename, message_id
+
+
+def inbound_mail(cfg: dict, sender: str, local: str, body: str,
+                 run=subprocess.run, capture_id: bool = False,
+                 room: dict | None = None) -> str | tuple[str, str]:
     """Deliver one owner chat message into a seat's Maildir; return the filename."""
     target = cfg["seats"].get(local)
     if target is None:
@@ -254,16 +373,23 @@ def inbound_mail(cfg: dict, sender: str, local: str, body: str, run=subprocess.r
     if len(text) > MAX_BODY:
         raise BridgeError("message too long")
     first = text.splitlines()[0].strip()
-    subject = "[xmpp] " + (first[:70] + "…" if len(first) > 70 else first)
+    prefix = f"[xmpp #{room['name']}] " if room is not None else "[xmpp] "
+    subject = prefix + (first[:70] + "…" if len(first) > 70 else first)
+    room_header = f"XMPP-Room: {room['jid']}\n" if room is not None else ""
     framed = (
         f"XMPP-From: {bare(sender)}\n"
         f"XMPP-To: {local}@{cfg['component_jid']}\n"
+        f"{room_header}"
         f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
         "\n"
         f"{text}\n"
     )
-    return mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
-                       "--subject", subject, "--body", framed], run).strip()
+    args = ["send", "--from", cfg["bridge_address"], "--to", target,
+            "--subject", subject, "--body", framed]
+    if capture_id:
+        args.append("--print-id")
+        return parse_print_id(mailcortex(args, run))
+    return mailcortex(args, run).strip()
 
 
 def split_upload_url(value: str):
@@ -375,7 +501,9 @@ def transcribe_voice(audio: Path, run=subprocess.run) -> str:
 
 
 def inbound_voice(cfg: dict, sender: str, local: str, url: str,
-                  run=subprocess.run, download=None, transcribe=None) -> tuple[str, str]:
+                  run=subprocess.run, download=None, transcribe=None,
+                  capture_id: bool = False,
+                  room: dict | None = None) -> tuple[str, str] | tuple[str, str, str]:
     target = cfg["seats"].get(local)
     if target is None:
         raise BridgeError("unknown seat")
@@ -389,13 +517,21 @@ def inbound_voice(cfg: dict, sender: str, local: str, url: str,
         text = (transcribe or transcribe_voice)(audio).strip()
         if not text or len(text) > MAX_BODY:
             raise BridgeError("voice transcript is empty or too long")
+        room_header = f"XMPP-Room: {room['jid']}\n" if room is not None else ""
         framed = (f"XMPP-From: {bare(sender)}\n"
                   f"XMPP-To: {local}@{cfg['component_jid']}\n"
+                  f"{room_header}"
                   f"Reply-Via: mailcortex send --from <your address> --to {cfg['bridge_address']}\n"
                   "Voice-Note: original audio attached\n\n" + text + "\n")
-        name = mailcortex(["send", "--from", cfg["bridge_address"], "--to", target,
-                          "--subject", "[xmpp voice] " + text.splitlines()[0][:70],
-                          "--body", framed, "--attach", str(audio)], run).strip()
+        args = ["send", "--from", cfg["bridge_address"], "--to", target,
+                "--subject", (f"[xmpp #{room['name']}] " if room is not None else "[xmpp voice] ")
+                + text.splitlines()[0][:70],
+                "--body", framed, "--attach", str(audio)]
+        if capture_id:
+            args.append("--print-id")
+            name, message_id = parse_print_id(mailcortex(args, run))
+            return name, text, message_id
+        name = mailcortex(args, run).strip()
         return name, text  # Expose the transcript only after MailCortex succeeds.
 
 
@@ -406,25 +542,146 @@ def echo_quote(cfg: dict, sender: str, transcript: str) -> str:
     return "\n".join(["> Re: " + name] + ["> " + line for line in lines])
 
 
-async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | None) -> None:
+def xml_local(tag: object) -> str:
+    return str(tag).rsplit("}", 1)[-1]
+
+
+def has_xml_element(msg, name: str) -> bool:
+    return any(xml_local(element.tag) == name for element in msg.xml.iter())
+
+
+def stanza_key(msg, prefix: str = "") -> str | None:
+    identifiers = []
+    for element in msg.xml.iter():
+        if xml_local(element.tag) in {"stanza-id", "origin-id"} and element.get("id"):
+            identifiers.append(f"{xml_local(element.tag)}:{element.get('id')}")
+    if identifiers:
+        return prefix + identifiers[0]
+    identifier = str(msg["id"] or "")
+    return prefix + identifier if identifier else None
+
+
+def recipient_local(msg) -> str:
+    recipient = msg["to"]
+    local = getattr(recipient, "user", None)
+    if local is not None:
+        return str(local)
+    return bare(str(recipient)).split("@", 1)[0]
+
+
+def occupant_nick(jid: str) -> str:
+    return str(jid).split("/", 1)[1] if "/" in str(jid) else ""
+
+
+def address_room(room: dict, body: str) -> tuple[list[str], str, str | None]:
+    """Return target seats, prefix-stripped body, and an unknown nickname."""
+    text = body.lstrip()
+    if not text:
+        return [room["lead"]], "", None
+    lower = text.casefold()
+    if lower == "@all" or lower.startswith("@all ") or lower.startswith("@all:") \
+            or lower.startswith("@all,"):
+        remainder = text[4:].lstrip(" :,")
+        return list(room["seats"]), remainder, None
+
+    targets: list[str] = []
+    cursor = text
+    first = True
+    while cursor:
+        cursor = cursor.lstrip()
+        if not cursor:
+            break
+        at = cursor.startswith("@")
+        if at:
+            match = re.match(r"@([^\s,:]+)(?:[:,])?(?:\s+|$)", cursor)
+            if match is None:
+                break
+            nickname = match.group(1)
+            consumed = match.end()
+        elif first:
+            match = re.match(r"([^\s,:]+)(?:[:,])(?:\s+|$)", cursor)
+            if match is None:
+                break
+            nickname = match.group(1)
+            consumed = match.end()
+        else:
+            match = re.match(r"([^\s,:]+)(?:[:,])(?:\s+|$)", cursor)
+            if match is None:
+                break
+            nickname = match.group(1)
+            consumed = match.end()
+        seat = room["nick_to_seat"].get(nickname.casefold())
+        if seat is None:
+            return [], text, nickname
+        if seat not in targets:
+            targets.append(seat)
+        cursor = cursor[consumed:]
+        first = False
+        if not at and cursor.startswith("@"):
+            continue
+        if not cursor:
+            break
+        if at and not cursor.startswith("@") and not re.match(r"[^\s,:]+[:,]", cursor):
+            break
+    if not targets:
+        unknown = None
+        unknown_match = re.match(r"@([^\s,:]+)|([^\s,:]+)[:,]", text)
+        if unknown_match:
+            unknown = unknown_match.group(1) or unknown_match.group(2)
+        return [room["lead"]], text, unknown
+    stripped = cursor.strip()
+    return targets, stripped, None
+
+
+def known_nicknames(room: dict) -> str:
+    return ", ".join(room["nicks"][local] for local in room["seats"])
+
+
+async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | None,
+                          body: str | None = None, room: dict | None = None,
+                          room_map: RoomMap | None = None) -> str | None:
     try:
         if url is not None:
-            name, transcript = await asyncio.to_thread(inbound_voice, cfg, sender, local, url)
+            if room is not None:
+                result = await asyncio.to_thread(
+                    inbound_voice, cfg, sender, local, url, capture_id=True, room=room)
+            else:
+                result = await asyncio.to_thread(inbound_voice, cfg, sender, local, url)
+            if room is not None:
+                name, transcript, message_id = result
+            else:
+                name, transcript = result
         else:
-            name = await asyncio.to_thread(inbound_mail, cfg, sender, local, msg["body"])
+            if room is not None:
+                result = await asyncio.to_thread(
+                    inbound_mail, cfg, sender, local,
+                    msg["body"] if body is None else body, capture_id=True, room=room)
+            else:
+                result = await asyncio.to_thread(
+                    inbound_mail, cfg, sender, local,
+                    msg["body"] if body is None else body)
+            if room is not None:
+                name, message_id = result
+            else:
+                name = result
     except (BridgeError, OSError) as error:
         reason = diagnostic(error)
         LOG.error("delivery failed for %s: %s", local, reason)
         prefix = "Voice note could not be transcribed: " if url is not None else "Not delivered: "
         msg.reply(prefix + reason).send()
-        return
+        return None
+    if room is not None:
+        if room_map is None:
+            raise BridgeError("room delivery has no room map")
+        room_map.add(message_id, room["jid"])
     LOG.info("delivered %s -> %s as %s", sender, local, name)
-    if url is not None:
+    if url is not None and room is None:
         # slixmpp Message.reply swaps the original seat/owner and preserves thread.
         try:
             msg.reply(echo_quote(cfg, sender, transcript)).chat().send()
         except Exception as error:
             LOG.error("transcript delivered but echo failed for %s: %s", local, diagnostic(error))
+    return transcript if url is not None else None
 
 
 def pending_outbound(cfg: dict, run=subprocess.run) -> list[str]:
@@ -444,6 +701,12 @@ def render_outbound(cfg: dict, rendered: str) -> tuple[str | None, str, str]:
     else:
         text = body or subject
     return local, text[:MAX_BODY], str(message.get("Message-ID", "")).strip()
+
+
+def reply_parent(rendered: str) -> str:
+    message = Parser(policy=policy.default).parsestr(rendered)
+    parent = str(message.get("In-Reply-To", "")).strip()
+    return parent if MESSAGE_ID_RE.fullmatch(parent) else ""
 
 
 def markdown_to_styling(text: str) -> str:
@@ -613,11 +876,35 @@ async def voice_worker(function, *args):
         raise cancelled
 
 
-async def relay_reply(component, cfg: dict, local: str, text: str) -> None:
-    """Text first for every owner; optional voice failure never loses that text."""
+def room_occupant(room: dict, local: str) -> str:
+    return f"{room['jid']}/{room['nicks'][local]}"
+
+
+async def relay_reply(component, cfg: dict, local: str, text: str,
+                      room: dict | None = None, joined: set[tuple[str, str]] | None = None) -> None:
+    """Post to a mapped room when possible; direct 1:1 is the safe fallback."""
     jid = f"{local}@{cfg['component_jid']}"
-    for owner in cfg["owner_jids"]:
-        component.send_message(mto=owner, mfrom=jid, mbody=markdown_to_styling(text), mtype="chat")
+    if room is not None:
+        if local not in room["seats"] or (room["jid"], local) not in (joined or set()):
+            note = f"Room reply not posted: {local} is not an occupant of {room['name']}."
+            await relay_reply(component, cfg, local, note + "\n\n" + text)
+            return
+        routes = [{"mto": room["jid"], "mfrom": room_occupant(room, local),
+                   "mtype": "groupchat"}]
+    else:
+        routes = [{"mto": owner, "mfrom": jid, "mtype": "chat"}
+                  for owner in cfg["owner_jids"]]
+    try:
+        for route in routes:
+            component.send_message(**route, mbody=markdown_to_styling(text))
+    except Exception as error:
+        if room is None:
+            raise
+        reason = diagnostic(error)
+        LOG.error("room reply failed for %s in %s: %s", local, room["name"], reason)
+        note = f"Room reply failed; sent 1:1: {reason}"
+        await relay_reply(component, cfg, local, note + "\n\n" + text)
+        return
     agent = cfg.get("voices", {}).get(local)
     if agent is None:
         return
@@ -634,17 +921,16 @@ async def relay_reply(component, cfg: dict, local: str, text: str) -> None:
                 raise BridgeError("upload slot request failed: " + diagnostic(condition)) from error
             put_url, get_url, headers = parse_slot(cfg, iq)
             await voice_worker(put_voice, cfg, put_url, audio, headers)
-            for owner in cfg["owner_jids"]:
-                message = component.make_message(mto=owner, mfrom=jid, mbody=get_url, mtype="chat")
+            for route in routes:
+                message = component.make_message(**route, mbody=get_url)
                 ET.SubElement(ET.SubElement(message.xml, "{jabber:x:oob}x"),
                               "{jabber:x:oob}url").text = get_url
                 message.send()
     except Exception as error:
         reason = diagnostic(error)
         LOG.error("voice reply failed for %s: %s", local, reason)
-        for owner in cfg["owner_jids"]:
-            component.send_message(mto=owner, mfrom=jid,
-                                   mbody="Voice reply failed: " + reason, mtype="chat")
+        for route in routes:
+            component.send_message(**route, mbody="Voice reply failed: " + reason)
 
 
 def run_bridge(cfg: dict) -> int:
@@ -657,6 +943,7 @@ def run_bridge(cfg: dict) -> int:
     secret = read_secret(cfg["component_secret_file"])
     gate = Gate(cfg["owner_jids"], cfg["rate_per_minute"])
     seen = Seen(state_root() / "seen.json")
+    room_map = RoomMap(state_root() / "room-map.json")
 
     class Component(slixmpp.ComponentXMPP):
         def __init__(self) -> None:
@@ -666,19 +953,139 @@ def run_bridge(cfg: dict) -> int:
             self.register_plugin("xep_0363")
             self.add_event_handler("session_start", self.on_start)
             self.add_event_handler("message", self.on_message)
+            self.add_event_handler("presence", self.on_presence)
             self.add_event_handler("presence_subscribe", self.on_subscribe)
             self.add_event_handler("presence_probe", self.on_probe)
             self.poller = None
             self.voice_jobs = 0
+            self.joined: set[tuple[str, str]] = set()
+            self.room_occupants: dict[str, dict[str, str]] = {}
+            self.join_failures: set[tuple[str, str]] = set()
 
         def seat_jid(self, local: str) -> str:
             return f"{local}@{cfg['component_jid']}"
 
+        def room_send(self, room: dict, local: str, body: str) -> None:
+            self.send_message(mto=room["jid"], mfrom=room_occupant(room, local),
+                              mbody=body, mtype="groupchat")
+
+        def join_room(self, room: dict, local: str) -> None:
+            occupant = room_occupant(room, local)
+            presence = self.make_presence(pto=occupant, pfrom=self.seat_jid(local))
+            history = ET.SubElement(ET.SubElement(presence.xml, "{" + MUC_NS + "}x"),
+                                    "{" + MUC_NS + "}history")
+            history.set("maxstanzas", "0")
+            presence.send()
+            self.joined.add((room["jid"], local))
+
+        def join_failure(self, room: dict, local: str, reason: str) -> None:
+            marker = (room["jid"], local)
+            self.joined.discard(marker)
+            if marker in self.join_failures:
+                return
+            self.join_failures.add(marker)
+            LOG.error("room join failed for %s in %s: %s", local, room["name"], reason)
+            message = f"Room join failed for {room['name']} ({local}): {diagnostic(reason)}"
+            for owner in cfg["owner_jids"]:
+                self.send_message(mto=owner, mfrom=self.seat_jid(room["lead"]),
+                                  mbody=message, mtype="chat")
+
+        def on_presence(self, presence) -> None:
+            room_jid = bare(str(presence["from"]))
+            room = cfg["room_by_jid"].get(room_jid)
+            if room is None:
+                return
+            nick = occupant_nick(str(presence["from"]))
+            local = room["nick_to_seat"].get(nick.casefold())
+            ptype = str(presence["type"] or "")
+            if ptype in {"unavailable", "error"}:
+                if local is None:
+                    self.room_occupants.get(room_jid, {}).pop(nick, None)
+                    return
+                reason = "presence error" if ptype == "error" else "occupant left"
+                if ptype == "error":
+                    for element in presence.xml.iter():
+                        if xml_local(element.tag) == "text" and element.text:
+                            reason = element.text
+                self.join_failure(room, local, reason) if ptype == "error" else self.joined.discard((room_jid, local))
+                self.room_occupants.get(room_jid, {}).pop(nick, None)
+                return
+            real = None
+            for element in presence.xml.iter():
+                if (xml_local(element.tag) == "item" and
+                        str(element.tag).startswith("{" + MUC_USER_NS + "}") and
+                        element.get("jid")):
+                    real = bare(element.get("jid"))
+                    break
+            if real:
+                self.room_occupants.setdefault(room_jid, {})[nick] = real
+
+        async def on_room_message(self, msg) -> None:
+            room = cfg["room_by_jid"].get(bare(str(msg["from"])))
+            if room is None:
+                return
+            local = recipient_local(msg)
+            if local not in room["seats"] or (room["jid"], local) not in self.joined:
+                return
+            nick = occupant_nick(str(msg["from"]))
+            if any(nick.casefold() == room["nicks"][seat].casefold()
+                   for seat in room["seats"]):
+                return
+            sender = self.room_occupants.get(room["jid"], {}).get(nick)
+            if sender not in gate.owners or has_xml_element(msg, "delay"):
+                return
+            url = voice_url(cfg, msg)
+            body = str(msg["body"] or "")
+            if not body and url is None:
+                return
+            refusal = gate.admit(sender, time.monotonic())
+            if refusal:
+                LOG.warning("refused %s from room occupant %s", refusal, nick)
+                if refusal == "rate_limited":
+                    self.room_send(room, room["lead"], "Rate limited; message not delivered.")
+                return
+            key = stanza_key(msg, room["jid"] + "|")
+            if not seen.check_and_add(key):
+                LOG.info("duplicate room stanza ignored")
+                return
+            targets, stripped, unknown = address_room(room, body)
+            if unknown is not None:
+                self.room_send(room, room["lead"],
+                               f"Unknown nickname {unknown}. Known nicknames: {known_nicknames(room)}")
+                return
+            if url is not None and self.voice_jobs >= VOICE_JOBS:
+                self.room_send(room, room["lead"],
+                               "Voice note not delivered: transcription capacity reached; resend later.")
+                return
+            if url is not None:
+                self.voice_jobs += 1
+            echoed = False
+            try:
+                for target in targets:
+                    transcript = await deliver_inbound(
+                        cfg, msg, sender, target, url, body=stripped,
+                        room=room, room_map=room_map)
+                    if url is not None and transcript and not echoed:
+                        self.room_send(room, target, echo_quote(cfg, sender, transcript))
+                        echoed = True
+            finally:
+                if url is not None:
+                    self.voice_jobs -= 1
+
         async def on_start(self, _event) -> None:
             LOG.info("component online: %s (%d seats)", cfg["component_jid"], len(cfg["seats"]))
+            self.joined.clear()
+            self.room_occupants.clear()
+            self.join_failures.clear()
             for local in cfg["seats"]:
                 for owner in cfg["owner_jids"]:
                     self.send_presence(pfrom=self.seat_jid(local), pto=owner)
+            for room in cfg["rooms"].values():
+                for local in room["seats"]:
+                    try:
+                        self.join_room(room, local)
+                    except Exception as error:
+                        self.join_failure(room, local, diagnostic(error))
             if self.poller is None:
                 self.poller = asyncio.ensure_future(self.poll_outbound())
 
@@ -695,6 +1102,9 @@ def run_bridge(cfg: dict) -> int:
                 self.send_presence(pfrom=presence["to"].bare, pto=presence["from"].bare)
 
         async def on_message(self, msg) -> None:
+            if msg["type"] == "groupchat":
+                await self.on_room_message(msg)
+                return
             if msg["type"] not in ("chat", "normal"):
                 return
             url = voice_url(cfg, msg)
@@ -745,7 +1155,15 @@ def run_bridge(cfg: dict) -> int:
                     if message_id:
                         await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_rejected"])
                     continue
-                await relay_reply(self, cfg, local, text)
+                parent = reply_parent(rendered)
+                mapped_room_jid = room_map.get(parent) if parent else None
+                room = cfg["room_by_jid"].get(mapped_room_jid) if mapped_room_jid else None
+                if mapped_room_jid and room is None:
+                    text = (f"Room reply not posted: the mapped room is not configured.\n\n{text}")
+                if mapped_room_jid:
+                    await relay_reply(self, cfg, local, text, room, self.joined)
+                else:
+                    await relay_reply(self, cfg, local, text)
                 if message_id:
                     await asyncio.to_thread(mailcortex, ["receipt", cfg["bridge_seat"], message_id, "handling_completed"])
                 LOG.info("relayed %s from %s", name, local)

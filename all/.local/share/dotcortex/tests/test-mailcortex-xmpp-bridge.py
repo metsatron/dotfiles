@@ -787,5 +787,191 @@ class RoutingTests(unittest.TestCase):
         self.assertIsNone(bridge.render_outbound(self.cfg, rendered)[0])
 
 
+class RoomTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        data = base_config(self.tmp) | {
+            "upload_base_url": "https://uploads.example.test/file_share/",
+            "upload_service_jid": "example.test",
+            "voices": {"fable": "Fable"},
+            "rooms": {
+                "comms": {
+                    "jid": "comms@rooms.example.test",
+                    "lead": "fable",
+                    "seats": ["fable", "worker"],
+                }
+            },
+            "nicks": {"worker": "Orca"},
+        }
+        path = self.tmp / "rooms.json"
+        path.write_text(json.dumps(data))
+        self.cfg = bridge.load_config(path)
+        self.room = self.cfg["rooms"]["comms"]
+
+    def test_room_config_defaults_and_validation(self):
+        self.assertEqual(self.room["nicks"], {"fable": "Fable", "worker": "Orca"})
+        self.assertEqual(self.cfg["room_by_jid"][self.room["jid"]], self.room)
+        cases = []
+        cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test/occupant",
+                                             "lead": "fable", "seats": ["fable"]}}})
+        cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test",
+                                             "lead": "ghost", "seats": ["fable"]}}})
+        cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test",
+                                             "lead": "fable", "seats": ["ghost"]}}})
+        cases.append({"nicks": {"fable": "Same", "worker": "same"}, "rooms": {
+            "comms": {"jid": "comms@rooms.example.test", "lead": "fable",
+                      "seats": ["fable", "worker"]}
+        }})
+        cases.append({"rooms": {
+            "comms": {"jid": "comms@rooms.example.test", "lead": "fable", "seats": ["fable"]},
+            "ops": {"jid": "ops@other.example.test", "lead": "fable", "seats": ["fable"]},
+        }})
+        for change in cases:
+            with self.subTest(change=change):
+                data = json.loads(json.dumps(base_config(self.tmp)))
+                data.update(change)
+                path = self.tmp / "invalid-room.json"
+                path.write_text(json.dumps(data))
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.load_config(path)
+
+    def test_room_addressing_and_prefix_stripping(self):
+        cases = (
+            ("Fable: hello", ["fable"], "hello", None),
+            ("@Fable @Orca hello", ["fable", "worker"], "hello", None),
+            ("@all hello", ["fable", "worker"], "hello", None),
+            ("plain line", ["fable"], "plain line", None),
+            ("Unknown: hello", [], "Unknown: hello", "Unknown"),
+        )
+        for raw, seats, body, unknown in cases:
+            with self.subTest(raw=raw):
+                self.assertEqual(bridge.address_room(self.room, raw), (seats, body, unknown))
+
+    def test_room_mail_has_room_header_subject_and_id_capture(self):
+        run = FakeRun({"send": "room.msg\t<room@example.test>\n"})
+        name, message_id = bridge.inbound_mail(
+            self.cfg, "owner@example.test/phone", "fable", "briefing",
+            run, capture_id=True, room=self.room)
+        self.assertEqual((name, message_id), ("room.msg", "<room@example.test>"))
+        argv = run.calls[0]
+        self.assertEqual(argv[argv.index("--subject") + 1], "[xmpp #comms] briefing")
+        self.assertIn("XMPP-Room: comms@rooms.example.test\n", argv[argv.index("--body") + 1])
+        self.assertIn("--print-id", argv)
+
+    def test_room_map_is_capped_and_private(self):
+        path = self.tmp / "state" / "room-map.json"
+        mapping = bridge.RoomMap(path)
+        for index in range(bridge.SEEN_CAP + 1):
+            mapping.add(f"<{index}@example.test>", self.room["jid"])
+        self.assertIsNone(mapping.get("<0@example.test>"))
+        self.assertEqual(mapping.get(f"<{bridge.SEEN_CAP}@example.test>"), self.room["jid"])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+
+    def test_room_reply_is_groupchat_only_and_unjoined_falls_back(self):
+        class Component:
+            def __init__(self):
+                self.messages = []
+            def send_message(self, **kwargs):
+                self.messages.append(kwargs)
+        cfg = dict(self.cfg, voices={})
+        component = Component()
+        asyncio.run(bridge.relay_reply(component, cfg, "fable", "**reply**",
+                                        self.room, {(self.room["jid"], "fable")}))
+        self.assertEqual(len(component.messages), 1)
+        self.assertEqual(component.messages[0]["mtype"], "groupchat")
+        self.assertEqual(component.messages[0]["mto"], self.room["jid"])
+        component.messages.clear()
+        asyncio.run(bridge.relay_reply(component, cfg, "fable", "reply", self.room, set()))
+        self.assertEqual([message["mtype"] for message in component.messages], ["chat"])
+        self.assertIn("not posted", component.messages[0]["mbody"])
+
+    def test_history_and_origin_identifiers_are_recognized(self):
+        message = FakeMessage("hello", mid="stanza")
+        ET.SubElement(message.xml, "{urn:xmpp:delay}delay")
+        ET.SubElement(message.xml, "{urn:xmpp:sid:0}origin-id", {"id": "origin"})
+        self.assertTrue(bridge.has_xml_element(message, "delay"))
+        self.assertEqual(bridge.stanza_key(message, "room|"), "room|origin-id:origin")
+
+    def test_room_authentication_drops_spoof_history_duplicate_and_nonowner(self):
+        loop = asyncio.new_event_loop()
+        self.addCleanup(loop.close)
+        asyncio.set_event_loop(loop)
+        self.addCleanup(asyncio.set_event_loop, None)
+        instances = []
+        sent_presences = []
+        class Presence:
+            def __init__(self, pto, pfrom):
+                self.xml = ET.Element("presence")
+                self.pto, self.pfrom, self.sent = pto, pfrom, False
+            def send(self):
+                self.sent = True
+                sent_presences.append(self)
+        class ComponentBase:
+            def __init__(self, *args):
+                self.disconnected = loop.create_future()
+                self.handlers = {}
+                self.messages = []
+                instances.append(self)
+            def register_plugin(self, name):
+                pass
+            def add_event_handler(self, name, handler):
+                self.handlers[name] = handler
+            def connect(self):
+                self.disconnected.set_result(None)
+            def make_presence(self, pto=None, pfrom=None):
+                return Presence(pto, pfrom)
+            def send_message(self, **kwargs):
+                self.messages.append(kwargs)
+        cfg = dict(self.cfg, voices={})
+        with patch.dict("sys.modules", {"slixmpp": types.SimpleNamespace(ComponentXMPP=ComponentBase)}), \
+                patch.object(bridge, "state_root", return_value=self.tmp / "state"):
+            bridge.run_bridge(cfg)
+        component, = instances
+        component.join_room(self.room, "fable")
+        component.join_room(self.room, "worker")
+        self.assertEqual(sent_presences[0].pto, "comms@rooms.example.test/Fable")
+        self.assertEqual(sent_presences[0].pfrom, "fable@seats.example.test")
+        history = sent_presences[0].xml.find("{" + bridge.MUC_NS + "}x/{" + bridge.MUC_NS + "}history")
+        self.assertEqual(history.get("maxstanzas"), "0")
+        class RoomPresence:
+            def __init__(self, room_jid, nick, real):
+                self.values = {"from": room_jid + "/" + nick, "type": "available"}
+                self.xml = ET.Element("presence")
+                item = ET.SubElement(self.xml, "{" + bridge.MUC_USER_NS + "}item")
+                item.set("jid", real)
+            def __getitem__(self, key):
+                return self.values[key]
+        component.handlers["presence"](RoomPresence(self.room["jid"], "admiral", "owner@example.test/phone"))
+        component.handlers["presence"](RoomPresence(self.room["jid"], "intruder", "evil@example.test/phone"))
+        calls = []
+        def deliver(cfg, sender, local, body, run=subprocess.run, capture_id=False, room=None):
+            calls.append((sender, local, body, room["jid"]))
+            return "fixture.msg", "<" + local + "@example.test>"
+        async def direct(function, *args, **kwargs):
+            return function(*args, **kwargs)
+        with patch.object(bridge, "inbound_mail", side_effect=deliver), \
+                patch.object(bridge.asyncio, "to_thread", side_effect=direct):
+            def room_message(body, nick="admiral", mid="fixture"):
+                msg = FakeMessage(body, sender=self.room["jid"] + "/" + nick,
+                                  local="fable", mid=mid)
+                msg.values["type"] = "groupchat"
+                return msg
+            loop.run_until_complete(component.handlers["message"](room_message("plain", mid="lead")))
+            loop.run_until_complete(component.handlers["message"](room_message("@Orca addressed", mid="seat")))
+            loop.run_until_complete(component.handlers["message"](room_message("@all everyone", mid="all")))
+            loop.run_until_complete(component.handlers["message"](room_message("evil", "intruder", "evil")))
+            loop.run_until_complete(component.handlers["message"](room_message("spoof", "Fable", "spoof")))
+            delayed = room_message("history", mid="history")
+            ET.SubElement(delayed.xml, "{urn:xmpp:delay}delay")
+            loop.run_until_complete(component.handlers["message"](delayed))
+            loop.run_until_complete(component.handlers["message"](room_message("duplicate", mid="seat")))
+            loop.run_until_complete(component.handlers["message"](room_message("@Unknown nope", mid="unknown")))
+        self.assertEqual([(local, body) for _sender, local, body, _room in calls],
+                         [("fable", "plain"), ("worker", "addressed"),
+                          ("fable", "everyone"), ("worker", "everyone")])
+        self.assertEqual(len(component.messages), 1)
+        self.assertIn("Known nicknames", component.messages[0]["mbody"])
+
+
 if __name__ == "__main__":
     unittest.main()
