@@ -86,7 +86,7 @@ guix-nonguix: guix-dirs
 # The X230 must never get this profile: it is the fileserver and does no local inference.
 guix-inference: guix-dirs
 | mkdir -p $(EXTRA)/inference
-| $(GUIX) package -m $(GUIX_HOME)/manifests/inference.scm -p $(EXTRA)/inference/inference
+| $(GUIX) package -L $(LOCAL_PKGS) -m $(GUIX_HOME)/manifests/inference.scm -p $(EXTRA)/inference/inference
 
 # Virtual Habitat — sanctuary substrate profiles (Phase 0B stubs; apply in Phase 1A)
 guix-desktop-common: guix-dirs
