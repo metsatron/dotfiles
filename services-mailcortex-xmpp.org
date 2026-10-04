@@ -197,7 +197,10 @@ GET URLs are bearer capabilities: keep them on the tailnet and out of logs.
 ** Reply voice activation (C3)
 
 After successful voice-mail delivery, the original owner receives the transcript
-quoted on every line from the addressed seat. =Message.reply= preserves an
+from the addressed seat in reply shape: a => Re: <name>= line, then the
+transcript wrapped in double quotes with every line quoted. =<name>= comes from
+the optional private =display_names= map (owner bare JID to a one-line name),
+falling back to the JID's local part. =Message.reply= preserves an
 existing thread and its parent; absent a thread, this is an ordinary quote.
 Outbound Markdown is translated conservatively to XEP-0393; escaped syntax,
 inline code, fenced/indented code and ambiguous constructs remain opaque.
@@ -236,7 +239,8 @@ No private/site file is written by this module, and nothing is restarted here.
 #+BEGIN_SRC json :tangle no
 {
   "upload_service_jid": "YOUR_VIRTUALHOST_DOMAIN",
-  "voices": { "YOUR_SEAT_LOCAL_PART": "YOUR_PVOX_AGENT" }
+  "voices": { "YOUR_SEAT_LOCAL_PART": "YOUR_PVOX_AGENT" },
+  "display_names": { "YOUR_OWNER_JID": "YOUR_DISPLAY_NAME" }
 }
 #+END_SRC
 
@@ -449,7 +453,15 @@ def load_config(path: Path) -> dict:
         raise BridgeError("upload_service_jid must be the upload VirtualHost domain")
     if voices and (not upload or not service):
         raise BridgeError("voices requires upload_base_url and upload_service_jid")
+    names = data.get("display_names", {})
+    owner_set = {bare(o) for o in owners}
+    if (not isinstance(names, dict) or any(
+            bare(jid) not in owner_set or not isinstance(name, str)
+            or not re.fullmatch(r"[^\x00-\x1f\x7f]{1,64}", name)
+            or name != name.strip() for jid, name in names.items())):
+        raise BridgeError("display_names must map owner JIDs to one-line names")
     return {
+        "display_names": {bare(jid): name for jid, name in names.items()},
         "voices": dict(voices),
         "upload_service_jid": service,
         "upload_base_url": upload,
@@ -707,6 +719,13 @@ def inbound_voice(cfg: dict, sender: str, local: str, url: str,
         return name, text  # Expose the transcript only after MailCortex succeeds.
 
 
+def echo_quote(cfg: dict, sender: str, transcript: str) -> str:
+    """Reply-shaped echo: '> Re: <name>' then the transcript in quotes, every line quoted."""
+    name = cfg.get("display_names", {}).get(bare(sender)) or bare(sender).split("@")[0]
+    lines = ('"' + transcript + '"').split("\n")
+    return "\n".join(["> Re: " + name] + ["> " + line for line in lines])
+
+
 async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | None) -> None:
     try:
         if url is not None:
@@ -723,7 +742,7 @@ async def deliver_inbound(cfg: dict, msg, sender: str, local: str, url: str | No
     if url is not None:
         # slixmpp Message.reply swaps the original seat/owner and preserves thread.
         try:
-            msg.reply("\n".join("> " + line for line in transcript.split("\n"))).chat().send()
+            msg.reply(echo_quote(cfg, sender, transcript)).chat().send()
         except Exception as error:
             LOG.error("transcript delivered but echo failed for %s: %s", local, diagnostic(error))
 
@@ -1701,6 +1720,20 @@ class ReplyVoiceTests(unittest.TestCase):
                 with self.assertRaises(bridge.BridgeError):
                     bridge.load_config(path)
 
+    def test_display_names_map_owners_only(self):
+        self.assertEqual(self.cfg["display_names"], {})
+        path = self.tmp / "names.json"
+        valid = base_config(self.tmp) | {"display_names": {"owner@example.test": "Metsatron"}}
+        path.write_text(json.dumps(valid))
+        self.assertEqual(bridge.load_config(path)["display_names"], {"owner@example.test": "Metsatron"})
+        for names in ([], {"stranger@example.test": "X"}, {"owner@example.test": ""},
+                      {"owner@example.test": "two\nlines"}, {"owner@example.test": " pad"},
+                      {"owner@example.test": 5}):
+            with self.subTest(names=names):
+                path.write_text(json.dumps(valid | {"display_names": names}))
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.load_config(path)
+
     def test_echo_only_after_delivery_and_preserves_every_line(self):
         msg = FakeMessage(self.url)
         def mail(args, run):
@@ -1710,7 +1743,14 @@ class ReplyVoiceTests(unittest.TestCase):
                 patch.object(bridge, "transcribe_voice", return_value="one\n\n**two**"), \
                 patch.object(bridge, "mailcortex", side_effect=mail):
             asyncio.run(bridge.deliver_inbound(self.cfg, msg, "owner@example.test", "fable", self.url))
-        self.assertEqual(msg.replies, ["> one\n> \n> **two**"])
+        self.assertEqual(msg.replies, ['> Re: owner\n> "one\n> \n> **two**"'])
+        msg = FakeMessage(self.url)
+        cfg = dict(self.cfg, display_names={"owner@example.test": "Metsatron"})
+        with patch.object(bridge, "download_voice", side_effect=self.download), \
+                patch.object(bridge, "transcribe_voice", return_value="hello"), \
+                patch.object(bridge, "mailcortex", return_value="delivered.msg"):
+            asyncio.run(bridge.deliver_inbound(cfg, msg, "owner@example.test/phone", "fable", self.url))
+        self.assertEqual(msg.replies, ['> Re: Metsatron\n> "hello"'])
         for failure in ("transcribe", "mail"):
             msg = FakeMessage(self.url)
             with patch.object(bridge, "download_voice", side_effect=self.download), \
