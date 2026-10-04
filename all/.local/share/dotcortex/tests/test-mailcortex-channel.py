@@ -69,6 +69,10 @@ class ChannelTest(unittest.TestCase):
         rows = self.mc(["inbox", FACE]).splitlines()
         self.assertEqual(len(rows), 1)
         self.assertIn(AGENT, rows[0])
+        reply_name = rows[0].split("\t")[1]
+        reply_rendered = self.mc(["read", FACE, reply_name])
+        self.assertIn("In-Reply-To: " + mid, reply_rendered)
+        self.assertIn("References: " + mid, reply_rendered)
         receipts = list((self.tmp / "state" / "receipts" / "fable").glob("*.json"))
         self.assertEqual(len(receipts), 1)
         self.assertIn("handling_completed", receipts[0].read_text())
