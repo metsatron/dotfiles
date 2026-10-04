@@ -45,7 +45,8 @@
 ;; CPU-tuned local inference. Apply with `loom guix:inference-apply'.
 ;; Deliberately excluded from core.scm — see the notes in package-guix.org.
 (use-modules (gnu packages)
-             (guix transformations))
+             (guix transformations)
+             (local packages llama-swap))
 
 ;; ggml and ggml-for-whisper are separate packages carrying the same defect; both need the flag.
 ;;
@@ -64,7 +65,8 @@
      (with-configure-flag . "ggml-for-whisper=-DGGML_CPU_ALL_VARIANTS=ON"))))
 
 (packages->manifest
- (map (compose tune-ggml specification->package)
-      (list "llama-cpp"      ; Recall embeddings (Qwen3-Embedding) + local chat fallback
-            "whisper-cpp"))) ; whisper-transcribe, whisper-hotkey dictation, telegram voice
+ (cons llama-swap
+       (map (compose tune-ggml specification->package)
+            (list "llama-cpp"      ; Recall embeddings (Qwen3-Embedding) + local chat fallback
+                  "whisper-cpp")))) ; whisper-transcribe, whisper-hotkey dictation, telegram voice
 ;; Inference profile — CPU-tuned llama.cpp and whisper.cpp:1 ends here
