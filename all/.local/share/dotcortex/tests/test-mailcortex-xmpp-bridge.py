@@ -499,6 +499,20 @@ class ReplyVoiceTests(unittest.TestCase):
                 with self.assertRaises(bridge.BridgeError):
                     bridge.load_config(path)
 
+    def test_display_names_map_owners_only(self):
+        self.assertEqual(self.cfg["display_names"], {})
+        path = self.tmp / "names.json"
+        valid = base_config(self.tmp) | {"display_names": {"owner@example.test": "Metsatron"}}
+        path.write_text(json.dumps(valid))
+        self.assertEqual(bridge.load_config(path)["display_names"], {"owner@example.test": "Metsatron"})
+        for names in ([], {"stranger@example.test": "X"}, {"owner@example.test": ""},
+                      {"owner@example.test": "two\nlines"}, {"owner@example.test": " pad"},
+                      {"owner@example.test": 5}):
+            with self.subTest(names=names):
+                path.write_text(json.dumps(valid | {"display_names": names}))
+                with self.assertRaises(bridge.BridgeError):
+                    bridge.load_config(path)
+
     def test_echo_only_after_delivery_and_preserves_every_line(self):
         msg = FakeMessage(self.url)
         def mail(args, run):
@@ -508,7 +522,14 @@ class ReplyVoiceTests(unittest.TestCase):
                 patch.object(bridge, "transcribe_voice", return_value="one\n\n**two**"), \
                 patch.object(bridge, "mailcortex", side_effect=mail):
             asyncio.run(bridge.deliver_inbound(self.cfg, msg, "owner@example.test", "fable", self.url))
-        self.assertEqual(msg.replies, ["> one\n> \n> **two**"])
+        self.assertEqual(msg.replies, ['> Re: owner\n> "one\n> \n> **two**"'])
+        msg = FakeMessage(self.url)
+        cfg = dict(self.cfg, display_names={"owner@example.test": "Metsatron"})
+        with patch.object(bridge, "download_voice", side_effect=self.download), \
+                patch.object(bridge, "transcribe_voice", return_value="hello"), \
+                patch.object(bridge, "mailcortex", return_value="delivered.msg"):
+            asyncio.run(bridge.deliver_inbound(cfg, msg, "owner@example.test/phone", "fable", self.url))
+        self.assertEqual(msg.replies, ['> Re: Metsatron\n> "hello"'])
         for failure in ("transcribe", "mail"):
             msg = FakeMessage(self.url)
             with patch.object(bridge, "download_voice", side_effect=self.download), \
