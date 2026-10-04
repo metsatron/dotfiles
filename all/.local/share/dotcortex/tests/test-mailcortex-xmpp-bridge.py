@@ -8,6 +8,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -483,7 +484,8 @@ class ComponentVoiceTests(unittest.TestCase):
             self.assertEqual(bridge.run_bridge(self.cfg), 1)
         component, = instances
         async def exercise():
-            with patch.object(bridge, "inbound_voice", return_value=("voice.msg", "heard words")) as worker:
+            with patch.object(bridge, "inbound_voice", return_value=("voice.msg", "heard words")) as worker, \
+                    patch.object(bridge, "transcribe_permission_voice", return_value=""):
                 owner = FakeMessage("", self.url)
                 await component.handlers["message"](owner)
                 worker.assert_called_once_with(self.cfg, "owner@example.test", "fable", self.url)
@@ -1087,6 +1089,155 @@ class RoomTests(unittest.TestCase):
                           ("fable", "everyone"), ("worker", "everyone")])
         self.assertEqual(len(component.messages), 1)
         self.assertIn("Known nicknames", component.messages[0]["mbody"])
+
+
+class ServiceEnsureTests(unittest.TestCase):
+    LOCAL = "YOUR_LOCAL_INTERFACE"
+    TAILNET = "YOUR_TAILNET_INTERFACE"
+    C2S_PORT = "5222"
+    HTTPS_PORT = "1"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.fakebin = self.home / "fakebin"
+        self.fakebin.mkdir()
+        self.base = self.home / ".config/mailcortex/xmpp"
+        self.site = self.home / ".config/mailcortex/xmpp-private"
+        self.data = self.home / ".local/share/mailcortex/xmpp"
+        self.state = self.home / ".local/state/mailcortex/xmpp"
+        self.base.mkdir(parents=True)
+        self.site.mkdir(parents=True)
+        self.data.mkdir(parents=True)
+        self.state.mkdir(parents=True)
+        (self.base / "prosody.cfg.lua").write_text("-- fixture\n")
+        (self.site / "bridge.json").write_text("{}\n")
+        (self.site / "local.cfg.lua").write_text(
+            f'c2s_interfaces = {{ "{self.LOCAL}", "{self.TAILNET}" }}\n'
+            f'c2s_ports = {{ {self.C2S_PORT} }}\n'
+            f'https_interfaces = {{ "{self.TAILNET}" }}\n'
+            f'https_ports = {{ {self.HTTPS_PORT} }}\n')
+        self.prosody_starts = self.home / "prosody-starts"
+        self.bridge_starts = self.home / "bridge-starts"
+        self.current_ss = self.home / "ss-current"
+        self.healthy_ss = self.home / "ss-healthy"
+        self.ip_output = self.home / "ip-output"
+        self.current_ss.write_text(self.ss_rows(
+            self.LOCAL, self.C2S_PORT, self.TAILNET, self.C2S_PORT,
+            self.TAILNET, self.HTTPS_PORT))
+        self.healthy_ss.write_text(self.current_ss.read_text())
+        self.ip_output.write_text(self.ip_rows(self.LOCAL, self.TAILNET))
+        self.write_fake("ss", """starts=$(wc -l < "$MAILCORTEX_TEST_PROSODY_STARTS" 2>/dev/null || printf '0')
+if [ "$starts" -ge 2 ]; then cat "$MAILCORTEX_TEST_SS_HEALTHY"; else cat "$MAILCORTEX_TEST_SS_CURRENT"; fi
+""")
+        self.write_fake("ip", """cat "$MAILCORTEX_TEST_IP_OUTPUT"
+""")
+        self.write_fake("prosody", """printf '%s\\n' "$$" > "$MAILCORTEX_TEST_PROSODY_PID"
+printf '%s\\n' start >> "$MAILCORTEX_TEST_PROSODY_STARTS"
+trap 'exit 0' TERM INT
+while :; do sleep 0.05; done
+""")
+        self.write_fake("mailcortex-xmpp-bridge", """if [ "$1" = --check ]; then exit 0; fi
+if [ "$1" != --fixture ]; then printf '%s\\n' start >> "$MAILCORTEX_TEST_BRIDGE_STARTS"; fi
+printf '%s\\n' "$$" > "$MAILCORTEX_TEST_BRIDGE_PID"
+trap 'exit 0' TERM INT
+while :; do sleep 0.05; done
+""")
+        self.env = os.environ.copy() | {
+            "HOME": str(self.home),
+            "PATH": str(self.fakebin) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "MAILCORTEX_TEST_PROSODY_PID": str(self.data / "prosody.pid"),
+            "MAILCORTEX_TEST_PROSODY_STARTS": str(self.prosody_starts),
+            "MAILCORTEX_TEST_BRIDGE_PID": str(self.state / "bridge.pid"),
+            "MAILCORTEX_TEST_BRIDGE_STARTS": str(self.bridge_starts),
+            "MAILCORTEX_TEST_SS_CURRENT": str(self.current_ss),
+            "MAILCORTEX_TEST_SS_HEALTHY": str(self.healthy_ss),
+            "MAILCORTEX_TEST_IP_OUTPUT": str(self.ip_output),
+        }
+        self.service = Path(__file__).resolve().parents[5] / "linux/.local/bin/mailcortex-xmpp-service"
+        self.processes = []
+        self.start_fixture("prosody", "--config", str(self.base / "prosody.cfg.lua"))
+        self.start_fixture("mailcortex-xmpp-bridge", "--fixture")
+
+    def tearDown(self):
+        for process in self.processes:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+    def write_fake(self, name, body):
+        path = self.fakebin / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+
+    @staticmethod
+    def ss_rows(*pairs):
+        return "".join(
+            f"LISTEN 0 128 {address}:{port} peer:*\n"
+            for address, port in zip(pairs[::2], pairs[1::2]))
+
+    @staticmethod
+    def ip_rows(*addresses):
+        return "".join(
+            f"2: fixture0 inet {address}/32 scope global\n"
+            for address in addresses)
+
+    def start_fixture(self, command, *args):
+        process = subprocess.Popen(
+            [str(self.fakebin / command), *args], env=self.env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.processes.append(process)
+        deadline = time.monotonic() + 2
+        pidfile = self.data / "prosody.pid" if command == "prosody" else self.state / "bridge.pid"
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.01)
+        self.assertTrue(pidfile.exists(), f"{command} fixture did not write its pid")
+        self.assertIsNone(process.poll(), f"{command} fixture exited")
+
+    def run_ensure(self):
+        return subprocess.run(
+            [str(self.service), "ensure"], env=self.env,
+            text=True, capture_output=True, check=False)
+
+    def assert_private_values_are_silent(self, result):
+        output = result.stdout + result.stderr
+        for value in (self.LOCAL, self.TAILNET):
+            self.assertNotIn(value, output)
+        for log in self.home.rglob("*.log"):
+            content = log.read_text()
+            self.assertNotIn(self.LOCAL, content)
+            self.assertNotIn(self.TAILNET, content)
+
+    def test_healthy_listeners_are_a_noop(self):
+        result = self.run_ensure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.prosody_starts.read_text().splitlines(), ["start"])
+        self.assertFalse(self.bridge_starts.exists())
+        self.assert_private_values_are_silent(result)
+
+    def test_present_but_missing_tailnet_listener_restarts_once(self):
+        self.current_ss.write_text(self.ss_rows(self.LOCAL, self.C2S_PORT))
+        result = self.run_ensure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.prosody_starts.read_text().splitlines(), ["start", "start"])
+        self.assertFalse(self.bridge_starts.exists())
+        self.assertIn("restarting Prosody", result.stderr)
+        self.assert_private_values_are_silent(result)
+
+    def test_absent_tailnet_address_defers_without_restart(self):
+        self.current_ss.write_text(self.ss_rows(self.LOCAL, self.C2S_PORT))
+        self.ip_output.write_text(self.ip_rows(self.LOCAL))
+        result = self.run_ensure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.prosody_starts.read_text().splitlines(), ["start"])
+        self.assertFalse(self.bridge_starts.exists())
+        self.assertIn("not present yet", result.stderr)
+        self.assert_private_values_are_silent(result)
 
 
 if __name__ == "__main__":
