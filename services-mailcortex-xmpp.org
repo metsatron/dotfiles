@@ -2008,10 +2008,14 @@ if __name__ == "__main__":
 
 * Service owner
 
-=mailcortex-xmpp-service= owns both processes on the serving host: Prosody (user instance, this module's configuration) and the bridge. =ensure= is idempotent and is what the boot and self-heal cron lines call; it starts only what is not running and refuses to start anything until the private site files exist. Processes are identified by pidfile plus a command-line check, never by name alone. =renew-cert= reads the client domain from the private =cert-domain= file, refreshes the Tailscale certificate (Tailscale reissues only inside its renewal window) and sends Prosody =SIGHUP= when the certificate changed, so it reloads without dropping clients. =install-cron= adds the tagged =@reboot=, five-minute self-heal and weekly renewal lines to the user crontab once; =remove-cron= deletes only those tagged lines.
+=mailcortex-xmpp-service= owns both processes on the serving host: Prosody (user instance, this module's configuration) and the bridge. =ensure= is idempotent and is what the boot and self-heal cron lines call; it starts only what is not running and refuses to start anything until the private site files exist. After Prosody is alive, =ensure= reads the private listener arrays without exposing their values, checks every c2s and optional HTTPS endpoint with =ss=, and distinguishes a missing local address (restart Prosody once) from an address that Tailscale has not assigned yet (log and defer). Processes are identified by pidfile plus a command-line check, never by name alone. =renew-cert= reads the client domain from the private =cert-domain= file, refreshes the Tailscale certificate (Tailscale reissues only inside its renewal window) and sends Prosody =SIGHUP= when the certificate changed, so it reloads without dropping clients. =install-cron= adds the tagged =@reboot=, five-minute self-heal and weekly renewal lines to the user crontab once; its PATH includes the system networking helpers; =remove-cron= deletes only those tagged lines.
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/mailcortex-xmpp-service :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 set -euo pipefail
+
+# Cron on Devuan does not include the system networking helpers by default.
+PATH="${PATH:-/usr/local/bin:/usr/bin:/bin}:/usr/local/sbin:/usr/sbin:/sbin"
+export PATH
 
 usage() {
   cat <<'EOF'
@@ -2056,6 +2060,171 @@ start_prosody() {
   return 1
 }
 
+# Read only quoted list members from one top-level Lua assignment. The output
+# is consumed by a private process substitution; it never reaches this
+# service's stdout, stderr or log.
+private_lua_strings() {
+  awk -v want="$1" '
+    {
+      line = $0
+      if (!inside) {
+        if (line !~ "^[[:space:]]*" want "[[:space:]]*=[[:space:]]*[{]") next
+        inside = 1
+        sub(/^[^{]*[{]/, "", line)
+      }
+      while (match(line, /"[^"]*"|\047[^\047]*\047/)) {
+        token = substr(line, RSTART, RLENGTH)
+        print substr(token, 2, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+      if (index(line, "}") > 0) exit
+    }
+  ' "$site/local.cfg.lua"
+}
+
+private_lua_numbers() {
+  awk -v want="$1" '
+    {
+      line = $0
+      if (!inside) {
+        if (line !~ "^[[:space:]]*" want "[[:space:]]*=[[:space:]]*[{]") next
+        inside = 1
+        sub(/^[^{]*[{]/, "", line)
+      }
+      while (match(line, /[0-9]+/)) {
+        print substr(line, RSTART, RLENGTH)
+        line = substr(line, RSTART + RLENGTH)
+      }
+      if (index(line, "}") > 0) exit
+    }
+  ' "$site/local.cfg.lua"
+}
+
+load_expected_listeners() {
+  local -a c2s_interfaces=() c2s_ports=() https_interfaces=() https_ports=()
+  local interface port
+  expected_listeners=()
+  while IFS= read -r interface; do
+    [ -n "$interface" ] && c2s_interfaces+=("$interface")
+  done < <(private_lua_strings c2s_interfaces)
+  [ "${#c2s_interfaces[@]}" -gt 0 ] || {
+    echo "mailcortex-xmpp-service: private c2s_interfaces is missing or empty" >&2
+    return 1
+  }
+  while IFS= read -r port; do
+    [ -n "$port" ] && c2s_ports+=("$port")
+  done < <(private_lua_numbers c2s_ports)
+  [ "${#c2s_ports[@]}" -gt 0 ] || c2s_ports=(5222)
+  for interface in "${c2s_interfaces[@]}"; do
+    for port in "${c2s_ports[@]}"; do
+      expected_listeners+=("$interface|$port")
+    done
+  done
+
+  while IFS= read -r interface; do
+    [ -n "$interface" ] && https_interfaces+=("$interface")
+  done < <(private_lua_strings https_interfaces)
+  [ "${#https_interfaces[@]}" -eq 0 ] && return 0
+  while IFS= read -r port; do
+    [ -n "$port" ] && https_ports+=("$port")
+  done < <(private_lua_numbers https_ports)
+  [ "${#https_ports[@]}" -gt 0 ] || {
+    echo "mailcortex-xmpp-service: private https_interfaces has no https_ports" >&2
+    return 1
+  }
+  for interface in "${https_interfaces[@]}"; do
+    for port in "${https_ports[@]}"; do
+      expected_listeners+=("$interface|$port")
+    done
+  done
+}
+
+listener_has_endpoint() {
+  local address="$1" port="$2" endpoint candidate
+  while read -r _ _ _ endpoint _; do
+    case "$endpoint" in
+      *":$port") candidate="${endpoint%:$port}" ;;
+      *) continue ;;
+    esac
+    candidate="${candidate#[}"
+    candidate="${candidate%]}"
+    [ "$candidate" = "$address" ] && return 0
+  done <<< "$listener_snapshot"
+  return 1
+}
+
+interface_has_address() {
+  local address="$1" cidr
+  while read -r _ _ _ cidr _; do
+    [ "${cidr%%/*}" = "$address" ] && return 0
+  done <<< "$interface_snapshot"
+  return 1
+}
+
+check_prosody_listeners() {
+  local expected address port missing_local=0 missing_absent=0
+  load_expected_listeners || return 1
+  command -v ss >/dev/null 2>&1 || {
+    echo "mailcortex-xmpp-service: ss is unavailable; cannot verify Prosody listeners" >&2
+    return 1
+  }
+  command -v ip >/dev/null 2>&1 || {
+    echo "mailcortex-xmpp-service: ip is unavailable; cannot verify local interfaces" >&2
+    return 1
+  }
+  if ! listener_snapshot="$(ss -H -ltn 2>/dev/null)"; then
+    echo "mailcortex-xmpp-service: ss listener probe failed" >&2
+    return 1
+  fi
+  if ! interface_snapshot="$(ip -o address show 2>/dev/null)"; then
+    echo "mailcortex-xmpp-service: local interface probe failed" >&2
+    return 1
+  fi
+  for expected in "${expected_listeners[@]}"; do
+    address="${expected%%|*}"
+    port="${expected#*|}"
+    listener_has_endpoint "$address" "$port" && continue
+    if interface_has_address "$address"; then
+      missing_local=1
+    else
+      missing_absent=1
+    fi
+  done
+  if [ "$missing_absent" -eq 1 ]; then
+    echo "mailcortex-xmpp-service: expected listener address is not present yet; retrying" >&2
+  fi
+  [ "$missing_local" -eq 0 ] || return 11
+  [ "$missing_absent" -eq 0 ] || return 10
+  return 0
+}
+
+ensure_prosody() {
+  local rc
+  start_prosody
+  if check_prosody_listeners; then
+    return 0
+  else
+    rc=$?
+  fi
+  case "$rc" in
+    10) return 10 ;;
+    11)
+      echo "mailcortex-xmpp-service: expected Prosody listener is missing; restarting Prosody" >&2
+      stop_one "$prosody_pid" "$config"
+      start_prosody
+      if check_prosody_listeners; then
+        return 0
+      else
+        rc=$?
+      fi
+      [ "$rc" -eq 10 ] && return 10
+      echo "mailcortex-xmpp-service: Prosody listener check still failed after restart" >&2
+      return 1
+      ;;
+    *) return "$rc" ;;
+  esac
+}
+
 start_bridge() {
   alive "$bridge_pid" mailcortex-xmpp-bridge && return 0
   install -d -m 700 "$state"
@@ -2083,7 +2252,16 @@ status() {
 
 case "${1:-}" in
   -h|--help) usage ;;
-  start|ensure) ready; start_prosody; start_bridge ;;
+  start|ensure)
+    ready
+    if ensure_prosody; then
+      start_bridge
+    else
+      rc=$?
+      [ "$rc" -eq 10 ] && exit 0
+      exit "$rc"
+    fi
+    ;;
   stop) stop_one "$bridge_pid" mailcortex-xmpp-bridge; stop_one "$prosody_pid" "$config" ;;
   status) status ;;
   renew-cert)
@@ -2102,7 +2280,7 @@ case "${1:-}" in
   install-cron)
     ready
     self="$HOME/.local/bin/mailcortex-xmpp-service"
-    env="HOME=$HOME PATH=$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+    env="HOME=$HOME PATH=$HOME/.local/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
     current="$(crontab -l 2>/dev/null || true)"
     if printf '%s\n' "$current" | grep -qF "$tag"; then echo "cron already installed"; exit 0; fi
     { printf '%s\n' "$current" | sed '/^$/d'
@@ -2120,7 +2298,7 @@ esac
 
 * Fixtures
 
-The fixtures exercise the bridge's pure parts with a fake =mailcortex= runner: config validation, the owner gate and rate limit, dedupe persistence, inbound framing, outbound parsing and the unmapped-sender rejection. They do not need =slixmpp= or a server.
+The fixtures exercise the bridge's pure parts with a fake =mailcortex= runner: config validation, the owner gate and rate limit, dedupe persistence, inbound framing, outbound parsing and the unmapped-sender rejection. They also run =mailcortex-xmpp-service ensure= against fake Prosody, =ss= and =ip= commands, covering healthy listeners, one Prosody repair, Tailscale deferral and private-value redaction. They do not need =slixmpp=, a server or a real network.
 
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-mailcortex-xmpp-bridge.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 """Fixture tests for mailcortex-xmpp-bridge (no network, no slixmpp)."""
@@ -2132,6 +2310,7 @@ import importlib.util
 import io
 import json
 import os
+import signal
 import subprocess
 import tempfile
 import threading
@@ -2607,7 +2786,8 @@ class ComponentVoiceTests(unittest.TestCase):
             self.assertEqual(bridge.run_bridge(self.cfg), 1)
         component, = instances
         async def exercise():
-            with patch.object(bridge, "inbound_voice", return_value=("voice.msg", "heard words")) as worker:
+            with patch.object(bridge, "inbound_voice", return_value=("voice.msg", "heard words")) as worker, \
+                    patch.object(bridge, "transcribe_permission_voice", return_value=""):
                 owner = FakeMessage("", self.url)
                 await component.handlers["message"](owner)
                 worker.assert_called_once_with(self.cfg, "owner@example.test", "fable", self.url)
@@ -3211,6 +3391,155 @@ class RoomTests(unittest.TestCase):
                           ("fable", "everyone"), ("worker", "everyone")])
         self.assertEqual(len(component.messages), 1)
         self.assertIn("Known nicknames", component.messages[0]["mbody"])
+
+
+class ServiceEnsureTests(unittest.TestCase):
+    LOCAL = "YOUR_LOCAL_INTERFACE"
+    TAILNET = "YOUR_TAILNET_INTERFACE"
+    C2S_PORT = "5222"
+    HTTPS_PORT = "1"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.home = Path(self.temporary.name)
+        self.fakebin = self.home / "fakebin"
+        self.fakebin.mkdir()
+        self.base = self.home / ".config/mailcortex/xmpp"
+        self.site = self.home / ".config/mailcortex/xmpp-private"
+        self.data = self.home / ".local/share/mailcortex/xmpp"
+        self.state = self.home / ".local/state/mailcortex/xmpp"
+        self.base.mkdir(parents=True)
+        self.site.mkdir(parents=True)
+        self.data.mkdir(parents=True)
+        self.state.mkdir(parents=True)
+        (self.base / "prosody.cfg.lua").write_text("-- fixture\n")
+        (self.site / "bridge.json").write_text("{}\n")
+        (self.site / "local.cfg.lua").write_text(
+            f'c2s_interfaces = {{ "{self.LOCAL}", "{self.TAILNET}" }}\n'
+            f'c2s_ports = {{ {self.C2S_PORT} }}\n'
+            f'https_interfaces = {{ "{self.TAILNET}" }}\n'
+            f'https_ports = {{ {self.HTTPS_PORT} }}\n')
+        self.prosody_starts = self.home / "prosody-starts"
+        self.bridge_starts = self.home / "bridge-starts"
+        self.current_ss = self.home / "ss-current"
+        self.healthy_ss = self.home / "ss-healthy"
+        self.ip_output = self.home / "ip-output"
+        self.current_ss.write_text(self.ss_rows(
+            self.LOCAL, self.C2S_PORT, self.TAILNET, self.C2S_PORT,
+            self.TAILNET, self.HTTPS_PORT))
+        self.healthy_ss.write_text(self.current_ss.read_text())
+        self.ip_output.write_text(self.ip_rows(self.LOCAL, self.TAILNET))
+        self.write_fake("ss", """starts=$(wc -l < "$MAILCORTEX_TEST_PROSODY_STARTS" 2>/dev/null || printf '0')
+if [ "$starts" -ge 2 ]; then cat "$MAILCORTEX_TEST_SS_HEALTHY"; else cat "$MAILCORTEX_TEST_SS_CURRENT"; fi
+""")
+        self.write_fake("ip", """cat "$MAILCORTEX_TEST_IP_OUTPUT"
+""")
+        self.write_fake("prosody", """printf '%s\\n' "$$" > "$MAILCORTEX_TEST_PROSODY_PID"
+printf '%s\\n' start >> "$MAILCORTEX_TEST_PROSODY_STARTS"
+trap 'exit 0' TERM INT
+while :; do sleep 0.05; done
+""")
+        self.write_fake("mailcortex-xmpp-bridge", """if [ "$1" = --check ]; then exit 0; fi
+if [ "$1" != --fixture ]; then printf '%s\\n' start >> "$MAILCORTEX_TEST_BRIDGE_STARTS"; fi
+printf '%s\\n' "$$" > "$MAILCORTEX_TEST_BRIDGE_PID"
+trap 'exit 0' TERM INT
+while :; do sleep 0.05; done
+""")
+        self.env = os.environ.copy() | {
+            "HOME": str(self.home),
+            "PATH": str(self.fakebin) + ":" + os.environ.get("PATH", "/usr/bin:/bin"),
+            "MAILCORTEX_TEST_PROSODY_PID": str(self.data / "prosody.pid"),
+            "MAILCORTEX_TEST_PROSODY_STARTS": str(self.prosody_starts),
+            "MAILCORTEX_TEST_BRIDGE_PID": str(self.state / "bridge.pid"),
+            "MAILCORTEX_TEST_BRIDGE_STARTS": str(self.bridge_starts),
+            "MAILCORTEX_TEST_SS_CURRENT": str(self.current_ss),
+            "MAILCORTEX_TEST_SS_HEALTHY": str(self.healthy_ss),
+            "MAILCORTEX_TEST_IP_OUTPUT": str(self.ip_output),
+        }
+        self.service = Path(__file__).resolve().parents[5] / "linux/.local/bin/mailcortex-xmpp-service"
+        self.processes = []
+        self.start_fixture("prosody", "--config", str(self.base / "prosody.cfg.lua"))
+        self.start_fixture("mailcortex-xmpp-bridge", "--fixture")
+
+    def tearDown(self):
+        for process in self.processes:
+            if process.poll() is None:
+                process.send_signal(signal.SIGTERM)
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+    def write_fake(self, name, body):
+        path = self.fakebin / name
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+
+    @staticmethod
+    def ss_rows(*pairs):
+        return "".join(
+            f"LISTEN 0 128 {address}:{port} peer:*\n"
+            for address, port in zip(pairs[::2], pairs[1::2]))
+
+    @staticmethod
+    def ip_rows(*addresses):
+        return "".join(
+            f"2: fixture0 inet {address}/32 scope global\n"
+            for address in addresses)
+
+    def start_fixture(self, command, *args):
+        process = subprocess.Popen(
+            [str(self.fakebin / command), *args], env=self.env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.processes.append(process)
+        deadline = time.monotonic() + 2
+        pidfile = self.data / "prosody.pid" if command == "prosody" else self.state / "bridge.pid"
+        while time.monotonic() < deadline and not pidfile.exists():
+            time.sleep(0.01)
+        self.assertTrue(pidfile.exists(), f"{command} fixture did not write its pid")
+        self.assertIsNone(process.poll(), f"{command} fixture exited")
+
+    def run_ensure(self):
+        return subprocess.run(
+            [str(self.service), "ensure"], env=self.env,
+            text=True, capture_output=True, check=False)
+
+    def assert_private_values_are_silent(self, result):
+        output = result.stdout + result.stderr
+        for value in (self.LOCAL, self.TAILNET):
+            self.assertNotIn(value, output)
+        for log in self.home.rglob("*.log"):
+            content = log.read_text()
+            self.assertNotIn(self.LOCAL, content)
+            self.assertNotIn(self.TAILNET, content)
+
+    def test_healthy_listeners_are_a_noop(self):
+        result = self.run_ensure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.prosody_starts.read_text().splitlines(), ["start"])
+        self.assertFalse(self.bridge_starts.exists())
+        self.assert_private_values_are_silent(result)
+
+    def test_present_but_missing_tailnet_listener_restarts_once(self):
+        self.current_ss.write_text(self.ss_rows(self.LOCAL, self.C2S_PORT))
+        result = self.run_ensure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.prosody_starts.read_text().splitlines(), ["start", "start"])
+        self.assertFalse(self.bridge_starts.exists())
+        self.assertIn("restarting Prosody", result.stderr)
+        self.assert_private_values_are_silent(result)
+
+    def test_absent_tailnet_address_defers_without_restart(self):
+        self.current_ss.write_text(self.ss_rows(self.LOCAL, self.C2S_PORT))
+        self.ip_output.write_text(self.ip_rows(self.LOCAL))
+        result = self.run_ensure()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.prosody_starts.read_text().splitlines(), ["start"])
+        self.assertFalse(self.bridge_starts.exists())
+        self.assertIn("not present yet", result.stderr)
+        self.assert_private_values_are_silent(result)
 
 
 if __name__ == "__main__":
