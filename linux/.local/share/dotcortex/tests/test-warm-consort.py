@@ -63,8 +63,19 @@ class WarmConsortTests(unittest.TestCase):
 
     def test_unstowed_account_falls_back_to_its_checkout(self) -> None:
         bin_ = self.put_bin("DotCortex/all/.local/bin/codex-warm")
-        out = self.body("codex-warm.agent-claude", 'warm_valid && echo "BIN $warm_bin"')
+        out = self.body("codex-warm.agent-claude", 'warm_valid && echo "BIN $warm_bin"',
+                        f"warm_checkout='{self.tmp.name}/none'")
         self.assertIn(f"BIN {bin_}", out.stdout)
+
+    def test_unstowed_account_prefers_the_system_checkout(self) -> None:
+        self.put_bin("DotCortex/all/.local/bin/claude-warm")
+        lane = Path(self.tmp.name) / "system"
+        sys_bin = lane / "all/.local/bin/claude-warm"
+        sys_bin.parent.mkdir(parents=True)
+        sys_bin.write_text("#!/bin/sh\nexec sleep 30\n")
+        sys_bin.chmod(0o755)
+        out = self.body("claude-warm.agent-claude", 'warm_valid && echo "BIN $warm_bin"', f"warm_checkout='{lane}'")
+        self.assertIn(f"BIN {sys_bin}", out.stdout)
 
     def test_bare_service_needs_conf(self) -> None:
         self.put_bin(".local/bin/claude-warm")
