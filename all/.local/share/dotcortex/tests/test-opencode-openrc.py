@@ -67,6 +67,36 @@ class OpencodeOpenrcTests(unittest.TestCase):
         out = run("opencode-telegram", 'opencode_user="agent-opencode"\nopencode_port="1"', "start_pre; echo RC=$?", "x")
         self.assertIn("RC=1", out.stdout)
 
+    def test_patch_guard_runs_as_the_user_against_the_launchers_package(self) -> None:
+        stub = 'setpriv() { echo "SETPRIV $*"; }\n'
+        with tempfile.TemporaryDirectory() as tmp:
+            guard = Path(tmp) / "FORGE/bin/opencode-telegram-patch-apply"
+            guard.parent.mkdir(parents=True)
+            guard.write_text("#!/bin/sh\n")
+            guard.chmod(0o755)
+            conf = self.conf("honey-opencode-bot") + f"\nopencode_patch_apply='{guard}'\nopencode_patch_root='{tmp}'\n"
+            out = run("opencode-telegram", conf, stub + f'output_log="{tmp}/log"; apply_patches; echo RC=$?; cat "{tmp}/log"',
+                      "honey-opencode-bot")
+            self.assertIn("RC=0", out.stdout)
+            self.assertIn("SETPRIV --reuid=agent-opencode --regid=agent-opencode --init-groups env -i "
+                          f"HOME=/home/agent-opencode", out.stdout)
+            self.assertIn(f"HELMCORTEX_ROOT={tmp} NPM_CONFIG_PREFIX=/home/agent-opencode/.local "
+                          f"OPENCODE_TELEGRAM_BIN=/home/agent-opencode/.local/bin/opencode-telegram {guard}", out.stdout)
+            refuse = 'setpriv() { return 1; }\n'
+            out = run("opencode-telegram", conf, refuse + f'output_log="{tmp}/log"; apply_patches; echo RC=$?',
+                      "honey-opencode-bot")
+            self.assertIn("RC=1", out.stdout)
+            self.assertIn("refused", out.stdout)
+        out = run("opencode-telegram", self.conf("honey-opencode-bot") + "\nopencode_patch_apply=/nonexistent\n",
+                  "apply_patches; echo RC=$?", "honey-opencode-bot")
+        self.assertIn("RC=1", out.stdout)
+
+    def test_patch_guard_is_off_unless_configured(self) -> None:
+        out = run("opencode-telegram", 'opencode_user="agent-opencode"',
+                  'setpriv() { echo CALLED; }; apply_patches; echo RC=$?', "x")
+        self.assertIn("RC=0", out.stdout)
+        self.assertNotIn("CALLED", out.stdout)
+
     def test_installer_dry_run_changes_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             etc = Path(tmp)
