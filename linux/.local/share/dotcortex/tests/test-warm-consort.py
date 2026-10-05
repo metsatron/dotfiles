@@ -77,6 +77,15 @@ class WarmConsortTests(unittest.TestCase):
         out = self.body("claude-warm.agent-claude", 'warm_valid && echo "BIN $warm_bin"', f"warm_checkout='{lane}'")
         self.assertIn(f"BIN {sys_bin}", out.stdout)
 
+    def test_agent_reference_conf_keeps_the_herdr_name_and_needs_its_lane(self) -> None:
+        conf = (CONF / "claude-warm.agent-claude").read_text()
+        out = self.body("claude-warm.agent-claude", 'echo "$warm_user|$warm_agent|$warm_cwd"', conf)
+        self.assertIn("agent-claude|honey-opus|/home/agent-claude/metsatron-peer", out.stdout)
+        missing = f"{self.tmp.name}/no-lane"
+        out = self.body("claude-warm.agent-claude", 'warm_valid; echo "RC=$?"', conf + f"\nwarm_cwd='{missing}'")
+        self.assertIn("RC=1", out.stdout)
+        self.assertIn(f"working dir {missing} missing", out.stdout)
+
     def test_bare_service_needs_conf(self) -> None:
         self.put_bin(".local/bin/claude-warm")
         out = self.body("claude-warm", "warm_valid; echo rc=$?")
