@@ -1,0 +1,866 @@
+#+TITLE: MailCortex XMPP — Squadron Room Reconciliation
+#+PROPERTY: header-args :mkdirp yes :comments link
+
+* Contract and deployment
+
+The service entrypoint in =services-mailcortex-xmpp.org= exposes
+=mailcortex-xmpp-service rooms ensure [--dry-run]=. This focused module owns
+its implementation and fixtures; the parent module already exceeds the
+100 KB source budget, so room administration does not grow another large
+implementation inside it. Tangle both modules in the same checkout, then
+use the normal machine-specific loom stow lane after coordinator integration.
+
+Private =bridge.json= remains the only room/seat registry. The helper imports
+the bridge's existing configuration validator without starting the component
+or reading any component/permission secret. Missing or empty =rooms= is an
+error. The only room policy is persistent, hidden, members-only,
+=whois = moderators= (semi-anonymous), with member invitations disabled.
+Every mapped room seat's bare JID gets =admin= affiliation, not =member=:
+admin gives persistent moderator rights across reconnects. Every other
+stored affiliation, including owner, member, outcast and domain-wide grants,
+is cleared to =none=. Current non-seat occupants are removed and current
+seat occupants are made moderators. Unlisted rooms are never touched.
+
+This is the approved seat-only policy, not automatic human admission.
+=owner_jids= is the bridge's sender allowlist, not a MUC affiliation grant.
+An Admiral who is not a mapped room seat cannot join a members-only room
+under this policy. Human admission requires an explicit policy ruling before
+live mention proof; this helper does not silently add an owner exception.
+External Prosody automatic-ownership rules that override affiliations cause
+verification failure rather than an unreported policy exception.
+
+* Local admin shell and failure boundary
+
+The serving host needs its already-running user Prosody instance and
+=prosodyctl= with local admin-shell access. =rooms ensure= never invokes
+service lifecycle =ensure=, restarts Prosody, activates hosts, or takes over
+the bridge connection. The public Prosody config selects the local admin
+socket. Prosody 13's documented global console prefix (= >= without the
+spaces) provides ordinary Lua globals; the script calls the same local MUC
+module APIs used by =muc:create= and =muc:room= in =mod_admin_shell=.
+
+All listed rooms are preflighted before any policy mutation. A missing MUC
+host, unsupported API, false lookup, locked room, broken-store placeholder
+or tombstone is an error, not permission to replace the room. New rooms start
+persistent and private. Existing rooms become persistent before membership
+tightening or affiliation removal: empty nonpersistent rooms would otherwise
+be destroyed by occupant-left hooks. Affiliation and occupant iterators are
+snapshotted before mutation. Setter return =false= means no change; getters
+verify their postconditions instead. Affiliation/role return failures are
+checked, and every apply (including an unchanged rerun) explicitly checks
+=room:save(true)=. This also retries persistence after an earlier failed save.
+Prosody's underlying save API does not independently confirm every internal
+storage-index write; the checked room save is its exposed persistence contract.
+
+=--dry-run= uses room lookup and getters to calculate the same intended
+policy changes, but invokes no create, setter, affiliation/role change or
+save. A normal lookup may hydrate Prosody's room cache. Output identifies
+rooms by sorted registry ordinal and gives setting changes and admin/removal
+counts; no private config values, JIDs, nicknames, paths, passwords, tokens
+or raw shell diagnostics are printed. The matching nonce-bearing structured
+response, validated shape and successful exit are all required. Exit zero
+alone is insufficient (a disconnected prosodyctl can exit zero).
+
+A timeout, interrupted socket, save failure or later-room failure can leave
+partial changes; failures say so and stop without claiming completion or
+retrying blindly. Rerun after fixing the cause. No room deletion, lock
+clearing, history erasure or automatic rollback is attempted.
+
+* Python adapter
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/mailcortex/xmpp-rooms.py
+"""Private room registry to a bounded local Prosody admin-shell operation."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+import uuid
+
+SETTINGS = ("persistent", "hidden", "whois", "allow_member_invites", "members_only")
+COUNTS = ("grant_admin", "clear_affiliations", "repair_moderators", "remove_occupants")
+ERRORS = {
+    "host-unavailable", "lookup-failed", "room-protected", "api-unavailable",
+    "create-failed", "setting-failed", "affiliation-failed", "role-failed",
+    "verify-failed", "save-failed", "operation-failed",
+}
+
+
+class RoomError(Exception):
+    """Only fixed, value-free diagnostics cross the stdout/stderr boundary."""
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        # argparse's default includes untrusted argument values.
+        super().error("invalid arguments (use --help)")
+
+
+def registry(bridge_path: Path, config_path: Path) -> list[dict]:
+    try:
+        bridge = runpy.run_path(str(bridge_path))
+        cfg = bridge["load_config"](config_path)
+    except Exception:
+        raise RoomError("bridge configuration invalid or unavailable") from None
+    if not cfg["rooms"]:
+        raise RoomError("rooms map is missing or empty")
+    # No other private config fields, including secret paths, enter the request.
+    return [
+        {"jid": room["jid"], "admins": sorted(
+            local + "@" + cfg["component_jid"] for local in room["seats"])}
+        for _, room in sorted(cfg["rooms"].items())
+    ]
+
+
+def lua_quote(value: str) -> str:
+    # Decimal byte escapes are valid Lua (JSON's Unicode escapes are not).
+    return '"' + "".join(f"\\{byte:03d}" for byte in value.encode("utf-8")) + '"'
+
+
+def command(rooms: list[dict], dry_run: bool, nonce: str) -> str:
+    try:
+        body = Path(__file__).with_suffix(".lua").read_text(encoding="utf-8")
+    except OSError:
+        raise RoomError("room Lua implementation unavailable") from None
+    request = json.dumps({"rooms": rooms, "dry_run": dry_run}, separators=(",", ":"))
+    script = ("> local request_json = " + lua_quote(request) + ";\n"
+              + "local response_marker = " + lua_quote(nonce) + ";\n" + body)
+    if len(script.encode("utf-8")) > 96 * 1024:
+        raise RoomError("room registry exceeds the bounded shell request size")
+    return script
+
+
+def response(stdout: str, nonce: str, rooms: list[dict], dry_run: bool) -> list[dict]:
+    prefix = "Result: " + nonce
+    matches = [line.strip()[len(prefix):] for line in stdout.splitlines()
+               if line.strip().startswith(prefix)]
+    if len(matches) != 1:
+        raise RoomError("admin shell did not return a unique confirmed response")
+    try:
+        result = json.loads(matches[0])
+        if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+            raise ValueError
+        if not result["ok"]:
+            code = result.get("code")
+            index = result.get("room")
+            phase = result.get("phase")
+            if (code not in ERRORS or type(index) is not int
+                    or not 0 <= index <= len(rooms) or phase not in ("preflight", "apply")):
+                raise ValueError
+            raise RoomError(f"room operation failed: {code}; room {index}; {phase}")
+        rows = result["rooms"]
+        if (type(result.get("dry_run")) is not bool or result["dry_run"] != dry_run
+                or not isinstance(rows, list) or len(rows) != len(rooms)):
+            raise ValueError
+        for index, row in enumerate(rows, 1):
+            if (not isinstance(row, dict) or type(row.get("index")) is not int
+                    or row["index"] != index or type(row.get("created")) is not bool
+                    or type(row.get("verified")) is not bool or row["verified"] != (not dry_run)
+                    or not isinstance(row.get("settings"), list)
+                    or any(key not in SETTINGS for key in row["settings"])
+                    or len(row["settings"]) != len(set(row["settings"]))
+                    or any(type(row.get(key)) is not int or row[key] < 0 for key in COUNTS)
+                    or row["grant_admin"] > len(rooms[index - 1]["admins"])):
+                raise ValueError
+        return rows
+    except (ValueError, KeyError, TypeError):
+        raise RoomError("admin shell response failed validation") from None
+
+
+def ensure(rooms: list[dict], dry_run: bool, prosody_config: Path) -> list[dict]:
+    nonce = "MAILCORTEX_ROOMS_" + uuid.uuid4().hex + ":"
+    script = command(rooms, dry_run, nonce)
+    try:
+        result = subprocess.run(
+            ["prosodyctl", "--config", str(prosody_config), "shell", script],
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+            check=False, encoding="utf-8", errors="replace")
+    except subprocess.TimeoutExpired:
+        raise RoomError("admin shell timed out") from None
+    except OSError:
+        raise RoomError("admin shell runner unavailable") from None
+    if result.returncode != 0:
+        raise RoomError("admin shell runner failed")
+    return response(result.stdout, nonce, rooms, dry_run)
+
+
+def report(rows: list[dict], dry_run: bool) -> None:
+    values = {"persistent": "true", "hidden": "true", "whois": "moderators",
+              "allow_member_invites": "false", "members_only": "true"}
+    for row in rows:
+        actions = (["create"] if row["created"] else [])
+        actions += [key + "=" + values[key] for key in row["settings"]]
+        actions += [key + "=" + str(row[key]) for key in COUNTS if row[key]]
+        label = "plan" if dry_run else "verified"
+        print(f"room {row['index']}: {label}: " + ("; ".join(actions) or "unchanged"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = Parser(prog="mailcortex-xmpp-service rooms ensure",
+                    description="Reconcile private squadron rooms on the running local Prosody.")
+    parser.add_argument("--dry-run", action="store_true", help="plan without policy mutation")
+    parser.add_argument("--config", type=Path, default=Path(os.environ.get(
+        "MAILCORTEX_XMPP_CONFIG", "~/.config/mailcortex/xmpp-private/bridge.json")).expanduser())
+    parser.add_argument("--prosody-config", type=Path,
+                        default=Path("~/.config/mailcortex/xmpp/prosody.cfg.lua").expanduser())
+    args = parser.parse_args(argv)
+    bridge = Path(os.environ.get("MAILCORTEX_XMPP_BRIDGE",
+                                "~/.local/bin/mailcortex-xmpp-bridge")).expanduser()
+    try:
+        rooms = registry(bridge, args.config)
+        report(ensure(rooms, args.dry_run, args.prosody_config), args.dry_run)
+        return 0
+    except RoomError as error:
+        print(f"mailcortex-xmpp-service: {error}; no completion claim; "
+              "apply may be partial, inspect before rerunning", file=sys.stderr)
+        return 1
+    except Exception:
+        print("mailcortex-xmpp-service: room operation failed; no completion claim; "
+              "apply may be partial, inspect before rerunning", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+* Lua policy operation
+
+#+BEGIN_SRC lua :tangle all/.local/share/dotcortex/mailcortex/xmpp-rooms.lua :comments no
+-- Evaluated as one global admin-shell chunk, with only registry fields as input.
+local json = require "prosody.util.json";
+local array = require "prosody.util.array";
+local request = json.decode(request_json);
+local current_index, phase = 0, "preflight";
+local function fail(code)
+    error({ code = code; room = current_index; phase = phase }, 0);
+end
+local settings = {
+    { "persistent", true }; { "hidden", true }; { "whois", "moderators" };
+    { "allow_member_invites", false }; { "members_only", true };
+};
+local methods = { "each_affiliation", "get_affiliation", "set_affiliation",
+                  "each_occupant", "get_role", "set_role", "save" };
+local function compatible(room)
+    if type(room._data) ~= "table" or room._data.destroyed or room._data.locked then
+        fail("room-protected");
+    end
+    for _, name in ipairs(methods) do
+        if type(room[name]) ~= "function" then fail("api-unavailable"); end
+    end
+    for _, item in ipairs(settings) do
+        if type(room["get_" .. item[1]]) ~= "function"
+        or type(room["set_" .. item[1]]) ~= "function" then fail("api-unavailable"); end
+    end
+end
+local function inspect(room, desired, index)
+    local row = { index = index; created = room == nil; verified = false;
+        settings = array(); grant_admin = 0; clear_affiliations = 0;
+        repair_moderators = 0; remove_occupants = 0; };
+    local allowed, grants, removals = {}, {}, {};
+    for _, jid in ipairs(desired.admins) do
+        allowed[jid] = true;
+        if not room or room:get_affiliation(jid) ~= "admin" then
+            row.grant_admin = row.grant_admin + 1;
+            table.insert(grants, jid);
+        end
+    end
+    for _, item in ipairs(settings) do
+        if not room or room["get_" .. item[1]](room) ~= item[2] then
+            table.insert(row.settings, item[1]);
+        end
+    end
+    if room then
+        for jid in room:each_affiliation() do
+            if not allowed[jid] then
+                row.clear_affiliations = row.clear_affiliations + 1;
+                table.insert(removals, jid);
+            end
+        end
+        for _, occupant in room:each_occupant() do
+            if not allowed[occupant.bare_jid] then
+                row.remove_occupants = row.remove_occupants + 1;
+            elseif occupant.role ~= "moderator" then
+                row.repair_moderators = row.repair_moderators + 1;
+            end
+        end
+    end
+    table.sort(grants); table.sort(removals);
+    return row, allowed, grants, removals;
+end
+local function work()
+    local plans, rows = {}, array();
+    for index, desired in ipairs(request.rooms) do
+        current_index = index;
+        local host = desired.jid:match("@(.+)$");
+        local host_session = prosody.hosts[host];
+        local muc = host_session and host_session.modules and host_session.modules.muc;
+        if not muc then fail("host-unavailable"); end
+        if type(muc.get_room_from_jid) ~= "function" or type(muc.create_room) ~= "function" then
+            fail("api-unavailable");
+        end
+        local room = muc.get_room_from_jid(desired.jid);
+        if room == false then fail("lookup-failed"); end
+        if room then compatible(room); end
+        local row, allowed, grants, removals = inspect(room, desired, index);
+        table.insert(rows, row);
+        table.insert(plans, { room = room; muc = muc; desired = desired; row = row;
+                             allowed = allowed; grants = grants; removals = removals });
+    end
+    if request.dry_run then return { ok = true; dry_run = true; rooms = rows }; end
+    phase = "apply";
+    for index, plan in ipairs(plans) do
+        current_index = index;
+        local room = plan.room;
+        if not room then
+            -- Config skips module defaults; new room is private and persistent immediately.
+            room = plan.muc.create_room(plan.desired.jid, {
+                persistent = true; hidden = true; whois = "moderators";
+                allow_member_invites = false; members_only = true;
+            });
+            if not room then fail("create-failed"); end
+            compatible(room);
+        end
+        -- Persist first: tightening membership may empty a room and fire destruction hooks.
+        for _, item in ipairs(settings) do
+            if item[1] ~= "members_only" then
+                if room["get_" .. item[1]](room) ~= item[2] then
+                    room["set_" .. item[1]](room, item[2]);
+                end
+                if room["get_" .. item[1]](room) ~= item[2] then fail("setting-failed"); end
+            end
+        end
+        -- Admit seats before tightening membership, preserving unaffiliated seat occupants.
+        for _, jid in ipairs(plan.grants) do
+            if not room:set_affiliation(true, jid, "admin") then fail("affiliation-failed"); end
+        end
+        if room:get_members_only() ~= true then room:set_members_only(true); end
+        if room:get_members_only() ~= true then fail("setting-failed"); end
+        for _, jid in ipairs(plan.removals) do
+            if not room:set_affiliation(true, jid, "none") then fail("affiliation-failed"); end
+        end
+        local occupants = {};
+        for nick, occupant in room:each_occupant() do
+            table.insert(occupants, { nick = nick; bare_jid = occupant.bare_jid; role = occupant.role });
+        end
+        for _, occupant in ipairs(occupants) do
+            if not plan.allowed[occupant.bare_jid] then
+                if not room:set_role(true, occupant.nick, nil) then fail("role-failed"); end
+            elseif occupant.role ~= "moderator" then
+                if not room:set_role(true, occupant.nick, "moderator") then fail("role-failed"); end
+            end
+        end
+        local check = inspect(room, plan.desired, index);
+        if #check.settings ~= 0 or check.grant_admin ~= 0 or check.clear_affiliations ~= 0
+        or check.repair_moderators ~= 0 or check.remove_occupants ~= 0 then fail("verify-failed"); end
+        -- set_affiliation internally saves but ignores save failure; always check final save.
+        if not room:save(true) then fail("save-failed"); end
+        plan.row.verified = true;
+    end
+    return { ok = true; dry_run = false; rooms = rows };
+end
+local ok, result = pcall(work);
+if not ok then
+    if type(result) ~= "table" or type(result.code) ~= "string" then
+        result = { code = "operation-failed"; room = current_index; phase = phase };
+    end
+    result = { ok = false; code = result.code; room = current_index; phase = phase };
+end
+return response_marker .. json.encode(result);
+#+END_SRC
+
+* Offline executable fixtures
+
+Run from the builder's checkout (never the stowed programs):
+
+#+BEGIN_EXAMPLE
+python3 all/.local/share/dotcortex/tests/test-mailcortex-xmpp-rooms.py
+MAILCORTEX_XMPP_BRIDGE="$PWD/all/.local/bin/mailcortex-xmpp-bridge" python3 all/.local/share/dotcortex/tests/test-mailcortex-xmpp-bridge.py
+#+END_EXAMPLE
+
+The fake =prosodyctl= executes the actual generated Lua against a stateful
+room-API fixture using the already-installed Lua and Prosody JSON utilities.
+It refuses missing fixture dependencies rather than skipping tests. No
+server, network, component secret, real private config or live room is used.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-mailcortex-xmpp-rooms.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Execute worktree service + Python + Lua with an offline stateful admin shell."""
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[5]
+HELPER = ROOT / "all/.local/share/dotcortex/mailcortex/xmpp-rooms.py"
+BRIDGE = ROOT / "all/.local/bin/mailcortex-xmpp-bridge"
+SERVICE = ROOT / "linux/.local/bin/mailcortex-xmpp-service"
+spec = importlib.util.spec_from_file_location("rooms_helper", HELPER)
+helper = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(helper)
+
+HARNESS = r'''
+package.path = "/usr/lib/?.lua;" .. package.path;
+package.cpath = "/usr/lib/?.so;" .. package.cpath;
+local json = require "prosody.util.json";
+local array = require "prosody.util.array";
+local function read(path) local f = assert(io.open(path)); local s = f:read("*a"); f:close(); return s; end
+local state = json.decode(read(os.getenv("FIXTURE_STATE")));
+state.calls = state.calls or array();
+local function record(operation) table.insert(state.calls, operation); end
+local function mutation(room, operation)
+    record(operation);
+    if state.fault == "exception" then error("YOUR_PASSWORD_TOKEN"); end
+    if not room._data.persistent and next(room.occupants) == nil then
+        error("nonpersistent room was destroyed");
+    end
+end
+local function attach(room)
+    room._data = room._data or {};
+    room.affiliations = room.affiliations or {};
+    room.occupants = room.occupants or {};
+    for _, key in ipairs({"persistent", "hidden", "whois", "allow_member_invites", "members_only"}) do
+        room["get_" .. key] = function(self)
+            local value = self._data[key];
+            if value ~= nil then return value; end
+            if key == "whois" then return "moderators"; end
+            return false;
+        end;
+        room["set_" .. key] = function(self, value)
+            if self._data[key] == value then return false; end
+            record("set:" .. key);
+            if state.fault == "setter" then return nil; end
+            self._data[key] = value;
+            if key == "members_only" and value then
+                for nick, occupant in pairs(self.occupants) do
+                    if not self.affiliations[occupant.bare_jid] then self.occupants[nick] = nil; end
+                end
+            end
+            mutation(self, "setting-complete");
+            return true;
+        end;
+    end
+    function room:each_affiliation() return next, self.affiliations, nil; end
+    function room:get_affiliation(jid) return self.affiliations[jid]; end
+    function room:each_occupant() return next, self.occupants, nil; end
+    function room:get_role(nick) return self.occupants[nick] and self.occupants[nick].role; end
+    function room:set_affiliation(actor, jid, value)
+        assert(actor == true);
+        if state.fault == "affiliation" then return nil, "YOUR_PASSWORD_TOKEN"; end
+        if state.fault == "ignored-affiliation" then return true; end
+        self.affiliations[jid] = value ~= "none" and value or nil;
+        for nick, occupant in pairs(self.occupants) do
+            if occupant.bare_jid == jid then
+                if value == "none" and self._data.members_only then self.occupants[nick] = nil;
+                elseif value == "admin" then occupant.role = "moderator"; end
+            end
+        end
+        mutation(self, "affiliation:" .. value);
+        self:save(true); -- same unchecked inner save as Prosody
+        return true;
+    end
+    function room:set_role(actor, nick, role)
+        assert(actor == true);
+        if state.fault == "role" then return nil, "YOUR_PASSWORD_TOKEN"; end
+        if not self.occupants[nick] then return nil; end
+        if role then self.occupants[nick].role = role; else self.occupants[nick] = nil; end
+        mutation(self, "role:" .. (role or "none"));
+        return true;
+    end
+    function room:save(force)
+        assert(force == true);
+        record("save");
+        if state.fault == "save" or self.fail_save then return nil, "YOUR_PASSWORD_TOKEN"; end
+        if not self._data.persistent then return nil; end
+        return true;
+    end
+    if state.fault == "api" then room.set_role = nil; end
+    return room;
+end
+for _, room in pairs(state.rooms) do attach(room); end
+local muc = {};
+function muc.get_room_from_jid(jid)
+    if state.fault == "lookup" then return false; end
+    return state.rooms[jid];
+end
+function muc.create_room(jid, config)
+    record("create");
+    if state.fault == "create" then return nil, "YOUR_PASSWORD_TOKEN"; end
+    assert(state.rooms[jid] == nil);
+    local room = attach({ _data = config; affiliations = {}; occupants = {} });
+    state.rooms[jid] = room;
+    return room;
+end
+prosody = { hosts = {} };
+if state.fault ~= "host" then prosody.hosts["rooms.example.test"] = { modules = { muc = muc } }; end
+local source = read(os.getenv("FIXTURE_SCRIPT")):gsub("^>", "");
+local ok, result = pcall(assert(load(source, "console", "t", _G)));
+-- Remove functions, preserving the room state for the next invocation.
+for _, room in pairs(state.rooms) do
+    for key, value in pairs(room) do if type(value) == "function" then room[key] = nil; end end
+end
+local f = assert(io.open(os.getenv("FIXTURE_STATE"), "w")); f:write(json.encode(state)); f:close();
+if not ok then print("Error: YOUR_PASSWORD_TOKEN"); os.exit(1); end
+print("Result: " .. result);
+'''
+
+FAKE = r'''#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, tempfile
+state = pathlib.Path(os.environ["FIXTURE_STATE"])
+trace = pathlib.Path(os.environ["FIXTURE_TRACE"])
+trace.write_text("invoked")
+assert len(sys.argv) == 5 and sys.argv[1] == "--config" and sys.argv[3] == "shell"
+script = sys.argv[4]
+assert script.startswith(">")
+assert "YOUR_PASSWORD_TOKEN" not in script
+assert "component_secret_file" not in script and "owner_jids" not in script
+mode = os.environ.get("FIXTURE_RUNNER", "normal")
+if mode == "disconnect":
+    print("YOUR_PASSWORD_TOKEN disconnected"); sys.exit(0)
+if mode == "error":
+    print("YOUR_PASSWORD_TOKEN", file=sys.stderr); sys.exit(1)
+print("warning: YOUR_PASSWORD_TOKEN")
+with tempfile.TemporaryDirectory() as directory:
+    path = pathlib.Path(directory) / "command.lua"
+    path.write_text(script)
+    env = os.environ.copy() | {"FIXTURE_SCRIPT": str(path)}
+    result = subprocess.run([env["FIXTURE_LUA"], env["FIXTURE_HARNESS"]], env=env,
+                            text=True, capture_output=True)
+    output = result.stdout
+    if mode == "duplicate": output += output
+    if mode == "malformed": output = output[:output.find("{")] + "{}\n"
+    if mode == "nonce": output = output.replace("MAILCORTEX_ROOMS_", "WRONG_NONCE_")
+    if mode == "mode": output = output.replace('"dry_run":false', '"dry_run":true')
+    if mode == "nonzero": result.returncode = 1
+    print(output, end="")
+    print(result.stderr, end="", file=sys.stderr)
+    sys.exit(result.returncode)
+'''
+
+
+class EnsureTests(unittest.TestCase):
+    def setUp(self):
+        lua = shutil.which("lua5.4")
+        if not lua or not Path("/usr/lib/prosody/util/json.lua").is_file():
+            self.fail("offline fixtures require the declared Prosody/Lua runtime")
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        self.fakebin = self.home / "fakebin"
+        self.fakebin.mkdir()
+        fake = self.fakebin / "prosodyctl"
+        fake.write_text(FAKE)
+        fake.chmod(0o755)
+        self.state = self.home / "state.json"
+        self.trace = self.home / "trace"
+        harness = self.home / "fixture.lua"
+        harness.write_text(HARNESS)
+        self.site = self.home / ".config/mailcortex/xmpp-private"
+        self.site.mkdir(parents=True)
+        self.config = self.site / "bridge.json"
+        self.data = {
+            "component_jid": "seats.example.test", "owner_jids": ["admiral@example.test"],
+            "bridge_address": "seat+bridge@fixture.helm",
+            "component_secret_file": str(self.home / "YOUR_PASSWORD_TOKEN"),
+            "seats": {"lead": "seat+lead@fixture.helm", "worker": "seat+worker@fixture.helm"},
+            "rooms": {"squadron": {"jid": "squadron@rooms.example.test", "lead": "lead",
+                                     "seats": ["lead", "worker"]}},
+            "password": "YOUR_PASSWORD_TOKEN", "token": "YOUR_PASSWORD_TOKEN",
+        }
+        self.config.write_text(json.dumps(self.data))
+        self.write_state({"rooms": {}, "calls": []})
+        self.env = os.environ.copy() | {
+            "HOME": str(self.home), "PATH": str(self.fakebin) + ":/usr/bin:/bin",
+            "MAILCORTEX_XMPP_BRIDGE": str(BRIDGE),
+            "MAILCORTEX_XMPP_ROOMS_HELPER": str(HELPER),
+            "FIXTURE_STATE": str(self.state), "FIXTURE_TRACE": str(self.trace),
+            "FIXTURE_LUA": lua, "FIXTURE_HARNESS": str(harness), "FIXTURE_RUNNER": "normal",
+        }
+        # A lifecycle action must fail, not silently start a fixture daemon.
+        for name in ("prosody", "mailcortex-xmpp-bridge", "ss", "ip", "kill"):
+            path = self.fakebin / name
+            path.write_text("#!/bin/sh\nprintf forbidden >&2\nexit 99\n")
+            path.chmod(0o755)
+
+    def write_state(self, state):
+        self.state.write_text(json.dumps(state))
+
+    def read_state(self):
+        return json.loads(self.state.read_text())
+
+    def invoke(self, *args):
+        result = subprocess.run([str(SERVICE), "rooms", "ensure", *args],
+                                env=self.env, text=True, capture_output=True, timeout=10)
+        output = result.stdout + result.stderr
+        for value in ("YOUR_PASSWORD_TOKEN", "admiral@example.test", str(self.home)):
+            self.assertNotIn(value, output)
+        self.assertNotIn("forbidden", output)
+        return result
+
+    def drift(self):
+        return {"_data": {"persistent": False, "hidden": False, "whois": "anyone",
+                          "members_only": False, "allow_member_invites": True},
+                "affiliations": {"lead@seats.example.test": "member",
+                                 "worker@seats.example.test": "owner",
+                                 "admiral@example.test": "owner", "outsider@example.test": "member",
+                                 "blocked@example.test": "outcast", "example.test": "admin"},
+                "occupants": {
+                    "squadron@rooms.example.test/lead": {
+                        "bare_jid": "lead@seats.example.test", "role": "participant"},
+                    "squadron@rooms.example.test/outsider": {
+                        "bare_jid": "outsider@example.test", "role": "moderator"},
+                    "squadron@rooms.example.test/stranger": {
+                        "bare_jid": "stranger@example.test", "role": "moderator"}}}
+
+    def compliant(self, room):
+        self.assertEqual(room["_data"], {"persistent": True, "hidden": True,
+            "whois": "moderators", "members_only": True, "allow_member_invites": False})
+        self.assertEqual(room["affiliations"], {
+            "lead@seats.example.test": "admin", "worker@seats.example.test": "admin"})
+        for occupant in room["occupants"].values():
+            self.assertIn(occupant["bare_jid"], room["affiliations"])
+            self.assertEqual(occupant["role"], "moderator")
+
+    def test_create_and_idempotent_rerun(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("create", result.stdout)
+        self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
+        before = self.read_state()
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("verified: unchanged", result.stdout)
+        after = self.read_state()
+        self.assertEqual(after["rooms"], before["rooms"])
+        self.assertEqual(after["calls"], before["calls"] + ["save"])
+        self.assertFalse((self.home / "YOUR_PASSWORD_TOKEN").exists())
+
+    def test_reconcile_and_leave_unlisted_room_untouched(self):
+        room = self.drift()
+        unlisted = {"_data": {"hidden": False}, "affiliations": {}, "occupants": {}}
+        self.write_state({"rooms": {"squadron@rooms.example.test": room,
+                                    "unlisted@rooms.example.test": unlisted}, "calls": []})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("clear_affiliations=4", result.stdout)
+        state = self.read_state()
+        self.compliant(state["rooms"]["squadron@rooms.example.test"])
+        self.assertEqual(state["rooms"]["unlisted@rooms.example.test"], unlisted)
+        self.assertEqual(state["calls"][0], "set:persistent")
+
+    def test_unaffiliated_seat_occupant_is_preserved_when_membership_tightens(self):
+        room = self.drift()
+        room["affiliations"].pop("lead@seats.example.test")
+        self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_state()
+        self.assertIn("squadron@rooms.example.test/lead",
+                      state["rooms"]["squadron@rooms.example.test"]["occupants"])
+        self.compliant(state["rooms"]["squadron@rooms.example.test"])
+
+    def test_empty_nonpersistent_room_persisted_before_tightening(self):
+        room = self.drift()
+        room["occupants"] = {}
+        self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+        self.assertEqual(self.invoke().returncode, 0)
+        self.assertEqual(self.read_state()["calls"][0], "set:persistent")
+
+    def test_dry_run_missing_and_drift_execute_no_mutations(self):
+        for rooms in ({}, {"squadron@rooms.example.test": self.drift()}):
+            with self.subTest(rooms=bool(rooms)):
+                before = {"rooms": rooms, "calls": []}
+                self.write_state(before)
+                result = self.invoke("--dry-run")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("plan:", result.stdout)
+                self.assertIn("grant_admin=2", result.stdout)
+                self.assertEqual(self.read_state(), before)
+
+    def test_missing_empty_invalid_registry_never_invokes_shell(self):
+        for value in (None, {}, [], {"bad": {"jid": "YOUR_PASSWORD_TOKEN"}}):
+            with self.subTest(value=value):
+                data = dict(self.data)
+                if value is None: data.pop("rooms")
+                else: data["rooms"] = value
+                self.config.write_text(json.dumps(data))
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.trace.exists())
+
+    def test_adversarial_config_diagnostics_are_redacted(self):
+        self.data["seats"] = {"YOUR_PASSWORD_TOKEN": "YOUR_PASSWORD_TOKEN"}
+        self.config.write_text(json.dumps(self.data))
+        self.assertNotEqual(self.invoke().returncode, 0)
+        self.config.write_text('{"YOUR_PASSWORD_TOKEN":')
+        self.assertNotEqual(self.invoke().returncode, 0)
+
+    def test_current_admin_with_drifted_role_is_repaired(self):
+        room = self.drift()
+        room["affiliations"]["lead@seats.example.test"] = "admin"
+        self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("role:moderator", self.read_state()["calls"])
+        self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
+
+    def test_locked_tombstone_and_broken_room_are_not_overwritten(self):
+        for data in ({"locked": 1}, {"destroyed": True}, {"locked": True}):
+            with self.subTest(data=data):
+                room = self.drift()
+                room["_data"].update(data)
+                self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(self.read_state()["calls"], [])
+                self.assertIn("room-protected", result.stderr)
+
+    def test_all_room_preflight_precedes_first_mutation(self):
+        self.data["rooms"]["z-last"] = {"jid": "last@rooms.example.test", "lead": "lead",
+                                       "seats": ["lead"]}
+        self.config.write_text(json.dumps(self.data))
+        self.write_state({"rooms": {"last@rooms.example.test": {
+            "_data": {"locked": 1}, "affiliations": {}, "occupants": {}}}, "calls": []})
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.read_state()["calls"], [])
+
+    def test_mutation_lookup_api_and_persistence_failures_are_loud(self):
+        cases = {"host": "host-unavailable", "lookup": "lookup-failed",
+                 "create": "create-failed", "api": "api-unavailable",
+                 "setter": "setting-failed", "affiliation": "affiliation-failed",
+                 "ignored-affiliation": "verify-failed", "role": "role-failed",
+                 "save": "save-failed", "exception": "operation-failed"}
+        for fault, expected_code in cases.items():
+            with self.subTest(fault=fault):
+                room = self.drift()
+                room["affiliations"]["lead@seats.example.test"] = "admin"
+                rooms = {} if fault == "create" else {"squadron@rooms.example.test": room}
+                self.write_state({"rooms": rooms, "calls": [], "fault": fault})
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("no completion claim", result.stderr)
+                self.assertIn(expected_code, result.stderr)
+
+    def test_failed_save_is_retried_when_in_memory_policy_is_already_correct(self):
+        self.write_state({"rooms": {}, "calls": [], "fault": "save"})
+        self.assertNotEqual(self.invoke().returncode, 0)
+        state = self.read_state()
+        state.pop("fault")
+        self.write_state(state)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unchanged", result.stdout)
+        self.assertEqual(self.read_state()["calls"], state["calls"] + ["save"])
+
+    def test_unconfirmed_malformed_duplicate_wrong_mode_and_nonzero_results_fail(self):
+        for mode in ("disconnect", "error", "duplicate", "malformed", "nonce", "mode", "nonzero"):
+            with self.subTest(mode=mode):
+                self.env["FIXTURE_RUNNER"] = mode
+                self.write_state({"rooms": {}, "calls": []})
+                self.assertNotEqual(self.invoke().returncode, 0)
+
+    def test_distinct_room_identities_and_admin_sets_are_not_cross_applied(self):
+        self.data["rooms"] = {
+            "z-worker": {"jid": "worker-room@rooms.example.test", "lead": "worker", "seats": ["worker"]},
+            "a-lead": {"jid": "lead-room@rooms.example.test", "lead": "lead", "seats": ["lead"]}}
+        self.config.write_text(json.dumps(self.data))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        state = self.read_state()
+        self.assertEqual(set(state["rooms"]), {"lead-room@rooms.example.test", "worker-room@rooms.example.test"})
+        for name in ("lead", "worker"):
+            self.assertEqual(state["rooms"][name + "-room@rooms.example.test"]["affiliations"],
+                             {name + "@seats.example.test": "admin"})
+        self.assertEqual(len(result.stdout.splitlines()), 2)
+
+    def test_later_room_save_failure_reports_partial_apply_not_success(self):
+        self.data["rooms"]["z-last"] = {"jid": "last@rooms.example.test", "lead": "lead", "seats": ["lead"]}
+        self.config.write_text(json.dumps(self.data))
+        room = self.drift()
+        room["fail_save"] = True
+        self.write_state({"rooms": {"last@rooms.example.test": room}, "calls": []})
+        result = self.invoke()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("room 2; apply", result.stderr)
+        self.assertIn("apply may be partial", result.stderr)
+        self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
+
+    def test_response_validation_rejects_wrong_identity_shape_and_contract_evidence(self):
+        rooms = [{"jid": "squadron@rooms.example.test", "admins": ["lead@seats.example.test"]}]
+        row = {"index": 1, "created": False, "verified": True, "settings": [],
+               "grant_admin": 0, "clear_affiliations": 0, "repair_moderators": 0, "remove_occupants": 0}
+        for changes in ({"index": 2}, {"index": True}, {"verified": False},
+                        {"settings": ["YOUR_PASSWORD_TOKEN"]}, {"grant_admin": 2},
+                        {"grant_admin": True}, {"remove_occupants": -1}):
+            with self.subTest(changes=changes):
+                result = {"ok": True, "dry_run": False, "rooms": [row | changes]}
+                with self.assertRaisesRegex(helper.RoomError, "failed validation"):
+                    helper.response("Result: NONCE:" + json.dumps(result), "NONCE:", rooms, False)
+        with self.assertRaisesRegex(helper.RoomError, "failed validation"):
+            helper.response('Result: NONCE:{"ok":true,"dry_run":false,"rooms":[]}',
+                            "NONCE:", rooms, False)
+
+    def test_timeout_is_redacted(self):
+        with patch.object(helper.subprocess, "run", side_effect=subprocess.TimeoutExpired(
+                "YOUR_PASSWORD_TOKEN", 30, output="YOUR_PASSWORD_TOKEN")):
+            with self.assertRaisesRegex(helper.RoomError, "timed out"):
+                helper.ensure([{"jid": "squadron@rooms.example.test", "admins": []}], False,
+                              Path("YOUR_PASSWORD_TOKEN"))
+
+    def test_argument_errors_and_help_are_safe_and_do_not_run_shell(self):
+        self.assertNotEqual(self.invoke("--YOUR_PASSWORD_TOKEN").returncode, 0)
+        result = self.invoke("--help")
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--dry-run", result.stdout)
+        self.assertFalse(self.trace.exists())
+
+    def test_lua_string_escaping_cannot_execute_injected_registry_text(self):
+        value = '"; error("YOUR_PASSWORD_TOKEN"); --\n\\\x00é'
+        lua = self.env["FIXTURE_LUA"]
+        result = subprocess.run([lua, "-e", "io.write(" + helper.lua_quote(value) + ")"],
+                                capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, value.encode("utf-8"))
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
+* Builder verification (2026-10-06)
+
+The builder ran the emitted programs from the isolated worktree: all 19 room
+fixtures and all 51 existing bridge/service fixtures passed. Bash syntax,
+Python AST parsing and Lua chunk parsing passed. A separate temporary Emacs
+tangle reproduced all nine outputs from both source modules byte-for-byte.
+A read-only live Prosody 13.0.1 shell probe confirmed the global prefix,
+JSON/array utilities and =Result:= framing; it did not look up or mutate rooms.
+No stow, private-site edit, daemon restart, component connection or live
+policy apply was performed. Fable owns review, integration and deployment.
+
+The first new-module tangle stopped at Emacs's missing Lua comment syntax;
+its partial output and Git state were inspected before retrying. The Lua
+block now uses =:comments no=, matching the parent module. A path-scoped
+checkpoint was initially refused because the hook's temporary index viewed
+the pending service change as dirty; the checkpoint was retried with all
+intended pending paths. The first fixture run exposed the missing Prosody
+C-module search path in the offline harness; it now uses the installed
+library path and checks precise failure codes, not just nonzero exits.
+
+The persistence ordering, nonce validation, explicit save checks and
+failure-code fixtures warrant =/reflect= for the existing MailCortex doctrine;
+a new skill is not needed. The parent source's pre-existing budget breach
+still needs a separately approved section-seam split; no destructive prose
+restructure was performed here.
