@@ -593,6 +593,14 @@ def iso_from_mtime(mt):
             .isoformat(timespec="seconds")
             .replace("+00:00", "Z"))
 
+def iso_from_epoch(ts):
+    try:
+        return (datetime.fromtimestamp(float(ts), tz=timezone.utc)
+                .isoformat(timespec="seconds")
+                .replace("+00:00", "Z"))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+
 
 # ── /proc metrics (Linux only; all fields guarded) ────────────────────────────
 def proc_metrics(pid_str):
@@ -626,6 +634,16 @@ def proc_metrics(pid_str):
     except Exception:
         pass
     return m
+
+
+PROC_STATE_LABELS = {
+    "R": "running", "S": "sleeping", "D": "uninterruptible",
+    "T": "stopped", "t": "tracing", "Z": "zombie", "X": "dead",
+    "I": "idle",
+}
+
+def process_state_label(status):
+    return PROC_STATE_LABELS.get(status) if status else None
 
 
 # ── session ID extraction from cmdline ────────────────────────────────────────
@@ -772,12 +790,15 @@ def _claude_model_probe(pid_str, session_id):
             tail = fh.read().decode(errors="replace")
         model = None
         usage = {}
+        last_activity_at = None
         for line in tail.splitlines():
             line = line.strip()
             if not line:
                 continue
             try:
                 entry = json.loads(line)
+                if isinstance(entry.get("timestamp"), str) and entry["timestamp"]:
+                    last_activity_at = entry["timestamp"]
                 msg   = entry.get("message", {})
                 if msg.get("role") == "assistant" and msg.get("model") and msg.get("usage"):
                     model = msg["model"]
@@ -792,6 +813,11 @@ def _claude_model_probe(pid_str, session_id):
         win = _ctx_window(model)
         pct = round(inp / win * 100, 1) if (win and inp) else None
         mts = jf.stat().st_mtime
+        if last_activity_at:
+            activity_source = "claude_jsonl"
+        else:
+            last_activity_at = iso_from_mtime(jf.stat().st_mtime)
+            activity_source = "claude_jsonl_mtime" if last_activity_at else None
         return {
             "provider":              "anthropic",
             "provider_source":       "claude_jsonl",
@@ -804,9 +830,50 @@ def _claude_model_probe(pid_str, session_id):
             "context_window_source": "model_table" if win else "unknown",
             "context_percent":       pct,
             "metadata_ts":           mts,
+            "last_activity_at":      last_activity_at,
+            "last_activity_source":  activity_source,
         }
     except Exception:
         return {}
+
+
+def _claude_runtime_probe(pid_str):
+    """Read explicit runtime/waiting/approval fields from Claude's session file.
+
+    A missing field is deliberately left missing.  Process state, an open
+    session, and an idle runtime are not approval evidence.
+    """
+    try:
+        data = json.loads((_CLAUDE_SESSIONS_DIR / f"{pid_str}.json").read_text())
+    except Exception:
+        return {}
+
+    result = {}
+    status = data.get("status")
+    if isinstance(status, str) and status:
+        result.update({
+            "waiting_status": status,
+            "waiting_status_source": "claude_session_file",
+        })
+
+    for key in ("approval_status", "approvalStatus", "permission_status", "permissionStatus"):
+        value = data.get(key)
+        if isinstance(value, bool):
+            value = "requested" if value else "not_requested"
+        if isinstance(value, str) and value:
+            result.update({
+                "approval_status": value,
+                "approval_status_source": "claude_session_file",
+            })
+            break
+
+    updated_at = data.get("updatedAt")
+    if isinstance(updated_at, (int, float)):
+        result.update({
+            "last_activity_at": iso_from_epoch(updated_at),
+            "last_activity_source": "claude_session_file",
+        })
+    return result
 
 
 # ── codex model probe (read logs_2.sqlite) ───────────────────────────────────
@@ -825,13 +892,16 @@ _CODEX_PID_RE       = re.compile(r'^pid:(\d+):')
 _CODEX_PROBE_HORIZON_S = 48 * 3600
 _CODEX_PROBE_LIMIT     = 2000
 _codex_model_by_pid    = None  # populated on first probe of this cycle
+_codex_activity_by_pid = None  # populated by the same bounded query
 
 def _codex_model_probe_scan():
     """One bounded pass over logs_2.sqlite, cached per collection cycle.
 
     Returns {pid_str: extra_dict} built from the most-recent (ts DESC)
     matching row per pid within the horizon window."""
+    global _codex_activity_by_pid
     result = {}
+    _codex_activity_by_pid = {}
     if not _CODEX_LOG_DB.exists():
         return result
     try:
@@ -843,6 +913,11 @@ def _codex_model_probe_scan():
                 "SELECT process_uuid, feedback_log_body, ts FROM logs "
                 "WHERE ts >= ? AND feedback_log_body LIKE '%model=%' "
                 "ORDER BY ts DESC, ts_nanos DESC LIMIT ?",
+                (horizon, _CODEX_PROBE_LIMIT)
+            ).fetchall()
+            activity_rows = conn.execute(
+                "SELECT process_uuid, ts FROM logs "
+                "WHERE ts >= ? ORDER BY ts DESC, ts_nanos DESC LIMIT ?",
                 (horizon, _CODEX_PROBE_LIMIT)
             ).fetchall()
         finally:
@@ -871,6 +946,12 @@ def _codex_model_probe_scan():
                     "context_percent":       None,
                     "metadata_ts":           float(ts) if ts else None,
                 }
+        for (process_uuid, ts) in activity_rows:
+            if not process_uuid or not ts:
+                continue
+            pm = _CODEX_PID_RE.match(process_uuid)
+            if pm and pm.group(1) not in _codex_activity_by_pid:
+                _codex_activity_by_pid[pm.group(1)] = iso_from_epoch(ts)
     except Exception:
         return {}
     return result
@@ -883,7 +964,12 @@ def _codex_model_probe(pid_str):
     global _codex_model_by_pid
     if _codex_model_by_pid is None:
         _codex_model_by_pid = _codex_model_probe_scan()
-    return _codex_model_by_pid.get(str(pid_str), {})
+    extra = dict(_codex_model_by_pid.get(str(pid_str), {}))
+    last_activity_at = (_codex_activity_by_pid or {}).get(str(pid_str))
+    if last_activity_at:
+        extra["last_activity_at"] = last_activity_at
+        extra["last_activity_source"] = "codex_log"
+    return extra
 
 
 # ── capabilities (binary presence) ───────────────────────────────────────────
@@ -1088,11 +1174,17 @@ if _oc_db.exists():
                 if _row and _row[0]:
                     _ctx_inp = (_row[2] or 0) + (_row[3] or 0)
                     _mts = _row[4] / 1000.0 if _row[4] else None
+                    _last_row = _conn.execute(
+                        "SELECT max(time_created) FROM message WHERE session_id=?",
+                        (_sid,)
+                    ).fetchone()
+                    _last_ts = _last_row[0] / 1000.0 if _last_row and _last_row[0] else None
                     _model_by_sid[_sid] = {
                         "provider":     _row[0],
                         "model":        _row[1] or "—",
                         "context_size": _ctx_inp if _ctx_inp > 0 else None,
                         "metadata_ts":  _mts,
+                        "last_activity_at": iso_from_epoch(_last_ts),
                     }
             _conn.close()
         except Exception as _exc:
@@ -1119,9 +1211,15 @@ for ln in pid_session_links:
             "context_window_source": "unknown",
             "context_percent":       None,
             "metadata_ts":           _mi.get("metadata_ts"),
+            "last_activity_at":      _mi.get("last_activity_at"),
+            "last_activity_source":  "opencode_db" if _mi.get("last_activity_at") else None,
         }
     elif _kind == "claude" and _sid and _pid:
         _extra = _claude_model_probe(_pid, _sid)
+        _runtime = _claude_runtime_probe(_pid)
+        for _key, _value in _runtime.items():
+            if _extra.get(_key) in (None, ""):
+                _extra[_key] = _value
     elif _agent in ("codex", "codex-helmastra") and _pid:
         _extra = _codex_model_probe(_pid)
     ln["provider"]              = _extra.get("provider")
@@ -1138,6 +1236,12 @@ for ln in pid_session_links:
     ln["metadata_ts"]           = _mts
     ln["metadata_age_s"]        = round(time.time() - _mts) if _mts else None
     ln["metadata_stale"]        = (ln["metadata_age_s"] or 0) > _STALE_THRESH_S
+    ln["last_activity_at"]      = _extra.get("last_activity_at")
+    ln["last_activity_source"]  = _extra.get("last_activity_source") or "unknown"
+    ln["waiting_status"]        = _extra.get("waiting_status")
+    ln["waiting_status_source"] = _extra.get("waiting_status_source") or "unknown"
+    ln["approval_status"]       = _extra.get("approval_status")
+    ln["approval_status_source"] = _extra.get("approval_status_source") or "unknown"
 
 
 # ── active_agents ─────────────────────────────────────────────────────────────
@@ -1152,8 +1256,11 @@ for proc in raw_procs:
         "pgid":              proc.get("pgid"),
         "sid":               proc.get("sid"),
         "proc_status":       proc.get("proc_status"),
+        "process_state":     process_state_label(proc.get("proc_status")),
         "command":           proc["command"],
         "cwd":               proc.get("cwd"),
+        "workspace":         proc.get("cwd"),
+        "workspace_source":  "proc_cwd" if proc.get("cwd") else "unknown",
         "cpu_ticks":         proc.get("cpu_ticks"),
         "rss_kb":            proc.get("rss_kb"),
         "io_read_bytes":     proc.get("io_read_bytes"),
@@ -1181,6 +1288,12 @@ for proc in raw_procs:
         "metadata_ts":           lnk.get("metadata_ts"),
         "metadata_age_s":        lnk.get("metadata_age_s"),
         "metadata_stale":        lnk.get("metadata_stale"),
+        "last_activity_at":      lnk.get("last_activity_at"),
+        "last_activity_source":  lnk.get("last_activity_source"),
+        "waiting_status":        lnk.get("waiting_status"),
+        "waiting_status_source": lnk.get("waiting_status_source"),
+        "approval_status":       lnk.get("approval_status"),
+        "approval_status_source": lnk.get("approval_status_source"),
     })
 
 

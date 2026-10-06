@@ -24,8 +24,9 @@ Action backends:
   pgkill  → kill -KILL -<pgid>
   jump    → tmux select-window + select-pane
 
-Metadata gaps: model/provider not in state or index; context_size/window/percent require
-  harness API; CPU% requires two snapshots for delta (cpu_ticks are cumulative).
+Evidence policy: process state/workspace come from the live snapshot; context and
+last activity are shown only when a native store supplies them; waiting and
+approval are never inferred from an open session or a sleeping process.
 
 Implementation phases: 2M non-destructive actions · 2N curses TUI · 2O destructive+confirm · 2P archive search
 
@@ -224,7 +225,6 @@ def age_str(secs):
         return f"{int(secs // 3600)}h"
     return f"{int(secs // 86400)}d"
 
-
 def freshness_badge(secs):
     if secs is None:
         return "OLD"
@@ -245,6 +245,37 @@ def state_age_seconds(state, now_utc):
         return max(0, (now_utc - datetime.datetime.fromisoformat(g)).total_seconds())
     except Exception:
         return None
+
+
+def proc_label(agent):
+    return agent.get("process_state") or {
+        "R": "running", "S": "sleeping", "D": "uninterruptible",
+        "T": "stopped", "t": "tracing", "Z": "zombie", "X": "dead",
+        "I": "idle",
+    }.get(agent.get("proc_status")) or "?"
+
+
+def timestamp_epoch(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+
+def activity_age(value):
+    epoch = timestamp_epoch(value)
+    if epoch is None:
+        return "?"
+    return age_str(max(0, datetime.datetime.now(datetime.timezone.utc).timestamp() - epoch))
+
+
+def missing(value):
+    return value if value not in (None, "") else "?"
 
 
 def hr(width=82):
@@ -417,7 +448,7 @@ print()
 if visible:
     print(BOLD + "ACTIVE AGENTS" + RST)
     hr()
-    print(DIM + f"  {'TIER':<5} {'MACH':<5} {'AGENT':<9} {'PID':<6} {'SESSION':<12} {'PROV':<9} {'MODEL':<20} {'CTX%':<5} {'QUESTION'}" + RST)
+    print(DIM + f"  {'TIER':<5} {'MACH':<5} {'AGENT':<9} {'PID':<6} {'SESSION':<12} {'PROV':<9} {'MODEL':<20} {'CTX%':<5} {'PROC':<11} {'LAST':<6} {'WORKSPACE':<12} {'WAIT':<8} {'APPR':<9} {'QUESTION'}" + RST)
     for a in visible:
         tier_label, tier_color = compute_tier(a)
         pattern  = a.get("pattern") or "?"
@@ -426,8 +457,14 @@ if visible:
         prov     = (a.get("provider") or "—")[:9]
         model    = short_model(a.get("model"))
         cpct     = a.get("context_percent")
-        ctx_s    = (("~" if a.get("metadata_stale") else "") + f"{cpct:.0f}%") if cpct is not None else "—"
+        ctx_s    = (("~" if a.get("metadata_stale") else "") + f"{cpct:.0f}%") if cpct is not None else "?"
         mach     = a.get("_state_host") or (_host_list[0] if _host_list else "?")
+        proc     = proc_label(a)
+        last     = activity_age(a.get("last_activity_at"))
+        workspace_path = a.get("workspace") or a.get("cwd")
+        workspace = cwd_name(workspace_path) if workspace_path else "?"
+        waiting  = missing(a.get("waiting_status"))
+        approval = missing(a.get("approval_status"))
         question = "—"
         if a.get("session_id") and a.get("session_id") in index:
             idx_item = index[a.get("session_id")]
@@ -444,6 +481,11 @@ if visible:
             f"{prov:<9} "
             f"{model:<20} "
             f"{ctx_s:<5} "
+            f"{proc[:11]:<11} "
+            f"{last:<6} "
+            f"{workspace[:12]:<12} "
+            f"{waiting[:8]:<8} "
+            f"{approval[:9]:<9} "
             f"{question}"
         )
     print()
@@ -1104,7 +1146,7 @@ run_show() {
     exit 1
   fi
   python3 - "$target" <<'PY'
-import json, os, re, shlex, socket, sys
+import datetime, json, os, re, shlex, socket, sys
 from pathlib import Path
 
 TARGET     = sys.argv[1]
@@ -1125,6 +1167,30 @@ def fmt_tok(n):
     if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
     if n >= 1_000:     return f"{n/1_000:.1f}k"
     return str(n)
+
+def proc_label(agent):
+    return agent.get("process_state") or {
+        "R": "running", "S": "sleeping", "D": "uninterruptible",
+        "T": "stopped", "t": "tracing", "Z": "zombie", "X": "dead",
+        "I": "idle",
+    }.get(agent.get("proc_status")) or "?"
+
+def activity_age(value):
+    try:
+        if isinstance(value, (int, float)):
+            epoch = float(value)
+        elif isinstance(value, str) and value:
+            epoch = datetime.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp()
+        else:
+            return "?"
+        seconds = max(0, datetime.datetime.now(datetime.timezone.utc).timestamp() - epoch)
+        if seconds < 60: return f"{int(seconds)}s"
+        if seconds < 3600: return f"{int(seconds // 60)}m"
+        if seconds < 86400: return f"{int(seconds // 3600)}h"
+        return f"{int(seconds // 86400)}d"
+    except (TypeError, ValueError, OverflowError):
+        return "?"
 
 def local_hostname():
     return socket.gethostname()
@@ -1292,6 +1358,11 @@ if entry:
     _la = next(iter(live_agents), {})
     row("provider",    f"{_la.get('provider') or '—'}  [{_la.get('provider_source') or 'unknown'}]")
     row("model",       f"{_la.get('model') or '—'}  [{_la.get('model_source') or 'unknown'}]")
+    row("process",      proc_label(_la))
+    row("last_activity", activity_age(_la.get("last_activity_at")))
+    row("workspace",    _la.get("workspace") or entry.get("cwd") or "?")
+    row("waiting",      _la.get("waiting_status") or entry.get("waiting_status") or "?")
+    row("approval",     _la.get("approval_status") or entry.get("approval_status") or "?")
     row("machine",     entry.get("machine"))
     row("cwd",         entry.get("cwd"))
     row("sessiondate", entry.get("sessiondate"))
@@ -1335,6 +1406,11 @@ if live_agents:
         row("confidence", a.get("link_confidence"))
         row("provider",   f"{a.get('provider') or '—'}  [{a.get('provider_source') or 'unknown'}]")
         row("model",      f"{a.get('model') or '—'}  [{a.get('model_source') or 'unknown'}]")
+        row("process",    proc_label(a))
+        row("last_activity", activity_age(a.get("last_activity_at")))
+        row("workspace",  a.get("workspace") or a.get("cwd") or "?")
+        row("waiting",    a.get("waiting_status") or "?")
+        row("approval",   a.get("approval_status") or "?")
         _cpct  = a.get("context_percent")
         _age   = a.get("metadata_age_s")
         _stale = a.get("metadata_stale")
@@ -1548,6 +1624,33 @@ def age_str(secs):
         return f"{int(secs // 3600)}h"
     return f"{int(secs // 86400)}d"
 
+def proc_label(agent):
+    return agent.get("process_state") or {
+        "R": "running", "S": "sleeping", "D": "uninterruptible",
+        "T": "stopped", "t": "tracing", "Z": "zombie", "X": "dead",
+        "I": "idle",
+    }.get(agent.get("proc_status")) or "?"
+
+def timestamp_epoch(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.datetime.fromisoformat(
+                value.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    return None
+
+def activity_age(value):
+    epoch = timestamp_epoch(value)
+    if epoch is None:
+        return "?"
+    return age_str(max(0, time.time() - epoch))
+
+def missing(value):
+    return value if value not in (None, "") else "?"
+
 def state_age_seconds(state):
     try:
         g = (state.get("generated_at") or "")[:19]
@@ -1669,6 +1772,13 @@ def load_data(show_closed=False, all_hosts=False):
             r["_ctx_pct"]    = a.get("context_percent")
             r["_meta_stale"] = a.get("metadata_stale") or False
             r["_meta_age"]   = a.get("metadata_age_s")
+            r["_proc"]       = proc_label(a)
+            r["_last"]       = a.get("last_activity_at")
+            r["_last_src"]   = a.get("last_activity_source") or "unknown"
+            r["_workspace"]  = (a.get("workspace") or idx.get("workspace") or
+                                 idx.get("cwd") or a.get("cwd"))
+            r["_wait"]       = a.get("waiting_status") or idx.get("waiting_status")
+            r["_approval"]   = a.get("approval_status") or idx.get("approval_status")
             r["_title"]      = idx.get("openquestion") or idx.get("title") or ""
             r["_ist"]        = ist or "—"
             r["_state_host"] = state_host
@@ -1702,7 +1812,8 @@ def filter_rows(rows, q):
         return any(ql in (v or "").lower() for v in [
             r.get("pattern"), str(r.get("pid") or ""),
             r.get("session_id"), r.get("_title"), r.get("_mach"),
-            r.get("cwd"), r.get("_ist"), r.get("_prov"),
+            r.get("cwd"), r.get("_workspace"), r.get("_proc"),
+            r.get("_wait"), r.get("_approval"), r.get("_ist"), r.get("_prov"),
         ])
     return [r for r in rows if m(r)]
 
@@ -1927,8 +2038,9 @@ class TUI:
     def _col_widths(self, w):
         fixed = [
             ("TIER", 5), ("AGENT", 10), ("PID", 7), ("SESSION", 14),
-            ("STATUS", 6), ("MACH", 6), ("PROV", 9), ("MODEL", 16), ("CTX%", 5), ("RSS", 6), ("PS", 3),
-            ("PANE", 10), ("CWD", 12),
+            ("STATUS", 6), ("MACH", 6), ("PROV", 9), ("MODEL", 16), ("CTX%", 5),
+            ("PROC", 12), ("LAST", 6), ("WORKSPACE", 12), ("WAIT", 8), ("APPR", 9),
+            ("RSS", 6), ("PANE", 10),
         ]
         used = 2 + sum(cw for _, cw in fixed) + len(fixed)
         return fixed + [("TITLE", max(4, w - used - 1))]
@@ -1974,14 +2086,18 @@ class TUI:
         tier = r["_tier"]
         cols = self._col_widths(w)
         tw   = cols[-1][1]
-        ps   = (r.get("proc_status") or "?")[:3]
         mach  = (r.get("_mach_short") or "—")[:6]
         model = short_model(r.get("_model"))
         cpct  = r.get("_ctx_pct")
         if cpct is not None:
             ctx_s = ("~" if r.get("_meta_stale") else "") + f"{cpct:.0f}%"
         else:
-            ctx_s = "—"
+            ctx_s = "?"
+        proc = (r.get("_proc") or "?")[:12]
+        last = activity_age(r.get("_last"))
+        workspace = (cwd_base(r.get("_workspace")) if r.get("_workspace") else "?")[:12]
+        waiting = missing(r.get("_wait"))[:8]
+        approval = missing(r.get("_approval"))[:9]
         fields = [
             f"{tier:<5}",
             f"{(r.get('pattern') or '?')[:10]:<10}",
@@ -1992,10 +2108,13 @@ class TUI:
             f"{r.get('_prov', '—')[:9]:<9}",
             f"{model:<16}",
             f"{ctx_s[:5]:<5}",
+            f"{proc:<12}",
+            f"{last[:6]:<6}",
+            f"{workspace:<12}",
+            f"{waiting:<8}",
+            f"{approval:<9}",
             f"{fmt_kb(r.get('rss_kb'))[:6]:<6}",
-            f"{ps:<3}",
             f"{(r.get('tmux_pane_id') or '—')[:10]:<10}",
-            f"{cwd_base(r.get('cwd'))[:12]:<12}",
             f"{(r.get('_title') or '')[:tw]:<{tw}}",
         ]
         line = "  " + " ".join(fields)
@@ -2199,6 +2318,11 @@ class TUI:
         _meta_stale  = r.get("_meta_stale")
         _cpct_raw    = r.get("_ctx_pct")
         ctx_pct_text = f"{_cpct_raw:.1f}%" if _cpct_raw is not None else "—"
+        process_text = r.get("_proc") or "?"
+        last_text = activity_age(r.get("_last"))
+        workspace_text = r.get("_workspace") or "?"
+        waiting_text = r.get("_wait") or "?"
+        approval_text = r.get("_approval") or "?"
         lines = [
             f" {sid}",
             "",
@@ -2213,6 +2337,11 @@ class TUI:
             f" ctx_win:  {fmt_ctx(r.get('_ctx_win'))}  [{r.get('_ctx_win_src', 'unknown')}]",
             f" ctx_pct:  {ctx_pct_text}",
             f" meta_age: {_fmt_age(_meta_age)}{'  [stale]' if _meta_stale else ''}",
+            f" process:  {process_text}",
+            f" last_activity: {last_text}  [{r.get('_last_src', 'unknown')}]",
+            f" workspace: {workspace_text}",
+            f" waiting:  {waiting_text}",
+            f" approval: {approval_text}",
             f" cwd:      {cwd_v or '—'}",
             f" date:     {idx.get('sessiondate') or '—'}",
             f" signal:   {idx.get('signal') or '—'}",
@@ -2564,3 +2693,128 @@ case "$cmd" in
 esac
 #+END_SRC
 
+** Deterministic tests
+
+The test runner consumes a scratch-tangled =agent-top= binary and fixture state;
+it never refreshes live telemetry, writes a native store, or invokes a control
+action.  =AGENT_SESSIOND_SOURCE= points at the source module so the contract
+between the collector and the TUI is checked alongside the rendered surface.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-agent-top.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+import json
+import os
+import re
+import subprocess
+import tempfile
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+
+AGENT_TOP = os.environ.get("AGENT_TOP_BIN")
+SESSIOND_SOURCE = os.environ.get("AGENT_SESSIOND_SOURCE")
+
+
+class AgentTopSurfaceTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.state_path = root / "state.json"
+        self.index_path = root / "session-index.json"
+        self.session_id = "session-agent-top-fixture"
+        self.state = {
+            "schema": "agent-sessiond.v2",
+            "host": "fixture-host",
+            "generated_at": now.isoformat().replace("+00:00", "Z"),
+            "active_agents": [{
+                "pattern": "claude",
+                "pid": "42",
+                "session_id": self.session_id,
+                "proc_status": "S",
+                "process_state": "sleeping",
+                "provider": "anthropic",
+                "model": "claude-sonnet-fixture",
+                "context_percent": 42.5,
+                "last_activity_at": (now - timedelta(seconds=125)).isoformat().replace("+00:00", "Z"),
+                "last_activity_source": "fixture-transcript",
+                "workspace": "/srv/agent/workspace",
+                "cwd": "/srv/agent/workspace",
+                "waiting_status": "waiting",
+                "approval_status": "requested",
+                "link_confidence": "high",
+                "rss_kb": 1024,
+            }],
+        }
+        self.state_path.write_text(json.dumps(self.state))
+        self.index_path.write_text(json.dumps({"sessions": [{
+            "id": self.session_id,
+            "agent": "claude",
+            "status": "open",
+            "machine": "fixture-host",
+            "cwd": "/srv/agent/workspace",
+            "openquestion": "fixture question",
+        }]}))
+        self.env = os.environ.copy()
+        self.env.update({
+            "AGENT_TOP_STATE": str(self.state_path),
+            "AGENT_TOP_STATE_DIR": str(root),
+            "AGENT_TOP_EXTRA_DIRS": "",
+            "AGENT_TOP_INDEX": str(self.index_path),
+            "AGENT_TOP_ALL_HOSTS": "false",
+            "TERM": "dumb",
+        })
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def run_top(self, *args):
+        if not AGENT_TOP:
+            self.skipTest("AGENT_TOP_BIN is required")
+        return subprocess.run(
+            [AGENT_TOP, *args], env=self.env, text=True,
+            capture_output=True, check=False,
+        )
+
+    def test_once_renders_live_surface(self):
+        result = self.run_top("once", "--local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        for label in ("PROC", "CTX%", "LAST", "WORKSPACE", "WAIT", "APPR"):
+            self.assertIn(label, output)
+        for value in ("sleeping", "42%", "2m", "workspace", "waiting", "requested"):
+            self.assertIn(value, output)
+
+    def test_missing_evidence_is_question_mark(self):
+        self.state["active_agents"][0] = {
+            "pattern": "unknown-agent", "pid": "43", "session_id": "unknown-fixture"
+        }
+        self.state_path.write_text(json.dumps(self.state))
+        result = self.run_top("once", "--local")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        row = next(line for line in output.splitlines() if "unknown-agent" in line)
+        self.assertGreaterEqual(row.count("?"), 6)
+
+    def test_show_includes_detail_surface(self):
+        result = self.run_top("show", self.session_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout)
+        for label in ("process", "last_activity", "workspace", "waiting", "approval"):
+            self.assertIn(label, output)
+        self.assertIn("sleeping", output)
+
+    def test_sessiond_exports_surface_contract(self):
+        if not SESSIOND_SOURCE:
+            self.skipTest("AGENT_SESSIOND_SOURCE is required")
+        source = Path(SESSIOND_SOURCE).read_text()
+        for field in (
+            '"process_state"', '"workspace"', '"last_activity_at"',
+            '"waiting_status"', '"approval_status"',
+        ):
+            self.assertIn(field, source)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
+#+END_SRC
