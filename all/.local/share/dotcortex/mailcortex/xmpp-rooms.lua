@@ -26,14 +26,21 @@ local function compatible(room)
 end
 local function inspect(room, desired, index)
     local row = { index = index; created = room == nil; verified = false;
-        settings = array(); grant_admin = 0; clear_affiliations = 0;
+        settings = array(); grant_owner = 0; grant_admin = 0; clear_affiliations = 0;
         repair_moderators = 0; remove_occupants = 0; };
-    local allowed, grants, removals = {}, {}, {};
+    local allowed, owner_grants, admin_grants, removals = {}, {}, {}, {};
+    for _, jid in ipairs(desired.owners) do
+        allowed[jid] = true;
+        if not room or room:get_affiliation(jid) ~= "owner" then
+            row.grant_owner = row.grant_owner + 1;
+            table.insert(owner_grants, jid);
+        end
+    end
     for _, jid in ipairs(desired.admins) do
         allowed[jid] = true;
         if not room or room:get_affiliation(jid) ~= "admin" then
             row.grant_admin = row.grant_admin + 1;
-            table.insert(grants, jid);
+            table.insert(admin_grants, jid);
         end
     end
     for _, item in ipairs(settings) do
@@ -56,8 +63,8 @@ local function inspect(room, desired, index)
             end
         end
     end
-    table.sort(grants); table.sort(removals);
-    return row, allowed, grants, removals;
+    table.sort(owner_grants); table.sort(admin_grants); table.sort(removals);
+    return row, allowed, owner_grants, admin_grants, removals;
 end
 local function work()
     local plans, rows = {}, array();
@@ -73,10 +80,11 @@ local function work()
         local room = muc.get_room_from_jid(desired.jid);
         if room == false then fail("lookup-failed"); end
         if room then compatible(room); end
-        local row, allowed, grants, removals = inspect(room, desired, index);
+        local row, allowed, owner_grants, admin_grants, removals = inspect(room, desired, index);
         table.insert(rows, row);
         table.insert(plans, { room = room; muc = muc; desired = desired; row = row;
-                             allowed = allowed; grants = grants; removals = removals });
+                             allowed = allowed; owner_grants = owner_grants;
+                             admin_grants = admin_grants; removals = removals });
     end
     if request.dry_run then return { ok = true; dry_run = true; rooms = rows }; end
     phase = "apply";
@@ -102,7 +110,10 @@ local function work()
             end
         end
         -- Admit seats before tightening membership, preserving unaffiliated seat occupants.
-        for _, jid in ipairs(plan.grants) do
+        for _, jid in ipairs(plan.owner_grants) do
+            if not room:set_affiliation(true, jid, "owner") then fail("affiliation-failed"); end
+        end
+        for _, jid in ipairs(plan.admin_grants) do
             if not room:set_affiliation(true, jid, "admin") then fail("affiliation-failed"); end
         end
         if room:get_members_only() ~= true then room:set_members_only(true); end
@@ -122,7 +133,8 @@ local function work()
             end
         end
         local check = inspect(room, plan.desired, index);
-        if #check.settings ~= 0 or check.grant_admin ~= 0 or check.clear_affiliations ~= 0
+        if #check.settings ~= 0 or check.grant_owner ~= 0 or check.grant_admin ~= 0
+        or check.clear_affiliations ~= 0
         or check.repair_moderators ~= 0 or check.remove_occupants ~= 0 then fail("verify-failed"); end
         -- set_affiliation internally saves but ignores save failure; always check final save.
         if not room:save(true) then fail("save-failed"); end

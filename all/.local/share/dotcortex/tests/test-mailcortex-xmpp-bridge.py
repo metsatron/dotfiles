@@ -917,6 +917,7 @@ class RoomTests(unittest.TestCase):
                     "jid": "comms@rooms.example.test",
                     "lead": "fable",
                     "seats": ["fable", "worker"],
+                    "owners": ["owner@example.test"],
                 }
             },
             "nicks": {"worker": "Orca"},
@@ -928,8 +929,15 @@ class RoomTests(unittest.TestCase):
 
     def test_room_config_defaults_and_validation(self):
         self.assertEqual(self.room["nicks"], {"fable": "Fable", "worker": "Orca"})
+        self.assertEqual(self.room["owners"], ["owner@example.test"])
         self.assertEqual(self.cfg["room_by_jid"][self.room["jid"]], self.room)
         cases = []
+        cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test",
+                                             "lead": "fable", "seats": ["fable"],
+                                             "owners": ["owner@example.test/phone"]}}})
+        cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test",
+                                             "lead": "fable", "seats": ["fable"],
+                                             "owners": ["fable@seats.example.test"]}}})
         cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test/occupant",
                                              "lead": "fable", "seats": ["fable"]}}})
         cases.append({"rooms": {"comms": {"jid": "comms@rooms.example.test",

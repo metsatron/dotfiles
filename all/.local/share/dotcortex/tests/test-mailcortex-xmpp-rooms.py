@@ -185,7 +185,8 @@ class EnsureTests(unittest.TestCase):
             "component_secret_file": str(self.home / "YOUR_PASSWORD_TOKEN"),
             "seats": {"lead": "seat+lead@fixture.helm", "worker": "seat+worker@fixture.helm"},
             "rooms": {"squadron": {"jid": "squadron@rooms.example.test", "lead": "lead",
-                                     "seats": ["lead", "worker"]}},
+                                     "seats": ["lead", "worker"],
+                                     "owners": ["owner@example.test"]}},
             "password": "YOUR_PASSWORD_TOKEN", "token": "YOUR_PASSWORD_TOKEN",
         }
         self.config.write_text(json.dumps(self.data))
@@ -223,7 +224,7 @@ class EnsureTests(unittest.TestCase):
                           "members_only": False, "allow_member_invites": True},
                 "affiliations": {"lead@seats.example.test": "member",
                                  "worker@seats.example.test": "owner",
-                                 "admiral@example.test": "owner", "outsider@example.test": "member",
+                                 "owner@example.test": "owner", "outsider@example.test": "member",
                                  "blocked@example.test": "outcast", "example.test": "admin"},
                 "occupants": {
                     "squadron@rooms.example.test/lead": {
@@ -237,7 +238,8 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(room["_data"], {"persistent": True, "hidden": True,
             "whois": "moderators", "members_only": True, "allow_member_invites": False})
         self.assertEqual(room["affiliations"], {
-            "lead@seats.example.test": "admin", "worker@seats.example.test": "admin"})
+            "lead@seats.example.test": "admin", "worker@seats.example.test": "admin",
+            "owner@example.test": "owner"})
         for occupant in room["occupants"].values():
             self.assertIn(occupant["bare_jid"], room["affiliations"])
             self.assertEqual(occupant["role"], "moderator")
@@ -263,7 +265,7 @@ class EnsureTests(unittest.TestCase):
                                     "unlisted@rooms.example.test": unlisted}, "calls": []})
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("clear_affiliations=4", result.stdout)
+        self.assertIn("clear_affiliations=3", result.stdout)
         state = self.read_state()
         self.compliant(state["rooms"]["squadron@rooms.example.test"])
         self.assertEqual(state["rooms"]["unlisted@rooms.example.test"], unlisted)
@@ -279,6 +281,19 @@ class EnsureTests(unittest.TestCase):
         self.assertIn("squadron@rooms.example.test/lead",
                       state["rooms"]["squadron@rooms.example.test"]["occupants"])
         self.compliant(state["rooms"]["squadron@rooms.example.test"])
+
+    def test_configured_owner_is_granted_and_never_cleared(self):
+        room = self.drift()
+        room["affiliations"]["owner@example.test"] = "member"
+        room["occupants"]["squadron@rooms.example.test/owner"] = {
+            "bare_jid": "owner@example.test", "role": "participant"}
+        self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        configured = self.read_state()["rooms"]["squadron@rooms.example.test"]
+        self.assertEqual(configured["affiliations"]["owner@example.test"], "owner")
+        self.assertEqual(configured["occupants"]["squadron@rooms.example.test/owner"]["role"],
+                         "moderator")
 
     def test_empty_nonpersistent_room_persisted_before_tightening(self):
         room = self.drift()
@@ -296,6 +311,8 @@ class EnsureTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("plan:", result.stdout)
                 self.assertIn("grant_admin=2", result.stdout)
+                if not rooms:
+                    self.assertIn("grant_owner=1", result.stdout)
                 self.assertEqual(self.read_state(), before)
 
     def test_missing_empty_invalid_registry_never_invokes_shell(self):
@@ -410,9 +427,11 @@ class EnsureTests(unittest.TestCase):
         self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
 
     def test_response_validation_rejects_wrong_identity_shape_and_contract_evidence(self):
-        rooms = [{"jid": "squadron@rooms.example.test", "admins": ["lead@seats.example.test"]}]
+        rooms = [{"jid": "squadron@rooms.example.test", "owners": [],
+                  "admins": ["lead@seats.example.test"]}]
         row = {"index": 1, "created": False, "verified": True, "settings": [],
-               "grant_admin": 0, "clear_affiliations": 0, "repair_moderators": 0, "remove_occupants": 0}
+               "grant_owner": 0, "grant_admin": 0, "clear_affiliations": 0,
+               "repair_moderators": 0, "remove_occupants": 0}
         for changes in ({"index": 2}, {"index": True}, {"verified": False},
                         {"settings": ["YOUR_PASSWORD_TOKEN"]}, {"grant_admin": 2},
                         {"grant_admin": True}, {"remove_occupants": -1}):

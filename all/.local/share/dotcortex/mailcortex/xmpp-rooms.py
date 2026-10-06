@@ -12,7 +12,7 @@ import sys
 import uuid
 
 SETTINGS = ("persistent", "hidden", "whois", "allow_member_invites", "members_only")
-COUNTS = ("grant_admin", "clear_affiliations", "repair_moderators", "remove_occupants")
+COUNTS = ("grant_owner", "grant_admin", "clear_affiliations", "repair_moderators", "remove_occupants")
 ERRORS = {
     "host-unavailable", "lookup-failed", "room-protected", "api-unavailable",
     "create-failed", "setting-failed", "affiliation-failed", "role-failed",
@@ -40,8 +40,9 @@ def registry(bridge_path: Path, config_path: Path) -> list[dict]:
         raise RoomError("rooms map is missing or empty")
     # No other private config fields, including secret paths, enter the request.
     return [
-        {"jid": room["jid"], "admins": sorted(
-            local + "@" + cfg["component_jid"] for local in room["seats"])}
+        {"jid": room["jid"],
+         "owners": sorted(room.get("owners", [])),
+         "admins": sorted(local + "@" + cfg["component_jid"] for local in room["seats"])}
         for _, room in sorted(cfg["rooms"].items())
     ]
 
@@ -94,6 +95,7 @@ def response(stdout: str, nonce: str, rooms: list[dict], dry_run: bool) -> list[
                     or any(key not in SETTINGS for key in row["settings"])
                     or len(row["settings"]) != len(set(row["settings"]))
                     or any(type(row.get(key)) is not int or row[key] < 0 for key in COUNTS)
+                    or row["grant_owner"] > len(rooms[index - 1]["owners"])
                     or row["grant_admin"] > len(rooms[index - 1]["admins"])):
                 raise ValueError
         return rows
