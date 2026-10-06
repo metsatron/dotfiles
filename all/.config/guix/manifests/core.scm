@@ -72,6 +72,12 @@
    ;; "bat"          ; now cargo bat
    ;; "lsd"
 
+   ;; Gajim — rich desktop XMPP client (OMEMO, group chat, HTTP file upload, voice)
+   ;; for the fleet's private Prosody and the members-only squadron rooms
+   ;; (services-mailcortex-xmpp.org). Guix main, GPL, independent community project.
+   ;; Approved by Mètsàtron 2026-10-06 (Telegram msg 4999, "a good rich one").
+   "gajim"
+
    ;; Require building
    ;; "gwenview"
    ))
