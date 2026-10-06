@@ -333,7 +333,7 @@ honey_claude_launch haiku "${HONEY_HAIKU_MODEL:-claude-haiku-4-5-20251001}" "$@"
 Mètsàtron's ask (2026-09-26): the tanuki bots hear his voice notes and answer with voice notes too, in the Kitten seats pvox gives their kikin counterparts: Bunta Jasper (the Opus seat), Sasuke Luna (Fable's), Shoukichi Kiki (Haiku's), each at speed 1.2 on =kitten-tts-nano-0.8-int8=. On kikin pvox plays replies aloud on the speaker host; here each reply is also sent back into the chat as a playable voice note, because Honey has no HelmCortex and no speaker lane.
 
 - *Inbound:* the fleet's own =claude-hook-voice-transcribe= ([[file:agents-hooks.org][agents-hooks.org]]) runs as the =UserPromptSubmit= hook. It honours =$WHISPER_TRANSCRIBE=, which the launcher points at =honey-whisper-transcribe=, the Honey subset of HelmCortex's =whisper-transcribe= (same call shape, model source, cache and SHA-256 pin; no resident daemon, loop detection or escalation). =whisper-cli= comes from agent-claude's Guix profile, =ffmpeg= from the host.
-- *Outbound:* =honey-claude-voice-reply= runs as the =PostToolUse= hook on the reply tool. It detaches at once, renders the text with the agent's =~/kitten-venv= (DotCortex =kitten-apply=), encodes Opus, and posts it with =sendVoice= to the same chat. The token is read from the bot's state dir, never argv or logs; the log (=~/.cache/honey-voice-reply.log=) carries no text. =HONEY_VOICE_OFF=1= silences it, =HONEY_<BOT>_VOICE= overrides a seat.
+- *Outbound:* =honey-claude-voice-reply= runs as the =PostToolUse= hook on the reply tool. It sends the raw reply and its declared format through the fleet's shared =voice-text-normalize= boundary before the spoken-character cap, detaches at once, renders the clean text with the agent's =~/kitten-venv= (DotCortex =kitten-apply=), encodes Opus, and posts it with =sendVoice= to the same chat. The token is read from the bot's state dir, never argv or logs; the log (=~/.cache/honey-voice-reply.log=) carries no text or synthesizer stderr. =HONEY_VOICE_OFF=1= silences it, =HONEY_<BOT>_VOICE= overrides a seat.
 - The hooks reach Claude through =--settings=, so an unstowed agent account needs no hand-edited =settings.json=.
 
 #+BEGIN_SRC python :tangle honey/.local/share/honey-claude/bin/honey-claude-voice-reply :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
@@ -348,6 +348,8 @@ appears in argv or the log.
 """
 import json
 import os
+from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -361,6 +363,11 @@ MODEL = os.environ.get("HONEY_VOICE_MODEL", "KittenML/kitten-tts-nano-0.8-int8")
 VOICE = os.environ.get("HONEY_VOICE", "")
 SPEED = os.environ.get("HONEY_VOICE_SPEED", "1.2")
 MAX_CHARS = int(os.environ.get("HONEY_VOICE_MAX_CHARS", "0") or 0)  # 0 = speak the whole reply (2026-10-07)
+NORMALIZER = (
+    os.environ.get("VOICE_TEXT_NORMALIZER")
+    or shutil.which("voice-text-normalize")
+    or str(Path(__file__).resolve().parents[5] / "all/.local/bin/voice-text-normalize")
+)
 SYNTH = r"""
 import sys
 import numpy as np
@@ -409,6 +416,19 @@ def send_voice(tok, chat_id, ogg, reply_to):
     return json.load(urllib.request.urlopen(req, timeout=60)).get("ok")
 
 
+def normalize_reply(text, format_name):
+    try:
+        result = subprocess.run(
+            [NORMALIZER, "--format", format_name], input=text,
+            text=True, capture_output=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise RuntimeError(error.__class__.__name__) from error
+    if result.returncode:
+        raise RuntimeError("exit-%d" % result.returncode)
+    return result.stdout.strip()
+
+
 def render_and_send(text, chat_id, reply_to):
     tok = token()
     if not tok:
@@ -420,7 +440,7 @@ def render_and_send(text, chat_id, reply_to):
         r = subprocess.run([KITTEN_PY, "-c", SYNTH, MODEL, VOICE, SPEED, pcm],
                            input=text.encode(), capture_output=True, timeout=600)
         if r.returncode != 0:
-            log("FAIL synth rc=%d %s" % (r.returncode, r.stderr.decode(errors="replace").strip().splitlines()[-1:]))
+            log("FAIL synth rc=%d" % r.returncode)
             return
         r = subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "s16le", "-ar", "24000", "-ac", "1",
                             "-i", pcm, "-c:a", "libopus", "-b:a", "32k", ogg], capture_output=True, timeout=120)
@@ -435,7 +455,7 @@ def render_and_send(text, chat_id, reply_to):
         log("OK voice=%s chars=%d secs=%.1f sent=%s" % (VOICE, len(text), time.time() - t0, ok))
 
 
-def main():
+def main(detach=True):
     if os.environ.get("HONEY_VOICE_OFF") or not VOICE or not os.path.exists(KITTEN_PY):
         return
     try:
@@ -443,24 +463,34 @@ def main():
     except ValueError:
         return
     ti = data.get("tool_input") or {}
-    text, chat_id = (ti.get("text") or "").strip(), ti.get("chat_id")
-    if not text or not chat_id:
+    raw, format_name = ti.get("text") or "", ti.get("format") or "markdown"
+    chat_id = ti.get("chat_id")
+    if not isinstance(raw, str) or not isinstance(format_name, str) or not raw.strip() or not chat_id:
+        return
+    try:
+        text = normalize_reply(raw, format_name)
+    except RuntimeError as error:
+        log("SKIP normalize-failed %s" % error)
+        return
+    if not text:
         return
     if MAX_CHARS and len(text) > MAX_CHARS:
         text = text[:MAX_CHARS]
     # Detach: the reply has already gone out; the voice note follows it.
-    if os.fork() > 0:
-        return
-    os.setsid()
-    if os.fork() > 0:
-        os._exit(0)
-    devnull = os.open(os.devnull, os.O_RDWR)
-    for fd in (0, 1, 2):
-        os.dup2(devnull, fd)
+    if detach:
+        if os.fork() > 0:
+            return
+        os.setsid()
+        if os.fork() > 0:
+            os._exit(0)
+        devnull = os.open(os.devnull, os.O_RDWR)
+        for fd in (0, 1, 2):
+            os.dup2(devnull, fd)
     try:
         render_and_send(text, chat_id, ti.get("reply_to"))
     finally:
-        os._exit(0)
+        if detach:
+            os._exit(0)
 
 
 if __name__ == "__main__":
