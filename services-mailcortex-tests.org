@@ -478,12 +478,13 @@ class WatcherTests(unittest.TestCase):
             "hermes_session_key": "hermesbot-key", "rate_limit_seconds": 0,
         }
 
-    def test_hermes_idle_health_delivers_named_session_with_continuation_header(self):
+    def test_hermes_missing_session_is_created_then_delivered(self):
         record = self.hermes_record()
         calls = []
         responses = iter((
             FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
                               "api_server": {"active_runs": 0}, "gateway_state": "running"}),
+            FakeHTTPResponse({"object": "hermes.session"}, status=201),
             FakeHTTPResponse({"object": "hermes.session.chat.completion"}),
         ))
 
@@ -494,15 +495,74 @@ class WatcherTests(unittest.TestCase):
         adapter = self.watcher.HermesAdapter(opener=opener)
         self.assertEqual(adapter.resolve_idle_pane(record), "hermesbot-session")
         adapter.deliver(record, "hermesbot-session", "wake")
-        self.assertEqual([call[0].get_method() for call in calls], ["GET", "POST"])
+        self.assertEqual([call[0].get_method() for call in calls], ["GET", "POST", "POST"])
         self.assertTrue(calls[0][0].full_url.endswith("/health/detailed"))
-        self.assertTrue(calls[1][0].full_url.endswith("/api/sessions/hermesbot-session/chat"))
-        headers = {key.lower(): value for key, value in calls[1][0].header_items()}
+        self.assertTrue(calls[1][0].full_url.endswith("/api/sessions"))
+        self.assertEqual(json.loads(calls[1][0].data),
+                         {"id": "hermesbot-session", "title": "hermesbot-session"})
+        self.assertTrue(calls[2][0].full_url.endswith("/api/sessions/hermesbot-session/chat"))
+        headers = {key.lower(): value for key, value in calls[2][0].header_items()}
         self.assertEqual(headers["authorization"], "Bearer YOUR_HERMES_API_KEY")
         self.assertEqual(headers["x-hermes-session-key"], "hermesbot-key")
-        self.assertEqual(json.loads(calls[1][0].data), {"message": "wake"})
+        self.assertEqual(json.loads(calls[2][0].data), {"message": "wake"})
         self.assertEqual(calls[0][1], 15)
-        self.assertEqual(calls[1][1], 60)
+        self.assertEqual(calls[2][1], 60)
+
+    def test_hermes_existing_session_is_left_untouched(self):
+        record = self.hermes_record()
+        calls = []
+        responses = iter((
+            FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
+                              "api_server": {"active_runs": 0}, "gateway_state": "running"}),
+            FakeHTTPResponse({"error": {"code": "session_exists"}}, status=409),
+            FakeHTTPResponse({"object": "hermes.session.chat.completion"}),
+        ))
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            return next(responses)
+
+        adapter = self.watcher.HermesAdapter(opener=opener)
+        target = adapter.resolve_idle_pane(record)
+        adapter.deliver(record, target, "wake")
+        self.assertEqual([call[0].get_method() for call in calls], ["GET", "POST", "POST"])
+        self.assertEqual(calls[1][0].full_url.rsplit("/", 1)[-1], "sessions")
+        self.assertEqual(json.loads(calls[1][0].data),
+                         {"id": "hermesbot-session", "title": "hermesbot-session"})
+        self.assertNotIn("/chat", calls[1][0].full_url)
+
+    def test_hermes_chat_404_is_typed_with_the_session_name(self):
+        record = self.hermes_record()
+        responses = iter((
+            FakeHTTPResponse({"error": {"code": "session_exists"}}, status=409),
+            FakeHTTPResponse({"error": {"code": "session_not_found"}}, status=404),
+        ))
+        adapter = self.watcher.HermesAdapter(
+            opener=lambda request, timeout: next(responses))
+        with self.assertRaisesRegex(self.watcher.HermesSessionNotFoundError,
+                                    "Hermes session not found: hermesbot-session"):
+            adapter.deliver(record, "hermesbot-session", "wake")
+
+    def test_hermes_chat_404_queues_named_failure_not_delivery_unknown(self):
+        record = self.hermes_record() | {"mailbox": "seats/builder"}
+        self.registry["seats"]["builder"] = record
+        mid = "<hermes-missing@node.helm>"
+        self.mail(mid, "hermes")
+        responses = iter((
+            FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
+                              "api_server": {"active_runs": 0}, "gateway_state": "running"}),
+            FakeHTTPResponse({"error": {"code": "session_exists"}}, status=409),
+            FakeHTTPResponse({"error": {"code": "session_not_found"}}, status=404),
+        ))
+        adapter = self.watcher.HermesAdapter(
+            opener=lambda request, timeout: next(responses))
+        with self.assertRaisesRegex(self.watcher.HermesSessionNotFoundError,
+                                    "hermesbot-session"):
+            self.watcher.locked_scan(self.registry, adapter, now=10)
+        receipt = self.receipt(mid)
+        self.assertEqual(receipt["wake_state"], "queued")
+        self.assertEqual(receipt["reason"], "session_not_found")
+        self.assertNotEqual(receipt["wake_state"], "delivery_unknown")
 
     def test_hermes_busy_and_unprovable_health_refuse(self):
         record = self.hermes_record()
