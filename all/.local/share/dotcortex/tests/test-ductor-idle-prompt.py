@@ -179,6 +179,20 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
         self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
 
+    async def test_shutdown_refuses_admission_even_during_session_lookup(self):
+        self.prepare(); client, channel = self.channel()
+        async def lookup(key):
+            await self.server.stop()
+            return self.session
+        self.sessions.get_active.side_effect = lookup
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.sessions.get_active.side_effect = None
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.server._idle_tasks, set())
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+
     async def test_second_admission_cannot_enter_during_first_turn(self):
         self.prepare(); client, channel = self.channel()
         await self.route(client, channel); await self.entered.wait()
@@ -297,6 +311,53 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(caught.exception, watcher.DuctorNotAdmittedError)
             await self.entered.wait(); await self.settle()
             self.assertEqual(len(self.calls), 1)
+
+    async def test_production_client_dependency_loss_before_send_is_safe_refusal(self):
+        import builtins
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        original = builtins.__import__
+        def unavailable(name, *args, **kwargs):
+            if name == "aiohttp":
+                raise ImportError("fixture dependency loss")
+            return original(name, *args, **kwargs)
+        with mock.patch.object(builtins, "__import__", side_effect=unavailable), \
+                self.assertRaises(watcher.DuctorNotAdmittedError):
+            await watcher.DuctorAdapter()._deliver_idle(
+                {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"},
+                fixture.KEY.storage_key, "mail")
+        self.assertFalse(hasattr(socket.auth_socket, "auth"))
+        self.assertEqual(self.calls, [])
+
+    async def test_production_client_redirect_refused_before_authentication(self):
+        import aiohttp
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        options = {}
+        class Redirect:
+            async def __aenter__(inner):
+                trace = options["trace_configs"][0]
+                trace.freeze()
+                await trace.on_request_redirect.send(None, None, None)
+                raise AssertionError("redirect was not refused")
+            async def __aexit__(inner, *args):
+                pass
+        class Session:
+            async def __aenter__(inner):
+                return inner
+            async def __aexit__(inner, *args):
+                pass
+            def ws_connect(inner, url):
+                return Redirect()
+        def factory(**kwargs):
+            options.update(kwargs)
+            return Session()
+        with mock.patch.object(aiohttp, "ClientSession", side_effect=factory), \
+                self.assertRaises(watcher.DuctorNotAdmittedError):
+            await watcher.DuctorAdapter()._deliver_idle(
+                {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"},
+                fixture.KEY.storage_key, "mail")
+        self.assertFalse(options["trust_env"])
+        self.assertFalse(hasattr(socket.auth_socket, "auth"))
+        self.assertEqual(self.calls, [])
 
     async def test_production_client_bad_auth_never_sends_prompt(self):
         self.prepare(); watcher, socket, patch = self.client_wire()
