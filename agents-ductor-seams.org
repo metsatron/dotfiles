@@ -665,6 +665,14 @@ This is a branch-built capability, not a live deployment. Operator approval,
 private API configuration and seam application/restart remain separate gates.
 No listener, token, chat identity or port is inferred or installed by these tests.
 
+The applier classifies overlapping hooks on a disposable copy: reverse the
+already-applied admission hook there, inspect prerequisite states, then replay
+the ordered series with =--fuzz=0=. It never reverses a live target. Shutdown
+closes admission before taking its owned-task snapshot, including requests that
+were awaiting session lookup when shutdown began. Tests cover
+all six valid prerequisite/admission states, byte-preserving repeated apply and
+=--check=, and refusal before any target mutation when either hook has drifted.
+
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/ductor-seams/idle_prompt.py
 """Atomic idle admission on Ductor's existing encrypted input surface."""
 from __future__ import annotations
@@ -721,7 +729,8 @@ async def handle_idle_message(orch, server, channel, key, data):
         await reply("unavailable"); return
     try:
         state = await main_busy_state(orch, server)
-        if state["known"] is not True or state["session_key"] != key.storage_key:
+        if (server._idle_stopping or state["known"] is not True
+                or state["session_key"] != key.storage_key):
             await reply("unavailable"); return
         if state["busy"] is not False:
             await reply("busy"); return
@@ -783,16 +792,17 @@ async def handle_idle_message(orch, server, channel, key, data):
  
      @property
      def closed(self) -> bool:
-@@ -194,6 +195,8 @@
+@@ -194,6 +195,9 @@
          self._provider_info: list[dict[str, object]] = []
          self._active_state_getter: Callable[[], tuple[str, str]] | None = None
          self._busy_state_handler: Callable[[], Awaitable[dict[str, object]]] | None = None
 +        self._idle_message_handler = None
 +        self._idle_tasks: set[asyncio.Task] = set()
++        self._idle_stopping = False
  
      # -- Handler wiring --------------------------------------------------------
  
-@@ -227,6 +230,9 @@
+@@ -227,6 +231,9 @@
  
      def set_busy_state_handler(self, handler: Callable[[], Awaitable[dict[str, object]]]) -> None:
          self._busy_state_handler = handler
@@ -802,10 +812,11 @@ async def handle_idle_message(orch, server, channel, key, data):
  
  
      # -- Lifecycle -------------------------------------------------------------
-@@ -262,6 +268,11 @@
+@@ -262,6 +269,12 @@
  
      async def stop(self) -> None:
          """Close all connections and shut down the server."""
++        self._idle_stopping = True
 +        tasks = list(self._idle_tasks)
 +        for task in tasks:
 +            task.cancel()
@@ -814,7 +825,7 @@ async def handle_idle_message(orch, server, channel, key, data):
          for ws in list(self._active_ws):
              await ws.close(
                  code=aiohttp.WSCloseCode.GOING_AWAY,
-@@ -401,7 +412,9 @@
+@@ -401,7 +414,9 @@
              return ws
  
          key, e2e = auth_result
@@ -825,7 +836,7 @@ async def handle_idle_message(orch, server, channel, key, data):
  
          self._active_ws.add(ws)
          try:
-@@ -534,6 +547,14 @@
+@@ -534,6 +549,14 @@
              return
  
          msg_type = str(data.get("type", ""))
@@ -956,18 +967,12 @@ hook_patch="$SEAMS_DIR/idle_compact_lifecycle.patch"
 [ -f "$module_src" ] && [ -f "$hook_patch" ] || fail "idle_compact seam files missing in $SEAMS_DIR"
 
 module_state="$(seam_file_state "$module_src" "$module_dst")"
-hook_state="$(seam_patch_state "$hook_patch")"
-[ "$hook_state" != drifted ] || fail "idle_compact: orchestrator/lifecycle.py drifted from the seam; regenerate it"
-echo "idle_compact: module=$module_state hook=$hook_state"
 
 busy_src="$SEAMS_DIR/busy_state.py"
 busy_dst="$PKG/api/busy_state.py"
 busy_patch="$SEAMS_DIR/busy_state_api.patch"
 [ -f "$busy_src" ] && [ -f "$busy_patch" ] || fail "busy_state seam files missing in $SEAMS_DIR"
 busy_module_state="$(seam_file_state "$busy_src" "$busy_dst")"
-busy_hook_state="$(seam_patch_state "$busy_patch")"
-[ "$busy_hook_state" != drifted ] || fail "busy_state: API/lifecycle upstream drift; regenerate it"
-echo "busy_state: module=$busy_module_state hook=$busy_hook_state"
 
 prompt_src="$SEAMS_DIR/idle_prompt.py"
 prompt_dst="$PKG/api/idle_prompt.py"
@@ -976,8 +981,8 @@ prompt_patch="$SEAMS_DIR/idle_prompt_api.patch"
 prompt_module_state="$(seam_file_state "$prompt_src" "$prompt_dst")"
 
 # Validate the complete ordered series on a disposable staged copy first.
-# The admission patch depends on busy wiring, so classify it only after the
-# earlier series has been reconciled on this copy (never on the live package).
+# Later patches overlap earlier context. Peel an applied admission hook off
+# this copy before classifying its prerequisites; never reverse the live target.
 preflight="$(mktemp -d)"
 trap 'rm -rf "$preflight"' EXIT
 mkdir -p "$preflight/ductor_bot/orchestrator" "$preflight/ductor_bot/api"
@@ -986,18 +991,26 @@ cp "$PKG/api/server.py" "$preflight/ductor_bot/api/"
 install -m 0644 "$module_src" "$preflight/ductor_bot/orchestrator/idle_compact.py"
 install -m 0644 "$busy_src" "$preflight/ductor_bot/api/busy_state.py"
 install -m 0644 "$prompt_src" "$preflight/ductor_bot/api/idle_prompt.py"
+prompt_hook_state=missing
+if patch -d "$preflight" -p1 --fuzz=0 --dry-run --reverse --force -s <"$prompt_patch" >/dev/null 2>&1; then
+    prompt_hook_state=applied
+    patch -d "$preflight" -p1 --fuzz=0 --reverse --force -s <"$prompt_patch" || fail "idle_prompt reverse preflight failed"
+fi
+hook_state="$(seam_patch_state "$hook_patch" "$preflight")"
+[ "$hook_state" != drifted ] || fail "idle_compact: orchestrator/lifecycle.py drifted from the seam; regenerate it"
+echo "idle_compact: module=$module_state hook=$hook_state"
+busy_hook_state="$(seam_patch_state "$busy_patch" "$preflight")"
+[ "$busy_hook_state" != drifted ] || fail "busy_state: API/lifecycle upstream drift; regenerate it"
+echo "busy_state: module=$busy_module_state hook=$busy_hook_state"
 if [ "$hook_state" = missing ]; then
     patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$hook_patch" || fail "idle_compact preflight failed"
 fi
 if [ "$busy_hook_state" = missing ]; then
     patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$busy_patch" || fail "busy_state preflight failed"
 fi
-prompt_hook_state="$(seam_patch_state "$prompt_patch" "$preflight")"
-[ "$prompt_hook_state" != drifted ] || fail "idle_prompt: API/lifecycle upstream drift; regenerate it"
+[ "$(seam_patch_state "$prompt_patch" "$preflight")" = missing ] || fail "idle_prompt: API/lifecycle upstream drift; regenerate it"
 echo "idle_prompt: module=$prompt_module_state hook=$prompt_hook_state"
-if [ "$prompt_hook_state" = missing ]; then
-    patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$prompt_patch" || fail "idle_prompt preflight failed"
-fi
+patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$prompt_patch" || fail "idle_prompt preflight failed"
 "$PYTHON_BIN" -m compileall -q "$preflight/ductor_bot" || fail "complete series preflight compile failed"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
@@ -1669,6 +1682,54 @@ class ApplyTests(unittest.TestCase):
             self.assertEqual(snapshot(site), before)
             print("DRIFT REFUSAL:\n" + result.stdout + result.stderr)
 
+    def test_ordered_series_all_valid_hook_states(self):
+        for compact in (False, True):
+            for stage in (0, 1, 2):  # absent, busy-only, complete admission
+                with self.subTest(compact=compact, stage=stage), tempfile.TemporaryDirectory() as root:
+                    site = Path(root)
+                    shutil.copytree(SITE / "ductor_bot", site / "ductor_bot",
+                                    ignore=shutil.ignore_patterns("__pycache__"))
+                    patches = []
+                    if stage < 2:
+                        patches.append("idle_prompt_api.patch")
+                    if stage < 1:
+                        patches.append("busy_state_api.patch")
+                    if not compact:
+                        patches.append("idle_compact_lifecycle.patch")
+                    for name in patches:
+                        subprocess.run(["patch", "-d", str(site), "-p1", "--fuzz=0",
+                                        "--reverse", "--force", "-s"],
+                                       input=(SEAMS / name).read_bytes(), check=True, capture_output=True)
+                    before = snapshot(site)
+                    checked = apply(site, "--check")
+                    self.assertEqual(checked.returncode, int(bool(patches)), checked.stdout + checked.stderr)
+                    self.assertEqual(snapshot(site), before)
+                    result = apply(site)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    after = snapshot(site)
+                    result = apply(site)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("already applied", result.stdout)
+                    self.assertEqual(snapshot(site), after)
+                    self.assertEqual(apply(site, "--check").returncode, 0)
+
+    def test_admission_drift_refuses_before_mutation_on_applied_series(self):
+        with tempfile.TemporaryDirectory() as root:
+            site = Path(root)
+            shutil.copytree(SITE / "ductor_bot", site / "ductor_bot",
+                            ignore=shutil.ignore_patterns("__pycache__"))
+            target = site / "ductor_bot/api/server.py"
+            needle = "        self._idle_message_handler = None"
+            source = target.read_text()
+            self.assertEqual(source.count(needle), 1)
+            target.write_text(source.replace(needle, needle + "  # fixture upstream drift"))
+            before = snapshot(site)
+            for args in ((), ("--check",)):
+                result = apply(site, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("upstream drift", result.stderr)
+                self.assertEqual(snapshot(site), before)
+
     def test_forced_idle_mutant_fails_active_turn_test(self):
         env = dict(os.environ, DUCTOR_BUSY_MUTANT="1", PYTHONDONTWRITEBYTECODE="1")
         result = subprocess.run([sys.executable, __file__, "BusyTests.test_active_turn", "-v"],
@@ -1875,6 +1936,20 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
         self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
 
+    async def test_shutdown_refuses_admission_even_during_session_lookup(self):
+        self.prepare(); client, channel = self.channel()
+        async def lookup(key):
+            await self.server.stop()
+            return self.session
+        self.sessions.get_active.side_effect = lookup
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.sessions.get_active.side_effect = None
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.server._idle_tasks, set())
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+
     async def test_second_admission_cannot_enter_during_first_turn(self):
         self.prepare(); client, channel = self.channel()
         await self.route(client, channel); await self.entered.wait()
@@ -1993,6 +2068,53 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIsInstance(caught.exception, watcher.DuctorNotAdmittedError)
             await self.entered.wait(); await self.settle()
             self.assertEqual(len(self.calls), 1)
+
+    async def test_production_client_dependency_loss_before_send_is_safe_refusal(self):
+        import builtins
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        original = builtins.__import__
+        def unavailable(name, *args, **kwargs):
+            if name == "aiohttp":
+                raise ImportError("fixture dependency loss")
+            return original(name, *args, **kwargs)
+        with mock.patch.object(builtins, "__import__", side_effect=unavailable), \
+                self.assertRaises(watcher.DuctorNotAdmittedError):
+            await watcher.DuctorAdapter()._deliver_idle(
+                {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"},
+                fixture.KEY.storage_key, "mail")
+        self.assertFalse(hasattr(socket.auth_socket, "auth"))
+        self.assertEqual(self.calls, [])
+
+    async def test_production_client_redirect_refused_before_authentication(self):
+        import aiohttp
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        options = {}
+        class Redirect:
+            async def __aenter__(inner):
+                trace = options["trace_configs"][0]
+                trace.freeze()
+                await trace.on_request_redirect.send(None, None, None)
+                raise AssertionError("redirect was not refused")
+            async def __aexit__(inner, *args):
+                pass
+        class Session:
+            async def __aenter__(inner):
+                return inner
+            async def __aexit__(inner, *args):
+                pass
+            def ws_connect(inner, url):
+                return Redirect()
+        def factory(**kwargs):
+            options.update(kwargs)
+            return Session()
+        with mock.patch.object(aiohttp, "ClientSession", side_effect=factory), \
+                self.assertRaises(watcher.DuctorNotAdmittedError):
+            await watcher.DuctorAdapter()._deliver_idle(
+                {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"},
+                fixture.KEY.storage_key, "mail")
+        self.assertFalse(options["trust_env"])
+        self.assertFalse(hasattr(socket.auth_socket, "auth"))
+        self.assertEqual(self.calls, [])
 
     async def test_production_client_bad_auth_never_sends_prompt(self):
         self.prepare(); watcher, socket, patch = self.client_wire()
