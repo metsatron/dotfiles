@@ -28,6 +28,7 @@ class Socket:
 
 class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
     setUp = fixture.BusyTests.setUp
+    request = fixture.BusyTests.request
 
     def channel(self, allowed=True):
         client, server = E2ESession(), E2ESession()
@@ -169,6 +170,141 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(seam.idle_peer_allowed(self.server, request))
         self.server._config.token = ""
         self.assertFalse(seam.idle_peer_allowed(self.server, fixture.BusyTests.request(self)))
+
+    async def test_cancellation_before_turn_starts_releases_claimed_locks(self):
+        self.prepare(); client, channel = self.channel()
+        await self.route(client, channel)
+        await self.server.stop()
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+
+    async def test_second_admission_cannot_enter_during_first_turn(self):
+        self.prepare(); client, channel = self.channel()
+        await self.route(client, channel); await self.entered.wait()
+        other, second = self.channel()
+        self.assertEqual((await self.route(other, second, request_id="b" * 32))[-1]["status"], "busy")
+        self.assertEqual(len(self.calls), 1)
+        await self.settle()
+
+    async def test_authority_exception_never_claims_or_dispatches(self):
+        self.prepare(); client, channel = self.channel()
+        self.sessions.get_active.side_effect = RuntimeError("fixture unavailable")
+        with self.assertLogs(seam.logger, "ERROR"):
+            self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.assertEqual(self.calls, [])
+        self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+
+    async def test_regular_encrypted_message_still_uses_original_handler(self):
+        client, channel = self.channel()
+        self.server.set_message_handler(mock.AsyncMock(return_value=SimpleNamespace(
+            text="normal result", stream_fallback=False)))
+        await self.server._route_text_message(channel, client.encrypt({"type": "message", "text": "normal"}),
+            fixture.KEY, self.server._lock_pool.get(fixture.KEY.lock_key))
+        self.assertEqual(client.decrypt(channel.ws.frames[-1])["text"], "normal result")
+        self.server._handle_message.assert_awaited_once()
+
+    def client_wire(self, *, ack_mode=None):
+        import aiohttp
+        import importlib.machinery
+        watcher_path = Path(__file__).resolve().parents[5] / "all/.local/bin/mailcortex-seat-watcher"
+        loader = importlib.machinery.SourceFileLoader("ductor_wire_watcher", str(watcher_path))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        watcher = importlib.util.module_from_spec(spec); spec.loader.exec_module(watcher)
+        test = self
+        class AuthSocket:
+            closed = False
+            async def receive(inner):
+                return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=json.dumps(inner.auth))
+            async def send_json(inner, value):
+                inner.answer = value
+            async def close(inner):
+                inner.closed = True
+        class ClientSocket:
+            def __init__(inner):
+                inner.auth_socket = AuthSocket(); inner.server_socket = Socket()
+                inner.sent = []; inner.channel = None
+            async def __aenter__(inner):
+                return inner
+            async def __aexit__(inner, *args):
+                inner.server_socket.closed = True
+            async def send_json(inner, value):
+                inner.auth_socket.auth = value
+                result = await test.server._authenticate(inner.auth_socket)
+                if result:
+                    inner.key, box = result
+                    inner.channel = _SecureChannel(inner.server_socket, box, idle_prompt_allowed=True)
+            async def receive_json(inner, timeout):
+                return inner.auth_socket.answer
+            async def send_str(inner, frame):
+                inner.sent.append(inner.channel.decrypt(frame))
+                await test.server._route_text_message(inner.channel, frame, inner.key,
+                    test.server._lock_pool.get(inner.key.lock_key))
+            async def receive(inner, timeout):
+                if ack_mode == "lost":
+                    raise TimeoutError("fixture ACK loss")
+                frame = inner.server_socket.frames[0]
+                if ack_mode in {"request_id", "session_key"}:
+                    # Re-encrypt an authentic but identity-mismatched ACK.
+                    box = inner.channel._e2e
+                    value = {"type": "idle_admission", "request_id": inner.sent[0]["request_id"],
+                             "session_key": fixture.KEY.storage_key, "status": "accepted"}
+                    value[ack_mode] = "wrong"
+                    frame = box.encrypt(value)
+                return SimpleNamespace(type=aiohttp.WSMsgType.TEXT, data=frame)
+        socket = ClientSocket()
+        class Session:
+            async def __aenter__(inner):
+                return inner
+            async def __aexit__(inner, *args):
+                pass
+            def ws_connect(inner, url):
+                test.assertTrue(url.endswith("/ws"))
+                return socket
+        return watcher, socket, mock.patch.object(aiohttp, "ClientSession", return_value=Session())
+
+    async def test_production_watcher_client_and_real_authenticated_router_agree(self):
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        settings = {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"}
+        with patch as factory:
+            await watcher.DuctorAdapter()._deliver_idle(settings, fixture.KEY.storage_key, "MailCortex delivery")
+        factory.assert_called_once()
+        self.assertFalse(factory.call_args.kwargs["trust_env"])
+        self.assertEqual(set(socket.auth_socket.auth), {"type", "token", "e2e_pk"})
+        self.assertEqual(socket.sent[0]["type"], "idle_message")
+        self.assertEqual(socket.sent[0]["session_key"], fixture.KEY.storage_key)
+        await self.entered.wait(); await self.settle()
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_production_client_negative_ack_is_safe_busy_retry(self):
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        with patch:
+            async with self.orch._lock_pool.get(fixture.KEY.lock_key):
+                with self.assertRaises(watcher.DuctorNotAdmittedError) as caught:
+                    await watcher.DuctorAdapter()._deliver_idle(
+                        {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"},
+                        fixture.KEY.storage_key, "mail")
+        self.assertEqual(caught.exception.reason, "busy")
+        self.assertEqual(self.calls, [])
+
+    async def test_production_client_lost_or_wrong_ack_is_ambiguous_not_safe_retry(self):
+        for mode in ("lost", "request_id", "session_key"):
+            self.prepare(); watcher, socket, patch = self.client_wire(ack_mode=mode)
+            with patch, self.assertRaises(watcher.WatcherError) as caught:
+                await watcher.DuctorAdapter()._deliver_idle(
+                    {"url": "http://localhost:YOUR_PORT", "token": "YOUR_API_TOKEN"},
+                    fixture.KEY.storage_key, "mail")
+            self.assertNotIsInstance(caught.exception, watcher.DuctorNotAdmittedError)
+            await self.entered.wait(); await self.settle()
+            self.assertEqual(len(self.calls), 1)
+
+    async def test_production_client_bad_auth_never_sends_prompt(self):
+        self.prepare(); watcher, socket, patch = self.client_wire()
+        with patch, self.assertRaises(watcher.DuctorNotAdmittedError):
+            await watcher.DuctorAdapter()._deliver_idle(
+                {"url": "http://localhost:YOUR_PORT", "token": "wrong"}, fixture.KEY.storage_key, "mail")
+        self.assertEqual(socket.sent, [])
+        self.assertEqual(self.calls, [])
 
     async def test_lifecycle_wires_real_conditional_handler(self):
         await fixture.BusyTests.test_lifecycle_wires_real_authority(self)
