@@ -248,6 +248,8 @@ class EnsureTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("create", result.stdout)
+        self.assertIn("grant_owner=1", result.stdout)
+        self.assertIn("grant_admin=2", result.stdout)
         self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
         before = self.read_state()
         result = self.invoke()
@@ -313,7 +315,12 @@ class EnsureTests(unittest.TestCase):
                     room["affiliations"]["admiral@example.test"] = affiliation
                 nick = "squadron@rooms.example.test/admiral"
                 room["occupants"][nick] = {"bare_jid": "admiral@example.test", "role": "participant"}
-                self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+                before = {"rooms": {"squadron@rooms.example.test": room}, "calls": []}
+                self.write_state(before)
+                plan = self.invoke("--dry-run")
+                self.assertEqual(plan.returncode, 0, plan.stderr)
+                self.assertIn("grant_owner=1", plan.stdout)
+                self.assertEqual(self.read_state(), before)
                 result = self.invoke()
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("grant_owner=1", result.stdout)
@@ -386,7 +393,12 @@ class EnsureTests(unittest.TestCase):
         for fault, code in (("affiliation", "affiliation-failed"), ("ignored-affiliation", "verify-failed"),
                             ("save", "save-failed")):
             with self.subTest(fault=fault):
-                self.write_state({"rooms": {}, "calls": [], "fault": fault})
+                room = {"_data": {"persistent": True, "hidden": True, "whois": "moderators",
+                                  "members_only": True, "allow_member_invites": False},
+                        "affiliations": {"lead@seats.example.test": "admin",
+                                         "worker@seats.example.test": "admin"}, "occupants": {}}
+                self.write_state({"rooms": {"squadron@rooms.example.test": room},
+                                  "calls": [], "fault": fault})
                 result = self.invoke()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(result.stdout, "")
