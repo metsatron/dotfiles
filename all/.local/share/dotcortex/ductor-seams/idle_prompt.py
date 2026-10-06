@@ -53,7 +53,8 @@ async def handle_idle_message(orch, server, channel, key, data):
         await reply("unavailable"); return
     try:
         state = await main_busy_state(orch, server)
-        if state["known"] is not True or state["session_key"] != key.storage_key:
+        if (server._idle_stopping or state["known"] is not True
+                or state["session_key"] != key.storage_key):
             await reply("unavailable"); return
         if state["busy"] is not False:
             await reply("busy"); return
