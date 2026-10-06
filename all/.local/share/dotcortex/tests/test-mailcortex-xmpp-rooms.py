@@ -73,7 +73,7 @@ local function attach(room)
         for nick, occupant in pairs(self.occupants) do
             if occupant.bare_jid == jid then
                 if value == "none" and self._data.members_only then self.occupants[nick] = nil;
-                elseif value == "admin" then occupant.role = "moderator"; end
+                elseif value == "admin" or value == "owner" then occupant.role = "moderator"; end
             end
         end
         mutation(self, "affiliation:" .. value);
@@ -224,6 +224,7 @@ class EnsureTests(unittest.TestCase):
                 "affiliations": {"lead@seats.example.test": "member",
                                  "worker@seats.example.test": "owner",
                                  "admiral@example.test": "owner", "outsider@example.test": "member",
+                                  "rogue@example.test": "owner",
                                  "blocked@example.test": "outcast", "example.test": "admin"},
                 "occupants": {
                     "squadron@rooms.example.test/lead": {
@@ -237,6 +238,7 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(room["_data"], {"persistent": True, "hidden": True,
             "whois": "moderators", "members_only": True, "allow_member_invites": False})
         self.assertEqual(room["affiliations"], {
+            "admiral@example.test": "owner",
             "lead@seats.example.test": "admin", "worker@seats.example.test": "admin"})
         for occupant in room["occupants"].values():
             self.assertIn(occupant["bare_jid"], room["affiliations"])
@@ -246,6 +248,8 @@ class EnsureTests(unittest.TestCase):
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("create", result.stdout)
+        self.assertIn("grant_owner=1", result.stdout)
+        self.assertIn("grant_admin=2", result.stdout)
         self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
         before = self.read_state()
         result = self.invoke()
@@ -296,7 +300,118 @@ class EnsureTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("plan:", result.stdout)
                 self.assertIn("grant_admin=2", result.stdout)
+                if rooms:
+                    self.assertNotIn("grant_owner=", result.stdout)
+                else:
+                    self.assertIn("grant_owner=1", result.stdout)
                 self.assertEqual(self.read_state(), before)
+
+    def test_human_owner_grant_preserves_occupant_before_membership_tightens(self):
+        for affiliation in (None, "member", "admin", "outcast"):
+            with self.subTest(affiliation=affiliation):
+                room = self.drift()
+                room["affiliations"].pop("admiral@example.test")
+                if affiliation:
+                    room["affiliations"]["admiral@example.test"] = affiliation
+                nick = "squadron@rooms.example.test/admiral"
+                room["occupants"][nick] = {"bare_jid": "admiral@example.test", "role": "participant"}
+                before = {"rooms": {"squadron@rooms.example.test": room}, "calls": []}
+                self.write_state(before)
+                plan = self.invoke("--dry-run")
+                self.assertEqual(plan.returncode, 0, plan.stderr)
+                self.assertIn("grant_owner=1", plan.stdout)
+                self.assertEqual(self.read_state(), before)
+                result = self.invoke()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("grant_owner=1", result.stdout)
+                state = self.read_state()
+                self.assertIn(nick, state["rooms"]["squadron@rooms.example.test"]["occupants"])
+                self.compliant(state["rooms"]["squadron@rooms.example.test"])
+                self.assertLess(state["calls"].index("affiliation:owner"),
+                                state["calls"].index("set:members_only"))
+                self.assertLess(state["calls"].index("affiliation:owner"),
+                                state["calls"].index("affiliation:none"))
+
+    def test_current_owner_role_is_repaired_without_regrant(self):
+        room = self.drift()
+        nick = "squadron@rooms.example.test/admiral"
+        room["occupants"][nick] = {"bare_jid": "admiral@example.test", "role": "participant"}
+        self.write_state({"rooms": {"squadron@rooms.example.test": room}, "calls": []})
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("grant_owner=", result.stdout)
+        self.assertNotIn("affiliation:owner", self.read_state()["calls"])
+        self.assertEqual(self.read_state()["rooms"]["squadron@rooms.example.test"]["occupants"][nick]["role"],
+                         "moderator")
+
+    def test_owner_overlap_wins_and_duplicate_owner_entries_count_once(self):
+        self.data["owner_jids"] = ["lead@seats.example.test", "lead@seats.example.test"]
+        self.config.write_text(json.dumps(self.data))
+        request = helper.registry(BRIDGE, self.config)
+        self.assertEqual(request, [{"jid": "squadron@rooms.example.test",
+            "owners": ["lead@seats.example.test"], "admins": ["worker@seats.example.test"]}])
+        before = {"rooms": {}, "calls": []}
+        self.write_state(before)
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("grant_owner=1", result.stdout)
+        self.assertIn("grant_admin=1", result.stdout)
+        self.assertEqual(self.read_state(), before)
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.read_state()["rooms"]["squadron@rooms.example.test"]["affiliations"],
+                         {"lead@seats.example.test": "owner", "worker@seats.example.test": "admin"})
+        before = self.read_state()
+        self.assertIn("verified: unchanged", self.invoke().stdout)
+        self.assertEqual(self.read_state()["rooms"], before["rooms"])
+
+    def test_ambiguous_owner_allowlist_fails_before_shell_without_broadening(self):
+        self.data["owner_jids"].append("second@example.test")
+        self.config.write_text(json.dumps(self.data))
+        for args in ((), ("--dry-run",)):
+            result = self.invoke(*args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("exactly one registry owner identity", result.stderr)
+            self.assertNotIn("second@example.test", result.stderr)
+            self.assertFalse(self.trace.exists())
+            self.assertEqual(self.read_state(), {"rooms": {}, "calls": []})
+
+    def test_changed_private_owner_identity_does_not_leave_previous_owner(self):
+        self.assertEqual(self.invoke().returncode, 0)
+        self.data["owner_jids"] = ["replacement@example.test"]
+        self.config.write_text(json.dumps(self.data))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("grant_owner=1", result.stdout)
+        self.assertIn("clear_affiliations=1", result.stdout)
+        self.assertNotIn("replacement@example.test", result.stdout + result.stderr)
+        self.assertEqual(self.read_state()["rooms"]["squadron@rooms.example.test"]["affiliations"],
+                         {"replacement@example.test": "owner", "lead@seats.example.test": "admin",
+                          "worker@seats.example.test": "admin"})
+
+    def test_owner_grant_and_persistence_failures_are_loud(self):
+        for fault, code in (("affiliation", "affiliation-failed"), ("ignored-affiliation", "verify-failed"),
+                            ("save", "save-failed")):
+            with self.subTest(fault=fault):
+                room = {"_data": {"persistent": True, "hidden": True, "whois": "moderators",
+                                  "members_only": True, "allow_member_invites": False},
+                        "affiliations": {"lead@seats.example.test": "admin",
+                                         "worker@seats.example.test": "admin"}, "occupants": {}}
+                self.write_state({"rooms": {"squadron@rooms.example.test": room},
+                                  "calls": [], "fault": fault})
+                result = self.invoke()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, "")
+                self.assertIn(code, result.stderr)
+                self.assertIn("no completion claim", result.stderr)
+
+    def test_missing_owner_count_evidence_is_rejected(self):
+        rooms = [{"jid": "squadron@rooms.example.test", "owners": ["admiral@example.test"], "admins": []}]
+        row = {"index": 1, "created": True, "verified": True, "settings": [],
+               "grant_admin": 0, "clear_affiliations": 0, "repair_moderators": 0, "remove_occupants": 0}
+        result = {"ok": True, "dry_run": False, "rooms": [row]}
+        with self.assertRaisesRegex(helper.RoomError, "failed validation"):
+            helper.response("Result: NONCE:" + json.dumps(result), "NONCE:", rooms, False)
 
     def test_missing_empty_invalid_registry_never_invokes_shell(self):
         for value in (None, {}, [], {"bad": {"jid": "YOUR_PASSWORD_TOKEN"}}):
@@ -393,7 +508,7 @@ class EnsureTests(unittest.TestCase):
         self.assertEqual(set(state["rooms"]), {"lead-room@rooms.example.test", "worker-room@rooms.example.test"})
         for name in ("lead", "worker"):
             self.assertEqual(state["rooms"][name + "-room@rooms.example.test"]["affiliations"],
-                             {name + "@seats.example.test": "admin"})
+                             {name + "@seats.example.test": "admin", "admiral@example.test": "owner"})
         self.assertEqual(len(result.stdout.splitlines()), 2)
 
     def test_later_room_save_failure_reports_partial_apply_not_success(self):
@@ -410,12 +525,15 @@ class EnsureTests(unittest.TestCase):
         self.compliant(self.read_state()["rooms"]["squadron@rooms.example.test"])
 
     def test_response_validation_rejects_wrong_identity_shape_and_contract_evidence(self):
-        rooms = [{"jid": "squadron@rooms.example.test", "admins": ["lead@seats.example.test"]}]
+        rooms = [{"jid": "squadron@rooms.example.test", "owners": ["admiral@example.test"],
+                  "admins": ["lead@seats.example.test"]}]
         row = {"index": 1, "created": False, "verified": True, "settings": [],
-               "grant_admin": 0, "clear_affiliations": 0, "repair_moderators": 0, "remove_occupants": 0}
+               "grant_owner": 0, "grant_admin": 0, "clear_affiliations": 0,
+               "repair_moderators": 0, "remove_occupants": 0}
         for changes in ({"index": 2}, {"index": True}, {"verified": False},
                         {"settings": ["YOUR_PASSWORD_TOKEN"]}, {"grant_admin": 2},
-                        {"grant_admin": True}, {"remove_occupants": -1}):
+                        {"grant_admin": True}, {"grant_owner": 2}, {"grant_owner": True},
+                        {"grant_owner": -1}, {"grant_owner": "1"}, {"remove_occupants": -1}):
             with self.subTest(changes=changes):
                 result = {"ok": True, "dry_run": False, "rooms": [row | changes]}
                 with self.assertRaisesRegex(helper.RoomError, "failed validation"):
@@ -428,7 +546,7 @@ class EnsureTests(unittest.TestCase):
         with patch.object(helper.subprocess, "run", side_effect=subprocess.TimeoutExpired(
                 "YOUR_PASSWORD_TOKEN", 30, output="YOUR_PASSWORD_TOKEN")):
             with self.assertRaisesRegex(helper.RoomError, "timed out"):
-                helper.ensure([{"jid": "squadron@rooms.example.test", "admins": []}], False,
+                helper.ensure([{"jid": "squadron@rooms.example.test", "owners": [], "admins": []}], False,
                               Path("YOUR_PASSWORD_TOKEN"))
 
     def test_argument_errors_and_help_are_safe_and_do_not_run_shell(self):
