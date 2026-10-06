@@ -26,14 +26,20 @@ local function compatible(room)
 end
 local function inspect(room, desired, index)
     local row = { index = index; created = room == nil; verified = false;
-        settings = array(); grant_admin = 0; clear_affiliations = 0;
+        settings = array(); grant_owner = 0; grant_admin = 0; clear_affiliations = 0;
         repair_moderators = 0; remove_occupants = 0; };
     local allowed, grants, removals = {}, {}, {};
-    for _, jid in ipairs(desired.admins) do
-        allowed[jid] = true;
-        if not room or room:get_affiliation(jid) ~= "admin" then
-            row.grant_admin = row.grant_admin + 1;
-            table.insert(grants, jid);
+    -- Owner-first union: an overlapping seat cannot downgrade the human.
+    for _, kind in ipairs({ { "owner", desired.owners }; { "admin", desired.admins } }) do
+        for _, jid in ipairs(kind[2]) do
+            if not allowed[jid] then
+                allowed[jid] = kind[1];
+                if not room or room:get_affiliation(jid) ~= kind[1] then
+                    local count = "grant_" .. kind[1];
+                    row[count] = row[count] + 1;
+                    table.insert(grants, { jid = jid; affiliation = kind[1] });
+                end
+            end
         end
     end
     for _, item in ipairs(settings) do
@@ -56,7 +62,11 @@ local function inspect(room, desired, index)
             end
         end
     end
-    table.sort(grants); table.sort(removals);
+    table.sort(grants, function(a, b)
+        if a.affiliation ~= b.affiliation then return a.affiliation == "owner"; end
+        return a.jid < b.jid;
+    end);
+    table.sort(removals);
     return row, allowed, grants, removals;
 end
 local function work()
@@ -101,9 +111,11 @@ local function work()
                 if room["get_" .. item[1]](room) ~= item[2] then fail("setting-failed"); end
             end
         end
-        -- Admit seats before tightening membership, preserving unaffiliated seat occupants.
-        for _, jid in ipairs(plan.grants) do
-            if not room:set_affiliation(true, jid, "admin") then fail("affiliation-failed"); end
+        -- Admit human and seats before tightening membership; retain their occupants.
+        for _, grant in ipairs(plan.grants) do
+            if not room:set_affiliation(true, grant.jid, grant.affiliation) then
+                fail("affiliation-failed");
+            end
         end
         if room:get_members_only() ~= true then room:set_members_only(true); end
         if room:get_members_only() ~= true then fail("setting-failed"); end
@@ -122,7 +134,8 @@ local function work()
             end
         end
         local check = inspect(room, plan.desired, index);
-        if #check.settings ~= 0 or check.grant_admin ~= 0 or check.clear_affiliations ~= 0
+        if #check.settings ~= 0 or check.grant_owner ~= 0 or check.grant_admin ~= 0
+        or check.clear_affiliations ~= 0
         or check.repair_moderators ~= 0 or check.remove_occupants ~= 0 then fail("verify-failed"); end
         -- set_affiliation internally saves but ignores save failure; always check final save.
         if not room:save(true) then fail("save-failed"); end
