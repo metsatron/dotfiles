@@ -1,0 +1,185 @@
+"""Conditional Ductor admission tests: copied package, no socket or live CLI."""
+from __future__ import annotations
+
+import asyncio
+import importlib.util
+import json
+from pathlib import Path
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+FIXTURE = Path(__file__).with_name("test-ductor-busy-state.py")
+spec = importlib.util.spec_from_file_location("ductor_busy_fixture", FIXTURE)
+fixture = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fixture)
+from ductor_bot.api.crypto import E2ESession
+from ductor_bot.api.server import _SecureChannel
+from ductor_bot.api import idle_prompt as seam
+
+
+class Socket:
+    closed = False
+    def __init__(self):
+        self.frames = []
+    async def send_str(self, frame):
+        self.frames.append(frame)
+
+
+class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
+    setUp = fixture.BusyTests.setUp
+
+    def channel(self, allowed=True):
+        client, server = E2ESession(), E2ESession()
+        client.set_remote_key(server.local_pk_b64)
+        server.set_remote_key(client.local_pk_b64)
+        socket = Socket()
+        channel = _SecureChannel(socket, server, idle_prompt_allowed=allowed)
+        return client, channel
+
+    def prepare(self):
+        self.server.set_idle_message_handler(lambda channel, key, data:
+            seam.handle_idle_message(self.orch, self.server, channel, key, data))
+        self.calls = []
+        self.entered = asyncio.Event(); self.finish = asyncio.Event()
+        async def handler(key, text):
+            self.assertTrue(self.orch._lock_pool.is_locked(key.lock_key))
+            self.assertTrue(self.server._lock_pool.is_locked(key.lock_key))
+            self.calls.append((key, text)); self.entered.set()
+            await self.finish.wait()
+            return SimpleNamespace(text="handled", stream_fallback=False)
+        self.orch.handle_message_streaming = handler
+
+    async def route(self, client, channel, **overrides):
+        payload = {"type": "idle_message", "request_id": "a" * 32,
+                   "session_key": fixture.KEY.storage_key, "text": "MailCortex delivery"}
+        payload.update(overrides)
+        await self.server._route_text_message(channel, client.encrypt(payload), fixture.KEY,
+            self.server._lock_pool.get(fixture.KEY.lock_key))
+        return [client.decrypt(frame) for frame in channel.ws.frames]
+
+    async def settle(self):
+        self.finish.set()
+        await asyncio.gather(*list(self.server._idle_tasks))
+
+    async def test_idle_admission_uses_real_router_and_holds_both_lock_owners(self):
+        self.prepare(); client, channel = self.channel()
+        frames = await self.route(client, channel)
+        self.assertEqual(frames, [{"type": "idle_admission", "request_id": "a" * 32,
+            "session_key": fixture.KEY.storage_key, "status": "accepted"}])
+        await self.entered.wait()
+        self.assertEqual(self.calls, [(fixture.KEY, "MailCortex delivery")])
+        self.assertTrue(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        await self.settle()
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+
+    async def test_mid_turn_nacks_without_dispatch_and_can_retry_when_idle(self):
+        self.prepare(); client, channel = self.channel()
+        async with self.orch._lock_pool.get(fixture.KEY.lock_key):
+            frames = await self.route(client, channel)
+        self.assertEqual(frames[-1]["status"], "busy")
+        self.assertEqual(self.calls, [])
+        channel.ws.frames.clear()
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "accepted")
+        await self.settle()
+
+    async def test_turn_start_during_async_session_lookup_is_refused(self):
+        self.prepare(); client, channel = self.channel()
+        async def lookup(key):
+            await self.orch._lock_pool.get(key.lock_key).acquire()
+            return self.session
+        self.sessions.get_active.side_effect = lookup
+        frames = await self.route(client, channel)
+        self.assertEqual(frames[-1]["status"], "busy")
+        self.assertEqual(self.calls, [])
+        self.orch._lock_pool.get(fixture.KEY.lock_key).release()
+
+    async def test_api_owner_compaction_and_active_process_each_refuse(self):
+        self.prepare()
+        for reason in ("api", "compaction", "process"):
+            client, channel = self.channel()
+            if reason == "api":
+                lock = self.server._lock_pool.get(fixture.KEY.lock_key); await lock.acquire()
+            elif reason == "compaction":
+                self.orch._idle_compactor._compacting.add(fixture.KEY.storage_key)
+            else:
+                self.orch._process_registry.register(1, SimpleNamespace(returncode=None, pid=1), "fixture")
+            self.assertEqual((await self.route(client, channel))[-1]["status"], "busy")
+            if reason == "api":
+                lock.release()
+            elif reason == "compaction":
+                self.orch._idle_compactor._compacting.clear()
+        self.assertEqual(self.calls, [])
+
+    async def test_unlocked_lock_with_pending_waiter_refuses_without_yield(self):
+        self.prepare(); client, channel = self.channel()
+        lock = self.orch._lock_pool.get(fixture.KEY.lock_key)
+        await lock.acquire()
+        waiter = asyncio.create_task(lock.acquire())
+        await asyncio.sleep(0)
+        lock.release()
+        frames = await self.route(client, channel)
+        self.assertEqual(frames[-1]["status"], "busy")
+        self.assertEqual(self.calls, [])
+        await waiter; lock.release()
+
+    async def test_missing_authority_identity_or_peer_fails_closed(self):
+        self.prepare()
+        for change in ({"session_key": "tg:2"}, {"request_id": "bad"}, {"text": ""}):
+            client, channel = self.channel()
+            self.assertNotEqual((await self.route(client, channel, **change))[-1]["status"], "accepted")
+        client, channel = self.channel(allowed=False)
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        client, channel = self.channel()
+        self.orch._lock_pool = None
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.assertEqual(self.calls, [])
+
+    async def test_disconnect_after_admission_does_not_abort_accepted_turn(self):
+        self.prepare(); client, channel = self.channel()
+        await self.route(client, channel)
+        channel.ws.closed = True
+        await self.entered.wait(); await self.settle()
+        self.assertEqual(len(self.calls), 1)
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+
+    async def test_handler_failure_and_shutdown_release_locks(self):
+        self.prepare(); client, channel = self.channel()
+        async def failed(*args):
+            raise RuntimeError("fixture failure")
+        self.orch.handle_message_streaming = failed
+        with self.assertLogs(seam.logger, "ERROR"):
+            await self.route(client, channel); await self.settle()
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.prepare(); client, channel = self.channel()
+        await self.route(client, channel); await self.entered.wait()
+        await self.server.stop()
+        self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertEqual(self.server._idle_tasks, set())
+
+    async def test_loopback_proxy_and_default_session_capability_gates(self):
+        self.prepare()
+        request = fixture.BusyTests.request(self)
+        self.assertTrue(seam.idle_peer_allowed(self.server, request))
+        for request in (fixture.BusyTests.request(self, peer="YOUR_PEER"),
+                        fixture.BusyTests.request(self, extra={"Forwarded": "YOUR_PROXY"}),
+                        fixture.BusyTests.request(self, extra={"X-Forwarded-Host": "YOUR_PROXY"})):
+            self.assertFalse(seam.idle_peer_allowed(self.server, request))
+        self.server._config.token = ""
+        self.assertFalse(seam.idle_peer_allowed(self.server, fixture.BusyTests.request(self)))
+
+    async def test_lifecycle_wires_real_conditional_handler(self):
+        await fixture.BusyTests.test_lifecycle_wires_real_authority(self)
+        server = self.orch._api_stop.__self__
+        self.assertIsNotNone(server._idle_message_handler)
+        response = await server._handle_busy(fixture.BusyTests.request(self))
+        self.assertEqual(json.loads(response.text)["idle_prompt"], "ductor.idle_prompt.v1")
+
+
+if __name__ == "__main__":
+    try:
+        unittest.main()
+    finally:
+        fixture.TEMP.cleanup()
