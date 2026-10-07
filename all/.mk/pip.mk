@@ -2,7 +2,7 @@
 .RECIPEPREFIX := |
 SHELL := /bin/bash
 
-.PHONY: pip-capture pip-diff pip-sync pip-apply pip-health
+.PHONY: pip-capture pip-diff pip-sync pip-apply pip-health python-deps-health
 
 pip-capture:
 | @chmod +x $(HOME)/.local/bin/pip-capture 2>/dev/null || true
@@ -23,3 +23,7 @@ pip-apply:
 pip-health:
 | @chmod +x $(HOME)/.local/bin/pip-health 2>/dev/null || true
 | $(HOME)/.local/bin/pip-health
+
+python-deps-health:
+| @chmod +x $(HOME)/.local/bin/python-deps-health 2>/dev/null || true
+| $(HOME)/.local/bin/python-deps-health
