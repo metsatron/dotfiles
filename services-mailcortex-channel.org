@@ -439,11 +439,15 @@ import json
 import hashlib
 import hmac
 import os
+import runpy
 import subprocess
 import tempfile
 import time
 import unittest
+from email import policy
+from email.message import EmailMessage
 from pathlib import Path
+from unittest.mock import patch
 
 CHANNEL = os.environ.get("MAILCORTEX_CHANNEL", str(Path("~/.local/bin/mailcortex-channel").expanduser()))
 AGENT, FACE, STRANGER = "fable@test.helm", "seat+xmpp-bridge@test.helm", "stranger@test.helm"
@@ -516,6 +520,152 @@ class ChannelTest(unittest.TestCase):
         self.send({"jsonrpc": "2.0", "id": 4, "method": "tools/call",
                    "params": {"name": "reply", "arguments": {"to": "not an address", "text": "x"}}})
         self.assertTrue(self.recv()["result"]["isError"])
+
+
+class ClubhouseIngressTest(unittest.TestCase):
+    DESTINATION = "seat+worker@test.helm"
+    SOURCE = "seat+coordinator@test.helm"
+    MESSAGE_ID = "<clubhouse-fixture@example.test>"
+    HANDOFF = "LOGS/handoffs/fixture.md"
+    BODY = "Read LOGS/handoffs/fixture.md"
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.tmp = Path(self.temporary.name)
+        self.env = dict(os.environ,
+                        MAILCORTEX_ROOT=str(self.tmp / "Mail"),
+                        MAILCORTEX_RUNTIME=str(self.tmp / "state"))
+        (self.tmp / "Mail").mkdir()
+        self.environment = patch.dict(os.environ, self.env)
+        self.environment.start()
+        self.mc(["provision", self.DESTINATION, self.SOURCE])
+
+        self.helm = self.tmp / "HelmCortex"
+        handoff = self.helm / self.HANDOFF
+        handoff.parent.mkdir(parents=True)
+        handoff.write_text("fixture handoff v1\n")
+        self.git("init", "-b", "master")
+        self.git("add", self.HANDOFF)
+        self.git("-c", "user.name=Fixture", "-c",
+                 "user.email=fixture@example.test", "commit", "-m", "fixture v1")
+
+        module = runpy.run_path(CHANNEL)
+        self.ChannelError = module["ChannelError"]
+        self.attempts = []
+        self.projected = []
+        self.fail_projection_once = False
+        self.server = module["Server"](
+            self.DESTINATION, [self.SOURCE], 0.2,
+            clubhouse_root=self.helm,
+            clubhouse_projector=self.projector,
+        )
+        self.notes = []
+        self.logs = []
+        self.server.write = self.notes.append
+        self.server.log = self.logs.append
+
+    def tearDown(self):
+        self.environment.stop()
+        self.temporary.cleanup()
+
+    def mc(self, args):
+        return subprocess.run(["mailcortex", *args], env=self.env, check=True,
+                              capture_output=True, text=True).stdout
+
+    def git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.helm, check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    def projector(self, receipt, prompt, root):
+        self.attempts.append((receipt, prompt, root))
+        if self.fail_projection_once:
+            self.fail_projection_once = False
+            raise self.ChannelError("fixture projection failure")
+        self.projected.append((receipt, prompt, root))
+
+    def deliver(self, *, body=None, message_id=None, key="fixture-mail"):
+        message = EmailMessage(policy=policy.SMTP)
+        message["From"] = self.SOURCE
+        message["To"] = self.DESTINATION
+        message["Subject"] = "[BRIEF] fixture"
+        message["Message-ID"] = message_id or self.MESSAGE_ID
+        message.set_content(body if body is not None else self.BODY)
+        target = Path(self.env["MAILCORTEX_ROOT"]) / "seats/worker/new" / key
+        target.write_bytes(message.as_bytes())
+        return target
+
+    def receipt(self):
+        paths = list((Path(self.env["MAILCORTEX_RUNTIME"]) /
+                      "clubhouse-ingress/worker").glob("*.json"))
+        self.assertEqual(len(paths), 1)
+        return json.loads(paths[0].read_text())
+
+    def current_message(self):
+        maildir = Path(self.env["MAILCORTEX_ROOT"]) / "seats/worker"
+        paths = [*maildir.joinpath("new").iterdir(), *maildir.joinpath("cur").iterdir()]
+        self.assertEqual(len(paths), 1)
+        return paths[0]
+
+    def test_committed_brief_is_projected_once_and_equal_redelivery_is_idempotent(self):
+        self.deliver()
+        self.assertEqual(self.server.scan_once(), 1)
+        self.assertEqual(len(self.projected), 1)
+        self.assertEqual(len(self.notes), 1)
+        receipt = self.receipt()
+        self.assertEqual(receipt["principal_class"], "agent")
+        self.assertEqual(receipt["recovery_state"], "dispatch_unknown")
+        self.assertEqual(receipt["source_record_ref"]["handoff_path"], self.HANDOFF)
+        self.assertEqual(receipt["source_record_ref"]["handoff_revision"],
+                         self.git("rev-list", "-1", "master", "--", self.HANDOFF))
+        self.assertEqual(self.server.scan_once(), 0)
+        self.assertEqual(len(self.projected), 1)
+        self.assertEqual(len(self.notes), 1)
+
+    def test_changed_body_under_the_same_message_id_conflicts(self):
+        self.deliver()
+        self.server.scan_once()
+        current = self.current_message()
+        current.unlink()
+        replacement = self.deliver(body="Changed private body", key=current.name)
+        if current.parent.name == "cur":
+            replacement.rename(current)
+        with self.assertRaisesRegex(self.ChannelError, "conflict"):
+            self.server.scan_once()
+        self.assertEqual(len(self.projected), 1)
+
+    def test_changed_handoff_revision_under_the_same_message_id_conflicts(self):
+        self.deliver()
+        self.server.scan_once()
+        (self.helm / self.HANDOFF).write_text("fixture handoff v2\n")
+        self.git("add", self.HANDOFF)
+        self.git("-c", "user.name=Fixture", "-c",
+                 "user.email=fixture@example.test", "commit", "-m", "fixture v2")
+        with self.assertRaisesRegex(self.ChannelError, "conflict"):
+            self.server.scan_once()
+        self.assertEqual(len(self.projected), 1)
+
+    def test_projection_failure_recovers_from_cur_without_double_notification(self):
+        original = self.deliver()
+        self.fail_projection_once = True
+        with self.assertRaisesRegex(self.ChannelError, "projection"):
+            self.server.scan_once()
+        receipt = self.receipt()
+        self.assertEqual(receipt["recovery_state"], "accepted_unprojected")
+        seen = original.parent.parent / "cur" / (original.name + ":2,S")
+        original.rename(seen)
+        self.assertEqual(self.server.scan_once(), 1)
+        self.assertEqual(len(self.attempts), 2)
+        self.assertEqual(len(self.projected), 1)
+        self.assertEqual(len(self.notes), 1)
+
+    def test_handling_receipt_alone_cannot_project_a_swing(self):
+        self.server.call("receipt", {
+            "message_id": "<handling-only@example.test>",
+            "state": "handling_completed",
+        })
+        self.assertEqual(self.attempts, [])
+        self.assertFalse((Path(self.env["MAILCORTEX_RUNTIME"]) /
+                          "clubhouse-ingress").exists())
 
 
 class PermissionChannelTest(unittest.TestCase):
