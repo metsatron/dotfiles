@@ -185,7 +185,7 @@ class WatcherTests(unittest.TestCase):
                 "host": "test-host", "mailbox": "consorts/deepbot", "harness": "deepseek",
                 "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
                 "deepseek_cookie_file": "YOUR_DEEPSEEK_COOKIE_FILE",
-                "deepseek_session": "deepbot-session", "rate_limit_seconds": 0,
+                "deepseek_session": "telegram-YOUR_DEEPSEEK_SESSION", "rate_limit_seconds": 0,
             },
             "hermesbot": {
                 "host": "test-host", "mailbox": "seats/hermesbot", "harness": "hermes",
@@ -210,6 +210,11 @@ class WatcherTests(unittest.TestCase):
         registry_path.chmod(0o600)
         loaded = self.watcher.load_registry(registry_path, "test-host")
         self.assertEqual(loaded["seats"]["ductbot"]["mailbox"], "consorts/ductbot")
+        hidden = dict(records["deepbot"], deepseek_session="YOUR_HIDDEN_DEEPSEEK_SESSION")
+        registry_path.write_text(json.dumps({"schema": "mailcortex.seats.v1", "host": "test-host",
+                                             "seats": {"deepbot": hidden}}))
+        with self.assertRaisesRegex(self.watcher.WatcherError, "invalid DeepSeek target"):
+            self.watcher.load_registry(registry_path, "test-host")
         for name, record in records.items():
             invalid = dict(record)
             invalid["unexpected"] = True
@@ -510,7 +515,8 @@ class WatcherTests(unittest.TestCase):
         record = {
             "host": "test-host", "mailbox": "consorts/deepbot", "harness": "deepseek",
             "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
-            "deepseek_cookie_file": str(cookie), "deepseek_session": "deepbot-session",
+            "deepseek_cookie_file": str(cookie),
+            "deepseek_session": "telegram-YOUR_DEEPSEEK_SESSION",
             "rate_limit_seconds": 0,
         }
         running = iter((True, False))
@@ -520,7 +526,8 @@ class WatcherTests(unittest.TestCase):
             body = json.loads(request.data)
             calls.append((request, timeout, body))
             if body["method"] == "session/list":
-                value = {"items": [{"sessionId": "deepbot-session", "running": next(running)}]}
+                value = {"items": [{"sessionId": "telegram-YOUR_DEEPSEEK_SESSION",
+                                    "running": next(running)}]}
             else:
                 value = {"accepted": True}
             return FakeHTTPResponse({"type": "server-response", "rpcId": body["rpcId"],
@@ -528,14 +535,58 @@ class WatcherTests(unittest.TestCase):
 
         adapter = self.watcher.DeepSeekAdapter(opener=opener)
         self.assertIsNone(adapter.resolve_idle_pane(record))
-        self.assertEqual(adapter.resolve_idle_pane(record), "deepbot-session")
-        adapter.deliver(record, "deepbot-session", "/inbox")
+        self.assertEqual(adapter.resolve_idle_pane(record), "telegram-YOUR_DEEPSEEK_SESSION")
+        adapter.deliver(record, "telegram-YOUR_DEEPSEEK_SESSION", "/inbox")
         self.assertEqual([call[2]["method"] for call in calls],
                          ["session/list", "session/list", "session/prompt"])
         self.assertTrue(all(call[2]["type"] == "client-request" for call in calls))
         self.assertEqual(calls[0][2]["payload"]["args"], {"_request": {}})
         self.assertEqual(calls[-1][2]["payload"]["args"]["request"]["mode"], "queue")
+        self.assertRegex(calls[-1][2]["payload"]["args"]["request"]["requestId"],
+                         r"^mailcortex-[0-9a-f]{32}$")
         self.assertEqual(calls[-1][0].headers["Cookie"], "session=YOUR_COOKIE")
+
+    def test_deepseek_busy_queues_and_lost_ack_is_never_resent(self):
+        cookie = self.base / "deepseek.cookie"
+        cookie.write_text("session=YOUR_COOKIE")
+        cookie.chmod(0o600)
+        record = {
+            "host": "test-host", "mailbox": "seats/builder", "harness": "deepseek",
+            "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
+            "deepseek_cookie_file": str(cookie),
+            "deepseek_session": "telegram-YOUR_DEEPSEEK_SESSION",
+            "rate_limit_seconds": 0,
+        }
+        self.registry["seats"]["builder"] = record
+        self.mail("<deepseek-lost@node.helm>", "a")
+        running = iter((True, False))
+        calls = []
+
+        def opener(request, timeout):
+            body = json.loads(request.data)
+            calls.append(body)
+            if body["method"] == "session/list":
+                value = {"items": [{"sessionId": record["deepseek_session"],
+                                    "running": next(running)}]}
+                return FakeHTTPResponse({"type": "server-response", "rpcId": body["rpcId"],
+                                         "result": {"ok": True, "value": value}})
+            self.assertEqual(body["method"], "session/prompt")
+            raise TimeoutError("fixture lost acknowledgement")
+
+        adapter = self.watcher.DeepSeekAdapter(opener=opener)
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 0)
+        self.assertEqual(self.receipt("<deepseek-lost@node.helm>")["wake_state"], "queued")
+        self.assertEqual([call["method"] for call in calls], ["session/list"])
+        with mock.patch("sys.stderr"):
+            self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=11), 0)
+        self.assertEqual(self.receipt("<deepseek-lost@node.helm>")["wake_state"],
+                         "delivery_unknown")
+        prompt = calls[-1]["payload"]["args"]["request"]
+        self.assertEqual(prompt["sessionId"], record["deepseek_session"])
+        self.assertRegex(prompt["requestId"], r"^mailcortex-[0-9a-f]{32}$")
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=12), 0)
+        self.assertEqual([call["method"] for call in calls],
+                         ["session/list", "session/list", "session/prompt"])
 
     def test_deepseek_wake_carries_the_mail_herdr_keeps_inbox(self):
         mail = self.base / "mail.eml"
@@ -558,7 +609,8 @@ class WatcherTests(unittest.TestCase):
         record = {"host": "test-host", "mailbox": "seats/builder", "harness": "deepseek",
                   "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
                   "deepseek_cookie_file": str(self.base / "cookie"),
-                  "deepseek_session": "deep-session", "rate_limit_seconds": 0}
+                  "deepseek_session": "telegram-YOUR_DEEPSEEK_SESSION",
+                  "rate_limit_seconds": 0}
         self.registry["seats"]["builder"] = record
         for leaf in ("tmp", "new", "cur"):
             (self.root / "consorts/sender" / leaf).mkdir(parents=True)
@@ -759,7 +811,7 @@ class WatcherTests(unittest.TestCase):
         for index in range(2):
             mid = f"<separate{index}@node.helm>"
             self.watcher.MAILCORTEX.write_wake_receipt("builder", mid, "injected",
-                reply_context={"session": "deep-session", "request_id": str(index),
+                reply_context={"session": "telegram-YOUR_DEEPSEEK_SESSION", "request_id": str(index),
                                "sender": "seat+builder@node.helm", "to": "sender@node.helm", "subject": "test"},
                 reply_state="pending")
         def reply(record, request_id):
@@ -816,7 +868,7 @@ class WatcherTests(unittest.TestCase):
         record, adapter = self.deep_fixture()
         cookie = self.base / "cookie"; cookie.write_text("test-cookie"); cookie.chmod(0o600)
         records = self.reply_events()
-        snapshot = {"type": "snapshot", "header": {"id": "deep-session"},
+        snapshot = {"type": "snapshot", "header": {"id": "telegram-YOUR_DEEPSEEK_SESSION"},
                     "cursor": 3, "records": records[1:], "hasMore": True}
         calls = []
         def rpc(record, method, args):
