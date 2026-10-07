@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# Hermes dashboard ownership helper
+
+
+# [[file:../../../agents-bots.org::*Hermes dashboard ownership helper][Hermes dashboard ownership helper:1]]
+"""Own one local Hermes dashboard process and its private exposure policy."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+SCHEMA = "dotcortex.hermes-dashboard-owner.v1"
+OWNER = "telegram-agent-host:hermes-dashboard"
+LOCAL_PUBLIC_URL = "http://localhost"
+ENV_KEYS = {
+    "HERMES_DASHBOARD_PUBLIC_URL",
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+}
+SANITIZE_KEYS = ENV_KEYS | {"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"}
+
+
+def state_path(value: str | None) -> Path:
+    return Path(value or os.environ.get(
+        "HERMES_DASHBOARD_STATE_FILE",
+        str(Path.home() / ".local/state/telegram-agents/hermes-dashboard.json"),
+    ))
+
+
+def env_path(value: str | None) -> Path:
+    return Path(value or os.environ.get(
+        "HERMES_DASHBOARD_ENV_FILE",
+        str(Path.home() / ".hermes/dashboard.env"),
+    ))
+
+
+def log_path(value: str | None) -> Path:
+    return Path(value or os.environ.get(
+        "HERMES_DASHBOARD_LOG_FILE",
+        str(Path.home() / ".local/state/telegram-agents/hermes-dashboard.log"),
+    ))
+
+
+def read_pid(pid: int) -> dict[str, object] | None:
+    proc = Path("/proc") / str(pid)
+    try:
+        raw_stat = (proc / "stat").read_text(encoding="utf-8")
+        fields = raw_stat[raw_stat.rfind(")") + 2 :].split()
+        if fields[0] == "Z":
+            return None
+        argv = [part.decode(errors="replace") for part in (proc / "cmdline").read_bytes().split(b"\0") if part]
+        return {"pid": pid, "start_ticks": int(fields[19]), "argv": argv}
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+
+
+def dashboard_argv(argv: list[str]) -> bool:
+    if len(argv) < 5 or argv[-4:] != ["dashboard", "--host", "localhost", "--no-open"]:
+        return False
+    return any(
+        Path(arg).name == "hermes" or "hermes_cli" in arg
+        for arg in argv[:-2]
+    )
+
+
+def any_dashboard_argv(argv: list[str]) -> bool:
+    return (
+        "dashboard" in argv
+        and any(Path(arg).name == "hermes" or "hermes_cli" in arg for arg in argv)
+    )
+
+
+def matching_processes() -> list[int]:
+    if os.environ.get("HERMES_DASHBOARD_SKIP_DISCOVERY") == "1":
+        return []
+    matches: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        current = read_pid(int(entry.name))
+        if current and any_dashboard_argv(current["argv"]):
+            matches.append(int(entry.name))
+    return matches
+
+
+def read_state(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def inspect(path: Path) -> tuple[str, dict[str, object] | None]:
+    if not path.exists():
+        return "missing", None
+    state = read_state(path)
+    if not state or state.get("schema") != SCHEMA or state.get("owner") != OWNER:
+        return "invalid", state
+    try:
+        pid = int(state["pid"])
+        ticks = int(state["start_ticks"])
+    except (KeyError, TypeError, ValueError):
+        return "invalid", state
+    current = read_pid(pid)
+    if not current:
+        return "stale", state
+    if int(current["start_ticks"]) != ticks or not dashboard_argv(current["argv"]):
+        return "invalid", state
+    return "running", state
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if key not in ENV_KEYS:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def is_placeholder(value: str) -> bool:
+    return not value or "YOUR_" in value
+
+
+def valid_public_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def dashboard_environment(path: Path) -> tuple[dict[str, str], str]:
+    fallback = {"HERMES_DASHBOARD_PUBLIC_URL": LOCAL_PUBLIC_URL}
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return fallback, "private env absent"
+    if mode != 0o600:
+        return fallback, "private env is not mode 0600"
+    try:
+        values = parse_env(path)
+    except (OSError, UnicodeError):
+        return fallback, "private env unreadable"
+    public_url = values.get("HERMES_DASHBOARD_PUBLIC_URL", "")
+    username = values.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "")
+    password_hash = values.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "")
+    if any(is_placeholder(value) for value in (public_url, username, password_hash)):
+        return fallback, "public URL or required authentication is unprovisioned"
+    if not valid_public_url(public_url) or not password_hash.startswith("scrypt$"):
+        return fallback, "public URL or password hash is invalid"
+    result = {
+        "HERMES_DASHBOARD_PUBLIC_URL": public_url,
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": username,
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH": password_hash,
+    }
+    secret = values.get("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "")
+    if not is_placeholder(secret):
+        result["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = secret
+    return result, "private public URL and basic authentication armed"
+
+
+def write_state(path: Path, pid: int, ticks: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    value = {"schema": SCHEMA, "owner": OWNER, "pid": pid, "start_ticks": ticks}
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp, path)
+
+
+def start(args: argparse.Namespace) -> int:
+    state_file = state_path(args.state)
+    status, state = inspect(state_file)
+    if status == "running":
+        print(f"hermes dashboard already running (pid {state['pid']})")
+        return 0
+    if status == "invalid":
+        print("Hermes dashboard owner state is invalid; refusing a second owner", file=sys.stderr)
+        return 1
+    if status == "stale":
+        state_file.unlink(missing_ok=True)
+    unowned = matching_processes()
+    if unowned:
+        print("An unowned Hermes dashboard process already exists; refusing a second owner", file=sys.stderr)
+        return 1
+
+    private_env, policy = dashboard_environment(env_path(args.env_file))
+    child_env = os.environ.copy()
+    for key in SANITIZE_KEYS:
+        child_env.pop(key, None)
+    child_env.update(private_env)
+    binary = args.binary or os.environ.get("HERMES_DASHBOARD_BIN", "hermes")
+    output = log_path(args.log)
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(output.parent, 0o700)
+    try:
+        with output.open("ab", buffering=0) as log:
+            process = subprocess.Popen(
+                [binary, "dashboard", "--host", "localhost", "--no-open"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        print(f"Could not start Hermes dashboard: {exc}", file=sys.stderr)
+        return 1
+    time.sleep(0.25)
+    current = read_pid(process.pid)
+    if process.poll() is not None or not current or not dashboard_argv(current["argv"]):
+        print("Hermes dashboard exited before ownership could be established", file=sys.stderr)
+        return 1
+    try:
+        write_state(state_file, process.pid, int(current["start_ticks"]))
+    except OSError as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        print(f"Could not publish Hermes dashboard owner state: {exc}", file=sys.stderr)
+        return 1
+    print(f"hermes dashboard started (pid {process.pid}; {policy})")
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    path = state_path(args.state)
+    status, state = inspect(path)
+    if status == "missing":
+        print("hermes dashboard is stopped")
+        return 0
+    if status == "stale":
+        path.unlink(missing_ok=True)
+        print("hermes dashboard stale owner state retired")
+        return 0
+    if status != "running" or not state:
+        print("Hermes dashboard owner state is invalid; refusing unverified stop", file=sys.stderr)
+        return 1
+    pid = int(state["pid"])
+    ticks = int(state["start_ticks"])
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        path.unlink(missing_ok=True)
+        print("hermes dashboard stopped")
+        return 0
+    for _ in range(40):
+        current = read_pid(pid)
+        if not current:
+            break
+        if int(current["start_ticks"]) != ticks:
+            print("Hermes dashboard PID identity changed while stopping", file=sys.stderr)
+            return 1
+        time.sleep(0.05)
+    else:
+        current = read_pid(pid)
+        if current and int(current["start_ticks"]) == ticks:
+            os.killpg(pid, signal.SIGKILL)
+    path.unlink(missing_ok=True)
+    print("hermes dashboard stopped")
+    return 0
+
+
+def status_command(args: argparse.Namespace) -> int:
+    status, state = inspect(state_path(args.state))
+    if status == "running" and state:
+        print(f"hermes dashboard: RUNNING pid={state['pid']}")
+        return 0
+    print(f"hermes dashboard: STOPPED owner={status}")
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("start", "stop", "status"))
+    parser.add_argument("--state")
+    parser.add_argument("--env-file")
+    parser.add_argument("--log")
+    parser.add_argument("--binary")
+    args = parser.parse_args()
+    return {"start": start, "stop": stop, "status": status_command}[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# Hermes dashboard ownership helper:1 ends here

@@ -94,6 +94,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "DUCTOR_READY_TIMEOUT": str(timeout),
             "DSH_TELEGRAM_ENV_FILE": str(self.home / ".config/deepseek-harness-telegram/env"),
             "DSH_HOME": str(self.home / ".local/share/deepseek-harness-telegram/dsh-home"),
+            "DSH_WEB_URL_HELPER": str(HERE.parents[3] / "bin/deepseek-harness-web-url"),
         }
         return env
 
@@ -546,6 +547,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                     "DSH_TELEGRAM_MODEL_PROVIDER=helmcortex-opencode-go",
                     "DSH_TELEGRAM_MODEL=deepseek-v4.1-flash",
                     "DSH_TELEGRAM_PROVIDER_BASE_URL=https://opencode.ai/zen/go/v1",
+                    "DSH_WEB_TRUSTED_HOST=YOUR_TAILNET_HOST:YOUR_DSH_WEB_PORT",
                     "",
                 ]
             ),
@@ -879,12 +881,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         manager_text = MANAGER.read_text(encoding="utf-8")
         detached = manager_text.index('exec nohup setsid env -u TELEGRAM_BOT_TOKEN')
         detached_shell = manager_text.index("bash -c '", detached)
-        redactor = manager_text.index("sed -u -E", detached_shell)
-        launch = manager_text.index('exec dsh --profile "$DSH_TELEGRAM_PROFILE"', detached_shell)
+        redactor = manager_text.index('"$DSH_WEB_URL_HELPER" capture', detached_shell)
+        launch = manager_text.index('exec dsh "${dsh_args[@]}"', detached_shell)
         pid_publish = manager_text.index('printf \'%s\\n\' "$launched_pid" > "$DSH_TELEGRAM_PID_FILE"', launch)
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
+        self.assertIn('dsh_args+=(--trusted-host "$DSH_WEB_TRUSTED_HOST")', manager_text)
         self.assertIn('OPENCODE_GO_API_KEY_FILE="$OPENCODE_GO_API_KEY_FILE"', manager_text)
 
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:

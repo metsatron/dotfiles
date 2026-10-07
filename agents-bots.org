@@ -12,6 +12,7 @@ at a time to avoid duplicate message handling.
 | Bot          | Type            | Status   | Transport                    | Port | Machine |
 |--------------+-----------------+----------+------------------------------+------+---------|
 | Hermes       | gateway (native) | WORKING  | python-telegram-bot webhooks | —    | x230    |
+| Hermes Dashboard | web UI (native) | STAGED | loopback + private reverse proxy | — | kikin |
 | OpenCode     | wrapper (npm)   | WORKING  | targeted polling / webhook | 4096 | kikin   |
 | Ductor       | wrapper (pip)   | PENDING  | Telegram / Matrix            | —    | t480s   |
 | Claude Code  | plugin (channel) | WORKAROUND | --channels plugin inline   | —    | x230    |
@@ -32,6 +33,22 @@ Native Telegram gateway via =python-telegram-bot[webhooks]>=22.6=.
 - Platform state: =connected= (last confirmed 2026-07-22)
 - Session ID format: =agent:main:telegram:dm:<user_id>=
 - Two-way: full conversation agent, tool calls, routines, MCP
+
+The Hermes browser dashboard is a separate =hermes-dashboard= service owned by
+=telegram-agent-host=.  It deliberately does not share the gateway's native
+service unit: the boot owner and watchdog start the dashboard through the same
+single lifecycle manager and honour its own intentional-stop marker.
+
+- Runtime env: private =~/.hermes/dashboard.env=, mode 0600
+- Public URL key: =HERMES_DASHBOARD_PUBLIC_URL=
+- Required auth keys: =HERMES_DASHBOARD_BASIC_AUTH_USERNAME= and
+  =HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=
+- Optional stable-session key: =HERMES_DASHBOARD_BASIC_AUTH_SECRET=
+- Local-only fallback: when the private file is absent, contains placeholders,
+  or lacks either required auth key, the manager masks any external public URL,
+  forces a =localhost= bind, and still starts the dashboard
+- Passwords are never stored by this lane.  The Admiral provisions only the
+  upstream scrypt password hash (and preferably a signing secret) from KeePass.
 
 ** OpenCode Telegram Bot
 
@@ -157,6 +174,13 @@ working directory.
 - Workspace config: private =~/HelmCortex/FORGE/brain/DeepSeek/.pi/telegram.json=
 - DSH profile/home: dedicated =helmcortex-telegram= profile under the private
   DSH home declared by the env file
+- Web trust: =DSH_WEB_TRUSTED_HOST= in the same private env file supplies one
+  bare =host[:port]= authority to dsh's supported =--trusted-host= option.  The
+  public template contains only =YOUR_*= placeholders.
+- Web auth handoff: =deepseek-harness-web-url= captures only the token-bearing
+  root path in agent-owned mode-0600 state while the detached log stream is
+  redacted.  Run the helper as =agent-deepseek= to print the private HTTPS URL;
+  it never writes the token to a log or tracked file.
 - Access control: =security.allowedChatIds=[]= in the template means deny all;
   =telegram-agent-host start deepseek-harness= refuses to start until the
   private workspace config contains an explicit non-empty allowlist
@@ -244,7 +268,7 @@ Define which agents run on which machines:
 
 thinkpad-t480s||t480s
 thinkpad-x230||x230
-kikin-kushi|ductor,codex,opencode,hermes,deepseek-harness,pi-agent,nanobot|kikin
+kikin-kushi|ductor,codex,opencode,hermes,hermes-dashboard,deepseek-harness,pi-agent,nanobot|kikin
 #+END_SRC
 
 * Agent Config Templates
@@ -416,6 +440,23 @@ CODEX_IDLE_COMPACT_SECONDS=1620
 CODEX_IDLE_COMPACT_MIN_TOKENS=70000
 #+END_SRC
 
+** Hermes Dashboard Env Template
+
+Copy this template to =~/.hermes/dashboard.env= on the target machine, keep it
+mode 0600, and replace every placeholder from private credential storage.  Do
+not put a plaintext password in this file: provision the scrypt hash emitted by
+Hermes's bundled =plugins.dashboard_auth.basic.hash_password= helper.  Until the
+URL, username, and password hash are all provisioned, the manager intentionally
+starts a loopback-only dashboard.
+
+#+BEGIN_SRC conf :tangle all/.bots/templates/hermes-dashboard.env
+# Hermes dashboard private exposure policy (mode 0600)
+HERMES_DASHBOARD_PUBLIC_URL=https://YOUR_TAILNET_HOST:YOUR_HERMES_DASHBOARD_PORT
+HERMES_DASHBOARD_BASIC_AUTH_USERNAME=YOUR_HERMES_DASHBOARD_BASIC_AUTH_USERNAME
+HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=YOUR_HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH
+HERMES_DASHBOARD_BASIC_AUTH_SECRET=YOUR_HERMES_DASHBOARD_BASIC_AUTH_SECRET
+#+END_SRC
+
 ** DeepSeek Harness Telegram Env Template
 
 The template contains placeholders only. Provision the real token/API key and
@@ -442,6 +483,9 @@ DSH_TELEGRAM_PLUGIN_ROOT=/home/metsatron/HelmCortex/NEXUS/git/dsh-telegram
 DSH_TELEGRAM_MODEL_PROVIDER=helmcortex-opencode-go
 DSH_TELEGRAM_MODEL=deepseek-v4.1-flash
 DSH_TELEGRAM_PROVIDER_BASE_URL=https://opencode.ai/zen/go/v1
+# Bare authority consumed by dsh's supported --trusted-host option.  Keep the
+# live tailnet hostname and listener port in this private file only.
+DSH_WEB_TRUSTED_HOST=YOUR_TAILNET_HOST:YOUR_DSH_WEB_PORT
 #+END_SRC
 
 ** DeepSeek Harness OpenCode Go Settings Template
@@ -604,6 +648,476 @@ startup until the private file is populated.
     "effort": "medium"
   }
 }
+#+END_SRC
+
+* Hermes dashboard ownership helper
+
+#+BEGIN_SRC python :tangle all/.local/bin/hermes-dashboard-owner :shebang "#!/usr/bin/env python3"
+"""Own one local Hermes dashboard process and its private exposure policy."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import signal
+import stat
+import subprocess
+import sys
+import time
+from pathlib import Path
+from urllib.parse import urlsplit
+
+
+SCHEMA = "dotcortex.hermes-dashboard-owner.v1"
+OWNER = "telegram-agent-host:hermes-dashboard"
+LOCAL_PUBLIC_URL = "http://localhost"
+ENV_KEYS = {
+    "HERMES_DASHBOARD_PUBLIC_URL",
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+}
+SANITIZE_KEYS = ENV_KEYS | {"HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"}
+
+
+def state_path(value: str | None) -> Path:
+    return Path(value or os.environ.get(
+        "HERMES_DASHBOARD_STATE_FILE",
+        str(Path.home() / ".local/state/telegram-agents/hermes-dashboard.json"),
+    ))
+
+
+def env_path(value: str | None) -> Path:
+    return Path(value or os.environ.get(
+        "HERMES_DASHBOARD_ENV_FILE",
+        str(Path.home() / ".hermes/dashboard.env"),
+    ))
+
+
+def log_path(value: str | None) -> Path:
+    return Path(value or os.environ.get(
+        "HERMES_DASHBOARD_LOG_FILE",
+        str(Path.home() / ".local/state/telegram-agents/hermes-dashboard.log"),
+    ))
+
+
+def read_pid(pid: int) -> dict[str, object] | None:
+    proc = Path("/proc") / str(pid)
+    try:
+        raw_stat = (proc / "stat").read_text(encoding="utf-8")
+        fields = raw_stat[raw_stat.rfind(")") + 2 :].split()
+        if fields[0] == "Z":
+            return None
+        argv = [part.decode(errors="replace") for part in (proc / "cmdline").read_bytes().split(b"\0") if part]
+        return {"pid": pid, "start_ticks": int(fields[19]), "argv": argv}
+    except (OSError, ValueError, IndexError, UnicodeError):
+        return None
+
+
+def dashboard_argv(argv: list[str]) -> bool:
+    if len(argv) < 5 or argv[-4:] != ["dashboard", "--host", "localhost", "--no-open"]:
+        return False
+    return any(
+        Path(arg).name == "hermes" or "hermes_cli" in arg
+        for arg in argv[:-2]
+    )
+
+
+def any_dashboard_argv(argv: list[str]) -> bool:
+    return (
+        "dashboard" in argv
+        and any(Path(arg).name == "hermes" or "hermes_cli" in arg for arg in argv)
+    )
+
+
+def matching_processes() -> list[int]:
+    if os.environ.get("HERMES_DASHBOARD_SKIP_DISCOVERY") == "1":
+        return []
+    matches: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        current = read_pid(int(entry.name))
+        if current and any_dashboard_argv(current["argv"]):
+            matches.append(int(entry.name))
+    return matches
+
+
+def read_state(path: Path) -> dict[str, object] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def inspect(path: Path) -> tuple[str, dict[str, object] | None]:
+    if not path.exists():
+        return "missing", None
+    state = read_state(path)
+    if not state or state.get("schema") != SCHEMA or state.get("owner") != OWNER:
+        return "invalid", state
+    try:
+        pid = int(state["pid"])
+        ticks = int(state["start_ticks"])
+    except (KeyError, TypeError, ValueError):
+        return "invalid", state
+    current = read_pid(pid)
+    if not current:
+        return "stale", state
+    if int(current["start_ticks"]) != ticks or not dashboard_argv(current["argv"]):
+        return "invalid", state
+    return "running", state
+
+
+def parse_env(path: Path) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key, value = key.strip(), value.strip()
+        if key not in ENV_KEYS:
+            continue
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def is_placeholder(value: str) -> bool:
+    return not value or "YOUR_" in value
+
+
+def valid_public_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme == "https"
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path in ("", "/")
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def dashboard_environment(path: Path) -> tuple[dict[str, str], str]:
+    fallback = {"HERMES_DASHBOARD_PUBLIC_URL": LOCAL_PUBLIC_URL}
+    try:
+        mode = stat.S_IMODE(path.stat().st_mode)
+    except OSError:
+        return fallback, "private env absent"
+    if mode != 0o600:
+        return fallback, "private env is not mode 0600"
+    try:
+        values = parse_env(path)
+    except (OSError, UnicodeError):
+        return fallback, "private env unreadable"
+    public_url = values.get("HERMES_DASHBOARD_PUBLIC_URL", "")
+    username = values.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "")
+    password_hash = values.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", "")
+    if any(is_placeholder(value) for value in (public_url, username, password_hash)):
+        return fallback, "public URL or required authentication is unprovisioned"
+    if not valid_public_url(public_url) or not password_hash.startswith("scrypt$"):
+        return fallback, "public URL or password hash is invalid"
+    result = {
+        "HERMES_DASHBOARD_PUBLIC_URL": public_url,
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": username,
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH": password_hash,
+    }
+    secret = values.get("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "")
+    if not is_placeholder(secret):
+        result["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = secret
+    return result, "private public URL and basic authentication armed"
+
+
+def write_state(path: Path, pid: int, ticks: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    value = {"schema": SCHEMA, "owner": OWNER, "pid": pid, "start_ticks": ticks}
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, sort_keys=True)
+        handle.write("\n")
+    os.replace(temp, path)
+
+
+def start(args: argparse.Namespace) -> int:
+    state_file = state_path(args.state)
+    status, state = inspect(state_file)
+    if status == "running":
+        print(f"hermes dashboard already running (pid {state['pid']})")
+        return 0
+    if status == "invalid":
+        print("Hermes dashboard owner state is invalid; refusing a second owner", file=sys.stderr)
+        return 1
+    if status == "stale":
+        state_file.unlink(missing_ok=True)
+    unowned = matching_processes()
+    if unowned:
+        print("An unowned Hermes dashboard process already exists; refusing a second owner", file=sys.stderr)
+        return 1
+
+    private_env, policy = dashboard_environment(env_path(args.env_file))
+    child_env = os.environ.copy()
+    for key in SANITIZE_KEYS:
+        child_env.pop(key, None)
+    child_env.update(private_env)
+    binary = args.binary or os.environ.get("HERMES_DASHBOARD_BIN", "hermes")
+    output = log_path(args.log)
+    output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(output.parent, 0o700)
+    try:
+        with output.open("ab", buffering=0) as log:
+            process = subprocess.Popen(
+                [binary, "dashboard", "--host", "localhost", "--no-open"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                env=child_env,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        print(f"Could not start Hermes dashboard: {exc}", file=sys.stderr)
+        return 1
+    time.sleep(0.25)
+    current = read_pid(process.pid)
+    if process.poll() is not None or not current or not dashboard_argv(current["argv"]):
+        print("Hermes dashboard exited before ownership could be established", file=sys.stderr)
+        return 1
+    try:
+        write_state(state_file, process.pid, int(current["start_ticks"]))
+    except OSError as exc:
+        try:
+            os.killpg(process.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        print(f"Could not publish Hermes dashboard owner state: {exc}", file=sys.stderr)
+        return 1
+    print(f"hermes dashboard started (pid {process.pid}; {policy})")
+    return 0
+
+
+def stop(args: argparse.Namespace) -> int:
+    path = state_path(args.state)
+    status, state = inspect(path)
+    if status == "missing":
+        print("hermes dashboard is stopped")
+        return 0
+    if status == "stale":
+        path.unlink(missing_ok=True)
+        print("hermes dashboard stale owner state retired")
+        return 0
+    if status != "running" or not state:
+        print("Hermes dashboard owner state is invalid; refusing unverified stop", file=sys.stderr)
+        return 1
+    pid = int(state["pid"])
+    ticks = int(state["start_ticks"])
+    try:
+        os.killpg(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        path.unlink(missing_ok=True)
+        print("hermes dashboard stopped")
+        return 0
+    for _ in range(40):
+        current = read_pid(pid)
+        if not current:
+            break
+        if int(current["start_ticks"]) != ticks:
+            print("Hermes dashboard PID identity changed while stopping", file=sys.stderr)
+            return 1
+        time.sleep(0.05)
+    else:
+        current = read_pid(pid)
+        if current and int(current["start_ticks"]) == ticks:
+            os.killpg(pid, signal.SIGKILL)
+    path.unlink(missing_ok=True)
+    print("hermes dashboard stopped")
+    return 0
+
+
+def status_command(args: argparse.Namespace) -> int:
+    status, state = inspect(state_path(args.state))
+    if status == "running" and state:
+        print(f"hermes dashboard: RUNNING pid={state['pid']}")
+        return 0
+    print(f"hermes dashboard: STOPPED owner={status}")
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command", choices=("start", "stop", "status"))
+    parser.add_argument("--state")
+    parser.add_argument("--env-file")
+    parser.add_argument("--log")
+    parser.add_argument("--binary")
+    args = parser.parse_args()
+    return {"start": start, "stop": stop, "status": status_command}[args.command](args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+* DeepSeek Harness web auth helper
+
+#+BEGIN_SRC python :tangle all/.local/bin/deepseek-harness-web-url :shebang "#!/usr/bin/env python3"
+"""Capture dsh's private web-auth path while keeping it out of service logs."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+
+URL_RE = re.compile(r"dsh web:\s+(https?://\S+)")
+REDACTIONS = (
+    (re.compile(r"bot[0-9]{8,}:[A-Za-z0-9_-]{30,}"), "bot[REDACTED]"),
+    (re.compile(r"chatId=-?[0-9]+"), "chatId=[REDACTED]"),
+    (re.compile(r"bar-sync\(-?[0-9]+\)"), "bar-sync([REDACTED])"),
+    (re.compile(r"([?&]token=)[^&\s]+"), r"\1[REDACTED]"),
+)
+
+
+def default_state() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return root / "telegram-agents/deepseek-harness.web-auth-path"
+
+
+def default_env() -> Path:
+    return Path.home() / ".config/deepseek-harness-telegram/env"
+
+
+def write_private(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(value + "\n")
+    os.replace(temp, path)
+
+
+def capture_url(line: str, state: Path) -> None:
+    match = URL_RE.search(line)
+    if not match:
+        return
+    try:
+        parsed = urlsplit(match.group(1))
+        _ = parsed.port
+    except ValueError:
+        return
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        return
+    tokens = parse_qs(parsed.query, keep_blank_values=True).get("token", [])
+    if parsed.path not in ("", "/") or not tokens or not tokens[0]:
+        return
+    path = "/?" + urlencode({"token": tokens[0]})
+    write_private(state, path)
+
+
+def redact(line: str) -> str:
+    for pattern, replacement in REDACTIONS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def capture(args: argparse.Namespace) -> int:
+    state = Path(args.state_file) if args.state_file else default_state()
+    for line in sys.stdin:
+        capture_url(line, state)
+        sys.stdout.write(redact(line))
+        sys.stdout.flush()
+    return 0
+
+
+def read_authority(path: Path) -> str:
+    try:
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise ValueError("private env must be mode 0600")
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError("private env is unavailable") from exc
+    authority = ""
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if not line.startswith("DSH_WEB_TRUSTED_HOST="):
+            continue
+        authority = line.split("=", 1)[1].strip()
+        if len(authority) >= 2 and authority[0] == authority[-1] and authority[0] in "\"'":
+            authority = authority[1:-1]
+    if not authority or "YOUR_" in authority or any(char.isspace() for char in authority):
+        raise ValueError("trusted host is unprovisioned")
+    if any(char in authority for char in "/?#@"):
+        raise ValueError("trusted host must be a bare authority")
+    try:
+        parsed = urlsplit("//" + authority)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("trusted host authority is invalid") from exc
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("trusted host authority is invalid")
+    return authority
+
+
+def show(args: argparse.Namespace) -> int:
+    try:
+        authority = read_authority(Path(args.env_file) if args.env_file else default_env())
+        state = Path(args.state_file) if args.state_file else default_state()
+        if stat.S_IMODE(state.stat().st_mode) != 0o600:
+            raise ValueError("private auth path must be mode 0600")
+        path = state.read_text(encoding="utf-8").strip()
+        parsed = urlsplit(path)
+        tokens = parse_qs(parsed.query, keep_blank_values=True).get("token", [])
+        if (
+            parsed.path != "/"
+            or parsed.netloc
+            or parsed.fragment
+            or not tokens
+            or not tokens[0]
+        ):
+            raise ValueError("private auth path is invalid")
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"Cannot print dsh web URL: {exc}", file=sys.stderr)
+        return 1
+    print(f"https://{authority}{path}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    capture_parser = subparsers.add_parser("capture")
+    capture_parser.add_argument("--state-file")
+    show_parser = subparsers.add_parser("show")
+    show_parser.add_argument("--env-file")
+    show_parser.add_argument("--state-file")
+    args = parser.parse_args()
+    return capture(args) if args.command == "capture" else show(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 #+END_SRC
 
 * OpenCode ownership helper
@@ -3123,6 +3637,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "DUCTOR_READY_TIMEOUT": str(timeout),
             "DSH_TELEGRAM_ENV_FILE": str(self.home / ".config/deepseek-harness-telegram/env"),
             "DSH_HOME": str(self.home / ".local/share/deepseek-harness-telegram/dsh-home"),
+            "DSH_WEB_URL_HELPER": str(HERE.parents[3] / "bin/deepseek-harness-web-url"),
         }
         return env
 
@@ -3575,6 +4090,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                     "DSH_TELEGRAM_MODEL_PROVIDER=helmcortex-opencode-go",
                     "DSH_TELEGRAM_MODEL=deepseek-v4.1-flash",
                     "DSH_TELEGRAM_PROVIDER_BASE_URL=https://opencode.ai/zen/go/v1",
+                    "DSH_WEB_TRUSTED_HOST=YOUR_TAILNET_HOST:YOUR_DSH_WEB_PORT",
                     "",
                 ]
             ),
@@ -3908,12 +4424,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         manager_text = MANAGER.read_text(encoding="utf-8")
         detached = manager_text.index('exec nohup setsid env -u TELEGRAM_BOT_TOKEN')
         detached_shell = manager_text.index("bash -c '", detached)
-        redactor = manager_text.index("sed -u -E", detached_shell)
-        launch = manager_text.index('exec dsh --profile "$DSH_TELEGRAM_PROFILE"', detached_shell)
+        redactor = manager_text.index('"$DSH_WEB_URL_HELPER" capture', detached_shell)
+        launch = manager_text.index('exec dsh "${dsh_args[@]}"', detached_shell)
         pid_publish = manager_text.index('printf \'%s\\n\' "$launched_pid" > "$DSH_TELEGRAM_PID_FILE"', launch)
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
+        self.assertIn('dsh_args+=(--trusted-host "$DSH_WEB_TRUSTED_HOST")', manager_text)
         self.assertIn('OPENCODE_GO_API_KEY_FILE="$OPENCODE_GO_API_KEY_FILE"', manager_text)
 
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
@@ -3997,6 +4514,195 @@ if __name__ == "__main__":
     unittest.main()
 #+END_SRC
 
+** Web UI ownership and private-config tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-agent-web-uis.py :comments no
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import signal
+import stat
+import subprocess
+import tempfile
+import unittest
+
+
+HERE = Path(__file__).resolve()
+BIN = HERE.parents[3] / "bin"
+MANAGER = BIN / "telegram-agent-host"
+DASHBOARD_OWNER = BIN / "hermes-dashboard-owner"
+DSH_WEB_URL = BIN / "deepseek-harness-web-url"
+
+
+class WebUiOwnershipTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.home = self.root / "home"
+        self.state = self.root / "state"
+        self.agents = self.root / "agents"
+        self.fake_bin = self.root / "bin"
+        for path in (self.home, self.state, self.agents, self.fake_bin):
+            path.mkdir(parents=True)
+        self.capture = self.root / "dashboard-env"
+        hermes = self.fake_bin / "hermes"
+        hermes.write_text(
+            "#!/bin/sh\n"
+            "{\n"
+            "  printf '%s\\n' \"${HERMES_DASHBOARD_PUBLIC_URL:-}\"\n"
+            "  printf '%s\\n' \"${HERMES_DASHBOARD_BASIC_AUTH_USERNAME:-}\"\n"
+            "  printf '%s\\n' \"${HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH:-}\"\n"
+            "  printf '%s\\n' \"${HERMES_DASHBOARD_BASIC_AUTH_SECRET:-}\"\n"
+            f"}} > {str(self.capture)!r}\n"
+            "trap 'exit 0' TERM INT\n"
+            "while :; do sleep 1; done\n",
+            encoding="utf-8",
+        )
+        hermes.chmod(hermes.stat().st_mode | stat.S_IXUSR)
+
+    def tearDown(self) -> None:
+        owner = self.state / "telegram-agents/hermes-dashboard.json"
+        if owner.exists():
+            subprocess.run(
+                [str(DASHBOARD_OWNER), "stop", "--state", str(owner)],
+                text=True,
+                capture_output=True,
+                env=self.environment(),
+                timeout=5,
+            )
+        self.temp.cleanup()
+
+    def environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.update({
+            "HOME": str(self.home),
+            "XDG_STATE_HOME": str(self.state),
+            "DOTCORTEX_AGENTS_DIR": str(self.agents),
+            "DOTCORTEX_BIN_DIR": str(BIN),
+            "HERMES_DASHBOARD_BIN": str(self.fake_bin / "hermes"),
+            "HERMES_DASHBOARD_SKIP_DISCOVERY": "1",
+            "HERMES_TEST_CAPTURE": str(self.capture),
+            "PATH": str(self.fake_bin) + os.pathsep + "/usr/local/bin:/usr/bin:/bin",
+        })
+        return env
+
+    def run_manager(self, *args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(MANAGER), *args],
+            text=True,
+            capture_output=True,
+            env=self.environment(),
+            timeout=8,
+        )
+
+    def write_dashboard_env(self, values: list[str], mode: int = 0o600) -> Path:
+        path = self.home / ".hermes/dashboard.env"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("\n".join(values) + "\n", encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def test_dashboard_start_stop_and_intentional_stop_use_one_owner(self) -> None:
+        result = self.run_manager("start", "hermes-dashboard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").splitlines(), ["http://localhost", "", "", ""])
+        status = self.run_manager("status", "hermes-dashboard")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("hermes dashboard: RUNNING", status.stdout)
+
+        stopped = self.run_manager("stop", "hermes-dashboard")
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        marker = self.state / "telegram-agents/intentional-stop/hermes-dashboard"
+        self.assertTrue(marker.exists())
+
+        restarted = self.run_manager("start", "hermes-dashboard")
+        self.assertEqual(restarted.returncode, 0, restarted.stderr)
+        self.assertFalse(marker.exists())
+
+    def test_dashboard_placeholders_and_bad_permissions_fall_back_local(self) -> None:
+        self.write_dashboard_env([
+            "HERMES_DASHBOARD_PUBLIC_URL=https://YOUR_TAILNET_HOST:YOUR_HERMES_DASHBOARD_PORT",
+            "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=YOUR_HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+            "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=YOUR_HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+        ], mode=0o644)
+        result = self.run_manager("start", "hermes-dashboard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("mode 0600", result.stdout)
+        self.assertEqual(self.capture.read_text(encoding="utf-8").splitlines()[0], "http://localhost")
+
+    def test_dashboard_provisioned_hash_arms_public_url_without_plaintext(self) -> None:
+        self.write_dashboard_env([
+            "HERMES_DASHBOARD_PUBLIC_URL=https://fixture.invalid",
+            "HERMES_DASHBOARD_BASIC_AUTH_USERNAME=fixture-user",
+            "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH=scrypt$fixture-hash",
+            "HERMES_DASHBOARD_BASIC_AUTH_SECRET=fixture-secret",
+        ])
+        result = self.run_manager("start", "hermes-dashboard")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("authentication armed", result.stdout)
+        self.assertEqual(
+            self.capture.read_text(encoding="utf-8").splitlines(),
+            ["https://fixture.invalid", "fixture-user", "scrypt$fixture-hash", "fixture-secret"],
+        )
+
+    def test_dsh_auth_path_is_private_and_service_output_is_redacted(self) -> None:
+        state = self.root / "dsh-auth-path"
+        fake_token = "fixture-token"
+        capture = subprocess.run(
+            [str(DSH_WEB_URL), "capture", "--state-file", str(state)],
+            input=f"dsh web: http://localhost/?token={fake_token}\n",
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(capture.returncode, 0, capture.stderr)
+        self.assertNotIn(fake_token, capture.stdout)
+        self.assertIn("token=[REDACTED]", capture.stdout)
+        self.assertEqual(stat.S_IMODE(state.stat().st_mode), 0o600)
+
+        private_env = self.root / "deepseek.env"
+        private_env.write_text("DSH_WEB_TRUSTED_HOST=fixture.invalid\n", encoding="utf-8")
+        private_env.chmod(0o600)
+        shown = subprocess.run(
+            [str(DSH_WEB_URL), "show", "--env-file", str(private_env), "--state-file", str(state)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(shown.stdout.strip(), f"https://fixture.invalid/?token={fake_token}")
+
+    def test_dsh_placeholder_authority_fails_closed(self) -> None:
+        state = self.root / "dsh-auth-path"
+        state.write_text("/?token=fixture-token\n", encoding="utf-8")
+        state.chmod(0o600)
+        private_env = self.root / "deepseek.env"
+        private_env.write_text("DSH_WEB_TRUSTED_HOST=YOUR_TAILNET_HOST:YOUR_DSH_WEB_PORT\n", encoding="utf-8")
+        private_env.chmod(0o600)
+        result = subprocess.run(
+            [str(DSH_WEB_URL), "show", "--env-file", str(private_env), "--state-file", str(state)],
+            text=True,
+            capture_output=True,
+            timeout=5,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertNotIn("fixture-token", result.stderr)
+
+    def test_public_templates_hold_placeholders_only(self) -> None:
+        templates = HERE.parents[3] / "../.bots/templates"
+        dashboard = (templates / "hermes-dashboard.env").resolve().read_text(encoding="utf-8")
+        deepseek = (templates / "deepseek-harness-telegram.env").resolve().read_text(encoding="utf-8")
+        self.assertIn("YOUR_TAILNET_HOST", dashboard)
+        self.assertIn("YOUR_HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH", dashboard)
+        self.assertIn("DSH_WEB_TRUSTED_HOST=YOUR_TAILNET_HOST:YOUR_DSH_WEB_PORT", deepseek)
+        self.assertNotIn(".ts.net", dashboard + deepseek)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
 * HelmCortex Nano Instance Wrapper
 
 The wrapper selects one Nanobot instance and imports only an allow-list from the private environment file: its dedicated token plus =NANOBOT_RECALL_MCP_URL= and =NANOBOT_TAILNET_CIDR=, the two machine-local network values the managed config references as =${VAR}= placeholders (DotCortex is public, so tailnet addresses never live in tracked files; Nanobot resolves the placeholders at load and fails loudly when one is unset). It never evaluates arbitrary shell content.
@@ -4068,7 +4774,8 @@ AGENTS_DIR="${DOTCORTEX_AGENTS_DIR:-$HOME/DotCortex/all/.bots}"
 CONFIG_DIR="$HOME/.config"
 HOSTS_FILE="$AGENTS_DIR/hosts.conf"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/telegram-agents"
-KNOWN_AGENTS="opencode ductor claudecode hermes codex deepseek-harness pi-agent nanobot"
+MANAGER_BIN_DIR="${DOTCORTEX_BIN_DIR:-$(dirname "$(readlink -f "$0")")}"
+KNOWN_AGENTS="opencode ductor claudecode hermes hermes-dashboard codex deepseek-harness pi-agent nanobot"
 DUCTOR_HOME_DIR="${DUCTOR_HOME_DIR:-$HOME/HelmCortex/FORGE/brain/ductor}"
 DUCTOR_SUPERVISOR="${DUCTOR_SUPERVISOR:-$HOME/HelmCortex/FORGE/bin/ductor-supervise}"
 CORE_PROFILE_BIN="${CORE_PROFILE_BIN:-$HOME/.guix-extra-profiles/core/core/bin}"
@@ -4084,6 +4791,10 @@ export OPENCODE_TELEGRAM_HOME
 OPENCODE_OWNER_HELPER="${OPENCODE_OWNER_HELPER:-${DOTCORTEX_BIN_DIR:-$HOME/DotCortex/all/.local/bin}/opencode-owner}"
 OPENCODE_BACKEND_PID_FILE="$STATE_DIR/opencode-backend.pid"
 OPENCODE_POLLER_PID_FILE="$STATE_DIR/opencode-poller.pid"
+HERMES_DASHBOARD_OWNER_HELPER="${HERMES_DASHBOARD_OWNER_HELPER:-$MANAGER_BIN_DIR/hermes-dashboard-owner}"
+HERMES_DASHBOARD_STATE_FILE="${HERMES_DASHBOARD_STATE_FILE:-$STATE_DIR/hermes-dashboard.json}"
+HERMES_DASHBOARD_LOG_FILE="${HERMES_DASHBOARD_LOG_FILE:-$STATE_DIR/hermes-dashboard.log}"
+HERMES_DASHBOARD_ENV_FILE="${HERMES_DASHBOARD_ENV_FILE:-${HERMES_HOME:-$HOME/.hermes}/dashboard.env}"
 DSH_TELEGRAM_ENV_FILE="${DSH_TELEGRAM_ENV_FILE:-$HOME/.config/deepseek-harness-telegram/env}"
 DSH_TELEGRAM_PID_FILE="${DSH_TELEGRAM_PID_FILE:-$STATE_DIR/deepseek-harness.pid}"
 DSH_TELEGRAM_LOG_FILE="${DSH_TELEGRAM_LOG_FILE:-$STATE_DIR/deepseek-harness.log}"
@@ -4106,6 +4817,9 @@ DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE="${DSH_TELEGRAM_PROFILE_PATCH_TEMPLATE:-$AGE
 DSH_TELEGRAM_MODEL_PROVIDER="${DSH_TELEGRAM_MODEL_PROVIDER:-helmcortex-opencode-go}"
 DSH_TELEGRAM_MODEL="${DSH_TELEGRAM_MODEL:-deepseek-v4.1-flash}"
 DSH_TELEGRAM_PROVIDER_BASE_URL="${DSH_TELEGRAM_PROVIDER_BASE_URL:-https://opencode.ai/zen/go/v1}"
+DSH_WEB_URL_HELPER="${DSH_WEB_URL_HELPER:-$MANAGER_BIN_DIR/deepseek-harness-web-url}"
+DSH_WEB_AUTH_PATH_FILE="${DSH_WEB_AUTH_PATH_FILE:-$STATE_DIR/deepseek-harness.web-auth-path}"
+DSH_WEB_TRUSTED_HOST="${DSH_WEB_TRUSTED_HOST:-}"
 export DSH_HOME
 GEMMA_TELEGRAM_WRAPPER="${GEMMA_TELEGRAM_WRAPPER:-$HOME/HelmCortex/FORGE/bin/gemma-pi-telegram}"
 GEMMA_TELEGRAM_STATE_DIR="${GEMMA_TELEGRAM_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/gemma-pi-telegram}"
@@ -4156,7 +4870,7 @@ Commands:
   switch <machine>  Switch to another machine's agents (disables local, enables remote)
   bring             Bring agents to this machine (stop remote, start local)
 
-Agents: opencode ductor claudecode hermes codex deepseek-harness pi-agent nanobot
+Agents: opencode ductor claudecode hermes hermes-dashboard codex deepseek-harness pi-agent nanobot
 
 Examples:
   telegram-agent-host list
@@ -4208,6 +4922,7 @@ list_agents() {
     echo "  ductor      - Ductor + Telegram/Matrix bot"
     echo "  claudecode  - Claude Code (MCP send/receive)"
     echo "  hermes      - Hermes gateway (native Telegram)"
+    echo "  hermes-dashboard - Hermes local dashboard"
     echo "  codex       - HelmAstra Codex app-server + Telegram bot"
     echo "  deepseek-harness - DeepSeek Harness + dsh-telegram bot"
     echo "  pi-agent    - Pi Agent Gemma Telegram adapter"
@@ -4439,6 +5154,33 @@ check_hermes() {
     else
         echo "  hermes gateway run: STOPPED"
     fi
+}
+
+check_hermes_dashboard() {
+    if [ ! -x "$HERMES_DASHBOARD_OWNER_HELPER" ]; then
+        echo "  hermes dashboard: STOPPED (owner helper unavailable)"
+        return 1
+    fi
+    "$HERMES_DASHBOARD_OWNER_HELPER" status --state "$HERMES_DASHBOARD_STATE_FILE"
+}
+
+start_hermes_dashboard() {
+    if [ ! -x "$HERMES_DASHBOARD_OWNER_HELPER" ]; then
+        echo "Hermes dashboard owner helper unavailable: $HERMES_DASHBOARD_OWNER_HELPER" >&2
+        return 1
+    fi
+    env PATH="$AGENT_RUNTIME_PATH" "$HERMES_DASHBOARD_OWNER_HELPER" start \
+        --state "$HERMES_DASHBOARD_STATE_FILE" \
+        --env-file "$HERMES_DASHBOARD_ENV_FILE" \
+        --log "$HERMES_DASHBOARD_LOG_FILE"
+}
+
+stop_hermes_dashboard() {
+    if [ ! -x "$HERMES_DASHBOARD_OWNER_HELPER" ]; then
+        echo "Hermes dashboard owner helper unavailable; refusing an unscoped stop" >&2
+        return 1
+    fi
+    "$HERMES_DASHBOARD_OWNER_HELPER" stop --state "$HERMES_DASHBOARD_STATE_FILE"
 }
 
 check_codex() {
@@ -4773,11 +5515,7 @@ deepseek_harness_rotate_log() {
 }
 
 deepseek_harness_redact_log() {
-    sed -u -E \
-        -e 's#bot[0-9]{8,}:[A-Za-z0-9_-]{30,}#bot[REDACTED]#g' \
-        -e 's#chatId=-?[0-9]+#chatId=[REDACTED]#g' \
-        -e 's#bar-sync\(-?[0-9]+\)#bar-sync([REDACTED])#g' \
-        -e 's#([?&]token=)[A-Za-z0-9_-]+#\1[REDACTED]#g'
+    "$DSH_WEB_URL_HELPER" capture --state-file "$DSH_WEB_AUTH_PATH_FILE"
 }
 
 deepseek_harness_load_env() {
@@ -4800,7 +5538,7 @@ deepseek_harness_load_env() {
             TELEGRAM_BOT_TOKEN_FILE|OPENCODE_GO_API_KEY_FILE|\
             DSH_HOME|DSH_TELEGRAM_PROFILE|DSH_TELEGRAM_WORKSPACE|DSH_TELEGRAM_PLUGIN_ROOT|\
             DSH_TELEGRAM_MODEL_PROVIDER|DSH_TELEGRAM_MODEL|DSH_TELEGRAM_PROVIDER_BASE_URL|\
-            DSH_RECALL_MCP_URL)
+            DSH_RECALL_MCP_URL|DSH_WEB_TRUSTED_HOST)
                 value="${value%\"}"
                 value="${value#\"}"
                 value="${value%\'}"
@@ -4852,6 +5590,37 @@ deepseek_harness_sync_profile_patch() {
 deepseek_harness_validate_private_config() {
     local token_file key_file config settings profile_patch
     deepseek_harness_load_env || return 1
+
+    case "${DSH_WEB_TRUSTED_HOST:-}" in
+        ""|*YOUR_*) DSH_WEB_TRUSTED_HOST="" ;;
+        *)
+            if ! python3 - "$DSH_WEB_TRUSTED_HOST" <<'PY'
+import sys
+from urllib.parse import urlsplit
+
+authority = sys.argv[1]
+try:
+    parsed = urlsplit("//" + authority)
+    _ = parsed.port
+except ValueError:
+    raise SystemExit(1)
+if (
+    not authority
+    or any(char.isspace() for char in authority)
+    or any(char in authority for char in "/?#@")
+    or not parsed.hostname
+    or parsed.username is not None
+    or parsed.password is not None
+):
+    raise SystemExit(1)
+PY
+            then
+                echo "DeepSeek Harness DSH_WEB_TRUSTED_HOST must be one bare host[:port] authority" >&2
+                return 1
+            fi
+            ;;
+    esac
+    export DSH_WEB_TRUSTED_HOST
 
     token_file="${TELEGRAM_BOT_TOKEN_FILE:-}"
     if [ -z "$token_file" ]; then
@@ -5022,6 +5791,10 @@ PY
 }
 
 deepseek_harness_validate_install() {
+    if [ ! -x "$DSH_WEB_URL_HELPER" ]; then
+        echo "DeepSeek Harness web URL helper is unavailable: $DSH_WEB_URL_HELPER" >&2
+        return 1
+    fi
     if ! env PATH="$AGENT_RUNTIME_PATH" bash -c 'command -v dsh >/dev/null 2>&1'; then
         echo "DeepSeek Harness CLI not found in PATH; run loom npm:apply after tangling" >&2
         return 1
@@ -5344,6 +6117,10 @@ status_cmd() {
         check_deepseek_harness
         return
     fi
+    if [ "$requested" = "hermes-dashboard" ]; then
+        check_hermes_dashboard
+        return
+    fi
     if [ "$requested" = "pi-agent" ]; then
         check_pi_agent
         return
@@ -5368,6 +6145,7 @@ status_cmd() {
     check_ductor || true
     check_claudecode || true
     check_hermes || true
+    check_hermes_dashboard || true
     check_codex || true
     check_deepseek_harness || true
     check_pi_agent || true
@@ -5464,6 +6242,17 @@ sync_configs() {
     local requested="${1:-}" delegated=0
     if [ -n "$requested" ]; then
         case "$requested" in
+            hermes-dashboard)
+                mkdir -p "$(dirname "$HERMES_DASHBOARD_ENV_FILE")"
+                chmod 700 "$(dirname "$HERMES_DASHBOARD_ENV_FILE")"
+                if [ ! -e "$HERMES_DASHBOARD_ENV_FILE" ]; then
+                    install -m 600 "$HOME/DotCortex/all/.bots/templates/hermes-dashboard.env" "$HERMES_DASHBOARD_ENV_FILE"
+                    echo "Installed Hermes dashboard placeholder env at $HERMES_DASHBOARD_ENV_FILE"
+                else
+                    echo "Preserved existing Hermes dashboard private env at $HERMES_DASHBOARD_ENV_FILE"
+                fi
+                return
+                ;;
             deepseek-harness)
                 deepseek_harness_delegate sync || delegated=$?
                 [ "$delegated" -eq 3 ] || return "$delegated"
@@ -5487,11 +6276,17 @@ sync_configs() {
     mkdir -p "$HOME/.config/opencode-telegram-bot"
     mkdir -p "$HOME/.config/codex-telegram-helmastra"
     mkdir -p "$HOME/.config/deepseek-harness-telegram"
+    mkdir -p "$(dirname "$HERMES_DASHBOARD_ENV_FILE")"
     mkdir -p "$HOME/.config/pi-agent" 2>/dev/null || true
     mkdir -p "$NANOBOT_CONFIG_DIR"
     mkdir -p "$HOME/.config/telegram-agents"
 
     chmod 700 "$NANOBOT_CONFIG_DIR"
+    chmod 700 "$(dirname "$HERMES_DASHBOARD_ENV_FILE")"
+    if [ ! -e "$HERMES_DASHBOARD_ENV_FILE" ]; then
+        install -m 600 "$repo/all/.bots/templates/hermes-dashboard.env" "$HERMES_DASHBOARD_ENV_FILE"
+        echo "Installed Hermes dashboard placeholder env at $HERMES_DASHBOARD_ENV_FILE"
+    fi
     if [ ! -e "$NANOBOT_CONFIG" ]; then
         install -m 600 "$repo/all/.bots/templates/nanobot-config.json" "$NANOBOT_CONFIG"
         echo "Installed Nanobot non-secret config template at $NANOBOT_CONFIG"
@@ -5614,6 +6409,9 @@ start_agent() {
         hermes)
             start_hermes
             ;;
+        hermes-dashboard)
+            start_hermes_dashboard
+            ;;
         codex)
             local wrapper="${CODEX_HELMASTRA_WRAPPER:-$HOME/HelmCortex/FORGE/bin/codex-helmastra}"
             if [ ! -x "$wrapper" ]; then
@@ -5682,6 +6480,7 @@ start_agent() {
                 return 1
             }
             launch_marker="${DSH_TELEGRAM_READY_MARKER}.${launch_generation}"
+            rm -f "$DSH_WEB_AUTH_PATH_FILE"
             printf '\n=== deepseek-harness launch %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$DSH_TELEGRAM_LOG_FILE"
             echo "Starting DeepSeek Harness Telegram profile $DSH_TELEGRAM_PROFILE..."
             (
@@ -5697,17 +6496,20 @@ start_agent() {
                     DSH_TELEGRAM_READY_GENERATION="$launch_generation" \
                     DSH_TELEGRAM_READY_MARKER="$launch_marker" \
                     DSH_TELEGRAM_LOG_FILE="$DSH_TELEGRAM_LOG_FILE" \
+                    DSH_WEB_URL_HELPER="$DSH_WEB_URL_HELPER" \
+                    DSH_WEB_AUTH_PATH_FILE="$DSH_WEB_AUTH_PATH_FILE" \
+                    DSH_WEB_TRUSTED_HOST="$DSH_WEB_TRUSTED_HOST" \
                     TELEGRAM_BOT_TOKEN_FILE="$TELEGRAM_BOT_TOKEN_FILE" \
                     OPENCODE_GO_API_KEY_FILE="$OPENCODE_GO_API_KEY_FILE" \
                     bash -c '
                         IFS= read -r OPENCODE_GO_API_KEY < "$OPENCODE_GO_API_KEY_FILE"
                         export OPENCODE_GO_API_KEY
-                        exec dsh --profile "$DSH_TELEGRAM_PROFILE" > >(
-                            sed -u -E \
-                                -e '\''s#bot[0-9]{8,}:[A-Za-z0-9_-]{30,}#bot[REDACTED]#g'\'' \
-                                -e '\''s#chatId=-?[0-9]+#chatId=[REDACTED]#g'\'' \
-                                -e '\''s#bar-sync\(-?[0-9]+\)#bar-sync([REDACTED])#g'\'' \
-                                -e '\''s#([?&]token=)[A-Za-z0-9_-]+#\1[REDACTED]#g'\'' \
+                        dsh_args=(--profile "$DSH_TELEGRAM_PROFILE")
+                        if [ -n "$DSH_WEB_TRUSTED_HOST" ]; then
+                            dsh_args+=(--trusted-host "$DSH_WEB_TRUSTED_HOST")
+                        fi
+                        exec dsh "${dsh_args[@]}" > >(
+                            "$DSH_WEB_URL_HELPER" capture --state-file "$DSH_WEB_AUTH_PATH_FILE" \
                                 >> "$DSH_TELEGRAM_LOG_FILE"
                         ) 2>&1 </dev/null
                     '
@@ -5770,6 +6572,9 @@ stop_agent() {
             ;;
         hermes)
             stop_hermes
+            ;;
+        hermes-dashboard)
+            stop_hermes_dashboard
             ;;
         codex)
             local codex_pid codex_pgid codex_ticks
@@ -5835,6 +6640,7 @@ stop_agent() {
             if [ ! -e "$DSH_TELEGRAM_PID_FILE" ] && [ ! -e "$DSH_TELEGRAM_READY_MARKER" ] && \
                [ ! -e "$DSH_TELEGRAM_GENERATION_FILE" ] && \
                { [ -z "$dsh_marker" ] || [ ! -e "$dsh_marker" ]; }; then
+                rm -f "$DSH_WEB_AUTH_PATH_FILE"
                 return 0
             fi
             dsh_pid="$(cat "$DSH_TELEGRAM_PID_FILE" 2>/dev/null || true)"
@@ -5851,7 +6657,7 @@ stop_agent() {
                 echo "DeepSeek Harness owner state is stale but an unowned poller uses this profile; refusing cleanup" >&2
                 return 1
             fi
-            rm -f "$DSH_TELEGRAM_PID_FILE" "$DSH_TELEGRAM_READY_MARKER" "$DSH_TELEGRAM_GENERATION_FILE"
+            rm -f "$DSH_TELEGRAM_PID_FILE" "$DSH_TELEGRAM_READY_MARKER" "$DSH_TELEGRAM_GENERATION_FILE" "$DSH_WEB_AUTH_PATH_FILE"
             [ -z "$dsh_marker" ] || rm -f "$dsh_marker"
             ;;
         pi-agent)
@@ -5903,7 +6709,7 @@ mark_intentional_stop() { mkdir -p "$INTENT_DIR" && : > "$INTENT_DIR/$1"; }
 clear_intentional_stop() { rm -f "$INTENT_DIR/$1"; }
 
 stop_all() {
-    for agent in opencode ductor claudecode hermes codex deepseek-harness pi-agent nanobot; do
+    for agent in opencode ductor claudecode hermes hermes-dashboard codex deepseek-harness pi-agent nanobot; do
         { stop_agent "$agent" 2>/dev/null && mark_intentional_stop "$agent"; } || true
     done
     echo "All agents stopped"

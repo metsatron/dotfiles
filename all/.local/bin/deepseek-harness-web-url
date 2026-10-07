@@ -1,0 +1,149 @@
+#!/usr/bin/env python3
+# DeepSeek Harness web auth helper
+
+
+# [[file:../../../agents-bots.org::*DeepSeek Harness web auth helper][DeepSeek Harness web auth helper:1]]
+"""Capture dsh's private web-auth path while keeping it out of service logs."""
+
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import stat
+import sys
+from pathlib import Path
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+
+URL_RE = re.compile(r"dsh web:\s+(https?://\S+)")
+REDACTIONS = (
+    (re.compile(r"bot[0-9]{8,}:[A-Za-z0-9_-]{30,}"), "bot[REDACTED]"),
+    (re.compile(r"chatId=-?[0-9]+"), "chatId=[REDACTED]"),
+    (re.compile(r"bar-sync\(-?[0-9]+\)"), "bar-sync([REDACTED])"),
+    (re.compile(r"([?&]token=)[^&\s]+"), r"\1[REDACTED]"),
+)
+
+
+def default_state() -> Path:
+    root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    return root / "telegram-agents/deepseek-harness.web-auth-path"
+
+
+def default_env() -> Path:
+    return Path.home() / ".config/deepseek-harness-telegram/env"
+
+
+def write_private(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(value + "\n")
+    os.replace(temp, path)
+
+
+def capture_url(line: str, state: Path) -> None:
+    match = URL_RE.search(line)
+    if not match:
+        return
+    try:
+        parsed = urlsplit(match.group(1))
+        _ = parsed.port
+    except ValueError:
+        return
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in ("localhost", "127.0.0.1", "::1"):
+        return
+    tokens = parse_qs(parsed.query, keep_blank_values=True).get("token", [])
+    if parsed.path not in ("", "/") or not tokens or not tokens[0]:
+        return
+    path = "/?" + urlencode({"token": tokens[0]})
+    write_private(state, path)
+
+
+def redact(line: str) -> str:
+    for pattern, replacement in REDACTIONS:
+        line = pattern.sub(replacement, line)
+    return line
+
+
+def capture(args: argparse.Namespace) -> int:
+    state = Path(args.state_file) if args.state_file else default_state()
+    for line in sys.stdin:
+        capture_url(line, state)
+        sys.stdout.write(redact(line))
+        sys.stdout.flush()
+    return 0
+
+
+def read_authority(path: Path) -> str:
+    try:
+        if stat.S_IMODE(path.stat().st_mode) != 0o600:
+            raise ValueError("private env must be mode 0600")
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError("private env is unavailable") from exc
+    authority = ""
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        if not line.startswith("DSH_WEB_TRUSTED_HOST="):
+            continue
+        authority = line.split("=", 1)[1].strip()
+        if len(authority) >= 2 and authority[0] == authority[-1] and authority[0] in "\"'":
+            authority = authority[1:-1]
+    if not authority or "YOUR_" in authority or any(char.isspace() for char in authority):
+        raise ValueError("trusted host is unprovisioned")
+    if any(char in authority for char in "/?#@"):
+        raise ValueError("trusted host must be a bare authority")
+    try:
+        parsed = urlsplit("//" + authority)
+        _ = parsed.port
+    except ValueError as exc:
+        raise ValueError("trusted host authority is invalid") from exc
+    if not parsed.hostname or parsed.username is not None or parsed.password is not None:
+        raise ValueError("trusted host authority is invalid")
+    return authority
+
+
+def show(args: argparse.Namespace) -> int:
+    try:
+        authority = read_authority(Path(args.env_file) if args.env_file else default_env())
+        state = Path(args.state_file) if args.state_file else default_state()
+        if stat.S_IMODE(state.stat().st_mode) != 0o600:
+            raise ValueError("private auth path must be mode 0600")
+        path = state.read_text(encoding="utf-8").strip()
+        parsed = urlsplit(path)
+        tokens = parse_qs(parsed.query, keep_blank_values=True).get("token", [])
+        if (
+            parsed.path != "/"
+            or parsed.netloc
+            or parsed.fragment
+            or not tokens
+            or not tokens[0]
+        ):
+            raise ValueError("private auth path is invalid")
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"Cannot print dsh web URL: {exc}", file=sys.stderr)
+        return 1
+    print(f"https://{authority}{path}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    capture_parser = subparsers.add_parser("capture")
+    capture_parser.add_argument("--state-file")
+    show_parser = subparsers.add_parser("show")
+    show_parser.add_argument("--env-file")
+    show_parser.add_argument("--state-file")
+    args = parser.parse_args()
+    return capture(args) if args.command == "capture" else show(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+# DeepSeek Harness web auth helper:1 ends here
