@@ -120,8 +120,10 @@ class Session:
                 "CODEX_IDLE_REAL_EXECUTABLE": str(self.fake),
                 "CODEX_IDLE_COMPACT_SECONDS": str(delay),
                 "CODEX_IDLE_COMPACT_TTL_SECONDS": str(ttl),
+                "CODEX_IDLE_COMPACT_MIN_TOKENS": "0",
                 "CODEX_IDLE_COMPACTION_TIMEOUT_SECONDS": str(compaction_timeout),
                 "CODEX_IDLE_COMPACTION_DEBUG": "1",
+                "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
                 "XDG_STATE_HOME": str(self.root / "state"),
             }
         )
@@ -280,10 +282,34 @@ class CodexWarmTests(unittest.TestCase):
         self.sessions.append(session)
         return session
 
+    def test_measured_window_opts_into_observed_endpoint_policy(self):
+        """Codex uses the measured endpoint row that already has fleet evidence."""
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            helper = root / "cache-policy"
+            policy = root / "cache-policy.json"
+            helper.write_text("fixture", encoding="utf-8")
+            policy.write_text("{}", encoding="utf-8")
+            decision = {
+                "compact_before_seconds": 7080,
+                "cache_expires_seconds": 7200,
+                "mode": "measured",
+            }
+            completed = subprocess.CompletedProcess([], 0, json.dumps(decision), "")
+            with mock.patch.dict(os.environ, {
+                "FLEET_CACHE_POLICY_HELPER": str(helper),
+                "FLEET_CACHE_POLICY_PATH": str(policy),
+            }), mock.patch.object(self.module.subprocess, "run", return_value=completed) as run:
+                compact_after, cache_expires, resolved = self.module.measured_window("gpt-5.6-sol")
+        command = run.call_args.args[0]
+        self.assertIn("--allow-observed", command)
+        self.assertEqual((compact_after, cache_expires), (7080, 7200))
+        self.assertEqual(resolved["mode"], "measured")
+
     # -- Gate logic --
 
-    def test_gate_skips_token_check_when_tokens_unknown(self):
-        """The None-token MVP path must not block compaction."""
+    def test_gate_rejects_when_tokens_unknown(self):
+        """Automatic compaction needs a measured current-context size."""
         supervisor = object.__new__(self.module.Supervisor)
         supervisor.enabled = True
         supervisor.status = "idle"
@@ -299,7 +325,7 @@ class CodexWarmTests(unittest.TestCase):
         supervisor.child_tty = None
         with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
             reason = supervisor._gate_reason("compact")
-        self.assertIsNone(reason)
+        self.assertEqual(reason, "token-count-unknown")
 
     def test_gate_rejects_when_tokens_below_threshold(self):
         """Known low token count must block compaction."""
@@ -339,8 +365,8 @@ class CodexWarmTests(unittest.TestCase):
             reason = supervisor._gate_reason("compact")
         self.assertIsNone(reason)
 
-    def test_gate_rejects_cold_cache(self):
-        """Compaction after TTL expiry is pointless."""
+    def test_gate_allows_large_context_after_cache_expiry(self):
+        """A cold compaction still prevents repeated full-context ingestion."""
         supervisor = object.__new__(self.module.Supervisor)
         supervisor.enabled = True
         supervisor.status = "idle"
@@ -349,14 +375,14 @@ class CodexWarmTests(unittest.TestCase):
         supervisor.last_normal_stop = time.time() - 99999
         supervisor.last_lifecycle_activity = None
         supervisor.last_local_input = None
-        supervisor.current_tokens = None
+        supervisor.current_tokens = 100000
         supervisor.dirty = True
         supervisor.pid = os.getpid()
         supervisor.master_fd = 0
         supervisor.child_tty = None
         with mock.patch.object(supervisor, "_pty_still_owned", return_value=True):
             reason = supervisor._gate_reason("compact")
-        self.assertEqual(reason, "cache-already-cold")
+        self.assertIsNone(reason)
 
     def test_gate_rejects_clean_session(self):
         """No dirty turns means nothing to compact."""

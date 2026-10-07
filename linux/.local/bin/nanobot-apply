@@ -1,15 +1,20 @@
 #!/usr/bin/env bash
-# Nanobot Telegram runtime (Linux, uv-managed)
-
-# Nanobot is a fleet bot, not a user-site Python library.  Keep its dependency
-# graph isolated inside the HelmCortex Nano workspace and pin the upstream release
-# here.  Re-running =nanobot-apply= upgrades or repairs the runtime to the declared
-# version without touching private credentials, OAuth state, sessions, or memory.
-
-
-# [[file:../../../package-pip.org::*Nanobot Telegram runtime (Linux, uv-managed)][Nanobot Telegram runtime (Linux, uv-managed):1]]
+# [[file:../../../package-pip.org::*Nanobot Telegram runtime (Linux, uv-managed)][Nanobot Telegram runtime (Linux, uv-managed):10]]
 # ~/DotCortex/linux/.local/bin/nanobot-apply
 set -euo pipefail
+
+case "${1:-}" in
+    -h|--help)
+        echo 'Usage: nanobot-apply'
+        echo 'Install or repair the pinned Nano runtime and managed DotCortex seams.'
+        exit 0
+        ;;
+    '') ;;
+    *)
+        echo "nanobot-apply: unknown argument: $1" >&2
+        exit 2
+        ;;
+esac
 
 NANOBOT_VERSION="0.3.5"
 WORKSPACE="${NANOBOT_WORKSPACE:-$HOME/HelmCortex/FORGE/brain/nanobot}"
@@ -17,6 +22,11 @@ VENV="${NANOBOT_VENV:-$WORKSPACE/.venv}"
 CONFIG_DIR="${NANOBOT_CONFIG_DIR:-$HOME/.config/nanobot-telegram}"
 CONFIG="${NANOBOT_CONFIG:-$CONFIG_DIR/config.json}"
 TEMPLATE="${NANOBOT_CONFIG_TEMPLATE:-$HOME/DotCortex/all/.bots/templates/nanobot-config.json}"
+POLICY_PATCH="${NANOBOT_CACHE_POLICY_PATCH:-$HOME/DotCortex/all/.bots/patches/nanobot-cache-policy.patch}"
+VOICE_PATCH="${NANOBOT_VOICE_REPLY_PATCH:-$HOME/DotCortex/all/.bots/patches/nanobot-voice-reply.patch}"
+TOOL_PATCH="${NANOBOT_TOOL_PATCH:-$HOME/DotCortex/all/.bots/patches/nanobot-tool-isolation.patch}"
+SEARCH_ISOLATION="${NANOBOT_SEARCH_ISOLATION:-$HOME/DotCortex/all/.bots/patches/nanobot-search-isolation.py}"
+PATCH_STAMP="$VENV/.dotcortex-runtime-patches.sha256"
 
 export PATH="$HOME/.local/bin:$PATH"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
@@ -42,6 +52,48 @@ uv pip install --upgrade --python "$VENV/bin/python" \
     "python-telegram-bot[socks,webhooks]>=22.6,<23.0" \
     "python-socks[asyncio]>=2.8,<3.0"
 
+SITE_PACKAGES="$($VENV/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+AUTOCOMPACT="$SITE_PACKAGES/nanobot/agent/autocompact.py"
+TELEGRAM_RUNTIME="$SITE_PACKAGES/nanobot/channels/telegram/runtime.py"
+EXECUTION_MODULE="$SITE_PACKAGES/nanobot/agent/tools/execution.py"
+REGISTRY_MODULE="$SITE_PACKAGES/nanobot/agent/tools/registry.py"
+INSTALLED_SEARCH_ISOLATION="$SITE_PACKAGES/nanobot/agent/tools/search_isolation.py"
+for managed_file in "$POLICY_PATCH" "$VOICE_PATCH" "$TOOL_PATCH" "$SEARCH_ISOLATION"; do
+    [ -r "$managed_file" ] || {
+        echo "nanobot-apply: managed runtime input is missing: $managed_file" >&2
+        exit 1
+    }
+done
+PATCH_HASH="$(sha256sum "$POLICY_PATCH" "$VOICE_PATCH" "$TOOL_PATCH" "$SEARCH_ISOLATION" | sha256sum | awk '{print $1}')"
+INSTALLED_PATCH_HASH="$(sed -n '1p' "$PATCH_STAMP" 2>/dev/null || true)"
+if grep -q 'Auto-compact policy shadow candidate' "$AUTOCOMPACT" \
+        && grep -q 'Feed the shared DotCortex relay' "$TELEGRAM_RUNTIME" \
+        && grep -q 'search_isolation import isolated_search' "$EXECUTION_MODULE" \
+        && grep -q 'search_isolation import isolated_search' "$REGISTRY_MODULE" \
+        && [ -r "$INSTALLED_SEARCH_ISOLATION" ] \
+        && cmp -s "$SEARCH_ISOLATION" "$INSTALLED_SEARCH_ISOLATION" \
+        && [ "$INSTALLED_PATCH_HASH" = "$PATCH_HASH" ]; then
+    echo "nanobot-apply: managed runtime seams already present"
+else
+    if grep -q 'Auto-compact policy shadow candidate' "$AUTOCOMPACT" \
+            || grep -q 'Feed the shared DotCortex relay' "$TELEGRAM_RUNTIME" \
+            || grep -q 'search_isolation import isolated_search' "$EXECUTION_MODULE" \
+            || grep -q 'search_isolation import isolated_search' "$REGISTRY_MODULE"; then
+        uv pip install --reinstall-package nanobot-ai --no-deps \
+            --python "$VENV/bin/python" "nanobot-ai==$NANOBOT_VERSION"
+    fi
+    for managed_patch in "$POLICY_PATCH" "$VOICE_PATCH" "$TOOL_PATCH"; do
+        if ! patch --dry-run --silent -d "$SITE_PACKAGES" -p1 < "$managed_patch"; then
+            echo "nanobot-apply: nanobot $NANOBOT_VERSION drifted from $managed_patch; refusing an unmanaged runtime" >&2
+            exit 1
+        fi
+        patch --silent -d "$SITE_PACKAGES" -p1 < "$managed_patch"
+    done
+    install -m 644 "$SEARCH_ISOLATION" "$INSTALLED_SEARCH_ISOLATION"
+    printf '%s\n' "$PATCH_HASH" > "$PATCH_STAMP"
+    echo "nanobot-apply: installed cache-policy, voice-reply, and search-isolation seams"
+fi
+
 if [ ! -e "$CONFIG" ]; then
     install -m 600 "$TEMPLATE" "$CONFIG"
     echo "nanobot-apply: installed non-secret config template at $CONFIG"
@@ -49,9 +101,52 @@ else
     chmod 600 "$CONFIG"
 fi
 
+"$VENV/bin/python" - "$CONFIG" "$TEMPLATE" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+config_path = Path(sys.argv[1])
+template_path = Path(sys.argv[2])
+
+with config_path.open("r", encoding="utf-8") as fh:
+    current = json.load(fh)
+with template_path.open("r", encoding="utf-8") as fh:
+    managed = json.load(fh)
+if not isinstance(current, dict) or not isinstance(managed, dict):
+    raise SystemExit("nanobot-apply: config and template must be JSON objects")
+
+def overlay(base, update):
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            overlay(base[key], value)
+        else:
+            base[key] = value
+
+overlay(current, managed)
+fd, temporary = tempfile.mkstemp(prefix=".config.json.", dir=config_path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(current, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, config_path)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+echo "nanobot-apply: reconciled managed config from $TEMPLATE"
+
 "$VENV/bin/nanobot" onboard --refresh --config "$CONFIG" --workspace "$WORKSPACE"
 "$VENV/bin/nanobot" --version
 "$VENV/bin/python" -c 'import telegram; print("telegram adapter", telegram.__version__)'
 
 echo "nanobot-apply: ready at $VENV (pinned nanobot-ai $NANOBOT_VERSION)"
-# Nanobot Telegram runtime (Linux, uv-managed):1 ends here
+# Nanobot Telegram runtime (Linux, uv-managed):10 ends here
