@@ -58,6 +58,7 @@ import struct
 import subprocess
 import sys
 import termios
+import time
 
 
 def report_size(_signum=None, _frame=None):
@@ -67,6 +68,60 @@ def report_size(_signum=None, _frame=None):
         os.write(1, (f"SIZE:{rows}x{columns}\n").encode())
     except OSError:
         pass
+
+
+def emit_development_channel_prompt():
+    entry = next(
+        (
+            argument.split("=", 1)[1]
+            for argument in sys.argv
+            if argument.startswith("--emit-dev-channel-prompt=")
+        ),
+        None,
+    )
+    if entry is None:
+        return
+    delay = next(
+        (
+            float(argument.split("=", 1)[1])
+            for argument in sys.argv
+            if argument.startswith("--dev-channel-prompt-delay=")
+        ),
+        0.0,
+    )
+    if delay:
+        time.sleep(delay)
+    prompt = (
+        b"\x1b[31mWARNING: Loading development channels\x1b[0m\n"
+        b"--dangerously-load-development-channels is for local channel development only. "
+        b"Do not use this option to run channels you have downloaded off the internet.\n"
+        b"Please use --channels to run a list of approved channels.\n"
+        + f"Channels: {entry}\n".encode()
+        + b"\x1b[1mI am using this for local development\x1b[0m\n"
+        b"Exit\n"
+    )
+    if "--alter-dev-channel-prompt" in sys.argv:
+        prompt = prompt.replace(
+            b"Please use --channels to run a list of approved channels.",
+            b"Please use --channels to run approved channels.",
+        )
+
+    def write_prompt():
+        if "--fragment-dev-channel-prompt" not in sys.argv:
+            os.write(1, prompt)
+            return
+        # Split both an ANSI escape and stable prompt phrases across distinct
+        # writes, as the real Ink renderer does while painting the PTY.
+        cuts = (2, 19, 71, 149, 231, 257, len(prompt))
+        start = 0
+        for end in cuts:
+            os.write(1, prompt[start:end])
+            start = end
+            time.sleep(0.04)
+
+    write_prompt()
+    if "--repeat-dev-channel-prompt" in sys.argv:
+        write_prompt()
 
 
 def main():
@@ -82,6 +137,7 @@ def main():
         )
     if "--exit-status=7" in sys.argv:
         return 7
+    emit_development_channel_prompt()
     try:
         while True:
             readable, _, _ = select.select([0], [], [], 0.1)
@@ -239,6 +295,8 @@ class Session:
         compact_timeout=900,
         preservation=False,
         preservation_mode="directive",
+        accept_dev_channels="",
+        dev_channel_accept_window=60,
     ):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="cw", dir="/tmp"))
         self.fake = self.root / "fake-claude"
@@ -254,6 +312,8 @@ class Session:
         environment = os.environ.copy()
         for key in PRESERVATION_ENV_KEYS:
             environment.pop(key, None)
+        environment.pop("CLAUDE_WARM_ACCEPT_DEV_CHANNELS", None)
+        environment.pop("CLAUDE_WARM_DEV_CHANNEL_ACCEPT_WINDOW_SECONDS", None)
         environment.update(
             {
                 "XDG_RUNTIME_DIR": str(self.root),
@@ -271,6 +331,10 @@ class Session:
                 "CLAUDE_IDLE_CHANNEL_RECOVERY_CONFIRM_SECONDS": str(recovery_confirm),
                 "CLAUDE_IDLE_COMPACT_RETRY_SECONDS": str(retry),
                 "CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS": str(compact_timeout),
+                "CLAUDE_WARM_ACCEPT_DEV_CHANNELS": accept_dev_channels,
+                "CLAUDE_WARM_DEV_CHANNEL_ACCEPT_WINDOW_SECONDS": str(
+                    dev_channel_accept_window
+                ),
             }
         )
         if preservation:
@@ -683,6 +747,91 @@ class ClaudeWarmTests(unittest.TestCase):
             classifier.feed("✻ Crunched for 16m 38s\n\n❯\n".encode()),
             "idle",
         )
+
+    def test_development_channel_recorded_prompt_accepts_opted_in_server_once(self):
+        session = self.make_session(
+            accept_dev_channels="server:mailcortex",
+            extra_args=("--emit-dev-channel-prompt=server:mailcortex",),
+        )
+        session.wait_output("INPUT:b'\\n'")
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'\\n'"), 1)
+        state = session.read_state()
+        self.assertEqual(
+            state["accepted_development_channels"], ["server:mailcortex"]
+        )
+        accepted = [
+            event
+            for event in session.guard_events()
+            if event.get("event") == "development-channel-accepted"
+        ]
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(accepted[0]["channels"], ["server:mailcortex"])
+
+    def test_development_channel_prompt_without_opt_in_sends_no_enter(self):
+        session = self.make_session(
+            extra_args=("--emit-dev-channel-prompt=server:mailcortex",),
+        )
+        session.wait_output("Channels: server:mailcortex")
+        time.sleep(0.2)
+        self.assertNotIn(b"INPUT:", bytes(session.output))
+
+    def test_development_channel_prompt_for_other_server_sends_no_enter(self):
+        session = self.make_session(
+            accept_dev_channels="server:mailcortex",
+            extra_args=("--emit-dev-channel-prompt=server:other",),
+        )
+        session.wait_output("Channels: server:other")
+        time.sleep(0.2)
+        self.assertNotIn(b"INPUT:", bytes(session.output))
+
+    def test_development_channel_prompt_after_startup_window_sends_no_enter(self):
+        session = self.make_session(
+            accept_dev_channels="server:mailcortex",
+            dev_channel_accept_window=0.05,
+            extra_args=(
+                "--emit-dev-channel-prompt=server:mailcortex",
+                "--dev-channel-prompt-delay=0.2",
+            ),
+        )
+        session.wait_output("Channels: server:mailcortex")
+        time.sleep(0.2)
+        self.assertNotIn(b"INPUT:", bytes(session.output))
+
+    def test_development_channel_prompt_repeated_sends_exactly_one_enter(self):
+        session = self.make_session(
+            accept_dev_channels="server:mailcortex",
+            extra_args=(
+                "--emit-dev-channel-prompt=server:mailcortex",
+                "--repeat-dev-channel-prompt",
+            ),
+        )
+        session.wait_output("INPUT:b'\\n'")
+        time.sleep(0.2)
+        session.output_contains(b"")
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'\\n'"), 1)
+
+    def test_development_channel_altered_prompt_sends_no_enter(self):
+        session = self.make_session(
+            accept_dev_channels="server:mailcortex",
+            extra_args=(
+                "--emit-dev-channel-prompt=server:mailcortex",
+                "--alter-dev-channel-prompt",
+            ),
+        )
+        session.wait_output("Please use --channels to run approved channels.")
+        time.sleep(0.2)
+        self.assertNotIn(b"INPUT:", bytes(session.output))
+
+    def test_development_channel_ansi_fragmented_prompt_still_accepts_once(self):
+        session = self.make_session(
+            accept_dev_channels="server:mailcortex",
+            extra_args=(
+                "--emit-dev-channel-prompt=server:mailcortex",
+                "--fragment-dev-channel-prompt",
+            ),
+        )
+        session.wait_output("INPUT:b'\\n'")
+        self.assertEqual(bytes(session.output).count(b"INPUT:b'\\n'"), 1)
 
     def test_arguments_and_full_pty_submission(self):
         session = self.make_session(delay=0, extra_args=("--resume", "fixture", "--model", "test"))
