@@ -618,6 +618,15 @@ class ClaudeWarmTests(unittest.TestCase):
             self.assertEqual(command[command.index("--endpoint")+1], "anthropic-default")
             self.assertNotIn("--allow-observed", command)
 
+    def test_cache_rejected_current_snapshot_cannot_reuse_previous_model(self):
+        session = self.make_session(delay=5, ttl=6, cache_result=self.cache_decision())
+        session.stop_and_bind()
+        session.status(session_id="different-owner-session", model="Sonnet 4.6")
+        wait_until(lambda: session.read_state() and session.read_state()["cache_policy"]["mode"] == "fallback", timeout=3)
+        state = session.read_state()
+        self.assertAlmostEqual(state["timer_deadline"] - state["last_normal_stop"], 5, delta=0.1)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
     def test_cache_current_snapshot_model_at_fire_rearms(self):
         session = self.make_session(delay=20, ttl=30, cache_result=self.cache_decision())
         session.stop_and_bind()

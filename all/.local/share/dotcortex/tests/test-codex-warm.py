@@ -98,6 +98,7 @@ class Session:
         terminal=False,
         cache_result=None,
         min_tokens=0,
+        config_model=None,
         compaction_timeout=300,
     ):
         self.root = pathlib.Path(tempfile.mkdtemp(prefix="cxw", dir="/tmp"))
@@ -135,6 +136,11 @@ class Session:
             policy.write_text("{}", encoding="utf-8")
             environment["FLEET_CACHE_POLICY_HELPER"] = str(cache_helper)
             environment["FLEET_CACHE_POLICY_PATH"] = str(policy)
+        self.config_path = self.root / "config" / "config.toml"
+        if config_model is not None:
+            self.config_path.parent.mkdir()
+            self.config_path.write_text(f'model="{config_model}"\n', encoding="utf-8")
+            environment["CODEX_HOME"] = str(self.config_path.parent)
         self.parent_master = None
         self.outer_tty_fd = None
         self.outer_tty_baseline = None
@@ -291,13 +297,28 @@ class CodexWarmTests(unittest.TestCase):
         return session
 
 
+    def test_automatic_action_does_not_guess_active_identity_from_declarations(self):
+        session = self.make_session(delay=1, ttl=2, min_tokens=70000,
+                                    cache_result=self.cache_decision(1, 2),
+                                    config_model="disk-model",
+                                    extra_args=("--model", "fixture-model"))
+        session.event("session-start", model="claimed-runtime-model", endpoint_id="claimed-endpoint")
+        session.event("stop", stop_hook_active=False, model="claimed-runtime-model", context_tokens=100000)
+        session.config_path.write_text('model="later-disk-model"\n', encoding="utf-8")
+        wait_until(lambda: session.read_state() and session.read_state()["last_gate_rejection_reason"] == "token-count-unknown", timeout=3)
+        state = session.read_state()
+        self.assertEqual((state["model"], state["endpoint_id"]), ("unknown", "unknown"))
+        self.assertEqual(state["cache_policy"]["mode"], "fallback")
+        self.assertFalse(session.cache_calls.exists(), "declarations must not select measured runtime timing")
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
+
     def test_automatic_cache_action_unknown_tokens_fails_closed(self):
         session = self.make_session(delay=1, ttl=2, min_tokens=70000)
         session.stop_and_bind()
         wait_until(lambda: session.read_state() and session.read_state()["last_gate_rejection_reason"] == "token-count-unknown", timeout=3)
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
-    def test_model_selection_refreshed_at_fire_keeps_exact_launch_override(self):
+    def test_declared_model_selection_is_separate_from_runtime_identity(self):
         with tempfile.TemporaryDirectory() as raw:
             root = pathlib.Path(raw)
             config_root = root / ".codex"
@@ -358,6 +379,12 @@ class CodexWarmTests(unittest.TestCase):
             with self.subTest(decision=decision):
                 session = self.make_session(delay=20, ttl=30, cache_result=decision,
                                             extra_args=("--model", "fixture-model"))
+                # Exercise malformed resolver stdout independently of the
+                # native runtime, whose identity is deliberately unsupported.
+                with mock.patch.dict(os.environ, {"FLEET_CACHE_POLICY_HELPER": str(session.root / "cache-policy"), "FLEET_CACHE_POLICY_PATH": str(session.root / "cache-policy.json")}), mock.patch.object(self.module.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, json.dumps(decision), "")):
+                    idle, ttl, resolved = self.module.measured_window("fixture-model")
+                self.assertEqual((idle, ttl), (self.module.IDLE_SECONDS, self.module.TTL_SECONDS))
+                self.assertEqual(resolved["mode"], "fallback")
                 session.stop_and_bind()
                 state = session.read_state()
                 self.assertEqual(state["cache_policy"]["mode"], "fallback")
@@ -365,21 +392,24 @@ class CodexWarmTests(unittest.TestCase):
                 self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
                 session.close()
 
-    def test_cache_policy_change_at_fire_rearms_without_early_compaction(self):
-        session = self.make_session(delay=20, ttl=30, cache_result=self.cache_decision(),
-                                    extra_args=("--model", "fixture-model"))
-        session.stop_and_bind()
-        session.cache_result_path.write_text(json.dumps(self.cache_decision(5, 6)), encoding="utf-8")
-        wait_until(lambda: session.read_state() and
-                   session.read_state()["last_state_transition"] == "policy-refreshed-rearmed", timeout=4)
-        state = session.read_state()
-        self.assertAlmostEqual(state["timer_deadline"] - state["last_normal_stop"], 5, delta=0.1)
-        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
-        calls = [json.loads(line) for line in session.cache_calls.read_text().splitlines()]
-        self.assertGreaterEqual(len(calls), 2)
-        for command in calls:
-            self.assertEqual(command[command.index("--endpoint")+1], "openai-codex-oauth")
-            self.assertNotIn("--allow-observed", command)
+    def test_automatic_action_refreshes_unknown_identity_and_rearms_fallback(self):
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.argv = ["--model", "launch-model"]
+        supervisor.model, supervisor.endpoint = "stale-model", "openai-codex-oauth"
+        supervisor.last_normal_stop = time.time() - 1
+        supervisor.timer_generation = 7
+        supervisor.timer_deadline = supervisor.last_normal_stop + 1
+        supervisor.timer_kind = "compact"
+        supervisor._write_state = mock.Mock()
+        supervisor._gate_reason = mock.Mock(side_effect=AssertionError("must rearm before injection gate"))
+        with mock.patch.object(self.module, "IDLE_SECONDS", 5), mock.patch.object(self.module, "TTL_SECONDS", 6), mock.patch.object(self.module, "write_all") as inject, mock.patch.object(self.module.subprocess, "run", side_effect=AssertionError("unknown identity must not resolve")):
+            self.assertFalse(supervisor.attempt(expected_generation=7))
+        self.assertEqual((supervisor.model, supervisor.endpoint), ("unknown", "unknown"))
+        self.assertEqual(supervisor.cache_policy["mode"], "fallback")
+        self.assertEqual(supervisor.timer_deadline, supervisor.last_normal_stop + 5)
+        self.assertEqual(supervisor.last_state_transition, "policy-refreshed-rearmed")
+        self.assertEqual(supervisor.timer_generation, 8)
+        inject.assert_not_called()
 
     def test_measured_window_defaults_to_supported_endpoint_policy(self):
         """Codex requires supported evidence unless explicitly opted in."""
