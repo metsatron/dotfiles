@@ -90,6 +90,126 @@ class WatcherTests(unittest.TestCase):
     def receipt(self, mid):
         return self.watcher.MAILCORTEX.load_receipt("builder", mid)
 
+    def add_export_seat(self, seat="reviewer"):
+        mailbox = self.root / f"consorts/{seat}"
+        for leaf in ("tmp", "new", "cur"):
+            (mailbox / leaf).mkdir(parents=True)
+        self.registry["seats"][seat] = {
+            "host": "test-host", "mailbox": f"consorts/{seat}", "harness": "claude",
+            "transport": "herdr", "herdr_session": f"{seat}-session",
+            "herdr_target": f"{seat}-agent", "rate_limit_seconds": 0,
+        }
+
+    def seed_export_receipts(self, seat, start):
+        wake_states = ("manual", "observed", "queued", "injecting", "injected", "delivery_unknown")
+        handling_states = ("handling_completed", "handling_deferred",
+                           "handling_rejected", "handling_failed", None, None)
+        for index, (wake_state, handling_state) in enumerate(zip(wake_states, handling_states)):
+            mid = f"<{seat}-{index}@fixture.invalid>"
+            value = {
+                "schema": "mailcortex.receipt.v2", "seat": seat, "message_id": mid,
+                "wake_state": wake_state, "handling_state": handling_state,
+                "subject": "Private subject", "body": "Private body",
+                "sender": "sender@fixture.invalid", "filename": "/private/receipt/path",
+            }
+            if wake_state != "manual":
+                value["wake_updated_at"] = start + index
+            if handling_state is not None:
+                value["handling_updated_at"] = start + index + 0.5
+            self.watcher.MAILCORTEX.atomic_json(
+                self.watcher.MAILCORTEX.receipt_path(seat, mid), value)
+
+    def test_host_seat_state_export_is_exact_private_and_deterministic(self):
+        self.add_export_seat()
+        self.seed_export_receipts("builder", 100)
+        self.seed_export_receipts("reviewer", 200)
+        path = self.watcher.publish_host_seat_state(
+            self.registry, "test-host", now=1000)
+        first = path.read_bytes()
+        self.assertEqual(path, self.root / ".centre/seat-state/test-host.json")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(
+            self.watcher.publish_host_seat_state(
+                self.registry, "test-host", now=1000).read_bytes(), first)
+        payload = json.loads(first)
+        self.assertEqual(payload, {
+            "schema": "mailcortex.host-seat-state.v1",
+            "source_host": "test-host",
+            "generated_at": "1970-01-01T00:16:40Z",
+            "stale_after_seconds": 300,
+            "seats": [
+                {
+                    "source_host": "test-host", "namespace": "seats", "name": "builder",
+                    "harness": "codex", "transport": "herdr",
+                    "wake_counts": {state: 1 for state in (
+                        "delivery_unknown", "injected", "injecting", "manual", "observed", "queued")},
+                    "handling_counts": {
+                        "handling_completed": 1, "handling_deferred": 1,
+                        "handling_failed": 1, "handling_rejected": 1, "unhandled": 2,
+                    },
+                    "newest_transition_at": "1970-01-01T00:01:45Z",
+                },
+                {
+                    "source_host": "test-host", "namespace": "consorts", "name": "reviewer",
+                    "harness": "claude", "transport": "herdr",
+                    "wake_counts": {state: 1 for state in (
+                        "delivery_unknown", "injected", "injecting", "manual", "observed", "queued")},
+                    "handling_counts": {
+                        "handling_completed": 1, "handling_deferred": 1,
+                        "handling_failed": 1, "handling_rejected": 1, "unhandled": 2,
+                    },
+                    "newest_transition_at": "1970-01-01T00:03:25Z",
+                },
+            ],
+        })
+        rendered = first.decode("utf-8")
+        for private in ("message_id", "Private subject", "Private body", "sender@fixture.invalid",
+                        "/private/receipt/path", "<builder-", "<reviewer-", str(self.runtime)):
+            self.assertNotIn(private, rendered)
+
+    def test_host_seat_state_identity_probe_rejects_rewritten_host_and_duplicate_seat(self):
+        payload = self.watcher.build_host_seat_state(self.registry, "test-host", now=1000)
+        rewritten = json.loads(json.dumps(payload))
+        rewritten["source_host"] = "other-host"
+        self.assertEqual(rewritten["seats"], payload["seats"])
+        with self.assertRaisesRegex(self.watcher.WatcherError, "host identity mismatch"):
+            self.watcher.validate_host_seat_state(rewritten, "test-host")
+        duplicated = json.loads(json.dumps(payload))
+        duplicated["seats"].append(dict(duplicated["seats"][0]))
+        with self.assertRaisesRegex(self.watcher.WatcherError, "duplicate seat"):
+            self.watcher.validate_host_seat_state(duplicated, "test-host")
+
+    def test_host_seat_state_rejects_wrong_host_and_symlinked_receipt_tree(self):
+        wrong = json.loads(json.dumps(self.registry))
+        wrong["host"] = "other-host"
+        with self.assertRaisesRegex(self.watcher.WatcherError, "registry.*host"):
+            self.watcher.build_host_seat_state(wrong, "test-host", now=1000)
+        outside = self.base / "outside-receipts"
+        outside.mkdir()
+        self.runtime.mkdir()
+        (self.runtime / "receipts").symlink_to(outside, target_is_directory=True)
+        with self.assertRaisesRegex(self.watcher.WatcherError, "receipt tree.*unsafe"):
+            self.watcher.build_host_seat_state(self.registry, "test-host", now=1000)
+
+    def test_host_seat_state_rejects_invalid_enum_and_malformed_receipt(self):
+        for kind in ("invalid-enum", "malformed"):
+            with self.subTest(kind=kind):
+                runtime = self.base / kind
+                os.environ["MAILCORTEX_RUNTIME"] = str(runtime)
+                mid = f"<{kind}@fixture.invalid>"
+                path = self.watcher.MAILCORTEX.receipt_path("builder", mid)
+                path.parent.mkdir(parents=True)
+                if kind == "invalid-enum":
+                    self.watcher.MAILCORTEX.atomic_json(path, {
+                        "schema": "mailcortex.receipt.v2", "seat": "builder",
+                        "message_id": mid, "wake_state": "unknown",
+                        "handling_state": None, "wake_updated_at": 100,
+                    })
+                else:
+                    path.write_text("{")
+                with self.assertRaisesRegex(self.watcher.WatcherError, "receipt is (invalid|unreadable)"):
+                    self.watcher.build_host_seat_state(self.registry, "test-host", now=1000)
+
     def test_idle_injects_once_and_duplicate_filename_does_not_repeat(self):
         self.mail("<same@node.helm>", "a")
         self.mail("<same@node.helm>", "b")
