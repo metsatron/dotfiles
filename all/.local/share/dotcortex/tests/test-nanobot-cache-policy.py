@@ -227,6 +227,33 @@ class PolicyDecisionTest(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("--endpoint") + 1], "https://other.invalid/v1")
 
+    def test_lossy_url_routes_cannot_arm_another_endpoint(self):
+        for endpoint in ("https://fixture.invalid/Route_A/v1", "https://fixture.invalid/Route/v1",
+                         "https://fixture.invalid/route_a/v1", "https://fixture.invalid/%2Froute/v1",
+                         "https://fixture.invalid/route/v1//"):
+            for initialized in (False, True):
+                with self.subTest(endpoint=endpoint, initialized=initialized):
+                    self.provider._effective_base = endpoint
+                    self.provider._client = None
+                    if initialized:
+                        from openai import AsyncOpenAI
+                        self.provider._client = AsyncOpenAI(api_key="fixture", base_url=endpoint)
+                    wire = str(self.provider._client.base_url) if initialized else endpoint
+                    decision = self.decision | dict(endpoint_id=wire.rstrip("/").lower().replace("_", "-"))
+                    result, run = self.resolve(decision)
+                    self.assertIsNone(result)
+                    run.assert_not_called()
+                    self.assertIsNone(AutoCompact._policy_identity(self.runtime))
+
+    def test_unchanged_lowercase_sdk_route_remains_supported(self):
+        from openai import AsyncOpenAI
+        endpoint = "https://fixture.invalid/route-a/v1"
+        for initialized in (False, True):
+            self.provider._effective_base = endpoint
+            self.provider._client = AsyncOpenAI(api_key="fixture", base_url=endpoint) if initialized else None
+            decision = self.decision | dict(endpoint_id=endpoint)
+            self.assertEqual(self.resolve(decision)[0], 60)
+
     def test_duplicate_keys_fail_closed(self):
         raw = json.dumps(self.decision)[:-1] + ', "mode": "measured"}'
         self.assertIsNone(self.resolve(raw=raw)[0])
