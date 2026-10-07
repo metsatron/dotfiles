@@ -48,6 +48,34 @@ errors retain pending state and an error timestamp; publication retries retain
 ready bytes. Diagnostics do not stop unrelated seats. Skipped automatic mail
 gets an observed receipt with reason =auto_submitted=, never a handling claim.
 
+* Conditional Ductor delivery
+
+The observation-only refusal described above applies to older installations.
+The Ductor adapter now requires =ductor.idle_prompt.v1= from the authenticated
+=/busy= response and speaks the encrypted conditional =idle_message= protocol
+in [[file:agents-ductor-seams.org][agents-ductor-seams.org]]. Its exact target is the configured flat default
+session, verified again during authentication and in the encrypted admission ACK.
+The private =ductor_config= path is unchanged; =api.enabled=, =api.host=,
+=api.port=, =api.token= and =api.chat_id= (or the first provisioned allowed user)
+come from that private file, never public source or an inferred mailbox identity.
+A tokenless, non-loopback, unprovisioned or observation-only API cannot deliver.
+
+Busy observations and exact negative admission ACKs queue the mail. Missing
+input surfaces also queue it and report per-seat errors without stopping other
+seats. A failure after the encrypted prompt is sent is =delivery_unknown= and
+never automatically retried. Mail bytes remain in Maildir; receipts retain the
+existing Message-ID digest and never claim handling completion. Ductor receives
+sender, Message-ID, subject and bounded plain body, without the DeepSeek-only
+promise of automatic mail-back. This lane does not change the XMPP bridge.
+
+The watcher reuses the declared Ductor =aiohttp= and NaCl client dependencies in
+its interpreter. Missing dependencies are a loud queued refusal, not permission
+to install packages. HTTP redirects and environment proxy routing are disabled
+for the bearer-token observation. No stow, seam apply, restart, real test mail or
+live acceptance follows from branch tests; operator approval remains required.
+The WebSocket handshake also rejects HTTP redirects before sending its private
+authentication frame; it never carries that token to a redirected input surface.
+
 * Private wake-lane registry entries
 
 These are private additions to =~/.config/mailcortex/seats.json=; they are
@@ -56,6 +84,9 @@ named Hermes session and sends its =X-Hermes-Session-Key= continuation header.
 Nano's entry is intentionally accepted by schema but refused at delivery until
 Nano exposes an authenticated idle-plus-prompt admission seam.  Ductor's
 existing entry remains a refusal for the non-atomic =/busy= observation.
+
+The conditional seam above enables that same Ductor entry without registry
+changes; older observation-only installations still queue and report refusal.
 
 #+BEGIN_SRC json :tangle no :comments no
 {
@@ -100,6 +131,7 @@ existing entry remains a refusal for the non-atomic =/busy= observation.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import fcntl
 import ipaddress
 import json
@@ -250,6 +282,10 @@ def wake_prompt(record: dict, path: Path, mailback_error: str | None = None) -> 
         return preamble + "\nOpen the mailbox now with: /inbox"
     if record["transport"] in {"hermes", "nanobot"}:
         return preamble + "\nOpen the mailbox now and follow the mail's instructions."
+    if record["transport"] == "ductor":
+        return (preamble + f"Subject: {message.get('Subject', '')}\n\n{body.strip()}\n\n"
+                "MailCortex has delivered the message content here. Use your harness tools "
+                "to handle it and reply. This wake lane does not publish an automatic mail reply.")
     footer = (
         "No mail-back is possible for this message. The return path failed "
         f"validation: {mailback_error}\n"
@@ -583,20 +619,142 @@ class NanobotAdapter:
         self._refuse()
 
 
+class DuctorNotAdmittedError(WatcherError):
+    """An explicit, identity-matched negative acknowledgment: no prompt admitted."""
+
+    def __init__(self, reason: str):
+        self.reason = reason if reason == "busy" else "transport_unavailable"
+        super().__init__(f"Ductor prompt not admitted: {self.reason}")
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
 class DuctorAdapter:
-    """Ductor's /busy observation is not an atomic prompt admission."""
+    """Private config, authoritative observation, then encrypted conditional admission."""
+
+    PROTOCOL = "ductor.idle_prompt.v1"
+
+    def __init__(self, opener=None, client=None):
+        self.opener = opener or urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), NoRedirect()).open
+        self.client = client or self._deliver_idle
+
+    @staticmethod
+    def settings(record: dict) -> dict:
+        try:
+            path = private_file(Path(record["ductor_config"]).expanduser(), "Ductor configuration")
+            config = json.loads(path.read_text(encoding="utf-8"))
+            api = config["api"]
+            if api.get("enabled") is not True or not isinstance(api.get("token"), str) or not api["token"].strip():
+                raise WatcherError("Ductor API is not privately enabled with a token")
+            host, port = api["host"], api["port"]
+            if not isinstance(host, str) or type(port) is not int or not 0 <= port <= 65535:
+                raise WatcherError("Ductor API address is invalid")
+            try:
+                valid_host = ipaddress.ip_address(host).is_loopback
+            except ValueError:
+                valid_host = host.lower() == "localhost"
+            if not valid_host:
+                raise WatcherError("Ductor API is not a loopback address")
+            address = f"[{host}]" if ":" in host else host
+            base = loopback_url(f"http://{address}:{port}", "Ductor API")
+            chat_id = api.get("chat_id")
+            if chat_id in (None, 0) and type(chat_id) is not bool:
+                users = config.get("allowed_user_ids", [])
+                chat_id = users[0] if isinstance(users, list) and users else None
+            if type(chat_id) is not int or chat_id <= 0:
+                raise WatcherError("Ductor default session identity is not provisioned")
+            return {"url": base, "token": api["token"], "session_key": f"tg:{chat_id}"}
+        except WatcherError:
+            raise
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            raise WatcherError("Ductor private configuration is unavailable or invalid") from error
 
     def resolve_idle_pane(self, record: dict) -> str | None:
-        raise WatcherError(
-            "Ductor transport has no safe conditional busy-status injection point; /busy is observational "
-            "and the encrypted WebSocket prompt path cannot claim idle atomically; refusing delivery"
-        )
+        settings = self.settings(record)
+        # Reuse Ductor's declared client dependencies; no ad-hoc installation.
+        try:
+            import aiohttp
+            from ductor_bot.api.crypto import E2ESession
+        except ImportError as error:
+            raise WatcherError("Ductor declared API client dependencies are unavailable") from error
+        request = urllib.request.Request(settings["url"] + "/busy",
+            headers={"Authorization": "Bearer " + settings["token"]}, method="GET")
+        try:
+            with self.opener(request, timeout=15) as response:
+                if response.status != 200:
+                    raise WatcherError("Ductor busy authority refused")
+                value = json.loads(response.read().decode("utf-8"))
+        except WatcherError:
+            raise
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            raise WatcherError("Ductor busy authority unavailable") from error
+        if (not isinstance(value, dict) or value.get("known") is not True
+                or type(value.get("busy")) is not bool
+                or value.get("session_key") != settings["session_key"]
+                or value.get("idle_prompt") != self.PROTOCOL):
+            raise WatcherError("Ductor conditional admission capability or exact idle authority is unavailable")
+        return None if value["busy"] else settings["session_key"]
+
+    async def _deliver_idle(self, settings: dict, target: str, prompt: str) -> None:
+        sent = False
+        try:
+            import aiohttp
+            from ductor_bot.api.crypto import E2ESession
+            request_id = uuid.uuid4().hex
+            e2e = E2ESession()
+            # aiohttp's WebSocket handshake follows HTTP redirects by default and
+            # does not expose allow_redirects. Reject before a redirected connection
+            # could receive the private token in its plaintext authentication frame.
+            trace = aiohttp.TraceConfig()
+            async def refuse_redirect(session, context, params):
+                raise DuctorNotAdmittedError("unavailable")
+            trace.on_request_redirect.append(refuse_redirect)
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15),
+                                             trust_env=False, trace_configs=[trace]) as session:
+                async with session.ws_connect(settings["url"].replace("http://", "ws://", 1) + "/ws") as ws:
+                    await ws.send_json({"type": "auth", "token": settings["token"], "e2e_pk": e2e.local_pk_b64})
+                    auth = await ws.receive_json(timeout=15)
+                    if (not isinstance(auth, dict) or auth.get("type") != "auth_ok"
+                            or type(auth.get("chat_id")) is not int
+                            or f"tg:{auth['chat_id']}" != target or auth.get("channel_id") is not None):
+                        raise DuctorNotAdmittedError("unavailable")
+                    e2e.set_remote_key(auth["e2e_pk"])
+                    frame = e2e.encrypt({"type": "idle_message", "request_id": request_id,
+                        "session_key": target, "text": prompt})
+                    # A failed send may have reached the server. From here onward
+                    # only an exact encrypted negative ACK proves safe retry.
+                    sent = True
+                    await ws.send_str(frame)
+                    raw = await ws.receive(timeout=15)
+                    if raw.type != aiohttp.WSMsgType.TEXT:
+                        raise WatcherError("Ductor admission outcome is unknown")
+                    ack = e2e.decrypt(raw.data)
+                    if (not isinstance(ack, dict) or ack.get("type") != "idle_admission"
+                            or ack.get("request_id") != request_id or ack.get("session_key") != target):
+                        raise WatcherError("Ductor admission outcome is unknown")
+                    if ack.get("status") in {"busy", "unavailable", "invalid"}:
+                        raise DuctorNotAdmittedError(ack["status"])
+                    if ack.get("status") != "accepted":
+                        raise WatcherError("Ductor admission outcome is unknown")
+        except (DuctorNotAdmittedError, WatcherError):
+            raise
+        except Exception as error:
+            if sent:
+                raise WatcherError("Ductor admission outcome is unknown") from error
+            raise DuctorNotAdmittedError("unavailable") from error
 
     def deliver(self, record: dict, target: str, prompt: str) -> None:
-        raise WatcherError(
-            "Ductor transport has no safe conditional busy-status injection point; /busy is observational "
-            "and the encrypted WebSocket prompt path cannot claim idle atomically; refusing delivery"
-        )
+        try:
+            settings = self.settings(record)
+        except WatcherError as error:
+            raise DuctorNotAdmittedError("unavailable") from error
+        if settings["session_key"] != target:
+            raise DuctorNotAdmittedError("unavailable")
+        asyncio.run(self.client(settings, target, prompt))
 
 
 class DeepSeekAdapter:
@@ -853,7 +1011,7 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             try:
                 pane_id = transport_adapter.resolve_idle_pane(record)
             except Exception as error:
-                if record["transport"] != "deepseek":
+                if record["transport"] not in {"deepseek", "ductor"}:
                     raise
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
                                               wake_error=diagnostic(error), wake_updated_at=now)
@@ -885,6 +1043,12 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                                               request_id=request_id)
                 else:
                     transport_adapter.deliver(record, pane_id, wake_prompt(record, path))
+            except DuctorNotAdmittedError as error:
+                MAILCORTEX.write_wake_receipt(
+                    seat, mid, "queued", filename=path.name, pane_id=pane_id,
+                    reason=error.reason, wake_error=diagnostic(error), wake_updated_at=now)
+                report_error(seat, path.name, error)
+                continue
             except HermesSessionNotFoundError as error:
                 MAILCORTEX.write_wake_receipt(
                     seat, mid, "queued", filename=path.name,
@@ -898,7 +1062,7 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                     seat, mid, "delivery_unknown", filename=path.name,
                     pane_id=pane_id, reason="delivery_error", wake_updated_at=now,
                 )
-                if record["transport"] == "deepseek":
+                if record["transport"] in {"deepseek", "ductor"}:
                     report_error(seat, path.name, error)
                     continue
                 if isinstance(error, WatcherError):
@@ -918,7 +1082,7 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
         try:
             count += scan_seats({"seats": {seat: record}}, adapter, now=now)
         except Exception as error:
-            if record.get("transport") != "deepseek":
+            if record.get("transport") not in {"deepseek", "ductor"}:
                 raise
             report_error(seat, "scan", error)
     return count
