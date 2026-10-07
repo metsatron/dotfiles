@@ -120,6 +120,17 @@ endpoint, account identity, or credential."
   "Minimum Codex-native current context usage before idle compaction."
   :type 'integer :group 'metsatron-idle-compaction)
 
+(defcustom metsatron-cache-policy-helper
+  (expand-file-name "HelmCortex/FORGE/bin/cache-policy" "~")
+  "Fleet cache-policy resolver executable."
+  :type 'file :group 'metsatron-idle-compaction)
+
+(defcustom metsatron-cache-policy-path
+  (expand-file-name
+   "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json" "~")
+  "Published endpoint/model cache-policy artifact."
+  :type 'file :group 'metsatron-idle-compaction)
+
 ;; Compatibility note: Codex 0.146.0 does not expose the ChatGPT backend's
 ;; selected prompt-cache retention policy.  The governor therefore speaks only
 ;; of a presumed warm-cache budget and records its source/confidence explicitly.
@@ -164,6 +175,51 @@ FORMAT-STRING and ARGS must not contain prompt or authentication data."
 (defun metsatron/idle-compaction--cancel-timer (timer)
   "Cancel TIMER when it is a live Emacs timer."
   (when (timerp timer) (cancel-timer timer)))
+
+(defun metsatron/idle-compaction--measured-window
+    (harness provider endpoint model fallback-delay fallback-cache)
+  "Resolve measured cache policy or return FALLBACK-DELAY/FALLBACK-CACHE.
+The external resolver owns freshness, support, and cross-harness endpoint
+matching.  No shell is involved and failures preserve the caller's fallback."
+  (let ((fallback (list fallback-delay fallback-cache nil)))
+    (if (or (not (stringp model)) (string-empty-p model)
+            (not (file-executable-p metsatron-cache-policy-helper))
+            (not (file-readable-p metsatron-cache-policy-path)))
+        fallback
+      (condition-case nil
+          (with-temp-buffer
+            (let ((status
+                   (call-process
+                    metsatron-cache-policy-helper nil t nil
+                    "resolve" "--policy" metsatron-cache-policy-path
+                    "--harness" harness "--provider" provider
+                    "--endpoint" endpoint "--model" model
+                    "--fallback-compact" (number-to-string fallback-delay)
+                    "--fallback-cache" (number-to-string fallback-cache))))
+              (if (not (equal status 0))
+                  fallback
+                (let ((decision
+                       (json-parse-buffer :object-type 'plist
+                                          :array-type 'list
+                                          :null-object nil
+                                          :false-object nil)))
+                  (list (plist-get decision :compact_before_seconds)
+                        (plist-get decision :cache_expires_seconds)
+                        decision)))))
+        (error fallback)))))
+
+(defun metsatron/idle-compaction--process-model (process)
+  "Return an explicit --model value from PROCESS, when present."
+  (when (processp process)
+    (let ((args (process-command process)) found)
+      (while args
+        (let ((arg (pop args)))
+          (cond
+           ((and (member arg '("--model" "-m")) args)
+            (setq found (car args) args nil))
+           ((string-prefix-p "--model=" arg)
+            (setq found (substring arg (length "--model=")) args nil)))))
+      found)))
 
 (defun metsatron/claude-idle-compact--effective-profile (&optional profile)
   "Resolve PROFILE to `long' or `short'.
@@ -267,13 +323,21 @@ Fail closed when the installed vterm does not expose its input accessor."
            (session-id (plist-get state :session-id))
            (completed-at (plist-get state :last-normal-turn-completed-at))
            (profile (metsatron/claude-idle-compact--state-profile state))
-           (delay (car (metsatron/claude-idle-compact--profile-values profile)))
+           (fallback (metsatron/claude-idle-compact--profile-values profile))
+           (window (metsatron/idle-compaction--measured-window
+                    "claude" "anthropic" "anthropic-default"
+                    (metsatron/idle-compaction--process-model
+                     (plist-get state :process))
+                    (car fallback) (cadr fallback)))
+           (delay (car window))
            (generation (1+ (or (plist-get state :timer-generation) 0)))
            (timer (run-at-time delay nil
                                #'metsatron/claude-idle-compact--timer-fired
                                channel session-id completed-at generation)))
       (metsatron/idle-compaction--cancel-timer (plist-get state :timer))
       (setq state (plist-put state :effective-profile profile))
+      (setq state (plist-put state :measured-cache-ttl-seconds (cadr window)))
+      (setq state (plist-put state :cache-policy-decision (caddr window)))
       (setq state (plist-put state :timer-generation generation))
       (setq state (plist-put state :timer timer))
       (puthash channel state metsatron/claude-idle-compact--sessions)
@@ -298,7 +362,8 @@ Fail closed when the installed vterm does not expose its input accessor."
          (process (plist-get state :process))
          (completion (plist-get state :last-normal-turn-completed-at))
          (profile (metsatron/claude-idle-compact--state-profile state))
-         (ttl (cadr (metsatron/claude-idle-compact--profile-values profile)))
+         (ttl (or (plist-get state :measured-cache-ttl-seconds)
+                  (cadr (metsatron/claude-idle-compact--profile-values profile))))
          (elapsed (and completion (- (metsatron/idle-compaction--now) completion)))
          (snapshot (and (buffer-live-p buffer)
                         (process-live-p process)
@@ -541,20 +606,28 @@ CONFIGURED is the requested delay; the result is nil when WARM is unusable."
 
 (defun metsatron/codex-idle-compact--state-warm-seconds (state)
   "Return STATE's presumed warm-cache budget, or nil when disabled."
-  (let ((policy (metsatron/codex-idle-compact--state-policy state)))
-    (if (plist-get state :policy-local)
-        (plist-get state :presumed-warm-seconds)
-      (metsatron/codex-idle-compact--global-warm-seconds policy))))
+  (let ((policy (metsatron/codex-idle-compact--state-policy state))
+        (decision (plist-get state :cache-policy-decision)))
+    (cond
+     ((plist-get state :policy-local)
+      (plist-get state :presumed-warm-seconds))
+     ((equal (plist-get decision :mode) "measured")
+      (plist-get decision :cache_expires_seconds))
+     (t (metsatron/codex-idle-compact--global-warm-seconds policy)))))
 
 (defun metsatron/codex-idle-compact--state-delay-seconds (state)
   "Return STATE's actual idle-compaction delay in seconds."
-  (metsatron/codex-idle-compact--delay-for-warm
-   (metsatron/codex-idle-compact--state-warm-seconds state)
-   (if (plist-get state :policy-local)
-       (plist-get state :idle-compaction-delay-seconds)
-     (and (eq (metsatron/codex-idle-compact--state-policy state) 'custom)
-          (or (plist-get state :idle-compaction-delay-seconds)
-              codex-custom-idle-compact-seconds)))))
+  (let ((decision (plist-get state :cache-policy-decision)))
+    (if (and (not (plist-get state :policy-local))
+             (equal (plist-get decision :mode) "measured"))
+        (plist-get decision :compact_before_seconds)
+      (metsatron/codex-idle-compact--delay-for-warm
+       (metsatron/codex-idle-compact--state-warm-seconds state)
+       (if (plist-get state :policy-local)
+           (plist-get state :idle-compaction-delay-seconds)
+         (and (eq (metsatron/codex-idle-compact--state-policy state) 'custom)
+              (or (plist-get state :idle-compaction-delay-seconds)
+                  codex-custom-idle-compact-seconds)))))))
 
 (defun metsatron/codex-idle-compact--policy-source (policy)
   "Return the source label for global POLICY."
@@ -572,17 +645,23 @@ CONFIGURED is the requested delay; the result is nil when WARM is unusable."
 
 (defun metsatron/codex-idle-compact--state-source (state)
   "Return STATE's cache-policy source label."
-  (or (and (plist-get state :policy-local)
-           (plist-get state :cache-policy-source))
-      (metsatron/codex-idle-compact--policy-source
-       (metsatron/codex-idle-compact--state-policy state))))
+  (let ((decision (plist-get state :cache-policy-decision)))
+    (if (equal (plist-get decision :mode) "measured")
+        "measured endpoint/model cache-policy.v1"
+      (or (and (plist-get state :policy-local)
+               (plist-get state :cache-policy-source))
+          (metsatron/codex-idle-compact--policy-source
+           (metsatron/codex-idle-compact--state-policy state))))))
 
 (defun metsatron/codex-idle-compact--state-confidence (state)
   "Return STATE's cache-policy confidence label."
-  (or (and (plist-get state :policy-local)
-           (plist-get state :cache-policy-confidence))
-      (metsatron/codex-idle-compact--policy-confidence
-       (metsatron/codex-idle-compact--state-policy state))))
+  (let ((decision (plist-get state :cache-policy-decision)))
+    (if (equal (plist-get decision :mode) "measured")
+        (or (plist-get decision :confidence) "supported")
+      (or (and (plist-get state :policy-local)
+               (plist-get state :cache-policy-confidence))
+          (metsatron/codex-idle-compact--policy-confidence
+           (metsatron/codex-idle-compact--state-policy state))))))
 
 (defun metsatron/codex-idle-compact--all-sessions ()
   "Return the owning client's currently tracked Codex sessions."
@@ -766,8 +845,18 @@ re-arm the governor."
   "Arm one Codex idle timer for SESSION when it is eligible to wait."
   (when-let ((state (metsatron/codex-idle-compact--state session)))
     (let* ((policy (metsatron/codex-idle-compact--state-policy state))
-           (warm (metsatron/codex-idle-compact--state-warm-seconds state))
-           (delay (metsatron/codex-idle-compact--state-delay-seconds state)))
+           (fallback-warm (metsatron/codex-idle-compact--state-warm-seconds state))
+           (fallback-delay (metsatron/codex-idle-compact--state-delay-seconds state))
+           (model (or (plist-get state :raw-model)
+                      (and (fboundp 'codex-ide--session-metadata-get)
+                           (codex-ide--session-metadata-get session :model-name))))
+           (window (if (or (eq policy 'disabled) (plist-get state :policy-local))
+                       (list fallback-delay fallback-warm nil)
+                     (metsatron/idle-compaction--measured-window
+                      "codex" "openai" "openai-codex-oauth" model
+                      fallback-delay fallback-warm)))
+           (delay (car window))
+           (warm (cadr window)))
       (when (and metsatron-idle-compaction-enabled
                  (not (eq policy 'disabled))
                  (plist-get state :enabled)
@@ -788,6 +877,9 @@ re-arm the governor."
           (metsatron/idle-compaction--cancel-timer (plist-get state :timer))
           (setq state (plist-put state :timer-generation generation))
           (setq state (plist-put state :timer timer))
+          (setq state (plist-put state :cache-policy-decision (caddr window)))
+          (setq state (plist-put state :idle-compaction-delay-seconds delay))
+          (setq state (plist-put state :presumed-warm-seconds warm))
           (codex-ide--session-metadata-put
            session metsatron/codex-idle-compact--metadata-key state)
           (metsatron/idle-compaction--log
