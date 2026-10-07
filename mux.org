@@ -109,10 +109,11 @@ set -g @plugin 'tmux-plugins/tmux-yank'
 set -g @resurrect-capture-pane-contents 'on'
 set -g @resurrect-strategy-nvim 'session'
 set -g @resurrect-strategy-vim 'session'
-# Claude bot lifecycle belongs to Nurse Joy, not tmux-resurrect. Restoring a
-# captured claude-warm command loses wrapper-owned identity state and can mint a
-# fresh session when the captured command has no --resume. Resurrect restores
-# the seats; tmux-boot-restore revives the agents through their canonical owner.
+# Claude bot lifecycle belongs to tmux-boot-restore, not tmux-resurrect.
+# Restoring a captured claude-warm command loses wrapper-owned identity state
+# and can mint a fresh session when the captured command has no --resume.
+# Resurrect restores the seats; tmux-boot-restore launches Fable through its
+# full claude-fable wrapper and delegates the other Claude seats to Nurse Joy.
 set -g @resurrect-processes 'ssh btop htop nvim vim man less tail top watch opencode ~codex->codex'
 set -g @resurrect-dir '~/.local/share/tmux/resurrect'
 set -g @resurrect-hook-post-restore-all 'run-shell ~/.config/tmux/resurrect-post-restore.sh'
@@ -228,9 +229,83 @@ fi
 echo "Done."
 #+END_SRC
 
+** Fable boot launcher
+
+The Fable seat is the one Claude bot whose boot contract includes Telegram,
+MailCortex and Remote Control together. This helper is called only by
+=tmux-boot-restore= after resurrect has restored the =Fable= seat. It reads
+the durable labelled record written by =claude-warm= at launch/exit, so the
+command cannot inherit a stale session id from a resurrected pane. It sends
+the command through the wrapper into the restored shell; it does not become a
+second lifecycle owner.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/tmux-fable-launch :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+set -euo pipefail
+
+STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-idle-compaction"
+BOT_SESSION="${TMUX_FABLE_SESSION:-Fable}"
+RECORD="$STATE_ROOT/last-session.Fable.json"
+
+case "${1:-}" in
+  --latest) ;;
+  -h|--help)
+    echo "Usage: tmux-fable-launch --latest"
+    exit 0
+    ;;
+  *)
+    echo "tmux-fable-launch: only --latest is supported" >&2
+    exit 2
+    ;;
+esac
+
+[ -r "$RECORD" ] || { echo "tmux-fable-launch: missing $RECORD" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "tmux-fable-launch: python3 unavailable" >&2; exit 1; }
+session_id="$(python3 - "$RECORD" <<'PY'
+import json
+import re
+import sys
+
+try:
+    value = json.load(open(sys.argv[1], encoding="utf-8")).get("session_id", "")
+except (OSError, ValueError, TypeError):
+    raise SystemExit(1)
+if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", str(value)):
+    raise SystemExit(1)
+print(value)
+PY
+)" || { echo "tmux-fable-launch: invalid latest Fable session record" >&2; exit 1; }
+
+command -v tmux >/dev/null 2>&1 || { echo "tmux-fable-launch: tmux unavailable" >&2; exit 1; }
+command -v claude-fable >/dev/null 2>&1 || { echo "tmux-fable-launch: claude-fable unavailable" >&2; exit 1; }
+pane=""
+for _ in $(seq 1 30); do
+  pane="$(tmux list-panes -t "$BOT_SESSION" -F '#{pane_id}' 2>/dev/null | sed -n '1p')"
+  [ -n "$pane" ] && break
+  sleep 2
+done
+[ -n "$pane" ] || { echo "tmux-fable-launch: no pane in $BOT_SESSION" >&2; exit 1; }
+
+pane_command=""
+for _ in $(seq 1 30); do
+  pane_command="$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null || true)"
+  case "$pane_command" in
+    bash|zsh|sh|dash|fish|-bash|-zsh|-sh|-dash|-fish) break ;;
+  esac
+  sleep 2
+done
+case "$pane_command" in
+  bash|zsh|sh|dash|fish|-bash|-zsh|-sh|-dash|-fish) ;;
+  *) echo "tmux-fable-launch: Fable pane is not at a shell: $pane_command" >&2; exit 1 ;;
+esac
+
+command_line="claude-fable --telegram --mailcortex --remote --resume $session_id"
+echo "tmux-fable-launch: $BOT_SESSION/$pane <- $command_line"
+tmux send-keys -t "$pane" C-u "$command_line" Enter
+#+END_SRC
+
 ** Tmux boot restore
 
-On systemd hosts, tmux-continuum's =@continuum-boot 'on'= starts a tmux server at boot via a user service, which fires the continuum restore. This fleet is sysvinit/OpenRC, so there is no such service and NOTHING starts a tmux server at boot — meaning continuum never restores and the Claude tmux bots (Fable/Auryn/Opus/Haiku) stay dead after a cold reboot even though =@continuum-restore= is on and a valid save exists (the 2026-09-19 incident: forced reboot, host bots up, all four Claude bots down). This lane is the missing boot trigger: a headless =@reboot= hook waits for the complete local bootstrap and network substrate, starts the tmux server, and lets continuum recreate the four saved seats. Claude processes are deliberately excluded from tmux-resurrect's process replay: after all four seats exist, the hook calls the canonical Nurse Joy lifecycle owner with each bot's durable labelled session ID. That preserves wrapper-owned identity/channel state and prevents a captured command without =--resume= from silently minting a fresh session. The bare-boot PATH includes Bun because the official Telegram channel plugin launches through =bun=; =CLAUDE_IDLE_REAL_EXECUTABLE= still pins the Claude binary independently of shell startup.
+On systemd hosts, tmux-continuum's =@continuum-boot 'on'= starts a tmux server at boot via a user service, which fires the continuum restore. This fleet is sysvinit/OpenRC, so there is no such service and NOTHING starts a tmux server at boot — meaning continuum never restores and the Claude tmux bots (Fable/Auryn/Opus/Haiku) stay dead after a cold reboot even though =@continuum-restore= is on and a valid save exists (the 2026-09-19 incident: forced reboot, host bots up, all four Claude bots down). This lane is the missing boot trigger: a headless =@reboot= hook waits for the complete local bootstrap and network substrate, starts the tmux server, and lets continuum recreate the four saved seats. Claude processes are deliberately excluded from tmux-resurrect's process replay: after all four seats exist, this single boot owner launches Fable through =claude-fable --telegram --mailcortex --remote= using its latest durable labelled session, then delegates Auryn, Haiku and Opus to Nurse Joy with their durable labelled session IDs. That preserves wrapper-owned identity/channel state and prevents a captured command without =--resume= from silently minting a fresh session. The bare-boot PATH includes Bun because the official Telegram channel plugin launches through =bun=; =CLAUDE_IDLE_REAL_EXECUTABLE= still pins the Claude binary independently of shell startup.
 
 #+BEGIN_SRC bash :tangle all/.local/bin/tmux-boot-restore :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
 set -uo pipefail
@@ -239,7 +314,9 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 LOG="${XDG_STATE_HOME:-$HOME/.local/state}/tmux-boot-restore.log"
 STATE_ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/claude-idle-compaction"
 NURSE_JOY="$HOME/HelmCortex/FORGE/bin/nurse-joy"
+FABLE_LAUNCHER="$HOME/.local/bin/tmux-fable-launch"
 BOT_NAMES="Auryn Fable Haiku Opus"
+OTHER_BOT_NAMES="Auryn Haiku Opus"
 mkdir -p "$(dirname "$LOG")"
 exec >>"$LOG" 2>&1
 echo "$(date -Is) tmux-boot-restore: start"
@@ -287,8 +364,10 @@ for _ in $(seq 1 90); do
     && command -v python3 >/dev/null 2>&1 \
     && command -v getent >/dev/null 2>&1 \
     && command -v curl >/dev/null 2>&1 \
+    && command -v claude-fable >/dev/null 2>&1 \
     && [ -x "${CLAUDE_IDLE_REAL_EXECUTABLE:-}" ] \
     && [ -x "$NURSE_JOY" ] \
+    && [ -x "$FABLE_LAUNCHER" ] \
     && network_ready; then
       break
   fi
@@ -298,6 +377,7 @@ command -v tmux >/dev/null 2>&1 || { echo "$(date -Is) bootstrap failed: tmux un
 command -v bun >/dev/null 2>&1 || { echo "$(date -Is) bootstrap failed: bun unavailable"; exit 1; }
 [ -x "${CLAUDE_IDLE_REAL_EXECUTABLE:-}" ] || { echo "$(date -Is) bootstrap failed: Claude executable unavailable"; exit 1; }
 [ -x "$NURSE_JOY" ] || { echo "$(date -Is) bootstrap failed: Nurse Joy unavailable"; exit 1; }
+[ -x "$FABLE_LAUNCHER" ] || { echo "$(date -Is) bootstrap failed: Fable launcher unavailable"; exit 1; }
 network_ready || { echo "$(date -Is) bootstrap failed: network endpoints unavailable"; exit 1; }
 
 # Never clobber a live tree. Existing restored seats still need Nurse Joy to
@@ -332,7 +412,13 @@ done
 all_bot_sessions_present || { echo "$(date -Is) restore failed: not all Claude seats exist"; exit 1; }
 
 result=0
-for bot in $BOT_NAMES; do
+if "$FABLE_LAUNCHER" --latest; then
+  echo "$(date -Is) Fable revive: latest durable session launched through claude-fable"
+else
+  echo "$(date -Is) Fable revive failed: tmux-fable-launch" >&2
+  result=1
+fi
+for bot in $OTHER_BOT_NAMES; do
   session_id="$(durable_session_id "$bot" 2>/dev/null || true)"
   if [ -z "$session_id" ]; then
     echo "$(date -Is) $bot revive refused: no valid durable session id"
@@ -395,8 +481,9 @@ trap 'rm -f "$TMP"' EXIT
 cat >"$TMP" <<EOF
 # DotCortex tmux boot restore; managed by $TAG.
 # Sysvinit/OpenRC has no continuum-boot service, so nothing starts a tmux server
-# at boot; this @reboot hook restores the seats and Nurse Joy revives the four
-# Claude agents from their durable session records after readiness gates pass.
+# at boot; this @reboot hook restores the seats, launches Fable through
+# claude-fable, and lets Nurse Joy revive the other Claude agents from their
+# durable session records after readiness gates pass.
 @reboot ${USER_NAME} HOME=${TARGET_HOME} PATH=${TARGET_HOME}/.bun/bin:${TARGET_HOME}/.guix-extra-profiles/core/core/bin:${TARGET_HOME}/HelmCortex/FORGE/bin:${TARGET_HOME}/.local/bin:${TARGET_HOME}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin XDG_RUNTIME_DIR=/run/user/${USER_ID} CLAUDE_IDLE_REAL_EXECUTABLE=${TARGET_HOME}/.npm-global/bin/claude ${HOOK}
 EOF
 
@@ -411,7 +498,12 @@ fi
 ** Tmux boot restore regression tests
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-tmux-boot-restore.py :comments no
 #!/usr/bin/env python3
+import json
+import os
 import pathlib
+import stat
+import subprocess
+import tempfile
 import unittest
 
 
@@ -420,6 +512,9 @@ SOURCE = (REPO / "mux.org").read_text(encoding="utf-8")
 TMUX_BEHAVIOR = (REPO / "all/.config/tmux/behavior.conf").read_text(encoding="utf-8")
 BOOT = (REPO / "all/.local/bin/tmux-boot-restore").read_text(encoding="utf-8")
 CRON_APPLY = (REPO / "all/.local/bin/tmux-boot-restore-cron-apply").read_text(encoding="utf-8")
+FABLE_LAUNCHER = REPO / "all/.local/bin/tmux-fable-launch"
+TELEGRAM_BOOT = (REPO / "all/.local/bin/telegram-agent-boot").read_text(encoding="utf-8")
+TELEGRAM_HOSTS = (REPO / "all/.bots/hosts.conf").read_text(encoding="utf-8")
 
 
 class TmuxBootRestoreContract(unittest.TestCase):
@@ -443,6 +538,66 @@ class TmuxBootRestoreContract(unittest.TestCase):
         self.assertIn('"$NURSE_JOY" revive "$bot" --resume "$session_id" --no-visit', BOOT)
         self.assertIn("all four Claude Telegram agents ready", BOOT)
 
+    def test_fable_fixture_launches_latest_session_through_wrapper(self):
+        latest = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        with tempfile.TemporaryDirectory() as temp:
+            root = pathlib.Path(temp)
+            state = root / "state" / "claude-idle-compaction"
+            state.mkdir(parents=True)
+            (state / "last-session.Fable.json").write_text(
+                json.dumps({"session_id": latest}) + "\n", encoding="utf-8"
+            )
+            fake_bin = root / "bin"
+            fake_bin.mkdir()
+            fake_tmux = fake_bin / "tmux"
+            fake_tmux.write_text(
+                "#!/usr/bin/env bash\n"
+                "case \"$1\" in\n"
+                "  list-panes) printf '%s\\n' '%2' ;;\n"
+                "  display-message) printf '%s\\n' 'bash' ;;\n"
+                "  send-keys) printf '%s\\n' \"$*\" >> \"$TMUX_FIXTURE_LOG\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            fake_claude = fake_bin / "claude-fable"
+            fake_claude.write_text("#!/usr/bin/env bash\nexit 0\n", encoding="utf-8")
+            for executable in (fake_tmux, fake_claude):
+                executable.chmod(executable.stat().st_mode | stat.S_IXUSR)
+            calls = root / "calls"
+            env = os.environ.copy()
+            env.update({
+                "HOME": str(root),
+                "XDG_STATE_HOME": str(root / "state"),
+                "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+                "TMUX_FIXTURE_LOG": str(calls),
+            })
+            result = subprocess.run(
+                [str(FABLE_LAUNCHER), "--latest"],
+                text=True,
+                capture_output=True,
+                env=env,
+                timeout=10,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(
+                f"claude-fable --telegram --mailcortex --remote --resume {latest}",
+                calls.read_text(encoding="utf-8"),
+            )
+
+    def test_fable_is_single_owner_other_seats_keep_nurse_joy(self):
+        self.assertIn('FABLE_LAUNCHER="$HOME/.local/bin/tmux-fable-launch"', BOOT)
+        self.assertIn('"$FABLE_LAUNCHER" --latest', BOOT)
+        self.assertIn('OTHER_BOT_NAMES="Auryn Haiku Opus"', BOOT)
+        self.assertNotIn('"$NURSE_JOY" revive "Fable"', BOOT)
+        for bot in ("Auryn", "Haiku", "Opus"):
+            self.assertIn(f'"$NURSE_JOY" revive "$bot" --resume "$session_id" --no-visit', BOOT)
+
+    def test_telegram_boot_owner_does_not_start_fable(self):
+        self.assertIn('enabled="$($MANAGER enabled)"', TELEGRAM_BOOT)
+        self.assertNotIn("claude-fable", TELEGRAM_BOOT)
+        self.assertNotIn("fable", TELEGRAM_HOSTS.casefold())
+
     def test_network_and_runtime_dependencies_gate_revival(self):
         for requirement in (
             "command -v bun",
@@ -455,7 +610,7 @@ class TmuxBootRestoreContract(unittest.TestCase):
 
     def test_source_owns_the_generated_contract(self):
         for marker in (
-            "Claude bot lifecycle belongs to Nurse Joy",
+            "Claude bot lifecycle belongs to tmux-boot-restore",
             "PATH=${TARGET_HOME}/.bun/bin:",
             "restore confirmed: all four Claude Telegram agents ready",
         ):
