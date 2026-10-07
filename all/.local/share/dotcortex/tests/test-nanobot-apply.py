@@ -12,6 +12,9 @@ import unittest
 
 REPO = Path(os.environ["NANOBOT_TEST_REPO"]) if "NANOBOT_TEST_REPO" in os.environ else Path(__file__).resolve().parents[5]
 ARCHIVE = Path(os.environ["NANOBOT_TEST_ARCHIVE"])
+PYTHON = sys.executable or shutil.which("python3")
+if not PYTHON:
+    raise RuntimeError("python3 interpreter path is unavailable")
 APPLY = REPO / "linux/.local/bin/nanobot-apply"
 HEALTH = REPO / "linux/.local/bin/nanobot-health"
 MANAGED = ("agent/autocompact.py", "channels/telegram/runtime.py", "agent/tools/execution.py",
@@ -62,7 +65,7 @@ class ApplyTest(unittest.TestCase):
             self.native[name]=p.read_bytes()
         bindir=self.venv / "bin";bindir.mkdir()
         python=bindir / "python"
-        python.write_text('#!'+sys.executable+'\nimport os,sys,json\nfrom pathlib import Path\n'
+        python.write_text('#!'+PYTHON+'\nimport os,sys,json\nfrom pathlib import Path\n'
             'if len(sys.argv)>2 and sys.argv[1]=="-c" and "site.getsitepackages" in sys.argv[2]:\n'
             ' if os.environ.get("FIXTURE_DRIFT_INPUT"): Path(os.environ["FIXTURE_DRIFT_INPUT"]).write_text("drift")\n'
             ' print(json.dumps([os.environ["FIXTURE_SITE"],"0.3.5"]))\n'
@@ -71,7 +74,7 @@ class ApplyTest(unittest.TestCase):
         cli=bindir / "nanobot";cli.write_text('#!/bin/sh\necho "forbidden native initialization" >&2\nexit 99\n');cli.chmod(0o755)
         home=self.root / "home"; tools=home / ".local/bin";tools.mkdir(parents=True)
         uv=tools / "uv"
-        uv.write_text('#!'+sys.executable+'\nimport os,sys,json,shutil\nfrom pathlib import Path\n'
+        uv.write_text('#!'+PYTHON+'\nimport os,sys,json,shutil\nfrom pathlib import Path\n'
             'with Path(os.environ["FIXTURE_INSTALLER_LOG"]).open("a") as log: log.write(json.dumps(sys.argv[1:])+"\\n")\n'
             'if os.environ.get("FIXTURE_INSTALLER_FAIL"): raise SystemExit(31)\n'
             'if sys.argv[1:3]==["pip","install"]:\n'
