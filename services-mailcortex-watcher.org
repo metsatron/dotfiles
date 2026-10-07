@@ -29,6 +29,16 @@ deliveries remain queued and are replayed on the next scan; an injection
 already started is never retried automatically because its delivery outcome
 may be ambiguous.
 
+After each complete scan, the owning host publishes one private, atomic
+=mailcortex.host-seat-state.v1= snapshot below
+=~/Mail/.centre/seat-state/<host>.json=.  It consumes the existing receipt-v2
+identity and enums, aggregates every allowed wake and handling state per
+registry-bound seat, and includes only host/seat category and freshness.  Raw
+receipts, Message-IDs, mail fields, transport targets and filesystem paths are
+never serialized.  A wrong host, duplicate seat, unsafe receipt tree, malformed
+receipt or unknown enum aborts publication and leaves the previous snapshot in
+place.
+
 DeepSeek mail-back correlates the persisted prompt request ID with durable
 =user/message= and =turn/end= events. Only a completed, single-request turn's
 last committed assistant text is returned to the original From address, with
@@ -135,6 +145,7 @@ import asyncio
 import fcntl
 import ipaddress
 import json
+import math
 import os
 import re
 import socket
@@ -166,6 +177,11 @@ SPEC.loader.exec_module(MAILCORTEX)
 SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
 TRANSPORTS = {"herdr", "hermes", "nanobot", "ductor", "deepseek"}
+HARNESSES = {"claude", "codex", "hermes", "nanobot", "ductor", "deepseek"}
+HOST_SEAT_STATE_SCHEMA = "mailcortex.host-seat-state.v1"
+HOST_SEAT_STATE_STALE_AFTER_SECONDS = 300
+WAKE_COUNT_STATES = tuple(sorted(MAILCORTEX.WAKE_STATES))
+HANDLING_COUNT_STATES = tuple(sorted(MAILCORTEX.HANDLING_STATES)) + ("unhandled",)
 
 
 class WatcherError(Exception):
@@ -181,6 +197,8 @@ class HermesSessionNotFoundError(WatcherError):
 
 
 def load_registry(path: Path, host: str) -> dict:
+    if not isinstance(host, str) or not SAFE.fullmatch(host):
+        raise WatcherError("registry host is invalid")
     if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
         raise WatcherError("registry is not a private regular file")
     try:
@@ -246,6 +264,202 @@ def load_registry(path: Path, host: str) -> dict:
         if not isinstance(record["rate_limit_seconds"], (int, float)) or record["rate_limit_seconds"] < 0 or record["rate_limit_seconds"] > 86400:
             raise WatcherError("invalid rate limit")
     return data
+
+
+def iso_timestamp(value: object, label: str) -> str:
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise WatcherError(f"{label} is invalid")
+    try:
+        return datetime.fromtimestamp(value, timezone.utc).isoformat().replace("+00:00", "Z")
+    except (OverflowError, OSError, ValueError) as error:
+        raise WatcherError(f"{label} is invalid") from error
+
+
+def validate_timestamp(value: object, label: str) -> None:
+    if not isinstance(value, str) or not value.endswith("Z"):
+        raise WatcherError(f"{label} is invalid")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise WatcherError(f"{label} is invalid") from error
+    if iso_timestamp(parsed.timestamp(), label) != value:
+        raise WatcherError(f"{label} is invalid")
+
+
+def receipt_rows(seat: str) -> list[dict]:
+    runtime = MAILCORTEX.runtime_root()
+    tree = runtime / "receipts"
+    directory = tree / seat
+    for path in (runtime, tree, directory):
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise WatcherError("receipt tree is unsafe")
+    if not directory.exists():
+        return []
+    rows = []
+    for path in sorted(directory.iterdir(), key=lambda candidate: candidate.name):
+        if path.is_symlink() or not path.is_file() or path.suffix != ".json":
+            raise WatcherError("receipt is invalid")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise WatcherError("receipt is unreadable") from error
+        required = {"schema", "seat", "message_id", "wake_state", "handling_state"}
+        if (not isinstance(raw, dict) or not required <= set(raw)
+                or not isinstance(raw.get("message_id"), str)):
+            raise WatcherError("receipt is invalid")
+        try:
+            expected = MAILCORTEX.receipt_path(seat, raw["message_id"])
+            receipt = MAILCORTEX.load_receipt(seat, raw["message_id"])
+        except MAILCORTEX.MailCortexError as error:
+            raise WatcherError(str(error)) from error
+        if path != expected or receipt is None or receipt != raw:
+            raise WatcherError("receipt identity mismatch")
+        rows.append(receipt)
+    return rows
+
+
+def seat_state_row(seat: str, record: dict, host: str) -> dict:
+    wake_counts = {state: 0 for state in WAKE_COUNT_STATES}
+    handling_counts = {state: 0 for state in HANDLING_COUNT_STATES}
+    newest = None
+    for receipt in receipt_rows(seat):
+        wake_state = receipt["wake_state"]
+        handling_state = receipt["handling_state"]
+        wake_counts[wake_state] += 1
+        handling_counts[handling_state or "unhandled"] += 1
+        transitions = []
+        if wake_state != "manual" or "wake_updated_at" in receipt:
+            wake_updated_at = receipt.get("wake_updated_at")
+            iso_timestamp(wake_updated_at, "receipt wake timestamp")
+            transitions.append(wake_updated_at)
+        if handling_state is not None or "handling_updated_at" in receipt:
+            handling_updated_at = receipt.get("handling_updated_at")
+            iso_timestamp(handling_updated_at, "receipt handling timestamp")
+            transitions.append(handling_updated_at)
+        if not transitions:
+            raise WatcherError("receipt transition timestamp is invalid")
+        candidate = max(transitions)
+        newest = candidate if newest is None else max(newest, candidate)
+    namespace = record["mailbox"].split("/", 1)[0]
+    return {
+        "source_host": host,
+        "namespace": namespace,
+        "name": seat,
+        "harness": record["harness"],
+        "transport": record["transport"],
+        "wake_counts": wake_counts,
+        "handling_counts": handling_counts,
+        "newest_transition_at": (None if newest is None
+                                 else iso_timestamp(newest, "seat transition timestamp")),
+    }
+
+
+def validate_host_seat_state(value: object, expected_host: str) -> dict:
+    top_fields = {"schema", "source_host", "generated_at", "stale_after_seconds", "seats"}
+    if not isinstance(value, dict) or set(value) != top_fields:
+        raise WatcherError("host seat-state export is invalid")
+    if (value["schema"] != HOST_SEAT_STATE_SCHEMA
+            or value["source_host"] != expected_host
+            or not isinstance(expected_host, str) or not SAFE.fullmatch(expected_host)):
+        raise WatcherError("host identity mismatch")
+    validate_timestamp(value["generated_at"], "export timestamp")
+    if (type(value["stale_after_seconds"]) is not int
+            or value["stale_after_seconds"] != HOST_SEAT_STATE_STALE_AFTER_SECONDS):
+        raise WatcherError("host seat-state freshness is invalid")
+    if not isinstance(value["seats"], list):
+        raise WatcherError("host seat-state seats are invalid")
+    seat_fields = {
+        "source_host", "namespace", "name", "harness", "transport",
+        "wake_counts", "handling_counts", "newest_transition_at",
+    }
+    seen = set()
+    order = []
+    for row in value["seats"]:
+        if not isinstance(row, dict) or set(row) != seat_fields:
+            raise WatcherError("host seat-state seat is invalid")
+        if row["source_host"] != expected_host:
+            raise WatcherError("host identity mismatch")
+        name = row["name"]
+        if not isinstance(name, str) or not SAFE.fullmatch(name):
+            raise WatcherError("host seat-state seat identity is invalid")
+        identity = (expected_host, name)
+        if identity in seen:
+            raise WatcherError("duplicate seat")
+        seen.add(identity)
+        order.append(name)
+        if (not isinstance(row["namespace"], str)
+                or row["namespace"] not in {"seats", "consorts"}
+                or not isinstance(row["harness"], str) or row["harness"] not in HARNESSES
+                or not isinstance(row["transport"], str) or row["transport"] not in TRANSPORTS):
+            raise WatcherError("host seat-state seat category is invalid")
+        for field, states in (("wake_counts", WAKE_COUNT_STATES),
+                              ("handling_counts", HANDLING_COUNT_STATES)):
+            counts = row[field]
+            if (not isinstance(counts, dict) or set(counts) != set(states)
+                    or any(type(count) is not int or count < 0 for count in counts.values())):
+                raise WatcherError("host seat-state counts are invalid")
+        total = sum(row["wake_counts"].values())
+        if total != sum(row["handling_counts"].values()):
+            raise WatcherError("host seat-state counts are inconsistent")
+        if total == 0:
+            if row["newest_transition_at"] is not None:
+                raise WatcherError("host seat-state transition is invalid")
+        else:
+            validate_timestamp(row["newest_transition_at"], "seat transition timestamp")
+    if order != sorted(order):
+        raise WatcherError("host seat-state order is invalid")
+    return value
+
+
+def build_host_seat_state(registry: dict, host: str, now: float | None = None) -> dict:
+    if (not isinstance(host, str) or not SAFE.fullmatch(host)
+            or not isinstance(registry, dict) or registry.get("schema") != "mailcortex.seats.v1"
+            or registry.get("host") != host or not isinstance(registry.get("seats"), dict)
+            or not registry["seats"]):
+        raise WatcherError("registry is not owned by this host")
+    rows = []
+    for seat in sorted(registry["seats"]):
+        record = registry["seats"][seat]
+        if (not isinstance(seat, str) or not SAFE.fullmatch(seat) or not isinstance(record, dict)
+                or record.get("host") != host
+                or record.get("mailbox") not in {f"seats/{seat}", f"consorts/{seat}"}
+                or record.get("harness") not in HARNESSES
+                or record.get("transport") not in TRANSPORTS):
+            raise WatcherError("registry seat is not owned by this host")
+        rows.append(seat_state_row(seat, record, host))
+    value = {
+        "schema": HOST_SEAT_STATE_SCHEMA,
+        "source_host": host,
+        "generated_at": iso_timestamp(time.time() if now is None else now, "export timestamp"),
+        "stale_after_seconds": HOST_SEAT_STATE_STALE_AFTER_SECONDS,
+        "seats": rows,
+    }
+    return validate_host_seat_state(value, host)
+
+
+def publish_host_seat_state(registry: dict, host: str, now: float | None = None) -> Path:
+    if not isinstance(host, str) or not SAFE.fullmatch(host):
+        raise WatcherError("host identity mismatch")
+    root = MAILCORTEX.mail_root()
+    if root.is_symlink() or not root.is_dir():
+        raise WatcherError("MailCortex root is absent or unsafe")
+    directory = root
+    for name in (".centre", "seat-state"):
+        directory = directory / name
+        if directory.is_symlink() or (directory.exists() and not directory.is_dir()):
+            raise WatcherError("host seat-state destination is unsafe")
+        directory.mkdir(mode=0o700, exist_ok=True)
+    target = directory / f"{host}.json"
+    if target.is_symlink() or (target.exists() and not target.is_file()):
+        raise WatcherError("host seat-state destination is unsafe")
+    value = build_host_seat_state(registry, host, now=now)
+    MAILCORTEX.atomic_json(target, value)
+    try:
+        published = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WatcherError("published host seat-state is unreadable") from error
+    validate_host_seat_state(published, host)
+    return target
 
 
 def message_id(path: Path) -> str:
@@ -1109,9 +1323,11 @@ def main() -> int:
     parser.add_argument("--interval", type=float, default=2.0)
     args = parser.parse_args()
     try:
-        registry = load_registry(Path(args.registry).expanduser(), os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
+        host = os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname())
+        registry = load_registry(Path(args.registry).expanduser(), host)
         while True:
             locked_scan(registry, TransportAdapters())
+            publish_host_seat_state(registry, host)
             if args.once:
                 return 0
             time.sleep(max(args.interval, 0.1))
