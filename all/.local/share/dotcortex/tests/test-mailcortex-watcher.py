@@ -191,14 +191,18 @@ class WatcherTests(unittest.TestCase):
                 "host": "test-host", "mailbox": "seats/hermesbot", "harness": "hermes",
                 "transport": "hermes", "hermes_url": "http://localhost:YOUR_HERMES_PORT",
                 "hermes_api_key_file": "YOUR_HERMES_API_KEY_FILE",
-                "hermes_session": "hermesbot-session", "hermes_session_key": "hermesbot-key",
+                "hermes_target": {"mode": "gateway_platform_session",
+                    "session_key": "agent:YOUR_PROFILE:telegram:dm:YOUR_HERMES_CHAT_ID"},
                 "rate_limit_seconds": 0,
             },
             "nanobot": {
                 "host": "test-host", "mailbox": "consorts/nanobot", "harness": "nanobot",
                 "transport": "nanobot", "nanobot_url": "http://localhost:YOUR_NANOBOT_PORT",
                 "nanobot_api_token_file": "YOUR_NANOBOT_API_TOKEN_FILE",
-                "nanobot_session": "nanobot-session", "rate_limit_seconds": 0,
+                "nanobot_target": {"mode": "telegram_gateway",
+                    "channel": "telegram", "chat_id": "YOUR_NANOBOT_CHAT_ID",
+                    "session_key": "telegram:YOUR_NANOBOT_CHAT_ID"},
+                "rate_limit_seconds": 0,
             },
         }
         registry_path = self.base / "registry.json"
@@ -351,10 +355,6 @@ class WatcherTests(unittest.TestCase):
             adapter.resolve_idle_pane(self.registry["seats"]["builder"])
         self.assertEqual(calls, [])
 
-    def test_nanobot_fails_loud_without_atomic_idle_prompt_admission(self):
-        with self.assertRaisesRegex(self.watcher.WatcherError, "Nano transport.*readiness-only"):
-            self.watcher.NanobotAdapter().resolve_idle_pane({})
-
     def hermes_record(self):
         key = self.base / "hermes.key"
         key.write_text("YOUR_HERMES_API_KEY\n")
@@ -362,108 +362,146 @@ class WatcherTests(unittest.TestCase):
         return {
             "host": "test-host", "mailbox": "seats/hermesbot", "harness": "hermes",
             "transport": "hermes", "hermes_url": "http://localhost:YOUR_HERMES_PORT",
-            "hermes_api_key_file": str(key), "hermes_session": "hermesbot-session",
-            "hermes_session_key": "hermesbot-key", "rate_limit_seconds": 0,
+            "hermes_api_key_file": str(key), "hermes_target": {
+                "mode": "gateway_platform_session",
+                "session_key": "agent:YOUR_PROFILE:telegram:dm:YOUR_HERMES_CHAT_ID",
+            }, "rate_limit_seconds": 0,
         }
 
-    def test_hermes_missing_session_is_created_then_delivered(self):
+    def test_hermes_delivery_targets_the_telegram_platform_session(self):
         record = self.hermes_record()
         calls = []
-        responses = iter((
-            FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
-                              "api_server": {"active_runs": 0}, "gateway_state": "running"}),
-            FakeHTTPResponse({"object": "hermes.session"}, status=201),
-            FakeHTTPResponse({"object": "hermes.session.chat.completion"}),
-        ))
 
         def opener(request, timeout):
             calls.append((request, timeout))
-            return next(responses)
+            body = json.loads(request.data)
+            if request.full_url.endswith("/status"):
+                return FakeHTTPResponse({"protocol": "hermes.gateway_idle_prompt.v1",
+                    "known": True, "busy": False,
+                    "session_key": "agent:YOUR_PROFILE:telegram:dm:YOUR_HERMES_CHAT_ID"})
+            return FakeHTTPResponse({"protocol": "hermes.gateway_idle_prompt.v1",
+                "request_id": body["request_id"],
+                "session_key": "agent:YOUR_PROFILE:telegram:dm:YOUR_HERMES_CHAT_ID",
+                "status": "accepted"}, status=202)
 
         adapter = self.watcher.HermesAdapter(opener=opener)
-        self.assertEqual(adapter.resolve_idle_pane(record), "hermesbot-session")
-        adapter.deliver(record, "hermesbot-session", "wake")
-        self.assertEqual([call[0].get_method() for call in calls], ["GET", "POST", "POST"])
-        self.assertTrue(calls[0][0].full_url.endswith("/health/detailed"))
-        self.assertTrue(calls[1][0].full_url.endswith("/api/sessions"))
-        self.assertEqual(json.loads(calls[1][0].data),
-                         {"id": "hermesbot-session", "title": "hermesbot-session"})
-        self.assertTrue(calls[2][0].full_url.endswith("/api/sessions/hermesbot-session/chat"))
-        headers = {key.lower(): value for key, value in calls[2][0].header_items()}
-        self.assertEqual(headers["authorization"], "Bearer YOUR_HERMES_API_KEY")
-        self.assertEqual(headers["x-hermes-session-key"], "hermesbot-key")
-        self.assertEqual(json.loads(calls[2][0].data), {"message": "wake"})
-        self.assertEqual(calls[0][1], 15)
-        self.assertEqual(calls[2][1], 60)
-
-    def test_hermes_existing_session_is_left_untouched(self):
-        record = self.hermes_record()
-        calls = []
-        responses = iter((
-            FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
-                              "api_server": {"active_runs": 0}, "gateway_state": "running"}),
-            FakeHTTPResponse({"error": {"code": "session_exists"}}, status=409),
-            FakeHTTPResponse({"object": "hermes.session.chat.completion"}),
-        ))
-
-        def opener(request, timeout):
-            calls.append((request, timeout))
-            return next(responses)
-
-        adapter = self.watcher.HermesAdapter(opener=opener)
-        target = adapter.resolve_idle_pane(record)
+        target = "agent:YOUR_PROFILE:telegram:dm:YOUR_HERMES_CHAT_ID"
+        self.assertEqual(adapter.resolve_idle_pane(record), target)
         adapter.deliver(record, target, "wake")
-        self.assertEqual([call[0].get_method() for call in calls], ["GET", "POST", "POST"])
-        self.assertEqual(calls[1][0].full_url.rsplit("/", 1)[-1], "sessions")
-        self.assertEqual(json.loads(calls[1][0].data),
-                         {"id": "hermesbot-session", "title": "hermesbot-session"})
-        self.assertNotIn("/chat", calls[1][0].full_url)
+        self.assertEqual([call[0].get_method() for call in calls], ["POST", "POST"])
+        self.assertTrue(calls[0][0].full_url.endswith("/api/gateway/idle-prompt/status"))
+        self.assertTrue(calls[1][0].full_url.endswith("/api/gateway/idle-prompt"))
+        self.assertEqual(json.loads(calls[0][0].data),
+                         {"protocol": "hermes.gateway_idle_prompt.v1", "session_key": target})
+        body = json.loads(calls[1][0].data)
+        self.assertEqual(set(body), {"protocol", "request_id", "session_key", "text"})
+        self.assertEqual(body["protocol"], "hermes.gateway_idle_prompt.v1")
+        self.assertEqual(body["session_key"], target)
+        self.assertEqual(body["text"], "wake")
+        headers = {key.lower(): value for key, value in calls[1][0].header_items()}
+        self.assertEqual(headers["authorization"], "Bearer YOUR_HERMES_API_KEY")
+        self.assertEqual(calls[0][1], 15)
+        self.assertEqual(calls[1][1], 15)
 
-    def test_hermes_chat_404_is_typed_with_the_session_name(self):
-        record = self.hermes_record()
-        responses = iter((
-            FakeHTTPResponse({"error": {"code": "session_exists"}}, status=409),
-            FakeHTTPResponse({"error": {"code": "session_not_found"}}, status=404),
-        ))
-        adapter = self.watcher.HermesAdapter(
-            opener=lambda request, timeout: next(responses))
-        with self.assertRaisesRegex(self.watcher.HermesSessionNotFoundError,
-                                    "Hermes session not found: hermesbot-session"):
-            adapter.deliver(record, "hermesbot-session", "wake")
-
-    def test_hermes_chat_404_queues_named_failure_not_delivery_unknown(self):
+    def test_hermes_busy_is_queued_and_never_interrupts(self):
         record = self.hermes_record() | {"mailbox": "seats/builder"}
         self.registry["seats"]["builder"] = record
-        mid = "<hermes-missing@node.helm>"
+        mid = "<hermes-busy@node.helm>"
         self.mail(mid, "hermes")
-        responses = iter((
-            FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
-                              "api_server": {"active_runs": 0}, "gateway_state": "running"}),
-            FakeHTTPResponse({"error": {"code": "session_exists"}}, status=409),
-            FakeHTTPResponse({"error": {"code": "session_not_found"}}, status=404),
-        ))
-        adapter = self.watcher.HermesAdapter(
-            opener=lambda request, timeout: next(responses))
-        with self.assertRaisesRegex(self.watcher.HermesSessionNotFoundError,
-                                    "hermesbot-session"):
-            self.watcher.locked_scan(self.registry, adapter, now=10)
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            return FakeHTTPResponse({"protocol": "hermes.gateway_idle_prompt.v1", "known": True,
+                "busy": True, "session_key": record["hermes_target"]["session_key"]})
+        self.assertEqual(self.watcher.locked_scan(
+            self.registry, self.watcher.HermesAdapter(opener=opener), now=10), 0)
         receipt = self.receipt(mid)
         self.assertEqual(receipt["wake_state"], "queued")
-        self.assertEqual(receipt["reason"], "session_not_found")
-        self.assertNotEqual(receipt["wake_state"], "delivery_unknown")
+        self.assertEqual(receipt["reason"], "busy")
+        self.assertEqual(len(calls), 1)
 
-    def test_hermes_busy_and_unprovable_health_refuse(self):
-        record = self.hermes_record()
+    def test_hermes_lost_admission_ack_is_unknown_and_never_resent(self):
+        record = self.hermes_record() | {"mailbox": "seats/builder"}
+        self.registry["seats"]["builder"] = record
+        mid = "<hermes-lost@node.helm>"; self.mail(mid, "hermes")
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            if request.full_url.endswith("/status"):
+                return FakeHTTPResponse({"protocol": "hermes.gateway_idle_prompt.v1",
+                    "known": True, "busy": False,
+                    "session_key": record["hermes_target"]["session_key"]})
+            raise TimeoutError("fixture lost acknowledgement")
+        with mock.patch("sys.stderr"):
+            self.assertEqual(self.watcher.locked_scan(
+                self.registry, self.watcher.HermesAdapter(opener=opener), now=10), 0)
+        self.assertEqual(self.receipt(mid)["wake_state"], "delivery_unknown")
+        self.assertEqual(self.watcher.locked_scan(
+            self.registry, self.watcher.HermesAdapter(opener=opener), now=11), 0)
+        self.assertEqual(len(calls), 2)
 
-        busy = self.watcher.HermesAdapter(opener=lambda request, timeout: FakeHTTPResponse(
-            {"gateway_busy": True, "active_agents": 1,
-             "api_server": {"active_runs": 1}, "gateway_state": "running"}))
-        self.assertIsNone(busy.resolve_idle_pane(record))
+    def nanobot_record(self):
+        key = self.base / "nanobot.key"
+        key.write_text("YOUR_NANOBOT_API_TOKEN\n"); key.chmod(0o600)
+        return {"host": "test-host", "mailbox": "consorts/nanobot", "harness": "nanobot",
+            "transport": "nanobot", "nanobot_url": "http://localhost:YOUR_NANOBOT_PORT",
+            "nanobot_api_token_file": str(key), "nanobot_target": {
+                "mode": "telegram_gateway", "channel": "telegram",
+                "chat_id": "YOUR_NANOBOT_CHAT_ID",
+                "session_key": "telegram:YOUR_NANOBOT_CHAT_ID"}, "rate_limit_seconds": 0}
 
-        unknown = self.watcher.HermesAdapter(opener=lambda request, timeout: FakeHTTPResponse(
-            {"gateway_busy": False, "active_agents": 0, "gateway_state": "running"}))
-        with self.assertRaisesRegex(self.watcher.WatcherError, "authoritative busy state"):
-            unknown.resolve_idle_pane(record)
+    def test_nanobot_atomic_interface_targets_telegram_session(self):
+        record = self.nanobot_record(); calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            body = json.loads(request.data) if request.data else {}
+            if request.get_method() == "GET":
+                return FakeHTTPResponse({"protocol": "nanobot.idle_prompt.v1", "known": True,
+                    "busy": False, "session_key": record["nanobot_target"]["session_key"]})
+            return FakeHTTPResponse({"protocol": "nanobot.idle_prompt.v1",
+                "request_id": body["request_id"],
+                "session_key": body["target"]["session_key"],
+                "status": "accepted"}, status=202)
+        adapter = self.watcher.NanobotAdapter(opener=opener)
+        target = record["nanobot_target"]["session_key"]
+        self.assertEqual(adapter.resolve_idle_pane(record), target)
+        adapter.deliver(record, target, "wake")
+        self.assertEqual([request.get_method() for request in calls], ["GET", "POST"])
+        body = json.loads(calls[1].data)
+        self.assertEqual(body["target"], record["nanobot_target"])
+        self.assertEqual(body["text"], "wake")
+        self.assertRegex(body["request_id"], r"^[0-9a-f]{32}$")
+        self.assertEqual(calls[1].headers["Authorization"], "Bearer YOUR_NANOBOT_API_TOKEN")
+
+    def test_nanobot_busy_and_lost_ack_have_distinct_receipt_states(self):
+        record = self.nanobot_record() | {"mailbox": "seats/builder"}
+        self.registry["seats"]["builder"] = record
+        mid = "<nano-busy@node.helm>"; self.mail(mid, "a")
+        busy_calls = []
+        def busy(request, timeout):
+            busy_calls.append(request)
+            return FakeHTTPResponse({"protocol": "nanobot.idle_prompt.v1", "known": True,
+                "busy": True, "session_key": record["nanobot_target"]["session_key"]})
+        self.assertEqual(self.watcher.locked_scan(
+            self.registry, self.watcher.NanobotAdapter(opener=busy), now=10), 0)
+        self.assertEqual(self.receipt(mid)["wake_state"], "queued")
+        self.assertEqual(self.receipt(mid)["reason"], "busy")
+        (self.mailbox / "new/a").unlink()
+        mid = "<nano-lost@node.helm>"; self.mail(mid, "b")
+        lost_calls = []
+        def lost(request, timeout):
+            lost_calls.append(request)
+            if request.get_method() == "GET":
+                return FakeHTTPResponse({"protocol": "nanobot.idle_prompt.v1", "known": True,
+                    "busy": False, "session_key": record["nanobot_target"]["session_key"]})
+            raise TimeoutError("fixture lost acknowledgement")
+        with mock.patch("sys.stderr"):
+            self.assertEqual(self.watcher.locked_scan(
+                self.registry, self.watcher.NanobotAdapter(opener=lost), now=11), 0)
+        self.assertEqual(self.receipt(mid)["wake_state"], "delivery_unknown")
+        self.assertEqual(self.watcher.locked_scan(
+            self.registry, self.watcher.NanobotAdapter(opener=lost), now=12), 0)
+        self.assertEqual(len(lost_calls), 2)
 
     def test_deepseek_busy_detection_prevents_prompt_until_session_is_idle(self):
         cookie = self.base / "deepseek.cookie"
