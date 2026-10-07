@@ -495,6 +495,77 @@ class ClaudeWarmTests(unittest.TestCase):
         self.sessions.append(session)
         return session
 
+    def test_measured_cache_window_uses_current_model_and_strict_policy(self):
+        with tempfile.TemporaryDirectory() as raw_root:
+            root = pathlib.Path(raw_root)
+            helper = root / "cache-policy"
+            policy = root / "cache-policy.json"
+            helper.write_text("fixture", encoding="utf-8")
+            policy.write_text("{}", encoding="utf-8")
+            decision = {
+                "compact_before_seconds": 7080,
+                "cache_expires_seconds": 7200,
+                "mode": "measured",
+                "reason": "endpoint-model-transfer",
+            }
+            completed = subprocess.CompletedProcess([], 0, json.dumps(decision), "")
+            with mock.patch.dict(os.environ, {
+                "FLEET_CACHE_POLICY_HELPER": str(helper),
+                "FLEET_CACHE_POLICY_PATH": str(policy),
+            }), mock.patch.object(self.module.subprocess, "run", return_value=completed) as run:
+                compact_after, cache_expires, resolved = self.module.measured_cache_window(
+                    "Opus 4.8", "long"
+                )
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--model") + 1], "Opus 4.8")
+        self.assertNotIn("--allow-observed", command)
+        self.assertEqual((compact_after, cache_expires), (7080, 7200))
+        self.assertEqual(resolved["reason"], "endpoint-model-transfer")
+
+    def test_action_refresh_rearms_when_new_policy_deadline_is_later(self):
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.current_model = "Opus 4.8"
+        supervisor.cache_profile = "long"
+        supervisor.cache_idle_seconds = 60
+        supervisor.cache_ttl_seconds = 120
+        supervisor.cache_policy = {"mode": "fallback", "reason": "startup"}
+        supervisor.timer_generation = 4
+        supervisor.timer_deadline = None
+        supervisor.timer_kind = None
+        supervisor.last_state_transition = "armed"
+        supervisor._read_snapshot = mock.Mock(return_value=({}, None))
+        supervisor._idle_anchor = mock.Mock(return_value=900.0)
+        supervisor._guard_log = mock.Mock()
+        supervisor._write_state = mock.Mock()
+        decision = {
+            "mode": "measured", "reason": "exact-harness",
+            "confidence": "supported", "source_harness": "claude",
+            "provider": "anthropic", "endpoint_id": "anthropic-default",
+            "model": "claude-opus-4-8", "observed_at": "2026-09-30T00:00:00Z",
+            "sample_count": 500, "session_count": 40,
+        }
+        with mock.patch.object(self.module, "now", return_value=1000.0), mock.patch.object(
+            self.module, "measured_cache_window", return_value=(300, 360, decision)
+        ):
+            self.assertFalse(supervisor._refresh_cache_policy_for_action())
+        self.assertEqual(supervisor.timer_generation, 5)
+        self.assertEqual(supervisor.timer_deadline, 1200.0)
+        self.assertEqual(supervisor.timer_kind, "compact")
+        self.assertEqual(supervisor.last_state_transition, "policy-refreshed-rearmed")
+        event, fields = supervisor._guard_log.call_args.args[0], supervisor._guard_log.call_args.kwargs
+        self.assertEqual(event, "policy-refreshed-rearmed")
+        self.assertEqual(fields["policy_model"], "claude-opus-4-8")
+        self.assertEqual(fields["policy_session_count"], 40)
+
+    def test_automatic_attempt_refreshes_policy_before_final_gate(self):
+        supervisor = object.__new__(self.module.Supervisor)
+        supervisor.timer_generation = 7
+        supervisor._refresh_cache_policy_for_action = mock.Mock(return_value=False)
+        supervisor._gate_reason = mock.Mock(side_effect=AssertionError("gate ran before refresh"))
+        self.assertFalse(supervisor.attempt(expected_generation=7, purpose="compact"))
+        supervisor._refresh_cache_policy_for_action.assert_called_once_with()
+        supervisor._gate_reason.assert_not_called()
+
     def test_herdr_registration_uses_supported_pane_contract(self):
         """The PTY owner reports logical identity and releases it cleanly."""
         root = pathlib.Path(tempfile.mkdtemp(prefix="cw-herdr-", dir="/tmp"))

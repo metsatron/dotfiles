@@ -319,10 +319,1122 @@ Nanobot is a fleet bot, not a user-site Python library.  Keep its dependency
 graph isolated inside the HelmCortex Nano workspace and pin the upstream release
 here.  Re-running =nanobot-apply= upgrades or repairs the runtime to the declared
 version without touching private credentials, OAuth state, sessions, or memory.
+The public non-secret template is recursively merged into an existing private
+config on every apply, with the template winning only for managed keys. This
+keeps access policy, MCP servers, model defaults, and gateway settings
+reproducible while preserving pairing state, WebUI secrets, OAuth metadata, and
+Nanobot-added defaults that the template does not own.
+
+The managed seam below keeps Nanobot's native locking and consolidation path,
+but replaces its fixed idle threshold with the fleet's measured endpoint/model
+policy. Upstream auto-compaction remains explicitly disabled in config; the
+scanner remains disabled whenever policy is missing, stale, unsupported, or
+unreadable. Nano explicitly accepts either the fully supported tier or a
+repeatable observed endpoint/model transition; weaker evidence cannot arm it.
+
+#+BEGIN_SRC diff :tangle all/.bots/patches/nanobot-cache-policy.patch :comments no
+--- a/nanobot/agent/autocompact.py
++++ b/nanobot/agent/autocompact.py
+@@ -4,6 +4,10 @@
+ 
+ from collections.abc import Collection
+ from datetime import datetime
++import json
++import os
++from pathlib import Path
++import subprocess
+ from typing import TYPE_CHECKING, Any, Callable, Coroutine
+ 
+ from loguru import logger
+@@ -36,9 +40,51 @@
+         self._summaries: dict[str, SessionSummary] = {}
+         self._bind_events = bind_events
+ 
++    @staticmethod
++    def _policy_ttl_seconds(runtime: LLMRuntime) -> float | None:
++        fallback_compact = int(os.environ.get(
++            "NANOBOT_CACHE_POLICY_FALLBACK_COMPACT_SECONDS", "1620"
++        ))
++        fallback_cache = int(os.environ.get(
++            "NANOBOT_CACHE_POLICY_FALLBACK_CACHE_SECONDS", "1800"
++        ))
++        helper = Path(os.environ.get(
++            "FLEET_CACHE_POLICY_HELPER",
++            str(Path.home() / "HelmCortex/FORGE/bin/cache-policy"),
++        )).expanduser()
++        policy = Path(os.environ.get(
++            "FLEET_CACHE_POLICY_PATH",
++            str(Path.home() / "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json"),
++        )).expanduser()
++        provider = str(getattr(runtime.provider, "provider_name", "unknown"))
++        try:
++            completed = subprocess.run(
++                [str(helper), "resolve", "--policy", str(policy),
++                 "--harness", "nanobot", "--provider", provider,
++                 "--endpoint", provider, "--model", runtime.model,
++                 "--fallback-compact", str(fallback_compact),
++                 "--fallback-cache", str(fallback_cache),
++                 "--allow-observed"],
++                capture_output=True, text=True, timeout=5, check=True,
++            )
++            decision = json.loads(completed.stdout)
++            mode = str(decision.get("mode") or "fallback")
++            seconds = (float(decision["compact_before_seconds"])
++                       if mode in {"measured", "observed"} else None)
++        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
++            seconds, mode = None, "fallback-error"
++        logger.debug(
++            "Auto-compact policy provider={} model={} mode={} threshold={}",
++            provider, runtime.model, mode,
++            "disabled" if seconds is None else f"{int(seconds)}s",
++        )
++        return None if seconds is None else max(60.0, seconds)
++
+     def _is_expired(self, ts: datetime | str | None,
+-                    now: datetime | None = None) -> bool:
+-        if self._ttl <= 0 or not ts:
++                    now: datetime | None = None,
++                    ttl_seconds: float | None = None) -> bool:
++        threshold = self._ttl * 60 if ttl_seconds is None else ttl_seconds
++        if threshold <= 0 or not ts:
+             return False
+         try:
+             if isinstance(ts, str):
+@@ -52,7 +98,7 @@
+             # list_sessions() forwards raw persisted metadata; an unusable value
+             # must not escape the idle scan and stop the agent loop.
+             return False
+-        return idle_seconds >= self._ttl * 60
++        return idle_seconds >= threshold
+ 
+     def _has_unarchived_messages(self, key: str) -> bool:
+         session = self.sessions.get_or_create(key)
+@@ -80,12 +126,39 @@
+             if key in active_session_keys:
+                 continue
+             updated_at = info.get("updated_at")
+-            if self._is_expired(updated_at, now) and self._has_unarchived_messages(key):
+-                session = self.sessions.get_or_create(key)
+-                try:
+-                    runtime = resolve_runtime(session)
+-                except (KeyError, ValueError):
+-                    # Invalid session selections remain recoverable through /model.
+-                    continue
++            session = self.sessions.get_or_create(key)
++            try:
++                runtime = resolve_runtime(session)
++            except (KeyError, ValueError):
++                # Invalid session selections remain recoverable through /model.
++                continue
++            ttl_seconds = self._policy_ttl_seconds(runtime)
++            if ttl_seconds is None:
++                continue
++            if (self._is_expired(updated_at, now, ttl_seconds)
++                    and self._has_unarchived_messages(key)):
++                try:
++                    estimated_tokens, estimate_source = (
++                        self.consolidator.estimate_session_prompt_tokens(
++                            session, runtime=runtime,
++                        )
++                    )
++                    min_tokens = max(1, int(os.environ.get(
++                        "NANOBOT_CACHE_POLICY_MIN_TOKENS", "70000"
++                    )))
++                except (OSError, TypeError, ValueError):
++                    continue
++                if estimated_tokens < min_tokens:
++                    logger.debug(
++                        "Auto-compact policy below token gate {} tokens={} minimum={} source={}",
++                        key, estimated_tokens, min_tokens, estimate_source,
++                    )
++                    continue
++                if os.environ.get("NANOBOT_CACHE_POLICY_MODE", "enforce") == "shadow":
++                    logger.info(
++                        "Auto-compact policy shadow candidate {} threshold={}s tokens={}",
++                        key, int(ttl_seconds), estimated_tokens,
++                    )
++                    continue
+                 self._archiving.add(key)
+                 schedule_background(self._archive(key, runtime=runtime))
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-nanobot-cache-policy.py :comments no
+"""Behavior checks for Nano's measured cache-expiry token gate."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
+import os
+import unittest
+from unittest import mock
+
+from nanobot.agent.autocompact import AutoCompact
+
+
+class FakeSession:
+    def __init__(self) -> None:
+        self.key = "telegram:approved"
+        self.updated_at = datetime.now() - timedelta(hours=3)
+        self.messages = [{"role": "user", "content": "durable context"}]
+        self.last_archived = 0
+        self.metadata = {}
+
+
+class FakeSessions:
+    def __init__(self, session: FakeSession) -> None:
+        self.session = session
+
+    def list_sessions(self):
+        return [{"key": self.session.key, "updated_at": self.session.updated_at}]
+
+    def get_or_create(self, _key: str):
+        return self.session
+
+
+class FakeConsolidator:
+    def __init__(self, estimated_tokens: int) -> None:
+        self.estimated_tokens = estimated_tokens
+
+    def estimate_session_prompt_tokens(self, _session, *, runtime):
+        return self.estimated_tokens, "fixture"
+
+
+class NanoCachePolicyTest(unittest.TestCase):
+    def run_scan(self, estimated_tokens: int) -> int:
+        session = FakeSession()
+        compact = AutoCompact(FakeSessions(session), FakeConsolidator(estimated_tokens))
+        scheduled = []
+        runtime = object()
+        with mock.patch.object(AutoCompact, "_policy_ttl_seconds", return_value=60), \
+             mock.patch.dict(os.environ, {"NANOBOT_CACHE_POLICY_MIN_TOKENS": "70000"}):
+            compact.check_expired(scheduled.append, lambda _session: runtime)
+        for coroutine in scheduled:
+            coroutine.close()
+        return len(scheduled)
+
+    def test_expiry_below_token_gate_does_not_compact(self) -> None:
+        self.assertEqual(self.run_scan(69999), 0)
+
+    def test_expiry_at_token_gate_forces_compaction(self) -> None:
+        self.assertEqual(self.run_scan(70000), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
+Nano's outbound voice lane reuses the fleet's established
+=claude-hook-voice-reply= payload instead of introducing a second pvox path.
+Only successfully delivered terminal Telegram text is queued: ordinary sends
+speak after the last chunk, and streamed replies speak once at =stream_end=.
+Progress/tool events and compaction notices remain silent. The relay runs in a
+tracked background task, identifies as =Nanobot= (mapped to the existing Haiku
+voice in =agents-hooks.org=), and retains =PVOX_REPLY_OFF=1= as the kill switch.
+
+#+BEGIN_SRC diff :tangle all/.bots/patches/nanobot-voice-reply.patch :comments no
+--- a/nanobot/channels/telegram/runtime.py
++++ b/nanobot/channels/telegram/runtime.py
+@@ -3,6 +3,8 @@
+ from __future__ import annotations
+
+ import asyncio
++import json
++import os
+ import re
+ import time
+ import unicodedata
+@@ -561,6 +563,7 @@
+         self._compaction_notices: dict[tuple[str, str], int] = {}  # (chat_id, compaction_id) -> message_id
+         self._inbound_buffers: dict[str, list[_QueuedTelegramUpdate]] = {}
+         self._inbound_workers: dict[str, asyncio.Task[None]] = {}
++        self._voice_reply_tasks: set[asyncio.Task[None]] = set()
+         self._rich_send_disabled: bool = False  # Latch off if Bot API < 10.1
+         self._last_poll_ok: float = 0.0  # monotonic time of last getUpdates round trip
+         self._app_ready = asyncio.Event()  # cleared while the app is being rebuilt
+@@ -851,6 +854,13 @@
+         self._inbound_workers.clear()
+         self._inbound_buffers.clear()
+
++        voice_tasks = tuple(self._voice_reply_tasks)
++        for task in voice_tasks:
++            task.cancel()
++        if voice_tasks:
++            await asyncio.gather(*voice_tasks, return_exceptions=True)
++        self._voice_reply_tasks.clear()
++
+         if self._app:
+             self.logger.info("Stopping bot...")
+         # Join an in-flight supervisor teardown before ChannelManager cancels
+@@ -1056,6 +1066,57 @@
+         buf.message_id = sent.message_id
+         buf.draft_id = None
+
++    def _queue_voice_reply(self, text: str) -> None:
++        """Speak one delivered terminal reply without delaying Telegram."""
++        if not text.strip() or os.environ.get("PVOX_REPLY_OFF"):
++            return
++        task = asyncio.create_task(self._run_voice_reply(text))
++        self._voice_reply_tasks.add(task)
++        task.add_done_callback(self._voice_reply_tasks.discard)
++
++    async def _run_voice_reply(self, text: str) -> None:
++        """Feed the shared DotCortex relay its established hook payload."""
++        command = Path(os.environ.get(
++            "NANOBOT_VOICE_REPLY_COMMAND",
++            "~/.local/bin/claude-hook-voice-reply",
++        )).expanduser()
++        if not command.is_file() or not os.access(command, os.X_OK):
++            self.logger.warning("voice reply relay unavailable: {}", command)
++            return
++
++        payload = json.dumps(
++            {"tool_input": {"text": text}}, ensure_ascii=False,
++        ).encode("utf-8")
++        env = os.environ.copy()
++        env["CLAUDE_WARM_HERDR_AGENT"] = "Nanobot"
++        process: asyncio.subprocess.Process | None = None
++        try:
++            process = await asyncio.create_subprocess_exec(
++                str(command),
++                stdin=asyncio.subprocess.PIPE,
++                stdout=asyncio.subprocess.DEVNULL,
++                stderr=asyncio.subprocess.DEVNULL,
++                env=env,
++                start_new_session=os.name != "nt",
++            )
++            await asyncio.wait_for(process.communicate(payload), timeout=5.0)
++            if process.returncode != 0:
++                self.logger.warning(
++                    "voice reply relay exited with status {}", process.returncode,
++                )
++        except asyncio.CancelledError:
++            if process is not None and process.returncode is None:
++                process.kill()
++                await process.wait()
++            raise
++        except asyncio.TimeoutError:
++            if process is not None and process.returncode is None:
++                process.kill()
++                await process.wait()
++            self.logger.warning("voice reply relay timed out")
++        except OSError as exc:
++            self.logger.warning("voice reply relay failed: {}", exc)
++
+     async def send(self, msg: OutboundMessage) -> None:
+         """Send a message through Telegram."""
+         app = await self._wait_for_app()
+@@ -1181,6 +1242,8 @@
+                     chat_id, text, reply_params, thread_kwargs, reply_markup,
+                 )
+                 if rich_ok:
++                    if progress_event is None:
++                        self._queue_voice_reply(text)
+                     return
+
+             chunks = _split_telegram_markdown(text, TELEGRAM_MAX_MESSAGE_LEN)
+@@ -1191,6 +1254,8 @@
+                     render_as_blockquote=render_as_blockquote,
+                     reply_markup=reply_markup if is_last else None,
+                 )
++            if progress_event is None:
++                self._queue_voice_reply(text)
+
+     async def _call_with_retry(
+         self,
+@@ -1370,6 +1435,7 @@
+                         buf.text = "\n".join(legacy_chunks[legacy_index + 1:])
+                     break
+                 self._stream_bufs.pop(chat_id, None)
++                self._queue_voice_reply(raw_text)
+                 return
+
+             # Group chats and streams that rejected drafts keep the established
+@@ -1387,6 +1453,7 @@
+                 if self._is_not_modified_error(e):
+                     self.logger.debug("Final stream edit already applied for {}", chat_id)
+                     self._stream_bufs.pop(chat_id, None)
++                    self._queue_voice_reply(raw_text)
+                     return
+                 self.logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
+                 primary_plain = (
+@@ -1421,6 +1488,7 @@
+                         thread_kwargs=thread_kwargs,
+                     )
+             self._stream_bufs.pop(chat_id, None)
++            self._queue_voice_reply(raw_text)
+             return
+
+         buf = self._stream_bufs.get(chat_id)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-nanobot-voice-reply.py :comments no
+"""Regression checks for Nano's Telegram-to-pvox terminal reply lane."""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import tempfile
+import time
+from types import SimpleNamespace
+import unittest
+from unittest.mock import AsyncMock, Mock, patch
+
+from nanobot.bus.events import OutboundMessage
+from nanobot.bus.outbound_events import ProgressEvent
+from nanobot.bus.queue import MessageBus
+from nanobot.channels.telegram.runtime import TelegramChannel, TelegramConfig, _StreamBuf
+from nanobot.events import ContextCompactionEvent
+
+
+ALL_OVERLAY = Path(__file__).resolve().parents[4]
+VOICE_HOOK = ALL_OVERLAY / ".local/bin/claude-hook-voice-reply"
+
+
+def make_channel() -> TelegramChannel:
+    channel = TelegramChannel(
+        TelegramConfig(token="test-token", rich_messages=False),
+        MessageBus(),
+    )
+    channel._app = SimpleNamespace(bot=SimpleNamespace(
+        edit_message_text=AsyncMock(),
+        send_message=AsyncMock(),
+    ))
+    channel._app_ready.set()
+    return channel
+
+
+class RuntimeVoiceReplyTest(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_send_queues_only_after_success(self):
+        channel = make_channel()
+        channel._send_text = AsyncMock()
+        channel._queue_voice_reply = Mock()
+        message = OutboundMessage("telegram", "7", "delivered terminal text")
+
+        await channel.send(message)
+
+        channel._send_text.assert_awaited_once()
+        channel._queue_voice_reply.assert_called_once_with("delivered terminal text")
+
+        channel._send_text.reset_mock(side_effect=True)
+        channel._queue_voice_reply.reset_mock()
+        channel._send_text.side_effect = RuntimeError("delivery failed")
+        with self.assertRaisesRegex(RuntimeError, "delivery failed"):
+            await channel.send(message)
+        channel._queue_voice_reply.assert_not_called()
+
+    async def test_progress_and_compaction_events_stay_silent(self):
+        channel = make_channel()
+        channel._send_text = AsyncMock()
+        channel._send_compaction_notice = AsyncMock()
+        channel._queue_voice_reply = Mock()
+
+        await channel.send(OutboundMessage(
+            "telegram", "7", "tool progress",
+            event=ProgressEvent(content="tool progress", tool_hint=True),
+        ))
+        await channel.send(OutboundMessage(
+            "telegram", "7", "compacting",
+            event=ContextCompactionEvent("compact-1", "started"),
+        ))
+
+        channel._send_text.assert_awaited_once()
+        channel._send_compaction_notice.assert_awaited_once()
+        channel._queue_voice_reply.assert_not_called()
+
+    async def test_stream_speaks_once_at_successful_stream_end(self):
+        channel = make_channel()
+        channel._queue_voice_reply = Mock()
+        channel._stream_bufs["7"] = _StreamBuf(
+            text="one streamed terminal reply",
+            message_id=17,
+            last_edit=time.monotonic(),
+        )
+
+        await channel.send_delta("7", " still streaming", stream_id="stream-1")
+        channel._queue_voice_reply.assert_not_called()
+
+        await channel.send_delta("7", "", stream_id="stream-1", stream_end=True)
+        await channel.send_delta("7", "", stream_id="stream-1", stream_end=True)
+
+        channel._queue_voice_reply.assert_called_once_with(
+            "one streamed terminal reply still streaming",
+        )
+
+    async def test_relay_payload_uses_nanobot_identity_and_kill_switch(self):
+        channel = make_channel()
+        with tempfile.TemporaryDirectory(prefix="nano-voice-payload-") as root:
+            root_path = Path(root)
+            capture = root_path / "payload.json"
+            identity = root_path / "identity"
+            relay = root_path / "relay"
+            relay.write_text(
+                "#!/bin/sh\n"
+                "printf '%s' \"$CLAUDE_WARM_HERDR_AGENT\" > \"$NANO_IDENTITY\"\n"
+                "cat > \"$NANO_CAPTURE\"\n",
+                encoding="utf-8",
+            )
+            relay.chmod(0o755)
+            env = {
+                "NANOBOT_VOICE_REPLY_COMMAND": str(relay),
+                "NANO_CAPTURE": str(capture),
+                "NANO_IDENTITY": str(identity),
+                "PVOX_REPLY_OFF": "",
+            }
+            with patch.dict(os.environ, env):
+                await channel._run_voice_reply("voice payload ✓")
+            self.assertEqual(identity.read_text(encoding="utf-8"), "Nanobot")
+            self.assertEqual(
+                json.loads(capture.read_text(encoding="utf-8")),
+                {"tool_input": {"text": "voice payload ✓"}},
+            )
+
+        channel._voice_reply_tasks.clear()
+        with patch.dict(os.environ, {"PVOX_REPLY_OFF": "1"}):
+            channel._queue_voice_reply("must stay silent")
+        self.assertFalse(channel._voice_reply_tasks)
+
+
+class SharedRelayIntegrationTest(unittest.TestCase):
+    def _run_hook(self, fail_host: str = "") -> tuple[list[str], str, str]:
+        self.assertTrue(VOICE_HOOK.is_file(), f"missing tangled hook: {VOICE_HOOK}")
+        with tempfile.TemporaryDirectory(prefix="nano-shared-relay-") as root:
+            home = Path(root)
+            bindir = home / "bin"
+            pvox = home / "HelmCortex/FORGE/VoxForge/bin/pvox"
+            bindir.mkdir(parents=True)
+            pvox.parent.mkdir(parents=True)
+            ssh_log = home / "ssh.log"
+            pvox_log = home / "pvox.log"
+            cache = home / "cache"
+
+            pvox.write_text(
+                "#!/usr/bin/env bash\n"
+                "printf '%s\\n' \"$*\" >> \"$PVOX_LOG\"\n"
+                "case \"${1:-}\" in\n"
+                "  voicespec) printf '%s\\n' '{\"engine\":\"piper\",\"voice\":\"test\",\"speed\":1.0}' ;;\n"
+                "  clean) cat ;;\n"
+                "  render) out=\"${@: -1}\"; printf 'RIFFnano' > \"$out\" ;;\n"
+                "  *) exit 2 ;;\n"
+                "esac\n",
+                encoding="utf-8",
+            )
+            pvox.chmod(0o755)
+            ssh = bindir / "ssh"
+            ssh.write_text(
+                "#!/usr/bin/env bash\n"
+                "while [ \"$#\" -gt 0 ]; do\n"
+                "  case \"$1\" in -o) shift 2 ;; *) host=\"$1\"; shift; break ;; esac\n"
+                "done\n"
+                "cat >/dev/null\n"
+                "printf '%s\\n' \"$host\" >> \"$SSH_LOG\"\n"
+                "[ -n \"${SSH_FAIL_HOST:-}\" ] && [ \"$host\" = \"$SSH_FAIL_HOST\" ] && exit 1\n"
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            ssh.chmod(0o755)
+
+            env = os.environ.copy()
+            env.update({
+                "HOME": str(home),
+                "PATH": f"{bindir}:{env.get('PATH', '')}:/usr/bin:/bin",
+                "XDG_CACHE_HOME": str(cache),
+                "CLAUDE_WARM_HERDR_AGENT": "Nanobot",
+                "PVOX_REPLY_HOST": "s24",
+                "PVOX_REPLY_FALLBACK_HOST": "t480s",
+                "PVOX_REPLY_NO_ONDEVICE": "1",
+                "PVOX_LOG": str(pvox_log),
+                "SSH_LOG": str(ssh_log),
+                "SSH_FAIL_HOST": fail_host,
+            })
+            env.pop("PVOX_REPLY_OFF", None)
+            subprocess.run(
+                [str(VOICE_HOOK)],
+                input=json.dumps({"tool_input": {"text": "Nano relay test"}}),
+                text=True,
+                env=env,
+                check=True,
+                timeout=10,
+            )
+
+            reply_log = cache / "pvox-reply.log"
+            deadline = time.monotonic() + 10
+            expected = "delivered=t480s" if fail_host else "delivered=s24"
+            while time.monotonic() < deadline:
+                log_text = reply_log.read_text(encoding="utf-8") if reply_log.exists() else ""
+                if expected in log_text:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"shared relay did not finish: {log_text!r}")
+
+            hosts = ssh_log.read_text(encoding="utf-8").splitlines()
+            pvox_calls = pvox_log.read_text(encoding="utf-8")
+            return hosts, pvox_calls, log_text
+
+    def test_nanobot_maps_to_haiku_and_prefers_s24(self):
+        hosts, pvox_calls, log_text = self._run_hook()
+        self.assertEqual(hosts, ["s24"])
+        self.assertIn("render --agent Haiku --no-play", pvox_calls)
+        self.assertIn("voice=Haiku", log_text)
+        self.assertIn("delivered=s24", log_text)
+
+    def test_t480s_is_used_only_after_s24_delivery_failure(self):
+        hosts, _, log_text = self._run_hook(fail_host="s24")
+        self.assertEqual(hosts, ["s24", "t480s"])
+        self.assertIn("host=s24 DELIVER-FAIL", log_text)
+        self.assertIn("delivered=t480s", log_text)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
+The following direct-wrapper prototype is retained only as design history and
+is deliberately not tangled. The active process boundary is the registry-level
+=nanobot-tool-isolation.patch= below, which keeps path policy inside the child.
+Nanobot's built-in =grep= executes its filesystem walk synchronously on the
+gateway event loop, while =find_files= moves the same risk into an unkillable
+thread. A blocked network filesystem lookup can therefore freeze the bot long
+after the nominal timeout. The managed search seam moves both walks into a
+dedicated process group. Cancellation or the 30-second scan budget kills only
+that scan group, leaving the gateway and other agent sessions intact.
+
+#+BEGIN_SRC diff :tangle no :comments no
+--- a/nanobot/agent/tools/search.py
++++ b/nanobot/agent/tools/search.py
+@@ -7,8 +7,11 @@
+ import asyncio
+ import fnmatch
+ import heapq
++import json
+ import os
+ import re
++import signal
++import sys
+ import threading
+ import time
+ from collections import deque
+@@ -20,5 +23,6 @@
+ from nanobot.agent.tools.base import ToolResult
+ from nanobot.agent.tools.filesystem import ListDirTool, _FsTool
++from nanobot.config.loader import get_config_path
+ from nanobot.utils.document import (
+     LocatedDocumentLine,
+     PdfPageRangeError,
+@@ -186,0 +191,63 @@
++    _SCAN_PROCESS_GRACE_SECONDS = 5.0
++
++    async def _execute_isolated(
++        self,
++        kind: str,
++        arguments: dict[str, Any],
++        *,
++        timeout_seconds: float,
++    ) -> str:
++        """Run a potentially blocking filesystem walk outside the gateway process."""
++        requested_path = str(arguments.get("path") or ".")
++        try:
++            target = self._resolve(requested_path)
++        except PermissionError as exc:
++            return ToolResult.error(f"Error: {exc}")
++        except Exception as exc:
++            return ToolResult.error(f"Error resolving search path: {exc}")
++
++        worker = Path(__file__).with_name("_dotcortex_search_worker.py")
++        if not worker.is_file():
++            return ToolResult.error("Error: isolated search worker is not installed")
++
++        payload = {
++            "kind": kind,
++            "workspace": str(self._display_workspace() or target.parent),
++            "config_path": str(get_config_path()),
++            "arguments": {**arguments, "path": str(target)},
++        }
++        process = await asyncio.create_subprocess_exec(
++            sys.executable,
++            str(worker),
++            stdin=asyncio.subprocess.PIPE,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.PIPE,
++            start_new_session=os.name != "nt",
++        )
++        try:
++            stdout, stderr = await asyncio.wait_for(
++                process.communicate(json.dumps(payload).encode("utf-8")),
++                timeout=timeout_seconds + self._SCAN_PROCESS_GRACE_SECONDS,
++            )
++        except (asyncio.TimeoutError, asyncio.CancelledError) as exc:
++            if process.returncode is None:
++                with suppress(ProcessLookupError, PermissionError):
++                    if os.name == "nt":
++                        process.kill()
++                    else:
++                        os.killpg(process.pid, signal.SIGKILL)
++                with suppress(asyncio.TimeoutError):
++                    await asyncio.wait_for(process.wait(), timeout=1.0)
++            if isinstance(exc, asyncio.CancelledError):
++                raise
++            return ToolResult.error(
++                f"Error: {kind} scan exceeded {timeout_seconds:g} seconds; "
++                "narrow path, query, glob, or type and retry."
++            )
++
++        output = stdout.decode("utf-8", errors="replace")
++        error = stderr.decode("utf-8", errors="replace").strip()
++        if process.returncode != 0:
++            detail = error or f"worker exited with status {process.returncode}"
++            return ToolResult.error(f"Error: isolated {kind} scan failed: {detail}")
++        return output
+@@ -381,21 +448,14 @@
+-        cancelled = threading.Event()
+-        try:
+-            return await asyncio.to_thread(
+-                self._execute_sync,
+-                path=path,
+-                query=query,
+-                glob=glob,
+-                file_type=type,
+-                include_dirs=include_dirs,
+-                sort=sort,
+-                head_limit=head_limit,
+-                offset=offset,
+-                cancelled=cancelled,
+-            )
+-        except asyncio.CancelledError:
+-            cancelled.set()
+-            raise
+-        except PermissionError as e:
+-            return ToolResult.error(f"Error: {e}")
+-        except Exception as e:
+-            return ToolResult.error(f"Error finding files: {e}")
++        return await self._execute_isolated(
++            "find_files",
++            {
++                "path": path,
++                "query": query,
++                "glob": glob,
++                "file_type": type,
++                "include_dirs": include_dirs,
++                "sort": sort,
++                "head_limit": head_limit,
++                "offset": offset,
++            },
++            timeout_seconds=self._MAX_SCAN_SECONDS,
++        )
+@@ -510,0 +571 @@
++    _MAX_SCAN_SECONDS = 30.0
+@@ -690,18 +752,57 @@
+-    async def execute(
+-        self,
+-        pattern: str,
+-        path: str = ".",
+-        glob: str | None = None,
+-        type: str | None = None,
+-        pages: str | None = None,
+-        case_insensitive: bool = False,
+-        fixed_strings: bool = False,
+-        output_mode: str = "content",
+-        context_before: int = 5,
+-        context_after: int = 5,
+-        max_matches: int | None = None,
+-        max_results: int | None = None,
+-        head_limit: int | None = None,
+-        offset: int = 0,
+-        **kwargs: Any,
+-    ) -> str:
++    async def execute(
++        self,
++        pattern: str,
++        path: str = ".",
++        glob: str | None = None,
++        type: str | None = None,
++        pages: str | None = None,
++        case_insensitive: bool = False,
++        fixed_strings: bool = False,
++        output_mode: str = "content",
++        context_before: int = 5,
++        context_after: int = 5,
++        max_matches: int | None = None,
++        max_results: int | None = None,
++        head_limit: int | None = None,
++        offset: int = 0,
++        **kwargs: Any,
++    ) -> str:
++        return await self._execute_isolated(
++            "grep",
++            {
++                "pattern": pattern,
++                "path": path,
++                "glob": glob,
++                "type": type,
++                "pages": pages,
++                "case_insensitive": case_insensitive,
++                "fixed_strings": fixed_strings,
++                "output_mode": output_mode,
++                "context_before": context_before,
++                "context_after": context_after,
++                "max_matches": max_matches,
++                "max_results": max_results,
++                "head_limit": head_limit,
++                "offset": offset,
++            },
++            timeout_seconds=self._MAX_SCAN_SECONDS,
++        )
++
++    def _execute_sync(
++        self,
++        pattern: str,
++        path: str = ".",
++        glob: str | None = None,
++        type: str | None = None,
++        pages: str | None = None,
++        case_insensitive: bool = False,
++        fixed_strings: bool = False,
++        output_mode: str = "content",
++        context_before: int = 5,
++        context_after: int = 5,
++        max_matches: int | None = None,
++        max_results: int | None = None,
++        head_limit: int | None = None,
++        offset: int = 0,
++        **kwargs: Any,
++    ) -> str:
+#+END_SRC
+
+#+BEGIN_SRC python :tangle no :comments no
+"""DotCortex child-process boundary for Nanobot filesystem scans."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import sys
+import threading
+from typing import Any
+
+from nanobot.agent.tools.search import FindFilesTool, GrepTool
+from nanobot.config.loader import set_config_path
+
+
+def main() -> int:
+    payload: dict[str, Any] = json.load(sys.stdin)
+    kind = payload.get("kind")
+    arguments = payload.get("arguments")
+    workspace = payload.get("workspace")
+    config_path = payload.get("config_path")
+    if (
+        not isinstance(arguments, dict)
+        or not isinstance(workspace, str)
+        or not isinstance(config_path, str)
+    ):
+        raise ValueError("invalid isolated-search payload")
+    set_config_path(Path(config_path))
+
+    if kind == "find_files":
+        tool = FindFilesTool(workspace=Path(workspace), restrict_to_workspace=False)
+        result = tool._execute_sync(cancelled=threading.Event(), **arguments)
+    elif kind == "grep":
+        tool = GrepTool(workspace=Path(workspace), restrict_to_workspace=False)
+        result = tool._execute_sync(**arguments)
+    else:
+        raise ValueError(f"unknown isolated-search kind: {kind!r}")
+
+    sys.stdout.write(str(result))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+#+END_SRC
+
+The search isolation seam runs the native =grep= and =find_files= implementations
+inside spawned child processes. Their existing path policy, document extraction,
+and output semantics remain Nanobot's own. A 60-second parent deadline prevents
+the gateway event loop from waiting on NFS indefinitely. A child blocked in
+kernel D-state may persist until the NFS RPC returns; the gateway records the
+timeout, limits concurrent search children, and remains responsive.
+
+#+BEGIN_SRC diff :tangle all/.bots/patches/nanobot-tool-isolation.patch :comments no
+--- a/nanobot/agent/tools/execution.py
++++ b/nanobot/agent/tools/execution.py
+@@ -169,6 +169,10 @@
+             if tool_call.name == "read_file" else nullcontext()
+         ):
+             if tool is not None:
+-                result = await tool.execute(**params)
++                if tool_call.name in {"grep", "find_files"}:
++                    from nanobot.agent.tools.search_isolation import isolated_search
++                    result = await isolated_search(tool, params, tool_call.name)
++                else:
++                    result = await tool.execute(**params)
+             else:
+                 result = await tools.execute(tool_call.name, params)
+--- a/nanobot/agent/tools/registry.py
++++ b/nanobot/agent/tools/registry.py
+@@ -194,7 +194,11 @@
+         try:
+             assert tool is not None  # guarded by prepare_call()
+-            result = await tool.execute(**params)
++            if name in {"grep", "find_files"}:
++                from nanobot.agent.tools.search_isolation import isolated_search
++                result = await isolated_search(tool, params, name)
++            else:
++                result = await tool.execute(**params)
+             if is_tool_error_result(result):
+                 return ToolResult.error(str(result) + hint)
+             return result
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.bots/patches/nanobot-search-isolation.py :comments no
+"""Keep filesystem search from blocking Nanobot's gateway event loop."""
+
+from __future__ import annotations
+
+import asyncio
+import multiprocessing
+import os
+from pathlib import Path
+import signal
+import time
+from typing import Any
+
+from nanobot.agent.tools.base import ToolResult
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    current_workspace_scope,
+    reset_workspace_scope,
+)
+
+_MAX_CHILDREN = 4
+_TIMEOUT_SECONDS = 60.0
+
+
+def _child(send: Any, tool: Any, params: dict[str, Any], scope: Any) -> None:
+    if os.name == "posix":
+        os.setsid()
+        try:
+            Path("/proc/self/comm").write_text("nanobot-search\n", encoding="utf-8")
+        except OSError:
+            pass
+    token = bind_workspace_scope(scope) if scope is not None else None
+    try:
+        result = asyncio.run(tool.execute(**params))
+        send.send((bool(getattr(result, "is_error", False)), str(result)))
+    except BaseException as exc:
+        send.send((True, f"Error: {type(exc).__name__}: {exc}"))
+    finally:
+        if token is not None:
+            reset_workspace_scope(token)
+        send.close()
+
+
+async def isolated_search(tool: Any, params: dict[str, Any], name: str,
+                          timeout: float = _TIMEOUT_SECONDS) -> str:
+    """Run native search in a spawned process; return a bounded tool result."""
+    if name not in {"grep", "find_files"}:
+        return ToolResult.error(f"Error: unsupported isolated tool {name}")
+    active = [child for child in multiprocessing.active_children()
+              if child.name == "nanobot-search"]
+    if len(active) >= _MAX_CHILDREN:
+        return ToolResult.error("Error: search workers are still blocked; retry later")
+    ctx = multiprocessing.get_context("spawn")
+    receive, send = ctx.Pipe(duplex=False)
+    child = ctx.Process(target=_child, args=(send, tool, params,
+                                             current_workspace_scope()),
+                        name="nanobot-search", daemon=True)
+    started = False
+    try:
+        child.start()
+        started = True
+        send.close()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if receive.poll(0):
+                try:
+                    is_error, result = receive.recv()
+                except EOFError:
+                    return ToolResult.error(f"Error: {name} search worker exited without a result")
+                return ToolResult.error(result) if is_error else result
+            if not child.is_alive():
+                return ToolResult.error(f"Error: {name} search worker exited without a result")
+            await asyncio.sleep(0.05)
+        return ToolResult.error(
+            f"Error: {name} search worker timed out after {timeout:g} seconds; "
+            "narrow the path and retry"
+        )
+    except asyncio.CancelledError:
+        raise
+    except (OSError, TypeError, ValueError) as exc:
+        return ToolResult.error(f"Error: cannot start {name} search worker: {exc}")
+    finally:
+        receive.close()
+        send.close()
+        if started:
+            child.join(timeout=0.1)
+            if child.is_alive():
+                try:
+                    if os.name == "posix" and os.getpgid(child.pid) == child.pid:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    else:
+                        child.kill()
+                except (OSError, ProcessLookupError):
+                    pass
+                child.join(timeout=0.1)
+#+END_SRC
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-nanobot-search-isolation.py :comments no
+"""Synthetic process-boundary checks; no live gateway or filesystem scan."""
+from __future__ import annotations
+
+import asyncio
+import multiprocessing
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+SOURCE = Path(__file__).resolve().parents[4] / ".bots/patches/nanobot-search-isolation.py"
+MODULE_DIR = tempfile.TemporaryDirectory(prefix="nano-isolation-module-")
+shutil.copyfile(SOURCE, Path(MODULE_DIR.name) / "candidate_search_isolation.py")
+sys.path.insert(0, MODULE_DIR.name)
+from candidate_search_isolation import isolated_search
+from nanobot.agent.tools.search import FindFilesTool, GrepTool
+from nanobot.security.workspace_access import (
+    bind_workspace_scope,
+    current_workspace_scope,
+    default_workspace_scope,
+    reset_workspace_scope,
+)
+
+
+class FakeSearch:
+    def __init__(self, mode: str, pid_file: str | None = None):
+        self.mode = mode
+        self.pid_file = pid_file
+
+    async def execute(self, **_params):
+        if self.mode == "descendant":
+            child = subprocess.Popen(["/bin/sleep", "30"],
+                                     stdin=subprocess.DEVNULL,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+            Path(self.pid_file).write_text(str(child.pid), encoding="utf-8")
+        if self.mode == "hang":
+            await asyncio.sleep(10)
+        if self.mode == "descendant":
+            await asyncio.sleep(10)
+        scope = current_workspace_scope()
+        return str(scope.project_path) if scope else "unscoped"
+
+
+class SearchIsolationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_native_tools_match_isolation_and_reject_outside_workspace(self):
+        with (tempfile.TemporaryDirectory(prefix="nano-native-workspace-") as root,
+              tempfile.TemporaryDirectory(prefix="nano-native-outside-") as outside):
+            workspace = Path(root)
+            outside_dir = Path(outside)
+            (workspace / "inside.txt").write_text("needle\n", encoding="utf-8")
+            outside_file = outside_dir / "outside.txt"
+            secret = "OUTSIDE_SECRET_SENTINEL"
+            outside_file.write_text(secret + "\n", encoding="utf-8")
+            cases = (
+                ("grep", GrepTool(workspace=workspace, allowed_dir=workspace,
+                                   restrict_to_workspace=True),
+                 {"pattern": "needle", "path": str(workspace), "fixed_strings": True,
+                  "context_before": 0, "context_after": 0, "head_limit": 10},
+                 {"pattern": secret, "path": str(outside_file), "fixed_strings": True}),
+                ("find_files", FindFilesTool(workspace=workspace, allowed_dir=workspace,
+                                             restrict_to_workspace=True),
+                 {"path": str(workspace), "glob": "*.txt", "head_limit": 10},
+                 {"path": str(outside_dir), "glob": "*.txt", "head_limit": 10}),
+            )
+            for name, tool, inside_params, outside_params in cases:
+                with self.subTest(tool=name):
+                    native = await tool.execute(**inside_params)
+                    isolated = await isolated_search(tool, inside_params, name, timeout=5)
+                    self.assertFalse(getattr(native, "is_error", False))
+                    self.assertEqual(str(isolated), str(native))
+                    self.assertEqual(getattr(isolated, "is_error", False),
+                                     getattr(native, "is_error", False))
+                    self.assertIn("inside.txt", str(isolated))
+
+                    native_denied = await tool.execute(**outside_params)
+                    isolated_denied = await isolated_search(tool, outside_params, name, timeout=5)
+                    self.assertTrue(getattr(native_denied, "is_error", False))
+                    self.assertEqual(str(isolated_denied), str(native_denied))
+                    self.assertEqual(getattr(isolated_denied, "is_error", False),
+                                     getattr(native_denied, "is_error", False))
+                    self.assertNotIn(secret, str(native_denied))
+                    self.assertNotIn(secret, str(isolated_denied))
+
+    async def test_native_scope_is_transmitted_to_each_search_kind(self):
+        with tempfile.TemporaryDirectory(prefix="nano-scope-") as root:
+            token = bind_workspace_scope(default_workspace_scope(Path(root), True))
+            try:
+                for kind in ("grep", "find_files"):
+                    result = await isolated_search(FakeSearch("return"), {}, kind, timeout=5)
+                    self.assertEqual(result, root)
+            finally:
+                reset_workspace_scope(token)
+
+    async def test_timeout_reaps_synthetic_worker(self):
+        start = time.monotonic()
+        result = await isolated_search(FakeSearch("hang"), {}, "grep", timeout=0.2)
+        self.assertIn("timed out", result)
+        self.assertLess(time.monotonic() - start, 2)
+        self.assertFalse(any(p.name == "nanobot-search" for p in multiprocessing.active_children()))
+
+    async def test_cancel_reaps_synthetic_worker(self):
+        task = asyncio.create_task(isolated_search(FakeSearch("hang"), {}, "find_files", timeout=5))
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertFalse(any(p.name == "nanobot-search" for p in multiprocessing.active_children()))
+
+    async def test_timeout_kills_synthetic_descendant_group(self):
+        with tempfile.TemporaryDirectory(prefix="nano-descendant-") as root:
+            pid_file = Path(root) / "pid"
+            result = await isolated_search(FakeSearch("descendant", str(pid_file)),
+                                           {}, "grep", timeout=3.0)
+            self.assertIn("timed out", result)
+            self.assertTrue(pid_file.is_file())
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            for _ in range(20):
+                stat = Path(f"/proc/{pid}/stat")
+                if not stat.exists() or stat.read_text(encoding="utf-8").rsplit(") ", 1)[1].startswith("Z"):
+                    break
+                await asyncio.sleep(0.05)
+            else:
+                self.fail(f"search descendant {pid} survived group kill")
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
 
 #+BEGIN_SRC bash :tangle linux/.local/bin/nanobot-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 # ~/DotCortex/linux/.local/bin/nanobot-apply
 set -euo pipefail
+
+case "${1:-}" in
+    -h|--help)
+        echo 'Usage: nanobot-apply'
+        echo 'Install or repair the pinned Nano runtime and managed DotCortex seams.'
+        exit 0
+        ;;
+    '') ;;
+    *)
+        echo "nanobot-apply: unknown argument: $1" >&2
+        exit 2
+        ;;
+esac
 
 NANOBOT_VERSION="0.3.5"
 WORKSPACE="${NANOBOT_WORKSPACE:-$HOME/HelmCortex/FORGE/brain/nanobot}"
@@ -330,6 +1442,11 @@ VENV="${NANOBOT_VENV:-$WORKSPACE/.venv}"
 CONFIG_DIR="${NANOBOT_CONFIG_DIR:-$HOME/.config/nanobot-telegram}"
 CONFIG="${NANOBOT_CONFIG:-$CONFIG_DIR/config.json}"
 TEMPLATE="${NANOBOT_CONFIG_TEMPLATE:-$HOME/DotCortex/all/.bots/templates/nanobot-config.json}"
+POLICY_PATCH="${NANOBOT_CACHE_POLICY_PATCH:-$HOME/DotCortex/all/.bots/patches/nanobot-cache-policy.patch}"
+VOICE_PATCH="${NANOBOT_VOICE_REPLY_PATCH:-$HOME/DotCortex/all/.bots/patches/nanobot-voice-reply.patch}"
+TOOL_PATCH="${NANOBOT_TOOL_PATCH:-$HOME/DotCortex/all/.bots/patches/nanobot-tool-isolation.patch}"
+SEARCH_ISOLATION="${NANOBOT_SEARCH_ISOLATION:-$HOME/DotCortex/all/.bots/patches/nanobot-search-isolation.py}"
+PATCH_STAMP="$VENV/.dotcortex-runtime-patches.sha256"
 
 export PATH="$HOME/.local/bin:$PATH"
 export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
@@ -355,12 +1472,97 @@ uv pip install --upgrade --python "$VENV/bin/python" \
     "python-telegram-bot[socks,webhooks]>=22.6,<23.0" \
     "python-socks[asyncio]>=2.8,<3.0"
 
+SITE_PACKAGES="$($VENV/bin/python -c 'import site; print(site.getsitepackages()[0])')"
+AUTOCOMPACT="$SITE_PACKAGES/nanobot/agent/autocompact.py"
+TELEGRAM_RUNTIME="$SITE_PACKAGES/nanobot/channels/telegram/runtime.py"
+EXECUTION_MODULE="$SITE_PACKAGES/nanobot/agent/tools/execution.py"
+REGISTRY_MODULE="$SITE_PACKAGES/nanobot/agent/tools/registry.py"
+INSTALLED_SEARCH_ISOLATION="$SITE_PACKAGES/nanobot/agent/tools/search_isolation.py"
+for managed_file in "$POLICY_PATCH" "$VOICE_PATCH" "$TOOL_PATCH" "$SEARCH_ISOLATION"; do
+    [ -r "$managed_file" ] || {
+        echo "nanobot-apply: managed runtime input is missing: $managed_file" >&2
+        exit 1
+    }
+done
+PATCH_HASH="$(sha256sum "$POLICY_PATCH" "$VOICE_PATCH" "$TOOL_PATCH" "$SEARCH_ISOLATION" | sha256sum | awk '{print $1}')"
+INSTALLED_PATCH_HASH="$(sed -n '1p' "$PATCH_STAMP" 2>/dev/null || true)"
+if grep -q 'Auto-compact policy shadow candidate' "$AUTOCOMPACT" \
+        && grep -q 'Feed the shared DotCortex relay' "$TELEGRAM_RUNTIME" \
+        && grep -q 'search_isolation import isolated_search' "$EXECUTION_MODULE" \
+        && grep -q 'search_isolation import isolated_search' "$REGISTRY_MODULE" \
+        && [ -r "$INSTALLED_SEARCH_ISOLATION" ] \
+        && cmp -s "$SEARCH_ISOLATION" "$INSTALLED_SEARCH_ISOLATION" \
+        && [ "$INSTALLED_PATCH_HASH" = "$PATCH_HASH" ]; then
+    echo "nanobot-apply: managed runtime seams already present"
+else
+    if grep -q 'Auto-compact policy shadow candidate' "$AUTOCOMPACT" \
+            || grep -q 'Feed the shared DotCortex relay' "$TELEGRAM_RUNTIME" \
+            || grep -q 'search_isolation import isolated_search' "$EXECUTION_MODULE" \
+            || grep -q 'search_isolation import isolated_search' "$REGISTRY_MODULE"; then
+        uv pip install --reinstall-package nanobot-ai --no-deps \
+            --python "$VENV/bin/python" "nanobot-ai==$NANOBOT_VERSION"
+    fi
+    for managed_patch in "$POLICY_PATCH" "$VOICE_PATCH" "$TOOL_PATCH"; do
+        if ! patch --dry-run --silent -d "$SITE_PACKAGES" -p1 < "$managed_patch"; then
+            echo "nanobot-apply: nanobot $NANOBOT_VERSION drifted from $managed_patch; refusing an unmanaged runtime" >&2
+            exit 1
+        fi
+        patch --silent -d "$SITE_PACKAGES" -p1 < "$managed_patch"
+    done
+    install -m 644 "$SEARCH_ISOLATION" "$INSTALLED_SEARCH_ISOLATION"
+    printf '%s\n' "$PATCH_HASH" > "$PATCH_STAMP"
+    echo "nanobot-apply: installed cache-policy, voice-reply, and search-isolation seams"
+fi
+
 if [ ! -e "$CONFIG" ]; then
     install -m 600 "$TEMPLATE" "$CONFIG"
     echo "nanobot-apply: installed non-secret config template at $CONFIG"
 else
     chmod 600 "$CONFIG"
 fi
+
+"$VENV/bin/python" - "$CONFIG" "$TEMPLATE" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+
+config_path = Path(sys.argv[1])
+template_path = Path(sys.argv[2])
+
+with config_path.open("r", encoding="utf-8") as fh:
+    current = json.load(fh)
+with template_path.open("r", encoding="utf-8") as fh:
+    managed = json.load(fh)
+if not isinstance(current, dict) or not isinstance(managed, dict):
+    raise SystemExit("nanobot-apply: config and template must be JSON objects")
+
+def overlay(base, update):
+    for key, value in update.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            overlay(base[key], value)
+        else:
+            base[key] = value
+
+overlay(current, managed)
+fd, temporary = tempfile.mkstemp(prefix=".config.json.", dir=config_path.parent)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(current, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, config_path)
+except BaseException:
+    try:
+        os.unlink(temporary)
+    except FileNotFoundError:
+        pass
+    raise
+PY
+echo "nanobot-apply: reconciled managed config from $TEMPLATE"
 
 "$VENV/bin/nanobot" onboard --refresh --config "$CONFIG" --workspace "$WORKSPACE"
 "$VENV/bin/nanobot" --version
@@ -388,6 +1590,18 @@ fi
 printf 'workspace: %s\nconfig: %s\n' "$WORKSPACE" "$CONFIG"
 if [ -r "$CONFIG" ]; then
     stat -c 'config mode: %a' "$CONFIG"
+    "$VENV/bin/python" - "$CONFIG" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+tools = data.get("tools", {})
+servers = tools.get("mcpServers", {})
+print(f"workspace restriction: {tools.get('restrictToWorkspace')}")
+print(f"exec sandbox: {tools.get('exec', {}).get('sandbox')!r}")
+print("mcp servers: " + ", ".join(sorted(servers)))
+PY
 else
     echo "config: MISSING"
     exit 1
