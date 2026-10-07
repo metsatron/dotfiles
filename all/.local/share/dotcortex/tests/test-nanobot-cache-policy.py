@@ -261,7 +261,9 @@ class PolicyDecisionTest(unittest.TestCase):
         for evidence in ([], {}, policy | dict(fresh_until=stale),
                          policy | dict(entries=[entry | dict(fresh_until=stale)]),
                          policy | dict(entries=[entry | dict(endpoint_id="other")]),
-                         policy | dict(entries=[entry | dict(compact_before_seconds=59)])):
+                         policy | dict(entries=[entry | dict(compact_before_seconds=59)]),
+                         policy | dict(entries=[entry | dict(mode="fallback")]),
+                         policy | dict(entries=[entry | dict(mode=None)])):
             self.assertIsNone(self.resolve(evidence=evidence)[0])
 
 
