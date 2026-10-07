@@ -16,6 +16,8 @@ spec.loader.exec_module(fixture)
 from ductor_bot.api.crypto import E2ESession
 from ductor_bot.api.server import _SecureChannel
 from ductor_bot.api import idle_prompt as seam
+from ductor_bot.bus.bus import MessageBus
+from ductor_bot.bus.envelope import LockMode, Origin
 
 
 class Socket:
@@ -41,6 +43,17 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
     def prepare(self):
         self.server.set_idle_message_handler(lambda channel, key, data:
             seam.handle_idle_message(self.orch, self.server, channel, key, data))
+        self.telegram = []
+        test = self
+        class Telegram:
+            transport_name = "tg"
+            async def deliver(inner, envelope):
+                test.telegram.append(envelope)
+            async def deliver_broadcast(inner, envelope):
+                raise AssertionError("wake reply must be unicast")
+        bus = MessageBus(self.orch._lock_pool)
+        bus.register_transport(Telegram())
+        self.orch._message_bus = bus
         self.calls = []
         self.entered = asyncio.Event(); self.finish = asyncio.Event()
         async def handler(key, text):
@@ -53,7 +66,8 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
 
     async def route(self, client, channel, **overrides):
         payload = {"type": "idle_message", "request_id": "a" * 32,
-                   "session_key": fixture.KEY.storage_key, "text": "MailCortex delivery"}
+                   "session_key": fixture.KEY.storage_key, "text": "MailCortex delivery",
+                   "mirror_to_telegram": True}
         payload.update(overrides)
         await self.server._route_text_message(channel, client.encrypt(payload), fixture.KEY,
             self.server._lock_pool.get(fixture.KEY.lock_key))
@@ -74,6 +88,12 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
         await self.settle()
         self.assertFalse(self.orch._lock_pool.is_locked(fixture.KEY.lock_key))
         self.assertFalse(self.server._lock_pool.is_locked(fixture.KEY.lock_key))
+        self.assertEqual(len(self.telegram), 1)
+        envelope = self.telegram[0]
+        self.assertEqual((envelope.origin, envelope.chat_id, envelope.topic_id,
+                          envelope.transport, envelope.result_text, envelope.lock_mode),
+                         (Origin.WEBHOOK_WAKE, fixture.KEY.chat_id, fixture.KEY.topic_id,
+                          "tg", "handled", LockMode.NONE))
 
     async def test_mid_turn_nacks_without_dispatch_and_can_retry_when_idle(self):
         self.prepare(); client, channel = self.channel()
@@ -127,12 +147,16 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_authority_identity_or_peer_fails_closed(self):
         self.prepare()
-        for change in ({"session_key": "tg:2"}, {"request_id": "bad"}, {"text": ""}):
+        for change in ({"session_key": "tg:2"}, {"request_id": "bad"}, {"text": ""},
+                       {"mirror_to_telegram": False}):
             client, channel = self.channel()
             self.assertNotEqual((await self.route(client, channel, **change))[-1]["status"], "accepted")
         client, channel = self.channel(allowed=False)
         self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
         client, channel = self.channel()
+        self.orch._message_bus = None
+        self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
+        self.prepare(); client, channel = self.channel()
         self.orch._lock_pool = None
         self.assertEqual((await self.route(client, channel))[-1]["status"], "unavailable")
         self.assertEqual(self.calls, [])
@@ -287,6 +311,7 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(socket.auth_socket.auth), {"type", "token", "e2e_pk"})
         self.assertEqual(socket.sent[0]["type"], "idle_message")
         self.assertEqual(socket.sent[0]["session_key"], fixture.KEY.storage_key)
+        self.assertIs(socket.sent[0]["mirror_to_telegram"], True)
         await self.entered.wait(); await self.settle()
         self.assertEqual(len(self.calls), 1)
 
@@ -372,7 +397,7 @@ class IdlePromptTests(unittest.IsolatedAsyncioTestCase):
         server = self.orch._api_stop.__self__
         self.assertIsNotNone(server._idle_message_handler)
         response = await server._handle_busy(fixture.BusyTests.request(self))
-        self.assertEqual(json.loads(response.text)["idle_prompt"], "ductor.idle_prompt.v1")
+        self.assertEqual(json.loads(response.text)["idle_prompt"], "ductor.idle_prompt.v2")
 
 
 if __name__ == "__main__":

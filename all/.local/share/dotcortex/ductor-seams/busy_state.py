@@ -67,7 +67,7 @@ async def handle_busy_request(server, request):
     try:
         state = await handler()
         if getattr(server, "_idle_message_handler", None) is not None:
-            state["idle_prompt"] = "ductor.idle_prompt.v1"
+            state["idle_prompt"] = "ductor.idle_prompt.v2"
         return reply(state)
     except Exception:
         logger.exception("Main-session busy authority failed")
