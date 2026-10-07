@@ -8,7 +8,7 @@ from ductor_bot.api.busy_state import _loopback, main_busy_state
 from ductor_bot.session.key import SessionKey
 
 logger = logging.getLogger(__name__)
-PROTOCOL = "ductor.idle_prompt.v1"
+PROTOCOL = "ductor.idle_prompt.v2"
 
 
 def idle_peer_allowed(server, request):
@@ -30,6 +30,15 @@ async def _run_turn(orch, server, channel, key, text, start):
     try:
         await start.wait()
         result = await orch.handle_message_streaming(key, text)
+        from ductor_bot.bus.adapters import from_webhook_wake
+        from ductor_bot.bus.envelope import LockMode
+        envelope = from_webhook_wake(key.chat_id, text)
+        envelope.topic_id = key.topic_id
+        envelope.transport = key.transport
+        envelope.result_text = result.text
+        envelope.status = "success"
+        envelope.lock_mode = LockMode.NONE
+        await orch._message_bus.submit(envelope)
         logger.info("Idle-admitted turn completed key=%s", key.storage_key)
         await channel.send({"type": "result", "text": result.text,
                             "stream_fallback": result.stream_fallback})
@@ -44,12 +53,17 @@ async def handle_idle_message(orch, server, channel, key, data):
     async def reply(status):
         await channel.send({"type": "idle_admission", "request_id": request_id,
                             "session_key": key.storage_key, "status": status})
-    if (set(data) != {"type", "request_id", "session_key", "text"}
+    if (set(data) != {"type", "request_id", "session_key", "text", "mirror_to_telegram"}
             or not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id)
             or not isinstance(data.get("text"), str) or not data["text"].strip()
-            or len(data["text"]) > 16000 or data["session_key"] != key.storage_key):
+            or len(data["text"]) > 16000 or data["session_key"] != key.storage_key
+            or data["mirror_to_telegram"] is not True):
         await reply("invalid"); return
-    if (not channel.idle_prompt_allowed or key != SessionKey(chat_id=server._default_chat_id)):
+    bus = getattr(orch, "_message_bus", None)
+    telegram = any(getattr(item, "transport_name", None) == "tg"
+                   for item in getattr(bus, "_transports", ()))
+    if (not channel.idle_prompt_allowed or key != SessionKey(chat_id=server._default_chat_id)
+            or key.transport != "tg" or not callable(getattr(bus, "submit", None)) or not telegram):
         await reply("unavailable"); return
     try:
         state = await main_busy_state(orch, server)
