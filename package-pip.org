@@ -331,64 +331,208 @@ policy. Upstream auto-compaction remains explicitly disabled in config; the
 scanner remains disabled whenever policy is missing, stale, unsupported, or
 unreadable. Nano explicitly accepts either the fully supported tier or a
 repeatable observed endpoint/model transition; weaker evidence cannot arm it.
+The runtime consumer binds the physical endpoint and wire model, validates fresh
+evidence and ordered timers, and keeps an immutable 70,000-token floor. The
+minimum-token environment setting can raise that floor; unknown routes or
+estimates disable scheduling.
 
 #+BEGIN_SRC diff :tangle all/.bots/patches/nanobot-cache-policy.patch :comments no
 --- a/nanobot/agent/autocompact.py
 +++ b/nanobot/agent/autocompact.py
-@@ -4,6 +4,10 @@
+@@ -3,8 +3,15 @@
+ from __future__ import annotations
  
  from collections.abc import Collection
- from datetime import datetime
+-from datetime import datetime
++from datetime import datetime, timezone
 +import json
++import math
++import re
 +import os
 +from pathlib import Path
 +import subprocess
  from typing import TYPE_CHECKING, Any, Callable, Coroutine
++from urllib.parse import urlsplit
  
  from loguru import logger
-@@ -36,9 +40,51 @@
+ 
+@@ -36,9 +43,185 @@
          self._summaries: dict[str, SessionSummary] = {}
          self._bind_events = bind_events
  
 +    @staticmethod
++    def _policy_identity(runtime: LLMRuntime) -> tuple[str, str, str] | None:
++        """Bind evidence to a proven wire route, never a provider display label."""
++        from nanobot.providers.anthropic_provider import AnthropicProvider
++        from nanobot.providers.openai_codex_provider import (
++            DEFAULT_CODEX_URL, OpenAICodexProvider, _strip_model_prefix,
++        )
++        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
++
++        provider = runtime.provider
++        model = runtime.model
++        name = provider.provider_name
++        if not isinstance(model, str) or not model.strip():
++            return None
++        if not isinstance(name, str) or not name.strip():
++            return None
++        # Overrides and failover wrappers can select a different physical model.
++        # Unknown provider implementations remain disabled until explicitly bound.
++        if type(provider) is OpenAICodexProvider:
++            if (DEFAULT_CODEX_URL != "https://chatgpt.com/backend-api/codex/responses"
++                    or provider.api_base is not None
++                    or "model" in provider._extra_body):
++                return None
++            return "openai", "openai-codex-oauth", _strip_model_prefix(model).lower().replace("_", "-")
++        if type(provider) is OpenAICompatProvider:
++            if "model" in provider._extra_body or provider._extra_query:
++                return None
++            endpoint = (str(provider._client.base_url) if provider._client is not None
++                        else provider._effective_base)
++            model = provider._request_model_name(model)
++        elif type(provider) is AnthropicProvider:
++            endpoint = str(provider._client.base_url)
++            model = provider._strip_prefix(model)
++        else:
++            return None
++        if not isinstance(endpoint, str) or not endpoint.strip():
++            return None
++        parsed = urlsplit(endpoint)
++        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
++                or parsed.username or parsed.password or parsed.query or parsed.fragment):
++            return None
++        name = name.strip().lower().replace("_", "-")
++        name = {"openai-codex": "openai", "openai-codex-oauth": "openai"}.get(name, name)
++        model = model.strip().lower().replace("_", "-")
++        if name == "anthropic":
++            model = re.sub(r"[ .]+", "-", model)
++            model = re.sub(r"-+", "-", model).strip("-")
++            if not model.startswith("claude-"):
++                model = "claude-" + model
++        if not model:
++            return None
++        return name, endpoint.strip().rstrip("/").lower().replace("_", "-"), model
++
++    @staticmethod
++    def _policy_env_integer(name: str, default: str) -> int:
++        value = os.environ.get(name, default)
++        if not value or not value.isascii() or not value.isdecimal():
++            raise ValueError("invalid cache-policy environment integer")
++        result = int(value)
++        if not math.isfinite(result):
++            raise ValueError("nonfinite cache-policy environment integer")
++        return result
++
++    @staticmethod
++    def _policy_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
++        result: dict[str, Any] = {}
++        for key, value in pairs:
++            if key in result:
++                raise ValueError("duplicate cache-policy key")
++            result[key] = value
++        return result
++
++    @staticmethod
 +    def _policy_ttl_seconds(runtime: LLMRuntime) -> float | None:
-+        fallback_compact = int(os.environ.get(
-+            "NANOBOT_CACHE_POLICY_FALLBACK_COMPACT_SECONDS", "1620"
-+        ))
-+        fallback_cache = int(os.environ.get(
-+            "NANOBOT_CACHE_POLICY_FALLBACK_CACHE_SECONDS", "1800"
-+        ))
-+        helper = Path(os.environ.get(
-+            "FLEET_CACHE_POLICY_HELPER",
-+            str(Path.home() / "HelmCortex/FORGE/bin/cache-policy"),
-+        )).expanduser()
-+        policy = Path(os.environ.get(
-+            "FLEET_CACHE_POLICY_PATH",
-+            str(Path.home() / "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json"),
-+        )).expanduser()
-+        provider = str(getattr(runtime.provider, "provider_name", "unknown"))
 +        try:
++            identity = AutoCompact._policy_identity(runtime)
++            if identity is None:
++                return None
++            provider, endpoint, model = identity
++            fallback_compact = AutoCompact._policy_env_integer(
++                "NANOBOT_CACHE_POLICY_FALLBACK_COMPACT_SECONDS", "1620",
++            )
++            fallback_cache = AutoCompact._policy_env_integer(
++                "NANOBOT_CACHE_POLICY_FALLBACK_CACHE_SECONDS", "1800",
++            )
++            if not 0 < fallback_compact < fallback_cache:
++                return None
++            if os.environ.get("NANOBOT_CACHE_POLICY_MODE", "enforce") not in {"enforce", "shadow"}:
++                return None
++            helper_value = os.environ.get(
++                "FLEET_CACHE_POLICY_HELPER",
++                str(Path.home() / "HelmCortex/FORGE/bin/cache-policy"),
++            )
++            policy_value = os.environ.get(
++                "FLEET_CACHE_POLICY_PATH",
++                str(Path.home() / "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json"),
++            )
++            if not helper_value.strip() or not policy_value.strip():
++                return None
++            helper = Path(helper_value).expanduser()
++            policy = Path(policy_value).expanduser()
 +            completed = subprocess.run(
 +                [str(helper), "resolve", "--policy", str(policy),
 +                 "--harness", "nanobot", "--provider", provider,
-+                 "--endpoint", provider, "--model", runtime.model,
++                 "--endpoint", endpoint, "--model", model,
 +                 "--fallback-compact", str(fallback_compact),
-+                 "--fallback-cache", str(fallback_cache),
-+                 "--allow-observed"],
++                 "--fallback-cache", str(fallback_cache), "--allow-observed"],
 +                capture_output=True, text=True, timeout=5, check=True,
 +            )
-+            decision = json.loads(completed.stdout)
-+            mode = str(decision.get("mode") or "fallback")
-+            seconds = (float(decision["compact_before_seconds"])
-+                       if mode in {"measured", "observed"} else None)
-+        except (OSError, ValueError, KeyError, subprocess.SubprocessError):
-+            seconds, mode = None, "fallback-error"
++            decision = json.loads(completed.stdout, object_pairs_hook=AutoCompact._policy_json_object)
++            if not isinstance(decision, dict):
++                return None
++            mode, confidence = decision.get("mode"), decision.get("confidence")
++            if (mode, confidence) not in (("measured", "supported"), ("observed", "observed")):
++                return None
++            if (decision.get("provider"), decision.get("endpoint_id"), decision.get("model")) != identity:
++                return None
++            compact, expiry = decision.get("compact_before_seconds"), decision.get("cache_expires_seconds")
++            if any(type(value) not in (int, float) or not math.isfinite(value)
++                   for value in (compact, expiry)):
++                return None
++            if not 0 < compact < expiry:
++                return None
++            stamp = decision.get("observed_at")
++            if not isinstance(stamp, str):
++                return None
++            observed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
++            if observed.tzinfo is None:
++                return None
++            age = (datetime.now(timezone.utc) - observed).total_seconds()
++            # The resolver also checks policy/entry fresh_until. Independently
++            # reject stale or future evidence using its 24-hour freshness contract.
++            if not 0 <= age < 24 * 60 * 60:
++                return None
++            # The resolver normalizes numbers with int(). Validate the selected
++            # source evidence too, so coercion cannot arm malformed policy data.
++            evidence = json.loads(policy.read_text(encoding="utf-8"),
++                                  object_pairs_hook=AutoCompact._policy_json_object)
++            if not isinstance(evidence, dict) or evidence.get("format") != "cache-policy.v1":
++                return None
++            def fresh_until(value: Any) -> bool:
++                if not isinstance(value, str):
++                    return False
++                stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
++                return stamp.tzinfo is not None and stamp > datetime.now(timezone.utc)
++            if not fresh_until(evidence.get("fresh_until")):
++                return None
++            entries = evidence.get("entries")
++            source_harness = decision.get("source_harness")
++            if (not isinstance(entries, list) or not isinstance(source_harness, str)
++                    or not source_harness):
++                return None
++            matches = [entry for entry in entries if isinstance(entry, dict)
++                       and (entry.get("provider"), entry.get("endpoint_id"), entry.get("model")) == identity
++                       and entry.get("harness") == source_harness
++                       and entry.get("confidence") == confidence
++                       and entry.get("observed_at") == decision.get("observed_at")]
++            if not matches:
++                return None
++            for entry in matches:
++                timers = (entry.get("compact_before_seconds"), entry.get("cache_expires_seconds"))
++                if (any(type(value) not in (int, float) or not math.isfinite(value) for value in timers)
++                        or timers != (compact, expiry) or not 0 < timers[0] < timers[1]
++                        or not fresh_until(entry.get("fresh_until"))):
++                    return None
++        except (AttributeError, ImportError, OSError, OverflowError, TypeError,
++                ValueError, KeyError, subprocess.SubprocessError):
++            return None
 +        logger.debug(
-+            "Auto-compact policy provider={} model={} mode={} threshold={}",
-+            provider, runtime.model, mode,
-+            "disabled" if seconds is None else f"{int(seconds)}s",
++            "Auto-compact policy provider={} model={} mode={} threshold={}s",
++            provider, model, mode, compact,
 +        )
-+        return None if seconds is None else max(60.0, seconds)
++        return float(compact)
 +
      def _is_expired(self, ts: datetime | str | None,
 -                    now: datetime | None = None) -> bool:
@@ -400,7 +544,7 @@ repeatable observed endpoint/model transition; weaker evidence cannot arm it.
              return False
          try:
              if isinstance(ts, str):
-@@ -52,7 +98,7 @@
+@@ -52,7 +235,7 @@
              # list_sessions() forwards raw persisted metadata; an unusable value
              # must not escape the idle scan and stop the agent loop.
              return False
@@ -409,7 +553,7 @@ repeatable observed endpoint/model transition; weaker evidence cannot arm it.
  
      def _has_unarchived_messages(self, key: str) -> bool:
          session = self.sessions.get_or_create(key)
-@@ -80,12 +126,39 @@
+@@ -80,12 +263,47 @@
              if key in active_session_keys:
                  continue
              updated_at = info.get("updated_at")
@@ -435,10 +579,18 @@ repeatable observed endpoint/model transition; weaker evidence cannot arm it.
 +                            session, runtime=runtime,
 +                        )
 +                    )
-+                    min_tokens = max(1, int(os.environ.get(
-+                        "NANOBOT_CACHE_POLICY_MIN_TOKENS", "70000"
-+                    )))
-+                except (OSError, TypeError, ValueError):
++                    min_tokens = max(70000, self._policy_env_integer(
++                        "NANOBOT_CACHE_POLICY_MIN_TOKENS", "70000",
++                    ))
++                    if (type(estimated_tokens) not in (int, float)
++                            or not math.isfinite(estimated_tokens) or estimated_tokens <= 0
++                            or not isinstance(estimate_source, str)
++                            or estimate_source not in {"tiktoken", "heuristic", "provider_counter"}):
++                        continue
++                    mode = os.environ.get("NANOBOT_CACHE_POLICY_MODE", "enforce")
++                    if mode not in {"enforce", "shadow"}:
++                        continue
++                except (OSError, OverflowError, TypeError, ValueError):
 +                    continue
 +                if estimated_tokens < min_tokens:
 +                    logger.debug(
@@ -457,11 +609,13 @@ repeatable observed endpoint/model transition; weaker evidence cannot arm it.
 #+END_SRC
 
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-nanobot-cache-policy.py :comments no
-"""Behavior checks for Nano's measured cache-expiry token gate."""
+"""Fail-closed behavior checks for Nano's runtime cache-policy consumer."""
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import os
+import json
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -493,18 +647,25 @@ class FakeConsolidator:
         self.estimated_tokens = estimated_tokens
 
     def estimate_session_prompt_tokens(self, _session, *, runtime):
-        return self.estimated_tokens, "fixture"
+        return self.estimated_tokens, getattr(self, "source", "tiktoken")
 
 
 class NanoCachePolicyTest(unittest.TestCase):
-    def run_scan(self, estimated_tokens: int) -> int:
+    def run_scan(self, estimated_tokens, *, minimum="70000", source="tiktoken",
+                 mode="enforce", key="telegram:approved", active=(), archiving=False) -> int:
         session = FakeSession()
-        compact = AutoCompact(FakeSessions(session), FakeConsolidator(estimated_tokens))
+        session.key = key
+        counter = FakeConsolidator(estimated_tokens)
+        counter.source = source
+        compact = AutoCompact(FakeSessions(session), counter)
+        if archiving:
+            compact._archiving.add(key)
         scheduled = []
         runtime = object()
         with mock.patch.object(AutoCompact, "_policy_ttl_seconds", return_value=60), \
-             mock.patch.dict(os.environ, {"NANOBOT_CACHE_POLICY_MIN_TOKENS": "70000"}):
-            compact.check_expired(scheduled.append, lambda _session: runtime)
+             mock.patch.dict(os.environ, {"NANOBOT_CACHE_POLICY_MIN_TOKENS": minimum,
+                                          "NANOBOT_CACHE_POLICY_MODE": mode}):
+            compact.check_expired(scheduled.append, lambda _session: runtime, active)
         for coroutine in scheduled:
             coroutine.close()
         return len(scheduled)
@@ -514,6 +675,205 @@ class NanoCachePolicyTest(unittest.TestCase):
 
     def test_expiry_at_token_gate_forces_compaction(self) -> None:
         self.assertEqual(self.run_scan(70000), 1)
+
+
+    def test_floor_cannot_be_lowered(self):
+        for minimum in ("1", "0", "69999"):
+            with self.subTest(minimum=minimum):
+                self.assertEqual(self.run_scan(69999, minimum=minimum), 0)
+                self.assertEqual(self.run_scan(70000, minimum=minimum), 1)
+
+    def test_floor_can_be_raised(self):
+        self.assertEqual(self.run_scan(70000, minimum="80000"), 0)
+        self.assertEqual(self.run_scan(80000, minimum="80000"), 1)
+
+    def test_bad_minimum_disables_without_scan_crash(self):
+        for minimum in ("", "NaN", "Infinity", "true", "70000.0", "-1", " 70000", "７００００"):
+            with self.subTest(minimum=minimum):
+                self.assertEqual(self.run_scan(90000, minimum=minimum), 0)
+
+    def test_bad_estimates_disable_without_scan_crash(self):
+        for tokens in (None, True, False, "90000", [], {}, float("nan"), float("inf"), -1, 0):
+            with self.subTest(tokens=tokens):
+                self.assertEqual(self.run_scan(tokens), 0)
+
+    def test_unknown_sources_disable(self):
+        for source in (None, "", "none", "unknown", "invented", [], True):
+            with self.subTest(source=source):
+                self.assertEqual(self.run_scan(90000, source=source), 0)
+
+    def test_shadow_and_invalid_modes_do_not_archive(self):
+        for mode in ("shadow", "", "typo"):
+            self.assertEqual(self.run_scan(90000, mode=mode), 0)
+
+    def test_active_dream_and_archiving_sessions_remain_excluded(self):
+        self.assertEqual(self.run_scan(90000, active=("telegram:approved",)), 0)
+        self.assertEqual(self.run_scan(90000, key="dream:probe"), 0)
+        self.assertEqual(self.run_scan(90000, archiving=True), 0)
+
+
+class PolicyDecisionTest(unittest.TestCase):
+    def setUp(self):
+        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
+        self.provider = OpenAICompatProvider(api_key="fixture", api_base="https://fixture.invalid/v1",
+                                             provider_name="custom")
+        from nanobot.utils.llm_runtime import LLMRuntime
+        self.runtime = LLMRuntime.capture(self.provider, "fixture-model", context_window_tokens=100000)
+        self.decision = dict(mode="measured", confidence="supported", compact_before_seconds=60,
+                             cache_expires_seconds=120, provider="custom",
+                             endpoint_id="https://fixture.invalid/v1", model="fixture-model",
+                             observed_at=datetime.now(timezone.utc).isoformat(), source_harness="nanobot")
+
+    def resolve(self, decision=None, *, raw=None, runtime=None, env=None, evidence=None):
+        output = json.dumps(self.decision if decision is None else decision) if raw is None else raw
+        entry = dict(self.decision if decision is None else decision)
+        entry.update(harness=entry.get("source_harness"),
+                     fresh_until=(datetime.now(timezone.utc) + timedelta(hours=1)).isoformat())
+        policy = evidence if evidence is not None else dict(format="cache-policy.v1",
+                     fresh_until=entry["fresh_until"], entries=[entry])
+        with mock.patch("nanobot.agent.autocompact.subprocess.run",
+                        return_value=SimpleNamespace(stdout=output)) as run, \
+             mock.patch.dict(os.environ, env or {}, clear=True), \
+             mock.patch("nanobot.agent.autocompact.Path.read_text", return_value=json.dumps(policy)):
+            result = AutoCompact._policy_ttl_seconds(runtime or self.runtime)
+        return result, run
+
+    def test_supported_and_observed_accept_exact_route(self):
+        for mode, confidence in (("measured", "supported"), ("observed", "observed")):
+            decision = self.decision | dict(mode=mode, confidence=confidence)
+            result, run = self.resolve(decision)
+            self.assertEqual(result, 60)
+            args = run.call_args.args[0]
+            self.assertEqual(args[args.index("--endpoint") + 1], "https://fixture.invalid/v1")
+            self.assertEqual(args[args.index("--model") + 1], "fixture-model")
+            self.assertIn("--allow-observed", args)
+
+    def test_confidence_and_fallback_fail_closed(self):
+        for mode, confidence in (("measured", "observed"), ("observed", "supported"),
+                                 ("fallback", "supported"), ("measured", None),
+                                 ("unsupported", "supported"), ([], "supported")):
+            with self.subTest(mode=mode, confidence=confidence):
+                self.assertIsNone(self.resolve(self.decision | dict(mode=mode, confidence=confidence))[0])
+
+    def test_nonobjects_and_bad_json_fail_closed(self):
+        for raw in ("[]", "null", "true", '"string"', "1", "garbage"):
+            with self.subTest(raw=raw):
+                self.assertIsNone(self.resolve(raw=raw)[0])
+
+    def test_bad_or_unordered_durations_fail_closed(self):
+        for field in ("compact_before_seconds", "cache_expires_seconds"):
+            for value in (None, True, "60", float("nan"), float("inf"), -1, 0, []):
+                with self.subTest(field=field, value=value):
+                    self.assertIsNone(self.resolve(self.decision | {field: value})[0])
+        for expiry in (59, 60):
+            self.assertIsNone(self.resolve(self.decision | dict(cache_expires_seconds=expiry))[0])
+
+    def test_missing_fields_fail_closed(self):
+        for field in self.decision:
+            decision = self.decision.copy()
+            del decision[field]
+            with self.subTest(field=field):
+                self.assertIsNone(self.resolve(decision)[0])
+
+    def test_mismatched_route_model_provider_fail_closed(self):
+        for field in ("provider", "endpoint_id", "model"):
+            self.assertIsNone(self.resolve(self.decision | {field: "other"})[0])
+
+    def test_stale_future_and_bad_evidence_dates_fail_closed(self):
+        for stamp in (None, "", "invalid", datetime.now().isoformat(),
+                      (datetime.now(timezone.utc) - timedelta(hours=25)).isoformat(),
+                      (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()):
+            with self.subTest(stamp=stamp):
+                self.assertIsNone(self.resolve(self.decision | dict(observed_at=stamp))[0])
+
+    def test_environment_validation_fail_closed(self):
+        for env in ({"NANOBOT_CACHE_POLICY_FALLBACK_COMPACT_SECONDS": "bad"},
+                    {"NANOBOT_CACHE_POLICY_FALLBACK_CACHE_SECONDS": "NaN"},
+                    {"NANOBOT_CACHE_POLICY_FALLBACK_COMPACT_SECONDS": "1800"},
+                    {"NANOBOT_CACHE_POLICY_FALLBACK_CACHE_SECONDS": "0"},
+                    {"FLEET_CACHE_POLICY_HELPER": ""}, {"FLEET_CACHE_POLICY_PATH": ""}):
+            with self.subTest(env=env):
+                self.assertIsNone(self.resolve(env=env)[0])
+
+    def test_helper_errors_fail_closed(self):
+        import subprocess
+        for error in (OSError(), subprocess.TimeoutExpired("fixture", 5),
+                      subprocess.CalledProcessError(1, "fixture")):
+            with mock.patch("nanobot.agent.autocompact.subprocess.run", side_effect=error):
+                self.assertIsNone(AutoCompact._policy_ttl_seconds(self.runtime))
+
+    def test_oauth_actual_class_and_wire_model(self):
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        provider = OpenAICodexProvider(default_model="openai-codex/fixture-model")
+        from nanobot.utils.llm_runtime import LLMRuntime
+        runtime = LLMRuntime.capture(provider, "openai-codex/fixture-model", context_window_tokens=100000)
+        decision = self.decision | dict(provider="openai", endpoint_id="openai-codex-oauth")
+        result, run = self.resolve(decision, runtime=runtime)
+        self.assertEqual(result, 60)
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--endpoint") + 1], "openai-codex-oauth")
+        self.assertEqual(args[args.index("--model") + 1], "fixture-model")
+
+    def test_provider_label_cannot_impersonate_oauth(self):
+        runtime = SimpleNamespace(provider=SimpleNamespace(provider_name="openai_codex", api_base=None),
+                                  model="fixture-model")
+        result, run = self.resolve(runtime=runtime)
+        self.assertIsNone(result)
+        run.assert_not_called()
+
+    def test_model_override_and_unresolved_endpoint_disable(self):
+        self.provider._extra_body = {"model": "other"}
+        self.assertIsNone(self.resolve()[0])
+        self.provider._extra_body = {}
+        self.provider._effective_base = None
+        self.assertIsNone(self.resolve()[0])
+
+
+    def test_initialized_client_route_is_authoritative(self):
+        self.provider._client = SimpleNamespace(base_url="https://other.invalid/v1/")
+        self.assertIsNone(self.resolve()[0])
+        decision = self.decision | dict(endpoint_id="https://other.invalid/v1")
+        result, run = self.resolve(decision)
+        self.assertEqual(result, 60)
+        args = run.call_args.args[0]
+        self.assertEqual(args[args.index("--endpoint") + 1], "https://other.invalid/v1")
+
+    def test_duplicate_keys_fail_closed(self):
+        raw = json.dumps(self.decision)[:-1] + ', "mode": "measured"}'
+        self.assertIsNone(self.resolve(raw=raw)[0])
+
+    def test_route_secrets_and_ambiguous_wrappers_disable(self):
+        for endpoint in ("https://name:password@fixture.invalid/v1", "https://fixture.invalid/v1?key=fixture",
+                         "https://fixture.invalid/v1#other", "relative-path"):
+            self.provider._effective_base = endpoint
+            result, run = self.resolve()
+            self.assertIsNone(result)
+            run.assert_not_called()
+        runtime = SimpleNamespace(provider=SimpleNamespace(provider_name="custom", primary=self.provider),
+                                  model="fixture-model")
+        self.assertIsNone(self.resolve(runtime=runtime)[0])
+
+
+    def test_raw_evidence_coercion_cannot_arm_timer(self):
+        fresh = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        entry = self.decision | dict(harness="nanobot", fresh_until=fresh)
+        for field in ("compact_before_seconds", "cache_expires_seconds"):
+            for value in (True, "60", "120", None, float("nan"), float("inf")):
+                evidence = dict(format="cache-policy.v1", fresh_until=fresh,
+                                entries=[entry | {field: value}])
+                with self.subTest(field=field, value=value):
+                    self.assertIsNone(self.resolve(evidence=evidence)[0])
+
+    def test_raw_evidence_missing_stale_and_mismatched_disable(self):
+        fresh = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+        stale = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+        entry = self.decision | dict(harness="nanobot", fresh_until=fresh)
+        policy = dict(format="cache-policy.v1", fresh_until=fresh, entries=[entry])
+        for evidence in ([], {}, policy | dict(fresh_until=stale),
+                         policy | dict(entries=[entry | dict(fresh_until=stale)]),
+                         policy | dict(entries=[entry | dict(endpoint_id="other")]),
+                         policy | dict(entries=[entry | dict(compact_before_seconds=59)])):
+            self.assertIsNone(self.resolve(evidence=evidence)[0])
 
 
 if __name__ == "__main__":
