@@ -14,15 +14,21 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from email import policy
-from email.parser import Parser
+from email.parser import BytesParser
 from email.utils import parseaddr
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ADDRESS_RE = re.compile(
     r"^(?:(consort|seat|machine|sanctuary)\+)?"
     r"([a-z0-9][a-z0-9._-]*)@"
     r"([a-z0-9][a-z0-9.-]*\.helm)$"
+)
+MESSAGE_ID_RE = re.compile(r"^<[^<>\s@]+@[^<>\s@]+>$")
+HANDOFF_RE = re.compile(
+    r"(?<![A-Za-z0-9._/-])(LOGS/handoffs/[A-Za-z0-9._/-]+\.md)"
+    r"(?![A-Za-z0-9._/-])"
 )
 HANDLING = ("handling_completed", "handling_deferred", "handling_rejected", "handling_failed")
 PROTOCOL = "2025-06-18"
@@ -100,16 +106,145 @@ def receipt_seat(address: str) -> str:
     return match.group(2)
 
 
+def mail_root() -> Path:
+    return Path(os.environ.get("MAILCORTEX_ROOT", "~/Mail")).expanduser()
+
+
+def runtime_root() -> Path:
+    return Path(os.environ.get("MAILCORTEX_RUNTIME", "~/.local/state/mailcortex")).expanduser()
+
+
+def address_maildir(address: str) -> Path:
+    match = ADDRESS_RE.fullmatch(address.lower())
+    if not match:
+        raise ChannelError(f"invalid address: {address}")
+    kind, name, _domain = match.groups()
+    namespace = {
+        None: "consorts", "consort": "consorts", "seat": "seats",
+        "machine": "machines", "sanctuary": "sanctuaries",
+    }[kind]
+    return mail_root() / namespace / name
+
+
+def canonical_digest(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    try:
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def git_output(root: Path, *args: str) -> str:
+    try:
+        result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
+                                text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ChannelError("committed handoff verification failed") from error
+    if result.returncode != 0:
+        raise ChannelError("committed handoff verification failed")
+    return result.stdout.strip()
+
+
+def committed_handoff(root: Path, prompt: str) -> tuple[str, str]:
+    matches = HANDOFF_RE.findall(prompt)
+    if len(matches) != 1:
+        raise ChannelError("[BRIEF] must name exactly one LOGS/handoffs markdown path")
+    relative = PurePosixPath(matches[0])
+    if relative.is_absolute() or ".." in relative.parts or relative.parts[:2] != ("LOGS", "handoffs"):
+        raise ChannelError("[BRIEF] handoff path is not canonical")
+    top = Path(git_output(root, "rev-parse", "--show-toplevel")).resolve()
+    if top != root:
+        raise ChannelError("Clubhouse root is not the canonical Git checkout")
+    git_output(root, "cat-file", "-e", f"master:{relative.as_posix()}")
+    revision = git_output(root, "rev-list", "-1", "master", "--", relative.as_posix())
+    if not revision:
+        raise ChannelError("[BRIEF] handoff has no committed revision on master")
+    return relative.as_posix(), revision
+
+
+def single_header(message, name: str, *, required: bool = False) -> str:
+    values = message.get_all(name, [])
+    if len(values) > 1 or (required and len(values) != 1):
+        raise ChannelError(f"mail has invalid {name} cardinality")
+    return str(values[0]).strip() if values else ""
+
+
+def admitted_prompt(message) -> str:
+    body = message.get_body(preferencelist=("plain",))
+    value = body.get_content() if body is not None else message.get_payload()
+    if not isinstance(value, str) or not value.strip():
+        raise ChannelError("mail has no admitted plain-text prompt")
+    return value.strip()
+
+
+def maildir_key(name: str) -> str:
+    return name.split(":2,", 1)[0]
+
+
+def project_clubhouse_input(receipt: dict, prompt: str, root: Path) -> None:
+    """Validate the source receipt, then use the existing PromptGolf recorder."""
+    helper_path = root / "FORGE/scripts/prompt_golf_input.py"
+    command_path = root / "FORGE/bin/prompt-golf"
+    if not helper_path.is_file() or not command_path.is_file():
+        raise ChannelError("PromptGolf source owner is unavailable")
+    driver = (
+        "import json,runpy,sys;"
+        "value=json.load(sys.stdin);"
+        "helper=runpy.run_path(sys.argv[1]);"
+        "helper['project_mailcortex_input'](value['receipt'],value['prompt'],sys.argv[2])"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", driver, str(helper_path), str(root)],
+            input=json.dumps({"receipt": receipt, "prompt": prompt},
+                             sort_keys=True, separators=(",", ":")),
+            env=dict(os.environ, HELMCORTEX_ROOT=str(root)),
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise ChannelError("PromptGolf projection failed before acknowledgement") from error
+    if result.returncode != 0:
+        raise ChannelError(f"PromptGolf projection failed with exit {result.returncode}")
+
+
 class Server:
     def __init__(self, address: str, allow_from: list[str], poll: float,
                  permission_secret: bytes | None = None,
-                 bridge_address: str | None = None) -> None:
-        self.address = address
+                 bridge_address: str | None = None,
+                 clubhouse_root: Path | None = None,
+                 clubhouse_projector=None) -> None:
+        self.address = address.lower()
         self.seat = receipt_seat(address)
-        self.allow = set(allow_from)
+        self.allow = {value.lower() for value in allow_from}
         self.poll = poll
         self.permission_secret = permission_secret
         self.bridge_address = bridge_address
+        self.clubhouse_root = (Path(clubhouse_root).expanduser().resolve(strict=True)
+                               if clubhouse_root is not None else None)
+        if clubhouse_projector is not None and self.clubhouse_root is None:
+            raise ChannelError("Clubhouse projector requires --clubhouse-root")
+        self.clubhouse_projector = (clubhouse_projector or project_clubhouse_input
+                                    if self.clubhouse_root is not None else None)
+        self.maildir = address_maildir(self.address)
         self.pending_permissions: dict[str, dict[str, str]] = {}
         self.answered_permissions: set[str] = set()
         self.permission_receipts: list[dict[str, str | int]] = []
@@ -128,29 +263,239 @@ class Server:
         sys.stderr.write(f"mailcortex-channel[{self.address}]: {text}\n")
         sys.stderr.flush()
 
+    # --- Clubhouse admission ---------------------------------------------
+    def ingress_dir(self) -> Path:
+        return runtime_root() / "clubhouse-ingress" / self.seat
+
+    def ingress_path(self, source_key: str) -> Path:
+        return self.ingress_dir() / f"{source_key}.json"
+
+    def load_ingress(self, source_key: str) -> dict | None:
+        path = self.ingress_path(source_key)
+        if not path.exists():
+            return None
+        if path.is_symlink() or not path.is_file():
+            raise ChannelError("Clubhouse ingress receipt is not a regular file")
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ChannelError("Clubhouse ingress receipt is unreadable") from error
+        if (not isinstance(value, dict)
+                or value.get("schema") != "helmcortex.prompt-ingress-receipt.v1"
+                or value.get("source_key") != source_key):
+            raise ChannelError("Clubhouse ingress receipt is invalid")
+        return value
+
+    def recoverable_maildir_keys(self) -> set[str]:
+        directory = self.ingress_dir()
+        if not directory.exists():
+            return set()
+        keys = set()
+        for path in directory.glob("*.json"):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+                record = value.get("source_record_ref")
+                key = record.get("maildir_key") if isinstance(record, dict) else None
+            except (OSError, json.JSONDecodeError) as error:
+                raise ChannelError("Clubhouse ingress receipt is unreadable") from error
+            if (not isinstance(value, dict)
+                    or value.get("schema") != "helmcortex.prompt-ingress-receipt.v1"
+                    or not isinstance(value.get("source_key"), str)
+                    or path.stem != value["source_key"]
+                    or not isinstance(key, str) or not key):
+                raise ChannelError("Clubhouse ingress receipt has no Maildir identity")
+            keys.add(key)
+        return keys
+
+    def source_message(self, state: str, name: str):
+        if state not in {"new", "cur"} or not name or Path(name).name != name:
+            raise ChannelError("mail row has invalid source identity")
+        path = self.maildir / state / name
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise ChannelError("mail source record disappeared") from error
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ChannelError("mail source record is not a regular file")
+        try:
+            with path.open("rb") as stream:
+                message = BytesParser(policy=policy.default).parse(stream)
+        except (OSError, UnicodeError) as error:
+            raise ChannelError("mail source record is unreadable") from error
+        if message.defects:
+            raise ChannelError("mail source record has parser defects")
+        return message
+
+    def ingress_candidate(self, state: str, name: str, message, listed_sender: str,
+                          prompt: str) -> dict | None:
+        sender = parseaddr(single_header(message, "From", required=True))[1].lower()
+        destination = parseaddr(single_header(message, "To", required=True))[1].lower()
+        subject = single_header(message, "Subject", required=True)
+        message_id = single_header(message, "Message-ID", required=True)
+        in_reply_to = single_header(message, "In-Reply-To")
+        references = single_header(message, "References")
+        if sender != listed_sender or sender not in self.allow:
+            raise ChannelError("mail sender identity changed after allowlist validation")
+        if destination != self.address:
+            raise ChannelError("mail destination does not match the owned mailbox")
+        if not MESSAGE_ID_RE.fullmatch(message_id):
+            raise ChannelError("mail lacks a stable Message-ID")
+        reference_ids = references.split()
+        if (in_reply_to and not MESSAGE_ID_RE.fullmatch(in_reply_to)) or any(
+                not MESSAGE_ID_RE.fullmatch(value) for value in reference_ids):
+            raise ChannelError("mail has invalid reply threading identity")
+        if in_reply_to and reference_ids and in_reply_to != reference_ids[-1]:
+            raise ChannelError("mail reply headers disagree")
+
+        handoff_path = handoff_revision = None
+        if subject.startswith("[BRIEF]"):
+            if self.clubhouse_root is None:
+                return None
+            lane = "mailcortex.brief"
+            handoff_path, handoff_revision = committed_handoff(self.clubhouse_root, prompt)
+        elif in_reply_to or references:
+            lane = "mailcortex.reply"
+        else:
+            return None
+
+        address_match = ADDRESS_RE.fullmatch(self.address)
+        if address_match is None:
+            raise ChannelError("owned mailbox address is invalid")
+        host = address_match.group(3).removesuffix(".helm")
+        namespace = f"mailcortex.ingress.v1/{host}/{self.address}"
+        source_key = canonical_digest(
+            ["mailcortex-message-v1", host, self.address, message_id]
+        )
+        parent_message_id = in_reply_to or (reference_ids[-1] if reference_ids else "")
+        parent_receipt_id = None
+        if parent_message_id and MESSAGE_ID_RE.fullmatch(parent_message_id):
+            parent_key = canonical_digest(
+                ["mailcortex-message-v1", host, self.address, parent_message_id]
+            )
+            parent = self.load_ingress(parent_key)
+            parent_receipt_id = parent.get("receipt_id") if parent else None
+        conversation_id = (f"{handoff_path}@{handoff_revision}"
+                           if lane == "mailcortex.brief"
+                           else parent_receipt_id or parent_message_id)
+        if not conversation_id:
+            raise ChannelError("mail reply has no stable parent identity")
+        source_record_ref = {
+            "host": host,
+            "namespace": namespace,
+            "root": str(mail_root().resolve()),
+            "maildir_key": maildir_key(name),
+            "handoff_path": handoff_path,
+            "handoff_revision": handoff_revision,
+        }
+        source_digest = canonical_digest([
+            "mailcortex-source-v1", prompt, self.address, sender, subject,
+            message_id, in_reply_to, references, handoff_path, handoff_revision,
+        ])
+        return {
+            "schema": "helmcortex.prompt-ingress-receipt.v1",
+            "lane": lane,
+            "source_owner": namespace,
+            "conversation_id": conversation_id,
+            "message_id": message_id,
+            "source_key": source_key,
+            "principal_class": "agent",
+            "principal_ref": sender,
+            "auth_method": "mailcortex-local-delivery/allow-from",
+            "source_digest": source_digest,
+            "content_digest": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "source_record_ref": source_record_ref,
+            "parent_receipt_id": parent_receipt_id,
+            "status": "accepted",
+        }
+
+    def resolve_ingress(self, candidate: dict) -> dict:
+        source_key = candidate["source_key"]
+        current = self.load_ingress(source_key)
+        if current is not None:
+            current_binding = {key: current.get(key) for key in candidate}
+            candidate_binding = dict(candidate)
+            current_record = dict(current_binding["source_record_ref"])
+            candidate_record = dict(candidate_binding["source_record_ref"])
+            current_record.pop("maildir_key", None)
+            candidate_record.pop("maildir_key", None)
+            current_binding["source_record_ref"] = current_record
+            candidate_binding["source_record_ref"] = candidate_record
+            if current_binding != candidate_binding:
+                raise ChannelError("MailCortex ingress identity/content conflict")
+            if current.get("recovery_state") not in {
+                    "accepted_unprojected", "projected_undispatched",
+                    "dispatch_unknown", "terminal"}:
+                raise ChannelError("MailCortex ingress recovery state is invalid")
+            return current
+        receipt = {
+            **candidate,
+            "receipt_id": canonical_digest(["mailcortex-receipt-v1", source_key]),
+            "accepted_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "recovery_state": "accepted_unprojected",
+        }
+        atomic_json(self.ingress_path(source_key), receipt)
+        return receipt
+
+    def transition_ingress(self, receipt: dict, state: str) -> dict:
+        if state not in {"projected_undispatched", "dispatch_unknown", "terminal"}:
+            raise ChannelError("invalid MailCortex ingress transition")
+        updated = {**receipt, "recovery_state": state}
+        atomic_json(self.ingress_path(receipt["source_key"]), updated)
+        return updated
+
     # --- mailbox watch ---------------------------------------------------
     def scan_once(self) -> int:
         pushed = 0
+        recoverable = self.recoverable_maildir_keys() if self.clubhouse_root else set()
         for row in mailcortex(["inbox", self.address]).splitlines():
             fields = row.split("\t")
-            if len(fields) < 5 or fields[0] != "new" or fields[1] in self.skipped:
+            if len(fields) < 5:
                 continue
-            name, sender = fields[1], parseaddr(fields[3])[1].lower()
+            state, name = fields[0], fields[1]
+            key = maildir_key(name)
+            if state not in {"new", "cur"} or key in self.skipped:
+                continue
+            if state == "cur" and key not in recoverable:
+                continue
+            sender = parseaddr(fields[3])[1].lower()
             if sender not in self.allow:
-                self.skipped.add(name)
+                self.skipped.add(key)
                 self.log(f"left unread: {name} from a sender not on --allow-from")
                 continue
-            rendered = mailcortex(["read", self.address, name])
-            message = Parser(policy=policy.default).parsestr(rendered)
+            message = self.source_message(state, name)
             auth = message.get("X-MailCortex-Permission")
             if auth and self.accept_permission(message, sender, auth):
+                if state == "new":
+                    mailcortex(["read", self.address, name])
                 pushed += 1
                 continue
+            prompt = admitted_prompt(message)
+            candidate = (self.ingress_candidate(state, name, message, sender, prompt)
+                         if self.clubhouse_root is not None else None)
+            if candidate is not None:
+                receipt = self.resolve_ingress(candidate)
+                if receipt["recovery_state"] == "accepted_unprojected":
+                    assert self.clubhouse_projector is not None
+                    self.clubhouse_projector(receipt, prompt, self.clubhouse_root)
+                    receipt = self.transition_ingress(receipt, "projected_undispatched")
+                if receipt["recovery_state"] in {"dispatch_unknown", "terminal"}:
+                    if state == "new":
+                        mailcortex(["read", self.address, name])
+                    continue
+                if receipt["recovery_state"] != "projected_undispatched":
+                    raise ChannelError("MailCortex ingress cannot dispatch from its current state")
+                if state == "new":
+                    mailcortex(["read", self.address, name])
+                receipt = self.transition_ingress(receipt, "dispatch_unknown")
+            elif state == "cur":
+                continue
+            else:
+                mailcortex(["read", self.address, name])
             self.write({
                 "jsonrpc": "2.0",
                 "method": "notifications/claude/channel",
                 "params": {
-                    "content": (message.get_payload() or "").strip(),
+                    "content": prompt,
                     "meta": {
                         "from": sender,
                         "subject": str(message.get("Subject", "")),
@@ -377,6 +722,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="private mode-600 secret enabling authenticated permission relay")
     parser.add_argument("--bridge-address",
                         help="MailCortex address that receives this seat's permission requests")
+    parser.add_argument("--clubhouse-root", type=Path,
+                        help="canonical HelmCortex checkout enabling source-owned PromptGolf admission")
     args = parser.parse_args(argv)
     try:
         for address in [args.address, *args.allow_from]:
@@ -394,7 +741,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ChannelError("--poll must be between 0.2 and 60")
         secret = read_permission_secret(args.permission_secret) if args.permission_secret else None
         return Server(args.address, [a.lower() for a in args.allow_from], args.poll,
-                      secret, args.bridge_address.lower() if args.bridge_address else None).serve()
+                      secret, args.bridge_address.lower() if args.bridge_address else None,
+                      args.clubhouse_root).serve()
     except ChannelError as error:
         print(f"mailcortex-channel: {error}", file=sys.stderr)
         return 2

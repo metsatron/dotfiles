@@ -149,12 +149,18 @@ class ClubhouseIngressTest(unittest.TestCase):
             raise self.ChannelError("fixture projection failure")
         self.projected.append((receipt, prompt, root))
 
-    def deliver(self, *, body=None, message_id=None, key="fixture-mail"):
+    def deliver(self, *, body=None, message_id=None, key="fixture-mail",
+                subject="[BRIEF] fixture", in_reply_to=None,
+                include_message_id=True):
         message = EmailMessage(policy=policy.SMTP)
         message["From"] = self.SOURCE
         message["To"] = self.DESTINATION
-        message["Subject"] = "[BRIEF] fixture"
-        message["Message-ID"] = message_id or self.MESSAGE_ID
+        message["Subject"] = subject
+        if include_message_id:
+            message["Message-ID"] = message_id or self.MESSAGE_ID
+        if in_reply_to:
+            message["In-Reply-To"] = in_reply_to
+            message["References"] = in_reply_to
         message.set_content(body if body is not None else self.BODY)
         target = Path(self.env["MAILCORTEX_ROOT"]) / "seats/worker/new" / key
         target.write_bytes(message.as_bytes())
@@ -183,16 +189,38 @@ class ClubhouseIngressTest(unittest.TestCase):
         self.assertEqual(receipt["source_record_ref"]["handoff_path"], self.HANDOFF)
         self.assertEqual(receipt["source_record_ref"]["handoff_revision"],
                          self.git("rev-list", "-1", "master", "--", self.HANDOFF))
+        self.deliver(key="equal-redelivery")
         self.assertEqual(self.server.scan_once(), 0)
         self.assertEqual(len(self.projected), 1)
         self.assertEqual(len(self.notes), 1)
+        self.assertEqual(self.receipt(), receipt)
+
+    def test_threaded_reply_preserves_agent_class_without_inventing_handoff_provenance(self):
+        self.deliver(subject="Re: fixture", in_reply_to="<parent@example.test>")
+        self.assertEqual(self.server.scan_once(), 1)
+        receipt = self.receipt()
+        self.assertEqual(receipt["lane"], "mailcortex.reply")
+        self.assertEqual(receipt["principal_class"], "agent")
+        self.assertIsNone(receipt["source_record_ref"]["handoff_path"])
+        self.assertIsNone(receipt["source_record_ref"]["handoff_revision"])
+
+    def test_missing_message_id_fails_closed_before_projection(self):
+        self.deliver(include_message_id=False)
+        with self.assertRaisesRegex(self.ChannelError, "Message-ID"):
+            self.server.scan_once()
+        self.assertEqual(self.attempts, [])
+        self.assertFalse((Path(self.env["MAILCORTEX_RUNTIME"]) /
+                          "clubhouse-ingress").exists())
 
     def test_changed_body_under_the_same_message_id_conflicts(self):
         self.deliver()
         self.server.scan_once()
         current = self.current_message()
         current.unlink()
-        replacement = self.deliver(body="Changed private body", key=current.name)
+        replacement = self.deliver(
+            body="Changed private body\nRead LOGS/handoffs/fixture.md",
+            key=current.name,
+        )
         if current.parent.name == "cur":
             replacement.rename(current)
         with self.assertRaisesRegex(self.ChannelError, "conflict"):
