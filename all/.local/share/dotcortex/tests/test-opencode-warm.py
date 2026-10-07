@@ -135,7 +135,9 @@ import json
 print(json.dumps({
     'compact_before_seconds': 7080,
     'cache_expires_seconds': 7200,
-    'mode': 'measured',
+    'mode': 'measured', 'confidence': 'supported',
+    'provider': 'fixture-provider', 'endpoint_id': 'fixture-provider',
+    'model': 'fixture-model', 'reason': 'exact-harness',
 }))
 """
 
@@ -265,6 +267,8 @@ class OpenCodeWarmFixture(unittest.TestCase):
         environment = os.environ.copy()
         environment.update({
             "XDG_STATE_HOME": str(self.root / "xdg-state"),
+            "FLEET_CACHE_POLICY_HELPER": str(self.cache_policy_helper),
+            "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_OWNER_STATE": str(self.owner_state),
             "OPENCODE_WARM_OWNER_HELPER": str(self.owner_helper),
@@ -340,6 +344,47 @@ class OpenCodeWarmFixture(unittest.TestCase):
             "OPENCODE_WARM_CACHE_TTL_SECONDS": "1800",
             "FIXTURE_POLICY_ACTION": action,
         }
+
+    def test_cache_invalid_stdout_retains_fixed_authority_ttl(self):
+        self.write_receipts()
+        valid = {"mode": "measured", "confidence": "supported",
+                 "provider": "fixture-provider", "endpoint_id": "fixture-provider",
+                 "model": "fixture-model", "compact_before_seconds": 7080,
+                 "cache_expires_seconds": 7200}
+        invalid = [[], None, True, {}, {**valid, "confidence": "observed"},
+                   {**valid, "model": "other"}, {**valid, "endpoint_id": "other"}]
+        invalid += [{**valid, "cache_expires_seconds": v}
+                    for v in (None, "7200", True, -1, 0, float("nan"), float("inf"), 7000)]
+        for value in invalid:
+            with self.subTest(value=value):
+                self.cache_policy_helper.write_text(
+                    "#!/usr/bin/env python3\nprint(" + repr(json.dumps(value)) + ")\n", encoding="utf-8")
+                environment = self.policy_env()
+                environment.update(FLEET_CACHE_POLICY_HELPER=str(self.cache_policy_helper),
+                                   FLEET_CACHE_POLICY_PATH=str(self.cache_policy))
+                decided = self.call(**environment)
+                self.assertEqual(decided.returncode, 0, decided.stderr)
+                payload = json.loads(decided.stdout)
+                self.assertAlmostEqual(payload["policy"]["request_cache_expires_at"] -
+                                       self.fixture.messages[-1]["info"]["time"]["completed"], 1800, delta=1)
+                self.assertEqual(self.fixture.posts, [])
+
+    def test_policy_changes_before_summarize_preserve_without_post(self):
+        self.write_receipts()
+        calls = self.root / "authority-calls"
+        self.policy_helper.write_text(
+            "#!/usr/bin/env python3\nimport json,pathlib,sys\n"
+            f"p=pathlib.Path({str(calls)!r})\n"
+            "count=int(p.read_text()) if p.exists() else 0\np.write_text(str(count+1))\n"
+            "json.load(sys.stdin)\n"
+            "print(json.dumps({'schema':'helmcortex.opencode-continuity-policy-decision.v1',"
+            "'action':'HANDOFF_AND_COMPACT' if count == 0 else 'CONTINUE_LOCAL'}))\n",
+            encoding="utf-8")
+        decided = self.call(**self.policy_env())
+        self.assertEqual(decided.returncode, 0, decided.stderr)
+        self.assertEqual(json.loads(decided.stdout)["action"], "skipped")
+        self.assertEqual(self.fixture.posts, [])
+        self.assertFalse(json.loads((self.state_dir / "state.json").read_text())["in_flight"])
 
     def test_idle_busy_unknown_status(self) -> None:
         self.write_receipts()
@@ -539,6 +584,8 @@ class OpenCodeWarmFixture(unittest.TestCase):
     def call_wakeup(self, job: dict, **environment_overrides: str) -> subprocess.CompletedProcess[str]:
         environment = os.environ.copy()
         environment.update({
+            "FLEET_CACHE_POLICY_HELPER": str(self.cache_policy_helper),
+            "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_OWNER_STATE": str(self.owner_state),
             "OPENCODE_WARM_OWNER_HELPER": str(self.owner_helper),
@@ -619,6 +666,8 @@ class OpenCodeWarmFixture(unittest.TestCase):
     def test_checkpoint_control_prepares_without_compacting(self) -> None:
         environment = os.environ.copy()
         environment.update({
+            "FLEET_CACHE_POLICY_HELPER": str(self.cache_policy_helper),
+            "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_OWNER_STATE": str(self.owner_state),
             "OPENCODE_WARM_OWNER_HELPER": str(self.owner_helper),
@@ -651,6 +700,8 @@ class OpenCodeWarmFixture(unittest.TestCase):
         environment = os.environ.copy()
         environment.update({
             "XDG_STATE_HOME": str(self.root / "xdg-state"),
+            "FLEET_CACHE_POLICY_HELPER": str(self.cache_policy_helper),
+            "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_OWNER_STATE": str(self.owner_state),
             "OPENCODE_WARM_OWNER_HELPER": str(self.owner_helper),
@@ -800,6 +851,8 @@ console.log(JSON.stringify({{context: compacting.context, enabled: continuation.
         dispatcher.chmod(0o700)
         environment = os.environ.copy()
         environment.update({
+            "FLEET_CACHE_POLICY_HELPER": str(self.cache_policy_helper),
+            "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_EVENT_BIN": str(dispatcher),
             "OPENCODE_TEST_DISPATCH_LOG": str(dispatch_log),
@@ -830,6 +883,8 @@ await hooks.event({{event: {{type: "session.compacted", properties: {{sessionID:
         dispatcher.chmod(0o700)
         environment = os.environ.copy()
         environment.update({
+            "FLEET_CACHE_POLICY_HELPER": str(self.cache_policy_helper),
+            "FLEET_CACHE_POLICY_PATH": str(self.root / "missing-policy.json"),
             "OPENCODE_WARM_STATE_DIR": str(self.state_dir),
             "OPENCODE_WARM_EVENT_BIN": str(dispatcher),
             "OPENCODE_TEST_DISPATCH_LOG": str(dispatch_log),
