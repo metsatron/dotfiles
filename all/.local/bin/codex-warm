@@ -15,9 +15,11 @@ import shutil
 import signal
 import socket
 import struct
+import subprocess
 import sys
 import termios
 import time
+import tomllib
 import tty
 import uuid
 
@@ -81,9 +83,61 @@ DEBUG_LOG_MAX_BYTES = env_int(
     "CODEX_IDLE_DEBUG_MAX_BYTES", 2 * 1024 * 1024, 65536
 )
 DEBUG = os.environ.get("CODEX_IDLE_COMPACTION_DEBUG", "") in {"1", "true", "yes"}
+ALLOW_OBSERVED_POLICY = os.environ.get(
+    "CODEX_CACHE_POLICY_ALLOW_OBSERVED", "1"
+).lower() in {"1", "true", "yes"}
 COMPACTION_TIMEOUT_SECONDS = env_float(
     "CODEX_IDLE_COMPACTION_TIMEOUT_SECONDS", 5 * 60, 1.0
 )
+
+
+def configured_model(argv: list[str]) -> str:
+    for index, value in enumerate(argv):
+        if value.startswith("--model="):
+            return value.split("=", 1)[1]
+        if value in {"--model", "-m"} and index + 1 < len(argv):
+            return argv[index + 1]
+    explicit = os.environ.get("CODEX_IDLE_MODEL")
+    if explicit:
+        return explicit
+    try:
+        config = tomllib.loads((pathlib.Path.home() / ".codex/config.toml").read_text(encoding="utf-8"))
+        value = config.get("model")
+        if isinstance(value, str) and value:
+            return value
+    except (OSError, tomllib.TOMLDecodeError):
+        pass
+    return "unknown"
+
+
+def measured_window(model: str) -> tuple[int, int, dict]:
+    helper = pathlib.Path(os.environ.get(
+        "FLEET_CACHE_POLICY_HELPER", str(pathlib.Path.home() / "HelmCortex/FORGE/bin/cache-policy")
+    )).expanduser()
+    policy = pathlib.Path(os.environ.get(
+        "FLEET_CACHE_POLICY_PATH",
+        str(pathlib.Path.home() / "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json"),
+    )).expanduser()
+    if not helper.is_file() or not policy.is_file():
+        return IDLE_SECONDS, TTL_SECONDS, {
+            "mode": "fallback",
+            "reason": "policy-unavailable",
+        }
+    try:
+        command = [str(helper), "resolve", "--policy", str(policy), "--harness", "codex",
+                   "--provider", "openai", "--endpoint", "openai-codex-oauth",
+                   "--model", model, "--fallback-compact", str(IDLE_SECONDS),
+                   "--fallback-cache", str(TTL_SECONDS)]
+        if ALLOW_OBSERVED_POLICY:
+            command.append("--allow-observed")
+        completed = subprocess.run(
+            command,
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        decision = json.loads(completed.stdout)
+        return int(decision["compact_before_seconds"]), int(decision["cache_expires_seconds"]), decision
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return IDLE_SECONDS, TTL_SECONDS, {"mode": "fallback", "reason": "resolver-error"}
 TERMINAL_CLEANUP_BYTES = (
     b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l"
     b"\x1b[?1005l\x1b[?1006l\x1b[?1015l"
@@ -550,6 +604,8 @@ class Supervisor:
         self.compaction_requested_at: float | None = None
         self.compaction_ignore_next_stop = False
         self.current_tokens: int | None = None
+        self.model = configured_model(argv)
+        self.compact_after_seconds, self.cache_expires_seconds, self.cache_policy = measured_window(self.model)
         self.last_normal_stop: float | None = None
         self.last_local_input: float | None = None
         self.last_local_input_classification: str | None = None
@@ -580,6 +636,8 @@ class Supervisor:
             "session_id": self.session_id,
             "status": self.status,
             "current_input_context_tokens": self.current_tokens,
+            "model": self.model,
+            "cache_policy": self.cache_policy,
             "dirty": self.dirty,
             "compacting": self.compacting,
             "compaction_ignore_next_stop": self.compaction_ignore_next_stop,
@@ -639,7 +697,7 @@ class Supervisor:
         self._debug(f"cancelled:{reason} channel={short_id(self.channel)}")
         self._write_state()
 
-    def arm(self) -> None:
+    def arm(self, preserve_transition: bool = False) -> None:
         if not (
             self.enabled
             and self.dirty
@@ -650,13 +708,15 @@ class Supervisor:
             and self.timer_deadline is None
         ):
             return
+        self.compact_after_seconds, self.cache_expires_seconds, self.cache_policy = measured_window(self.model)
         self.timer_generation += 1
-        self.timer_deadline = self.last_normal_stop + IDLE_SECONDS
+        self.timer_deadline = self.last_normal_stop + self.compact_after_seconds
         self.timer_kind = "compact"
-        self.last_state_transition = "armed"
+        if not preserve_transition:
+            self.last_state_transition = "armed"
         self._debug(
             f"armed channel={short_id(self.channel)} "
-            f"delay={IDLE_SECONDS}"
+            f"delay={self.compact_after_seconds} policy={self.cache_policy.get('mode')}"
         )
         self._write_state()
 
@@ -688,9 +748,10 @@ class Supervisor:
         # The failure is already being handled at the Stop/timeout boundary;
         # do not consume the next genuine turn's Stop hook as a late failure.
         self.compaction_ignore_next_stop = False
-        self.cancel("compaction-recovered")
-        self.arm()
         self.last_state_transition = "compaction-recovered"
+        self.cancel("compaction-recovered")
+        self.last_state_transition = "compaction-recovered"
+        self.arm(preserve_transition=True)
         self._debug(
             f"compaction-recovered channel={short_id(self.channel)} reason={reason}"
         )
@@ -855,8 +916,8 @@ class Supervisor:
         if purpose == "compact":
             if not self.dirty:
                 return "clean"
-            if now() - self.last_normal_stop >= TTL_SECONDS:
-                return "cache-already-cold"
+            if MIN_TOKENS > 0 and self.current_tokens is None:
+                return "token-count-unknown"
             if self.current_tokens is not None and self.current_tokens < MIN_TOKENS:
                 return "below-token-threshold"
         elif purpose != "manual":
@@ -1310,6 +1371,8 @@ def main(argv: list[str]) -> int:
         print("Environment: CODEX_IDLE_COMPACTION_DEBUG,")
         print("CODEX_IDLE_COMPACT_SECONDS, CODEX_IDLE_COMPACT_TTL_SECONDS,")
         print("CODEX_IDLE_COMPACT_MIN_TOKENS,")
+        print("CODEX_CACHE_POLICY_ALLOW_OBSERVED,")
+        print("FLEET_CACHE_POLICY_HELPER, FLEET_CACHE_POLICY_PATH,")
         print("CODEX_IDLE_COMPACTION_TIMEOUT_SECONDS,")
         print("CODEX_IDLE_INPUT_ESCAPE_TIMEOUT_SECONDS,")
         print("CODEX_WARM_HERDR_AGENT, CODEX_WARM_HERDR_HEARTBEAT_SECONDS,")

@@ -306,6 +306,32 @@ TTL_SECONDS = {
     "long": env_int("CLAUDE_IDLE_COMPACT_LONG_CACHE_TTL_SECONDS", 60 * 60),
     "short": env_int("CLAUDE_IDLE_COMPACT_SHORT_CACHE_TTL_SECONDS", 5 * 60),
 }
+
+
+def measured_cache_window(model: str | None, profile: str) -> tuple[int, int, dict]:
+    fallback_idle = IDLE_SECONDS[profile]
+    fallback_ttl = TTL_SECONDS[profile]
+    if not model:
+        return fallback_idle, fallback_ttl, {"mode": "fallback", "reason": "model-unknown"}
+    helper = pathlib.Path(os.environ.get(
+        "FLEET_CACHE_POLICY_HELPER", str(pathlib.Path.home() / "HelmCortex/FORGE/bin/cache-policy")
+    )).expanduser()
+    policy = pathlib.Path(os.environ.get(
+        "FLEET_CACHE_POLICY_PATH",
+        str(pathlib.Path.home() / "HelmCortex/ROOTS/DotRoot/agent-session/centre/data/cache-policy.json"),
+    )).expanduser()
+    try:
+        completed = subprocess.run(
+            [str(helper), "resolve", "--policy", str(policy), "--harness", "claude",
+             "--provider", "anthropic", "--endpoint", "anthropic-default",
+             "--model", model, "--fallback-compact", str(fallback_idle),
+             "--fallback-cache", str(fallback_ttl)],
+            capture_output=True, text=True, timeout=5, check=True,
+        )
+        decision = json.loads(completed.stdout)
+        return int(decision["compact_before_seconds"]), int(decision["cache_expires_seconds"]), decision
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        return fallback_idle, fallback_ttl, {"mode": "fallback", "reason": "resolver-error"}
 MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
 # An unknown transcript record fails closed (transcript-uncertain), but the
 # uncertainty must be a bounded caution, never a permanent veto: with the
@@ -1560,6 +1586,9 @@ class Supervisor:
         self.input_classifier = TerminalInputClassifier()
         self.cache_profile_requested = os.environ.get("CLAUDE_IDLE_CACHE_PROFILE", "auto")
         self.cache_profile = effective_profile(self.cache_profile_requested)
+        self.cache_idle_seconds = IDLE_SECONDS[self.cache_profile]
+        self.cache_ttl_seconds = TTL_SECONDS[self.cache_profile]
+        self.cache_policy = {"mode": "fallback", "reason": "startup"}
         self.timer_deadline: float | None = None
         self.timer_kind: str | None = None
         self.timer_generation = 0
@@ -1675,6 +1704,7 @@ class Supervisor:
             "last_lifecycle_activity": self.last_lifecycle_activity,
             "cache_profile": self.cache_profile,
             "cache_profile_requested": self.cache_profile_requested,
+            "cache_policy": self.cache_policy,
             "timer_deadline": self.timer_deadline,
             "timer_kind": self.timer_kind,
             "timer_generation": self.timer_generation,
@@ -1810,21 +1840,83 @@ class Supervisor:
             and not self.recovery_pending
         ):
             return
+        self.cache_idle_seconds, self.cache_ttl_seconds, self.cache_policy = measured_cache_window(
+            self.current_model, self.cache_profile
+        )
         self.timer_generation += 1
-        self.timer_deadline = self.last_normal_stop + IDLE_SECONDS[self.cache_profile]
+        self.timer_deadline = self.last_normal_stop + self.cache_idle_seconds
         self.timer_kind = "compact"
         self.last_state_transition = "armed"
         self._debug(
             f"armed channel={short_id(self.channel)} profile={self.cache_profile} "
-            f"delay={IDLE_SECONDS[self.cache_profile]}"
+            f"delay={self.cache_idle_seconds} policy={self.cache_policy.get('mode')}"
         )
         self._guard_log(
             "armed",
             kind="compact",
             profile=self.cache_profile,
-            delay=IDLE_SECONDS[self.cache_profile],
+            delay=self.cache_idle_seconds,
+            cache_expires=self.cache_ttl_seconds,
+            policy_mode=self.cache_policy.get("mode"),
+            policy_reason=self.cache_policy.get("reason"),
+            policy_confidence=self.cache_policy.get("confidence"),
+            policy_source_harness=self.cache_policy.get("source_harness"),
+            policy_provider=self.cache_policy.get("provider"),
+            policy_endpoint=self.cache_policy.get("endpoint_id"),
+            policy_model=self.cache_policy.get("model"),
+            policy_observed_at=self.cache_policy.get("observed_at"),
+            policy_sample_count=self.cache_policy.get("sample_count"),
+            policy_session_count=self.cache_policy.get("session_count"),
         )
         self._write_state()
+
+    def _refresh_cache_policy_for_action(self) -> bool:
+        """Refresh endpoint evidence before an automatic compaction fires.
+
+        A policy can be regenerated, expire, or resolve to a different model
+        while a timer is sleeping.  Refreshing only when the timer arms would
+        let that stale decision trigger a compaction too early.  Return false
+        after re-arming to the newly resolved deadline; manual injections do
+        not pass through this method.
+        """
+        # The snapshot is also the authoritative source for a mid-session
+        # model change.  Its validation remains in the final gate below.
+        self._read_snapshot()
+        previous = self.cache_policy
+        self.cache_idle_seconds, self.cache_ttl_seconds, self.cache_policy = measured_cache_window(
+            self.current_model, self.cache_profile
+        )
+        anchor = self._idle_anchor()
+        refreshed_deadline = (
+            anchor + self.cache_idle_seconds if anchor is not None else None
+        )
+        fields = {
+            "profile": self.cache_profile,
+            "delay": self.cache_idle_seconds,
+            "cache_expires": self.cache_ttl_seconds,
+            "previous_mode": previous.get("mode"),
+            "policy_mode": self.cache_policy.get("mode"),
+            "policy_reason": self.cache_policy.get("reason"),
+            "policy_confidence": self.cache_policy.get("confidence"),
+            "policy_source_harness": self.cache_policy.get("source_harness"),
+            "policy_provider": self.cache_policy.get("provider"),
+            "policy_endpoint": self.cache_policy.get("endpoint_id"),
+            "policy_model": self.cache_policy.get("model"),
+            "policy_observed_at": self.cache_policy.get("observed_at"),
+            "policy_sample_count": self.cache_policy.get("sample_count"),
+            "policy_session_count": self.cache_policy.get("session_count"),
+        }
+        if refreshed_deadline is not None and refreshed_deadline > now():
+            self.timer_generation += 1
+            self.timer_deadline = refreshed_deadline
+            self.timer_kind = "compact"
+            self.last_state_transition = "policy-refreshed-rearmed"
+            self._guard_log("policy-refreshed-rearmed", **fields)
+            self._write_state()
+            return False
+        self._guard_log("policy-refreshed-for-action", **fields)
+        self._write_state()
+        return True
 
     def _idle_anchor(self) -> float | None:
         """Return the most recent activity of any kind that moves the idle window."""
@@ -1843,7 +1935,7 @@ class Supervisor:
     def _idle_window_open(self) -> bool:
         """True while any activity is younger than the idle threshold."""
         anchor = self._idle_anchor()
-        return anchor is not None and now() - anchor < IDLE_SECONDS[self.cache_profile]
+        return anchor is not None and now() - anchor < self.cache_idle_seconds
 
     def rearm(self, reason: str) -> None:
         """Re-arm the compaction timer after a transient cancellation or refusal.
@@ -1870,7 +1962,7 @@ class Supervisor:
         anchor = self._idle_anchor()
         delay = float(COMPACT_RETRY_SECONDS)
         if anchor is not None:
-            delay = max(delay, anchor + IDLE_SECONDS[self.cache_profile] - now())
+            delay = max(delay, anchor + self.cache_idle_seconds - now())
         self.timer_generation += 1
         self.timer_deadline = now() + delay
         self.timer_kind = "compact"
@@ -1907,7 +1999,7 @@ class Supervisor:
             anchor = self._idle_anchor()
             if anchor is not None:
                 self.timer_deadline = max(
-                    self.timer_deadline, anchor + IDLE_SECONDS[self.cache_profile]
+                    self.timer_deadline, anchor + self.cache_idle_seconds
                 )
             self._write_state()
             return
@@ -2814,6 +2906,12 @@ class Supervisor:
             self._guard_log("gate-refused", purpose=purpose, reason="stale-timer")
             self._write_state()
             return False
+        if (
+            purpose == "compact"
+            and expected_generation is not None
+            and not self._refresh_cache_policy_for_action()
+        ):
+            return False
         reason = self._gate_reason(purpose)
         if reason:
             self.last_cancellation_reason = reason
@@ -2917,7 +3015,7 @@ class Supervisor:
                 cache=(
                     "unknown"
                     if cache_age is None
-                    else ("warm" if cache_age < TTL_SECONDS[self.cache_profile] else "cold")
+                    else ("warm" if cache_age < self.cache_ttl_seconds else "cold")
                 ),
                 queued_behind_turn=queued_behind_turn,
             )
