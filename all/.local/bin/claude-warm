@@ -329,11 +329,51 @@ TTL_SECONDS = {
 }
 
 
+def validated_cache_decision(decision: object, provider: str, endpoint: str,
+                             model: str, allow_observed: bool = False) -> dict:
+    """Accept only the resolver's exact identity and ordered integer window."""
+    if not isinstance(decision, dict):
+        raise ValueError("cache-policy-not-object")
+    mode, confidence = decision.get("mode"), decision.get("confidence")
+    if mode == "fallback" and confidence == "fallback":
+        # The caller owns fallback timing; stdout cannot redefine its profile.
+        return decision
+    if not (mode == "measured" and confidence == "supported" or
+            allow_observed and mode == "observed" and confidence == "observed"):
+        raise ValueError("cache-policy-confidence-invalid")
+    def canonical(value: str) -> str:
+        return value.strip().lower().replace("_", "-")
+    expected_provider = canonical(provider)
+    expected_provider = {"openai-codex": "openai",
+                         "openai-codex-oauth": "openai"}.get(expected_provider, expected_provider)
+    expected_endpoint = canonical(endpoint)
+    if expected_provider == "openai" and expected_endpoint in {"openai", "openai-codex", "openai-codex-oauth"}:
+        expected_endpoint = "openai-codex-oauth"
+    expected_model = canonical(model)
+    if expected_provider == "anthropic":
+        expected_model = re.sub(r"-+", "-", re.sub(r"[ .]+", "-", expected_model)).strip("-")
+        if not expected_model.startswith("claude-"):
+            expected_model = "claude-" + expected_model
+    for key, expected in (("provider", expected_provider), ("endpoint_id", expected_endpoint), ("model", expected_model)):
+        if decision.get(key) != expected:
+            raise ValueError("cache-policy-identity-mismatch")
+    compact, expiry = decision.get("compact_before_seconds"), decision.get("cache_expires_seconds")
+    if (type(compact) is not int or type(expiry) is not int or
+            not 0 < compact < expiry or expiry > 2**31 - 1):
+        raise ValueError("cache-policy-window-invalid")
+    return decision
+
+
 def measured_cache_window(model: str | None, profile: str) -> tuple[int, int, dict]:
     fallback_idle = IDLE_SECONDS[profile]
     fallback_ttl = TTL_SECONDS[profile]
     if not model:
         return fallback_idle, fallback_ttl, {"mode": "fallback", "reason": "model-unknown"}
+    if any(os.environ.get(name) for name in (
+        "ANTHROPIC_BASE_URL", "ANTHROPIC_BEDROCK_BASE_URL",
+        "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY",
+    )):
+        return fallback_idle, fallback_ttl, {"mode": "fallback", "reason": "endpoint-unknown"}
     helper = pathlib.Path(os.environ.get(
         "FLEET_CACHE_POLICY_HELPER", str(pathlib.Path.home() / "HelmCortex/FORGE/bin/cache-policy")
     )).expanduser()
@@ -349,9 +389,11 @@ def measured_cache_window(model: str | None, profile: str) -> tuple[int, int, di
              "--fallback-cache", str(fallback_ttl)],
             capture_output=True, text=True, timeout=5, check=True,
         )
-        decision = json.loads(completed.stdout)
-        return int(decision["compact_before_seconds"]), int(decision["cache_expires_seconds"]), decision
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        decision = validated_cache_decision(json.loads(completed.stdout), "anthropic", "anthropic-default", model)
+        if decision["mode"] == "fallback":
+            return fallback_idle, fallback_ttl, decision
+        return decision["compact_before_seconds"], decision["cache_expires_seconds"], decision
+    except (OSError, TypeError, ValueError, KeyError, OverflowError, subprocess.SubprocessError):
         return fallback_idle, fallback_ttl, {"mode": "fallback", "reason": "resolver-error"}
 MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
 # An unknown transcript record fails closed (transcript-uncertain), but the
@@ -2022,8 +2064,9 @@ class Supervisor:
             and not self.recovery_pending
         ):
             return
+        _, snapshot_error = self._read_snapshot()
         self.cache_idle_seconds, self.cache_ttl_seconds, self.cache_policy = measured_cache_window(
-            self.current_model, self.cache_profile
+            self.current_model if snapshot_error is None else None, self.cache_profile
         )
         self.timer_generation += 1
         self.timer_deadline = self.last_normal_stop + self.cache_idle_seconds
@@ -2063,10 +2106,10 @@ class Supervisor:
         """
         # The snapshot is also the authoritative source for a mid-session
         # model change.  Its validation remains in the final gate below.
-        self._read_snapshot()
+        _, snapshot_error = self._read_snapshot()
         previous = self.cache_policy
         self.cache_idle_seconds, self.cache_ttl_seconds, self.cache_policy = measured_cache_window(
-            self.current_model, self.cache_profile
+            self.current_model if snapshot_error is None else None, self.cache_profile
         )
         anchor = self._idle_anchor()
         refreshed_deadline = (
