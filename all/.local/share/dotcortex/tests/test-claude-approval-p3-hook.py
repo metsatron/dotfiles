@@ -58,6 +58,14 @@ class ApprovalHookHarness(unittest.TestCase):
         data = json.loads(json.dumps(self.base))
         data["repo_roots"] = [str(root)]
         data["readonly_host"] = "YOUR_READONLY_HOST"
+        data["remote_home"] = "/home/metsatron"
+        data["remote_path_roots"] = [
+            "/home/metsatron/HelmCortex",
+            "/home/metsatron/DotCortex",
+            "/home/metsatron/HelmCortex-wt-kikin",
+            "/home/metsatron/DotCortex-wt-kikin",
+        ]
+        data["mailcortex_account"] = "bunta@kikin.helm"
         for item in data["classes"]:
             item["enabled"] = item["name"] in classes
         target = Path(self.tempdir.name) / "manifest.json"
@@ -95,8 +103,18 @@ class ApprovalHookHarness(unittest.TestCase):
     def test_ssh_readonly_exact_shape_and_smuggling(self):
         root = self.make_tree()
         manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
-        good = "ssh -o BatchMode=yes YOUR_READONLY_HOST 'git status --short | head -20'"
-        self.assert_allow(event("Bash", {"command": good}, root), manifest, root)
+        for good in (
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'git -C HelmCortex status --short | head -20'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'find HelmCortex/FORGE -maxdepth 2 -type f | grep approval | wc -l'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat HelmCortex/README.md'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat /home/metsatron/HelmCortex/README.md'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat ~/HelmCortex/README.md'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat DotCortex/../HelmCortex/README.md'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat //home/metsatron/HelmCortex/./README.md'",
+            "ssh -o BatchMode=yes YOUR_READONLY_HOST 'mailcortex inbox bunta@kikin.helm'",
+        ):
+            with self.subTest(good=good):
+                self.assert_allow(event("Bash", {"command": good}, root), manifest, root)
         for command in (
             "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat /etc/hosts > /tmp/x'",
             "ssh -o BatchMode=yes YOUR_READONLY_HOST 'date; id'",
@@ -139,7 +157,29 @@ class ApprovalHookHarness(unittest.TestCase):
                 "git -C HelmCortex show HEAD:NEXUS/.secrets/x",
                 "find HelmCortex -name env",
                 'find HelmCortex -name "*.env"',
+                "find -name README.md",
                 "grep TOKEN .config -r",
+                "grep -r TOKEN",
+                "ls",
+                "git status --short",
+                "cat HelmCortex/*.md",
+                "cat HelmCortex/{README.md,AGENTS.md}",
+                "cat HelmCortex/$FILE",
+                "cat HelmCortex/NEXUS/private/x",
+                "cat HelmCortex/NEXUS/secrets/x",
+                "cat HelmCortex/NEXUS/keys/x",
+                "cat HelmCortex/NEXUS/credentials/x",
+                "cat HelmCortex/public/env",
+                "cat HelmCortex/public/.env",
+                "cat HelmCortex/public/dev.env",
+                "cat HelmCortex/public/x.token",
+                "cat HelmCortex/public/x.key",
+                "cat HelmCortex/public/x.pem",
+                "cat HelmCortex/public/auth.json",
+                "cat HelmCortex/public/cookies.sqlite",
+                "cat HelmCortex/public/archive.jar",
+                "cat HelmCortex/public/session-token-cache",
+                "cat HelmCortex/public/secret-notes",
                 "cat /etc/passwd",
                 "cat /proc/self/environ",
                 "cat /var/lib/private/token",

@@ -4,6 +4,7 @@
 import json
 import os
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shlex
 import signal
@@ -95,6 +96,9 @@ def _load_manifest():
     if set(data) != {
         "schema_version",
         "readonly_host",
+        "remote_home",
+        "remote_path_roots",
+        "mailcortex_account",
         "repo_roots",
         "tmp_roots",
         "outbound_tools",
@@ -107,6 +111,17 @@ def _load_manifest():
         r"[A-Za-z0-9._-]+", data["readonly_host"]
     ):
         raise Rejected("readonly host")
+    if not isinstance(data["remote_home"], str) or not data["remote_home"].startswith("/"):
+        raise Rejected("remote home")
+    if not isinstance(data["remote_path_roots"], list) or not data["remote_path_roots"]:
+        raise Rejected("remote path roots")
+    if any(
+        not isinstance(root, str) or not root.startswith("/") or root == "/"
+        for root in data["remote_path_roots"]
+    ):
+        raise Rejected("remote path root")
+    if not isinstance(data["mailcortex_account"], str) or not data["mailcortex_account"]:
+        raise Rejected("mailcortex account")
     if not isinstance(data["repo_roots"], list) or not data["repo_roots"]:
         raise Rejected("repo roots")
     roots = []
@@ -251,44 +266,223 @@ def _safe_relative_path(raw):
     return not _protected_token(raw)
 
 
-def _remote_argument_paths_safe(words):
-    for word in words[1:]:
-        candidates = [word]
-        if "=" in word:
-            candidates.append(word.split("=", 1)[1])
-        for candidate in candidates:
-            if _protected_token(candidate):
-                return False
-    return True
+REMOTE_DYNAMIC_PATH = re.compile(r"[*?\[\]{}]")
+REMOTE_EXCLUDED_COMPONENTS = {
+    "private",
+    "secrets",
+    ".secrets",
+    "keys",
+    "credentials",
+}
 
 
-def _reader_segment(segment):
+def _remote_path(raw, remote_home, base=None):
+    if (
+        not raw
+        or "\x00" in raw
+        or "$" in raw
+        or "`" in raw
+        or REMOTE_DYNAMIC_PATH.search(raw)
+        or any(ord(character) < 32 or ord(character) == 127 for character in raw)
+    ):
+        return None
+    if raw == "~":
+        path = remote_home
+    elif raw.startswith("~/"):
+        path = remote_home.rstrip("/") + raw[1:]
+    elif raw.startswith("~"):
+        return None
+    elif raw.startswith("/"):
+        path = "/" + raw.lstrip("/")
+    else:
+        path = posixpath.join(base or remote_home, raw)
+    normalized = posixpath.normpath(path)
+    return normalized if normalized.startswith("/") else None
+
+
+def _remote_path_excluded(path):
+    components = tuple(part.lower() for part in path.split("/") if part)
+    if any(part in REMOTE_EXCLUDED_COMPONENTS for part in components):
+        return True
+    basename = components[-1] if components else ""
+    return (
+        basename in {"env", ".env", "auth.json"}
+        or basename.endswith((".env", ".token", ".key", ".pem", ".jar"))
+        or basename.startswith("cookies")
+        or "token" in basename
+        or "secret" in basename
+    )
+
+
+def _remote_paths_allowed(raw_paths, manifest, base=None):
+    roots = tuple(
+        _remote_path(raw, manifest["remote_home"])
+        for raw in manifest["remote_path_roots"]
+    )
+    if any(root is None for root in roots):
+        return None
+    resolved = []
+    for raw in raw_paths:
+        path = _remote_path(raw, manifest["remote_home"], base=base)
+        if (
+            path is None
+            or not any(path == root or path.startswith(root.rstrip("/") + "/") for root in roots)
+            or _remote_path_excluded(path)
+        ):
+            return None
+        resolved.append(path)
+    return resolved
+
+
+def _remote_git_paths(args, repo_raw, manifest):
+    repo = _remote_path(repo_raw, manifest["remote_home"])
+    roots = tuple(
+        _remote_path(raw, manifest["remote_home"])
+        for raw in manifest["remote_path_roots"]
+    )
+    if (
+        repo is None
+        or any(root is None for root in roots)
+        or not any(repo == root or repo.startswith(root.rstrip("/") + "/") for root in roots)
+        or _remote_path_excluded(repo)
+    ):
+        return None
+    subcommand = args[0]
+    raw_paths = []
+    for token in args[1:]:
+        if REMOTE_DYNAMIC_PATH.search(token):
+            return None
+        if token.startswith("-"):
+            continue
+        if subcommand == "show" and ":" in token:
+            revision, object_path = token.split(":", 1)
+            if not revision or not object_path or object_path.startswith("/"):
+                return None
+            raw_paths.append(object_path)
+        else:
+            raw_paths.append(token)
+    resolved = _remote_paths_allowed(raw_paths, manifest, base=repo)
+    return [repo, *resolved] if resolved is not None else None
+
+
+def _reader_segment(segment, manifest):
     try:
         words = shlex.split(segment, posix=True)
     except ValueError:
-        return False
-    if not words or not _remote_argument_paths_safe(words):
-        return False
+        return None
+    if not words:
+        return None
     command = words[0]
     if command == "git":
-        if len(words) < 2 or words[1] not in GIT_READERS:
-            return False
-        for word in words[2:]:
-            if word in GIT_UNSAFE_READ_OPTIONS or word.startswith("--output="):
-                return False
-        return True
+        args = words[1:]
+        repo_raw = "."
+        if args[:1] == ["-C"]:
+            if len(args) < 3:
+                return None
+            repo_raw = args[1]
+            args = args[2:]
+        if not args or args[0] not in GIT_READERS:
+            return None
+        if any(
+            word in GIT_UNSAFE_READ_OPTIONS or word in {"-C"} or word.startswith(("--output=", "--git-dir=", "--work-tree="))
+            for word in args[1:]
+        ):
+            return None
+        return _remote_git_paths(args, repo_raw, manifest)
     if command not in READERS:
-        return False
+        return None
+    args = words[1:]
+    if command == "cat":
+        return _remote_paths_allowed(args, manifest) if args and all(not item.startswith("-") for item in args) else None
     if command == "mailcortex":
-        return len(words) >= 2 and words[1] in {"inbox", "read"}
+        if not args or args[0] not in {"inbox", "read"}:
+            return None
+        expected = 2 if args[0] == "inbox" else 3
+        return [] if (
+            len(args) == expected
+            and args[1] == manifest["mailcortex_account"]
+            and all(not item.startswith("-") for item in args[1:])
+        ) else None
     if command == "find":
-        return not any(
+        if not args or any(
             word in FIND_WRITE_ACTIONS or any(word.startswith(item + "=") for item in FIND_WRITE_ACTIONS)
-            for word in words[1:]
-        )
-    if command == "tail" and any(word in {"-f", "--follow"} or word.startswith("--follow=") for word in words[1:]):
-        return False
-    return True
+            for word in args
+        ):
+            return None
+        cursor = 0
+        while cursor < len(args) and not args[cursor].startswith("-") and args[cursor] not in {"!", ","}:
+            cursor += 1
+        starts = args[:cursor]
+        expression = args[cursor:]
+        if not starts or any(REMOTE_DYNAMIC_PATH.search(item) for item in expression):
+            return None
+        for index, item in enumerate(expression):
+            if item in {"-name", "-iname"}:
+                if index + 1 >= len(expression) or _remote_path_excluded("/" + expression[index + 1]):
+                    return None
+        return _remote_paths_allowed(starts, manifest)
+    if command in {"head", "tail"}:
+        if not args or any(item in {"-f", "--follow", "--retry", "--pid"} or item.startswith(("--follow=", "--pid=")) for item in args):
+            return None
+        cursor = 0
+        while cursor < len(args) and args[cursor].startswith("-"):
+            option = args[cursor]
+            if re.fullmatch(r"-\d+", option):
+                cursor += 1
+                continue
+            if option in {"-n", "--lines", "-c", "--bytes"} and cursor + 1 < len(args):
+                cursor += 2
+                continue
+            if option.startswith(("--lines=", "--bytes=")):
+                cursor += 1
+                continue
+            return None
+        return _remote_paths_allowed(args[cursor:], manifest) if cursor < len(args) else []
+    if command == "grep":
+        safe_flags = {"-E", "-F", "-G", "-H", "-h", "-i", "-l", "-n", "-s", "-v", "-w", "-x", "-c"}
+        cursor = 0
+        explicit_pattern = False
+        while cursor < len(args) and args[cursor].startswith("-"):
+            option = args[cursor]
+            if option in safe_flags or option == "--color=never":
+                cursor += 1
+                continue
+            if option in {"-e", "--regexp", "-m", "--max-count"} and cursor + 1 < len(args):
+                explicit_pattern = explicit_pattern or option in {"-e", "--regexp"}
+                cursor += 2
+                continue
+            if option.startswith(("--regexp=", "--max-count=")):
+                explicit_pattern = explicit_pattern or option.startswith("--regexp=")
+                cursor += 1
+                continue
+            return None
+        operands = args[cursor:]
+        if not explicit_pattern:
+            if not operands:
+                return None
+            operands = operands[1:]
+        if any(item.startswith("-") for item in operands):
+            return None
+        return _remote_paths_allowed(operands, manifest) if operands else []
+    if command == "pgrep":
+        return [] if args and all(
+            not item.startswith("-") or item in {"-c", "-l", "-x", "--count", "--exact", "--list-name"}
+            for item in args
+        ) and len([item for item in args if not item.startswith("-")]) == 1 else None
+    if command == "date":
+        return [] if all(
+            item in {"-u", "--utc", "-R", "--rfc-email"}
+            or item.startswith(("+", "--iso-8601", "--date="))
+            for item in args
+        ) else None
+    if command == "wc" and any(item == "--files0-from" or item.startswith("--files0-from=") for item in args):
+        return None
+    if command in {"ls", "stat", "wc"}:
+        operands = [item for item in args if not item.startswith("-")]
+        if command in {"ls", "stat"} and not operands:
+            return None
+        return _remote_paths_allowed(operands, manifest) if operands else []
+    return None
 
 
 def _ssh_readonly(command, manifest):
@@ -303,7 +497,9 @@ def _ssh_readonly(command, manifest):
     if _hard_never(remote):
         return False
     parts = [part.strip() for part in remote.split("|")]
-    return bool(parts) and all(part and _reader_segment(part) for part in parts)
+    return bool(parts) and all(
+        part and _reader_segment(part, manifest) is not None for part in parts
+    )
 
 
 def _local_test(command, event, manifest):
