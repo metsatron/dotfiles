@@ -239,6 +239,12 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         "opencode_go",
         note="Direct OpenCode Go usage probe (OPENCODE_API_KEY, else OpenCode's auth.json); /zen/go/v1/usage.",
     ),
+    ProviderSpec(
+        "mistral",
+        "Mistral",
+        "mistral",
+        note="Mistral Vibe monthly plan % via /api/vibe/whoami (MISTRAL_API_KEY); Admin API usage needs a separate admin key.",
+    ),
 )
 
 # Providers shown by default (no --providers flag). antigravity/openrouter were dropped
@@ -246,7 +252,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
 # was unhidden and opencode-go added 2026-09-25 (Go's rolling/weekly/monthly windows
 # belong beside the other fuel gauges). antigravity stays on demand via
 # `--providers antigravity`.
-DEFAULT_PROVIDER_KEYS: tuple[str, ...] = ("codex", "claude", "openrouter", "opencode-go")
+DEFAULT_PROVIDER_KEYS: tuple[str, ...] = ("codex", "claude", "openrouter", "opencode-go", "mistral")
 
 
 def eprint(*args: Any, **kwargs: Any) -> None:
@@ -2428,6 +2434,67 @@ def apply_opencode_go_observation(result: dict[str, Any], collected_at: datetime
     return {**result, "summary": opencode_go_summary(observation), "observation": observation}
 
 
+# --- Mistral usage probe ----------------------------------------------------
+#
+# Mistral's Vibe monthly-plan percentage is NOT on the public API. The tRPC
+# endpoint `console.mistral.ai/api-ui/trpc/billing.vibeUsage` requires a browser
+# session (ory_session + csrftoken cookies) and is Cloudflare-gated — an API key
+# gets HTTP 401/403 there. What DOES accept the plain MISTRAL_API_KEY is:
+#   GET https://console.mistral.ai/api/vibe/whoami
+# which returns plan_type/plan_name plus `prompt_switching_to_pro_plan`.
+# The whoami payload carries no usage percentage, so this probe reports the
+# plan identity and a truthful "usage % unavailable via API key" hint pointing
+# at the console UI (Code > CLI > View organization usage) and at the Admin API
+# (/v1/admin/usage, needs a separate admin API key from the Backoffice).
+# It never fabricates a percentage.
+MISTRAL_WHOAMI_URL = os.environ.get(
+    "MISTRAL_WHOAMI_URL", "https://console.mistral.ai/api/vibe/whoami"
+)
+
+
+def fetch_mistral(timeout_seconds: float) -> dict[str, Any]:
+    token, token_source = _env_token("MISTRAL_API_KEY")
+    if not token:
+        return {
+            "provider": "mistral",
+            "label": "Mistral",
+            "state": "missing",
+            "source": token_source,
+            "summary": "No Mistral API key found (set MISTRAL_API_KEY).",
+            "raw": None,
+        }
+    result = _bearer_json_probe(
+        "mistral", "Mistral", MISTRAL_WHOAMI_URL, token, timeout_seconds,
+        summarize=_mistral_summary,
+    )
+    if result.get("state") == "ok" and isinstance(result.get("raw"), dict):
+        result["identity"] = _mistral_identity(result["raw"])
+    return result
+
+
+def _mistral_identity(data: dict[str, Any]) -> dict[str, Any]:
+    identity: dict[str, Any] = {}
+    for field in ("plan_type", "plan_name", "organization_kind", "customer_id"):
+        value = data.get(field)
+        if isinstance(value, str) and value:
+            identity[field] = value
+    return identity
+
+
+def _mistral_summary(data: dict[str, Any]) -> str:
+    plan = data.get("plan_name")
+    plan_type = data.get("plan_type")
+    parts: list[str] = []
+    if isinstance(plan, str) and plan:
+        parts.append(f"plan={plan}")
+    if isinstance(plan_type, str) and plan_type:
+        parts.append(f"type={plan_type}")
+    if data.get("prompt_switching_to_pro_plan") is True:
+        parts.append("pro upgrade prompted")
+    parts.append("usage % needs console session or Admin API key")
+    return "; ".join(parts) if parts else "Mistral whoami ok"
+
+
 # --- Shared result cache + rate-limit backoff -------------------------------
 #
 # Every provider probe funnels through fetch_provider, so the cache lives here
@@ -2600,6 +2667,9 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
 
     if spec.kind == "opencode_go":
         return fetch_opencode_go(timeout_seconds)
+
+    if spec.kind == "mistral":
+        return fetch_mistral(timeout_seconds)
 
     if spec.kind == "antigravity_kit":
         result = fetch_antigravity_quota(spec, timeout_seconds)
@@ -2900,6 +2970,20 @@ def render_text(results: list[dict[str, Any]]) -> None:
             else:
                 print_fitted_text(item["summary"], indent="  ", width=width)
 
+        elif item["provider"] == "mistral" and isinstance(raw, dict):
+            identity = item.get("identity") if isinstance(item.get("identity"), dict) else {}
+            if identity:
+                parts: list[str] = []
+                plan = identity.get("plan_name")
+                if isinstance(plan, str) and plan:
+                    parts.append(f"Plan: {plan}")
+                org = identity.get("organization_kind")
+                if isinstance(org, str) and org:
+                    parts.append(f"Org: {org}")
+                if parts:
+                    print(f"  {FGY}{' · '.join(parts)}{R}")
+            print_fitted_text(item["summary"], indent="  ", width=width)
+
         else:
             print_fitted_text(item["summary"], indent="  ", width=width)
 
@@ -3009,7 +3093,7 @@ def fetch_remote_results(remotes_file: Path, default_timeout: float) -> list[dic
 # then remote, so Codex (mine, then the operator's) reads as one block, then Claude,
 # then the direct probes. Remote panels keep their remotes-file order; providers
 # outside the list keep their existing relative order after these.
-PROVIDER_DISPLAY_ORDER = ("codex", "claude", "opencode-go", "openrouter")
+PROVIDER_DISPLAY_ORDER = ("codex", "claude", "opencode-go", "openrouter", "mistral")
 
 
 def order_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -3553,13 +3637,14 @@ class ResultOrderTests(unittest.TestCase):
             {"provider": "claude", "label": "Claude Code"},
             {"provider": "opencode-go", "label": "OpenCode Go"},
             {"provider": "openrouter", "label": "OpenRouter"},
+            {"provider": "mistral", "label": "Mistral"},
             {"provider": "codex", "label": "the operator · Codex", "remote": "the operator"},
             {"provider": "claude", "label": "the operator · Claude Code", "remote": "the operator"},
         ]
         self.assertEqual(
             [item["label"] for item in self.ai_usage.order_results(items)],
             ["Codex", "the operator · Codex", "Claude Code", "the operator · Claude Code",
-             "OpenCode Go", "OpenRouter"],
+             "OpenCode Go", "OpenRouter", "Mistral"],
         )
 
     def test_remote_panels_keep_file_order_and_unknowns_go_last(self):
@@ -3573,6 +3658,94 @@ class ResultOrderTests(unittest.TestCase):
             [item["label"] for item in self.ai_usage.order_results(items)],
             ["Codex", "the operator · Codex", "X230 · Codex", "NeuralWatt"],
         )
+
+
+MISTRAL_WHOAMI_FIXTURE = {
+    "plan_type": "API",
+    "plan_name": "FREE",
+    "prompt_switching_to_pro_plan": True,
+    "organization_kind": "S",
+    "customer_id": "25587b01-3447-483d-b6ac-7bc2caf053f3",
+    "api_base": "https://api.mistral.ai",
+    "vibe_base": "https://chat.mistral.ai",
+    "primitive_access_scope": "personal_and_shared",
+}
+
+
+class MistralProbeTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def test_no_credential_reports_missing(self):
+        with patch.dict(os.environ, {"MISTRAL_API_KEY": ""}):
+            with patch.object(self.ai_usage, "load_dotenv_exports", return_value={}):
+                result = self.ai_usage.fetch_mistral(1.0)
+        self.assertEqual(result["state"], "missing")
+        self.assertEqual(result["provider"], "mistral")
+        self.assertIn("MISTRAL_API_KEY", result["summary"])
+
+    def test_whoami_success_reports_plan_and_never_fabricates_percentage(self):
+        captured = {}
+
+        def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+            captured["token"] = token
+            captured["url"] = url
+            payload = json.loads(json.dumps(MISTRAL_WHOAMI_FIXTURE))
+            summary = summarize(payload) if summarize else ""
+            return {"provider": provider, "label": label, "state": "ok", "source": "api",
+                    "summary": summary, "raw": payload}
+
+        with patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}), \
+             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+            result = self.ai_usage.fetch_mistral(1.0)
+
+        self.assertEqual(captured["token"], "test-key")
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(result["identity"]["plan_name"], "FREE")
+        self.assertEqual(result["identity"]["customer_id"], "25587b01-3447-483d-b6ac-7bc2caf053f3")
+        # The summary must be truthful: no percentage number, explicit pointer to
+        # the console/Admin API for the actual usage figure.
+        self.assertIn("plan=FREE", result["summary"])
+        self.assertIn("usage % needs console session or Admin API key", result["summary"])
+        self.assertNotRegex(result["summary"], r"\d+(\.\d+)?%")
+
+    def test_http_error_surfaces_status_without_crashing(self):
+        def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+            return {"provider": provider, "label": label, "state": "error", "source": "api",
+                    "summary": f"{url} returned HTTP 401", "raw": None}
+
+        with patch.dict(os.environ, {"MISTRAL_API_KEY": "bad-key"}), \
+             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+            result = self.ai_usage.fetch_mistral(1.0)
+
+        self.assertEqual(result["state"], "error")
+        self.assertIn("HTTP 401", result["summary"])
+        self.assertNotIn("identity", result)
+
+    def test_mistral_is_registered_and_default_visible(self):
+        keys = [spec.key for spec in self.ai_usage.PROVIDERS]
+        self.assertIn("mistral", keys)
+        self.assertIn("mistral", self.ai_usage.DEFAULT_PROVIDER_KEYS)
+        self.assertIn("mistral", self.ai_usage.PROVIDER_DISPLAY_ORDER)
+
+    def test_renderer_shows_mistral_plan_line(self):
+        result = {
+            "provider": "mistral",
+            "label": "Mistral",
+            "state": "ok",
+            "source": "api",
+            "summary": "plan=FREE; type=API; usage % needs console session or Admin API key",
+            "raw": dict(MISTRAL_WHOAMI_FIXTURE),
+            "identity": {"plan_name": "FREE", "organization_kind": "S"},
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.ai_usage.render_text([result])
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", output.getvalue())
+        self.assertIn("Mistral", plain)
+        self.assertIn("Plan: FREE", plain)
+        self.assertIn("usage % needs console session or Admin API key", plain)
 
 
 if __name__ == "__main__":
