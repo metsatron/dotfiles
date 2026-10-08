@@ -362,6 +362,25 @@ class ApprovalHookHarness(unittest.TestCase):
         self.assertEqual(engine_decision(payload, manifest, runner), "allow")
         self.assertEqual(runner.calls[0][0][-1:], (repo,))
 
+    def test_remote_realpath_mount_alias_is_allowed_but_privacy_still_asks(self):
+        root = self.make_tree()
+        manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
+        payload = event(
+            "Bash",
+            {"command": "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat HelmCortex/README.md'"},
+            root,
+        )
+        mounted_readme = "/home/metsatron/mnt/x230/HelmCortex/README.md"
+        allowed_runner = FakeRemotePathRunner(stdout=mounted_readme + "\n")
+        self.assertEqual(engine_decision(payload, manifest, allowed_runner), "allow")
+
+        mounted_personal = (
+            "/home/metsatron/mnt/x230/HelmCortex/"
+            "LOGS/Telegram/Personal/x"
+        )
+        private_runner = FakeRemotePathRunner(stdout=mounted_personal + "\n")
+        self.assertEqual(engine_decision(payload, manifest, private_runner), "ask")
+
     def test_local_test_run_exact_shapes_and_paths(self):
         root = self.make_tree()
         manifest = self.enabled_manifest(root, "local-test-run")
