@@ -228,7 +228,7 @@ class ApprovalHookHarness(unittest.TestCase):
         )
         started = time.monotonic()
         with self.assertRaises(subprocess.TimeoutExpired):
-            proc.communicate(timeout=0.05)
+            proc.wait(timeout=0.05)
         proc.kill()
         stdout, _ = proc.communicate(timeout=1)
         self.assertLess(time.monotonic() - started, 1)
