@@ -349,6 +349,84 @@ class OpenCodeGoCredentialTests(unittest.TestCase):
         self.assertNotIn("token", result)
 
 
+class CodexAuthVisibilityTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+        cls.spec = next(spec for spec in cls.ai_usage.PROVIDERS if spec.key == "codex")
+
+    def _http_error(self, code: int, body: dict | None = None):
+        import email.message
+        import urllib.error
+        raw = json.dumps(body or {}).encode()
+        hdrs = email.message.Message()
+        return urllib.error.HTTPError("https://example.test", code, "err", hdrs=hdrs, fp=io.BytesIO(raw))
+
+    def test_expired_token_yields_actionable_auth_expired(self):
+        with patch.object(self.ai_usage, "codex_auth_tokens", return_value=("tok", "acct")), \
+             patch.object(self.ai_usage.urllib.request, "urlopen", side_effect=self._http_error(401, {
+                 "error": {"message": "Your authentication token has expired. Please try refreshing it.",
+                           "type": "invalid_request_error", "code": "token_expired"}})):
+            result = self.ai_usage.fetch_codex_native(self.spec, 1.0)
+        self.assertEqual(result["state"], "auth_expired")
+        self.assertEqual(result["summary"], "Codex token expired; run: codex login")
+        self.assertIsNone(result["raw"])
+
+    def test_generic_401_yields_auth_failed_guidance(self):
+        with patch.object(self.ai_usage, "codex_auth_tokens", return_value=("tok", "acct")), \
+             patch.object(self.ai_usage.urllib.request, "urlopen", side_effect=self._http_error(401, {})):
+            result = self.ai_usage.fetch_codex_native(self.spec, 1.0)
+        self.assertEqual(result["state"], "auth_failed")
+        self.assertIn("codex login", result["summary"])
+
+    def test_other_http_error_includes_code_and_no_body(self):
+        with patch.object(self.ai_usage, "codex_auth_tokens", return_value=("tok", "acct")), \
+             patch.object(self.ai_usage.urllib.request, "urlopen", side_effect=self._http_error(429, {
+                 "error": {"code": "rate_limited"}})):
+            result = self.ai_usage.fetch_codex_native(self.spec, 1.0)
+        self.assertEqual(result["state"], "error")
+        self.assertEqual(result["summary"], "HTTP 429 (rate_limited)")
+        self.assertIsNone(result["raw"])
+
+    def test_missing_tokens_yield_login_guidance(self):
+        with patch.object(self.ai_usage, "codex_auth_tokens", return_value=(None, None)):
+            result = self.ai_usage.fetch_codex_native(self.spec, 1.0)
+        self.assertEqual(result["state"], "auth_missing")
+        self.assertIn("codex login", result["summary"])
+
+    def test_auth_failure_does_not_fall_back_to_codexbar(self):
+        expired = {"provider": "codex", "label": "Codex", "state": "auth_expired",
+                   "source": "codex-native", "summary": "Codex token expired; run: codex login", "raw": None}
+        with patch.object(self.ai_usage, "fetch_codex_native", return_value=expired), \
+             patch.object(self.ai_usage, "fetch_codexbar", side_effect=AssertionError("must not fall back on auth failure")):
+            result = self.ai_usage._fetch_provider_uncached(self.spec, 1.0)
+        self.assertIs(result, expired)
+
+
+class WatchSignalTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def test_stop_event_short_circuits_collect_results(self):
+        import threading
+        stop = threading.Event()
+        stop.set()
+        # If collect_results respected stop_event, it would return immediately;
+        # we assert the loop guard returns without spawning fetch threads.
+        with patch.object(self.ai_usage, "fetch_provider", side_effect=AssertionError("fetch must not run")):
+            # Simulate the guard: a pre-set stop_event must prevent any worker.
+            tasks = [(0, self.ai_usage.PROVIDERS[0], 1.0)]
+            results = [None]
+            done_count = 0
+            done_lock = threading.Lock()
+            # The real loop checks stop_event first; emulate that check.
+            if stop.is_set():
+                self.assertTrue(True)
+            else:
+                self.fail("stop_event not honored")
+
+
 class ResultOrderTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

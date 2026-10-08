@@ -1149,9 +1149,9 @@ def fetch_codex_native(spec: ProviderSpec, timeout_seconds: float) -> dict[str, 
         return {
             "provider": spec.key,
             "label": spec.label,
-            "state": "missing",
+            "state": "auth_missing",
             "source": "",
-            "summary": "Codex auth tokens unavailable (~/.codex/auth.json).",
+            "summary": "Codex auth unavailable (~/.codex/auth.json); run: codex login",
             "raw": None,
         }
 
@@ -1168,9 +1168,37 @@ def fetch_codex_native(spec: ProviderSpec, timeout_seconds: float) -> dict[str, 
         with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
             data = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as error:
+        body = b""
+        try:
+            body = error.read(4096)
+        except Exception:
+            body = b""
+        code = ""
+        try:
+            parsed = json.loads(body.decode("utf-8", "replace"))
+            err = parsed.get("error") if isinstance(parsed, dict) else None
+            if isinstance(err, dict) and isinstance(err.get("code"), str):
+                code = err["code"]
+        except Exception:
+            code = ""
+        if error.code == 401 and code == "token_expired":
+            return {
+                "provider": spec.key, "label": spec.label, "state": "auth_expired",
+                "source": "codex-native",
+                "summary": "Codex token expired; run: codex login",
+                "raw": None,
+            }
+        if error.code == 401:
+            return {
+                "provider": spec.key, "label": spec.label, "state": "auth_failed",
+                "source": "codex-native",
+                "summary": "Codex auth failed (HTTP 401); run: codex login",
+                "raw": None,
+            }
+        detail = f" ({code})" if code else ""
         return {
             "provider": spec.key, "label": spec.label, "state": "error",
-            "source": "codex-native", "summary": f"HTTP {error.code}", "raw": None,
+            "source": "codex-native", "summary": f"HTTP {error.code}{detail}", "raw": None,
         }
     except urllib.error.URLError as error:
         return {
@@ -2530,6 +2558,11 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
         result = fetch_codex_native(spec, timeout_seconds)
         if result["state"] == "ok":
             return enrich_codex_reset_credits(result, timeout_seconds)
+        # Never fall back to another credential source on auth failure: an
+        # expired/invalid token must surface as actionable guidance, not be
+        # masked by a stale codexbar binary reading a different file.
+        if result["state"] in {"auth_expired", "auth_failed", "auth_missing"}:
+            return result
         fallback = fetch_codexbar(spec, timeout_seconds)
         if fallback["state"] == "ok":
             return enrich_codex_reset_credits(fallback, timeout_seconds)
@@ -3078,7 +3111,7 @@ def main() -> int:
 
         while True:
             if stop_event.is_set():
-                raise KeyboardInterrupt
+                return 0
             with done_lock:
                 if done_count >= len(tasks):
                     break
@@ -3115,8 +3148,14 @@ def main() -> int:
 
     stop_event = threading.Event()
     watch_thread: threading.Thread | None = None
+
+    def handle_stop_signal(signum, frame) -> None:
+        stop_event.set()
+
     if args.watch:
         watch_thread, _ = start_watch_input_thread(stop_event)
+        prev_int = signal.signal(signal.SIGINT, handle_stop_signal)
+        prev_term = signal.signal(signal.SIGTERM, handle_stop_signal)
 
     try:
         while True:
@@ -3143,6 +3182,12 @@ def main() -> int:
         return 130
     finally:
         stop_event.set()
+        if args.watch:
+            try:
+                signal.signal(signal.SIGINT, prev_int)
+                signal.signal(signal.SIGTERM, prev_term)
+            except (ValueError, AttributeError):
+                pass
         if watch_thread and watch_thread.is_alive():
             watch_thread.join(timeout=0.5)
 
