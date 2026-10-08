@@ -227,23 +227,74 @@ class PolicyDecisionTest(unittest.TestCase):
         args = run.call_args.args[0]
         self.assertEqual(args[args.index("--endpoint") + 1], "https://other.invalid/v1")
 
-    def test_lossy_url_routes_cannot_arm_another_endpoint(self):
-        for endpoint in ("https://fixture.invalid/Route_A/v1", "https://fixture.invalid/Route/v1",
-                         "https://fixture.invalid/route_a/v1", "https://fixture.invalid/%2Froute/v1",
-                         "https://fixture.invalid/route/v1//"):
+    def test_case_underscore_and_percent_routes_preserve_identity(self):
+        from openai import AsyncOpenAI
+        for endpoint, canonical in (
+            ("HTTPS://Fixture.Invalid/Route_A/%2fValue",
+             "https://fixture.invalid/Route_A/%2fValue"),
+            ("https://fixture.invalid/Route_A/%2FValue/",
+             "https://fixture.invalid/Route_A/%2FValue"),
+        ):
             for initialized in (False, True):
                 with self.subTest(endpoint=endpoint, initialized=initialized):
                     self.provider._effective_base = endpoint
-                    self.provider._client = None
-                    if initialized:
-                        from openai import AsyncOpenAI
-                        self.provider._client = AsyncOpenAI(api_key="fixture", base_url=endpoint)
-                    wire = str(self.provider._client.base_url) if initialized else endpoint
-                    decision = self.decision | dict(endpoint_id=wire.rstrip("/").lower().replace("_", "-"))
-                    result, run = self.resolve(decision)
-                    self.assertIsNone(result)
-                    run.assert_not_called()
-                    self.assertIsNone(AutoCompact._policy_identity(self.runtime))
+                    self.provider._client = (
+                        AsyncOpenAI(api_key="fixture", base_url=endpoint) if initialized else None
+                    )
+                    identity = AutoCompact._policy_identity(self.runtime)
+                    self.assertEqual(identity, ("custom", canonical, "fixture-model"))
+                    decision = self.decision | dict(endpoint_id=canonical)
+                    self.assertEqual(self.resolve(decision)[0], 60)
+
+    def test_distinct_path_and_percent_spellings_cannot_cross_arm(self):
+        endpoint = "https://fixture.invalid/Route_A/%2fValue"
+        self.provider._effective_base = endpoint
+        for other in (
+            "https://fixture.invalid/route_A/%2fValue",
+            "https://fixture.invalid/Route-A/%2fValue",
+            "https://fixture.invalid/Route_A/%2FValue",
+        ):
+            with self.subTest(other=other):
+                result, run = self.resolve(self.decision | dict(endpoint_id=other))
+                self.assertIsNone(result)
+                run.assert_called_once()
+
+    def test_malformed_physical_routes_fail_before_resolver(self):
+        for endpoint in (
+            "https://fixture.invalid/route/v1//",
+            "https://fixture.invalid/path?",
+            "https://fixture.invalid/path#",
+            "https://fixture.invalid/%ZZ",
+            "https://fixture.invalid/%2",
+            "https://fixture.invalid\\other/path",
+            "https://fixture.invalid:bad/path",
+            "https:///path",
+            "ftp://fixture.invalid/path",
+        ):
+            with self.subTest(endpoint=endpoint):
+                self.provider._effective_base = endpoint
+                result, run = self.resolve()
+                self.assertIsNone(result)
+                run.assert_not_called()
+                self.assertIsNone(AutoCompact._policy_identity(self.runtime))
+
+    def test_bare_root_slash_matches_no_slash(self):
+        from openai import AsyncOpenAI
+        canonical = "https://fixture.invalid"
+        for endpoint in (canonical, canonical + "/"):
+            for initialized in (False, True):
+                with self.subTest(endpoint=endpoint, initialized=initialized):
+                    self.provider._effective_base = endpoint
+                    self.provider._client = (
+                        AsyncOpenAI(api_key="fixture", base_url=endpoint) if initialized else None
+                    )
+                    self.assertEqual(
+                        AutoCompact._policy_identity(self.runtime),
+                        ("custom", canonical, "fixture-model"),
+                    )
+                    self.assertEqual(
+                        self.resolve(self.decision | dict(endpoint_id=canonical))[0], 60,
+                    )
 
     def test_unchanged_lowercase_sdk_route_remains_supported(self):
         from openai import AsyncOpenAI
