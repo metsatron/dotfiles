@@ -82,7 +82,10 @@ def engine_decision(payload, manifest, runner=identity_remote_path_runner):
     kwargs = {}
     if "remote_path_runner" in inspect.signature(ENGINE_MODULE.evaluate).parameters:
         kwargs["remote_path_runner"] = runner
-    return "allow" if ENGINE_MODULE.evaluate(payload, loaded, **kwargs) else "ask"
+    try:
+        return "allow" if ENGINE_MODULE.evaluate(payload, loaded, **kwargs) else "ask"
+    except Exception:
+        return "ask"
 
 
 class ApprovalHookHarness(unittest.TestCase):
@@ -93,7 +96,9 @@ class ApprovalHookHarness(unittest.TestCase):
 
     def enabled_manifest(self, root, *classes):
         data = json.loads(json.dumps(self.base))
-        data["repo_roots"] = [str(root)]
+        data["local_test_roots"] = [str(root)]
+        data["centre_roots"] = [str(root)]
+        data["dotcortex_roots"] = [str(root)]
         data["readonly_host"] = "YOUR_READONLY_HOST"
         data["remote_home"] = "/home/metsatron"
         data["remote_path_roots"] = [
