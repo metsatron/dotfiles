@@ -103,6 +103,7 @@ class ApprovalHookHarness(unittest.TestCase):
         data["remote_home"] = "/home/metsatron"
         data["remote_path_roots"] = [
             "/home/metsatron/HelmCortex",
+            "/home/metsatron/mnt/x230/HelmCortex",
             "/home/metsatron/DotCortex",
             "/home/metsatron/HelmCortex-wt-kikin",
             "/home/metsatron/DotCortex-wt-kikin",
