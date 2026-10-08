@@ -500,6 +500,38 @@ class MistralProbeTests(unittest.TestCase):
         self.assertEqual(result["identity"]["plan_name"], "FREE")
         self.assertNotIn("usage", result)
 
+    def test_no_jar_configured_skips_budget_probe_and_says_so(self):
+        """MISTRAL_COOKIE_JAR unset => budget probe skipped, output says why,
+        and the fallback never fabricates a budget number."""
+        def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+            payload = json.loads(json.dumps(MISTRAL_WHOAMI_FIXTURE))
+            summary = summarize(payload) if summarize else ""
+            return {"provider": provider, "label": label, "state": "ok", "source": "api",
+                    "summary": summary, "raw": payload}
+
+        def fail_http(*args, **kwargs):
+            raise AssertionError("budget probe must not touch the network when the jar is unset")
+
+        # Empty cookie header => real _mistral_trpc returns None before any HTTP,
+        # so urlopen staying untouched proves the probe was skipped.
+        with patch.dict(os.environ, {"MISTRAL_COOKIE_JAR": "", "MISTRAL_API_KEY": "test-key"}), \
+             patch.object(self.ai_usage, "_mistral_cookie_header", return_value=""), \
+             patch.object(self.ai_usage.urllib.request, "urlopen", side_effect=fail_http), \
+             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+            result = self.ai_usage.fetch_mistral(1.0)
+
+        self.assertEqual(result["state"], "ok")
+        self.assertIn("MISTRAL_COOKIE_JAR not set", result["summary"])
+        # Plan identity still surfaces; no budget percentage is invented.
+        self.assertEqual(result["identity"]["plan_name"], "FREE")
+        self.assertNotIn("usage", result)
+
+    def test_tangled_script_has_no_home_paths(self):
+        """DotCortex is public: no username/host path may leak into the tangled
+        script. Fails if any '/home/' literal appears in ai-usage source."""
+        script = Path(self.ai_usage.__file__).read_text()
+        self.assertNotIn("/home/", script)
+
     def test_http_error_surfaces_status_without_crashing(self):
         def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
             return {"provider": provider, "label": label, "state": "error", "source": "api",
