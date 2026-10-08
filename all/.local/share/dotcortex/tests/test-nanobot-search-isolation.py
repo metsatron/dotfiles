@@ -41,7 +41,7 @@ class FakeSearch:
         if self.mode == "hang":
             await asyncio.sleep(10)
         if self.mode == "descendant":
-            await asyncio.sleep(10)
+            await asyncio.sleep(60)
         scope = current_workspace_scope()
         return str(scope.project_path) if scope else "unscoped"
 
@@ -114,8 +114,10 @@ class SearchIsolationTest(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_kills_synthetic_descendant_group(self):
         with tempfile.TemporaryDirectory(prefix="nano-descendant-") as root:
             pid_file = Path(root) / "pid"
+            # A spawned interpreter may cold-start through an NFS-backed venv;
+            # leave startup headroom while keeping the synthetic descendant alive.
             result = await isolated_search(FakeSearch("descendant", str(pid_file)),
-                                           {}, "grep", timeout=3.0)
+                                           {}, "grep", timeout=10.0)
             self.assertIn("timed out", result)
             self.assertTrue(pid_file.is_file())
             pid = int(pid_file.read_text(encoding="utf-8"))
