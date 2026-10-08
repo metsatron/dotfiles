@@ -26,6 +26,16 @@ esac
 """
 
 
+FAKE_NURSE = """#!/usr/bin/env bash
+root="$FAKE_ROOT"
+case "$1" in
+  status) cat "$root/nurse_status" ;;
+  revive) shift; for a in "$@"; do case "$a" in --*) ;; *) echo "$a" >> "$root/revives" ;; esac; done ;;
+  *) exit 2 ;;
+esac
+"""
+
+
 class WatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -35,6 +45,10 @@ class WatchdogTests(unittest.TestCase):
         self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
         (self.root / "enabled").write_text("ductor codex\n")
         self.set_status("RUNNING", "RUNNING")
+        self.nurse = self.root / "nurse"
+        self.nurse.write_text(FAKE_NURSE)
+        self.nurse.chmod(self.nurse.stat().st_mode | stat.S_IXUSR)
+        self.set_warm({})
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -49,7 +63,8 @@ class WatchdogTests(unittest.TestCase):
             [str(WATCHDOG), "--expected-host", HOST, "--manager", str(self.manager),
              "--state-dir", str(self.root / "state"), "--intent-dir", str(self.root / "intent"),
              "--boot-lock", str(self.root / "boot.lock"), "--spool", str(self.root / "spool"),
-             "--pid-dir", str(self.root / "pids"), "--backoff", backoff, *extra],
+             "--pid-dir", str(self.root / "pids"), "--backoff", backoff,
+             "--warm-file", str(self.root / "warm"), "--nurse", str(self.nurse), *extra],
             env=dict(os.environ, FAKE_ROOT=str(self.root)), text=True, capture_output=True, timeout=30,
         )
 
@@ -214,6 +229,55 @@ class WatchdogTests(unittest.TestCase):
         refused = self.request("ductor", self.dead_pid(), env={"TELEGRAM_AGENT_SELF": "codex"})
         self.assertEqual(refused.returncode, 2)
         self.assertFalse((self.root / "state/requests/ductor.json").exists())
+
+    def set_warm(self, verdicts: dict[str, str]) -> None:
+        members = [{"name": name, "verdict": verdict} for name, verdict in verdicts.items()]
+        (self.root / "nurse_status").write_text(json.dumps({"members": members}))
+
+    def revives(self) -> list[str]:
+        path = self.root / "revives"
+        return path.read_text().split() if path.exists() else []
+
+    def test_no_warm_list_never_calls_nurse(self) -> None:
+        self.set_warm({"Fable": "down"})
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_down_warm_session_is_revived_through_nurse_joy(self) -> None:
+        (self.root / "warm").write_text("Fable\nOpus  # sealed consort\nHaiku\n")
+        self.set_warm({"Fable": "field", "Opus": "down", "Haiku": "field", "Auryn": "down"})
+        self.run_watchdog()
+        self.assertEqual(self.revives(), ["opus"])  # Auryn is down but not listed: untouched
+        self.assertEqual(self.starts(), [])  # never routed through the Telegram host manager
+        self.assertEqual([(e["kind"], e["payload"]["agent"]) for e in self.events()], [("down", "warm-opus")])
+        self.set_warm({"Fable": "field", "Opus": "field", "Haiku": "field"})
+        self.run_watchdog()
+        self.assertEqual([e["kind"] for e in self.events()], ["down", "recovered"])
+
+    def test_warm_operator_stop_marker_is_respected(self) -> None:
+        (self.root / "warm").write_text("Opus\n")
+        (self.root / "intent").mkdir()
+        (self.root / "intent" / "warm-opus").write_text("")
+        self.set_warm({"Opus": "down"})
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_unreadable_or_unusual_warm_state_never_revives(self) -> None:
+        (self.root / "warm").write_text("Opus\nHaiku\nFable\n")
+        self.set_warm({"Opus": "fainted", "Haiku": "field"})  # Fable missing from the roster entirely
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+        (self.root / "nurse_status").write_text("not json")
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_warm_attempt_cap_holds(self) -> None:
+        (self.root / "warm").write_text("Opus\n")
+        self.set_warm({"Opus": "down"})
+        for _ in range(5):
+            self.run_watchdog()
+        self.assertEqual(self.revives(), ["opus", "opus", "opus"])
+        self.assertIn("relaunch_failed", [e["kind"] for e in self.events()])
 
     def test_wrong_host_refuses(self) -> None:
         result = subprocess.run([str(WATCHDOG), "--expected-host", "not-" + HOST, "--manager", str(self.manager)],
