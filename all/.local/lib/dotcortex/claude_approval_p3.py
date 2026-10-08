@@ -6,11 +6,13 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
+import signal
 import stat
 import sys
 
 
 SCHEMA_VERSION = "so-approval-p3.v1"
+HARD_TIMEOUT_SECONDS = 0.75
 CLASS_NAMES = (
     "ssh-kikin-readonly",
     "local-test-run",
@@ -374,7 +376,16 @@ def evaluate(event, manifest):
     return bool(matched and manifest["enabled"].get(rule) is True)
 
 
+def _deadline(_signum, _frame):
+    raise TimeoutError("approval deadline")
+
+
 def main():
+    try:
+        previous_handler = signal.signal(signal.SIGALRM, _deadline)
+        signal.setitimer(signal.ITIMER_REAL, HARD_TIMEOUT_SECONDS)
+    except Exception:
+        return 0
     try:
         raw = sys.stdin.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
@@ -386,6 +397,9 @@ def main():
             sys.stdout.write("\n")
     except Exception:
         pass
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
     return 0
 
 
