@@ -9,11 +9,13 @@ import re
 import shlex
 import signal
 import stat
+import subprocess
 import sys
 
 
 SCHEMA_VERSION = "so-approval-p3.v1"
 HARD_TIMEOUT_SECONDS = 0.75
+REMOTE_REALPATH_TIMEOUT_SECONDS = 0.5
 CLASS_NAMES = (
     "ssh-kikin-readonly",
     "local-test-run",
@@ -99,7 +101,9 @@ def _load_manifest():
         "remote_home",
         "remote_path_roots",
         "mailcortex_account",
-        "repo_roots",
+        "local_test_roots",
+        "centre_roots",
+        "dotcortex_roots",
         "tmp_roots",
         "outbound_tools",
         "classes",
@@ -122,16 +126,18 @@ def _load_manifest():
         raise Rejected("remote path root")
     if not isinstance(data["mailcortex_account"], str) or not data["mailcortex_account"]:
         raise Rejected("mailcortex account")
-    if not isinstance(data["repo_roots"], list) or not data["repo_roots"]:
-        raise Rejected("repo roots")
-    roots = []
-    for raw in data["repo_roots"]:
-        if not isinstance(raw, str) or not raw.startswith("/"):
-            raise Rejected("repo root")
-        root = Path(raw).resolve(strict=False)
-        if root == Path("/"):
-            raise Rejected("broad repo root")
-        roots.append(root)
+    for field in ("local_test_roots", "centre_roots", "dotcortex_roots"):
+        if not isinstance(data[field], list) or not data[field]:
+            raise Rejected(field)
+        roots = []
+        for raw in data[field]:
+            if not isinstance(raw, str) or not raw.startswith("/"):
+                raise Rejected(field)
+            root = Path(raw).resolve(strict=False)
+            if root == Path("/"):
+                raise Rejected(field)
+            roots.append(root)
+        data[field] = roots
     if not isinstance(data["tmp_roots"], list) or not data["tmp_roots"]:
         raise Rejected("tmp roots")
     tmp_roots = []
@@ -159,7 +165,6 @@ def _load_manifest():
         ):
             raise Rejected("class entry")
         enabled[expected] = item["enabled"]
-    data["repo_roots"] = roots
     data["tmp_roots"] = tmp_roots
     data["enabled"] = enabled
     return data
@@ -302,7 +307,14 @@ def _remote_path(raw, remote_home, base=None):
 
 def _remote_path_excluded(path):
     components = tuple(part.lower() for part in path.split("/") if part)
-    if any(part in REMOTE_EXCLUDED_COMPONENTS for part in components):
+    if (
+        any(part in REMOTE_EXCLUDED_COMPONENTS for part in components)
+        or "palmcortex" in components
+        or any(
+            components[index:index + 3] == ("logs", "telegram", "personal")
+            for index in range(max(0, len(components) - 2))
+        )
+    ):
         return True
     basename = components[-1] if components else ""
     return (
@@ -334,6 +346,13 @@ def _remote_paths_allowed(raw_paths, manifest, base=None):
     return resolved
 
 
+def _remote_analysis(paths, realpath_paths=None):
+    return {
+        "paths": list(paths),
+        "realpath_paths": list(paths if realpath_paths is None else realpath_paths),
+    }
+
+
 def _remote_git_paths(args, repo_raw, manifest):
     repo = _remote_path(repo_raw, manifest["remote_home"])
     roots = tuple(
@@ -348,21 +367,46 @@ def _remote_git_paths(args, repo_raw, manifest):
     ):
         return None
     subcommand = args[0]
-    raw_paths = []
-    for token in args[1:]:
-        if REMOTE_DYNAMIC_PATH.search(token):
+    remainder = list(args[1:])
+    if any(REMOTE_DYNAMIC_PATH.search(token) for token in remainder):
+        return None
+    lexical_paths = [repo]
+    realpath_paths = [repo]
+    if subcommand == "show":
+        if "--" in remainder:
             return None
-        if token.startswith("-"):
-            continue
-        if subcommand == "show" and ":" in token:
+        object_paths = []
+        for token in remainder:
+            if token.startswith("-"):
+                continue
+            if ":" not in token:
+                continue
             revision, object_path = token.split(":", 1)
             if not revision or not object_path or object_path.startswith("/"):
                 return None
-            raw_paths.append(object_path)
-        else:
-            raw_paths.append(token)
-    resolved = _remote_paths_allowed(raw_paths, manifest, base=repo)
-    return [repo, *resolved] if resolved is not None else None
+            object_paths.append(object_path)
+        resolved_objects = _remote_paths_allowed(object_paths, manifest, base=repo)
+        if resolved_objects is None:
+            return None
+        lexical_paths.extend(resolved_objects)
+        return _remote_analysis(lexical_paths, realpath_paths)
+
+    disk_raw_paths = []
+    if "--" in remainder:
+        if remainder.count("--") != 1:
+            return None
+        separator = remainder.index("--")
+        disk_raw_paths = remainder[separator + 1:]
+        if not disk_raw_paths:
+            return None
+    elif subcommand == "status":
+        disk_raw_paths = [token for token in remainder if not token.startswith("-")]
+    resolved_disk = _remote_paths_allowed(disk_raw_paths, manifest, base=repo)
+    if resolved_disk is None:
+        return None
+    lexical_paths.extend(resolved_disk)
+    realpath_paths.extend(resolved_disk)
+    return _remote_analysis(lexical_paths, realpath_paths)
 
 
 def _reader_segment(segment, manifest):
@@ -393,12 +437,13 @@ def _reader_segment(segment, manifest):
         return None
     args = words[1:]
     if command == "cat":
-        return _remote_paths_allowed(args, manifest) if args and all(not item.startswith("-") for item in args) else None
+        paths = _remote_paths_allowed(args, manifest) if args and all(not item.startswith("-") for item in args) else None
+        return None if paths is None else _remote_analysis(paths)
     if command == "mailcortex":
         if not args or args[0] not in {"inbox", "read"}:
             return None
         expected = 2 if args[0] == "inbox" else 3
-        return [] if (
+        return _remote_analysis([]) if (
             len(args) == expected
             and args[1] == manifest["mailcortex_account"]
             and all(not item.startswith("-") for item in args[1:])
@@ -420,7 +465,8 @@ def _reader_segment(segment, manifest):
             if item in {"-name", "-iname"}:
                 if index + 1 >= len(expression) or _remote_path_excluded("/" + expression[index + 1]):
                     return None
-        return _remote_paths_allowed(starts, manifest)
+        paths = _remote_paths_allowed(starts, manifest)
+        return None if paths is None else _remote_analysis(paths)
     if command in {"head", "tail"}:
         if not args or any(item in {"-f", "--follow", "--retry", "--pid"} or item.startswith(("--follow=", "--pid=")) for item in args):
             return None
@@ -437,7 +483,10 @@ def _reader_segment(segment, manifest):
                 cursor += 1
                 continue
             return None
-        return _remote_paths_allowed(args[cursor:], manifest) if cursor < len(args) else []
+        if cursor >= len(args):
+            return _remote_analysis([])
+        paths = _remote_paths_allowed(args[cursor:], manifest)
+        return None if paths is None else _remote_analysis(paths)
     if command == "grep":
         safe_flags = {"-E", "-F", "-G", "-H", "-h", "-i", "-l", "-n", "-s", "-v", "-w", "-x", "-c"}
         cursor = 0
@@ -463,14 +512,17 @@ def _reader_segment(segment, manifest):
             operands = operands[1:]
         if any(item.startswith("-") for item in operands):
             return None
-        return _remote_paths_allowed(operands, manifest) if operands else []
+        if not operands:
+            return _remote_analysis([])
+        paths = _remote_paths_allowed(operands, manifest)
+        return None if paths is None else _remote_analysis(paths)
     if command == "pgrep":
-        return [] if args and all(
+        return _remote_analysis([]) if args and all(
             not item.startswith("-") or item in {"-c", "-l", "-x", "--count", "--exact", "--list-name"}
             for item in args
         ) and len([item for item in args if not item.startswith("-")]) == 1 else None
     if command == "date":
-        return [] if all(
+        return _remote_analysis([]) if all(
             item in {"-u", "--utc", "-R", "--rfc-email"}
             or item.startswith(("+", "--iso-8601", "--date="))
             for item in args
@@ -481,7 +533,10 @@ def _reader_segment(segment, manifest):
         operands = [item for item in args if not item.startswith("-")]
         if command in {"ls", "stat"} and not operands:
             return None
-        return _remote_paths_allowed(operands, manifest) if operands else []
+        if not operands:
+            return _remote_analysis([])
+        paths = _remote_paths_allowed(operands, manifest)
+        return None if paths is None else _remote_analysis(paths)
     return None
 
 
@@ -497,13 +552,71 @@ def _ssh_readonly(command, manifest):
     if _hard_never(remote):
         return False
     parts = [part.strip() for part in remote.split("|")]
-    return bool(parts) and all(
-        part and _reader_segment(part, manifest) is not None for part in parts
+    analyses = [_reader_segment(part, manifest) if part else None for part in parts]
+    if not parts or any(analysis is None for analysis in analyses):
+        return None
+    return {
+        "paths": [path for analysis in analyses for path in analysis["paths"]],
+        "realpath_paths": [
+            path for analysis in analyses for path in analysis["realpath_paths"]
+        ],
+    }
+
+
+def _run_remote_realpath(argv, timeout_seconds):
+    return subprocess.run(
+        list(argv),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout_seconds,
+        check=False,
     )
 
 
+def _remote_realpath_proven(analysis, manifest, runner):
+    paths = analysis.get("realpath_paths")
+    if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
+        return False
+    if not paths:
+        return True
+    argv = (
+        "ssh",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ConnectTimeout=3",
+        manifest["readonly_host"],
+        "realpath",
+        "-e",
+        "--",
+        *(shlex.quote(path) for path in paths),
+    )
+    completed = runner(argv, REMOTE_REALPATH_TIMEOUT_SECONDS)
+    if getattr(completed, "returncode", None) != 0:
+        return False
+    stdout = getattr(completed, "stdout", None)
+    if (
+        not isinstance(stdout, str)
+        or not stdout.endswith("\n")
+        or "\r" in stdout
+        or "\x00" in stdout
+    ):
+        return False
+    resolved = stdout[:-1].split("\n")
+    if len(resolved) != len(paths) or any(
+        not path
+        or not path.startswith("/")
+        or any(ord(character) < 32 or ord(character) == 127 for character in path)
+        for path in resolved
+    ):
+        return False
+    checked = _remote_paths_allowed(resolved, manifest)
+    return checked == resolved
+
+
 def _local_test(command, event, manifest):
-    cwd, root = _cwd_and_root(event, manifest["repo_roots"])
+    cwd, root = _cwd_and_root(event, manifest["local_test_roots"])
     if SHELL_META_RE.search(command):
         return False
     if UNITTEST_RE.fullmatch(command):
@@ -520,7 +633,7 @@ def _local_test(command, event, manifest):
 
 
 def _centre(command, event, manifest):
-    cwd, _root = _cwd_and_root(event, manifest["repo_roots"], exact=True)
+    cwd, _root = _cwd_and_root(event, manifest["centre_roots"], exact=True)
     if command not in CENTRE_COMMANDS:
         return False
     script = "FORGE/bin/pokemon-centre" if command.startswith("/usr/bin/python3 ") else command
@@ -533,7 +646,7 @@ def _centre(command, event, manifest):
 
 
 def _safe_commit(command, event, manifest):
-    cwd, root = _cwd_and_root(event, manifest["repo_roots"], exact=True)
+    cwd, root = _cwd_and_root(event, manifest["dotcortex_roots"], exact=True)
     if cwd != root or SHELL_META_RE.search(command) or _hard_never(command):
         return False
     try:
@@ -623,20 +736,28 @@ def _candidate(event, manifest):
     matches = []
     for name, parser in parsers:
         try:
-            if parser():
-                matches.append(name)
+            parsed = parser()
+            if parsed:
+                matches.append((name, parsed if name == "ssh-kikin-readonly" else None))
         except (OSError, Rejected, ValueError):
             continue
     if len(matches) != 1:
         raise Rejected("no unique rule")
-    return matches[0], True
+    return matches[0]
 
 
-def evaluate(event, manifest):
+def evaluate(event, manifest, remote_path_runner=_run_remote_realpath):
     if not isinstance(event, dict) or event.get("hook_event_name") != "PermissionRequest":
         raise Rejected("event")
-    rule, matched = _candidate(event, manifest)
-    return bool(matched and manifest["enabled"].get(rule) is True)
+    rule, analysis = _candidate(event, manifest)
+    if manifest["enabled"].get(rule) is not True:
+        return False
+    if rule == "ssh-kikin-readonly":
+        try:
+            return _remote_realpath_proven(analysis, manifest, remote_path_runner)
+        except Exception:
+            return False
+    return True
 
 
 def _deadline(_signum, _frame):
