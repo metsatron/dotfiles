@@ -36,6 +36,13 @@ esac
 """
 
 
+FAKE_TMUX = """#!/usr/bin/env bash
+if [ -f "$FAKE_ROOT/tmux_dead" ]; then echo "no server running on /tmp/tmux-1000/default" >&2; exit 1; fi
+if [ -f "$FAKE_ROOT/tmux_broken" ]; then echo "some other failure" >&2; exit 1; fi
+echo "Fable: 1 windows"
+"""
+
+
 class WatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -49,6 +56,9 @@ class WatchdogTests(unittest.TestCase):
         self.nurse.write_text(FAKE_NURSE)
         self.nurse.chmod(self.nurse.stat().st_mode | stat.S_IXUSR)
         self.set_warm({})
+        self.tmux = self.root / "tmux"
+        self.tmux.write_text(FAKE_TMUX)
+        self.tmux.chmod(self.tmux.stat().st_mode | stat.S_IXUSR)
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -64,7 +74,7 @@ class WatchdogTests(unittest.TestCase):
              "--state-dir", str(self.root / "state"), "--intent-dir", str(self.root / "intent"),
              "--boot-lock", str(self.root / "boot.lock"), "--spool", str(self.root / "spool"),
              "--pid-dir", str(self.root / "pids"), "--backoff", backoff,
-             "--warm-file", str(self.root / "warm"), "--nurse", str(self.nurse), *extra],
+             "--warm-file", str(self.root / "warm"), "--nurse", str(self.nurse), "--tmux", str(self.tmux), *extra],
             env=dict(os.environ, FAKE_ROOT=str(self.root)), text=True, capture_output=True, timeout=30,
         )
 
@@ -269,6 +279,28 @@ class WatchdogTests(unittest.TestCase):
         self.assertEqual(self.revives(), [])
         (self.root / "nurse_status").write_text("not json")
         self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_degraded_warm_session_counts_as_up(self) -> None:
+        (self.root / "warm").write_text("Opus\n")
+        self.set_warm({"Opus": "degraded"})
+        (self.root / "tmux_dead").write_text("")  # even a failed tmux probe never overrides an observed live verdict
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_unknown_with_dead_tmux_server_is_down_and_revived(self) -> None:
+        (self.root / "warm").write_text("Fable\nOpus\n")
+        self.set_warm({"Fable": "unknown", "Opus": "unknown"})
+        (self.root / "tmux_dead").write_text("")
+        self.run_watchdog()
+        self.assertEqual(sorted(self.revives()), ["fable", "opus"])
+
+    def test_unknown_with_live_or_unreadable_tmux_is_left_alone(self) -> None:
+        (self.root / "warm").write_text("Opus\n")
+        self.set_warm({"Opus": "unknown"})
+        self.run_watchdog()  # tmux server answers: unknown stays unknown
+        (self.root / "tmux_broken").write_text("")
+        self.run_watchdog()  # tmux probe fails for another reason: still no action
         self.assertEqual(self.revives(), [])
 
     def test_warm_attempt_cap_holds(self) -> None:
