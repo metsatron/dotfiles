@@ -2413,8 +2413,100 @@ MISTRAL_WHOAMI_URL = os.environ.get(
     "MISTRAL_WHOAMI_URL", "https://console.mistral.ai/api/vibe/whoami"
 )
 
+# Admin console tRPC endpoints (admin.mistral.ai) accept the browser session
+# cookie jar exported from the signed-in Agentify Brave. The jar carries the
+# ory_session + csrf cookies for .mistral.ai. billing.budget returns the REAL
+# api_budget and vibe_budget usage percentages plus reset date — the numbers
+# the console subscription page renders. Discovered 2026-10-08.
+MISTRAL_ADMIN_TRPC = os.environ.get(
+    "MISTRAL_ADMIN_TRPC", "https://admin.mistral.ai/api/local-trpc"
+)
+MISTRAL_COOKIE_JAR = os.path.expanduser(os.environ.get(
+    "MISTRAL_COOKIE_JAR",
+    "/home/metsatron/mnt/x230/HelmCortex/NEXUS/.secrets/mistral_cookies.jar",
+))
+_MISTRAL_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+)
+
+
+def _mistral_cookie_header() -> str:
+    if not os.path.exists(MISTRAL_COOKIE_JAR):
+        return ""
+    pairs = []
+    try:
+        with open(MISTRAL_COOKIE_JAR) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 7:
+                    pairs.append(f"{parts[5]}={parts[6]}")
+    except OSError:
+        return ""
+    return "; ".join(pairs)
+
+
+def _mistral_trpc(endpoint: str, params: dict[str, Any], timeout_seconds: float):
+    """GET an admin.mistral.ai tRPC query with session cookies. None on failure."""
+    cookie = _mistral_cookie_header()
+    if not cookie:
+        return None
+    url = f"{MISTRAL_ADMIN_TRPC}/{endpoint}?input={urllib.parse.quote(json.dumps(params))}"
+    request = urllib.request.Request(url, headers={
+        "Cookie": cookie,
+        "Accept": "application/json",
+        "User-Agent": _MISTRAL_UA,
+        "Referer": "https://admin.mistral.ai/subscription",
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = json.loads(response.read().decode("utf-8", errors="replace"))
+    except (urllib.error.URLError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(body, dict) or body.get("error"):
+        return None
+    return nested_get(body, "result", "data", "json")
+
 
 def fetch_mistral(timeout_seconds: float) -> dict[str, Any]:
+    result = {
+        "provider": "mistral",
+        "label": "Mistral",
+        "state": "missing",
+        "source": "admin-trpc",
+        "summary": "",
+        "raw": None,
+    }
+    # Preferred path: real budget numbers from the admin console session.
+    budget = _mistral_trpc(
+        "billing.budget",
+        {"json": None, "meta": {"values": ["undefined"], "v": 1}},
+        timeout_seconds,
+    )
+    if isinstance(budget, dict) and budget.get("initial_budget"):
+        api_budget = budget.get("api_budget") or budget
+        vibe_budget = budget.get("vibe_budget") or {}
+        result["state"] = "ok"
+        result["raw"] = budget
+        result["identity"] = {"plan_name": "Pro", "plan_type": "chat"}
+        result["usage"] = {
+            "secondary": {
+                "usedPercent": api_budget.get("usage_percentage"),
+                "resetsAt": api_budget.get("reset_at"),
+                "label": "API",
+            },
+            "vibe": {
+                "usedPercent": vibe_budget.get("usage_percentage"),
+                "resetsAt": vibe_budget.get("reset_at"),
+                "label": "Vibe",
+            },
+        }
+        result["summary"] = _mistral_budget_summary(api_budget, vibe_budget)
+        return result
+    # Fallback: whoami identity only (no usage % without a browser session).
     token, token_source = _env_token("MISTRAL_API_KEY")
     if not token:
         return {
@@ -2422,7 +2514,7 @@ def fetch_mistral(timeout_seconds: float) -> dict[str, Any]:
             "label": "Mistral",
             "state": "missing",
             "source": token_source,
-            "summary": "No Mistral API key found (set MISTRAL_API_KEY).",
+            "summary": "No Mistral cookie jar or API key found (set MISTRAL_COOKIE_JAR or MISTRAL_API_KEY).",
             "raw": None,
         }
     result = _bearer_json_probe(
@@ -2432,6 +2524,20 @@ def fetch_mistral(timeout_seconds: float) -> dict[str, Any]:
     if result.get("state") == "ok" and isinstance(result.get("raw"), dict):
         result["identity"] = _mistral_identity(result["raw"])
     return result
+
+
+def _mistral_budget_summary(api_budget: dict[str, Any], vibe_budget: dict[str, Any]) -> str:
+    def fmt(b: dict[str, Any]) -> str:
+        try:
+            budget = float(b.get("initial_budget", 0))
+            used = float(b.get("usage_percentage", 0)) / 100.0 * budget
+            return f"${used:.2f}/${budget:.0f} ({float(b.get('usage_percentage', 0)):.1f}%)"
+        except (TypeError, ValueError):
+            return "n/a"
+    reset = (api_budget or {}).get("reset_at") or "?"
+    return (
+        f"API {fmt(api_budget)} · Vibe {fmt(vibe_budget)} · resets {reset[:10]}"
+    )
 
 
 def _mistral_identity(data: dict[str, Any]) -> dict[str, Any]:

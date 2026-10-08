@@ -394,6 +394,30 @@ MISTRAL_WHOAMI_FIXTURE = {
     "primitive_access_scope": "personal_and_shared",
 }
 
+MISTRAL_BUDGET_FIXTURE = {
+    "usage_percentage": 61.051076,
+    "initial_budget": 30,
+    "currency": "USD",
+    "reset_at": "2026-11-01T00:00:00Z",
+    "api_budget": {
+        "usage_percentage": 61.051076,
+        "initial_budget": 30,
+        "currency": "USD",
+        "reset_at": "2026-11-01T00:00:00Z",
+    },
+    "vibe_budget": {
+        "usage_percentage": 0.53698893,
+        "initial_budget": 300,
+        "currency": "USD",
+        "reset_at": "2026-11-01T00:00:00Z",
+    },
+}
+
+
+def _no_cookie_jar(ai_usage):
+    """Patch helper: disable the admin-trpc cookie path for whoami-era tests."""
+    return patch.object(ai_usage, "_mistral_cookie_header", return_value="")
+
 
 class MistralProbeTests(unittest.TestCase):
     @classmethod
@@ -401,9 +425,10 @@ class MistralProbeTests(unittest.TestCase):
         cls.ai_usage = load_ai_usage()
 
     def test_no_credential_reports_missing(self):
-        with patch.dict(os.environ, {"MISTRAL_API_KEY": ""}):
-            with patch.object(self.ai_usage, "load_dotenv_exports", return_value={}):
-                result = self.ai_usage.fetch_mistral(1.0)
+        with patch.dict(os.environ, {"MISTRAL_API_KEY": ""}), \
+             patch.object(self.ai_usage, "load_dotenv_exports", return_value={}), \
+             _no_cookie_jar(self.ai_usage):
+            result = self.ai_usage.fetch_mistral(1.0)
         self.assertEqual(result["state"], "missing")
         self.assertEqual(result["provider"], "mistral")
         self.assertIn("MISTRAL_API_KEY", result["summary"])
@@ -420,18 +445,60 @@ class MistralProbeTests(unittest.TestCase):
                     "summary": summary, "raw": payload}
 
         with patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}), \
-             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe), \
+             _no_cookie_jar(self.ai_usage):
             result = self.ai_usage.fetch_mistral(1.0)
 
         self.assertEqual(captured["token"], "test-key")
         self.assertEqual(result["state"], "ok")
         self.assertEqual(result["identity"]["plan_name"], "FREE")
         self.assertEqual(result["identity"]["customer_id"], "25587b01-3447-483d-b6ac-7bc2caf053f3")
-        # The summary must be truthful: no percentage number, explicit pointer to
-        # the console/Admin API for the actual usage figure.
+        # The fallback summary must stay truthful: no percentage number, explicit
+        # pointer to the console/Admin API for the actual usage figure.
         self.assertIn("plan=FREE", result["summary"])
         self.assertIn("usage % needs console session or Admin API key", result["summary"])
         self.assertNotRegex(result["summary"], r"\d+(\.\d+)?%")
+
+    def test_budget_from_cookie_jar_reports_real_percentages(self):
+        """The admin-trpc path reports the console's real budget numbers."""
+        captured = {}
+
+        def fake_trpc(endpoint, params, timeout_seconds):
+            captured["endpoint"] = endpoint
+            return json.loads(json.dumps(MISTRAL_BUDGET_FIXTURE))
+
+        with patch.object(self.ai_usage, "_mistral_trpc", side_effect=fake_trpc):
+            result = self.ai_usage.fetch_mistral(1.0)
+
+        self.assertEqual(captured["endpoint"], "billing.budget")
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(result["source"], "admin-trpc")
+        self.assertEqual(result["identity"]["plan_name"], "Pro")
+        # Both budgets surface as real percentages with reset dates.
+        self.assertAlmostEqual(result["usage"]["secondary"]["usedPercent"], 61.051076)
+        self.assertAlmostEqual(result["usage"]["vibe"]["usedPercent"], 0.53698893)
+        self.assertEqual(result["usage"]["secondary"]["resetsAt"], "2026-11-01T00:00:00Z")
+        self.assertIn("$18.32/$30", result["summary"])
+        self.assertIn("61.1%", result["summary"])
+        self.assertIn("Vibe", result["summary"])
+        self.assertIn("resets 2026-11-01", result["summary"])
+
+    def test_budget_trpc_failure_falls_back_to_whoami(self):
+        """No cookie session -> whoami identity only, never a fabricated number."""
+        def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
+            payload = json.loads(json.dumps(MISTRAL_WHOAMI_FIXTURE))
+            summary = summarize(payload) if summarize else ""
+            return {"provider": provider, "label": label, "state": "ok", "source": "api",
+                    "summary": summary, "raw": payload}
+
+        with patch.dict(os.environ, {"MISTRAL_API_KEY": "test-key"}), \
+             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe), \
+             _no_cookie_jar(self.ai_usage):
+            result = self.ai_usage.fetch_mistral(1.0)
+
+        self.assertEqual(result["state"], "ok")
+        self.assertEqual(result["identity"]["plan_name"], "FREE")
+        self.assertNotIn("usage", result)
 
     def test_http_error_surfaces_status_without_crashing(self):
         def fake_probe(provider, label, url, token, timeout_seconds, summarize=None):
@@ -439,7 +506,8 @@ class MistralProbeTests(unittest.TestCase):
                     "summary": f"{url} returned HTTP 401", "raw": None}
 
         with patch.dict(os.environ, {"MISTRAL_API_KEY": "bad-key"}), \
-             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe):
+             patch.object(self.ai_usage, "_bearer_json_probe", side_effect=fake_probe), \
+             _no_cookie_jar(self.ai_usage):
             result = self.ai_usage.fetch_mistral(1.0)
 
         self.assertEqual(result["state"], "error")
