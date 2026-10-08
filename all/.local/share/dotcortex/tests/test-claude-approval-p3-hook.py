@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 import json
+import importlib.util
+import inspect
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 REPO = Path(__file__).resolve().parents[5]
 HOOK = REPO / "all/.local/bin/claude-hook-permission-request"
 MANIFEST = REPO / "all/.config/dotcortex/claude-approval-p3.json"
+ENGINE = REPO / "all/.local/lib/dotcortex/claude_approval_p3.py"
+ENGINE_SPEC = importlib.util.spec_from_file_location("dotcortex_approval_p3", ENGINE)
+ENGINE_MODULE = importlib.util.module_from_spec(ENGINE_SPEC)
+ENGINE_SPEC.loader.exec_module(ENGINE_MODULE)
 
 
 def event(tool_name, tool_input, cwd=None):
@@ -46,6 +54,35 @@ def decision(stdout):
         return "ask"
     parsed = json.loads(stdout)
     return parsed["hookSpecificOutput"]["decision"]["behavior"]
+
+
+class FakeRemotePathRunner:
+    def __init__(self, *, stdout="", returncode=0, error=None):
+        self.stdout = stdout
+        self.returncode = returncode
+        self.error = error
+        self.calls = []
+
+    def __call__(self, argv, timeout_seconds):
+        self.calls.append((tuple(argv), timeout_seconds))
+        if self.error is not None:
+            raise self.error
+        return subprocess.CompletedProcess(argv, self.returncode, self.stdout, "")
+
+
+def identity_remote_path_runner(argv, timeout_seconds):
+    separator = list(argv).index("--")
+    paths = [shlex.split(item)[0] for item in argv[separator + 1:]]
+    return subprocess.CompletedProcess(argv, 0, "".join(path + "\n" for path in paths), "")
+
+
+def engine_decision(payload, manifest, runner=identity_remote_path_runner):
+    with mock.patch.dict(os.environ, {"SO_APPROVAL_P3_MANIFEST": str(manifest)}):
+        loaded = ENGINE_MODULE._load_manifest()
+    kwargs = {}
+    if "remote_path_runner" in inspect.signature(ENGINE_MODULE.evaluate).parameters:
+        kwargs["remote_path_runner"] = runner
+    return "allow" if ENGINE_MODULE.evaluate(payload, loaded, **kwargs) else "ask"
 
 
 class ApprovalHookHarness(unittest.TestCase):
@@ -95,9 +132,18 @@ class ApprovalHookHarness(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(decision(completed.stdout), "allow", completed.stdout)
 
-    def test_committed_manifest_keeps_every_candidate_off(self):
+    def test_committed_manifest_matches_admiral_enablement_ruling(self):
         self.assertTrue(self.base["classes"])
-        self.assertTrue(all(item["enabled"] is False for item in self.base["classes"]))
+        self.assertEqual(
+            {item["name"]: item["enabled"] for item in self.base["classes"]},
+            {
+                "ssh-kikin-readonly": True,
+                "local-test-run": False,
+                "centre-render": True,
+                "dotcortex-safe-commit": True,
+                "outbound-tool-call": False,
+            },
+        )
         self.assert_ask(event("Bash", {"command": "python3 -m unittest FORGE.tests.test_gate"}, REPO))
 
     def test_ssh_readonly_exact_shape_and_smuggling(self):
@@ -114,7 +160,10 @@ class ApprovalHookHarness(unittest.TestCase):
             "ssh -o BatchMode=yes YOUR_READONLY_HOST 'mailcortex inbox bunta@kikin.helm'",
         ):
             with self.subTest(good=good):
-                self.assert_allow(event("Bash", {"command": good}, root), manifest, root)
+                self.assertEqual(
+                    engine_decision(event("Bash", {"command": good}, root), manifest),
+                    "allow",
+                )
         for command in (
             "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat /etc/hosts > /tmp/x'",
             "ssh -o BatchMode=yes YOUR_READONLY_HOST 'date; id'",
@@ -125,7 +174,10 @@ class ApprovalHookHarness(unittest.TestCase):
             "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat .ssh/config'",
         ):
             with self.subTest(command=command):
-                self.assert_ask(event("Bash", {"command": command}, root), manifest, root)
+                self.assertEqual(
+                    engine_decision(event("Bash", {"command": command}, root), manifest),
+                    "ask",
+                )
 
     def test_ssh_readonly_credential_and_path_boundary(self):
         root = self.make_tree()
@@ -188,7 +240,122 @@ class ApprovalHookHarness(unittest.TestCase):
             for remote in commands:
                 command = f"ssh -o BatchMode=yes YOUR_READONLY_HOST '{remote}'"
                 with self.subTest(leak=leak, command=command):
-                    self.assert_ask(event("Bash", {"command": command}, root), manifest, root)
+                    self.assertEqual(
+                        engine_decision(event("Bash", {"command": command}, root), manifest),
+                        "ask",
+                    )
+
+    def test_ssh_readonly_privacy_boundaries(self):
+        root = self.make_tree()
+        manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
+        privacy_cases = {
+            "personal": {
+                "paths": (
+                    "HelmCortex/LOGS/Telegram/Personal/chat.md",
+                    "/home/metsatron/HelmCortex/LOGS/Telegram/Personal/chat.md",
+                    "~/HelmCortex/LOGS/Telegram/Personal/chat.md",
+                    "HelmCortex/FORGE/../../HelmCortex/LOGS/Telegram/Personal/chat.md",
+                ),
+                "repos": (
+                    "HelmCortex",
+                    "/home/metsatron/HelmCortex",
+                    "~/HelmCortex",
+                    "HelmCortex/FORGE/..",
+                ),
+                "object": "LOGS/Telegram/Personal/chat.md",
+            },
+            "palmcortex": {
+                "paths": (
+                    "HelmCortex/CORTEX/PalmCortex/Diary.md",
+                    "/home/metsatron/HelmCortex/CORTEX/PalmCortex/Diary.md",
+                    "~/HelmCortex/CORTEX/PalmCortex/Diary.md",
+                    "HelmCortex/FORGE/../../HelmCortex/CORTEX/PalmCortex/Diary.md",
+                ),
+                "repos": (
+                    "HelmCortex",
+                    "/home/metsatron/HelmCortex",
+                    "~/HelmCortex",
+                    "HelmCortex/FORGE/..",
+                ),
+                "object": "CORTEX/pAlMcOrTeX/Diary.md",
+            },
+        }
+        for boundary, values in privacy_cases.items():
+            commands = []
+            for path in values["paths"]:
+                commands.extend((
+                    f"cat {path}",
+                    f"grep private {path}",
+                    f"ls {path}",
+                    f"find {path} -maxdepth 1",
+                    f"git -C HelmCortex log -- {path}",
+                    f"git -C HelmCortex diff -- {path}",
+                ))
+            commands.extend(
+                f"git -C {repo} show HEAD:{values['object']}"
+                for repo in values["repos"]
+            )
+            for remote in commands:
+                command = f"ssh -o BatchMode=yes YOUR_READONLY_HOST '{remote}'"
+                with self.subTest(boundary=boundary, command=command):
+                    self.assertEqual(
+                        engine_decision(event("Bash", {"command": command}, root), manifest),
+                        "ask",
+                    )
+
+    def test_ssh_remote_realpath_proof_is_fixed_argv_and_fail_ask(self):
+        root = self.make_tree()
+        manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
+        command = "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat HelmCortex/README.md'"
+        payload = event("Bash", {"command": command}, root)
+        allowed = "/home/metsatron/HelmCortex/README.md"
+        runner = FakeRemotePathRunner(stdout=allowed + "\n")
+        self.assertEqual(engine_decision(payload, manifest, runner), "allow")
+        self.assertEqual(
+            runner.calls,
+            [
+                (
+                    (
+                        "ssh",
+                        "-o",
+                        "BatchMode=yes",
+                        "-o",
+                        "ConnectTimeout=3",
+                        "YOUR_READONLY_HOST",
+                        "realpath",
+                        "-e",
+                        "--",
+                        allowed,
+                    ),
+                    0.5,
+                )
+            ],
+        )
+        failures = (
+            FakeRemotePathRunner(stdout="/home/metsatron/HelmCortex/NEXUS/.secrets/x\n"),
+            FakeRemotePathRunner(stdout="/etc/passwd\n"),
+            FakeRemotePathRunner(stdout="/home/metsatron/HelmCortex/LOGS/Telegram/Personal/chat.md\n"),
+            FakeRemotePathRunner(error=subprocess.TimeoutExpired(["ssh"], 0.5)),
+            FakeRemotePathRunner(returncode=1),
+            FakeRemotePathRunner(stdout=allowed + "\n" + allowed + "\n"),
+            FakeRemotePathRunner(stdout="not-an-absolute-path\n"),
+        )
+        for failed_runner in failures:
+            with self.subTest(runner=failed_runner):
+                self.assertEqual(engine_decision(payload, manifest, failed_runner), "ask")
+
+    def test_git_show_object_path_stays_lexical_only(self):
+        root = self.make_tree()
+        manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
+        repo = "/home/metsatron/HelmCortex"
+        runner = FakeRemotePathRunner(stdout=repo + "\n")
+        payload = event(
+            "Bash",
+            {"command": "ssh -o BatchMode=yes YOUR_READONLY_HOST 'git -C HelmCortex show HEAD:README.md'"},
+            root,
+        )
+        self.assertEqual(engine_decision(payload, manifest, runner), "allow")
+        self.assertEqual(runner.calls[0][0][-1:], (repo,))
 
     def test_local_test_run_exact_shapes_and_paths(self):
         root = self.make_tree()
