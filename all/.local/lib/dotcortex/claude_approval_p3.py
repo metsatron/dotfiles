@@ -14,8 +14,8 @@ import sys
 
 
 SCHEMA_VERSION = "so-approval-p3.v1"
-HARD_TIMEOUT_SECONDS = 0.75
-REMOTE_REALPATH_TIMEOUT_SECONDS = 0.5
+HARD_TIMEOUT_SECONDS = 3.0
+REMOTE_REALPATH_TIMEOUT_SECONDS = 2.5
 CLASS_NAMES = (
     "ssh-kikin-readonly",
     "local-test-run",
