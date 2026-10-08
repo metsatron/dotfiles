@@ -96,6 +96,7 @@ def _load_manifest():
         "schema_version",
         "readonly_host",
         "repo_roots",
+        "tmp_roots",
         "outbound_tools",
         "classes",
     }:
@@ -116,6 +117,16 @@ def _load_manifest():
         if root == Path("/"):
             raise Rejected("broad repo root")
         roots.append(root)
+    if not isinstance(data["tmp_roots"], list) or not data["tmp_roots"]:
+        raise Rejected("tmp roots")
+    tmp_roots = []
+    for raw in data["tmp_roots"]:
+        if not isinstance(raw, str) or not raw.startswith("/"):
+            raise Rejected("tmp root")
+        root = Path(raw).resolve(strict=False)
+        if root == Path("/"):
+            raise Rejected("broad tmp root")
+        tmp_roots.append(root)
     if not isinstance(data["outbound_tools"], list) or not all(
         isinstance(item, str) and item for item in data["outbound_tools"]
     ):
@@ -134,6 +145,7 @@ def _load_manifest():
             raise Rejected("class entry")
         enabled[expected] = item["enabled"]
     data["repo_roots"] = roots
+    data["tmp_roots"] = tmp_roots
     data["enabled"] = enabled
     return data
 
@@ -295,18 +307,33 @@ def _ssh_readonly(command, manifest):
 
 
 def _local_test(command, event, manifest):
-    _cwd_and_root(event, manifest["repo_roots"])
+    cwd, root = _cwd_and_root(event, manifest["repo_roots"])
     if SHELL_META_RE.search(command):
         return False
     if UNITTEST_RE.fullmatch(command):
         return True
     match = PYTEST_RE.fullmatch(command)
-    return bool(match and _safe_relative_path(match.group(1)))
+    if not match or not _safe_relative_path(match.group(1)):
+        return False
+    target = (cwd / match.group(1)).resolve(strict=False)
+    try:
+        info = target.lstat()
+    except OSError:
+        return False
+    return _inside(target, root) and stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
 
 def _centre(command, event, manifest):
-    _cwd_and_root(event, manifest["repo_roots"], exact=True)
-    return command in CENTRE_COMMANDS
+    cwd, _root = _cwd_and_root(event, manifest["repo_roots"], exact=True)
+    if command not in CENTRE_COMMANDS:
+        return False
+    script = "FORGE/bin/pokemon-centre" if command.startswith("/usr/bin/python3 ") else command
+    target = (cwd / script).resolve(strict=False)
+    try:
+        info = target.lstat()
+    except OSError:
+        return False
+    return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode)
 
 
 def _safe_commit(command, event, manifest):
@@ -334,7 +361,47 @@ def _safe_commit(command, event, manifest):
         return False
     if not stat.S_ISREG(info.st_mode) or stat.S_ISLNK(info.st_mode) or stat.S_IMODE(info.st_mode) & 0o077:
         return False
-    return all(_safe_relative_path(path) for path in words[5:])
+    if info.st_uid != os.getuid() or not any(
+        _inside(message.resolve(strict=False), root) and message.resolve(strict=False) != root
+        for root in manifest["tmp_roots"]
+    ):
+        return False
+    for raw in words[5:]:
+        if not _safe_relative_path(raw):
+            return False
+        target = (cwd / raw).resolve(strict=False)
+        try:
+            target_info = target.lstat()
+        except OSError:
+            return False
+        if (
+            not _inside(target, root)
+            or not stat.S_ISREG(target_info.st_mode)
+            or stat.S_ISLNK(target_info.st_mode)
+        ):
+            return False
+    return True
+
+
+def _protected_tool_input(tool_input):
+    try:
+        raw = json.dumps(tool_input, ensure_ascii=False, sort_keys=True).lower().replace("\\\\", "/")
+    except (TypeError, ValueError):
+        return True
+    return any(
+        marker in raw
+        for marker in (
+            "/home/gille",
+            "secret vault",
+            "nexus/keys",
+            "/.ssh/",
+            "~/.ssh/",
+            "/.env",
+            "auth.json",
+            "credentials.json",
+            "oauth.json",
+        )
+    )
 
 
 def _candidate(event, manifest):
@@ -343,7 +410,7 @@ def _candidate(event, manifest):
     if not isinstance(tool_name, str) or not isinstance(tool_input, dict):
         raise Rejected("tool event")
     if tool_name != "Bash":
-        if tool_name in manifest["outbound_tools"]:
+        if tool_name in manifest["outbound_tools"] and not _protected_tool_input(tool_input):
             return "outbound-tool-call", True
         raise Rejected("unknown tool")
     if set(tool_input) != {"command"} or not isinstance(tool_input.get("command"), str):

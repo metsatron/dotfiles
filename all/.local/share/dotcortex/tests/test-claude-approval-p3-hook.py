@@ -70,6 +70,9 @@ class ApprovalHookHarness(unittest.TestCase):
         root = Path(self.tempdir.name) / "DotCortex"
         (root / "tests").mkdir(parents=True)
         (root / "FORGE/bin").mkdir(parents=True)
+        (root / "tests/test_gate.py").write_text("# synthetic\n", encoding="utf-8")
+        (root / "FORGE/bin/pokemon-centre").write_text("# synthetic\n", encoding="utf-8")
+        (root / "FORGE/bin/clubhouse-bosses-refresh").write_text("# synthetic\n", encoding="utf-8")
         (root / "message.txt").write_text("subject\n", encoding="utf-8")
         os.chmod(root / "message.txt", 0o600)
         return root
@@ -157,6 +160,8 @@ class ApprovalHookHarness(unittest.TestCase):
             f"git commit -F {message} -- .git/config",
             f"git commit -F {message} -- NEXUS/keys/token",
             f"git commit -F {message} -- /home/gille/file",
+            f"git commit -F {message} -- tests/missing.py",
+            f"git commit -F {message} -- tests",
             f"git commit -F {message} -- tests/test_gate.py && git push",
         ):
             with self.subTest(command=command):
@@ -170,6 +175,7 @@ class ApprovalHookHarness(unittest.TestCase):
         manifest = self.enabled_manifest(root, "outbound-tool-call")
         self.assert_allow(event(telegram, {"text": "hello"}, root), manifest, root)
         self.assert_allow(event(mail, {"to": "seat", "body": "hello"}, root), manifest, root)
+        self.assert_ask(event(telegram, {"text": "send NEXUS/keys/token"}, root), manifest, root)
         self.assert_ask(event("mcp__mailcortex__delete", {}, root), manifest, root)
 
     def test_hard_never_wins_over_enabled_classes(self):
