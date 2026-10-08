@@ -66,6 +66,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--warm-file", default=str(Path.home() / ".config/telegram-agent-watchdog/warm-sessions"),
                         help="private list of nurse-joy warm sessions to supervise, one name per line")
     parser.add_argument("--nurse", default=shutil.which("nurse-joy") or str(Path.home() / ".local/hx/bin/nurse-joy"))
+    parser.add_argument("--tmux", default=shutil.which("tmux") or "tmux", help="tmux binary used to tell a dead server from a stale reading")
     parser.add_argument("--dry-run", action="store_true", help="report decisions without relaunching or publishing")
     return parser.parse_args(argv)
 
@@ -141,7 +142,21 @@ def read_warm_sessions(path: Path) -> list[str]:
     return names
 
 
-def warm_verdicts(nurse: str, names: list[str], timeout: int) -> dict[str, str]:
+def tmux_server_running(tmux: str) -> bool | None:
+    """True or False when tmux answers clearly; None when the probe itself fails."""
+    try:
+        run = subprocess.run([tmux, "ls"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                             stderr=subprocess.PIPE, text=True, timeout=15, close_fds=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if run.returncode == 0:
+        return True
+    if re.search(r"no server running|error connecting to .*No such file or directory", run.stderr or ""):
+        return False
+    return None
+
+
+def warm_verdicts(nurse: str, names: list[str], timeout: int, tmux: str | None = None) -> dict[str, str]:
     """Map each warm session to up, down, or unknown from nurse-joy's own verdict; anything unreadable is unknown."""
     verdicts = {name: "unknown" for name in names}
     if not names:
@@ -155,8 +170,12 @@ def warm_verdicts(nurse: str, names: list[str], timeout: int) -> dict[str, str]:
     seen = {str(m.get("name", "")).lower(): m.get("verdict") for m in members if isinstance(m, dict)}
     for name in names:
         verdict = seen.get(name.lower())
-        # Only nurse-joy's two plain verdicts drive action; any other state is left alone.
-        verdicts[name] = "up" if verdict == "field" else "down" if verdict == "down" else "unknown"
+        # field and degraded (alive, e.g. stale agent code) are up; only down drives action.
+        verdicts[name] = "up" if verdict in ("field", "degraded") else "down" if verdict == "down" else "unknown"
+    # Every warm session lives in tmux. When the tmux server itself is gone (a user-wide kill took it),
+    # nurse-joy can only report "unknown"; that is not ambiguity, every warm session is down.
+    if tmux and "unknown" in verdicts.values() and tmux_server_running(tmux) is False:
+        verdicts = {name: ("down" if verdict == "unknown" else verdict) for name, verdict in verdicts.items()}
     return verdicts
 
 
@@ -380,7 +399,7 @@ def main(argv: list[str]) -> int:
     # Telegram agents relaunch through the host manager; warm Claude sessions through nurse-joy.
     targets = [(agent, classify(agent, status_text), [args.manager, "start", agent]) for agent in enabled]
     warm = read_warm_sessions(Path(args.warm_file))
-    warm_status = warm_verdicts(args.nurse, warm, 60)
+    warm_status = warm_verdicts(args.nurse, warm, 60, args.tmux)
     targets += [("warm-" + name.lower(), warm_status[name], [args.nurse, "revive", "--no-visit", name.lower()]) for name in warm]
     supervised = {agent for agent, _, _ in targets}
 
