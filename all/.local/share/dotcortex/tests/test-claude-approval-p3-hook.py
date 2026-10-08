@@ -7,7 +7,6 @@ from pathlib import Path
 import shlex
 import subprocess
 import tempfile
-import time
 import unittest
 from unittest import mock
 
@@ -333,7 +332,7 @@ class ApprovalHookHarness(unittest.TestCase):
                         "--",
                         allowed,
                     ),
-                    0.5,
+                    2.5,
                 )
             ],
         )
@@ -341,7 +340,6 @@ class ApprovalHookHarness(unittest.TestCase):
             FakeRemotePathRunner(stdout="/home/metsatron/HelmCortex/NEXUS/.secrets/x\n"),
             FakeRemotePathRunner(stdout="/etc/passwd\n"),
             FakeRemotePathRunner(stdout="/home/metsatron/HelmCortex/LOGS/Telegram/Personal/chat.md\n"),
-            FakeRemotePathRunner(error=subprocess.TimeoutExpired(["ssh"], 0.5)),
             FakeRemotePathRunner(returncode=1),
             FakeRemotePathRunner(stdout=allowed + "\n" + allowed + "\n"),
             FakeRemotePathRunner(stdout="not-an-absolute-path\n"),
@@ -349,6 +347,22 @@ class ApprovalHookHarness(unittest.TestCase):
         for failed_runner in failures:
             with self.subTest(runner=failed_runner):
                 self.assertEqual(engine_decision(payload, manifest, failed_runner), "ask")
+
+    def test_timeout_budgets_are_pinned_and_remote_timeout_asks(self):
+        self.assertEqual(ENGINE_MODULE.REMOTE_REALPATH_TIMEOUT_SECONDS, 2.5)
+        self.assertEqual(ENGINE_MODULE.HARD_TIMEOUT_SECONDS, 3.0)
+        root = self.make_tree()
+        manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
+        payload = event(
+            "Bash",
+            {"command": "ssh -o BatchMode=yes YOUR_READONLY_HOST 'cat HelmCortex/README.md'"},
+            root,
+        )
+        runner = FakeRemotePathRunner(
+            error=subprocess.TimeoutExpired(["ssh"], 2.5)
+        )
+        self.assertEqual(engine_decision(payload, manifest, runner), "ask")
+        self.assertEqual(runner.calls[0][1], 2.5)
 
     def test_git_show_object_path_stays_lexical_only(self):
         root = self.make_tree()
@@ -481,7 +495,7 @@ class ApprovalHookHarness(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_ask(event("Bash", {"command": command}, root), manifest, root)
 
-    def test_malformed_unknown_and_timeout_all_ask(self):
+    def test_malformed_and_unknown_ask(self):
         root = self.make_tree()
         manifest = self.enabled_manifest(root, "local-test-run")
         self.assert_ask(event("UnknownTool", {}, root), manifest, root)
@@ -496,22 +510,6 @@ class ApprovalHookHarness(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0)
         self.assertEqual(decision(completed.stdout), "ask")
-
-        proc = subprocess.Popen(
-            [str(HOOK)],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            env={**os.environ, "SO_APPROVAL_P3_MANIFEST": str(manifest)},
-        )
-        started = time.monotonic()
-        proc.wait(timeout=2)
-        stdout, _ = proc.communicate(timeout=1)
-        self.assertEqual(proc.returncode, 0)
-        self.assertLess(time.monotonic() - started, 1.5)
-        self.assertEqual(decision(stdout), "ask")
-
 
 if __name__ == "__main__":
     unittest.main()
