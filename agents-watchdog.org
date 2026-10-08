@@ -17,6 +17,10 @@ An unknown reading (no status line, unparsable line, or a failed =status= call) 
 
 Alerts publish =helmcortex.notification.v1= events into the same spool the fleet-health collector uses (=~/.local/state/helmcortex-notifications/spool=), with source =agent_watchdog=. The spool is the transport; delivery to Telegram belongs to the spool consumer, so the pending alerts-bot token ruling gates delivery, not detection or relaunch. Every run writes =receipt.json= so a silent watchdog is itself detectable.
 
+** Warm Claude sessions
+
+Added 2026-10-08 after a user-wide SIGTERM on Kikin killed the Fable, Opus and Haiku warm sessions together. Cron brought every daemon back, but nothing revived the warm sessions, because =telegram-agent-host status= reports Claude only as one =claudecode= line that reads RUNNING while any Claude Telegram session is alive. The watchdog now also supervises the warm sessions named in a private, machine-local list (=~/.config/telegram-agent-watchdog/warm-sessions=, one name per line, =#= comments allowed; absent means none), so the fleet roster stays out of this public source. Each session's state comes from =nurse-joy status --json=: verdict =field= is up, =down= is down, and any other verdict, a missing member, or unreadable output is unknown and never acted on. A down session is revived with =nurse-joy revive --no-visit <name>=, the sanctioned bounce path, under the same backoff, attempt cap, alerts and boot-lock stand-down as the Telegram agents. Its state key and intentional-stop marker are =warm-<name>=: to keep a session down on purpose, touch =~/.local/state/telegram-agents/intentional-stop/warm-<name>= first.
+
 ** Self-revive request lane
 
 Added 2026-09-30 at HelmAstra's requirement: an agent cannot safely stop and start itself, because the stop kills the caller's own process group before the start runs. Instead the agent runs =telegram-agent-watchdog request [AGENT]= and returns; the command only queues =requests/<agent>.json= under the watchdog state dir and never signals anything. A later watchdog run performs the =stop= and =start= from cron, outside the agent's process group.
@@ -36,6 +40,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -89,6 +94,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--max-attempts", type=int, default=3, help="relaunch attempts per down episode")
     parser.add_argument("--backoff", type=int, default=120, help="base seconds between attempts; doubles each attempt")
     parser.add_argument("--start-timeout", type=int, default=240)
+    parser.add_argument("--warm-file", default=str(Path.home() / ".config/telegram-agent-watchdog/warm-sessions"),
+                        help="private list of nurse-joy warm sessions to supervise, one name per line")
+    parser.add_argument("--nurse", default=shutil.which("nurse-joy") or str(Path.home() / ".local/hx/bin/nurse-joy"))
     parser.add_argument("--dry-run", action="store_true", help="report decisions without relaunching or publishing")
     return parser.parse_args(argv)
 
@@ -148,6 +156,39 @@ def classify(agent: str, status_text: str) -> str:
             elif re.search(r"\bSTOPPED\b", line):
                 verdicts.add("down")
     return verdicts.pop() if len(verdicts) == 1 else "unknown"
+
+
+def read_warm_sessions(path: Path) -> list[str]:
+    """Warm Claude sessions to supervise, from a private machine-local list (topology stays out of source)."""
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    names: list[str] = []
+    for line in lines:
+        name = line.split("#", 1)[0].strip()
+        if name and re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", name) and name.lower() not in [n.lower() for n in names]:
+            names.append(name)
+    return names
+
+
+def warm_verdicts(nurse: str, names: list[str], timeout: int) -> dict[str, str]:
+    """Map each warm session to up, down, or unknown from nurse-joy's own verdict; anything unreadable is unknown."""
+    verdicts = {name: "unknown" for name in names}
+    if not names:
+        return verdicts
+    try:
+        run = subprocess.run([nurse, "status", "--json"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=timeout, close_fds=True)
+        members = json.loads(run.stdout).get("members", [])
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        return verdicts
+    seen = {str(m.get("name", "")).lower(): m.get("verdict") for m in members if isinstance(m, dict)}
+    for name in names:
+        verdict = seen.get(name.lower())
+        # Only nurse-joy's two plain verdicts drive action; any other state is left alone.
+        verdicts[name] = "up" if verdict == "field" else "down" if verdict == "down" else "unknown"
+    return verdicts
 
 
 def make_event(host: str, agent: str, kind: str, severity: str, title: str, body: str, payload: dict, when: dt.datetime) -> dict:
@@ -367,9 +408,15 @@ def main(argv: list[str]) -> int:
     # read whatever the exit code; a probe that printed nothing still reads as unknown per agent.
     status_text = status_run.stdout if status_run is not None else ""
 
-    for agent in enabled:
+    # Telegram agents relaunch through the host manager; warm Claude sessions through nurse-joy.
+    targets = [(agent, classify(agent, status_text), [args.manager, "start", agent]) for agent in enabled]
+    warm = read_warm_sessions(Path(args.warm_file))
+    warm_status = warm_verdicts(args.nurse, warm, 60)
+    targets += [("warm-" + name.lower(), warm_status[name], [args.nurse, "revive", "--no-visit", name.lower()]) for name in warm]
+    supervised = {agent for agent, _, _ in targets}
+
+    for agent, verdict, start_cmd in targets:
         entry = agents_state.setdefault(agent, {})
-        verdict = classify(agent, status_text)
         marker = Path(args.intent_dir) / agent
         if verdict == "up":
             if entry.get("down_since"):
@@ -413,14 +460,14 @@ def main(argv: list[str]) -> int:
         entry["attempts"] = attempts + 1
         entry["last_attempt"] = int(now)
         try:
-            started = run_manager(args.manager, ["start", agent], args.start_timeout)
+            started = run_manager(start_cmd[0], start_cmd[1:], args.start_timeout)
             outcomes[agent] = "relaunched" if started.returncode == 0 else "relaunch-failed"
             entry["last_result"] = started.returncode
         except (OSError, subprocess.SubprocessError) as exc:
             outcomes[agent] = "relaunch-failed"
             entry["last_result"] = type(exc).__name__
 
-    agents_state_out = {name: value for name, value in agents_state.items() if name in enabled or value}
+    agents_state_out = {name: value for name, value in agents_state.items() if name in supervised or value}
     if not args.dry_run:
         for event in events:
             try:
@@ -526,6 +573,16 @@ esac
 """
 
 
+FAKE_NURSE = """#!/usr/bin/env bash
+root="$FAKE_ROOT"
+case "$1" in
+  status) cat "$root/nurse_status" ;;
+  revive) shift; for a in "$@"; do case "$a" in --*) ;; *) echo "$a" >> "$root/revives" ;; esac; done ;;
+  *) exit 2 ;;
+esac
+"""
+
+
 class WatchdogTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -535,6 +592,10 @@ class WatchdogTests(unittest.TestCase):
         self.manager.chmod(self.manager.stat().st_mode | stat.S_IXUSR)
         (self.root / "enabled").write_text("ductor codex\n")
         self.set_status("RUNNING", "RUNNING")
+        self.nurse = self.root / "nurse"
+        self.nurse.write_text(FAKE_NURSE)
+        self.nurse.chmod(self.nurse.stat().st_mode | stat.S_IXUSR)
+        self.set_warm({})
 
     def tearDown(self) -> None:
         self.tmp.cleanup()
@@ -549,7 +610,8 @@ class WatchdogTests(unittest.TestCase):
             [str(WATCHDOG), "--expected-host", HOST, "--manager", str(self.manager),
              "--state-dir", str(self.root / "state"), "--intent-dir", str(self.root / "intent"),
              "--boot-lock", str(self.root / "boot.lock"), "--spool", str(self.root / "spool"),
-             "--pid-dir", str(self.root / "pids"), "--backoff", backoff, *extra],
+             "--pid-dir", str(self.root / "pids"), "--backoff", backoff,
+             "--warm-file", str(self.root / "warm"), "--nurse", str(self.nurse), *extra],
             env=dict(os.environ, FAKE_ROOT=str(self.root)), text=True, capture_output=True, timeout=30,
         )
 
@@ -714,6 +776,55 @@ class WatchdogTests(unittest.TestCase):
         refused = self.request("ductor", self.dead_pid(), env={"TELEGRAM_AGENT_SELF": "codex"})
         self.assertEqual(refused.returncode, 2)
         self.assertFalse((self.root / "state/requests/ductor.json").exists())
+
+    def set_warm(self, verdicts: dict[str, str]) -> None:
+        members = [{"name": name, "verdict": verdict} for name, verdict in verdicts.items()]
+        (self.root / "nurse_status").write_text(json.dumps({"members": members}))
+
+    def revives(self) -> list[str]:
+        path = self.root / "revives"
+        return path.read_text().split() if path.exists() else []
+
+    def test_no_warm_list_never_calls_nurse(self) -> None:
+        self.set_warm({"Fable": "down"})
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_down_warm_session_is_revived_through_nurse_joy(self) -> None:
+        (self.root / "warm").write_text("Fable\nOpus  # sealed consort\nHaiku\n")
+        self.set_warm({"Fable": "field", "Opus": "down", "Haiku": "field", "Auryn": "down"})
+        self.run_watchdog()
+        self.assertEqual(self.revives(), ["opus"])  # Auryn is down but not listed: untouched
+        self.assertEqual(self.starts(), [])  # never routed through the Telegram host manager
+        self.assertEqual([(e["kind"], e["payload"]["agent"]) for e in self.events()], [("down", "warm-opus")])
+        self.set_warm({"Fable": "field", "Opus": "field", "Haiku": "field"})
+        self.run_watchdog()
+        self.assertEqual([e["kind"] for e in self.events()], ["down", "recovered"])
+
+    def test_warm_operator_stop_marker_is_respected(self) -> None:
+        (self.root / "warm").write_text("Opus\n")
+        (self.root / "intent").mkdir()
+        (self.root / "intent" / "warm-opus").write_text("")
+        self.set_warm({"Opus": "down"})
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_unreadable_or_unusual_warm_state_never_revives(self) -> None:
+        (self.root / "warm").write_text("Opus\nHaiku\nFable\n")
+        self.set_warm({"Opus": "fainted", "Haiku": "field"})  # Fable missing from the roster entirely
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+        (self.root / "nurse_status").write_text("not json")
+        self.run_watchdog()
+        self.assertEqual(self.revives(), [])
+
+    def test_warm_attempt_cap_holds(self) -> None:
+        (self.root / "warm").write_text("Opus\n")
+        self.set_warm({"Opus": "down"})
+        for _ in range(5):
+            self.run_watchdog()
+        self.assertEqual(self.revives(), ["opus", "opus", "opus"])
+        self.assertIn("relaunch_failed", [e["kind"] for e in self.events()])
 
     def test_wrong_host_refuses(self) -> None:
         result = subprocess.run([str(WATCHDOG), "--expected-host", "not-" + HOST, "--manager", str(self.manager)],
