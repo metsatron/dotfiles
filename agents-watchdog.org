@@ -839,3 +839,189 @@ class WatchdogTests(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 #+END_SRC
+
+* Session anchor
+
+Sealed 2026-10-09 after two user-wide SIGTERMs on Kikin (2026-10-08 21:01 and 2026-10-09 01:16). Each one fired the moment the user's last live elogind login ended: all week the only live login had been one long-running SSH connection from a laptop, and when it dropped, every process the user owned died with it: tmux, herdr, the Telegram agents, the warm Claude sessions. The kernel log orders it each time: =Removed session N=, then the kill. elogind reports =KillUserProcesses=false=, so the exact mechanism is not the textbook one, but the trigger is reproducible: the user dropping to zero live sessions.
+
+The anchor keeps one live login open at all times, independent of any laptop. It is a loopback SSH session with a dedicated key that sshd confines to =from="127.0.0.1,::1",restrict,command="/bin/sleep infinity"=, so the key can do nothing but hold a session open. The host key is pinned from the machine's own =/etc/ssh= public key in a private known_hosts file, never accepted on first use. A cron entry starts the supervisor every minute; =flock= keeps exactly one alive, and the supervisor reconnects with a short backoff if the session ever drops.
+
+Machine-local setup (private, never tracked): generate =~/.ssh/session-anchor= (ed25519, no passphrase), append the restricted line above with its public key to =~/.ssh/authorized_keys=, and write =~/.config/session-anchor/known_hosts= as =127.0.0.1 <type> <key>= taken from =/etc/ssh/ssh_host_ed25519_key.pub=. The supervisor refuses to start without all three.
+
+#+BEGIN_SRC bash :tangle all/.local/bin/session-anchor :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+# session-anchor: hold one permanent loopback SSH login so the user never drops to zero live elogind sessions.
+set -uo pipefail
+
+TAG="session-anchor"
+KEY="${SESSION_ANCHOR_KEY:-$HOME/.ssh/session-anchor}"
+KNOWN_HOSTS="${SESSION_ANCHOR_KNOWN_HOSTS:-$HOME/.config/session-anchor/known_hosts}"
+STATE_DIR="${SESSION_ANCHOR_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/session-anchor}"
+SSH_BIN="${SESSION_ANCHOR_SSH_BIN:-ssh}"
+BACKOFF="${SESSION_ANCHOR_BACKOFF:-10}"
+ONCE=0
+
+usage() { echo "Usage: $TAG [--once] [--check]  (holds a loopback SSH session; see agents-watchdog.org)"; }
+
+CHECK=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --once) ONCE=1 ;;
+    --check) CHECK=1 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+[ -r "$KEY" ] || { echo "$TAG: missing key $KEY (machine-local setup not done)" >&2; exit 69; }
+[ -s "$KNOWN_HOSTS" ] || { echo "$TAG: missing pinned known_hosts $KNOWN_HOSTS" >&2; exit 69; }
+[ "$CHECK" = 0 ] || { echo "$TAG: setup present"; exit 0; }
+
+mkdir -p "$STATE_DIR"
+exec 9>"$STATE_DIR/anchor.lock"
+if ! flock -n 9; then
+  exit 0  # another supervisor already holds the anchor
+fi
+
+while :; do
+  date +%s > "$STATE_DIR/last-connect"
+  "$SSH_BIN" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes \
+    -o UserKnownHostsFile="$KNOWN_HOSTS" -o StrictHostKeyChecking=yes -o GlobalKnownHostsFile=/dev/null \
+    -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -o ControlMaster=no -o ControlPath=none \
+    -T 127.0.0.1 9>&- </dev/null >>"$STATE_DIR/anchor.log" 2>&1
+  echo "$(date -Is) $TAG: session ended (rc=$?); reconnecting in ${BACKOFF}s" >>"$STATE_DIR/anchor.log"
+  [ "$ONCE" = 0 ] || exit 0
+  sleep "$BACKOFF"
+done
+#+END_SRC
+
+** Session anchor cron deployment helper
+
+#+BEGIN_SRC bash :tangle all/.local/bin/session-anchor-cron-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+set -euo pipefail
+
+TAG="session-anchor-cron-apply"
+TARGET="/etc/cron.d/dotcortex-session-anchor"
+EXPECTED_HOST=""
+DRY=0
+REMOVE=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host) [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --dry-run) DRY=1 ;;
+    --remove) REMOVE=1 ;;
+    -h|--help|help) echo "Usage: $TAG --host EXACT_HOST [--dry-run] [--remove]"; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+run_priv() { if [ "$(id -u)" = 0 ]; then "$@"; else sudo -n "$@"; fi; }
+
+if [ "$REMOVE" = 1 ]; then
+  if [ "$DRY" = 1 ]; then echo "remove $TARGET"; else run_priv rm -f "$TARGET"; echo "$TAG: removed $TARGET"; fi
+  exit 0
+fi
+
+[ -n "$EXPECTED_HOST" ] || { echo "$TAG: --host EXACT_HOST is required" >&2; exit 2; }
+[ "$(hostname)" = "$EXPECTED_HOST" ] || { echo "$TAG: refusing installation on $(hostname); expected $EXPECTED_HOST" >&2; exit 1; }
+
+USER_NAME="$(id -un)"
+TARGET_HOME="$HOME"
+ANCHOR="$TARGET_HOME/.local/bin/session-anchor"
+[ "$DRY" = 1 ] || "$ANCHOR" --check || { echo "$TAG: machine-local setup missing; see agents-watchdog.org" >&2; exit 1; }
+
+TMP="$(mktemp)"
+trap 'rm -f "$TMP"' EXIT
+cat >"$TMP" <<EOF
+# DotCortex session anchor; managed by $TAG.
+,* * * * * ${USER_NAME} HOME=${TARGET_HOME} PATH=/usr/local/bin:/usr/bin:/bin ${ANCHOR} >/dev/null 2>&1
+EOF
+
+if [ "$DRY" = 1 ]; then
+  cat "$TMP"
+else
+  run_priv install -o root -g root -m 0644 "$TMP" "$TARGET"
+  echo "$TAG: installed $TARGET"
+fi
+#+END_SRC
+
+** Session anchor tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-session-anchor.py :comments no
+from __future__ import annotations
+
+import os
+from pathlib import Path
+import stat
+import subprocess
+import tempfile
+import time
+import unittest
+
+ANCHOR = Path(__file__).resolve().parents[3] / "bin" / "session-anchor"
+
+FAKE_SSH = """#!/usr/bin/env bash
+printf '%s\\n' "$@" > "$FAKE_ROOT/ssh-args"
+sleep "${FAKE_SSH_HOLD:-0}"
+"""
+
+
+class SessionAnchorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.ssh = self.root / "ssh"
+        self.ssh.write_text(FAKE_SSH)
+        self.ssh.chmod(self.ssh.stat().st_mode | stat.S_IXUSR)
+        (self.root / "key").write_text("k")
+        (self.root / "known").write_text("127.0.0.1 ssh-ed25519 AAAA\n")
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def env(self, **extra: str) -> dict:
+        return dict(os.environ, FAKE_ROOT=str(self.root), SESSION_ANCHOR_KEY=str(self.root / "key"),
+                    SESSION_ANCHOR_KNOWN_HOSTS=str(self.root / "known"), SESSION_ANCHOR_STATE_DIR=str(self.root / "state"),
+                    SESSION_ANCHOR_SSH_BIN=str(self.ssh), **extra)
+
+    def run_anchor(self, *args: str, **extra: str) -> subprocess.CompletedProcess:
+        return subprocess.run([str(ANCHOR), *args], env=self.env(**extra), text=True, capture_output=True, timeout=30)
+
+    def test_refuses_without_machine_local_setup(self) -> None:
+        (self.root / "key").unlink()
+        result = self.run_anchor("--once")
+        self.assertEqual(result.returncode, 69)
+        self.assertFalse((self.root / "ssh-args").exists())
+
+    def test_connects_loopback_with_pinned_host_key_only(self) -> None:
+        result = self.run_anchor("--once")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = (self.root / "ssh-args").read_text().split("\n")
+        self.assertEqual(args[-2], "127.0.0.1")  # loopback only
+        joined = " ".join(args)
+        for required in ("IdentitiesOnly=yes", "BatchMode=yes", "StrictHostKeyChecking=yes",
+                         "UserKnownHostsFile=%s" % (self.root / "known"), "GlobalKnownHostsFile=/dev/null", "-T"):
+            self.assertIn(required, joined)
+        self.assertNotIn("accept-new", joined)
+        self.assertNotIn("StrictHostKeyChecking=no", joined)
+
+    def test_second_supervisor_stands_down(self) -> None:
+        first = subprocess.Popen([str(ANCHOR), "--once"], env=self.env(FAKE_SSH_HOLD="3"))
+        try:
+            time.sleep(0.5)
+            second = self.run_anchor("--once")
+            self.assertEqual(second.returncode, 0)
+        finally:
+            first.wait(timeout=30)
+        self.assertEqual(first.returncode, 0)
+
+    def test_help_is_side_effect_free(self) -> None:
+        result = subprocess.run([str(ANCHOR), "--help"], text=True, capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
