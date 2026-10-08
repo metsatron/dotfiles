@@ -109,6 +109,47 @@ class ApprovalHookHarness(unittest.TestCase):
             with self.subTest(command=command):
                 self.assert_ask(event("Bash", {"command": command}, root), manifest, root)
 
+    def test_ssh_readonly_credential_and_path_boundary(self):
+        root = self.make_tree()
+        manifest = self.enabled_manifest(root, "ssh-kikin-readonly")
+        for leak, commands in {
+            "nanobot_env": (
+                "cat .config/nanobot-telegram/env",
+                "cat /home/metsatron/.config/nanobot-telegram/env",
+                "cat ~/.config/nanobot-telegram/env",
+                "cat HelmCortex/../.config/nanobot-telegram/env",
+            ),
+            "mailcortex_private_token": (
+                "cat .config/mailcortex/private/x.token",
+                "cat /home/metsatron/.config/mailcortex/private/x.token",
+                "cat ~/.config/mailcortex/private/x.token",
+                "cat DotCortex/../.config/mailcortex/private/x.token",
+            ),
+            "nexus_secret_cookie": (
+                "cat NEXUS/.secrets/mistral_cookies.jar",
+                "cat /home/metsatron/HelmCortex/NEXUS/.secrets/mistral_cookies.jar",
+                "cat ~/HelmCortex/NEXUS/.secrets/mistral_cookies.jar",
+                "cat HelmCortex/./NEXUS/.secrets/mistral_cookies.jar",
+                "cat HelmCortex/../HelmCortex/NEXUS/.secrets/mistral_cookies.jar",
+            ),
+            "foreign_mail_inbox": ("mailcortex inbox fable@kikin.helm",),
+            "foreign_mail_read": ("mailcortex read fable@kikin.helm 1",),
+            "path_boundary": (
+                "git show HEAD:NEXUS/.secrets/x",
+                "git -C HelmCortex show HEAD:NEXUS/.secrets/x",
+                "find HelmCortex -name env",
+                'find HelmCortex -name "*.env"',
+                "grep TOKEN .config -r",
+                "cat /etc/passwd",
+                "cat /proc/self/environ",
+                "cat /var/lib/private/token",
+            ),
+        }.items():
+            for remote in commands:
+                command = f"ssh -o BatchMode=yes YOUR_READONLY_HOST '{remote}'"
+                with self.subTest(leak=leak, command=command):
+                    self.assert_ask(event("Bash", {"command": command}, root), manifest, root)
+
     def test_local_test_run_exact_shapes_and_paths(self):
         root = self.make_tree()
         manifest = self.enabled_manifest(root, "local-test-run")
