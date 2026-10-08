@@ -441,6 +441,13 @@ INPUT_ESCAPE_TIMEOUT_SECONDS = env_float(
 CHANNEL_ATTACH_WAIT_SECONDS = env_int(
     "CLAUDE_IDLE_CHANNEL_ATTACH_WAIT_SECONDS", 30, 0
 )
+# A supervised session proves its lifecycle hooks are wired by sending any
+# event (SessionStart fires at launch).  None inside this window means the
+# idle timer can never arm: record it loudly (2026-09-30: Honey's Telegram
+# bots ran for days at status "starting", never compacting, hooks unwired).
+LIFECYCLE_WAIT_SECONDS = env_int(
+    "CLAUDE_IDLE_LIFECYCLE_WAIT_SECONDS", 180, 1
+)
 CHANNEL_RECOVERY_COOLDOWN_SECONDS = env_int(
     "CLAUDE_IDLE_CHANNEL_RECOVERY_COOLDOWN_SECONDS", 3, 0
 )
@@ -1785,6 +1792,9 @@ class Supervisor:
         self.screen_classifier = ClaudeScreenClassifier()
         self.screen_state: str | None = None
         self.preservation_federation = PreservationFederationClient(self)
+        self.lifecycle_health = "pending"
+        self.lifecycle_deadline = monotonic() + LIFECYCLE_WAIT_SECONDS
+        self.lifecycle_alarm_path = self.state_root / f"{self.channel}.LIFECYCLE-HOOKS-MISSING"
         self._guard_log("supervisor-started")
         self._write_state()
 
@@ -1840,6 +1850,7 @@ class Supervisor:
             "channel_turn_seen": self.channel_turn_seen,
             "channel_attach_checked": self.channel_attach_checked,
             "channel_attach_deadline": self.channel_attach_deadline,
+            "lifecycle_health": self.lifecycle_health,
             "channel_recovery_pending": self.recovery_pending,
             "channel_recovery_awaiting": self.recovery_awaiting,
             "channel_recovery_ignore_next_stop": self.recovery_ignore_next_stop,
@@ -2879,6 +2890,49 @@ class Supervisor:
             self._notice("channel did not attach; the terminal session remains running")
             self._write_state()
 
+    def _note_lifecycle_event(self) -> None:
+        """Any valid hook event proves the lifecycle adapter reaches this supervisor."""
+        if self.lifecycle_health == "wired":
+            return
+        recovered = self.lifecycle_health == "missing"
+        self.lifecycle_health = "wired"
+        if recovered:
+            self._guard_log("lifecycle-hooks-recovered")
+            try:
+                self.lifecycle_alarm_path.unlink()
+            except OSError:
+                pass
+
+    def _check_lifecycle_hooks(self) -> None:
+        """Flag a session whose Claude never sends a lifecycle event after launch.
+
+        Without claude-hook-idle-event in the settings Claude actually loads
+        (an unstowed account, a --settings file that omits it, a missing
+        command on PATH), this supervisor never sees a Stop, so it never arms
+        the idle timer and never compacts, silently.  The terminal session is
+        left untouched; the fault goes to the guard log, the state file (and
+        so claude-warmctl list), the debug log, and a durable alarm file.
+        """
+        if self.lifecycle_health != "pending" or monotonic() < self.lifecycle_deadline:
+            return
+        self.lifecycle_health = "missing"
+        self.last_state_transition = "lifecycle-hooks-missing"
+        self._guard_log("lifecycle-hooks-missing", waited=LIFECYCLE_WAIT_SECONDS)
+        self._notice("no lifecycle hook event since launch; idle compaction cannot run")
+        try:
+            atomic_json(self.lifecycle_alarm_path, {
+                "timestamp": now(),
+                "channel": self.channel,
+                "pid": self.pid,
+                "waited_seconds": LIFECYCLE_WAIT_SECONDS,
+                "cause": "no lifecycle hook event since launch: claude-hook-idle-event is not "
+                         "registered in the settings Claude loads, not on its PATH, or Claude "
+                         "is blocked before its session started",
+            })
+        except OSError as error:
+            self._debug(f"lifecycle-alarm-write-failed channel={short_id(self.channel)} error={error}")
+        self._write_state()
+
     def _child_argv(self) -> list[str]:
         """Add private Claude debug capture only for channel sessions."""
         if not self.watched_servers:
@@ -3268,6 +3322,7 @@ class Supervisor:
         session_id = message.get("session_id")
         if event not in EVENTS or not isinstance(session_id, str) or not SESSION_RE.fullmatch(session_id):
             return {"ok": False, "error": "invalid-event"}
+        self._note_lifecycle_event()
         if event == "session-start":
             new_session = self.session_id != session_id
             if new_session and self.session_id and not self._same_project_transcript(
@@ -3796,6 +3851,8 @@ class Supervisor:
                 self.preservation_federation.poll()
                 self._check_channel_attach()
                 self._expire_development_channel_acceptance()
+                if not child_exited:
+                    self._check_lifecycle_hooks()
                 self._flush_input_classifier()
                 if (
                     self.transcript_quiescence_deadline is not None
@@ -3970,6 +4027,9 @@ def list_sessions() -> int:
             continue
         state["live"] = child_alive(state.get("pid"))
         print(json.dumps(state, sort_keys=True))
+        if state["live"] and state.get("lifecycle_health") == "missing":
+            print(f"WARNING {state.get('channel')}: no lifecycle hook event since launch; "
+                  "claude-hook-idle-event is not wired, idle compaction cannot run", file=sys.stderr)
     if not found:
         print("no supervised Claude sessions")
     return 0
