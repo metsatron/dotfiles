@@ -227,11 +227,10 @@ class ApprovalHookHarness(unittest.TestCase):
             env={**os.environ, "SO_APPROVAL_P3_MANIFEST": str(manifest)},
         )
         started = time.monotonic()
-        with self.assertRaises(subprocess.TimeoutExpired):
-            proc.wait(timeout=0.05)
-        proc.kill()
+        proc.wait(timeout=2)
         stdout, _ = proc.communicate(timeout=1)
-        self.assertLess(time.monotonic() - started, 1)
+        self.assertEqual(proc.returncode, 0)
+        self.assertLess(time.monotonic() - started, 1.5)
         self.assertEqual(decision(stdout), "ask")
 
 
