@@ -1524,7 +1524,7 @@ disabled until that local copy is reviewed and the hook is explicitly wired.
       "name": "local_read",
       "enabled": false,
       "tool_names": ["Read", "Glob", "Grep"],
-      "bash_verbs": ["cat", "head", "tail", "grep", "ls", "stat", "wc", "find"]
+      "bash_verbs": ["cat", "head", "tail", "grep", "ls", "stat", "wc", "find", "sed"]
     },
     {
       "name": "git_observe",
@@ -1582,6 +1582,19 @@ PACKAGE = {"apt", "apt-get", "apk", "brew", "cargo", "conda", "dnf", "guix", "ge
 AUTH = {".authinfo", ".authinfo.gpg", ".netrc", "auth.json", "authorized_keys", "credentials", "credentials.json", "id_ed25519", "id_rsa", "oauth.json", "oauth_creds.json", "secrets.json", "cookies.sqlite", "cookies.jar"}
 READ_OPTIONS = {"-n", "-i", "-v", "-E", "-F", "-h", "-H", "--line-number", "--ignore-case"}
 FIND_OPTIONS = {"-maxdepth", "-mindepth", "-type", "-name", "-iname", "-path", "-ipath", "-print", "-print0", "-mount", "-xdev"}
+# Compound commands (2026-10-09): agents write `cd X && sed -n 1,60p f | cut -c1-200`.
+# A compound is considered only when it contains nothing but the separators below;
+# any redirection, substitution, backslash, background `&` or newline stays at the hard floor.
+DISCARDS = (" 2>/dev/null", " 2> /dev/null", " >/dev/null", " > /dev/null", " 2>&1")
+SEPARATORS = ("&&", "||", "|", ";")
+TOOL_INPUT_KEYS = {"command", "description", "timeout"}
+# Bundled short flags that only change how matches or listings are printed.
+# grep -r/-R stays out: recursion would walk past the per-path protected check.
+GREP_FLAGS = re.compile(r"^-[nivEFhHlLwxcoIs]+$")
+LS_FLAGS = re.compile(r"^-[alhtrdAF1S]+$")
+SED_PRINT = re.compile(r"^(?:\d+|\$)(?:,(?:\d+|\$))?p$")
+COUNT_VALUE = re.compile(r"^\+?\d+$")
+FILTERS = {"head", "tail", "cut", "sort", "uniq", "wc", "tr", "grep", "sed"}
 BRANCH_OPTIONS = {"-a", "--all", "-r", "--remotes", "-v", "-vv", "--verbose", "--show-current", "--no-color"}
 
 
@@ -1617,7 +1630,7 @@ def _hard_floor(event):
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     if not isinstance(command, str):
         return False
-    if SHELL_META.search(command):
+    if SHELL_META.search(command) and not _routes_compound(command):
         return True
     try:
         words = shlex.split(command, posix=True)
@@ -1725,7 +1738,7 @@ def _repo(raw, cwd, manifest):
         current = current.parent
 
 
-def _local_match(event, manifest):
+def _local_match(event, manifest, words=None):
     entry = manifest["entries"].get("local_read")
     if entry is None:
         return False
@@ -1741,19 +1754,37 @@ def _local_match(event, manifest):
         base = tool_input.get("path") or cwd
         pattern = tool_input.get("pattern")
         return bool(_targets([base], cwd, manifest, True) and isinstance(pattern, str) and pattern and ".." not in pattern.split("/"))
-    if name != "Bash" or set(tool_input) != {"command"} or not isinstance(tool_input.get("command"), str) or SHELL_META.search(tool_input["command"]):
+    if name != "Bash" or not set(tool_input) <= TOOL_INPUT_KEYS or not isinstance(tool_input.get("command"), str):
         return False
-    try:
-        words = shlex.split(tool_input["command"], posix=True)
-    except ValueError:
-        return False
+    if words is None:
+        # A whole command: refuse shell syntax. _compound passes words it already
+        # parsed with quotes respected, so a quoted backslash pattern is no threat there.
+        if SHELL_META.search(tool_input["command"]):
+            return False
+        try:
+            words = shlex.split(tool_input["command"], posix=True)
+        except ValueError:
+            return False
     if not words or words[0] not in entry["bash_verbs"] or words[0] != words[0].rsplit("/", 1)[-1]:
         return False
     verb, args = words[0], words[1:]
-    if verb == "grep":
-        if not args or args[0].startswith("-") or any(arg.startswith("-") and arg not in READ_OPTIONS for arg in args[1:]):
+    if verb in {"head", "tail"}:
+        args = _strip_counts(args)
+        if args is None:
             return False
-        operands = [arg for arg in args[1:] if not arg.startswith("-")]
+    if verb == "sed":
+        if len(args) < 3 or args[0] != "-n" or not SED_PRINT.match(args[1]) or any(arg.startswith("-") for arg in args[2:]):
+            return False
+        return bool(_targets(args[2:], cwd, manifest, False))
+    if verb == "grep":
+        # Read-only flags may sit before or after the pattern (agents write grep -n PAT f);
+        # the first non-flag word is the pattern, every later one is a file to check.
+        if any(arg.startswith("-") and arg not in READ_OPTIONS and not GREP_FLAGS.match(arg) for arg in args):
+            return False
+        words_only = [arg for arg in args if not arg.startswith("-")]
+        if len(words_only) < 2:
+            return False
+        operands = words_only[1:]
     elif verb == "find":
         split = next((index for index, arg in enumerate(args) if arg.startswith("-")), len(args))
         operands, expression = args[:split], args[split:]
@@ -1761,6 +1792,10 @@ def _local_match(event, manifest):
             return False
         if any(arg.startswith("-") and arg not in FIND_OPTIONS for arg in expression):
             return False
+    elif verb == "ls":
+        if any(arg.startswith("-") and not LS_FLAGS.match(arg) for arg in args):
+            return False
+        operands = [arg for arg in args if not arg.startswith("-")] or ["."]
     else:
         operands = [arg for arg in args if not arg.startswith("-")]
         if not operands or any(arg.startswith("-") and arg not in READ_OPTIONS for arg in args):
@@ -1771,7 +1806,7 @@ def _local_match(event, manifest):
 def _git_match(event, manifest):
     entry = manifest["entries"].get("git_observe")
     tool_input, cwd = event.get("tool_input"), event.get("cwd")
-    if entry is None or event.get("tool_name") != "Bash" or not isinstance(tool_input, dict) or set(tool_input) != {"command"} or not isinstance(cwd, str):
+    if entry is None or event.get("tool_name") != "Bash" or not isinstance(tool_input, dict) or not set(tool_input) <= TOOL_INPUT_KEYS or not isinstance(tool_input.get("command"), str) or not isinstance(cwd, str):
         return False
     try:
         words = shlex.split(tool_input["command"], posix=True)
@@ -1887,12 +1922,169 @@ def _safe_commit(event, manifest):
     return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid() and not stat.S_IMODE(info.st_mode) & 0o077 and all(not _protected(path) and ".git" not in Path(path).parts for path in targets)
 
 
+def _strip_counts(args):
+    """Drop head/tail line or byte counts (-n N, -c N, -N, --lines=N); None if malformed."""
+    kept, index = [], 0
+    while index < len(args):
+        arg = args[index]
+        if arg in {"-n", "-c"}:
+            if index + 1 >= len(args) or not COUNT_VALUE.match(args[index + 1]):
+                return None
+            index += 2
+            continue
+        if re.fullmatch(r"-\d+", arg) or re.fullmatch(r"--(?:lines|bytes)=\+?\d+", arg) or arg == "-q":
+            index += 1
+            continue
+        kept.append(arg)
+        index += 1
+    return kept
+
+
+def _split_compound(command):
+    """Split on top-level &&, ||, | and ; outside quotes, dropping harmless stderr/stdout
+    discards (2>/dev/null, >/dev/null, 2>&1). Returns [(separator, text), ...] or None.
+    Single-quoted text is literal; anything that could substitute, redirect to a file,
+    background or escape (outside single quotes) makes it None."""
+    segments, current, quote, index, separator = [], [], None, 0, None
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+            current.append(char)
+            index += 1
+            continue
+        if quote == '"':
+            if char in {"`", "\\"} or command.startswith("$(", index):
+                return None
+            if char == '"':
+                quote = None
+            current.append(char)
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            current.append(char)
+            index += 1
+            continue
+        discard = next((d for d in DISCARDS if command.startswith(d, index)), None)
+        if discard:
+            index += len(discard)
+            continue
+        found = next((sep for sep in SEPARATORS if command.startswith(sep, index)), None)
+        if found:
+            segments.append((separator, "".join(current).strip()))
+            current, separator = [], found
+            index += len(found)
+            continue
+        if char in {"\n", "\r", "`", "<", ">", "\\", "&"} or command.startswith("$(", index):
+            return None
+        current.append(char)
+        index += 1
+    if quote:
+        return None
+    segments.append((separator, "".join(current).strip()))
+    if any(not text for _, text in segments):
+        return None
+    return segments
+
+
+def _routes_compound(command):
+    """True when the command should be judged stage by stage by _compound."""
+    segments = _split_compound(command)
+    return segments is not None and (len(segments) > 1 or bool(SHELL_META.search(command)))
+
+
+def _filter_ok(words):
+    """A pipe stage that only transforms stdin: no file operands, no writing options."""
+    verb, args = words[0], words[1:]
+    if verb not in FILTERS or verb != verb.rsplit("/", 1)[-1]:
+        return False
+    if verb in {"head", "tail"}:
+        return _strip_counts(args) == []
+    if verb == "wc":
+        return all(arg in {"-l", "-c", "-w", "-m"} for arg in args)
+    if verb == "uniq":
+        return all(arg in {"-c", "-d", "-u", "-i"} for arg in args)
+    if verb == "tr":
+        options = [arg for arg in args if arg.startswith("-")]
+        return all(arg in {"-d", "-s"} for arg in options) and 1 <= len(args) - len(options) <= 2
+    if verb == "sed":
+        return len(args) == 2 and args[0] == "-n" and bool(SED_PRINT.match(args[1]))
+    if verb == "grep":
+        operands = [arg for arg in args if not arg.startswith("-")]
+        return len(operands) == 1 and all(arg in READ_OPTIONS or GREP_FLAGS.match(arg) for arg in args if arg.startswith("-"))
+    with_value = {"cut": {"-c", "-d", "-f", "-b"}, "sort": {"-k", "-t"}}[verb]
+    flags = {"cut": {"-s"}, "sort": {"-n", "-r", "-u", "-h", "-V", "-f"}}[verb]
+    index = 0
+    while index < len(args):
+        arg = args[index]
+        if arg in with_value and index + 1 < len(args):
+            index += 2
+        elif any(arg.startswith(option) and len(arg) > len(option) for option in with_value) or arg in flags:
+            index += 1
+        else:
+            return False
+    return True
+
+
+def _compound(event, manifest):
+    """Approve a compound only when every stage is a cd inside the roots, an enabled
+    read or git observation, or (after a pipe) a stdin-only filter."""
+    segments = _split_compound(event["tool_input"]["command"])
+    cwd = _path(event.get("cwd"), event.get("cwd") or "/", manifest["roots"]) if isinstance(event.get("cwd"), str) else None
+    if segments is None or cwd is None:
+        return False, "no_match"
+    used = []
+    for separator, text in segments:
+        try:
+            words = shlex.split(text, posix=True)
+        except ValueError:
+            return False, "no_match"
+        if words[:1] == ["timeout"] and len(words) > 2 and re.fullmatch(r"\d+(?:\.\d+)?[smh]?", words[1]):
+            words = words[2:]
+        if not words:
+            return False, "no_match"
+        if words[0] in {"true", "echo"}:
+            # No redirection can survive _split_compound, so these only print or no-op.
+            continue
+        if separator == "|":
+            if not _filter_ok(words):
+                return False, "no_match"
+            continue
+        if words[0] == "cd":
+            # Only a cd that must succeed for the chain to continue (start or after &&),
+            # so later relative paths really resolve where this check resolved them.
+            if separator not in (None, "&&"):
+                return False, "no_match"
+            target = _path(words[1], cwd, manifest["roots"]) if len(words) == 2 else None
+            if target is None or not os.path.isdir(target):
+                return False, "no_match"
+            cwd = target
+            continue
+        stage = {**event, "cwd": cwd, "tool_input": {"command": shlex.join(words)}}
+        for matcher, name in ((_local_match, "local_read"), (_git_match, "git_observe")):
+            if (matcher(stage, manifest, words) if matcher is _local_match else matcher(stage, manifest)):
+                if manifest["entries"][name]["enabled"] is not True:
+                    return False, f"{name}_disabled"
+                used.append(name)
+                break
+        else:
+            return False, "no_match"
+    if not used:
+        return False, "no_match"
+    return True, "compound:" + "+".join(sorted(set(used)))
+
+
 def classify(event, manifest):
     """Return (allow, reason). The reason names the class that matched, or why none did."""
     if not isinstance(event, dict) or event.get("hook_event_name") != "PermissionRequest":
         return False, "not_permission_request"
     if _hard_floor(event):
         return False, "hard_floor"
+    tool_input = event.get("tool_input")
+    if event.get("tool_name") == "Bash" and isinstance(tool_input, dict) and set(tool_input) <= TOOL_INPUT_KEYS and isinstance(tool_input.get("command"), str) and _routes_compound(tool_input["command"]):
+        return _compound(event, manifest)
     for matcher in (_local_match, _git_match, _centre_match, _safe_commit):
         if matcher(event, manifest):
             name = {"_local_match": "local_read", "_git_match": "git_observe", "_centre_match": "centre_render", "_safe_commit": "safe_commit"}[matcher.__name__]
@@ -2037,6 +2229,59 @@ class KikinApprovalHookTests(unittest.TestCase):
                          [("allow", "local_read"), ("ask", "local_read_disabled"), ("ask", "not_permission_request")])
         self.assertNotIn(secret_path, log.read_text())
         self.assertEqual(oct(log.stat().st_mode & 0o777), "0o600")
+
+    def test_compound_reads_allow_and_anything_else_asks(self):
+        manifest = self.manifest("local_read", "git_observe")
+        root = str(self.root)
+        allow = [
+            f"cd {root} && cat README.md",
+            f"cd {root} && sed -n 1,2p README.md | cut -c1-200",
+            "grep -n synthetic README.md | head -n 5",
+            "cat README.md | wc -l",
+            "git status --short && git log --oneline -1",
+            "head -n 3 README.md; tail -1 README.md",
+            "grep -n 'a|b' README.md | sort -n | uniq -c",
+            "grep -n -i -E 'synth\\.etic|x' README.md 2>/dev/null | head -5",
+            "timeout 30 grep -n synthetic README.md; echo === ; cat README.md 2>&1 | wc -l",
+            "cat README.md 2>/dev/null || true",
+            f"cd {root} && ls -la FORGE/bin | grep -iE 'poke|club'",
+            "grep -il synthetic README.md",
+        ]
+        for command in allow:
+            with self.subTest(allow=command):
+                self.assert_decision(event("Bash", {"command": command, "description": "read"}, self.root), manifest, "allow")
+        ask = [
+            "cat README.md > copy",
+            "cat README.md | tee copy",
+            "cat README.md | sh",
+            "git status | xargs rm",
+            "cat README.md; rm README.md",
+            "cat README.md && curl https://example.invalid",
+            "cat README.md | sort -o copy",
+            "cat README.md & ls",
+            "cat $(echo README.md) | head",
+            "cd / && cat etc/passwd",
+            f"cat README.md || cd {root}",
+            f"cd {root} && sed -n '1p;w copy' README.md",
+            "sed -n 1p README.md | sed -i s/a/b/ README.md",
+            "cat README.md | head -n 5 README.md",
+            "cat README.md |",
+            "cat 'README.md && ls",
+            "printf x && cat README.md",
+            'grep -n "$(id)" README.md',
+            'grep -n "a\\$b" README.md | head',
+            "cat README.md 2>/tmp/err",
+            "cat README.md >/dev/null; cat README.md > copy",
+            "timeout 30 rm README.md && cat README.md",
+            "echo x | sh",
+            "grep -rn synthetic . | head",
+            "ls -la / && cat README.md",
+        ]
+        for command in ask:
+            with self.subTest(ask=command):
+                self.assert_decision(event("Bash", {"command": command}, self.root), manifest, "ask")
+        # A compound read still respects a disabled class.
+        self.assert_decision(event("Bash", {"command": "cat README.md | wc -l"}, self.root), self.manifest(), "ask")
 
     def test_all_classes_are_default_off(self):
         manifest = REPO / "all/.config/dotcortex/claude-approval-canary.kikin.v1.json"
