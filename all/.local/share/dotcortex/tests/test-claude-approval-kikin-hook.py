@@ -408,6 +408,18 @@ class KikinApprovalHookTests(unittest.TestCase):
             with self.subTest(command=command):
                 self.assertFalse(self._engine._write_capable(event("Bash", {"command": command}, self.root)))
 
+    def test_git_apply_routes_dual(self):
+        # Calibration finding 2026-10-10: 'git apply x.patch' is a worktree
+        # write and must be dual-judged; --check/--stat dry runs stay single.
+        self._classify_reason(event("Bash", {"command": "true"}, self.root), self.manifest())
+        for command, expected in [
+            ("cd /repo && git apply /tmp/x.patch", True),
+            ("git apply --check /tmp/x.patch", False),
+            ("git apply --stat /tmp/x.patch", False),
+        ]:
+            with self.subTest(command=command):
+                self.assertEqual(self._engine._write_capable(event("Bash", {"command": command}, self.root)), expected)
+
     def test_write_capable_routes_dual_not_single(self):
         # A sed -i grey prompt must consult the destructive question, not just
         # sensitive: wire the fake decider to answer single-mode allow but dual
