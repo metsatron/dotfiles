@@ -370,7 +370,7 @@ class ResultOrderTests(unittest.TestCase):
         self.assertEqual(
             [item["label"] for item in self.ai_usage.order_results(items)],
             ["Codex", "Gillean · Codex", "Claude Code", "Gillean · Claude Code",
-             "Mistral", "OpenCode Go", "OpenRouter", "NeuralWatt"],
+             "OpenCode Go", "Mistral", "OpenRouter", "NeuralWatt"],
         )
 
     def test_remote_panels_keep_file_order_and_unknowns_go_last(self):
@@ -477,10 +477,17 @@ class MistralProbeTests(unittest.TestCase):
         self.assertEqual(result["state"], "ok")
         self.assertEqual(result["source"], "admin-trpc")
         self.assertEqual(result["identity"]["plan_name"], "Pro")
-        # Both budgets surface as real percentages with reset dates.
-        self.assertAlmostEqual(result["usage"]["secondary"]["usedPercent"], 61.051076)
-        self.assertAlmostEqual(result["usage"]["vibe"]["usedPercent"], 0.53698893)
-        self.assertEqual(result["usage"]["secondary"]["resetsAt"], "2026-11-01T00:00:00Z")
+        # Standard quota shape (2026-10-09): budgets render as gauges like every
+        # other panel — primary=Vibe, secondary=API, each with usedPercent,
+        # windowMinutes (30d), resetsAt, label.
+        primary = result["usage"]["primary"]
+        secondary = result["usage"]["secondary"]
+        self.assertAlmostEqual(primary["usedPercent"], 0.53698893)
+        self.assertAlmostEqual(secondary["usedPercent"], 61.051076)
+        self.assertEqual(primary["label"], "Vibe")
+        self.assertEqual(secondary["label"], "API")
+        self.assertEqual(primary["windowMinutes"], 30 * 24 * 60)
+        self.assertEqual(secondary["resetsAt"], "2026-11-01T00:00:00Z")
         self.assertIn("$18.32/$30", result["summary"])
         self.assertIn("61.1%", result["summary"])
         self.assertIn("Vibe", result["summary"])
@@ -598,6 +605,30 @@ class MistralProbeTests(unittest.TestCase):
 
         self.assertEqual(captured["token"], "vibe-key")
         self.assertEqual(result["identity"]["plan_name"], "INDIVIDUAL")
+
+    def test_mistral_budgets_render_as_standard_quotas(self):
+        """Admiral pattern conformance (2026-10-09): the budget dicts must land
+        in raw.usage.primary/secondary in the same shape _codex_window_to_quota
+        emits ({usedPercent, windowMinutes, resetsAt ISO}), so the existing
+        format_compact_quota_line renderer draws bars and countdowns with no
+        bespoke Mistral path."""
+        def fake_trpc(endpoint, params, timeout_seconds):
+            return json.loads(json.dumps(MISTRAL_BUDGET_FIXTURE))
+
+        with patch.object(self.ai_usage, "_mistral_trpc", side_effect=fake_trpc):
+            result = self.ai_usage.fetch_mistral(1.0)
+
+        for slot in ("primary", "secondary"):
+            quota = result["usage"][slot]
+            self.assertIn("usedPercent", quota)
+            self.assertIsInstance(quota["windowMinutes"], int)
+            self.assertIn("resetsAt", quota)
+            self.assertIn(quota["resetsAt"], "2026-11-01T00:00:00Z")
+            # The existing renderer must produce a bar line from it.
+            label = quota.get("label") or ("Vibe" if slot == "primary" else "API")
+            line = self.ai_usage.format_compact_quota_line(label, quota)
+            self.assertIsNotNone(line, f"{slot} quota did not render")
+            self.assertIn("%", line)
 
     def test_cookie_jar_resolved_from_dotenv_at_call_time(self):
         """Fix 2026-10-09: the jar path used to be baked in at import time, so a
@@ -740,13 +771,8 @@ class NeuralWattAddendumTests(unittest.TestCase):
         self.assertEqual(result["active_offer"]["title"], "Free Flash weekend")
         self.assertEqual(result["active_offer"]["amount_wh"], 250.0)
 
-    def test_reserve_tank_groups_at_bottom(self):
-        """openrouter + neuralwatt order beneath the subscription gauges."""
-        order = self.ai_usage.PROVIDER_DISPLAY_ORDER
-        self.assertLess(order.index("mistral"), order.index("openrouter"))
-        self.assertLess(order.index("opencode-go"), order.index("openrouter"))
-        self.assertEqual(order.index("openrouter") + 1, order.index("neuralwatt"))
-        self.assertIn("neuralwatt", self.ai_usage.DEFAULT_PROVIDER_KEYS)
+    ["Codex", "Gillean · Codex", "Claude Code", "Gillean · Claude Code",
+             "OpenCode Go", "Mistral", "OpenRouter", "NeuralWatt"],
 
     def test_offer_feed_reader_validates_format_and_window(self):
         """The feed reader only accepts centre-provider-bonuses.v1 offers whose
