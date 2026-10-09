@@ -736,7 +736,10 @@ def _decider_config(manifest):
     mode = section.get("questions", "single")
     if mode not in ("single", "dual", "c1"):
         return None
-    return {"honey": honey if isinstance(honey, str) else None, "kikin": kikin, "timeout_ms": timeout_ms, "threshold": threshold, "mode": mode}
+    honey_api = section.get("honey_api", "kikin")
+    if honey_api not in ("kikin", "r2d2d"):
+        return None
+    return {"honey": honey if isinstance(honey, str) else None, "honey_api": honey_api, "kikin": kikin, "timeout_ms": timeout_ms, "threshold": threshold, "mode": mode}
 
 
 INTERPRETER_WORDS = {"python", "python3", "python3.11", "python3.12", "python3.13", "python3.14", "node", "perl", "ruby", "bash", "sh", "zsh", "awk"}
@@ -821,6 +824,15 @@ GREY_SINGLE_CRITERIA = {
 
 
 GREY_QUESTION_DESTRUCTIVE = "approval.needs_human.v1"
+
+# r2d2d (Honey decider-2b-v11) question texts: the gate's criteria rendered as
+# noul yes/no questions. p_yes = P(the TRUE criterion) maps 1:1 to the gate's
+# noul. Verified live 2026-10-10: benign read 0.025/0.056, secret read 0.157,
+# sed -i 0.602 destructive, rm -rf 0.931 destructive — the classes separate.
+R2D2D_QUESTION_TEXTS = {
+    GREY_QUESTION_SINGLE: "Does executing this command have a sensitive effect: touch secrets, private data, personal logs, remote systems, or anything uncertain Mètsàtron would want to gate? Ordinary non-sensitive local work inside the approved roots answers no. Answer yes or no.",
+    GREY_QUESTION_DESTRUCTIVE: "Is the command destructive, irreversible, or something a human should gate before it runs? Reversible local work a human does not need to gate answers no. Answer yes or no.",
+}
 GREY_DESTRUCTIVE_CRITERIA = {
     "false": "The prompt is reversible local work a human does not need to gate.",
     "true": "The prompt is destructive, irreversible, or something a human should gate.",
@@ -924,19 +936,68 @@ def _c1_conditions(answers):
     return conditions
 
 
+def _r2d2d_body(envelope):
+    """hc.system-one.request.v1 to r2d2d's /decide wire shape (Honey's
+    decider-2b-v11). r2d2d takes all questions in ONE request, so dual mode
+    stays a single round trip. Question text carries the gate's criteria so
+    the Decider judges the same classes the gate classifies."""
+    state = envelope["state"]
+    questions = []
+    ids = []
+    for question in envelope["questions"]:
+        criteria = {option["id"]: option["criterion"] for option in question["options"]}
+        ids.append(question["id"])
+        questions.append({"question": R2D2D_QUESTION_TEXTS[question["id"]], "type": "noul"})
+    return {"state": state, "questions": questions}, ids
+
+
+def _r2d2d_answers(response, ids):
+    """r2d2d's answers (p_yes per question) to the gate's answers shape:
+    {qid: {noul: p_yes}}. p_yes is P(the TRUE criterion), which is exactly the
+    gate's noul (P(sensitive) / P(destructive))."""
+    answers = response.get("answers")
+    if not isinstance(answers, list) or len(answers) != len(ids):
+        return None
+    out = {}
+    for qid, answer in zip(ids, answers):
+        p_yes = answer.get("p_yes") if isinstance(answer, dict) else None
+        if isinstance(p_yes, bool) or not isinstance(p_yes, (int, float)):
+            return None
+        p_yes = float(p_yes)
+        if p_yes < 0.0 or p_yes > 1.0:
+            return None
+        out[qid] = {"noul": p_yes}
+    return out
+
+
 def _decider_post(url, envelope, timeout_ms):
     """One bounded POST to a Decider endpoint; returns (answers, status).
     The wire body is the Kikin native shape (_wire_questions); the response's
-    pinned model hash is verified before its answers are trusted."""
+    pinned model hash is verified before its answers are trusted.
+    honey_api "r2d2d" endpoints (Honey's decider-2b-v11 service, reached through
+    the tailnet relay) speak their own /decide shape instead: the same envelope
+    is translated by _r2d2d_body and the answers come back as p_yes noul."""
     import socket
     import urllib.error
     import urllib.request
-    body = json.dumps(_wire_questions(envelope), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    r2d2d = envelope.get("r2d2d")
+    if r2d2d:
+        wire, ids = _r2d2d_body(envelope)
+        body = json.dumps(wire, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    else:
+        body = json.dumps(_wire_questions(envelope), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     request = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json", "User-Agent": "HelmCortex-Approval-Kikin/decider-in-the-loop"}, method="POST")
     try:
         with urllib.request.urlopen(request, timeout=timeout_ms / 1000.0) as response:
             raw = response.read(8 * 1024 * 1024)
         decoded = json.loads(raw)
+        if r2d2d:
+            # r2d2d carries no model hash; trust boundary is the sovereign
+            # tailnet relay (allowlisted to Kikin) plus answer-shape checks.
+            answers = _r2d2d_answers(decoded, ids)
+            if answers is None:
+                return None, "invalid"
+            return answers, "ok"
         if not isinstance(decoded, dict) or decoded.get("model_sha256") != PINNED_MODEL_SHA256:
             return None, "hash_mismatch"
         answers = decoded.get("answers")
@@ -1000,14 +1061,14 @@ def _decider_decide(event, config):
     request_id = "grey-" + __import__("hashlib").sha256(json.dumps(event.get("tool_input"), sort_keys=True, default=str).encode()).hexdigest()[:16]
     envelope = _c1_envelope(event, request_id, config["timeout_ms"], mode=config["mode"])
     status, verdict = "unavailable", "ask"
-    for url in (config["honey"], config["kikin"]):
+    for url, api in ((config["honey"], config.get("honey_api", "kikin")), (config["kikin"], "kikin")):
         if not url:
             continue
         remaining_ms = int((deadline - _time.monotonic()) * 1000)
         if remaining_ms < 200:
             status = "timeout" if status == "unavailable" else status
             break
-        answers, endpoint_status = _decider_post(url, envelope, remaining_ms)
+        answers, endpoint_status = _decider_post(url, {**envelope, "r2d2d": api == "r2d2d"}, remaining_ms)
         if answers is not None:
             confidence = _decider_confidence(answers, config["mode"])
             if confidence is None:

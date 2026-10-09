@@ -174,7 +174,7 @@ class KikinApprovalHookTests(unittest.TestCase):
         manifest.write_text(json.dumps(data))
         self.assert_decision(event("Bash", {"command": "FORGE/bin/pokemon-centre render --out /etc/x"}, canonical), manifest, "ask")
 
-    def _decider_manifest(self, *, honey=None, kikin=None, enabled=True):
+    def _decider_manifest(self, *, honey=None, kikin=None, enabled=True, honey_api=None):
         data = json.loads(self.manifest("local_read", "git_observe").read_text())
         data["manifest_version"] = "claude-approval-canary.kikin.v2"
         data["decider"] = {
@@ -185,6 +185,8 @@ class KikinApprovalHookTests(unittest.TestCase):
             "min_allow_confidence": 0.95,
             "questions": "single",
         }
+        if honey_api is not None:
+            data["decider"]["honey_api"] = honey_api
         path = self.scratch / "manifest-decider.json"
         path.write_text(json.dumps(data))
         return path
@@ -420,6 +422,77 @@ class KikinApprovalHookTests(unittest.TestCase):
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "ask")
         self.assertEqual(records[-1]["decider_status"], "threshold_failed")
+
+    def test_r2d2d_wire_round_trip(self):
+        self._classify_reason(event("Bash", {"command": "true"}, self.root), self.manifest())  # load engine
+        envelope = self._engine._c1_envelope(event("Bash", {"command": "stat README.md"}, self.root), "req-1", 2200, mode="dual")
+        envelope["r2d2d"] = True
+        wire, ids = self._engine._r2d2d_body(envelope)
+        self.assertEqual(ids, [self._engine.GREY_QUESTION_SINGLE, self._engine.GREY_QUESTION_DESTRUCTIVE])
+        self.assertEqual(len(wire["questions"]), 2)
+        self.assertTrue(all(q["type"] == "noul" for q in wire["questions"]))
+        # responses adapt back into the gate answers shape
+        answers = self._engine._r2d2d_answers({"answers": [{"p_yes": 0.02}, {"p_yes": 0.03}]}, ids)
+        self.assertEqual(answers[self._engine.GREY_QUESTION_SINGLE]["noul"], 0.02)
+        # shape failures are rejected
+        self.assertIsNone(self._engine._r2d2d_answers({"answers": [{"p_yes": 0.5}]}, ids))
+        self.assertIsNone(self._engine._r2d2d_answers({"answers": [{"p_yes": "x"}, {"p_yes": 0.5}]}, ids))
+        self.assertIsNone(self._engine._r2d2d_answers({"answers": [{"p_yes": 1.5}, {"p_yes": 0.5}]}, ids))
+
+    def test_decider_config_honey_api_validation(self):
+        self._classify_reason(event("Bash", {"command": "true"}, self.root), self.manifest())  # load engine
+        base = {"enabled": True, "honey_url": "http://honey.tailnet:8097/decide", "kikin_url": "http://127.0.0.1:8098/v1/systemone", "timeout_ms": 2200, "min_allow_confidence": 0.95, "questions": "single"}
+        cfg = self._engine._decider_config({"decider": base})
+        self.assertEqual(cfg["honey_api"], "kikin")
+        cfg2 = self._engine._decider_config({"decider": {**base, "honey_api": "r2d2d"}})
+        self.assertEqual(cfg2["honey_api"], "r2d2d")
+        cfg3 = self._engine._decider_config({"decider": {**base, "honey_api": "weird"}})
+        self.assertIsNone(cfg3)
+
+    def test_r2d2d_endpoint_allows_and_denies(self):
+        # A fake r2d2d server on loopback: honey endpoint with honey_api=r2d2d.
+        import http.server
+        import threading
+
+        class FakeR2D2D(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length", "0"))
+                req = json.loads(self.rfile.read(n) or b"{}")
+                n_questions = len(req.get("questions") or [])
+                # benign p_yes values under the threshold for every question
+                p = [0.02] * n_questions
+                state = json.dumps(req.get("state", {}))
+                if "rm -rf" in state or ">" in state:
+                    p = [0.9] * n_questions
+                answers = [{"choice": "yes" if v > 0.5 else "no", "confidence": 0.9, "probs": {"yes": v, "no": 1 - v}, "p_yes": v} for v in p]
+                body = json.dumps({"answers": answers, "ms": 42}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), FakeR2D2D)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        port = server.server_address[1]
+        manifest = self._decider_manifest(honey=f"http://127.0.0.1:{port}/decide", honey_api="r2d2d", kikin="http://127.0.0.1:1/v1/systemone")
+        try:
+            log = self.scratch / "r2d2d.jsonl"
+            run_hook(event("Bash", {"command": "stat README.md extra.txt"}, self.root), manifest, log)
+            records = [json.loads(line) for line in log.read_text().splitlines()]
+            self.assertEqual(records[-1]["decision"], "allow")
+            self.assertEqual(records[-1]["decider_status"], "accepted")
+            log2 = self.scratch / "r2d2d-deny.jsonl"
+            run_hook(event("Bash", {"command": "echo hi > out.txt && stat x"}, self.root), manifest, log2)
+            records2 = [json.loads(line) for line in log2.read_text().splitlines()]
+            self.assertEqual(records2[-1]["decision"], "ask")
+            self.assertEqual(records2[-1]["decider_status"], "threshold_failed")
+        finally:
+            server.shutdown()
 
     def test_dual_mode_requires_both_questions(self):
         url = self._fake_decider({
