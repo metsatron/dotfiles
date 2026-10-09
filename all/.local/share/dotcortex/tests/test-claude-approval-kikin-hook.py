@@ -16,8 +16,9 @@ def event(tool_name, tool_input, cwd):
     return {"hook_event_name": "PermissionRequest", "tool_name": tool_name, "tool_input": tool_input, "cwd": str(cwd)}
 
 
-def run_hook(payload, manifest):
-    env = {**os.environ, "SO_APPROVAL_KIKIN_MANIFEST": str(manifest)}
+def run_hook(payload, manifest, log=os.devnull):
+    # Never let a test write the real decision ledger; os.devnull unless a test reads it.
+    env = {**os.environ, "SO_APPROVAL_KIKIN_MANIFEST": str(manifest), "SO_APPROVAL_KIKIN_LOG": str(log)}
     return subprocess.run([str(HOOK)], input=json.dumps(payload), text=True, capture_output=True, env=env, timeout=2, check=False)
 
 
@@ -58,6 +59,18 @@ class KikinApprovalHookTests(unittest.TestCase):
         completed = run_hook(payload, manifest)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(decision(completed), expected, completed.stdout)
+
+    def test_decision_ledger_records_reason_without_tool_input(self):
+        log = self.scratch / "decisions.jsonl"
+        secret_path = str(self.root / "README.md")
+        run_hook(event("Read", {"file_path": secret_path}, self.root), self.manifest("local_read"), log)
+        run_hook(event("Read", {"file_path": secret_path}, self.root), self.manifest(), log)
+        run_hook("not json", self.manifest(), log)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual([(r["decision"], r["reason"]) for r in records],
+                         [("allow", "local_read"), ("ask", "local_read_disabled"), ("ask", "not_permission_request")])
+        self.assertNotIn(secret_path, log.read_text())
+        self.assertEqual(oct(log.stat().st_mode & 0o777), "0o600")
 
     def test_all_classes_are_default_off(self):
         manifest = REPO / "all/.config/dotcortex/claude-approval-canary.kikin.v1.json"
