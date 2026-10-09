@@ -222,10 +222,12 @@ class KikinApprovalHookTests(unittest.TestCase):
         return f"http://127.0.0.1:{server.server_address[1]}/v1/systemone"
 
     def test_decider_allow_enables_grey_zone(self):
+        # 2026-10-10: a plain grey read (no write, no interpreter body) stays
+        # single-mode eligible; 'cat > file' now routes dual by design.
         url = self._fake_decider(self._c1_answers(allow=True))
         manifest = self._decider_manifest(kikin=url)
         log = self.scratch / "decider.jsonl"
-        payload = event("Bash", {"command": "cat README.md > copy"}, self.root)
+        payload = event("Bash", {"command": "stat README.md extra.txt"}, self.root)
         run_hook(payload, manifest, log)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "allow")
@@ -283,6 +285,165 @@ class KikinApprovalHookTests(unittest.TestCase):
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "ask")
         self.assertNotIn("decider_status", records[-1])
+
+    def _classify_reason(self, payload, manifest):
+        """Run the engine's classify directly (imported once) for reason checks."""
+        import importlib.util
+        from importlib.machinery import SourceFileLoader
+        if not hasattr(self, "_engine"):
+            loader = SourceFileLoader("kikin_engine_floor", str(ENGINE))
+            spec = importlib.util.spec_from_loader("kikin_engine_floor", loader)
+            module = importlib.util.module_from_spec(spec)
+            loader.exec_module(module)
+            self._engine = module
+        import json as _json
+        data = _json.loads(Path(manifest).read_text())
+        data["entries"] = {item["name"]: item for item in data.get("classes", [])}
+        return self._engine.classify(payload, data)[1]
+
+    def test_true_floor_destructive_git(self):
+        commands = [
+            "git push", "git push origin main", "git push --force origin x",
+            "git reset --hard HEAD~1", "git reset --merge", "git rebase main",
+            "git clean -fd", "git checkout -- file.py", "git restore file.py",
+            "git branch -D topic", "git stash drop", "git stash clear",
+            "git commit --amend -m x", "git worktree prune", "git worktree remove ../x",
+            "git filter-branch --tree-filter x", "git filter-repo --x",
+            "git checkout main", "git merge main",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._classify_reason(event("Bash", {"command": command}, self.root), self.manifest()), "true_floor")
+
+    def test_true_floor_git_reads_still_classify(self):
+        # Fable's additions must not floor observation forms:
+        manifest = self.manifest("git_observe")
+        reads = ["git status", "git status --short", "git log --oneline -3", "git diff"]
+        for command in reads:
+            with self.subTest(command=command):
+                self.assertIn(self._classify_reason(event("Bash", {"command": command}, self.root), manifest), ("git_observe", "git_observe_disabled"))
+
+    def test_true_floor_disk_and_permissions(self):
+        commands = [
+            "dd if=/dev/zero of=/dev/sda", "mkfs.ext4 /dev/sda1", "cryptsetup luksFormat /dev/sda2",
+            "wipefs /dev/sda", "fdisk /dev/sda", "parted /dev/sda", "shred secret.bin",
+            "truncate -s 0 data.db", "mount /dev/sda1 /mnt", "umount /mnt",
+            "chmod -R 777 dir", "chown -R user dir", "crontab -r", "at now",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._classify_reason(event("Bash", {"command": command}, self.root), self.manifest()), "true_floor")
+
+    def test_plain_chmod_not_floored(self):
+        # chmod without -R stays a grey-zone ask, not an absolute floor.
+        reason = self._classify_reason(event("Bash", {"command": "chmod +x script.sh"}, self.root), self.manifest("local_read"))
+        self.assertIn(reason, ("no_match_decider", "syntax"))
+
+    def test_interpreter_body_detection(self):
+        self._classify_reason(event("Bash", {"command": "true"}, self.root), self.manifest())  # load the engine
+        bodies = [
+            "python3 -c 'import os'",
+            "python -c \"import shutil\"",
+            "bash -c 'echo hi'",
+            "cat <<EOF\nprint(1)\nEOF",
+            "python3 <<'PY'\nimport os\nPY",
+        ]
+        for command in bodies:
+            with self.subTest(command=command):
+                self.assertTrue(self._engine._interpreter_body(event("Bash", {"command": command}, self.root)))
+        plain = ["python3 script.py", "cat README.md", "git status"]
+        for command in plain:
+            with self.subTest(command=command):
+                self.assertFalse(self._engine._interpreter_body(event("Bash", {"command": command}, self.root)))
+
+    def test_floor_verbs_caught_inside_compounds(self):
+        # Replay finding (2026-10-10): floor verbs hid inside compound segments.
+        commands = [
+            "cd /repo && kill -TERM 30130",
+            "cd /repo && rm -rf build && make",
+            "cd /repo && git commit --amend --no-edit",
+            "cd /repo && ssh honey date",
+            "cd /repo && pkill -f worker",
+            "cd /repo && git push origin main",
+            "cd /repo && crontab -r",
+            "cd /repo && chmod -R 777 dir",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._classify_reason(event("Bash", {"command": command}, self.root), self.manifest()), "true_floor")
+
+    def test_floor_verbs_caught_in_multiline(self):
+        # Replay finding: _split_compound refuses raw newlines, so multi-line
+        # commands escaped the segment scan ('cd X\nkill -TERM pid'). The
+        # apostrophe-in-comment case ('job's') made the whole command
+        # unparseable and used to skip the floor entirely.
+        commands = [
+            "cd /repo\n# stop the job\nkill -TERM 15943; sleep 2\nkill -KILL 15943",
+            "cd /repo\n# the job's process group\nkill -TERM -15943 2>/dev/null; sleep 2",
+            "cd /repo\ngit push origin master",
+            "echo start; rm -rf build; echo done",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self._classify_reason(event("Bash", {"command": command}, self.root), self.manifest()), "true_floor")
+
+    def test_write_capable_detection(self):
+        writes = [
+            "sed -i 's/a/b/' file.txt",
+            "awk -i inplace '{print}' data.txt",
+            "cp src dst",
+            "mv a b",
+            "touch marker",
+            "tee out.txt",
+            "echo hi > out.txt",
+        ]
+        self._classify_reason(event("Bash", {"command": "true"}, self.root), self.manifest())  # load engine
+        for command in writes:
+            with self.subTest(command=command):
+                self.assertTrue(self._engine._write_capable(event("Bash", {"command": command}, self.root)))
+        reads = ["cat README.md", "grep -n x file.txt", "ls -la", "git status"]
+        for command in reads:
+            with self.subTest(command=command):
+                self.assertFalse(self._engine._write_capable(event("Bash", {"command": command}, self.root)))
+
+    def test_write_capable_routes_dual_not_single(self):
+        # A sed -i grey prompt must consult the destructive question, not just
+        # sensitive: wire the fake decider to answer single-mode allow but dual
+        # threshold-fail on the destructive half.
+        url = self._fake_decider({
+            "approval.sensitive_effect.v1": {"type": "noul", "noul": 0.02},
+            "approval.needs_human.v1": {"type": "noul", "noul": 0.9},
+        })
+        manifest = self._decider_manifest(kikin=url)
+        log = self.scratch / "write-dual.jsonl"
+        run_hook(event("Bash", {"command": "sed -i 's/a/b/' file.txt"}, self.root), manifest, log)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(records[-1]["decision"], "ask")
+        self.assertEqual(records[-1]["decider_status"], "threshold_failed")
+
+    def test_dual_mode_requires_both_questions(self):
+        url = self._fake_decider({
+            "approval.sensitive_effect.v1": {"type": "noul", "noul": 0.02},
+            "approval.needs_human.v1": {"type": "noul", "noul": 0.9},
+        })
+        manifest = self._decider_manifest(kikin=url)
+        log = self.scratch / "dual.jsonl"
+        run_hook(event("Bash", {"command": "python3 -c 'import os'"}, self.root), manifest, log)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(records[-1]["decision"], "ask")
+        self.assertEqual(records[-1]["decider_status"], "threshold_failed")
+
+    def test_dual_mode_allows_when_both_clear(self):
+        url = self._fake_decider({
+            "approval.sensitive_effect.v1": {"type": "noul", "noul": 0.02},
+            "approval.needs_human.v1": {"type": "noul", "noul": 0.03},
+        })
+        manifest = self._decider_manifest(kikin=url)
+        log = self.scratch / "dual-ok.jsonl"
+        run_hook(event("Bash", {"command": "python3 -c 'print(1)'"}, self.root), manifest, log)
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(records[-1]["decision"], "allow")
+        self.assertEqual(records[-1]["reason"], "decider_allow")
 
     def test_v1_manifest_still_loads_without_decider(self):
         manifest = self.manifest("local_read")

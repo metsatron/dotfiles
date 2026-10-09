@@ -86,20 +86,115 @@ def _true_floor(event):
         return False
     if _protected(command):
         return True
+    # 2026-10-10 (replay finding): an unbalanced quote (a comment saying
+    # "job's") makes the WHOLE command unparseable — the old early bail-out
+    # skipped the entire floor. Now a failed whole-command parse still runs the
+    # per-line scans below (which parse the real command lines), and only the
+    # word-level scan is skipped.
     try:
         words = shlex.split(command, posix=True)
     except ValueError:
-        return False
+        words = None
     # Word-level secret scan, path-like tokens only ('cat .env', 'cat NEXUS/keys/x'):
     # a bare word such as grep 'private' is not a path and must not floor.
-    if any(_protected(word) for word in words if "/" in word or word.startswith("~") or "." in word):
+    if words is not None and any(_protected(word) for word in words if "/" in word or word.startswith("~") or "." in word):
+        return True
+    # 2026-10-10 (Fable review, replay finding): floor verbs hide inside compound
+    # segments ('cd X && kill -TERM 30130', 'rm -f a && make'). Every segment's
+    # first word gets the same absolute checks as a standalone command.
+    # _split_compound refuses raw newlines (safe for the approve path); the
+    # floor is fail-closed, so multi-line commands get a cruder line scan:
+    # every line and every ;-separated piece has its first word checked. A
+    # false positive here means ASK, never a silent allow.
+    segments = _split_compound(command)
+    if segments is not None:
+        for _separator, text in segments:
+            # A segment can still hold several newline-separated commands; each
+            # line's first word is checked, not just the segment head.
+            for line in text.split("\n"):
+                try:
+                    segment_words = shlex.split(line, posix=True)
+                except ValueError:
+                    continue
+                if segment_words and _floor_verb([w.casefold() for w in segment_words]):
+                    return True
+    else:
+        for line in command.replace(";", "\n").split("\n"):
+            try:
+                line_words = shlex.split(line, posix=True)
+            except ValueError:
+                continue
+            if line_words and _floor_verb([w.casefold() for w in line_words]):
+                return True
+    if words is None:
+        # Unparseable as one shell command: the line scans above already
+        # checked every parseable line; anything left unparsed is floor.
         return True
     lowered = [word.casefold() for word in words]
     if any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
         return True
     if any(word in SERVICE or word in {"pkill", "killall"} for word in lowered):
         return True
-    if lowered and lowered[0] == "kill" and (len(lowered) == 1 or any(word.startswith("-") for word in lowered[1:])):
+    return _floor_verb(lowered)
+
+
+def _floor_verb(lowered):
+    """Absolute floor checks on a command's (or compound segment's) word list.
+
+    Shared by the whole-command path and the per-segment scan so a floor verb
+    cannot hide inside a compound ('cd X && kill -TERM 30130')."""
+    # 2026-10-10 (replay finding): a bare 'kill PID' is still process control —
+    # any kill form floors (flag forms AND plain PID forms).
+    if lowered and lowered[0] == "kill":
+        return True
+    # Remote and service control also floor per segment ('cd X && ssh y'):
+    if any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
+        return True
+    if any(word in SERVICE or word in {"pkill", "killall"} for word in lowered):
+        return True
+    # 2026-10-10 (Fable review): destructive git forms are absolute floor —
+    # history loss, branch deletion and forced updates can never be
+    # Decider-eligible. Reads (status, log, diff) stay with the classes above.
+    if lowered and lowered[0] == "git":
+        sub = lowered[1] if len(lowered) > 1 else ""
+        rest = lowered[2:]
+        if sub in {"push", "rebase", "clean"}:
+            return True  # any form, per review
+        if sub == "reset" and any(word in {"--hard", "--merge"} or word.startswith("--hard") or word.startswith("--merge") for word in rest):
+            return True  # review lists --hard / --merge forms
+        if sub in {"checkout", "restore"}:
+            # Discarding worktree paths is floor; a plain branch switch is
+            # checked by the classes and, when unmatched, the Decider.
+            if sub == "restore" or "--" in rest:
+                return True
+            if any(word.startswith("--") and word not in {"--"} for word in rest):
+                return True  # e.g. --ours/--theirs discards the other side
+        if sub == "branch" and any(word in {"-d", "-D", "--delete", "--delete-force"} for word in rest):
+            return True
+        if sub == "stash" and any(word in {"drop", "clear", "pop"} for word in rest):
+            return True
+        if sub == "commit" and "--amend" in rest:
+            return True
+        if sub == "worktree" and any(word in {"prune", "remove", "delete"} for word in rest):
+            return True
+        if sub in {"filter-branch", "filter-repo"}:
+            return True
+        # "any 'main' branch name" (review): a git subcommand that NAMES the
+        # main branch as a word is floor — switching, merging or moving main is
+        # the fleet's protected spine. Reads never carry it as a bare word.
+        if sub and any(word in {"main", "master"} for word in lowered[2:]):
+            return True
+    # Disk and permission tools (2026-10-10 review): irreversible or system-wide.
+    disk_verbs = {"dd", "mkfs", "mkfs.ext2", "mkfs.ext3", "mkfs.ext4", "mkfs.btrfs", "mkfs.xfs", "mkfs.vfat", "mkfs.fat", "mkfs.ntfs", "cryptsetup", "wipefs", "fdisk", "parted", "shred", "truncate", "mount", "umount", "crontab"}
+    if lowered and lowered[0] in disk_verbs:
+        if lowered[0] == "crontab":
+            return any(word in {"-r", "--remove"} or word.startswith("-r") for word in lowered[1:])
+        return True
+    if lowered and lowered[0] in {"chmod", "chown"} and any(word.startswith("-") and ("r" in word[1:] or "R" in word[1:]) for word in lowered[1:]):
+        return True
+    # Process control beyond kill (2026-10-10 review): 'at' schedules jobs —
+    # any invocation floors, no flags-only exception.
+    if lowered and lowered[0] == "at":
         return True
     if "telegram-agent-host" in lowered and any(word in {"stop", "start", "switch", "bring"} for word in lowered):
         return True
@@ -639,9 +734,83 @@ def _decider_config(manifest):
     if honey is not None and (not isinstance(honey, str) or not honey):
         return None
     mode = section.get("questions", "single")
-    if mode not in ("single", "c1"):
+    if mode not in ("single", "dual", "c1"):
         return None
     return {"honey": honey if isinstance(honey, str) else None, "kikin": kikin, "timeout_ms": timeout_ms, "threshold": threshold, "mode": mode}
+
+
+INTERPRETER_WORDS = {"python", "python3", "python3.11", "python3.12", "python3.13", "python3.14", "node", "perl", "ruby", "bash", "sh", "zsh", "awk"}
+
+
+def _interpreter_body(event):
+    """True when the command runs an interpreter over a -c script or a heredoc.
+
+    2026-10-10 (Fable review): a heredoc or -c body can do anything, so
+    'non-sensitive' alone cannot auto-allow it. Such prompts go to the Decider
+    in dual mode (the destructive question must also clear) — never single."""
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return False
+    if "<<" in command:
+        return True
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return True  # unparseable + interpreter-shaped: fail closed
+    if not words:
+        return False
+    verb = words[0].rsplit("/", 1)[-1]
+    if verb not in INTERPRETER_WORDS:
+        return False
+    return any(word == "-c" or word.startswith("-") and "c" in word[1:] and not word.startswith("--") for word in words[1:])
+
+
+WRITE_VERBS = {"cp", "mv", "ln", "tee", "touch", "install", "mkdir", "rmdir", "truncate", "chmod", "chown", "rm", "unlink"}
+WRITE_INLINE = ("sed", "awk", "perl")  # -i / in-place variants write files
+
+
+def _write_capable(event):
+    """True when a grey-zone command can mutate files as written.
+
+    2026-10-10 (Fable review): single mode is fine for plain reads and
+    syntax-only refusals — nothing else. A write-capable prompt (sed -i, a
+    redirect into a file, cp/mv/tee/touch) is judged with the destructive
+    question too (dual), because 'not sensitive' says nothing about reversibility."""
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return False
+    # Redirects into files were syntax refusals: still write-capable.
+    if SHELL_META.search(command) and ">" in command:
+        return True
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError:
+        return True  # unknown shape: judge it with the destructive question
+    if not words:
+        return False
+    verb = words[0].rsplit("/", 1)[-1]
+    if verb in WRITE_VERBS:
+        return True
+    if verb in WRITE_INLINE:
+        return any(word == "-i" or word.startswith("-i") or "--in-place" in word for word in words[1:])
+    # Compounds ('CP=...; rm -v $l'): every segment and line's first word is
+    # checked too, mirroring the floor's per-segment scan.
+    segments = _split_compound(command)
+    lines = [text for _separator, text in segments] if segments is not None else command.replace(";", "\n").split("\n")
+    for line in lines:
+        for piece in line.split("\n"):
+            try:
+                line_words = shlex.split(piece, posix=True)
+            except ValueError:
+                return True
+            if line_words and line_words[0].rsplit("/", 1)[-1] in WRITE_VERBS:
+                return True
+            if line_words and line_words[0].rsplit("/", 1)[-1] in WRITE_INLINE:
+                if any(word == "-i" or word.startswith("-i") or "--in-place" in word for word in line_words[1:]):
+                    return True
+    return False
 
 
 GREY_QUESTION_SINGLE = "approval.sensitive_effect.v1"
@@ -651,16 +820,25 @@ GREY_SINGLE_CRITERIA = {
 }
 
 
+GREY_QUESTION_DESTRUCTIVE = "approval.needs_human.v1"
+GREY_DESTRUCTIVE_CRITERIA = {
+    "false": "The prompt is reversible local work a human does not need to gate.",
+    "true": "The prompt is destructive, irreversible, or something a human should gate.",
+}
+
+
 def _c1_envelope(event, request_id, timeout_ms, mode="single"):
     """Build the hc.system-one.request.v1 envelope for one grey-zone prompt.
 
     Measured on the live Kikin CPU Decider (2026-10-09): one noul question
     answers in ~2.4s; the full six-question C1 set needs far more than the
-    hook's 3s budget. Default mode 'single' asks the one decisive
-    sensitive-effect question (confidence = 1 - noul). Mode 'c1' asks all
-    six C1 questions for fast Honey endpoints; the deterministic C1
-    conditions then apply. Question payloads use the Kikin native shape
-    (type/criteria) that the local service accepts."""
+    hook's 3s budget. Modes: 'single' asks the one decisive sensitive-effect
+    question (confidence = 1 - noul) — allowed only for plain reads and
+    syntax-only refusals. 'dual' (interpreter bodies: heredocs and -c scripts)
+    adds the destructive/needs-human question and BOTH must clear the
+    threshold. 'c1' asks all six C1 questions for fast Honey endpoints.
+    Question payloads use the Kikin native shape (type/criteria) that the
+    local service accepts."""
     tool_input = event.get("tool_input") if isinstance(event.get("tool_input"), dict) else {}
     state = {
         "tool": str(event.get("tool_name") or ""),
@@ -677,6 +855,11 @@ def _c1_envelope(event, request_id, timeout_ms, mode="single"):
         questions = [
             native_question(qid, "choice", [(i, i.replace("_", " ")) for i in ids])
             for qid, ids in C1_QUESTIONS
+        ]
+    elif mode == "dual":
+        questions = [
+            native_question(GREY_QUESTION_SINGLE, "binary", list(GREY_SINGLE_CRITERIA.items())),
+            native_question(GREY_QUESTION_DESTRUCTIVE, "binary", list(GREY_DESTRUCTIVE_CRITERIA.items())),
         ]
     else:
         questions = [native_question(GREY_QUESTION_SINGLE, "binary", list(GREY_SINGLE_CRITERIA.items()))]
@@ -790,7 +973,22 @@ def _decider_confidence(answers, mode):
     noul = float(noul)
     if noul < 0.0 or noul > 1.0:
         return None
-    return 1.0 - noul
+    sensitive_confidence = 1.0 - noul
+    if mode == "dual":
+        # Interpreter bodies (heredoc / -c): non-sensitive is not enough — the
+        # destructive question must ALSO clear the threshold (2026-10-10 review).
+        destructive = answers.get(GREY_QUESTION_DESTRUCTIVE)
+        if not isinstance(destructive, dict):
+            return None
+        destructive_noul = destructive.get("noul")
+        if isinstance(destructive_noul, bool) or not isinstance(destructive_noul, (int, float)):
+            return None
+        destructive_noul = float(destructive_noul)
+        if destructive_noul < 0.0 or destructive_noul > 1.0:
+            return None
+        destructive_confidence = 1.0 - destructive_noul
+        return min(sensitive_confidence, destructive_confidence)
+    return sensitive_confidence
 
 
 def _decider_decide(event, config):
@@ -877,6 +1075,13 @@ def main():
         if not allow and reason in ("no_match_decider", "syntax"):
             config = _decider_config(manifest)
             if config is not None:
+                # 2026-10-10 (Fable review): a heredoc or -c interpreter body can
+                # do anything, and single mode is fine only for plain reads and
+                # syntax-only refusals — interpreter bodies AND write-capable
+                # prompts (sed -i, redirects, cp/mv/tee) are judged with the
+                # destructive question too (dual); c1-mode configs stay c1.
+                if config["mode"] == "single" and (_interpreter_body(event) or _write_capable(event)):
+                    config = {**config, "mode": "dual"}
                 decider_allow, status, latency_ms, verdict = _decider_decide(event, config)
                 _log_decision.extras = {"decider_status": status, "verdict": verdict, "latency_ms": latency_ms}
                 if decider_allow:
