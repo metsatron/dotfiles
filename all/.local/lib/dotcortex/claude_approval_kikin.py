@@ -798,6 +798,11 @@ def _write_capable(event):
         return True
     if verb in WRITE_INLINE:
         return any(word == "-i" or word.startswith("-i") or "--in-place" in word for word in words[1:])
+    # 'git apply' (without --check/--stat, which are dry runs) writes the worktree
+    # (calibration finding 2026-10-10: a 'git apply /tmp/x.patch' was single-mode
+    # eligible; it must be dual-judged like every other write).
+    if verb == "git" and any(word == "apply" for word in words[1:]) and not any(word in {"--check", "--stat", "-n", "--numstat"} for word in words[2:]):
+        return True
     # Compounds ('CP=...; rm -v $l'): every segment and line's first word is
     # checked too, mirroring the floor's per-segment scan.
     segments = _split_compound(command)
@@ -813,6 +818,8 @@ def _write_capable(event):
             if line_words and line_words[0].rsplit("/", 1)[-1] in WRITE_INLINE:
                 if any(word == "-i" or word.startswith("-i") or "--in-place" in word for word in line_words[1:]):
                     return True
+            if line_words and line_words[0].rsplit("/", 1)[-1] == "git" and any(word == "apply" for word in line_words[1:]) and not any(word in {"--check", "--stat", "-n", "--numstat"} for word in line_words[2:]):
+                return True
     return False
 
 
