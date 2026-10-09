@@ -334,14 +334,50 @@ def _safe_commit(event, manifest):
     return stat.S_ISREG(info.st_mode) and not stat.S_ISLNK(info.st_mode) and info.st_uid == os.getuid() and not stat.S_IMODE(info.st_mode) & 0o077 and all(not _protected(path) and ".git" not in Path(path).parts for path in targets)
 
 
-def evaluate(event, manifest):
-    if not isinstance(event, dict) or event.get("hook_event_name") != "PermissionRequest" or _hard_floor(event):
-        return False
+def classify(event, manifest):
+    """Return (allow, reason). The reason names the class that matched, or why none did."""
+    if not isinstance(event, dict) or event.get("hook_event_name") != "PermissionRequest":
+        return False, "not_permission_request"
+    if _hard_floor(event):
+        return False, "hard_floor"
     for matcher in (_local_match, _git_match, _centre_match, _safe_commit):
         if matcher(event, manifest):
             name = {"_local_match": "local_read", "_git_match": "git_observe", "_centre_match": "centre_render", "_safe_commit": "safe_commit"}[matcher.__name__]
-            return manifest["entries"][name]["enabled"] is True
-    return False
+            if manifest["entries"][name]["enabled"] is True:
+                return True, name
+            return False, f"{name}_disabled"
+    return False, "no_match"
+
+
+def evaluate(event, manifest):
+    return classify(event, manifest)[0]
+
+
+def _log_decision(event, allow, reason):
+    # Decision ledger (2026-10-09): one JSON line per prompt, so prompts saved and
+    # misfires can be measured. It never records tool_input itself (commands and
+    # paths can carry secrets), only a short digest for correlation. Logging must
+    # never change the decision, so every failure here is swallowed.
+    try:
+        import datetime
+        import hashlib
+        path = Path(os.environ.get("SO_APPROVAL_KIKIN_LOG") or Path.home() / ".local/state/dotcortex/claude-approval-kikin.jsonl")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        event = event if isinstance(event, dict) else {}
+        digest = hashlib.sha256(json.dumps(event.get("tool_input"), sort_keys=True, default=str).encode()).hexdigest()[:12]
+        record = {
+            "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
+            "session": str(event.get("session_id") or "")[:64],
+            "tool": str(event.get("tool_name") or "")[:64],
+            "decision": "allow" if allow else "ask",
+            "reason": reason,
+            "input_sha": digest,
+        }
+        fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(json.dumps(record, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
 
 
 def _deadline(_signal, _frame):
@@ -358,10 +394,13 @@ def main():
         raw = sys.stdin.read(1024 * 1024 + 1)
         if len(raw) > 1024 * 1024:
             raise ValueError("input too large")
-        if evaluate(json.loads(raw), _load_manifest()):
+        event = json.loads(raw)
+        allow, reason = classify(event, _load_manifest())
+        if allow:
             sys.stdout.write(json.dumps(ALLOW_OUTPUT, separators=(",", ":")) + "\n")
-    except Exception:
-        pass
+        _log_decision(event, allow, reason)
+    except Exception as exc:
+        _log_decision(None, False, f"error:{type(exc).__name__}")
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         signal.signal(signal.SIGALRM, previous)
