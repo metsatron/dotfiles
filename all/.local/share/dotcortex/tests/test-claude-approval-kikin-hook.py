@@ -72,6 +72,59 @@ class KikinApprovalHookTests(unittest.TestCase):
         self.assertNotIn(secret_path, log.read_text())
         self.assertEqual(oct(log.stat().st_mode & 0o777), "0o600")
 
+    def test_compound_reads_allow_and_anything_else_asks(self):
+        manifest = self.manifest("local_read", "git_observe")
+        root = str(self.root)
+        allow = [
+            f"cd {root} && cat README.md",
+            f"cd {root} && sed -n 1,2p README.md | cut -c1-200",
+            "grep -n synthetic README.md | head -n 5",
+            "cat README.md | wc -l",
+            "git status --short && git log --oneline -1",
+            "head -n 3 README.md; tail -1 README.md",
+            "grep -n 'a|b' README.md | sort -n | uniq -c",
+            "grep -n -i -E 'synth\\.etic|x' README.md 2>/dev/null | head -5",
+            "timeout 30 grep -n synthetic README.md; echo === ; cat README.md 2>&1 | wc -l",
+            "cat README.md 2>/dev/null || true",
+            f"cd {root} && ls -la FORGE/bin | grep -iE 'poke|club'",
+            "grep -il synthetic README.md",
+        ]
+        for command in allow:
+            with self.subTest(allow=command):
+                self.assert_decision(event("Bash", {"command": command, "description": "read"}, self.root), manifest, "allow")
+        ask = [
+            "cat README.md > copy",
+            "cat README.md | tee copy",
+            "cat README.md | sh",
+            "git status | xargs rm",
+            "cat README.md; rm README.md",
+            "cat README.md && curl https://example.invalid",
+            "cat README.md | sort -o copy",
+            "cat README.md & ls",
+            "cat $(echo README.md) | head",
+            "cd / && cat etc/passwd",
+            f"cat README.md || cd {root}",
+            f"cd {root} && sed -n '1p;w copy' README.md",
+            "sed -n 1p README.md | sed -i s/a/b/ README.md",
+            "cat README.md | head -n 5 README.md",
+            "cat README.md |",
+            "cat 'README.md && ls",
+            "printf x && cat README.md",
+            'grep -n "$(id)" README.md',
+            'grep -n "a\\$b" README.md | head',
+            "cat README.md 2>/tmp/err",
+            "cat README.md >/dev/null; cat README.md > copy",
+            "timeout 30 rm README.md && cat README.md",
+            "echo x | sh",
+            "grep -rn synthetic . | head",
+            "ls -la / && cat README.md",
+        ]
+        for command in ask:
+            with self.subTest(ask=command):
+                self.assert_decision(event("Bash", {"command": command}, self.root), manifest, "ask")
+        # A compound read still respects a disabled class.
+        self.assert_decision(event("Bash", {"command": "cat README.md | wc -l"}, self.root), self.manifest(), "ask")
+
     def test_all_classes_are_default_off(self):
         manifest = REPO / "all/.config/dotcortex/claude-approval-canary.kikin.v1.json"
         self.assertTrue(all(not item["enabled"] for item in self.base["classes"]))
