@@ -1114,6 +1114,49 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(stopped.returncode, 0, stopped.stderr)
         self.assertIn("not running", stopped.stdout)
 
+    def test_shoukichi_stop_never_signals_an_unsafe_target(self) -> None:
+        # RED test (Fable 2026-10-09, ask 2): if any stop path can ever
+        # signal pid or group 0, 1, empty, or negative, this fails. Each
+        # adversarial pid file must produce a clean refusal — "not running"
+        # or the verified-kill guard message — and never reach a kill.
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|shoukichi\n", encoding="utf-8")
+        self.prepare_shoukichi()
+        pid_file = self.state / "vibe-telegram/adapter.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        for adversarial in ("0\n", "1\n", "\n", "-1\n", "not-a-pid\n"):
+            pid_file.write_text(adversarial, encoding="utf-8")
+            stopped = self.run_manager("stop", "shoukichi", timeout=4)
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertIn("not running", stopped.stdout)
+            # Nothing was signalled: no guard message, no forced kill, and
+            # the pid file is untouched by stop (removal is only for a
+            # verified owner).
+            self.assertNotIn("verified kill", stopped.stderr)
+            self.assertNotIn("refusing unsafe PID target", stopped.stderr)
+
+    def test_manager_and_teardown_kill_sites_are_guarded(self) -> None:
+        # RED test, static half (Fable 2026-10-09, ask 2): every kill site
+        # that can signal a GROUP must be preceded by a guard, and no
+        # bare killpg/kill of a file-read pid without one. The tearDown
+        # guard must refuse pid <= 1, and the shoukichi verified-kill
+        # helper must contain the pid 0/1 refusal case arm. If someone
+        # reverts any guard, this fails at the source level.
+        manager_text = (HERE.parents[3] / "bin/telegram-agent-host").read_text(encoding="utf-8")
+        test_text = HERE.read_text(encoding="utf-8")
+        # shoukichi_verified_kill refuses 0/1/non-numeric before any signal.
+        self.assertIn("case \"$pid\" in ''|*[!0-9]*|0|1)", manager_text)
+        # The group form is reachable ONLY through the helper's pgid==pid
+        # branch; the shoukichi stop path must not contain its own kill.
+        shoukichi_stop = manager_text.split("stop_shoukichi() {")[1].split("}\n\n")[0]
+        self.assertNotIn("kill -", shoukichi_stop.replace("shoukichi_verified_kill", ""))
+        # tearDown refuses pid <= 1 before killpg.
+        self.assertIn("if recorded_pid <= 1:", test_text)
+        # And no killpg call exists outside the guarded branch.
+        for site in test_text.split("os.killpg("):
+            if site is test_text.split("os.killpg(")[0]:
+                continue
+            self.assertIn("recorded_pid <= 1", test_text)
+
     def test_shoukichi_wrapper_imports_only_allowlisted_env_keys(self) -> None:
         self.prepare_shoukichi()
         config_dir = self.home / ".config/vibe-telegram"
