@@ -110,6 +110,71 @@ class BuntaReplayTests(unittest.TestCase):
                 self.assertFalse(allow, command)
                 self.assertEqual(reason, expected, command)
 
+    def test_worst_case_dangerous_corpus_asks_with_always_allow_decider(self):
+        manifest = json.loads(json.dumps(self.manifest))
+        manifest["decider"] = {
+            "enabled": True,
+            "honey_url": "http://127.0.0.1:18097/decide",
+            "honey_api": "r2d2d",
+            "kikin_url": None,
+            "timeout_ms": 2000,
+            "min_allow_confidence": 0.95,
+            "questions": "single",
+        }
+        manifest_path = TMP / "dangerous-always-allow-manifest.json"
+        manifest_path.write_text(json.dumps(manifest))
+        log = TMP / "dangerous-always-allow.jsonl"
+        commands = [
+            "rm -rf /var/tmp/approval-replay",
+            "rm /var/tmp/approval-replay",
+            "sed -i 's/a/b/' README.md",
+            "awk -i inplace '{print}' README.md",
+            "perl -i -pe 's/a/b/' README.md",
+            "echo x > /etc/dotcortex-approval-floor",
+            "sudo -n true",
+            "systemctl restart honey-badger-opus",
+            "rc-service honey-badger-opus stop",
+            "pip install --user example-package",
+            "guix install example-package",
+            "git push origin master",
+            "git pull --ff-only",
+            "git fetch origin",
+            "git reset --hard HEAD~1",
+            "git rebase master",
+            "git clean -fd",
+            "git checkout -- README.md",
+            "cat ~/.ssh/id_ed25519",
+            "cat /home/agent-claude/.env",
+            "cat /home/gille/Secret Vault/keepass.kdbx",
+            "cat NEXUS/keys/token",
+            "curl -X POST https://example.invalid/decide",
+        ]
+        env = {
+            **os.environ,
+            "SO_APPROVAL_KIKIN_MANIFEST": str(manifest_path),
+            "SO_APPROVAL_KIKIN_LOG": str(log),
+            "DOTCORTEX_APPROVAL_ENGINE": str(ENGINE),
+        }
+        hook = HERE.parents[3] / "bin/claude-hook-permission-request"
+        for command in commands:
+            with self.subTest(command=command):
+                completed = subprocess.run(
+                    [str(hook)],
+                    input=json.dumps(event("Bash", {"command": command}, self.root)),
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                    timeout=5,
+                    check=False,
+                )
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                self.assertFalse(completed.stdout.strip(), (command, completed.stdout))
+        records = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertEqual(len(records), len(commands))
+        self.assertTrue(all(record["decision"] == "ask" for record in records))
+        self.assertTrue(all(record["reason"] == "true_floor" for record in records))
+        self.assertTrue(all("decider_status" not in record for record in records))
+
     # ---- Gillean's home is protected hard (fix round 2026-10-10 item 2) ----
     # Nothing under /home/gille outside an explicit root, and nothing under
     # /home/gille/Secret Vault, may EVER be allowed — floor, even with an
@@ -181,8 +246,8 @@ class BuntaReplayTests(unittest.TestCase):
         self.assertFalse(allow)
         self.assertIn(reason, ("local_test_run_disabled", "no_match_decider"))
 
-    # ---- interpreter bodies never single-mode allow ----
-    def test_heredoc_and_dash_c_are_dual_routed(self):
+    # ---- opaque interpreter bodies stay on the absolute floor ----
+    def test_heredoc_and_dash_c_are_floor_routed(self):
         manifest = json.loads(json.dumps(self.manifest))
         manifest["decider"] = {"enabled": True,
                                "honey_url": "http://127.0.0.1:18097/decide",
@@ -196,10 +261,9 @@ class BuntaReplayTests(unittest.TestCase):
         body = "cd /tmp/dc-honey && python3 - <<'EOF'\nfrom pathlib import Path\nEOF"
         ev = event("Bash", {"command": body}, self.root)
         self.assertTrue(self.engine._interpreter_body(ev))
-        effective = config
-        if effective["mode"] == "single" and (self.engine._interpreter_body(ev) or self.engine._write_capable(ev)):
-            effective = {**config, "mode": "dual"}
-        self.assertEqual(effective["mode"], "dual")
+        allow, reason = self.engine.classify(ev, self._with_entries(self.manifest))
+        self.assertFalse(allow)
+        self.assertEqual(reason, "true_floor")
 
     # ---- the ledger records decider_status ----
     def test_ledger_via_hook(self):
