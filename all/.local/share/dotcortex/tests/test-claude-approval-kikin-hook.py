@@ -229,7 +229,7 @@ class KikinApprovalHookTests(unittest.TestCase):
         url = self._fake_decider(self._c1_answers(allow=True))
         manifest = self._decider_manifest(kikin=url)
         log = self.scratch / "decider.jsonl"
-        payload = event("Bash", {"command": "stat README.md extra.txt"}, self.root)
+        payload = event("Bash", {"command": "true"}, self.root)
         run_hook(payload, manifest, log)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "allow")
@@ -271,6 +271,9 @@ class KikinApprovalHookTests(unittest.TestCase):
         floor_commands = [
             "ssh kikin date", "sudo true", "pkill python3", "kill -9 123",
             "pip install x", "rm -rf README.md", "cat .env", "cat NEXUS/keys/token",
+            "rm README.md", "sed -i 's/a/b/' README.md",
+            "awk -i inplace '{print}' README.md", "perl -i -pe 's/a/b/' README.md",
+            "echo x > /etc/dotcortex-approval-floor",
         ]
         for command in floor_commands:
             with self.subTest(command=command):
@@ -279,6 +282,35 @@ class KikinApprovalHookTests(unittest.TestCase):
         self.assertTrue(all(record["decision"] == "ask" for record in records[-len(floor_commands):]))
         self.assertTrue(all(record["reason"] == "true_floor" for record in records[-len(floor_commands):]))
         self.assertNotIn("decider_status", records[-1])
+
+    def test_common_read_only_shapes_are_class_allowed(self):
+        manifest = self.manifest("local_read", "git_observe")
+        root = str(self.root)
+        json_path = root + "/config.json"
+        Path(json_path).write_text('{"schema": "synthetic"}')
+        commands = [
+            "git -C " + root + " status --short",
+            "git -C " + root + " log --oneline -1",
+            "git -C " + root + " diff --stat",
+            "rg -n synthetic README.md",
+            "ls -la /etc/passwd",
+            "stat /etc/passwd",
+            "ps aux",
+            "pgrep -af python",
+            "uptime",
+            "df -h /var/tmp",
+            "free -h",
+            "tmux list-windows",
+            "tmux list-sessions",
+            "tmux capture-pane -p -t honey-opus",
+            "ps aux | head -3",
+            "uptime && df -h /var/tmp",
+            "cd " + root + " && git status --short && ls /etc/passwd",
+            "python3 -c 'import json; print(json.load(open(\"" + json_path + "\"))[\"schema\"])'",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assert_decision(event("Bash", {"command": command}, self.root), manifest, "allow")
 
     def test_decider_disabled_keeps_grey_zone_asking(self):
         manifest = self._decider_manifest(enabled=False)
@@ -421,16 +453,17 @@ class KikinApprovalHookTests(unittest.TestCase):
                 self.assertEqual(self._engine._write_capable(event("Bash", {"command": command}, self.root)), expected)
 
     def test_write_capable_routes_dual_not_single(self):
-        # A sed -i grey prompt must consult the destructive question, not just
-        # sensitive: wire the fake decider to answer single-mode allow but dual
-        # threshold-fail on the destructive half.
+        # A reversible in-root redirect must consult the destructive question,
+        # not just sensitive: wire the fake decider to answer single-mode allow
+        # but dual threshold-fail on the destructive half. In-place transforms
+        # are true-floor asks and are covered by the replay below.
         url = self._fake_decider({
             "approval.sensitive_effect.v1": {"type": "noul", "noul": 0.02},
             "approval.needs_human.v1": {"type": "noul", "noul": 0.9},
         })
         manifest = self._decider_manifest(kikin=url)
         log = self.scratch / "write-dual.jsonl"
-        run_hook(event("Bash", {"command": "sed -i 's/a/b/' file.txt"}, self.root), manifest, log)
+        run_hook(event("Bash", {"command": "echo hi > copy"}, self.root), manifest, log)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "ask")
         self.assertEqual(records[-1]["decider_status"], "threshold_failed")
@@ -443,6 +476,8 @@ class KikinApprovalHookTests(unittest.TestCase):
         self.assertEqual(ids, [self._engine.GREY_QUESTION_SINGLE, self._engine.GREY_QUESTION_DESTRUCTIVE])
         self.assertEqual(len(wire["questions"]), 2)
         self.assertTrue(all(q["type"] == "noul" for q in wire["questions"]))
+        self.assertTrue(all("state.command" in q["question"] for q in wire["questions"]))
+        self.assertTrue(all("Do not execute" in q["question"] for q in wire["questions"]))
         # responses adapt back into the gate answers shape
         answers = self._engine._r2d2d_answers({"answers": [{"p_yes": 0.02}, {"p_yes": 0.03}]}, ids)
         self.assertEqual(answers[self._engine.GREY_QUESTION_SINGLE]["noul"], 0.02)
@@ -494,7 +529,7 @@ class KikinApprovalHookTests(unittest.TestCase):
         manifest = self._decider_manifest(honey=f"http://127.0.0.1:{port}/decide", honey_api="r2d2d", kikin="http://127.0.0.1:1/v1/systemone")
         try:
             log = self.scratch / "r2d2d.jsonl"
-            run_hook(event("Bash", {"command": "stat README.md extra.txt"}, self.root), manifest, log)
+            run_hook(event("Bash", {"command": "true"}, self.root), manifest, log)
             records = [json.loads(line) for line in log.read_text().splitlines()]
             self.assertEqual(records[-1]["decision"], "allow")
             self.assertEqual(records[-1]["decider_status"], "accepted")
@@ -513,7 +548,7 @@ class KikinApprovalHookTests(unittest.TestCase):
         })
         manifest = self._decider_manifest(kikin=url)
         log = self.scratch / "dual.jsonl"
-        run_hook(event("Bash", {"command": "python3 -c 'import os'"}, self.root), manifest, log)
+        run_hook(event("Bash", {"command": "echo hi > copy"}, self.root), manifest, log)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "ask")
         self.assertEqual(records[-1]["decider_status"], "threshold_failed")
@@ -525,7 +560,7 @@ class KikinApprovalHookTests(unittest.TestCase):
         })
         manifest = self._decider_manifest(kikin=url)
         log = self.scratch / "dual-ok.jsonl"
-        run_hook(event("Bash", {"command": "python3 -c 'print(1)'"}, self.root), manifest, log)
+        run_hook(event("Bash", {"command": "echo hi > copy"}, self.root), manifest, log)
         records = [json.loads(line) for line in log.read_text().splitlines()]
         self.assertEqual(records[-1]["decision"], "allow")
         self.assertEqual(records[-1]["reason"], "decider_allow")
