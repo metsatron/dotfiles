@@ -33,14 +33,25 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.write_executable("node", "#!/bin/sh\nexit 0\n", directory=self.core_bin)
 
     def tearDown(self) -> None:
+        # Kill-safety guard (Fable 2026-10-09, the three-kill night): a pid
+        # file left behind by a failed test may contain anything — including 1,
+        # whose killpg is a SIGTERM to every process this user owns. Never
+        # signal pid 0/1 or a non-positive value; a stale entry stays stale.
         for pid_file in (
             self.state / "telegram-agents/ductor-supervise.pid",
             self.state / "telegram-agents/codex-helmastra-telegram.pid",
             self.state / "gemma-pi-telegram/adapter.pid",
+            self.state / "vibe-telegram/adapter.pid",
         ):
             if pid_file.exists():
                 try:
-                    os.killpg(int(pid_file.read_text()), signal.SIGTERM)
+                    recorded_pid = int(pid_file.read_text())
+                except ValueError:
+                    continue
+                if recorded_pid <= 1:
+                    continue
+                try:
+                    os.killpg(recorded_pid, signal.SIGTERM)
                 except (ProcessLookupError, PermissionError, ValueError):
                     pass
         self.temp.cleanup()
@@ -403,7 +414,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         wrapper = HERE.parents[3] / "bin/nanobot-telegram"
         result = subprocess.run(
             [str(wrapper), "--help"],
-            env={"PATH": os.environ["PATH"], "HOME": str(self.home)},
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.home)},
             text=True, capture_output=True, timeout=10,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -990,6 +1001,294 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "CODEX_TELEGRAM_APPROVALS_REVIEWER",
         ):
             self.assertIn(f"-u {name}", codex_start)
+
+    # -- Shoukichi (vibe-bridge) -------------------------------------------
+
+    def prepare_shoukichi(self) -> None:
+        workspace = self.home / "HelmCortex/FORGE/brain/shoukichi"
+        workspace.mkdir(parents=True)
+        (workspace / "AGENTS.md").write_text(
+            "# Shoukichi synthetic identity\n", encoding="utf-8"
+        )
+        venv_bin = self.home / "HelmCortex/NEXUS/git/vibe-bridge/.venv/bin"
+        venv_bin.mkdir(parents=True)
+        self.shoukichi_bridge_py = venv_bin / "python"
+        # The manager verifies ownership against the EXACT argv
+        # ".venv/bin/python -m vibe_bridge.main" read from /proc/cmdline,
+        # so the fake must keep that argv itself — no exec -a disguise.
+        self.write_looping_bridge(self.shoukichi_bridge_py)
+        config_dir = self.home / ".config/vibe-telegram"
+        config_dir.mkdir(parents=True)
+        (config_dir / "vibe-home").mkdir()
+        (config_dir / "vibe-home/config.toml").write_text(
+            'default_agent = "ask"\nactive_model = "zai-glm-5-3"\n',
+            encoding="utf-8",
+        )
+        (config_dir / "env").write_text(
+            "TELEGRAM_BOT_TOKEN=123456789:abcdefghijklmnopqrstuvwxyzABCDE\n"
+            "TELEGRAM_ALLOWED_USER_IDS=123456789\n"
+            "MISTRAL_VIBE_API_KEY=synthetic-vibe-key\n",
+            encoding="utf-8",
+        )
+        # The manager resolves the wrapper from DOTCORTEX_BIN_DIR's default,
+        # $HOME/DotCortex/all/.local/bin — never the user's ~/.local/bin.
+        dotcortex_bin = self.home / "DotCortex/all/.local/bin"
+        dotcortex_bin.mkdir(parents=True)
+        self.write_executable(
+            "shoukichi-telegram",
+            # The manager verifies ownership against the EXACT argv the real
+            # wrapper produces: `$VENV_PY -m vibe_bridge.main`. The fake must
+            # reproduce that argv so /proc/cmdline matches.
+            "#!/bin/sh\nexec " + str(self.shoukichi_bridge_py) + " -m vibe_bridge.main\n",
+            directory=dotcortex_bin,
+        )
+
+    def write_looping_bridge(self, bridge_py: Path) -> None:
+        # Long-running, ignores TERM (stop must force the verified KILL
+        # path), and — because it is a shell script, so `python -m X` runs
+        # via the interpreter named in its shebang — it must not clobber
+        # argv: bash keeps `-m vibe_bridge.main` as arguments and the
+        # identity check reads them from /proc/cmdline unchanged.
+        bridge_py.parent.mkdir(parents=True, exist_ok=True)
+        bridge_py.write_text(
+            "#!/bin/sh\n"
+            "trap '' TERM INT\n"
+            "while :; do sleep 1; done\n",
+            encoding="utf-8",
+        )
+        bridge_py.chmod(0o755)
+
+    def write_exit_zero_bridge(self, bridge_py: Path) -> None:
+        bridge_py.parent.mkdir(parents=True, exist_ok=True)
+        bridge_py.write_text(
+            "#!/usr/bin/env bash\nexit 0\n", encoding="utf-8"
+        )
+        bridge_py.chmod(0o755)
+
+    def test_shoukichi_targeted_lifecycle_and_argv_ownership(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|shoukichi\n", encoding="utf-8")
+        self.prepare_shoukichi()
+        started = self.run_manager("start", "shoukichi", timeout=8)
+        self.assertEqual(started.returncode, 0, started.stdout + started.stderr)
+        status = self.run_manager("status", "shoukichi", timeout=4)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertRegex(status.stdout, r"^shoukichi: RUNNING pid=\d+ \(vibe-bridge\)\n$")
+        stopped = self.run_manager("stop", "shoukichi", timeout=8)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        pid_file = self.state / "vibe-telegram/adapter.pid"
+        self.assertFalse(pid_file.exists())
+
+    def test_shoukichi_start_refuses_missing_private_env(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|shoukichi\n", encoding="utf-8")
+        self.prepare_shoukichi()
+        (self.home / ".config/vibe-telegram/env").unlink()
+        result = self.run_manager("start", "shoukichi", timeout=4)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("private env missing", result.stderr)
+
+    def test_shoukichi_status_rejects_a_recycled_pid(self) -> None:
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|shoukichi\n", encoding="utf-8")
+        self.prepare_shoukichi()
+        pid_file = self.state / "vibe-telegram/adapter.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        # A recycled PID is simulated with a value that is dead by construction
+        # and never init: pid 1 in a fixture made tearDown's killpg(1) SIGTERM
+        # the whole user session (the 2026-10-09 three-kill night). Use the
+        # opencode fixture's certainly-dead convention instead, and keep the
+        # manager's refusal assertion identical.
+        pid_file.write_text("999999991\n", encoding="utf-8")
+        status = self.run_manager("status", "shoukichi", timeout=4)
+        self.assertIn("shoukichi: STOPPED", status.stdout)
+
+    def test_shoukichi_status_refuses_pid_one_entirely(self) -> None:
+        # Belt and braces: even if a future fixture drops a 1 here, the
+        # manager must report stopped and nothing may signal it.
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|shoukichi\n", encoding="utf-8")
+        self.prepare_shoukichi()
+        pid_file = self.state / "vibe-telegram/adapter.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        pid_file.write_text("1\n", encoding="utf-8")
+        status = self.run_manager("status", "shoukichi", timeout=4)
+        self.assertIn("shoukichi: STOPPED", status.stdout)
+        stopped = self.run_manager("stop", "shoukichi", timeout=4)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        self.assertIn("not running", stopped.stdout)
+
+    def test_shoukichi_stop_never_signals_an_unsafe_target(self) -> None:
+        # RED test (Fable 2026-10-09, ask 2): if any stop path can ever
+        # signal pid or group 0, 1, empty, or negative, this fails. Each
+        # adversarial pid file must produce a clean refusal — "not running"
+        # or the verified-kill guard message — and never reach a kill.
+        self.agents.joinpath("hosts.conf").write_text(f"{HOST}|shoukichi\n", encoding="utf-8")
+        self.prepare_shoukichi()
+        pid_file = self.state / "vibe-telegram/adapter.pid"
+        pid_file.parent.mkdir(parents=True, exist_ok=True)
+        for adversarial in ("0\n", "1\n", "\n", "-1\n", "not-a-pid\n"):
+            pid_file.write_text(adversarial, encoding="utf-8")
+            stopped = self.run_manager("stop", "shoukichi", timeout=4)
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            self.assertIn("not running", stopped.stdout)
+            # Nothing was signalled: no guard message, no forced kill, and
+            # the pid file is untouched by stop (removal is only for a
+            # verified owner).
+            self.assertNotIn("verified kill", stopped.stderr)
+            self.assertNotIn("refusing unsafe PID target", stopped.stderr)
+
+    def test_manager_and_teardown_kill_sites_are_guarded(self) -> None:
+        # RED test, static half (Fable 2026-10-09, ask 2): every kill site
+        # that can signal a GROUP must be preceded by a guard, and no
+        # bare killpg/kill of a file-read pid without one. The tearDown
+        # guard must refuse pid <= 1, and the shoukichi verified-kill
+        # helper must contain the pid 0/1 refusal case arm. If someone
+        # reverts any guard, this fails at the source level.
+        manager_text = (HERE.parents[3] / "bin/telegram-agent-host").read_text(encoding="utf-8")
+        test_text = HERE.read_text(encoding="utf-8")
+        # shoukichi_verified_kill refuses 0/1/non-numeric before any signal.
+        self.assertIn("case \"$pid\" in ''|*[!0-9]*|0|1)", manager_text)
+        # The group form is reachable ONLY through the helper's pgid==pid
+        # branch; the shoukichi stop path must not contain its own kill.
+        shoukichi_stop = manager_text.split("stop_shoukichi() {")[1].split("}\n\n")[0]
+        self.assertNotIn("kill -", shoukichi_stop.replace("shoukichi_verified_kill", ""))
+        # tearDown refuses pid <= 1 before killpg.
+        self.assertIn("if recorded_pid <= 1:", test_text)
+        # And no killpg call exists outside the guarded branch.
+        for site in test_text.split("os.killpg("):
+            if site is test_text.split("os.killpg(")[0]:
+                continue
+            self.assertIn("recorded_pid <= 1", test_text)
+
+    def test_shoukichi_wrapper_imports_only_allowlisted_env_keys(self) -> None:
+        self.prepare_shoukichi()
+        config_dir = self.home / ".config/vibe-telegram"
+        (config_dir / "env").write_text(
+            "TELEGRAM_BOT_TOKEN=123456789:abcdefghijklmnopqrstuvwxyzABCDE\n"
+            "TELEGRAM_ALLOWED_USER_IDS=123456789\n"
+            "MISTRAL_VIBE_API_KEY=synthetic-vibe-key\n"
+            "MISTRAL_API_KEY=synthetic-studio-key\n"
+            "TELEGRAM_ALLOWED_USER_IDS_EVIL=999\n",
+            encoding="utf-8",
+        )
+        probe = self.home / "HelmCortex/NEXUS/git/vibe-bridge/.venv/bin/python"
+        probe.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os\n"
+            "print(json.dumps({key: value for key, value in os.environ.items() "
+            "if key in ('TELEGRAM_BOT_TOKEN', 'TELEGRAM_ALLOWED_USER_IDS', "
+            "'MISTRAL_API_KEY', 'MISTRAL_VIBE_API_KEY', "
+            "'VIBE_HOME', 'VIBE_BRIDGE_WORKSPACE', 'VIBE_BRIDGE_LANG', "
+            "'ACP_AGENT_COMMAND', 'VIBE_BRIDGE_FORBIDDEN_MODES', "
+            "'VIBE_BRIDGE_HTTP_TOKEN')}))\n",
+            encoding="utf-8",
+        )
+        probe.chmod(0o755)
+        wrapper = HERE.parents[3] / "bin/shoukichi-telegram"
+        result = subprocess.run(
+            [str(wrapper)],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.home)},
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = json.loads(result.stdout)
+        self.assertEqual(observed["TELEGRAM_BOT_TOKEN"], "123456789:abcdefghijklmnopqrstuvwxyzABCDE")
+        self.assertEqual(observed["TELEGRAM_ALLOWED_USER_IDS"], "123456789")
+        # The subscription key rides the provider env name; the Studio key
+        # from the private file must NOT survive as MISTRAL_API_KEY.
+        self.assertEqual(observed["MISTRAL_API_KEY"], "synthetic-vibe-key")
+        self.assertNotIn("MISTRAL_VIBE_API_KEY", observed)
+        self.assertEqual(observed["VIBE_BRIDGE_LANG"], "en")
+        self.assertEqual(observed["ACP_AGENT_COMMAND"], "vibe-acp")
+        self.assertEqual(observed["VIBE_BRIDGE_FORBIDDEN_MODES"], "auto-approve")
+        # The HTTP automation endpoint stays disabled: no token is imported.
+        self.assertNotIn("VIBE_BRIDGE_HTTP_TOKEN", observed)
+        self.assertTrue(observed["VIBE_HOME"].endswith("/vibe-home"))
+        self.assertTrue(observed["VIBE_BRIDGE_WORKSPACE"].endswith("/FORGE/brain/shoukichi"))
+
+    def test_shoukichi_wrapper_refuses_each_missing_private_value(self) -> None:
+        self.prepare_shoukichi()
+        env_file = self.home / ".config/vibe-telegram/env"
+        full = env_file.read_text(encoding="utf-8")
+        wrapper = HERE.parents[3] / "bin/shoukichi-telegram"
+        base_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.home)}
+        for missing, message in (
+            ("TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN is not provisioned"),
+            ("TELEGRAM_ALLOWED_USER_IDS", "TELEGRAM_ALLOWED_USER_IDS is not provisioned"),
+            ("MISTRAL_VIBE_API_KEY", "MISTRAL_VIBE_API_KEY is not provisioned"),
+        ):
+            env_file.write_text(
+                "".join(line + "\n" for line in full.splitlines()
+                        if not line.startswith(missing + "=")),
+                encoding="utf-8",
+            )
+            result = subprocess.run(
+                [str(wrapper)], env=base_env,
+                text=True, capture_output=True, timeout=10,
+            )
+            self.assertNotEqual(result.returncode, 0, message)
+            self.assertIn(message, result.stderr)
+        env_file.write_text(full, encoding="utf-8")
+
+    def test_shoukichi_wrapper_projects_identity_into_vibe_home(self) -> None:
+        self.prepare_shoukichi()
+        wrapper = HERE.parents[3] / "bin/shoukichi-telegram"
+        vibe_home = self.home / ".config/vibe-telegram/vibe-home"
+        # Pre-existing divergent identity must be overwritten.
+        (vibe_home / "AGENTS.md").write_text("stale persona\n", encoding="utf-8")
+        # The looping bridge fake would hang: the wrapper always execs it.
+        self.write_exit_zero_bridge(self.shoukichi_bridge_py)
+        result = subprocess.run(
+            [str(wrapper)],
+            env={"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.home)},
+            text=True, capture_output=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        projected = (vibe_home / "AGENTS.md").read_text(encoding="utf-8")
+        self.assertIn("Shoukichi synthetic identity", projected)
+        self.assertNotIn("stale persona", projected)
+        self.assertEqual((vibe_home / "AGENTS.md").stat().st_mode & 0o777, 0o600)
+        self.assertEqual(vibe_home.stat().st_mode & 0o777, 0o700)
+
+    def test_shoukichi_vibe_home_config_pins_ask_and_glm(self) -> None:
+        templates = HERE.parents[4] / ".bots/templates"
+        config_text = (templates / "shoukichi-vibe-home-config.toml").read_text(encoding="utf-8")
+        active_lines = [
+            line for line in config_text.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertIn('default_agent = "ask"', active_lines)
+        self.assertIn('active_model = "zai-glm-5-3"', active_lines)
+        self.assertIn('allowed_models = ["zai-glm-5-3"]', active_lines)
+        # The fixture fails the moment the pin falls back to accept-edits or
+        # auto-approve (Fable's go-ahead, note 2) — checked on active lines;
+        # the template's explanatory comments may name the refused modes.
+        self.assertFalse(any("accept-edits" in line or "auto-approve" in line
+                             for line in active_lines))
+        # Model id is Mistral's exact zai-glm-5-3; no glm-5.3 alias exists.
+        self.assertFalse(any("glm-5.3" in line for line in active_lines))
+
+    def test_shoukichi_templates_hold_no_secrets(self) -> None:
+        templates = HERE.parents[4] / ".bots/templates"
+        for name in ("shoukichi-vibe-telegram.env", "shoukichi-vibe-telegram.conf",
+                     "shoukichi-vibe-home-config.toml"):
+            text = (templates / name).read_text(encoding="utf-8")
+            self.assertIsNone(
+                re.search(r"bot[0-9]{8,}:[A-Za-z0-9_-]{30,}", text),
+                name + " leaks a bot-token-shaped literal",
+            )
+        env_lines = (templates / "shoukichi-vibe-telegram.env").read_text(encoding="utf-8").splitlines()
+        for key in ("TELEGRAM_BOT_TOKEN", "TELEGRAM_ALLOWED_USER_IDS", "MISTRAL_VIBE_API_KEY"):
+            self.assertIn(f"# {key}=", env_lines)
+            self.assertFalse(any(line.startswith(key + "=") for line in env_lines))
+        conf_lines = [
+            line for line in (templates / "shoukichi-vibe-telegram.conf")
+            .read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        conf_active = "\n".join(conf_lines)
+        self.assertIn("VIBE_BRIDGE_LANG=en", conf_lines)
+        self.assertIn("VIBE_BRIDGE_FORBIDDEN_MODES=auto-approve", conf_lines)
+        # The HTTP automation endpoint stays disabled: no active line sets
+        # the token (comments may explain its absence).
+        self.assertNotIn("VIBE_BRIDGE_HTTP_TOKEN", conf_active)
 
 
 if __name__ == "__main__":
