@@ -110,6 +110,39 @@ class BuntaReplayTests(unittest.TestCase):
                 self.assertFalse(allow, command)
                 self.assertEqual(reason, expected, command)
 
+    # ---- Gillean's home is protected hard (fix round 2026-10-10 item 2) ----
+    # Nothing under /home/gille outside an explicit root, and nothing under
+    # /home/gille/Secret Vault, may EVER be allowed — floor, even with an
+    # always-allow decider. The Bunta manifest carries NO gille root, so no
+    # class can reach it and the floor denies all of it.
+    def test_gille_home_never_allowed_even_with_always_allow_decider(self):
+        manifest = json.loads(json.dumps(self.manifest))
+        manifest["decider"] = {"enabled": True,
+                               "honey_url": "http://127.0.0.1:18097/decide",
+                               "honey_api": "r2d2d",
+                               "kikin_url": None,
+                               "timeout_ms": 2000,
+                               "min_allow_confidence": 0.95,
+                               "questions": "single"}
+        manifest = self._with_entries(manifest)
+        denied = [
+            "cat /home/gille/notes.md",
+            "cat /home/gille/Secret Vault/keepass.kdbx",
+            "ls /home/gille/Secret Vault/",
+            "sed -n 1,60p /home/gille/.ductor/workspace/state.json",
+            "grep -r x /home/gille/metsatron-peer/",
+            "head -5 /home/gille/.ssh/authorized_keys",
+            "cd /home/gille && cat README",
+            "cat /home/gille/DotCortex/agents-approval.org",
+            "cat /home/gille/HelmCortex/LOGS/TODO",
+            "find /home/gille/Secret Vault -name '*.kdbx'",
+        ]
+        for command in denied:
+            with self.subTest(command=command):
+                allow, reason = self.engine.classify(event("Bash", {"command": command}, self.root), manifest)
+                self.assertFalse(allow, command)
+                self.assertEqual(reason, "true_floor", command)
+
     # ---- Bunta's real read shapes: class allows (no decider needed) ----
     def test_bunta_read_shapes_classify(self):
         allow_cases = [
