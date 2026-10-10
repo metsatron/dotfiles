@@ -14,7 +14,13 @@ import sys
 
 SCHEMA = "hc.approval.canary.kikin.manifest.v1"
 VERSION = "claude-approval-canary.kikin.v1"
-CLASS_NAMES = ("local_read", "git_observe", "centre_render", "safe_commit")
+# 2026-10-10 shared-engine (Fable handoff): the four Kikin classes plus the
+# p3 classes ported for per-host manifests. A manifest that omits the extended
+# classes (v1 four-class shape) loads them as disabled-and-inert.
+CLASS_NAMES = (
+    "local_read", "git_observe", "centre_render", "safe_commit",
+    "ssh_readonly", "local_test_run", "outbound_tool",
+)
 ALLOW_OUTPUT = {
     "hookSpecificOutput": {
         "hookEventName": "PermissionRequest",
@@ -73,7 +79,7 @@ def _protected(value):
 # filesystem-writing find options. SYNTAX-only refusals (heredocs, redirections
 # inside the roots, $() substitution, unparsable quoting) are now Decider-eligible
 # instead of hard-refused: they are plumbing, not substance.
-def _true_floor(event):
+def _true_floor(event, manifest=None):
     try:
         raw = json.dumps(event.get("tool_input", {}), ensure_ascii=False, sort_keys=True).casefold()
     except (TypeError, ValueError):
@@ -132,6 +138,12 @@ def _true_floor(event):
         return True
     lowered = [word.casefold() for word in words]
     if any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
+        # 2026-10-10 shared-engine carve-out: the ssh_readonly class (p3 port)
+        # may allow a parser-PROVEN readonly ssh command to the reviewed host.
+        # The proof runs here, inside the floor, so no other REMOTE shape and
+        # no other verb ever escapes. Anything not proven floors as before.
+        if manifest is not None and _ssh_readonly_proven(event, manifest):
+            return False
         return True
     if any(word in SERVICE or word in {"pkill", "killall"} for word in lowered):
         return True
@@ -272,7 +284,7 @@ def _load_manifest():
         allowed_keys = allowed_keys | {"decider"}
     if not isinstance(data, dict) or set(data) != allowed_keys or data.get("schema") != SCHEMA or version not in (VERSION, "claude-approval-canary.kikin.v2"):
         raise ValueError("invalid Kikin manifest")
-    if not isinstance(data["hard_floor_ids"], list) or not isinstance(data["classes"], list) or len(data["classes"]) != len(CLASS_NAMES):
+    if not isinstance(data["hard_floor_ids"], list) or not isinstance(data["classes"], list) or not 4 <= len(data["classes"]) <= len(CLASS_NAMES):
         raise ValueError("invalid Kikin manifest classes")
     roots = tuple(os.path.realpath(item) for item in data["roots"] if isinstance(item, str) and item.startswith("/"))
     scratch = tuple(os.path.realpath(item) for item in data["scratch_roots"] if isinstance(item, str) and item.startswith("/"))
@@ -283,6 +295,9 @@ def _load_manifest():
         if not isinstance(entry, dict) or entry.get("name") != name or type(entry.get("enabled")) is not bool:
             raise ValueError("invalid Kikin class")
         entries[name] = entry
+    # Extended (p3-ported) classes absent from a manifest are inert-disabled.
+    for name in CLASS_NAMES[len(data["classes"]):]:
+        entries[name] = {"name": name, "enabled": False}
     data["roots"] = roots
     data["scratch_roots"] = scratch
     data["entries"] = entries
@@ -651,6 +666,282 @@ def _compound(event, manifest):
     return True, "compound:" + "+".join(sorted(set(used)))
 
 
+# ---------------------------------------------------------------------------
+# p3 classes ported for the shared engine (2026-10-10, Fable handoff). Each is
+# manifest-gated: inert without an enabled manifest entry. Adapted from the
+# vendored p3 engine; the ssh parser keeps its remote realpath proof.
+# ---------------------------------------------------------------------------
+
+SSH_RE = re.compile(r"^ssh\s+(?:-\S+\s+)*([A-Za-z0-9_.@\-]+)\s+(.+)$")
+SHELL_META_RE = re.compile(r"[`$\\<>;&\n]")
+PYTEST_RE = re.compile(r"^pytest\s+(?:-{1,2}[\w=]+\s+)*([\w./\-]+)$")
+UNITTEST_RE = re.compile(r"^/usr/bin/python3(?:\.\d+)?\s+-m\s+unittest\s+[\w.]+$")
+REMOTE_REALPATH_TIMEOUT_SECONDS = 2.5
+GIT_READERS = {"status", "log", "diff", "show", "branch", "ls-files", "remote", "tag"}
+GIT_UNSAFE_READ_OPTIONS = {"-C", "--output", "--exec"}
+READERS = {"cat", "head", "tail", "grep", "find", "ls", "stat", "wc", "pgrep", "date", "mailcortex"}
+FIND_WRITE_ACTIONS = {"-delete", "-exec", "-execdir", "-fprint", "-fprint0", "-fprintf", "-fls"}
+REMOTE_EXCLUDED_COMPONENTS = {"private", "secrets", ".secrets", "keys", "credentials", ".git", ".ssh", ".env"}
+
+
+def _class_config(manifest, name):
+    entry = manifest["entries"].get(name)
+    if not isinstance(entry, dict) or entry.get("enabled") is not True:
+        return None
+    return entry
+
+
+def _protected_token_p3(token):
+    lowered = token.lower().replace("\\", "/")
+    components = [part for part in lowered.split("/") if part]
+    if ".git" in components or ".ssh" in components or ".env" in components:
+        return True
+    names = {".netrc", ".authinfo", ".authinfo.gpg", "authorized_keys", "credentials",
+             "credentials.json", "auth.json", "secrets.json", "id_rsa", "id_ed25519"}
+    return any(part in names for part in components)
+
+
+def _remote_path_p3(raw, remote_home, base=None):
+    import posixpath as _posix
+    if (not raw or "\x00" in raw or "$" in raw or "`" in raw
+            or re.search(r"[*?\[\]{}]", raw)
+            or any(ord(c) < 32 or ord(c) == 127 for c in raw)):
+        return None
+    if raw == "~":
+        path = remote_home
+    elif raw.startswith("~/"):
+        path = remote_home.rstrip("/") + raw[1:]
+    elif raw.startswith("~"):
+        return None
+    elif raw.startswith("/"):
+        path = "/" + raw.lstrip("/")
+    else:
+        path = _posix.join(base or remote_home, raw)
+    normalized = _posix.normpath(path)
+    return normalized if normalized.startswith("/") else None
+
+
+def _remote_path_excluded_p3(path):
+    components = tuple(part.lower() for part in path.split("/") if part)
+    return any(part in REMOTE_EXCLUDED_COMPONENTS for part in components)
+
+
+def _remote_paths_allowed_p3(raw_paths, config, base=None):
+    allowed = []
+    for raw in raw_paths:
+        path = _remote_path_p3(raw, config["remote_home"], base)
+        if path is None or _remote_path_excluded_p3(path):
+            return None
+        if not any(path == root or path.startswith(root.rstrip("/") + "/") for root in config["remote_path_roots"]):
+            return None
+        allowed.append(path)
+    return allowed
+
+
+def _remote_git_paths_p3(args, repo_raw, config):
+    paths = _remote_paths_allowed_p3([repo_raw], config)
+    if paths is None:
+        return None
+    repo = paths[0]
+    out = {"paths": [repo], "realpath_paths": [repo]}
+    for word in args[1:]:
+        if word.startswith(":"):
+            continue  # git show REV:PATH object paths: lexical only
+        if word.startswith("-") or word == "REV":
+            continue
+        more = _remote_paths_allowed_p3([word], config, base=repo)
+        if more is None:
+            return None
+        out["paths"].extend(more)
+        out["realpath_paths"].extend(more)
+    return out
+
+
+def _reader_segment_p3(segment, config):
+    try:
+        words = shlex.split(segment, posix=True)
+    except ValueError:
+        return None
+    if not words:
+        return None
+    command = words[0]
+    if command == "git":
+        args = words[1:]
+        repo_raw = "."
+        if args[:1] == ["-C"]:
+            if len(args) < 3:
+                return None
+            repo_raw = args[1]
+            args = args[2:]
+        if not args or args[0] not in GIT_READERS:
+            return None
+        if any(word in GIT_UNSAFE_READ_OPTIONS or word.startswith(("--output=", "--git-dir=", "--work-tree=")) for word in args[1:]):
+            return None
+        return _remote_git_paths_p3(args, repo_raw, config)
+    if command not in READERS:
+        return None
+    args = words[1:]
+    if command == "cat":
+        if not args or any(item.startswith("-") for item in args):
+            return None
+        paths = _remote_paths_allowed_p3(args, config)
+        return None if paths is None else {"paths": paths, "realpath_paths": paths}
+    if command in {"ls", "stat", "wc"}:
+        operands = [item for item in args if not item.startswith("-")]
+        if command in {"ls", "stat"} and not operands:
+            return None
+        if not operands:
+            return {"paths": [], "realpath_paths": []}
+        paths = _remote_paths_allowed_p3(operands, config)
+        return None if paths is None else {"paths": paths, "realpath_paths": paths}
+    if command in {"head", "tail", "grep", "find", "pgrep", "date", "mailcortex"}:
+        # Simplified p3 readers: flags then operands, no write actions.
+        if command == "find" and any(word in FIND_WRITE_ACTIONS for word in args):
+            return None
+        if command == "grep" and "-r" in [w.lower() for w in args]:
+            return None  # recursion walks past per-path protection
+        operands = [item for item in args if not item.startswith("-")]
+        if command in {"pgrep", "date"}:
+            return {"paths": [], "realpath_paths": []}
+        if command == "mailcortex":
+            if not args or args[0] not in {"inbox", "read"}:
+                return None
+            return {"paths": [], "realpath_paths": []}
+        if not operands:
+            return None
+        paths = _remote_paths_allowed_p3([operands[-1]] if command == "grep" else operands, config)
+        return None if paths is None else {"paths": paths, "realpath_paths": paths}
+    return None
+
+
+def _ssh_readonly_analysis(command, config):
+    match = SSH_RE.fullmatch(command)
+    if not match or match.group(1) != config["readonly_host"]:
+        return None
+    remote = match.group(2)
+    if SHELL_META_RE.search(remote.replace("|", "")):
+        return None
+    if "||" in remote or remote.startswith("|") or remote.endswith("|"):
+        return None
+    parts = [part.strip() for part in remote.split("|")]
+    analyses = [_reader_segment_p3(part, config) if part else None for part in parts]
+    if not parts or any(analysis is None for analysis in analyses):
+        return None
+    return {
+        "paths": [p for a in analyses for p in a["paths"]],
+        "realpath_paths": [p for a in analyses for p in a["realpath_paths"]],
+    }
+
+
+def _ssh_readonly_proven(event, manifest):
+    """Floor carve-out helper: prove the event is a readonly ssh command to the
+    reviewed host, INCLUDING the remote realpath proof. Runs only when the
+    ssh_readonly class is enabled; any failure means not proven (floors)."""
+    config = _class_config(manifest, "ssh_readonly")
+    if config is None:
+        return False
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return False
+    analysis = _ssh_readonly_analysis(command, config)
+    if analysis is None:
+        return False
+    return _remote_realpath_proven_p3(analysis, config)
+
+
+def _remote_realpath_proven_p3(analysis, config):
+    paths = analysis.get("realpath_paths")
+    if not isinstance(paths, list) or any(not isinstance(p, str) for p in paths):
+        return False
+    if not paths:
+        return True
+    argv = ("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=3",
+            config["readonly_host"], "realpath", "-e", "--",
+            *(shlex.quote(p) for p in paths))
+    try:
+        completed = subprocess.run(list(argv), stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True,
+                                  timeout=REMOTE_REALPATH_TIMEOUT_SECONDS, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    stdout = completed.stdout
+    if (completed.returncode != 0 or not isinstance(stdout, str)
+            or not stdout.endswith("\n") or "\r" in stdout or "\x00" in stdout):
+        return False
+    resolved = stdout[:-1].split("\n")
+    if len(resolved) != len(paths) or any(
+            not p or not p.startswith("/") or any(ord(c) < 32 or ord(c) == 127 for c in p)
+            for p in resolved):
+        return False
+    checked = _remote_paths_allowed_p3(resolved, config)
+    return checked == resolved
+
+
+def _ssh_readonly_match(event, manifest):
+    config = _class_config(manifest, "ssh_readonly")
+    if config is None:
+        return False
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    if not isinstance(command, str):
+        return False
+    analysis = _ssh_readonly_analysis(command, config)
+    if analysis is None:
+        return False
+    return _remote_realpath_proven_p3(analysis, config)
+
+
+def _local_test_match(event, manifest):
+    config = _class_config(manifest, "local_test_run")
+    if config is None:
+        return False
+    roots = tuple(config.get("local_test_roots") or ())
+    if not roots:
+        return False
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    cwd_raw = event.get("cwd")
+    if not isinstance(command, str) or not isinstance(cwd_raw, str) or not cwd_raw.startswith("/"):
+        return False
+    if SHELL_META_RE.search(command):
+        return False
+    cwd = Path(cwd_raw).resolve(strict=False)
+    if not any(_inside(cwd, Path(root)) for root in roots):
+        return False
+    if UNITTEST_RE.fullmatch(command):
+        return True
+    match = PYTEST_RE.fullmatch(command)
+    if not match:
+        return False
+    raw = match.group(1)
+    if not raw or raw.startswith(("/", "~")) or any(part in {"", ".", ".."} for part in Path(raw).parts):
+        return False
+    if _protected_token_p3(raw):
+        return False
+    target = (cwd / raw).resolve(strict=False)
+    if not any(_inside(target, Path(root)) for root in roots):
+        return False
+    try:
+        info = target.lstat()
+    except OSError:
+        return False
+    return info.st_mode & 0o170000 == 0o100000  # regular file, not a symlink
+
+
+def _outbound_tool_match(event, manifest):
+    config = _class_config(manifest, "outbound_tool")
+    if config is None:
+        return False
+    names = tuple(config.get("tool_names") or ())
+    if event.get("tool_name") in names:
+        raw = json.dumps(event.get("tool_input", {}), ensure_ascii=False, sort_keys=True).lower()
+        return not any(marker in raw for marker in (
+            "/home/gille", "secret vault", "nexus/keys", "/.ssh/", "~/.ssh/", "/.env",
+            "auth.json", "credentials.json", "oauth.json", "secrets.json", "id_rsa", "id_ed25519"))
+    return False
+
+
 def classify(event, manifest):
     """Return (allow, reason). The reason names the class that matched, or why none did.
 
@@ -660,7 +951,7 @@ def classify(event, manifest):
     Decider for those."""
     if not isinstance(event, dict) or event.get("hook_event_name") != "PermissionRequest":
         return False, "not_permission_request"
-    if _true_floor(event):
+    if _true_floor(event, manifest):
         return False, "true_floor"
     tool_input = event.get("tool_input")
     if event.get("tool_name") == "Bash" and isinstance(tool_input, dict) and set(tool_input) <= TOOL_INPUT_KEYS and isinstance(tool_input.get("command"), str) and _routes_compound(tool_input["command"]):
@@ -670,9 +961,13 @@ def classify(event, manifest):
         if reason.endswith("_disabled"):
             return False, reason
         return False, "no_match_decider" if reason == "no_match" else reason
-    for matcher in (_local_match, _git_match, _centre_match, _safe_commit):
+    for matcher in (_local_match, _git_match, _centre_match, _safe_commit,
+                    _ssh_readonly_match, _local_test_match, _outbound_tool_match):
         if matcher(event, manifest):
-            name = {"_local_match": "local_read", "_git_match": "git_observe", "_centre_match": "centre_render", "_safe_commit": "safe_commit"}[matcher.__name__]
+            name = {"_local_match": "local_read", "_git_match": "git_observe",
+                    "_centre_match": "centre_render", "_safe_commit": "safe_commit",
+                    "_ssh_readonly_match": "ssh_readonly", "_local_test_match": "local_test_run",
+                    "_outbound_tool_match": "outbound_tool"}[matcher.__name__]
             if manifest["entries"][name]["enabled"] is True:
                 return True, name
             return False, f"{name}_disabled"
