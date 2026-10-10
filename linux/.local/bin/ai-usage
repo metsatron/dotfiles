@@ -1834,12 +1834,45 @@ def claude_oauth_token() -> str | None:
     return token
 
 
-def _claude_quota(percent: Any, resets_at: Any, label: str) -> dict[str, Any]:
-    return {
+def _claude_quota(percent: Any, resets_at: Any, label: str, window_minutes: int | None = None) -> dict[str, Any]:
+    # 2026-10-10 (Admiral): the 5-hour and weekly windows carry explicit
+    # windowMinutes (300 / 10080) so downstream consumers (Coin Heaven corner
+    # bars, meter ranking) see the window definition, not just the label.
+    quota = {
         "label": label,
         "usedPercent": float(percent) if isinstance(percent, (int, float)) else None,
         "resetsAt": resets_at if isinstance(resets_at, str) else None,
     }
+    if window_minutes is not None:
+        quota["windowMinutes"] = window_minutes
+    return quota
+
+
+def _claude_window_minutes_for_label(label: Any) -> int | None:
+    """The Admiral's fixed windows (2026-10-10): Claude Code's 5-hour and
+    weekly quota windows carry explicit windowMinutes (300 / 10080) so
+    every consumer (Coin Heaven corner bars, meter ranking) sees the
+    window definition even when a source (fuelcheck web/oauth cache)
+    supplies only the label."""
+    text = str(label or "").strip().lower()
+    if text in ("5h", "five_hour", "five hour", "5 hour", "5h session"):
+        return 300
+    if text in ("wk", "week", "weekly", "seven_day", "7d"):
+        return 10080
+    return None
+
+
+def _ensure_claude_window_minutes(result: dict[str, Any]) -> dict[str, Any]:
+    """Idempotent: add windowMinutes to claude quota windows lacking one."""
+    usage = (result.get("raw") or {}).get("usage")
+    if not isinstance(usage, dict):
+        return result
+    for window in (usage.get("primary"), usage.get("secondary")):
+        if isinstance(window, dict) and window.get("windowMinutes") is None:
+            minutes = _claude_window_minutes_for_label(window.get("label"))
+            if minutes is not None:
+                window["windowMinutes"] = minutes
+    return result
 
 
 def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
@@ -1899,8 +1932,8 @@ def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, 
     five = data.get("five_hour") or {}
     seven = data.get("seven_day") or {}
 
-    primary = _claude_quota(five.get("utilization"), five.get("resets_at"), "5h")
-    secondary = _claude_quota(seven.get("utilization"), seven.get("resets_at"), "wk")
+    primary = _claude_quota(five.get("utilization"), five.get("resets_at"), "5h", window_minutes=300)
+    secondary = _claude_quota(seven.get("utilization"), seven.get("resets_at"), "wk", window_minutes=10080)
 
     # Every scoped limit the account carries — one line each, named by the model.
     scoped: list[dict[str, Any]] = []
@@ -2898,7 +2931,12 @@ def _revive(cached: dict[str, Any], spec: ProviderSpec) -> dict[str, Any]:
     # `ai-usage --json` crash (ProviderSpec is not JSON serializable) on every
     # cache hit within the TTL. `spec` is kept as a parameter only for call-site
     # stability; the caller already holds it.
-    return dict(cached)
+    revived = dict(cached)
+    if spec.key == "claude":
+        # 2026-10-10: cached claude entries from before the windowMinutes fix
+        # still lack the window definition — normalize on revival too.
+        revived = _ensure_claude_window_minutes(revived)
+    return revived
 
 
 def _provider_cache_key(spec: ProviderSpec) -> str:
@@ -2991,10 +3029,10 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
         # Native OAuth first: it is the only source that carries the per-model
         # scoped limits (Fable). fuelcheck stays as the fallback for when there
         # is no usable token.
-        result = fetch_claude_oauth(spec, timeout_seconds)
+        result = _ensure_claude_window_minutes(fetch_claude_oauth(spec, timeout_seconds))
         if result["state"] == "ok":
             return result
-        fallback = fetch_fuelcheck(spec, timeout_seconds)
+        fallback = _ensure_claude_window_minutes(fetch_fuelcheck(spec, timeout_seconds))
         return fallback if fallback["state"] == "ok" else result
 
     if spec.kind == "openrouter":
