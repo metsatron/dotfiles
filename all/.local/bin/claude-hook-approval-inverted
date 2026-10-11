@@ -2,6 +2,7 @@
 """Preserve native present approval or defer, even with unavailable engines."""
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -79,6 +80,21 @@ def _present_refusal(manifest):
     return 'deny' if isinstance(section, dict) and section.get('present_refusal') == 'deny' else 'ask'
 
 
+def _fallback_queue(event, manifest, away_reason):
+    """Use the installed shared queue engine even when the selected engine fails."""
+    here = Path(__file__).resolve()
+    engine = here.parents[1] / 'lib/dotcortex/claude_approval_kikin.py'
+    if not engine.is_file():
+        return None
+    try:
+        spec = importlib.util.spec_from_file_location('fallback_approval_engine', engine)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module._queue_morning(event, 'engine_unavailable', away_reason, manifest)
+    except (OSError, TypeError, ValueError, AttributeError, ImportError):
+        return None
+
+
 def defer(raw):
     # Read policy before queue mutation; this private manifest has no credentials.
     try:
@@ -94,41 +110,8 @@ def defer(raw):
         event = json.loads(raw)
     except ValueError:
         event = {'raw_input': raw}
-    queued = False
-    fd = None
-    try:
-        path = Path(os.environ.get('SO_APPROVAL_MORNING_QUEUE') or Path.home() / '.local/state/dotcortex/approval-morning-queue.jsonl')
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
-            raise OSError('invalid private queue')
-        os.fchmod(fd, 0o600)
-        deadline = time.monotonic() + 0.25
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError()
-                time.sleep(0.005)
-        payload = event if isinstance(event, dict) else {}
-        tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
-        import datetime
-        record = {'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
-                  'tool': payload.get('tool_name'), 'command': tool_input.get('command'),
-                  'cwd': payload.get('cwd'), 'session': payload.get('session_id'),
-                  'reason': 'engine_unavailable', 'away_reason': away_reason, 'request': event}
-        with os.fdopen(fd, 'a', encoding='utf-8') as file:
-            fd = None
-            file.write(json.dumps(record, ensure_ascii=True) + '\n')
-        queued = True
-    except (OSError, ValueError, TypeError, TimeoutError):
-        pass
-    finally:
-        if fd is not None:
-            os.close(fd)
+    item_id = _fallback_queue(event, manifest, away_reason)
+    queued = bool(item_id)
     notification = False
     try:
         # Routing failure does not alter a queued refusal.
@@ -146,9 +129,11 @@ def defer(raw):
     note = "deferred: engine unavailable; " + ("queued for the Admiral's morning review" if away else "awaiting the Admiral's approval on the Desk/Telegram")
     if not queued:
         note += '; morning queue unavailable'
+    else:
+        note += '; item ' + item_id + '; state intent: <one line describing what you are trying to achieve>'
     if not notification:
         note += '; Telegram notification unavailable'
-    note += '; continue with other work, do not retry or rephrase this command'
+    note += '; continue with other work or a genuinely different in-policy method; never retry, rephrase or route around this refusal'
     return {'hookSpecificOutput': {'hookEventName': 'PermissionRequest',
         'decision': {'behavior': 'deny', 'message': note, 'interrupt': False}}}
 

@@ -304,7 +304,8 @@ class GateInversionTests(unittest.TestCase):
             self.assertEqual(decision['behavior'], 'deny')
             self.assertIs(decision['interrupt'], False)
         records = [json.loads(line) for line in self.queue.read_text().splitlines()]
-        self.assertEqual(len(records), 4)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]['count'], 4)
         self.assertTrue(all(record['request'] == self.event() for record in records))
 
     def test_present_refusal_switch_for_floor_veto_outside_and_coordinator(self):
@@ -323,7 +324,8 @@ class GateInversionTests(unittest.TestCase):
                 for event, reason in cases:
                     with self.subTest(mode=mode, away=away, reason=reason), \
                             mock.patch.object(e, '_notify_admiral', return_value='sent') as notify:
-                        before = len(self.queue.read_text().splitlines()) if self.queue.exists() else 0
+                        before_records = [json.loads(line) for line in self.queue.read_text().splitlines() if line.strip()] if self.queue.exists() else []
+                        before = len(before_records)
                         expected = 'deny' if away or mode == 'deny' else 'ask'
                         result = self.run_hook(event, answers={'approval.risky.v2': {'noul': 0.99}})
                         self.assertEqual(result['behavior'], expected)
@@ -331,11 +333,16 @@ class GateInversionTests(unittest.TestCase):
                         self.assertEqual(ledger['decision'], expected)
                         self.assertEqual(ledger['reason'], reason)
                         after = len(self.queue.read_text().splitlines()) if self.queue.exists() else 0
-                        self.assertEqual(after - before, int(expected == 'deny'))
+                        command = event.get('tool_input', {}).get('command') if isinstance(event, dict) else None
+                        existing = any(record.get('status') == 'open' and record.get('command') == command
+                                       for record in before_records)
+                        expected_delta = int(expected == 'deny' and not existing)
+                        self.assertEqual(after - before, expected_delta)
                         if expected == 'deny':
                             notify.assert_called_once()
                             self.assertEqual(notify.call_args.args[2], away)
-                            self.assertEqual(json.loads(self.queue.read_text().splitlines()[-1])['request'], event)
+                            self.assertTrue(any(record.get('request') == event for record in
+                                                (json.loads(line) for line in self.queue.read_text().splitlines() if line.strip())))
                         else:
                             notify.assert_not_called()
                 if away:
@@ -409,7 +416,8 @@ class GateInversionTests(unittest.TestCase):
                         self.path.write_text(json.dumps(self.manifest))
                         env = {**os.environ, 'DOTCORTEX_KIKIN_APPROVAL_ENGINE': str(candidate),
                                'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
-                        before = len(self.queue.read_text().splitlines()) if self.queue.exists() else 0
+                        before_records = [json.loads(line) for line in self.queue.read_text().splitlines() if line.strip()] if self.queue.exists() else []
+                        before = len(before_records)
                         out = io.StringIO()
                         original_run = wrapper.subprocess.run
                         def run(argv, **kwargs):
@@ -424,13 +432,17 @@ class GateInversionTests(unittest.TestCase):
                         expected = 'deny' if away or mode == 'deny' else 'ask'
                         result = json.loads(out.getvalue())['hookSpecificOutput']['decision'] if out.getvalue().strip() else {'behavior': 'ask'}
                         self.assertEqual(result['behavior'], expected)
-                        after = len(self.queue.read_text().splitlines()) if self.queue.exists() else 0
-                        self.assertEqual(after - before, int(expected == 'deny'))
+                        after_records = [json.loads(line) for line in self.queue.read_text().splitlines() if line.strip()] if self.queue.exists() else []
+                        after = len(after_records)
+                        command = self.event().get('tool_input', {}).get('command')
+                        existing = any(record.get('status') == 'open' and record.get('command') == command
+                                       for record in before_records)
+                        self.assertEqual(after - before, int(expected == 'deny' and not existing))
                         self.assertEqual(sink.exists(), expected == 'deny')
                         if expected == 'deny':
                             self.assertIs(result['interrupt'], False)
                             self.assertEqual(json.loads(sink.read_text())['away'], away)
-                            record = json.loads(self.queue.read_text().splitlines()[-1])
+                            record = next(record for record in after_records if record.get('request') == self.event())
                             self.assertEqual(record['request'], self.event())
                             self.assertEqual(record['away_reason'], 'away_flag' if away else 'presence')
                 if away:

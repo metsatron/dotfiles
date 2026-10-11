@@ -1223,6 +1223,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[5]
 ENGINE = REPO / 'all/.local/lib/dotcortex/claude_approval_kikin.py'
 READER = REPO / 'all/.local/bin/approval-morning-queue'
+QUEUE_CLI = REPO / 'all/.local/bin/approval-queue'
 PRESENCE_HOOK = REPO / 'all/.local/bin/claude-hook-admiral-presence'
 SPEC = importlib.util.spec_from_file_location('unattended_engine', ENGINE)
 e = importlib.util.module_from_spec(SPEC)
@@ -1347,6 +1348,73 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.assertIn('timestamp', record)
         self.assertEqual(self.queue.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(self.ledger.read_text())['decision'], 'deny')
+
+    def test_queue_contract_deduplicates_and_tracks_intent_and_seen_times(self):
+        first = self.run_hook('unknown-command --argument', intent='refresh the synthetic artifact')
+        second = self.run_hook('unknown-command --argument', intent='refresh the synthetic artifact')
+        self.assertEqual(first['behavior'], 'deny')
+        self.assertEqual(second['behavior'], 'deny')
+        records = [json.loads(line) for line in self.queue.read_text().splitlines() if line.strip()]
+        self.assertEqual(len(records), 1)
+        item = records[0]
+        self.assertRegex(item['item_id'], r'^q-[0-9a-f]{16}$')
+        self.assertEqual(item['count'], 2)
+        self.assertEqual(item['intent'], 'refresh the synthetic artifact')
+        self.assertEqual(item['command'], 'unknown-command --argument')
+        self.assertEqual(item['first_seen'], item['timestamp'])
+        self.assertGreaterEqual(item['last_seen'], item['first_seen'])
+        self.assertEqual(item['status'], 'open')
+        self.assertIn(item['item_id'], second['message'])
+        self.assertIn('intent:', second['message'])
+
+    def test_queue_cli_resolve_removes_awaiting_and_reports_done(self):
+        self.run_hook('resolve-me', intent='produce the synthetic result')
+        env = {**os.environ, 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
+        listed = subprocess.run(['/usr/bin/python3', str(QUEUE_CLI), 'list'], env=env,
+                                capture_output=True, text=True, timeout=3, check=True)
+        before = json.loads(listed.stdout)
+        item = before['awaiting'][0]
+        resolved = subprocess.run(['/usr/bin/python3', str(QUEUE_CLI), 'resolve', item['item_id'],
+                                   '--how', 'the result was produced by the fixture'], env=env,
+                                  capture_output=True, text=True, timeout=3, check=True)
+        self.assertEqual(json.loads(resolved.stdout)['item']['status'], 'resolved')
+        after = json.loads(subprocess.run(['/usr/bin/python3', str(QUEUE_CLI), 'list'], env=env,
+                                          capture_output=True, text=True, timeout=3, check=True).stdout)
+        self.assertEqual(after['awaiting'], [])
+        self.assertEqual(after['done_while_away'][0]['item_id'], item['item_id'])
+        self.assertEqual(after['done_while_away'][0]['resolved_how'], 'the result was produced by the fixture')
+
+    def test_queue_contract_staleness_sweep_is_deterministic_and_conservative(self):
+        self.run_hook('gone-worktree', worktree=str(self.base / 'gone-worktree'),
+                      intent='finish the gone worktree')
+        self.run_hook('landed-branch', branch_landed=True, intent='finish the landed branch')
+        self.run_hook('ended-session', session_ended=True, intent_met=True,
+                      intent='finish the completed session')
+        self.run_hook('uncertain-request', intent='finish the uncertain request')
+        env = {**os.environ, 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
+        result = json.loads(subprocess.run(['/usr/bin/python3', str(QUEUE_CLI), 'list'], env=env,
+                                           capture_output=True, text=True, timeout=3, check=True).stdout)
+        self.assertEqual({item['obsolete_reason'] for item in result['obsolete']},
+                         {'worktree_gone', 'branch_landed', 'session_ended_intent_met'})
+        self.assertEqual([item['intent'] for item in result['awaiting']], ['finish the uncertain request'])
+
+    def test_pre_replay_recheck_consumes_once_and_obsolete_approval_is_noop(self):
+        self.run_hook('gone-worktree', worktree=str(self.base / 'gone-worktree'),
+                      intent='finish the gone worktree')
+        self.run_hook('still-needed', intent='finish the still-needed work')
+        items = [json.loads(line) for line in self.queue.read_text().splitlines() if line.strip()]
+        gone = next(item for item in items if item['command'] == 'gone-worktree')
+        open_item = next(item for item in items if item['command'] == 'still-needed')
+        with mock.patch.dict(os.environ, {'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}):
+            obsolete = e._pre_replay_check(gone['item_id'], 'wake confirmation')
+            first = e._pre_replay_check(open_item['item_id'], 'wake confirmation')
+            second = e._pre_replay_check(open_item['item_id'], 'wake confirmation')
+        self.assertFalse(obsolete['replayable'])
+        self.assertEqual(obsolete['approval_outcome'], 'obsolete_noop')
+        self.assertTrue(first['replayable'])
+        self.assertEqual(first['approval_outcome'], 'replay_authorized')
+        self.assertFalse(second['replayable'])
+        self.assertEqual(second['approval_outcome'], 'already_consumed')
 
     def test_fresh_terminal_presence_keeps_native_ask(self):
         self.presence.unlink()

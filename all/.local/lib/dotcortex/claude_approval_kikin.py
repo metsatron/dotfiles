@@ -2468,23 +2468,300 @@ def _morning_queue_file():
             os.close(fd)
 
 
-def _queue_morning(event, reason, away_reason):
+QUEUE_ITEM_SCHEMA = 'dotcortex.approval.queue.item.v1'
+QUEUE_LIST_SCHEMA = 'dotcortex.approval.queue.list.v1'
+QUEUE_ACTION_SCHEMA = 'dotcortex.approval.queue.action.v1'
+
+
+def _queue_now():
     import datetime
-    payload = event if isinstance(event, dict) else {}
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
+
+
+def _queue_one_line(value, fallback):
+    if not isinstance(value, str):
+        value = fallback
+    value = ' '.join(value.split()).strip()
+    return value[:240] or fallback
+
+
+def _queue_command(payload):
     tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
-    record = {
-        'timestamp': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
-        'tool': payload.get('tool_name'), 'command': tool_input.get('command'),
-        'cwd': payload.get('cwd'), 'session': payload.get('session_id'),
-        'reason': reason, 'away_reason': away_reason, 'request': event,
-    }
+    command = tool_input.get('command')
+    if isinstance(command, str):
+        return command
+    return json.dumps(command, ensure_ascii=True, sort_keys=True, default=str)
+
+
+def _queue_intent(payload, command):
+    tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+    for candidate in (payload.get('intent'), payload.get('deferred_intent'),
+                      tool_input.get('intent'), payload.get('description'),
+                      tool_input.get('description')):
+        if isinstance(candidate, str) and candidate.strip():
+            return _queue_one_line(candidate, 'Complete the requested operation')
+    return _queue_one_line('Complete the requested operation: ' + command, 'Complete the requested operation')
+
+
+def _queue_seat(payload, manifest=None):
+    for candidate in (payload.get('seat'), payload.get('seat_id'),
+                      os.environ.get('DOTCORTEX_APPROVAL_SEAT')):
+        if isinstance(candidate, str) and candidate.strip():
+            return _queue_one_line(candidate, 'local-seat')
+    config = manifest.get('coordinator_ops') if isinstance(manifest, dict) else None
+    if isinstance(config, dict) and isinstance(config.get('seat_account'), str):
+        return config['seat_account']
+    return 'local-seat'
+
+
+def _queue_context(payload):
+    context = payload.get('queue_context') if isinstance(payload.get('queue_context'), dict) else {}
+    result = {}
+    for key in ('branch', 'repo', 'branch_head', 'worktree', 'session_ended', 'intent_met', 'branch_landed'):
+        value = context.get(key, payload.get(key))
+        if value is not None:
+            result[key] = value
+    cwd = payload.get('cwd')
+    if isinstance(cwd, str) and os.path.isdir(cwd):
+        if not isinstance(result.get('repo'), str):
+            repo = _coordinator_git(cwd, 'rev-parse', '--show-toplevel')
+            if repo:
+                result['repo'] = repo
+        if not isinstance(result.get('branch'), str) and isinstance(result.get('repo'), str):
+            branch = _coordinator_git(result['repo'], 'branch', '--show-current')
+            if branch:
+                result['branch'] = branch
+        if (result.get('branch') != 'master' and not isinstance(result.get('branch_head'), str)
+                and isinstance(result.get('repo'), str) and isinstance(result.get('branch'), str)):
+            head = _coordinator_git(result['repo'], 'rev-parse', result['branch'])
+            if head:
+                result['branch_head'] = head
+    return result
+
+
+def _queue_item_id(seat, command_sha, intent):
+    import hashlib
+    material = seat + '\0' + command_sha + '\0' + intent
+    return 'q-' + hashlib.sha256(material.encode('utf-8')).hexdigest()[:16]
+
+
+def _queue_normalize(record):
+    """Upgrade legacy append-only records without creating another queue."""
+    if not isinstance(record, dict):
+        raise ValueError('invalid queue record')
+    item = dict(record)
+    command = item.get('command')
+    if not isinstance(command, str):
+        command = json.dumps(command, ensure_ascii=True, sort_keys=True, default=str)
+        item['command'] = command
+    timestamp = item.get('timestamp') if isinstance(item.get('timestamp'), str) else _queue_now()
+    intent = _queue_one_line(item.get('intent'), 'Complete the requested operation')
+    seat = item.get('seat') if isinstance(item.get('seat'), str) else 'local-seat'
+    import hashlib
+    command_sha = item.get('command_sha')
+    if not isinstance(command_sha, str) or not re.fullmatch(r'[0-9a-f]{64}', command_sha):
+        command_sha = hashlib.sha256(command.encode('utf-8')).hexdigest()
+    item.update({
+        'schema': QUEUE_ITEM_SCHEMA,
+        'item_id': item.get('item_id') or _queue_item_id(seat, command_sha, intent),
+        'seat': seat,
+        'command_sha': command_sha,
+        'intent': intent,
+        'status': item.get('status') if item.get('status') in ('open', 'resolved', 'obsolete') else 'open',
+        'count': int(item.get('count', 1)) if str(item.get('count', 1)).isdigit() else 1,
+        'first_seen': item.get('first_seen') or timestamp,
+        'last_seen': item.get('last_seen') or timestamp,
+        'timestamp': item.get('timestamp') or timestamp,
+    })
+    item.setdefault('commands', [command])
+    if not isinstance(item['commands'], list) or not all(isinstance(value, str) for value in item['commands']):
+        item['commands'] = [command]
+    return item
+
+
+def _queue_read(file):
+    file.seek(0)
+    return [_queue_normalize(json.loads(line)) for line in file if line.strip()]
+
+
+def _queue_write(file, items):
+    file.seek(0)
+    file.truncate(0)
+    for item in items:
+        file.write(json.dumps(item, ensure_ascii=True, separators=(',', ':')) + '\n')
+    file.flush()
+
+
+def _queue_match(item, seat, command_sha, intent):
+    return item.get('status') == 'open' and item.get('seat') == seat and (
+        item.get('command_sha') == command_sha or item.get('intent') == intent)
+
+
+def _queue_morning(event, reason, away_reason, manifest=None):
+    payload = event if isinstance(event, dict) else {}
+    command = _queue_command(payload)
+    intent = _queue_intent(payload, command)
+    seat = _queue_seat(payload, manifest)
+    import hashlib
+    command_sha = hashlib.sha256(command.encode('utf-8')).hexdigest()
+    now = _queue_now()
     try:
         with _morning_queue_file() as file:
-            file.write(json.dumps(record, ensure_ascii=True, separators=(',', ':')) + '\n')
-            file.flush()
-        return True
+            items = _queue_read(file)
+            item = next((candidate for candidate in items if _queue_match(candidate, seat, command_sha, intent)), None)
+            if item is None:
+                tool_input = payload.get('tool_input') if isinstance(payload.get('tool_input'), dict) else {}
+                item = {
+                    'schema': QUEUE_ITEM_SCHEMA,
+                    'item_id': _queue_item_id(seat, command_sha, intent),
+                    'seat': seat,
+                    'tool': payload.get('tool_name'),
+                    'command': command,
+                    'commands': [command],
+                    'command_sha': command_sha,
+                    'intent': intent,
+                    'cwd': payload.get('cwd'),
+                    'session': payload.get('session_id'),
+                    'reason': reason,
+                    'away_reason': away_reason,
+                    'request': event,
+                    'status': 'open',
+                    'count': 1,
+                    'first_seen': now,
+                    'last_seen': now,
+                    'timestamp': now,
+                }
+                item.update(_queue_context(payload))
+                items.append(item)
+            else:
+                item['count'] = int(item.get('count', 1)) + 1
+                item['last_seen'] = now
+                item['reason'] = reason
+                item['away_reason'] = away_reason
+                item['request'] = event
+                if command not in item.setdefault('commands', []):
+                    item['commands'].append(command)
+                item['command'] = command
+                item['command_sha'] = command_sha
+                item.update(_queue_context(payload))
+            _queue_write(file, items)
+        return item['item_id']
     except (OSError, ValueError, TypeError, TimeoutError):
+        return None
+
+
+def _queue_git_landed(item):
+    branch = item.get('branch')
+    repo = item.get('repo')
+    if item.get('branch_landed') is True:
+        return True
+    if not isinstance(branch, str) or not isinstance(repo, str) or not branch or not os.path.isdir(repo):
         return False
+    if branch == 'master':
+        return False
+    branch_head = item.get('branch_head')
+    if isinstance(branch_head, str) and re.fullmatch(r'[0-9a-f]{7,64}', branch_head):
+        if _coordinator_git(repo, 'merge-base', '--is-ancestor', branch_head, 'master') is not None:
+            return True
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_./-]*', branch):
+        return False
+    result = _coordinator_git(repo, 'branch', '--merged', 'master', '--format=%(refname:short)')
+    return isinstance(result, str) and branch in {line.strip() for line in result.splitlines()}
+
+
+def _queue_stale_reason(item):
+    if item.get('status') != 'open':
+        return None
+    if _queue_git_landed(item):
+        return 'branch_landed'
+    worktree = item.get('worktree')
+    if isinstance(worktree, str) and worktree and not os.path.exists(worktree):
+        return 'worktree_gone'
+    if item.get('session_ended') is True and item.get('intent_met') is True:
+        return 'session_ended_intent_met'
+    return None
+
+
+def _queue_sweep(items):
+    changed = False
+    now = _queue_now()
+    for item in items:
+        reason = _queue_stale_reason(item)
+        if reason:
+            item.update(status='obsolete', obsolete_at=now, obsolete_reason=reason)
+            changed = True
+    return changed
+
+
+def _queue_snapshot(sweep=True):
+    try:
+        with _morning_queue_file() as file:
+            items = _queue_read(file)
+            changed = _queue_sweep(items) if sweep else False
+            if changed:
+                _queue_write(file, items)
+            return items
+    except (OSError, ValueError, TypeError, TimeoutError):
+        return None
+
+
+def _queue_resolve(item_id, how):
+    how = _queue_one_line(how, '')
+    if not how:
+        return None
+    now = _queue_now()
+    try:
+        with _morning_queue_file() as file:
+            items = _queue_read(file)
+            item = next((candidate for candidate in items if candidate.get('item_id') == item_id), None)
+            if item is None or item.get('status') != 'open':
+                return None
+            item.update(status='resolved', resolved_at=now, resolved_how=how)
+            _queue_write(file, items)
+            return item
+    except (OSError, ValueError, TypeError, TimeoutError):
+        return None
+
+
+def _pre_replay_check(item_id, confirmation, seat=None):
+    """Consume one replay token only after a fresh deterministic queue check."""
+    import hashlib
+    confirmation = _queue_one_line(confirmation, '')
+    now = _queue_now()
+    digest = hashlib.sha256(confirmation.encode('utf-8')).hexdigest()[:16]
+    try:
+        with _morning_queue_file() as file:
+            items = _queue_read(file)
+            _queue_sweep(items)
+            item = next((candidate for candidate in items if candidate.get('item_id') == item_id), None)
+            if item is None:
+                return {'schema': QUEUE_ACTION_SCHEMA, 'item_id': item_id, 'replayable': False,
+                        'approval_outcome': 'missing'}
+            item.update(approval_recorded_at=now, approval_confirmation_sha=digest)
+            if seat is not None and seat != item.get('seat'):
+                outcome = 'seat_mismatch'
+                replayable = False
+            elif not confirmation:
+                outcome = 'confirmation_required'
+                replayable = False
+            elif item.get('approval_status') == 'consumed':
+                outcome = 'already_consumed'
+                replayable = False
+            elif item.get('status') != 'open':
+                outcome = 'obsolete_noop' if item.get('status') == 'obsolete' else 'resolved_noop'
+                replayable = False
+                item['approval_status'] = 'consumed'
+            else:
+                outcome = 'replay_authorized'
+                replayable = True
+                item['approval_status'] = 'consumed'
+            item['approval_outcome'] = outcome
+            _queue_write(file, items)
+            return {'schema': QUEUE_ACTION_SCHEMA, 'item_id': item_id, 'status': item.get('status'),
+                    'replayable': replayable, 'approval_outcome': outcome}
+    except (OSError, ValueError, TypeError, TimeoutError):
+        return {'schema': QUEUE_ACTION_SCHEMA, 'item_id': item_id, 'replayable': False,
+                'approval_outcome': 'queue_unavailable'}
 
 
 def _notify_admiral(event, reason, away, queued, manifest):
@@ -2581,11 +2858,14 @@ def main():
         # The floor/proof still refused; only the human may approve this request.
         _log_decision.extras.update(decision='ask', away_reason=away_reason, morning_queued=False, notification_status='not_requested')
     else:
-        queued = _queue_morning(event, reason, away_reason)
+        item_id = _queue_morning(event, reason, away_reason, manifest)
+        queued = bool(item_id)
         notification = _notify_admiral(event, reason, away, queued, manifest)
         note = "queued for the Admiral's morning review" if away else "awaiting the Admiral's approval on the Desk/Telegram"
         if not queued:
             note += '; morning queue unavailable'
+        else:
+            note += '; item ' + item_id + '; state intent: <one line describing what you are trying to achieve>'
         if notification != 'sent':
             note += '; Telegram notification unavailable (' + notification + ')'
         message = 'deferred: ' + note + '; continue with other work or a genuinely different in-policy method; never retry, rephrase or route around this refusal'
