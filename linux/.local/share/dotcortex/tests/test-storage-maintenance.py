@@ -182,6 +182,135 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertIn("--expected-host kikin-kushi", result.stdout)
             self.assertIn(str(root / ".local/state/dotcortex-storage-maintenance/cron.log"), result.stdout)
 
+    def test_worktree_reaper_removes_only_old_merged_clean_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_guix = root / "guix"
+            fake_guix.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_guix.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(root),
+                    "STORAGE_MAINTENANCE_HOME": str(root),
+                    "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
+                    "STORAGE_MAINTENANCE_GUIX": str(fake_guix),
+                    "STORAGE_MAINTENANCE_NALA": str(root / "missing-nala"),
+                    "STORAGE_MAINTENANCE_FLATPAK": str(root / "missing-flatpak"),
+                    "STORAGE_MAINTENANCE_BREW": str(root / "missing-brew"),
+                    "STORAGE_MAINTENANCE_UV": str(root / "missing-uv"),
+                    "STORAGE_MAINTENANCE_DOTCORTEX_REPO": str(root / "DotCortex"),
+                    "STORAGE_MAINTENANCE_DOTCORTEX_WORKTREE_ROOT": str(root / "DotCortex-wt-kikin"),
+                    "STORAGE_MAINTENANCE_HELMCORTEX_REPO": str(root / "HelmCortex"),
+                    "STORAGE_MAINTENANCE_HELMCORTEX_WORKTREE_ROOT": str(root / "HelmCortex-wt-kikin"),
+                    "STORAGE_MAINTENANCE_WORKTREE_MIN_AGE_SECONDS": "21600",
+                }
+            )
+
+            def git(repo: Path, *args: str) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                )
+                return result.stdout
+
+            def make_repo(repo: Path) -> None:
+                repo.mkdir()
+                subprocess.run(
+                    ["git", "init", "--initial-branch=master", str(repo)],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                )
+                git(repo, "config", "user.email", "test@example.invalid")
+                git(repo, "config", "user.name", "Storage Test")
+                (repo / "README").write_text("root\n", encoding="utf-8")
+                git(repo, "add", "README")
+                git(repo, "commit", "-m", "initial")
+
+            def candidate(repo: Path, worktree_root: Path, name: str, merged: bool, old: bool = False) -> Path:
+                branch = f"candidate-{name}"
+                git(repo, "switch", "-c", branch)
+                (repo / name).write_text(f"{name}\n", encoding="utf-8")
+                git(repo, "add", name)
+                commit_env = env.copy()
+                if old:
+                    old_timestamp = int(time.time() - (2 * 86400))
+                    commit_env["GIT_AUTHOR_DATE"] = f"@{old_timestamp}"
+                    commit_env["GIT_COMMITTER_DATE"] = f"@{old_timestamp}"
+                subprocess.run(
+                    ["git", "-C", str(repo), "commit", "-m", name],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=commit_env,
+                )
+                git(repo, "switch", "master")
+                if merged:
+                    git(repo, "merge", "--no-ff", "--no-edit", branch)
+                path = worktree_root / name
+                worktree_root.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "worktree", "add", str(path), branch],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                )
+                if old:
+                    old_time = time.time() - (2 * 86400)
+                    os.utime(path, (old_time, old_time))
+                return path
+
+            dot = root / "DotCortex"
+            helm = root / "HelmCortex"
+            make_repo(dot)
+            make_repo(helm)
+            removed = candidate(dot, root / "DotCortex-wt-kikin", "merged-clean", True, old=True)
+            helm_removed = candidate(helm, root / "HelmCortex-wt-kikin", "merged-clean", True, old=True)
+            unmerged = candidate(dot, root / "DotCortex-wt-kikin", "unmerged", False)
+            dirty = candidate(dot, root / "DotCortex-wt-kikin", "dirty", True)
+            (dirty / "dirty-file").write_text("changed\n", encoding="utf-8")
+            untracked = candidate(dot, root / "DotCortex-wt-kikin", "untracked", True)
+            (untracked / "untracked-file").write_text("untracked\n", encoding="utf-8")
+            busy = candidate(dot, root / "DotCortex-wt-kikin", "busy", True)
+            busy_process = subprocess.Popen(["sleep", "30"], cwd=busy)
+            young = candidate(dot, root / "DotCortex-wt-kikin", "young", True)
+
+            try:
+                result = subprocess.run(
+                    [CLEANUP, "--expected-host", "kikin-kushi"],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+            finally:
+                busy_process.terminate()
+                busy_process.wait(timeout=5)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(removed.exists())
+            self.assertFalse(helm_removed.exists())
+            for kept, reason in (
+                (unmerged, "unmerged"),
+                (dirty, "dirty"),
+                (untracked, "dirty"),
+                (busy, "busy"),
+                (young, "too young"),
+            ):
+                self.assertTrue(kept.exists())
+                self.assertIn(f"path={kept} reason={reason}", result.stdout)
+            self.assertIn("pruned worktree metadata", result.stdout)
+            for repo, branch in (
+                (dot, "candidate-merged-clean"),
+                (helm, "candidate-merged-clean"),
+            ):
+                self.assertTrue(git(repo, "show-ref", "--verify", f"refs/heads/{branch}"))
+
 
 if __name__ == "__main__":
     unittest.main()

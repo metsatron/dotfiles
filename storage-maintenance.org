@@ -21,6 +21,17 @@ The cleanup command is host-gated and singleton.  Dry-run mode reports the
 same targets without changing them.  The cron installer is separate so
 tangling never changes the live scheduler.
 
+The same command reaps worktrees from =~/DotCortex-wt-kikin= and
+=~/HelmCortex-wt-kikin= when their owning repository records them in
+=git worktree list --porcelain=.  A candidate must be an ancestor of =master=,
+clean including untracked files, idle (no =/proc/*/cwd= is inside it), and
+older than =STORAGE_MAINTENANCE_WORKTREE_MIN_AGE_SECONDS= (default 21600,
+six hours) by both its branch tip commit and directory mtime.  Reaping uses
+plain =git worktree remove= and leaves the branch intact, then prunes each
+repository's stale worktree metadata.  The existing Kikin cron job already
+runs this command daily at 06:30; because this module's established command
+mode is apply-by-default, use =--dry-run= for inspection.
+
 ** Cleanup command
 
 #+BEGIN_SRC bash :tangle all/.local/bin/dotcortex-storage-maintenance :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
@@ -30,6 +41,7 @@ TAG="dotcortex-storage-maintenance"
 DRY_RUN=0
 EXPECTED_HOST=""
 CANDIDATE_MAX_AGE_DAYS="${STORAGE_MAINTENANCE_CANDIDATE_DAYS:-14}"
+WORKTREE_MIN_AGE_SECONDS="${STORAGE_MAINTENANCE_WORKTREE_MIN_AGE_SECONDS:-21600}"
 CLIPMENU_MAX_BYTES="${STORAGE_MAINTENANCE_CLIPMENU_MAX_BYTES:-16777216}"
 TELEGRAM_STATE_MAX_BYTES="${STORAGE_MAINTENANCE_TELEGRAM_STATE_MAX_BYTES:-268435456}"
 CLAUDE_STATE_MAX_BYTES="${STORAGE_MAINTENANCE_CLAUDE_STATE_MAX_BYTES:-268435456}"
@@ -47,6 +59,7 @@ Run the narrow DotCortex cleanup allowlist:
   - prune dangling uv cache entries
   - truncate Redstone 9X clipmenud.log files larger than 16 MiB
   - remove Ductor candidate-cache entries older than 14 days
+  - reap old, merged, clean, idle Git worktrees under the Kikin roots
 
 No dependency autoremove, package-generation deletion, generic cache,
 temporary-directory, Flatpak object surgery, Borg, model, agent-session, or
@@ -90,7 +103,7 @@ if [ -z "$BREW_BIN" ] && [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then
   BREW_BIN=/home/linuxbrew/.linuxbrew/bin/brew
 fi
 
-case "$CANDIDATE_MAX_AGE_DAYS:$CLIPMENU_MAX_BYTES:$TELEGRAM_STATE_MAX_BYTES:$CLAUDE_STATE_MAX_BYTES:$CADDY_LOG_MAX_BYTES" in
+case "$CANDIDATE_MAX_AGE_DAYS:$WORKTREE_MIN_AGE_SECONDS:$CLIPMENU_MAX_BYTES:$TELEGRAM_STATE_MAX_BYTES:$CLAUDE_STATE_MAX_BYTES:$CADDY_LOG_MAX_BYTES" in
   *[!0-9:]*|:*|*:) printf '%s: cleanup limits must be non-negative integers\n' "$TAG" >&2; exit 2 ;;
 esac
 
@@ -164,6 +177,122 @@ report_file_family_high_water() {
   fi
 }
 
+worktree_is_busy() {
+  local worktree="$1" proc cwd
+  for proc in /proc/[0-9]*; do
+    [ -d "$proc" ] || continue
+    cwd="$(readlink "$proc/cwd" 2>/dev/null || true)"
+    case "$cwd" in
+      "$worktree"|"$worktree"/*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+inspect_worktree() {
+  local repo="$1" root="$2" main_worktree="$3" worktree="$4" branch_ref="$5"
+  local candidate_path status_output last_commit mtime now commit_age mtime_age
+
+  candidate_path="$(realpath -e "$worktree" 2>/dev/null || true)"
+  [ -n "$candidate_path" ] || return 0
+  case "$candidate_path" in
+    "$root"/*) ;;
+    *) return 0 ;;
+  esac
+  [ "$candidate_path" = "$main_worktree" ] && return 0
+
+  if [ -z "$branch_ref" ] || [[ "$branch_ref" != refs/heads/* ]]; then
+    printf 'skipped worktree: path=%s reason=unmerged (detached HEAD)\n' "$candidate_path"
+    return 0
+  fi
+  if ! git -C "$repo" merge-base --is-ancestor "$branch_ref" master; then
+    printf 'skipped worktree: path=%s reason=unmerged branch=%s\n' \
+      "$candidate_path" "${branch_ref#refs/heads/}"
+    return 0
+  fi
+
+  status_output="$(git -C "$candidate_path" status --porcelain)"
+  if [ -n "$status_output" ]; then
+    printf 'skipped worktree: path=%s reason=dirty\n' "$candidate_path"
+    return 0
+  fi
+  if worktree_is_busy "$candidate_path"; then
+    printf 'skipped worktree: path=%s reason=busy\n' "$candidate_path"
+    return 0
+  fi
+
+  last_commit="$(git -C "$repo" log -1 --format=%ct "$branch_ref")"
+  mtime="$(stat -c '%Y' "$candidate_path")"
+  now="$(date +%s)"
+  commit_age=$((now - last_commit))
+  mtime_age=$((now - mtime))
+  if [ "$commit_age" -lt "$WORKTREE_MIN_AGE_SECONDS" ] || \
+     [ "$mtime_age" -lt "$WORKTREE_MIN_AGE_SECONDS" ]; then
+    printf 'skipped worktree: path=%s reason=too young commit_age=%s mtime_age=%s minimum_age=%s\n' \
+      "$candidate_path" "$commit_age" "$mtime_age" "$WORKTREE_MIN_AGE_SECONDS"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would remove merged, clean, idle worktree: path=%s branch=%s\n' \
+      "$candidate_path" "${branch_ref#refs/heads/}"
+  elif git -C "$repo" worktree remove "$candidate_path"; then
+    printf 'removed merged, clean, idle worktree: path=%s branch=%s\n' \
+      "$candidate_path" "${branch_ref#refs/heads/}"
+  else
+    printf '%s: failed to remove worktree: path=%s\n' "$TAG" "$candidate_path" >&2
+    WORKTREE_FAILURES=$((WORKTREE_FAILURES + 1))
+  fi
+}
+
+reap_repo_worktrees() {
+  local repo="$1" root="$2" main_worktree records line worktree="" branch_ref=""
+  [ -d "$repo" ] || {
+    printf 'skipped worktree reaping: repo=%s reason=repo unavailable\n' "$repo"
+    return 0
+  }
+  main_worktree="$(realpath -e "$(git -C "$repo" rev-parse --show-toplevel)")"
+  if ! records="$(git -C "$repo" worktree list --porcelain)"; then
+    printf '%s: unable to list worktrees: repo=%s\n' "$TAG" "$repo" >&2
+    WORKTREE_FAILURES=$((WORKTREE_FAILURES + 1))
+    return 0
+  fi
+
+  if [ -d "$root" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in
+        "worktree "*)
+          if [ -n "$worktree" ]; then
+            inspect_worktree "$repo" "$root" "$main_worktree" "$worktree" "$branch_ref"
+          fi
+          worktree="${line#worktree }"
+          branch_ref="" ;;
+        "branch "*) branch_ref="${line#branch }" ;;
+        "")
+          if [ -n "$worktree" ]; then
+            inspect_worktree "$repo" "$root" "$main_worktree" "$worktree" "$branch_ref"
+            worktree=""
+            branch_ref=""
+          fi ;;
+      esac
+    done <<<"$records"
+    if [ -n "$worktree" ]; then
+      inspect_worktree "$repo" "$root" "$main_worktree" "$worktree" "$branch_ref"
+    fi
+  else
+    printf 'skipped worktree reaping: repo=%s reason=root unavailable root=%s\n' "$repo" "$root"
+  fi
+
+  if [ "$DRY_RUN" = 1 ]; then
+    printf 'would prune worktree metadata: repo=%s\n' "$repo"
+  elif git -C "$repo" worktree prune; then
+    printf 'pruned worktree metadata: repo=%s\n' "$repo"
+  else
+    printf '%s: failed to prune worktree metadata: repo=%s\n' "$TAG" "$repo" >&2
+    WORKTREE_FAILURES=$((WORKTREE_FAILURES + 1))
+  fi
+}
+
 printf '%s: start host=%s dry_run=%s %s\n' "$TAG" "$CURRENT_HOST" "$DRY_RUN" "$(disk_line)"
 
 if [ "$DRY_RUN" = 1 ]; then
@@ -213,6 +342,14 @@ if [ -d "$CANDIDATE_DIR" ]; then
 fi
 
 PACKAGE_FAILURES=0
+WORKTREE_FAILURES=0
+
+reap_repo_worktrees \
+  "${STORAGE_MAINTENANCE_DOTCORTEX_REPO:-$MAINTENANCE_HOME/DotCortex}" \
+  "${STORAGE_MAINTENANCE_DOTCORTEX_WORKTREE_ROOT:-$MAINTENANCE_HOME/DotCortex-wt-kikin}"
+reap_repo_worktrees \
+  "${STORAGE_MAINTENANCE_HELMCORTEX_REPO:-$MAINTENANCE_HOME/HelmCortex}" \
+  "${STORAGE_MAINTENANCE_HELMCORTEX_WORKTREE_ROOT:-$MAINTENANCE_HOME/HelmCortex-wt-kikin}"
 
 if optional_executable "$NALA_BIN"; then
   if [ "$DRY_RUN" = 1 ]; then
@@ -279,7 +416,7 @@ report_file_family_high_water \
   caddy-refresh "$MAINTENANCE_HOME/.local/state" caddy-refresh.log "$CADDY_LOG_MAX_BYTES"
 
 printf '%s: finish %s\n' "$TAG" "$(disk_line)"
-[ "$PACKAGE_FAILURES" -eq 0 ] || exit 1
+[ "$PACKAGE_FAILURES" -eq 0 ] && [ "$WORKTREE_FAILURES" -eq 0 ] || exit 1
 #+END_SRC
 
 ** Daily Kikin schedule
@@ -578,6 +715,135 @@ class StorageMaintenanceTests(unittest.TestCase):
             self.assertIn("30 6 * * * test-user", result.stdout)
             self.assertIn("--expected-host kikin-kushi", result.stdout)
             self.assertIn(str(root / ".local/state/dotcortex-storage-maintenance/cron.log"), result.stdout)
+
+    def test_worktree_reaper_removes_only_old_merged_clean_worktrees(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake_guix = root / "guix"
+            fake_guix.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            fake_guix.chmod(0o755)
+            env = os.environ.copy()
+            env.update(
+                {
+                    "HOME": str(root),
+                    "STORAGE_MAINTENANCE_HOME": str(root),
+                    "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
+                    "STORAGE_MAINTENANCE_GUIX": str(fake_guix),
+                    "STORAGE_MAINTENANCE_NALA": str(root / "missing-nala"),
+                    "STORAGE_MAINTENANCE_FLATPAK": str(root / "missing-flatpak"),
+                    "STORAGE_MAINTENANCE_BREW": str(root / "missing-brew"),
+                    "STORAGE_MAINTENANCE_UV": str(root / "missing-uv"),
+                    "STORAGE_MAINTENANCE_DOTCORTEX_REPO": str(root / "DotCortex"),
+                    "STORAGE_MAINTENANCE_DOTCORTEX_WORKTREE_ROOT": str(root / "DotCortex-wt-kikin"),
+                    "STORAGE_MAINTENANCE_HELMCORTEX_REPO": str(root / "HelmCortex"),
+                    "STORAGE_MAINTENANCE_HELMCORTEX_WORKTREE_ROOT": str(root / "HelmCortex-wt-kikin"),
+                    "STORAGE_MAINTENANCE_WORKTREE_MIN_AGE_SECONDS": "21600",
+                }
+            )
+
+            def git(repo: Path, *args: str) -> str:
+                result = subprocess.run(
+                    ["git", "-C", str(repo), *args],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                )
+                return result.stdout
+
+            def make_repo(repo: Path) -> None:
+                repo.mkdir()
+                subprocess.run(
+                    ["git", "init", "--initial-branch=master", str(repo)],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                )
+                git(repo, "config", "user.email", "test@example.invalid")
+                git(repo, "config", "user.name", "Storage Test")
+                (repo / "README").write_text("root\n", encoding="utf-8")
+                git(repo, "add", "README")
+                git(repo, "commit", "-m", "initial")
+
+            def candidate(repo: Path, worktree_root: Path, name: str, merged: bool, old: bool = False) -> Path:
+                branch = f"candidate-{name}"
+                git(repo, "switch", "-c", branch)
+                (repo / name).write_text(f"{name}\n", encoding="utf-8")
+                git(repo, "add", name)
+                commit_env = env.copy()
+                if old:
+                    old_timestamp = int(time.time() - (2 * 86400))
+                    commit_env["GIT_AUTHOR_DATE"] = f"@{old_timestamp}"
+                    commit_env["GIT_COMMITTER_DATE"] = f"@{old_timestamp}"
+                subprocess.run(
+                    ["git", "-C", str(repo), "commit", "-m", name],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=commit_env,
+                )
+                git(repo, "switch", "master")
+                if merged:
+                    git(repo, "merge", "--no-ff", "--no-edit", branch)
+                path = worktree_root / name
+                worktree_root.mkdir(parents=True, exist_ok=True)
+                subprocess.run(
+                    ["git", "-C", str(repo), "worktree", "add", str(path), branch],
+                    check=True,
+                    text=True,
+                    capture_output=True,
+                    env=env,
+                )
+                if old:
+                    old_time = time.time() - (2 * 86400)
+                    os.utime(path, (old_time, old_time))
+                return path
+
+            dot = root / "DotCortex"
+            helm = root / "HelmCortex"
+            make_repo(dot)
+            make_repo(helm)
+            removed = candidate(dot, root / "DotCortex-wt-kikin", "merged-clean", True, old=True)
+            helm_removed = candidate(helm, root / "HelmCortex-wt-kikin", "merged-clean", True, old=True)
+            unmerged = candidate(dot, root / "DotCortex-wt-kikin", "unmerged", False)
+            dirty = candidate(dot, root / "DotCortex-wt-kikin", "dirty", True)
+            (dirty / "dirty-file").write_text("changed\n", encoding="utf-8")
+            untracked = candidate(dot, root / "DotCortex-wt-kikin", "untracked", True)
+            (untracked / "untracked-file").write_text("untracked\n", encoding="utf-8")
+            busy = candidate(dot, root / "DotCortex-wt-kikin", "busy", True)
+            busy_process = subprocess.Popen(["sleep", "30"], cwd=busy)
+            young = candidate(dot, root / "DotCortex-wt-kikin", "young", True)
+
+            try:
+                result = subprocess.run(
+                    [CLEANUP, "--expected-host", "kikin-kushi"],
+                    env=env,
+                    text=True,
+                    capture_output=True,
+                )
+            finally:
+                busy_process.terminate()
+                busy_process.wait(timeout=5)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(removed.exists())
+            self.assertFalse(helm_removed.exists())
+            for kept, reason in (
+                (unmerged, "unmerged"),
+                (dirty, "dirty"),
+                (untracked, "dirty"),
+                (busy, "busy"),
+                (young, "too young"),
+            ):
+                self.assertTrue(kept.exists())
+                self.assertIn(f"path={kept} reason={reason}", result.stdout)
+            self.assertIn("pruned worktree metadata", result.stdout)
+            for repo, branch in (
+                (dot, "candidate-merged-clean"),
+                (helm, "candidate-merged-clean"),
+            ):
+                self.assertTrue(git(repo, "show-ref", "--verify", f"refs/heads/{branch}"))
 
 
 if __name__ == "__main__":
