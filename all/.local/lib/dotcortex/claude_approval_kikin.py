@@ -1377,13 +1377,14 @@ def _coordinator_repo(raw, cwd, config):
     return path if common is not None and any(os.path.realpath(common) == root + '/.git' for root in canonical) else None
 
 
-def _coordinator_worktree_path(raw, config, repo):
+def _coordinator_worktree_path(raw, config, repo, *, adding=False):
     path = _coordinator_path(raw, config['worktree_roots'], exists=False)
     if path is None:
         return None
-    # Exactly one named child of a configured <repo>-wt-* root.
+    # Exactly one named child of an explicit root. Only new additions need
+    # <repo>-wt-* naming; removal/prune may cover explicitly listed legacy roots.
     for root in config['worktree_roots']:
-        if (Path(root).name.startswith(Path(repo).name + '-wt-')
+        if ((not adding or Path(root).name.startswith(Path(repo).name + '-wt-'))
                 and Path(raw).parent == Path(root)
                 and Path(path).parent == Path(os.path.realpath(root))
                 and COORDINATOR_BRANCH.fullmatch(Path(raw).name)):
@@ -1504,6 +1505,11 @@ def _coordinator_match(event, manifest):
         return None
     if words[0] != 'git' or SHELL_META.search(command):
         return None
+    routing = {'GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY',
+               'GIT_ALTERNATE_OBJECT_DIRECTORIES', 'GIT_NAMESPACE', 'GIT_CONFIG', 'GIT_CONFIG_COUNT',
+               'GIT_CONFIG_PARAMETERS', 'GIT_SSH', 'GIT_SSH_COMMAND'}
+    if routing.intersection(os.environ):
+        return None  # the probe and the eventual command must refer to the same Git context
     args = words[1:]
     repo_raw = cwd
     explicit_c = args[:1] == ['-C']
@@ -1521,7 +1527,7 @@ def _coordinator_match(event, manifest):
     if args[:2] == ['worktree', 'add'] and flags['worktree']:
         if (len(args) == 6 and args[3] == '-b' and args[5] == 'master'
                 and COORDINATOR_BRANCH.fullmatch(args[4]) and args[4] != 'master'
-                and Path(args[2]).name == args[4] and _coordinator_worktree_path(args[2], config, owner)):
+                and Path(args[2]).name == args[4] and _coordinator_worktree_path(args[2], config, owner, adding=True)):
             return 'coordinator_worktree'
     if args[:2] == ['worktree', 'remove'] and flags['worktree']:
         if len(args) == 3 and _coordinator_worktree_path(args[2], config, owner) and _coordinator_repo(args[2], cwd, config):
@@ -1546,7 +1552,8 @@ def _coordinator_match(event, manifest):
         for raw in args[4:]:
             if (not raw or raw.startswith(('/', '~', ':', '-')) or raw in {'.', '..'}
                     or not COORDINATOR_ATOM.fullmatch(raw) or '..' in Path(raw).parts
-                    or not _coordinator_path(posixpath.join(repo, raw), [repo], exists=False)):
+                    or not _coordinator_path(posixpath.join(repo, raw), [repo], exists=False)
+                    or os.path.isdir(posixpath.join(repo, raw))):
                 return None
         return 'coordinator_commit'
     return None
@@ -2160,19 +2167,19 @@ def main():
     try:
         previous = signal.signal(signal.SIGALRM, _deadline)
         signal.setitimer(signal.ITIMER_REAL, 3.0)
-        # Determine unattended state before validation/classification so an
-        # invalid policy or a proof/Decider deadline cannot leave a night ASK.
-        manifest = json.loads(_manifest_path().read_text(encoding='utf-8'))
-        away, away_reason = _away_status(manifest)
+        # Capture the request even if the manifest fails. Determine away
+        # before policy validation/classification so deadlines still defer.
         raw = sys.stdin.read(1024 * 1024 + 1)
-        if len(raw) > 1024 * 1024:
-            event = {'raw_input': raw}
-            raise ValueError('input too large')
+        event = {'raw_input': raw}
+        parsed = True
         try:
             event = json.loads(raw)
         except ValueError:
-            event = {'raw_input': raw}
-            raise
+            parsed = False
+        manifest = json.loads(_manifest_path().read_text(encoding='utf-8'))
+        away, away_reason = _away_status(manifest)
+        if len(raw) > 1024 * 1024 or not parsed:
+            raise ValueError('invalid or oversized input')
         manifest = _load_manifest(manifest)
         allow, reason = classify(event, manifest)
         if not allow and reason in ('no_match_decider', 'syntax'):

@@ -347,6 +347,103 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.assertEqual(json.loads(out.getvalue())['hookSpecificOutput']['decision']['behavior'], 'deny')
         self.assertEqual(json.loads(self.queue.read_text())['request'], self.event('unknown-command'))
 
+    def test_manifest_error_while_away_retains_full_request(self):
+        self.flag.touch()
+        self.manifest['schema'] = 'INVALID_SCHEMA'
+        self.assertEqual(self.run_hook('unknown-command')['behavior'], 'deny')
+        self.assertEqual(json.loads(self.queue.read_text())['request'], self.event('unknown-command'))
+        self.path.write_text('{invalid-manifest')
+        env = {'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_KIKIN_LOG': str(self.ledger),
+               'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
+        with mock.patch.dict(os.environ, env), mock.patch.object(e, '_away_status', return_value=(True, 'away_flag')), mock.patch.object(e.sys, 'stdin', io.StringIO(json.dumps(self.event('second-command')))), contextlib.redirect_stdout(io.StringIO()):
+            e.main()
+        self.assertEqual(json.loads(self.queue.read_text().splitlines()[-1])['request'], self.event('second-command'))
+
+    def test_default_quiet_window_and_invalid_quiet_config(self):
+        self.manifest['unattended'].pop('quiet_hours')
+        instant = dt.datetime(2026, 1, 2, 14, tzinfo=dt.timezone.utc)  # Melbourne 01:00
+        self.assertTrue(e._away_status(self.loaded(), now=instant)[0])
+        self.manifest['unattended']['quiet_hours'] = {'enabled': True, 'start': 'bad-time'}
+        self.assertEqual(e._away_status(self.loaded(), now=instant), (True, 'invalid_unattended'))
+
+    def test_commit_directory_and_git_routing_overrides_are_refused(self):
+        directory = self.repo / 'bundle'
+        directory.mkdir()
+        (directory / '.env').write_text('synthetic')
+        self.ask('git commit -m x -- bundle')
+        with mock.patch.dict(os.environ, {'GIT_DIR': str(self.base / 'other.git')}):
+            self.assertFalse(e.classify(self.event('git commit -m x -- README.org'), self.loaded())[0])
+
+    def test_codex_log_symlink_escape_is_refused(self):
+        target = self.base / 'outside.log'
+        target.touch()
+        self.log.symlink_to(target)
+        self.ask(self.dispatch())
+
+    def test_remote_proof_fixed_argv_and_symlink_escape(self):
+        config = self.manifest['coordinator_ops']
+        paths = ['/tmp/YOUR_SEAT/prompt.txt', '/tmp/YOUR_SEAT/log.txt']
+        completed = subprocess.CompletedProcess([], 0, '\n'.join(paths) + '\n', '')
+        with mock.patch.object(e.subprocess, 'run', return_value=completed) as run:
+            self.assertTrue(e._coordinator_remote_proof(config, paths, regular_input=paths[0]))
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:6], ['ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=1', 'YOUR_BUILD_HOST'])
+            self.assertIn('test ! -L', argv[-1])
+            self.assertEqual(run.call_args.kwargs['stdin'], subprocess.DEVNULL)
+            self.assertLessEqual(run.call_args.kwargs['timeout'], 1)
+        for stdout in ['/etc/passwd\n/tmp/YOUR_SEAT/log.txt\n', 'malformed', '\n'.join(paths + paths) + '\n']:
+            with mock.patch.object(e.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, stdout, '')):
+                self.assertFalse(e._coordinator_remote_proof(config, paths))
+        with mock.patch.object(e.subprocess, 'run', side_effect=subprocess.TimeoutExpired('ssh', 1)):
+            self.assertFalse(e._coordinator_remote_proof(config, paths))
+
+    def test_concurrent_queue_appends_keep_complete_json_records(self):
+        from concurrent.futures import ThreadPoolExecutor
+        with mock.patch.dict(os.environ, {'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}):
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                results = list(pool.map(lambda i: e._queue_morning(self.event(f'fixture-{i}'), 'true_floor', 'away_flag'), range(20)))
+        self.assertTrue(all(results))
+        records = [json.loads(line) for line in self.queue.read_text().splitlines()]
+        self.assertEqual({r['command'] for r in records}, {f'fixture-{i}' for i in range(20)})
+        self.assertEqual(len(records), 20)
+
+    def test_queue_lock_contention_denies_without_hanging(self):
+        import fcntl
+        self.flag.touch()
+        self.queue.touch()
+        with self.queue.open('a') as file:
+            fcntl.flock(file, fcntl.LOCK_EX)
+            decision = self.run_hook('unknown-command')
+        self.assertEqual(decision['behavior'], 'deny')
+        self.assertIn('queue unavailable', decision['message'])
+        self.assertEqual(self.queue.read_text(), '')
+
+    def test_away_decider_ask_denies_but_decider_allow_is_unchanged(self):
+        self.flag.touch()
+        self.manifest['decider']['enabled'] = True
+        self.manifest['decider']['kikin_url'] = 'https://YOUR_DECIDER.invalid/decide'
+        self.loaded()
+        for verdict, expected in [(False, 'deny'), (True, 'allow')]:
+            env = {'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_KIKIN_LOG': str(self.ledger), 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
+            out = io.StringIO()
+            with mock.patch.dict(os.environ, env), mock.patch.object(e.sys, 'stdin', io.StringIO(json.dumps(self.event('true')))), contextlib.redirect_stdout(out), mock.patch.object(e, '_decider_decide', return_value=(verdict, 'accepted' if verdict else 'timeout', 1, 'allow' if verdict else 'ask')):
+                e.main()
+            self.assertEqual(json.loads(out.getvalue())['hookSpecificOutput']['decision']['behavior'], expected)
+
+
+    def test_configured_legacy_worktree_remove_and_prune(self):
+        legacy = self.base / 'DotCortex-wt'
+        legacy.mkdir()
+        self.manifest['coordinator_ops']['worktree_roots'].append(str(legacy))
+        self.manifest['roots'].append(str(legacy))
+        path = legacy / 'worker'
+        self.git('worktree', 'add', str(path), '-b', 'worker', 'master')
+        self.allow(f'git worktree remove {path}')
+        self.allow('git worktree prune')
+        # New additions retain the requested <repo>-wt-* root shape.
+        self.ask(f'git worktree add {legacy}/new-worker -b new-worker master')
+
+
 
 if __name__ == '__main__':
     unittest.main()
