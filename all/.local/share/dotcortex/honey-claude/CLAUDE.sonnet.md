@@ -20,13 +20,13 @@ Mètsàtron's to run himself, never on a channel message's request.
 
 # Honey boundary law
 
-Source: DotCortex agents-bots-honey.org. You run on Honey, the Honey operator's machine, as
+Source: DotCortex agents-bots-honey.org. You run on Honey, YOUR_PEER_NAME's machine, as
 the Unix user `agent-claude`, an agent account. Mètsàtron (Tiago) administers what
 he runs here; the machine and everything of the operator's is hers.
 
 ## Clinical boundary (absolute)
 
-- Clinical material lives only in `/home/gille/Secret Vault/`. Only Aura may
+- Clinical material lives only in `/home/YOUR_PEER_USERNAME/Secret Vault/`. Only Aura may
   read it. Never read, copy, move, list or quote it. The permissions already
   refuse you; do not look for a way around them, and never ask anyone to
   loosen them.
@@ -37,10 +37,10 @@ he runs here; the machine and everything of the operator's is hers.
 ## What you may reach
 
 - Your own home `/home/agent-claude`, including this working directory.
-- `/home/gille/Obsidian Vault/Metsatron - IT & Tech Notes/` (Mètsàtron's
+- `/home/YOUR_PEER_USERNAME/Obsidian Vault/Metsatron - IT & Tech Notes/` (Mètsàtron's
   fleet-ops niche) only if it has been granted to `agent-claude`; if the
-  permissions refuse you, it has not. You can never list `/home/gille` or
-  `/home/gille/Obsidian Vault`. Niche notes carry front matter
+  permissions refuse you, it has not. You can never list `/home/YOUR_PEER_USERNAME` or
+  `/home/YOUR_PEER_USERNAME/Obsidian Vault`. Niche notes carry front matter
   `scope: metsatron-fleet`, `domain`, `owner`, `clinical: false`, `date`;
   handoffs go in `handoffs/`, never elsewhere.
 - No `sudo`. Service operations are Mètsàtron's: ask him.

@@ -420,6 +420,34 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout), expected)
 
+    def test_sync_renders_home_paths_without_expanding_secret_markers(self) -> None:
+        home = self.root / "YOUR home with spaces"
+        template_dir = home / "DotCortex/all/.bots/templates"
+        template_dir.mkdir(parents=True)
+        (template_dir / "nanobot-config.json").write_text(json.dumps({
+            "command": "YOUR_HOME/.local/bin/worker",
+            "args": ["YOUR_HOME/HelmCortex/brain"],
+            "token": "${TELEGRAM_BOT_TOKEN}",
+        }))
+        (template_dir / "nanobot-telegram.env").write_text("# synthetic private template\n")
+        env = self.environment(10)
+        env["HOME"] = str(home)
+        result = subprocess.run([str(MANAGER), "sync"], env=env, text=True,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        config = home / ".config/nanobot-telegram/config.json"
+        rendered = json.loads(config.read_text())
+        self.assertEqual(rendered["command"], str(home / ".local/bin/worker"))
+        self.assertEqual(rendered["args"], [str(home / "HelmCortex/brain")])
+        self.assertEqual(rendered["token"], "${TELEGRAM_BOT_TOKEN}")
+        self.assertEqual(stat.S_IMODE(config.stat().st_mode), 0o600)
+        # Existing private configuration is never replaced on a later sync.
+        config.write_text('{"private": true}\n')
+        again = subprocess.run([str(MANAGER), "sync"], env=env, text=True,
+                               capture_output=True, timeout=15)
+        self.assertEqual(again.returncode, 0, again.stderr)
+        self.assertEqual(json.loads(config.read_text()), {"private": True})
+
     def test_managed_nanobot_template_holds_no_network_addresses(self) -> None:
         templates = HERE.parents[4] / ".bots/templates"
         def strict_pairs(pairs):

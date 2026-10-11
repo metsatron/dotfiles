@@ -118,9 +118,9 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(len(guard), 18, sorted(guard))
             digest = "sha256:" + hashlib.sha256(b"test-account").hexdigest()
             self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_ACCOUNT_HASH"], digest)
-            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_AUTHORITY_IDENTITY"], "kikin-kushi")
-            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_TELEMETRY_HOST"], "honey-metsatron")
-            self.assertTrue(guard["CLAUDE_WARM_PRESERVATION_LEDGER_ROOT"].endswith("/claude-gillean"))
+            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_AUTHORITY_IDENTITY"], "")
+            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_TELEMETRY_HOST"], "")
+            self.assertEqual(guard["CLAUDE_WARM_PRESERVATION_LEDGER_ROOT"], "")
             self.assertTrue(guard["CLAUDE_WARM_PRESERVATION_BRIDGE"].endswith(
                 "/skills-mirror/FORGE/bin/fleet-preservation"))
             self.assertNotIn("test-account", json.dumps(guard))
@@ -214,7 +214,7 @@ class ServiceTests(unittest.TestCase):
         self.assertIn('bot_launcher="${bot_lane}/bin/${RC_SVCNAME}"', text)
         self.assertIn("-perm /022", text, "must refuse a checkout the bot could edit")
         self.assertNotIn("${bot_home}/DotCortex", text, "never the bot's own checkout")
-        self.assertNotIn("/home/gille", text)
+        self.assertNotRegex(text, r'/home/[a-z]+(?:/|")')
         result = subprocess.run(["sh", "-n", str(OPENRC / "honey-bot")], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
 

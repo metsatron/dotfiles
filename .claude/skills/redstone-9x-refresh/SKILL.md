@@ -86,7 +86,7 @@ Any new `redstone-9x-*` wrapper must use `#!/bin/bash`. The sanctuary guest is a
 The trap is the error text. IceWM reports it as:
 
 ```
-IceWM: Warning: Failed to execute /home/metsatron/.local/bin/redstone-9x-<tool>: No such file or directory
+IceWM: Warning: Failed to execute /home/YOUR_USERNAME/.local/bin/redstone-9x-<tool>: No such file or directory
 ```
 
 which names *the launcher*, not the interpreter — so it reads as a broken symlink or an unstowed file, and sends you auditing `ls -l` on a symlink that is perfectly correct. Check the shebang first: `head -1` the tangled script and compare it against a sibling that works. Every existing wrapper already uses `#!/bin/bash`.

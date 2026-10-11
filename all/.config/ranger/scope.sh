@@ -13,7 +13,7 @@ FILE_EXTENSION_LOWER="$(printf '%s' "${FILE_EXTENSION:-}" | tr '[:upper:]' '[:lo
 MIMETYPE="$(file --dereference --brief --mime-type -- "${FILE_PATH}")"
 
 preview_text() {
-  if command -v /home/metsatron/.cargo/bin/bat >/dev/null 2>&1; then
+  if command -v "${CARGO_HOME:-$HOME/.cargo}/bin/bat" >/dev/null 2>&1; then
     # --theme=base16: bat's "base16" theme maps syntax roles onto the 16 base
     # ANSI color slots (0-15) rather than hardcoding hex, and those exact 16
     # slots are already wired to the LainCore/DreamWeave base16 palette in
@@ -25,7 +25,7 @@ preview_text() {
     # drift from the theme. Plain "ansi" was rejected too: it drops down to
     # bare SGR with far fewer distinguished syntax roles than base16 offers
     # while inheriting the same terminal palette.
-    /home/metsatron/.cargo/bin/bat \
+    "${CARGO_HOME:-$HOME/.cargo}/bin/bat" \
       --color=always \
       --style=plain \
       --paging=never \

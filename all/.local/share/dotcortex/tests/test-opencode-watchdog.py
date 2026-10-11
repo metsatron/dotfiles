@@ -17,7 +17,7 @@ import unittest
 HERE = Path(__file__).resolve()
 WATCHDOG = HERE.parents[3] / "bin" / "opencode-watchdog"
 SESSION_ID = "ses_fixture00000000000000000000000"
-PROJECT = "/home/metsatron/HelmCortex"
+PROJECT = os.environ.get("OPENCODE_PROJECT_ROOT", str(Path.home() / "HelmCortex"))
 HOST = Path("/etc/hostname").read_text(encoding="utf-8").strip()
 
 

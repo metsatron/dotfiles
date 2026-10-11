@@ -10,7 +10,7 @@ Use this for fresh-machine setup or recovery.
 ## Quick Path
 
 ```bash
-git clone --recursive https://gitlab.com/metsatron/dotfiles.git ~/DotCortex
+git clone --recursive https://gitlab.com/YOUR_GIT_NAMESPACE/dotfiles.git ~/DotCortex
 cd ~/DotCortex && bash INSTALL.sh
 ```
 

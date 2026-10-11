@@ -9,14 +9,14 @@ Icon themes, GTK/xfwm themes, editor packs, and many other payloads in DotCortex
 
 ## Creating a NEW submodule repo yourself — push-to-create over SSH
 
-**You do not need `glab`, a token, or the GitLab API.** DotCortex already pushes over SSH, and GitLab's *push-to-create* makes a new **private** project automatically on first push to a path that does not exist yet, using that same SSH key. Absence of a CLI is not absence of the capability — the capability is the SSH key. `which glab` failing is not "I cannot create a repo"; check `ssh -T git@gitlab.com` → `Welcome to GitLab, @metsatron!` and proceed.
+**You do not need `glab`, a token, or the GitLab API.** DotCortex already pushes over SSH, and GitLab's *push-to-create* makes a new **private** project automatically on first push to a path that does not exist yet, using that same SSH key. Absence of a CLI is not absence of the capability — the capability is the SSH key. `which glab` failing is not "I cannot create a repo"; check `ssh -T git@gitlab.com` → `Welcome to GitLab, @YOUR_GIT_NAMESPACE!` and proceed.
 
-1. Confirm the key: `ssh -T git@gitlab.com` (with `-o BatchMode=yes`) → `Welcome to GitLab, @metsatron!`.
+1. Confirm the key: `ssh -T git@gitlab.com` (with `-o BatchMode=yes`) → `Welcome to GitLab, @YOUR_GIT_NAMESPACE!`.
 2. Confirm the repo does NOT already exist: `git ls-remote git@gitlab.com:metsatron/<name>.git` — **real exit 128 + "project could not be found" = safe to create**. Check the *real* exit, not a piped one — a pipe (`… | head`) masks `ls-remote`'s exit behind `head`'s 0.
 3. Build the content locally, on master: `git init -b master` — `git init` may default to `main`, which is an EXTREME WARMAPCODEX violation baked permanently into a new repo, so pass `-b master` and verify `git branch --show-current` before pushing. Commit.
 4. `git remote add origin git@gitlab.com:metsatron/<name>.git`
-5. `GIT_SSH_COMMAND='/usr/bin/ssh -o BatchMode=yes -o PreferredAuthentications=publickey' git push -u origin master` → GitLab replies **"The private project metsatron/<name> was successfully created."**
-6. **Verify visibility in the web UI** (`https://gitlab.com/metsatron/<name>`). You cannot query it over SSH without a token, and getting it wrong publishes whatever the repo holds — for license-restricted payloads, have Mètsàtron eyeball it.
+5. `GIT_SSH_COMMAND='/usr/bin/ssh -o BatchMode=yes -o PreferredAuthentications=publickey' git push -u origin master` → GitLab replies **"The private project YOUR_GIT_NAMESPACE/<name> was successfully created."**
+6. **Verify visibility in the web UI** (`https://gitlab.com/YOUR_GIT_NAMESPACE/<name>`). You cannot query it over SSH without a token, and getting it wrong publishes whatever the repo holds — for license-restricted payloads, have Mètsàtron eyeball it.
 
 ## Registering it in DotCortex
 

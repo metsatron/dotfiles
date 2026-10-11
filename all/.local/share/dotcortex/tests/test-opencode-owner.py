@@ -12,12 +12,14 @@ import unittest
 
 HERE = Path(__file__).resolve()
 OWNER = HERE.parents[3] / "bin" / "opencode-owner"
-PROJECT = "/home/metsatron/HelmCortex"
+PROJECT = "/tmp/YOUR_WORKSPACE"
 
 
 class OpenCodeOwnerTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
+        self.project = str(Path(self.temp.name) / "YOUR_WORKSPACE")
+        Path(self.project).mkdir()
         self.state = Path(self.temp.name) / "opencode.json"
 
     def tearDown(self) -> None:
@@ -28,7 +30,7 @@ class OpenCodeOwnerTest(unittest.TestCase):
             "schema": "helmcortex.opencode-owner.v2",
             "owner": "telegram-agent-host:opencode",
             "bot": "opencode",
-            "project": PROJECT,
+            "project": self.project,
             "host": "127.0.0.1",
             "port": 4096,
             "backend_pid": 999999991,
@@ -39,9 +41,10 @@ class OpenCodeOwnerTest(unittest.TestCase):
 
     def stop(self) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [str(OWNER), "stop", "--state", str(self.state), "--project", PROJECT,
+            [str(OWNER), "stop", "--state", str(self.state), "--project", self.project,
              "--host", "127.0.0.1", "--port", "4096"],
             text=True, capture_output=True, timeout=10,
+            env=dict(os.environ, OPENCODE_PROJECT_ROOT=self.project),
         )
 
     def test_exact_dead_preboot_owner_state_is_retired(self) -> None:
@@ -62,7 +65,7 @@ class OpenCodeOwnerTest(unittest.TestCase):
         poller = Path(self.temp.name) / "poller"
         poller.write_text("#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n", encoding="utf-8")
         poller.chmod(poller.stat().st_mode | stat.S_IXUSR)
-        process = subprocess.Popen([str(poller), "start", "--mode", "installed"], cwd=PROJECT)
+        process = subprocess.Popen([str(poller), "start", "--mode", "installed"], cwd=self.project)
         try:
             time.sleep(0.1)
             proc = Path("/proc") / str(process.pid)
@@ -72,7 +75,7 @@ class OpenCodeOwnerTest(unittest.TestCase):
             self.write_state(
                 poller_pid=process.pid,
                 poller_start_ticks=start_ticks,
-                poller_cwd=os.path.realpath(PROJECT),
+                poller_cwd=os.path.realpath(self.project),
                 poller_argv=argv,
                 poller_entrypoint=str(poller),
             )

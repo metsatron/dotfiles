@@ -16,7 +16,7 @@ An isolated Xvfb/host render — even with the guest's exact `icewm-gradients` b
 `loom redstone:refresh` projects theme dirs the guest is **missing**. It does **not** re-project a theme dir that already exists in the guest home. So: you edit `linux/.icewm/themes/<Theme>/frameATL.xpm`, run refresh, capture — and the guest still has the OLD pixmap. You then "verify" a change that never shipped and conclude the edit did nothing (or that some unrelated thing regressed). This has burned multiple sessions.
 
 Before testing ANY edit to an existing theme dir:
-1. `GH=/home/metsatron/.local/share/dotcortex/guests/sanctuary-redstone-9x/home`
+1. `GH=/home/YOUR_USERNAME/.local/share/dotcortex/guests/sanctuary-redstone-9x/home`
 2. `rm -rf "$GH/.icewm/themes/<Theme>"`  (guest copy only — never the DotCortex source). The SAME law covers `$GH/.themes/<Theme>` (GTK themes) and the guest icon-theme dirs under `$GH/.local/share/` — a GTK or icon edit that skips the guest rm "verifies" a change that never shipped, exactly like the IceWM case (burned 2026-08-08). Open question, logged the same night: painted marker pixels in a guest theme dir vanished without a refresh — something re-projects guest theme dirs we believed were gap-fill-only; do not trust guest-side edits to persist across scheme applies.
 3. `cd ~/DotCortex && loom redstone:refresh`
 4. **Confirm deployment** by grepping the guest file for your exact edit BEFORE you capture: `grep -m1 'yourEditPattern' "$GH/.icewm/themes/<Theme>/frameATL.xpm"`. If it is not there, nothing you capture is about your change.
@@ -78,9 +78,9 @@ Theme dirs are vendored payload. After fixing a generator, the built output is s
 # top-left corner, indexed by (x-frameX, y-frameY). Read-only — safe while the
 # user is in the room. Requires the room running on :93.
 set -u
-TITLE="${1:?window title, e.g. metsatron}"
+TITLE="${1:?window title, e.g. YOUR_USERNAME}"
 CW="${2:-26}"; CH="${3:-30}"; DX="${4:--6}"; DY="${5:--8}"
-XA=/home/metsatron/.Xauthority
+XA=/home/YOUR_USERNAME/.Xauthority
 IMPORT=$(ls -d ~/.guix-extra-profiles/*/*/bin/import 2>/dev/null | head -1)
 CV=$(ls -d ~/.guix-extra-profiles/*/*/bin/convert 2>/dev/null | head -1)
 XD=/usr/bin/xdotool; XW=/usr/bin/xwininfo

@@ -391,12 +391,14 @@ class HostScopeTests(unittest.TestCase):
     def test_firmware_row_only_on_kikin_kushi_and_other_hosts_unchanged(self):
         self.assertIn('firmware-amd-graphics "" system kikin-kushi ""', FLEET_MANIFEST.read_text())
         with tempfile.TemporaryDirectory() as tmp:
-            old_script = Path(tmp) / "nala-apply.master"
-            old_manifest = Path(tmp) / "packages.master.ssv"
-            for rel, out in (("debian/.local/bin/nala-apply", old_script),
-                             ("debian/.nala/manifest/packages.ssv", old_manifest)):
-                out.write_text(subprocess.run(["git", "-C", str(ROOT), "show", f"{BASE_REV}:{rel}"],
-                                              capture_output=True, text=True, check=True).stdout)
+            # Compare the current manifest with only the scoped row removed:
+            # unrelated later package additions must not invalidate this policy test.
+            old_script = NALA_APPLY
+            old_manifest = Path(tmp) / "packages.without-host-firmware.ssv"
+            old_manifest.write_text("\n".join(
+                row for row in FLEET_MANIFEST.read_text().splitlines()
+                if not row.startswith('firmware-amd-graphics "" system kikin-kushi ')
+            ) + "\n")
             for host in ("x230", "t480s", "t480", "kikin-kushi", "beelink", "some-new-box"):
                 new_result, new_set = self.resolve(NALA_APPLY, FLEET_MANIFEST, host)
                 _old_result, old_set = self.resolve(old_script, old_manifest, host)

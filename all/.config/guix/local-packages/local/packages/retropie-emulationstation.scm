@@ -2,7 +2,7 @@
 
 ;; Guix's main-channel =emulation-station= is the original unmaintained Aloshi
 ;; upstream (commit-pinned, no release since) — a different, long-diverged
-;; lineage from the actively-developed RetroPie fork the =metsatron= ES theme
+;; lineage from the actively-developed RetroPie fork the =YOUR_USERNAME= ES theme
 ;; and =es_systems.cfg= actually target. Packaged locally from source instead.
 
 ;; Pinned: tag =v2.9.6=, recursive submodule checkout (RetroPie's ES vendors a

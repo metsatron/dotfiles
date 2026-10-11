@@ -19,7 +19,7 @@ checkpath() { echo "CHECKPATH $*"; }
 hostname() { echo testhost; }
 getent() {
     case "$2" in
-        gille) echo "gille:x:1000:1000::$FAKE_HOME:/bin/sh" ;;
+        YOUR_PEER_USERNAME) echo "YOUR_PEER_USERNAME:x:1000:1000::$FAKE_HOME:/bin/sh" ;;
         agent-claude) echo "agent-claude:x:2002:2002::$FAKE_HOME:/bin/bash" ;;
         rooty) echo "rooty:x:0:0::$FAKE_HOME:/bin/sh" ;;
         *) return 2 ;;
@@ -48,7 +48,7 @@ class WarmConsortTests(unittest.TestCase):
         return path
 
     def body(self, svc: str, script: str, conf: str = "") -> subprocess.CompletedProcess[str]:
-        prog = f"{STUBS}\nFAKE_HOME='{self.home}'\nRC_SVCNAME='{svc}'\n{conf}\n. '{BODY}'\n{script}\n"
+        prog = f"{STUBS}\nWARM_OPERATOR_USER=YOUR_PEER_USERNAME\nFAKE_HOME='{self.home}'\nRC_SVCNAME='{svc}'\n{conf}\n. '{BODY}'\n{script}\n"
         return subprocess.run(["bash", "-c", prog], capture_output=True, text=True, timeout=30)
 
     def test_instance_derives_from_the_service_name(self) -> None:
@@ -94,11 +94,11 @@ class WarmConsortTests(unittest.TestCase):
 
     def test_compat_conf_reproduces_the_hand_written_scripts(self) -> None:
         self.put_bin(".local/bin/claude-warm")
-        conf = (CONF / "claude-warm").read_text().replace("/home/gille", str(self.home))
+        conf = (CONF / "claude-warm").read_text().replace("/home/YOUR_PEER_USERNAME", str(self.home))
         out = self.body("claude-warm", "start", conf)
         self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
         su = next(line for line in out.stdout.splitlines() if line.startswith("SU "))
-        self.assertIn("-l gille", su)
+        self.assertIn("-l YOUR_PEER_USERNAME", su)
         self.assertIn("XDG_RUNTIME_DIR='/run/warm'", su)
         self.assertIn(f"PATH='{self.home}/.local/bin:/usr/local/bin:/usr/bin:/bin'", su)
         self.assertIn("CLAUDE_WARM_HERDR_AGENT='honey-opus'", su)
@@ -109,7 +109,7 @@ class WarmConsortTests(unittest.TestCase):
 
     def test_codex_gets_no_claude_herdr_name(self) -> None:
         self.put_bin(".local/bin/codex-warm")
-        conf = (CONF / "codex-warm").read_text().replace("/home/gille", str(self.home))
+        conf = (CONF / "codex-warm").read_text().replace("/home/YOUR_PEER_USERNAME", str(self.home))
         out = self.body("codex-warm", "start", conf)
         su = next(line for line in out.stdout.splitlines() if line.startswith("SU "))
         self.assertNotIn("CLAUDE_WARM_HERDR_AGENT", su)
@@ -131,7 +131,7 @@ class WarmConsortTests(unittest.TestCase):
 
     def test_unknown_account_and_kind_are_refused(self) -> None:
         self.assertIn("rc=1", self.body("claude-warm.nobody-here", "warm_valid; echo rc=$?").stdout)
-        self.assertIn("rc=1", self.body("gemini-warm.gille", "warm_valid; echo rc=$?").stdout)
+        self.assertIn("rc=1", self.body("gemini-warm.YOUR_PEER_USERNAME", "warm_valid; echo rc=$?").stdout)
 
     def test_pid_file_names_one_supervisor_among_several(self) -> None:
         bin_ = self.put_bin(".local/bin/claude-warm")
@@ -140,7 +140,7 @@ class WarmConsortTests(unittest.TestCase):
             time.sleep(0.2)
             pidfile = self.run_dir / "svc.pid"
             pidfile.write_text(f"{procs[1].pid}\n")
-            conf = f"warm_user=gille\nwarm_pidfile='{pidfile}'"
+            conf = f"warm_user=YOUR_PEER_USERNAME\nwarm_pidfile='{pidfile}'"
             out = self.body("claude-warm", "warm_pid", conf)
             self.assertEqual(out.stdout.strip(), str(procs[1].pid))
             pidfile.write_text("999999\n")

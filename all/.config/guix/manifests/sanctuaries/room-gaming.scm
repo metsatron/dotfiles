@@ -53,7 +53,7 @@
 ;; GVFS's trash aggregator (GUnixMountMonitor) walks every mount point it
 ;; can see in ITS OWN mount namespace and checks each one for a
 ;; .Trash-<uid>/files directory. It found the host's ~/mnt/x230 network
-;; mount bridged in at /run/host/home/metsatron/mnt/x230, which has a real
+;; mount bridged in at /run/host/home/YOUR_USERNAME/mnt/x230, which has a real
 ;; .Trash-1000 on it, and merged its real personal files (voice messages,
 ;; vault notes, etc.) into this sandboxed room's trash:/// view. This is
 ;; structural, not an orphan-daemon artifact, and will recur on ANY fresh

@@ -67,7 +67,7 @@ Both need pushing for the icons to reach another machine — a DotCortex push al
    `--copy-aliases` is passed.
 4. Sync live icon roots:
    ```bash
-   all/.local/bin/icons-home-sync --repo-root /home/metsatron/DotCortex
+   all/.local/bin/icons-home-sync --repo-root /home/YOUR_USERNAME/DotCortex
    ```
 5. Verify files resolve through the live theme:
    ```bash
