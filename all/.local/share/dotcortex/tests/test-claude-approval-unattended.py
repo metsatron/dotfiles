@@ -245,6 +245,7 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         (self.repo / 'README.org').write_text('remote divergence')
         self.git('commit', '-am', 'test: divergence')
         divergent = self.git('rev-parse', 'HEAD')
+        self.git('push', 'origin', 'topic')  # transfer the object without refreshing origin/master
         subprocess.run(['git', '--git-dir', str(remote), 'update-ref', 'refs/heads/master', divergent], capture_output=True, check=True)
         self.git('checkout', 'master')
         self.ask('git push origin master')
