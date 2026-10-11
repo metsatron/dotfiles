@@ -1223,6 +1223,7 @@ from unittest import mock
 REPO = Path(__file__).resolve().parents[5]
 ENGINE = REPO / 'all/.local/lib/dotcortex/claude_approval_kikin.py'
 READER = REPO / 'all/.local/bin/approval-morning-queue'
+PRESENCE_HOOK = REPO / 'all/.local/bin/claude-hook-admiral-presence'
 SPEC = importlib.util.spec_from_file_location('unattended_engine', ENGINE)
 e = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(e)
@@ -1249,6 +1250,14 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.flag = self.base / 'away'
         self.queue = self.base / 'queue.jsonl'
         self.ledger = self.base / 'ledger.jsonl'
+        self.presence = self.base / 'admiral-last-seen'
+        self.presence.touch()
+        self.presence_env = mock.patch.dict(os.environ, {
+            'DOTCORTEX_ADMIRAL_LAST_SEEN': str(self.presence),
+            'DOTCORTEX_ADMIRAL_TELEGRAM_USER_ID': 'ADMIRAL_FIXTURE',
+        })
+        self.presence_env.start()
+        self.addCleanup(self.presence_env.stop)
         self.git('init', '-b', 'master')
         self.git('config', 'user.name', 'YOUR_TEST_USER')
         self.git('config', 'user.email', 'YOUR_USER@YOUR_HOST.helm')
@@ -1301,6 +1310,10 @@ class UnattendedCoordinatorTests(unittest.TestCase):
                            env=env, capture_output=True, text=True, timeout=5, check=True)
         return json.loads(p.stdout)['hookSpecificOutput']['decision'] if p.stdout.strip() else {'behavior': 'ask'}
 
+    def stamp_presence(self, payload):
+        subprocess.run([str(PRESENCE_HOOK)], input=json.dumps(payload), env=os.environ.copy(),
+                       capture_output=True, text=True, timeout=3, check=True)
+
     def allow(self, command):
         result = e.classify(self.event(command), self.loaded())
         self.assertTrue(result[0], (command, result))
@@ -1324,7 +1337,7 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.assertEqual(decision['behavior'], 'deny')
         self.assertIs(decision['interrupt'], False)
         self.assertIn('deferred: queued', decision['message'])
-        self.assertIn('do not retry or rephrase', decision['message'])
+        self.assertIn('never retry, rephrase or route around this refusal', decision['message'])
         record = json.loads(self.queue.read_text())
         self.assertEqual(record['tool'], 'Bash')
         self.assertEqual(record['command'], 'unknown-command --argument')
@@ -1334,6 +1347,50 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.assertIn('timestamp', record)
         self.assertEqual(self.queue.stat().st_mode & 0o777, 0o600)
         self.assertEqual(json.loads(self.ledger.read_text())['decision'], 'deny')
+
+    def test_fresh_terminal_presence_keeps_native_ask(self):
+        self.presence.unlink()
+        self.stamp_presence({'hook_event_name': 'UserPromptSubmit', 'prompt': 'terminal request'})
+        self.manifest['gate_inversion']['present_refusal'] = 'ask'
+        decision = self.run_hook('unknown-command')
+        self.assertEqual(decision['behavior'], 'ask')
+        self.assertFalse(self.queue.exists())
+        self.assertEqual(json.loads(self.ledger.read_text())['away_reason'], 'presence')
+
+    def test_fresh_admiral_telegram_presence_keeps_native_ask(self):
+        self.presence.unlink()
+        self.stamp_presence({
+            'hook_event_name': 'UserPromptSubmit',
+            'prompt': '<channel source="telegram">telegram request</channel>',
+            'sender_id': 'ADMIRAL_FIXTURE',
+        })
+        self.manifest['gate_inversion']['present_refusal'] = 'ask'
+        decision = self.run_hook('unknown-command')
+        self.assertEqual(decision['behavior'], 'ask')
+        self.assertFalse(self.queue.exists())
+
+    def test_other_telegram_sender_does_not_refresh_presence(self):
+        self.presence.unlink()
+        self.stamp_presence({
+            'hook_event_name': 'UserPromptSubmit',
+            'prompt': '<channel source="telegram">other request</channel>',
+            'sender_id': 'OTHER_FIXTURE',
+        })
+        decision = self.run_hook('unknown-command')
+        self.assertEqual(decision['behavior'], 'deny')
+        self.assertEqual(json.loads(self.queue.read_text())['away_reason'], 'presence_missing')
+
+    def test_stale_presence_denies_and_queues(self):
+        os.utime(self.presence, (0, 0))
+        decision = self.run_hook('unknown-command')
+        self.assertEqual(decision['behavior'], 'deny')
+        self.assertEqual(json.loads(self.queue.read_text())['away_reason'], 'presence_stale')
+
+    def test_missing_presence_file_is_away(self):
+        self.presence.unlink()
+        decision = self.run_hook('unknown-command')
+        self.assertEqual(decision['behavior'], 'deny')
+        self.assertEqual(json.loads(self.queue.read_text())['away_reason'], 'presence_missing')
 
     def test_away_floor_denies_and_queues(self):
         self.flag.touch()

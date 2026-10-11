@@ -31,6 +31,13 @@ class GateInversionTests(unittest.TestCase):
         self.queue = self.base / 'queue.jsonl'
         self.log = self.base / 'ledger.jsonl'
         self.flag = self.base / 'away'
+        self.presence = self.base / 'admiral-last-seen'
+        self.presence.touch()
+        self.presence_env = mock.patch.dict(os.environ, {
+            'DOTCORTEX_ADMIRAL_LAST_SEEN': str(self.presence),
+        })
+        self.presence_env.start()
+        self.addCleanup(self.presence_env.stop)
         self.manifest = json.loads((REPO / 'all/.config/dotcortex/claude-approval-canary.kikin.v1.json').read_text())
         self.manifest['roots'] = [str(self.root), str(self.worktree)]
         self.manifest['scratch_roots'] = [str(self.root)]
@@ -50,7 +57,7 @@ class GateInversionTests(unittest.TestCase):
 
     def run_hook(self, event, *, answers=None, status='ok', side_effect=None):
         self.path.write_text(json.dumps(self.manifest))
-        env = {'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_KIKIN_LOG': str(self.log),
+        env = {**os.environ, 'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_KIKIN_LOG': str(self.log),
                'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
         out = io.StringIO()
         with mock.patch.dict(os.environ, env), mock.patch.object(e.sys, 'stdin', io.StringIO(json.dumps(event))), \
@@ -400,7 +407,7 @@ class GateInversionTests(unittest.TestCase):
                         if body is not None:
                             candidate.write_text('pass' if body == 'timeout' else body)
                         self.path.write_text(json.dumps(self.manifest))
-                        env = {'DOTCORTEX_KIKIN_APPROVAL_ENGINE': str(candidate),
+                        env = {**os.environ, 'DOTCORTEX_KIKIN_APPROVAL_ENGINE': str(candidate),
                                'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
                         before = len(self.queue.read_text().splitlines()) if self.queue.exists() else 0
                         out = io.StringIO()
@@ -425,7 +432,7 @@ class GateInversionTests(unittest.TestCase):
                             self.assertEqual(json.loads(sink.read_text())['away'], away)
                             record = json.loads(self.queue.read_text().splitlines()[-1])
                             self.assertEqual(record['request'], self.event())
-                            self.assertEqual(record['away_reason'], 'away_flag' if away else 'present')
+                            self.assertEqual(record['away_reason'], 'away_flag' if away else 'presence')
                 if away:
                     self.flag.unlink()
 
@@ -434,7 +441,7 @@ class GateInversionTests(unittest.TestCase):
         wrapper = self.wrapper_module()
         self.manifest['gate_inversion'].pop('present_refusal')
         self.path.write_text(json.dumps(self.manifest))
-        env = {'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
+        env = {**os.environ, 'SO_APPROVAL_KIKIN_MANIFEST': str(self.path), 'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
         with mock.patch.dict(os.environ, env):
             self.assertIsNone(wrapper.defer(json.dumps(self.event())))
         self.assertFalse(self.queue.exists())
