@@ -158,14 +158,19 @@ class RemotePresenceTests(unittest.TestCase):
         self.assertEqual(e._away_status(self.loaded(), now=now), (True, 'away_flag'))
 
     def test_present_hold_timeout_queues_and_note_has_id(self):
+        # pty-hold-20261012: the Telegram plugin hold is gone. When the
+        # Admiral is present the gate returns the NATIVE ask exactly as
+        # today (the harness relay shows it; nothing is queued at the gate).
+        # The PTY owner (claude-warm) owns the timeout and writes the queue
+        # item with reason hold_timeout when the prompt outlives the
+        # deadline (covered by test-approval-pty-hold.py).
         self.configure()
         self.stamp.touch()
+        self.manifest['unattended'].pop('hold_notify_argv', None)
         result = self.hook(self.event('rm report'))
-        self.assertEqual(result['behavior'], 'deny')
-        record = self.records()[0]
-        self.assertEqual(record['away_reason'], 'hold_timeout')
-        self.assertIn(record['id'], result['message'])
-        self.assertIn('never retry, rephrase or route around this refusal', result['message'])
+        self.assertEqual(result['behavior'], 'ask')
+        self.assertFalse(self.queue.exists(),
+                         'the present gate must not write the queue')
 
     def test_later_policy_allow_resolves_same_request(self):
         self.configure()
@@ -396,59 +401,6 @@ class RemotePresenceTests(unittest.TestCase):
         for command in ['approval-presence stamp','approval-telegram-verdict','approval-telegram-presence',
                         'approval-queue approve abc --sender 123456','approval-queue claim abc --confirmation abc']:
             self.assertFalse(e._decide_request(self.event(command),self.loaded())[0],command)
-
-    def telegram_button_flow(self, mode):
-        self.configure();self.loaded();self.stamp.touch()
-        self.manifest['unattended'].update(hold_timeout_minutes=.02,
-            hold_notify_argv=[str(REPO/'all/.local/bin/approval-telegram-hold')])
-        self.loaded()
-        socket_path=self.base/'holds.sock'
-        module=str(REPO/'all/.local/share/dotcortex/approval-telegram/approval-holds.ts')
-        runner=self.base/'bridge.ts'
-        runner.write_text('import {startApprovalHolds,handleApprovalCallback} from '+json.dumps(module)+';\n'+r'''
-const access={allowFrom:['123456']};
-const ctx={from:{id:123456},answerCallbackQuery:async()=>{},editMessageReplyMarkup:async()=>{}};
-const bot={api:{sendMessage:async(_chat,text,options)=>{
-  if(!text.includes('rm report'))throw new Error('missing preview');
-  if(process.env.APPROVAL_FIXTURE_MODE==='failed')throw new Error('synthetic delivery failure');
-  const data=options.reply_markup.inline_keyboard[0][process.env.APPROVAL_FIXTURE_MODE==='deny'?1:0].callback_data;
-  setTimeout(()=>handleApprovalCallback(ctx,data,access),20);
-}}};
-startApprovalHolds(bot,()=>access,process.env.TELEGRAM_STATE_DIR!);
-''')
-        env={**os.environ,'SO_APPROVAL_KIKIN_MANIFEST':str(self.path),'SO_APPROVAL_MORNING_QUEUE':str(self.queue),
-             'SO_APPROVAL_KIKIN_LOG':str(self.ledger),'APPROVAL_TELEGRAM_HOLD_SOCKET':str(socket_path),
-             'APPROVAL_VERDICT_HELPER':str(REPO/'all/.local/bin/approval-telegram-verdict'),
-             'APPROVAL_PRESENCE_HELPER':str(REPO/'all/.local/bin/approval-telegram-presence'),
-             'APPROVAL_FIXTURE_MODE':mode,'TELEGRAM_STATE_DIR':str(self.base),'DOTCORTEX_KIKIN_APPROVAL_ENGINE':str(fixture.ENGINE)}
-        process=subprocess.Popen(['bun',str(runner)],env=env,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
-        try:
-            for _ in range(100):
-                if socket_path.exists():break
-                if process.poll() is not None:self.fail(process.stderr.read().decode())
-                time.sleep(.01)
-            self.assertTrue(socket_path.exists())
-            result=subprocess.run([str(REPO/'all/.local/bin/claude-hook-approval-inverted')],env=env,
-                input=json.dumps(self.event('rm report')),text=True,capture_output=True,timeout=5,check=True)
-            expected='allow' if mode=='allow' else 'deny'
-            self.assertEqual(json.loads(result.stdout)['hookSpecificOutput']['decision']['behavior'],expected,result.stdout)
-            self.assertEqual(self.records()[0]['status'],'resolved' if mode=='allow' else 'open')
-            ledger=json.loads(self.ledger.read_text().splitlines()[-1])
-            if mode=='allow':self.assertTrue(ledger['human_approved'])
-            else:self.assertEqual(ledger['hold_status'],'deny' if mode=='deny' else 'unavailable')
-            self.assertEqual(ledger['reason'],'true_floor')
-        finally:
-            process.terminate();process.communicate(timeout=3)
-
-
-    def test_complete_hook_plugin_allow_button_flow(self):
-        self.telegram_button_flow('allow')
-
-    def test_complete_hook_plugin_deny_button_flow(self):
-        self.telegram_button_flow('deny')
-
-    def test_complete_hook_plugin_delivery_failure_flow(self):
-        self.telegram_button_flow('failed')
 
     def test_fable_absolute_scratch_write_from_protected_cwd(self):
         self.configure()
