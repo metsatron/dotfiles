@@ -245,6 +245,21 @@ def private_path(path, kind):
         raise ValueError("unsafe Claude runtime ownership")
 
 
+def private_socket(path):
+    """Bunta follow-up 1 (mail 179172671600): the socket's OWN mode bits are
+    not the safety signal — its PRIVATE parent directory is. Honey's seats may
+    legitimately carry a group bit on the socket file while the containing
+    directory is 0o700 owned by the run-as user, which locks every other
+    principal out of the path. Judge safety by the parent (owner = run-as
+    user, no group/other access), and additionally require the socket itself
+    to be a socket owned by us; the socket's group/other MODE bits do not
+    matter. A loose parent is still refused."""
+    info = path.lstat()
+    if info.st_uid != os.getuid() or not stat.S_ISSOCK(info.st_mode):
+        raise ValueError("unsafe Claude runtime ownership")
+    private_path(path.parent, stat.S_ISDIR)
+
+
 def descendant(pid, ancestor):
     for _ in range(32):
         path = Path(f"/proc/{pid}")
@@ -293,7 +308,7 @@ def resolve_owner(target):
         if not valid_owner(owner) or path.parent.name != owner["channel"]:
             raise ValueError("invalid Claude owner")
         control = path.parent / "control.sock"
-        private_path(control, stat.S_ISSOCK)
+        private_socket(control)
         if state.get("control_socket") != str(control):
             raise ValueError("invalid Claude control socket")
         matches.append((owner, control))
@@ -437,15 +452,35 @@ def owner_control(owner, request, warm):
         return dict(ack, status="accepted")
 
 
+def fresh_seat_idle(owner):
+    """Bunta follow-up 2 (mail 179172671600): a freshly launched seat has no
+    completed turn yet (last_normal_stop None) and must not be stranded
+    waiting for a hand-typed first message. It counts as idle at
+    completed-turn epoch 0 ONLY when it is pristine: no local input ever,
+    no transcript quiescence running, hooks healthy, screen idle, no
+    compaction or recovery, no turn running — the rest of admission_busy
+    already enforces those, so this predicate only relaxes the
+    `last_normal_stop` requirement when nothing else is pending. Every
+    other admission check (screen re-read under the lock, owner identity,
+    epoch recheck) still applies."""
+    return (owner.last_local_input is None
+            and owner.transcript_quiescence_deadline is None)
+
+
 def admission_busy(owner):
+    stop = owner.last_normal_stop
+    fresh = stop is None
+    if fresh and not fresh_seat_idle(owner):
+        return True  # fresh but not pristine: refuse (follow-up 2)
+    if not fresh and not stop:
+        return True  # non-fresh seat that never completed a turn
     return (owner.status != "idle" or owner.screen_state != "idle" or owner.lifecycle_health != "wired"
             or owner.compacting or owner.recovery_pending or owner.recovery_awaiting
             or getattr(owner, "mailcortex_input_dirty", True)
             or owner.transcript_gate_blocked or owner.transcript_partial
             or owner.transcript_quiescence_deadline is not None
-            or not owner.last_normal_stop
-            or (owner.last_local_input is not None and owner.last_local_input >= owner.last_normal_stop)
-            or (owner.last_lifecycle_activity is not None and owner.last_lifecycle_activity > owner.last_normal_stop)
+            or (owner.last_local_input is not None and (fresh or owner.last_local_input >= stop))
+            or (owner.last_lifecycle_activity is not None and (fresh or owner.last_lifecycle_activity > stop))
             or owner._gate_reason("manual") is not None)
 
 

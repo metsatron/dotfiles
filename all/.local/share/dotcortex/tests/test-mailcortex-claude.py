@@ -2,6 +2,7 @@
 """Cross-host Claude wake fixtures: no SSH, live sessions, or private config."""
 import importlib.machinery
 import importlib.util
+import contextlib
 import json
 import os
 import shutil
@@ -291,6 +292,110 @@ class ClaudeWakeTests(unittest.TestCase):
                 result.stdout = row
                 state.chmod(0o644)
                 with self.assertRaises(ValueError): self.c.resolve_owner(target)
+
+    def test_fresh_idle_seat_is_admitted_with_epoch_zero(self):
+        # Bunta follow-up 2 (mail 179172671600): a freshly launched seat has
+        # no completed turn yet (last_normal_stop None). If it is idle at its
+        # prompt with healthy hooks and no anomaly, it counts as idle with
+        # completed-turn epoch 0 and IS admitted.
+        o = self.fake_owner()
+        o.completed_turn_epoch = 0
+        o.last_normal_stop = None
+        o.last_lifecycle_activity = None
+        w = self.fake_warm()
+        with mock.patch.object(self.c, "owner_matches", return_value=True), \
+             mock.patch.object(self.c, "pending_terminal", return_value=False):
+            self.assertEqual(self.c.owner_control(o, self.request(), w)["status"], "accepted")
+            self.assertEqual(o.completed_turn_epoch, 0)
+        w.write_all.assert_called_once()
+
+    def test_fresh_seat_still_painting_or_anomalous_is_refused_and_requeued(self):
+        # fresh + anything non-idle (still painting, mid-startup, gate reason,
+        # local input, quiescence running) must stay refused (busy)
+        for field, value in (("screen_state", "unknown"), ("screen_state", "blocked"),
+                             ("status", "active"), ("last_local_input", 5),
+                             ("transcript_quiescence_deadline", 99.0),
+                             ("lifecycle_health", "missing"), ("compacting", True),
+                             ("mailcortex_input_dirty", True)):
+            with self.subTest(field=field, value=value):
+                o = self.fake_owner()
+                o.completed_turn_epoch = 0
+                o.last_normal_stop = None
+                o.last_lifecycle_activity = None
+                setattr(o, field, value)
+                with mock.patch.object(self.c, "owner_matches", return_value=True), \
+                     mock.patch.object(self.c, "pending_terminal", return_value=False):
+                    self.assertEqual(
+                        self.c.owner_control(o, self.request(), self.fake_warm())["status"],
+                        "busy")
+
+    def test_fresh_seat_epoch_recheck_still_holds(self):
+        # even for a fresh seat, a mismatched epoch in the expected owner is
+        # refused (unavailable) — the identity fence does not relax
+        o = self.fake_owner()
+        o.completed_turn_epoch = 0
+        o.last_normal_stop = None
+        o.last_lifecycle_activity = None
+        with mock.patch.object(self.c, "owner_matches", return_value=False), \
+             mock.patch.object(self.c, "pending_terminal", return_value=False):
+            self.assertEqual(
+                self.c.owner_control(o, self.request(), self.fake_warm())["status"],
+                "unavailable")
+
+    def test_socket_safety_judged_by_private_parent_not_socket_bits(self):
+        # Bunta follow-up 1 (mail 179172671600): the socket's OWN mode bits are
+        # not the safety signal; the PRIVATE parent directory is (owner = us,
+        # no group/other access on the parent). A loose socket mode under a
+        # private parent passes; a loose parent fails; a wrong owner fails.
+        import socket
+        target = dict(self.record["claude_target"], tmux_socket=str(self.short_dir("tmux.sock") / "s"),
+                      runtime_dir=str(self.short_dir("runtime")))
+        root = Path(target["runtime_dir"]) / "claude-idle-compaction" / self.owner["channel"]
+        root.mkdir(parents=True)
+        root.chmod(0o700)
+        root.parent.chmod(0o700)
+        control = root / "control.sock"
+        state = root / "state.json"
+        row = f"YOUR_TMUX_SESSION\t%1\t{os.getpid()}\t/dev/pts/1\t0\t0\n"
+        tmux_path = Path(target["tmux_socket"])
+
+        def bind_and_state():
+            for stale in (control, tmux_path):
+                with contextlib.suppress(FileNotFoundError):
+                    stale.unlink()
+            with socket.socket(socket.AF_UNIX) as tmux, socket.socket(socket.AF_UNIX) as ipc:
+                tmux.bind(str(tmux_path))
+                os.chmod(tmux_path, 0o600)
+                ipc.bind(str(control))
+            state.write_text(json.dumps(dict(self.owner, supervisor_pid=os.getpid(),
+                supervisor_start_time=self.c.process_start_time(os.getpid()),
+                completed_turn_epoch=1, control_socket=str(control))))
+            state.chmod(0o600)
+
+        def resolve():
+            result = subprocess.CompletedProcess([], 0, row, "")
+            with mock.patch.object(self.c.subprocess, "run", return_value=result):
+                return self.c.resolve_owner(target)
+
+        # baseline: private parent + 0o600 socket resolves
+        bind_and_state()
+        owner, path = resolve()
+        self.assertEqual(path, control)
+        # private parent with a LOOSE socket mode (0o666 on the socket itself):
+        # safety rides the parent, so this must still resolve
+        control.chmod(0o666)
+        owner, path = resolve()
+        self.assertEqual(path, control)
+        # loose PARENT (group access on the socket's private directory): refused
+        root.chmod(0o707)
+        with self.assertRaises(ValueError):
+            resolve()
+        root.chmod(0o700)
+        # wrong owner (uid mismatch): refused
+        bind_and_state()
+        with mock.patch("os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaises(ValueError):
+                resolve()
 
     def test_status_failure_and_bad_claude_mail_do_not_block_other_seats(self):
         self.mail(1)
