@@ -42,4 +42,29 @@ with tempfile.TemporaryDirectory(prefix='fb-beos-transitions-') as tmp:
  (Path(tmp)/'.beos-r5-theme.json').unlink();config.write_text('server: {}\n');run('beos-r5');run('off');assert yaml.safe_load(config.read_text())=={'server':{}}
  config.write_text('frontend: {}\nfrontend: {}\n');run('beos-r5',ok=False)
  config.unlink();config.symlink_to(Path(tmp)/'other.yaml');(Path(tmp)/'other.yaml').write_text('server: {}\n');run('beos-r5',ok=False)
+# Round 2n: the editor close button sits in its own top-right strip and covers no editor control.
+for needle in ('--beos-editor-strip','.floating-close.button','iframe[name="frameEditor"]'):
+ assert needle in css,needle
+checks+=1
+import shutil,html as _html
+chromium=shutil.which('chromium') or shutil.which('chromium-browser')
+if chromium:
+ page=('<!doctype html><html><head><meta charset=utf-8><style>html,body{margin:0;height:100%;background:#d8d8d8}'
+  # Quantum's own rules for the button, which the theme must beat
+  '.floating-close{position:fixed;left:50%;transform:translate(-50%,-5em);transition:transform .4s ease;font-size:.5em;top:0;z-index:1002;background:#999}'
+  '.float-in{transform:translate(-50%,2.75em)}.floating-close i{font-size:2em;padding-right:1em;padding-left:1em}</style><style>'+css+'</style></head>'
+  '<body><div id="app"><iframe name="frameEditor" style="width:100%;height:100%;border:0" srcdoc="&lt;body style=margin:0&gt;&lt;div style=height:40px;background:#456&gt;TOOLBAR&lt;/div&gt;"></iframe>'
+  '<div class="floating-close button float-in"><i class="material-symbols">close</i></div></div>'
+  '<pre id=out></pre><script>setTimeout(()=>{const r=e=>{const b=document.querySelector(e).getBoundingClientRect();return [b.left,b.top,b.right,b.bottom]};'
+  'document.getElementById("out").textContent=JSON.stringify({btn:r(".floating-close"),frame:r("iframe"),w:document.documentElement.clientWidth,h:document.documentElement.clientHeight})},900)</script></body></html>')
+ with tempfile.TemporaryDirectory(prefix='fb-close-') as tmp:
+  (Path(tmp)/'p.html').write_text(page)
+  out=subprocess.run([chromium,'--headless=new','--no-sandbox','--disable-gpu','--virtual-time-budget=3000','--window-size=1000,700',
+   '--user-data-dir='+tmp+'/u','--dump-dom','file://'+tmp+'/p.html'],capture_output=True,text=True,timeout=60).stdout
+ m=re.search(r'<pre id="out">(.*?)</pre>',out,re.S);assert m,out[-300:]
+ g=json.loads(_html.unescape(m.group(1)));bx=g['btn'];fr=g['frame']
+ assert bx[2]>g['w']-16 and bx[2]<=g['w'],('button is at the right edge',g)
+ assert bx[1]>=0 and bx[3]<=fr[1],('button sits above the editor frame',g)
+ assert abs(fr[1]-26)<=1 and abs(fr[3]-g['h'])<=1 and fr[0]==0 and abs(fr[2]-g['w'])<=1,('editor frame fills the rest',g)
+ checks+=1
 print(f'PASS: {checks} transitions/guards, field-only rollback, unrelated settings preserved, cap and font table identity')
