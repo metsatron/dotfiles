@@ -2046,6 +2046,10 @@ def _queue_live_allow(event, manifest):
 
 def _queue_obsolete_reason(item):
     context = item.get('context', {})
+    # Lifecycle changes alone do not prove that the requested intent was met.
+    # Keep uncertainty open; only explicit boolean evidence permits retirement.
+    if context.get('intent_met') is not True:
+        return None
     worktree = context.get('worktree')
     if isinstance(worktree, str) and worktree.startswith('/') and not os.path.exists(worktree):
         return 'worktree gone'
