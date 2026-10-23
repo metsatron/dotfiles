@@ -96,7 +96,9 @@ class WatcherTests(unittest.TestCase):
         adapter = FakeAdapter()
         self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 1)
         self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=11), 0)
-        self.assertEqual(adapter.deliveries, [("builder-agent", "wT:p1", "/inbox")])
+        self.assertEqual(len(adapter.deliveries), 1)
+        self.assertIn("MailCortex delivery", adapter.deliveries[0][-1])
+        self.assertIn("Message-ID: <same@node.helm>", adapter.deliveries[0][-1])
         self.assertEqual(self.receipt("<same@node.helm>")["wake_state"], "injected")
 
     def test_in_flight_sync_temp_file_is_not_a_wake(self):
@@ -185,6 +187,19 @@ class WatcherTests(unittest.TestCase):
                 "deepseek_cookie_file": "YOUR_DEEPSEEK_COOKIE_FILE",
                 "deepseek_session": "deepbot-session", "rate_limit_seconds": 0,
             },
+            "hermesbot": {
+                "host": "test-host", "mailbox": "seats/hermesbot", "harness": "hermes",
+                "transport": "hermes", "hermes_url": "http://localhost:YOUR_HERMES_PORT",
+                "hermes_api_key_file": "YOUR_HERMES_API_KEY_FILE",
+                "hermes_session": "hermesbot-session", "hermes_session_key": "hermesbot-key",
+                "rate_limit_seconds": 0,
+            },
+            "nanobot": {
+                "host": "test-host", "mailbox": "consorts/nanobot", "harness": "nanobot",
+                "transport": "nanobot", "nanobot_url": "http://localhost:YOUR_NANOBOT_PORT",
+                "nanobot_api_token_file": "YOUR_NANOBOT_API_TOKEN_FILE",
+                "nanobot_session": "nanobot-session", "rate_limit_seconds": 0,
+            },
         }
         registry_path = self.base / "registry.json"
         registry_path.write_text(json.dumps({"schema": "mailcortex.seats.v1", "host": "test-host", "seats": records}))
@@ -213,7 +228,8 @@ class WatcherTests(unittest.TestCase):
         (mailbox / "new/message").write_bytes(message.as_bytes())
         adapter = FakeAdapter()
         self.assertEqual(self.watcher.locked_scan(registry, adapter, now=10), 1)
-        self.assertEqual(adapter.deliveries, [("builder-agent", "wT:p1", "/inbox")])
+        self.assertEqual(len(adapter.deliveries), 1)
+        self.assertIn("MailCortex delivery", adapter.deliveries[0][-1])
         (mailbox / "new/message").unlink()
         (mailbox / "new").rmdir()
         (mailbox / "cur").rmdir()
@@ -224,9 +240,63 @@ class WatcherTests(unittest.TestCase):
         with self.assertRaisesRegex(self.watcher.WatcherError, "absent or unsafe"):
             self.watcher.locked_scan(registry, FakeAdapter(), now=11)
 
-    def test_ductor_fails_loud_without_a_safe_busy_status_query(self):
-        with self.assertRaisesRegex(self.watcher.WatcherError, "no safe local busy-status injection point"):
+    def test_ductor_fails_loud_without_atomic_busy_status_injection(self):
+        with self.assertRaisesRegex(self.watcher.WatcherError, "busy-status injection point.*observational"):
             self.watcher.DuctorAdapter().resolve_idle_pane(self.registry["seats"]["builder"])
+
+    def test_nanobot_fails_loud_without_atomic_idle_prompt_admission(self):
+        with self.assertRaisesRegex(self.watcher.WatcherError, "Nano transport.*readiness-only"):
+            self.watcher.NanobotAdapter().resolve_idle_pane({})
+
+    def hermes_record(self):
+        key = self.base / "hermes.key"
+        key.write_text("YOUR_HERMES_API_KEY\n")
+        key.chmod(0o600)
+        return {
+            "host": "test-host", "mailbox": "seats/hermesbot", "harness": "hermes",
+            "transport": "hermes", "hermes_url": "http://localhost:YOUR_HERMES_PORT",
+            "hermes_api_key_file": str(key), "hermes_session": "hermesbot-session",
+            "hermes_session_key": "hermesbot-key", "rate_limit_seconds": 0,
+        }
+
+    def test_hermes_idle_health_delivers_named_session_with_continuation_header(self):
+        record = self.hermes_record()
+        calls = []
+        responses = iter((
+            FakeHTTPResponse({"gateway_busy": False, "active_agents": 0,
+                              "api_server": {"active_runs": 0}, "gateway_state": "running"}),
+            FakeHTTPResponse({"object": "hermes.session.chat.completion"}),
+        ))
+
+        def opener(request, timeout):
+            calls.append((request, timeout))
+            return next(responses)
+
+        adapter = self.watcher.HermesAdapter(opener=opener)
+        self.assertEqual(adapter.resolve_idle_pane(record), "hermesbot-session")
+        adapter.deliver(record, "hermesbot-session", "wake")
+        self.assertEqual([call[0].get_method() for call in calls], ["GET", "POST"])
+        self.assertTrue(calls[0][0].full_url.endswith("/health/detailed"))
+        self.assertTrue(calls[1][0].full_url.endswith("/api/sessions/hermesbot-session/chat"))
+        headers = {key.lower(): value for key, value in calls[1][0].header_items()}
+        self.assertEqual(headers["authorization"], "Bearer YOUR_HERMES_API_KEY")
+        self.assertEqual(headers["x-hermes-session-key"], "hermesbot-key")
+        self.assertEqual(json.loads(calls[1][0].data), {"message": "wake"})
+        self.assertEqual(calls[0][1], 15)
+        self.assertEqual(calls[1][1], 60)
+
+    def test_hermes_busy_and_unprovable_health_refuse(self):
+        record = self.hermes_record()
+
+        busy = self.watcher.HermesAdapter(opener=lambda request, timeout: FakeHTTPResponse(
+            {"gateway_busy": True, "active_agents": 1,
+             "api_server": {"active_runs": 1}, "gateway_state": "running"}))
+        self.assertIsNone(busy.resolve_idle_pane(record))
+
+        unknown = self.watcher.HermesAdapter(opener=lambda request, timeout: FakeHTTPResponse(
+            {"gateway_busy": False, "active_agents": 0, "gateway_state": "running"}))
+        with self.assertRaisesRegex(self.watcher.WatcherError, "authoritative busy state"):
+            unknown.resolve_idle_pane(record)
 
     def test_deepseek_busy_detection_prevents_prompt_until_session_is_idle(self):
         cookie = self.base / "deepseek.cookie"
@@ -270,8 +340,14 @@ class WatcherTests(unittest.TestCase):
         prompt = self.watcher.wake_prompt({"transport": "deepseek"}, mail)
         self.assertIn("Subject: Comms check", prompt)
         self.assertIn("Wolf, reply with Fox.", prompt)
+        self.assertIn("MailCortex delivery", prompt)
+        self.assertIn("Sender: fable@test-host.helm", prompt)
+        self.assertIn("Message-ID: <1.2@test-host.helm>", prompt)
+        self.assertIn("act according to your harness", prompt)
         self.assertNotEqual(prompt, "/inbox")
-        self.assertEqual(self.watcher.wake_prompt({"transport": "herdr"}, mail), "/inbox")
+        herdr_prompt = self.watcher.wake_prompt({"transport": "herdr"}, mail)
+        self.assertIn("MailCortex delivery", herdr_prompt)
+        self.assertIn("/inbox", herdr_prompt)
 
     def deep_fixture(self):
         record = {"host": "test-host", "mailbox": "seats/builder", "harness": "deepseek",
@@ -511,7 +587,8 @@ class WatcherTests(unittest.TestCase):
         path.write_bytes(message.as_bytes())
         adapter = FakeAdapter()
         self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 1)
-        self.assertEqual(adapter.deliveries[0][-1], "/inbox")
+        self.assertIn("MailCortex delivery", adapter.deliveries[0][-1])
+        self.assertIn("/inbox", adapter.deliveries[0][-1])
 
     def test_mailback_collision_fails_without_overwriting_and_symlinks_are_refused(self):
         record, adapter = self.deep_fixture()
