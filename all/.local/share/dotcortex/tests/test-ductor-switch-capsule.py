@@ -251,6 +251,23 @@ class AppliedSeamTests(unittest.TestCase):
         self.assertIn("capsule body", seen[4])                # retry delivers it
         self.assertTrue(seen[4].endswith("\n\nm4"))
 
+    def test_only_switch_capsule_touches_nothing_else(self):
+        with tempfile.TemporaryDirectory() as root:
+            site = self.fresh_site(root + "/o") if (Path(root) / "o").mkdir() is None else None
+            before = self.snapshot(site)
+            self.assertEqual(self.apply(site, "--only", "switch_capsule", "--check").returncode, 1)
+            self.assertEqual(self.snapshot(site), before)
+            done = self.apply(site, "--only", "switch_capsule")
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            after = self.snapshot(site)
+            changed = sorted(k for k in after if before.get(k) != after[k])
+            self.assertEqual(changed, ["ductor_bot/orchestrator/core.py", "ductor_bot/orchestrator/switch_capsule.py"])
+            again = self.apply(site, "--only", "switch_capsule")
+            self.assertIn("switch_capsule already applied", again.stdout)
+            self.assertEqual(self.snapshot(site), after)
+            self.assertEqual(self.apply(site, "--only", "switch_capsule", "--check").returncode, 0)
+            self.assertNotEqual(self.apply(site, "--only", "bogus").returncode, 0)
+
     def test_fail_open_when_seam_module_is_broken_or_missing(self):
         with tempfile.TemporaryDirectory() as root:
             site = self.fresh_site(root + "/s") if (Path(root) / "s").mkdir() is None else None

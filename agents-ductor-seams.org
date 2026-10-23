@@ -1127,16 +1127,20 @@ set -euo pipefail
 TARGET_VERSION="0.20.1"
 CHECK_ONLY=0
 SITE_OVERRIDE=""
+ONLY=""
 
 usage() {
     cat <<'EOF'
-Usage: ductor-seam-apply [--check] [--site DIR] [-h|--help]
+Usage: ductor-seam-apply [--check] [--only switch_capsule] [--site DIR] [-h|--help]
 
 Apply DotCortex's fleet-wide ductor_bot seams to the installed package.
 
   (no args)     Apply missing seams idempotently, then byte-compile-verify.
   --check       Report applied/missing per seam; change nothing. Exit 1 if any
                 seam is missing.
+  --only switch_capsule
+                Handle just that seam and leave every other one untouched
+                (--check works the same way). Its hook is independent of the rest.
   --site DIR    Operate on the site-packages root DIR instead of the one the
                 `ductor` launcher's interpreter uses.
   -h, --help    Show this help and exit (no side effects).
@@ -1159,6 +1163,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --check)   CHECK_ONLY=1; shift ;;
+        --only)    ONLY="${2:-}"; [ "$ONLY" = switch_capsule ] || { usage >&2; exit 2; }; shift 2 ;;
         --site)    SITE_OVERRIDE="${2:-}"; [ -n "$SITE_OVERRIDE" ] || { usage >&2; exit 2; }; shift 2 ;;
         *) echo "ductor-seam-apply: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -1200,6 +1205,32 @@ fi
 
 missing=0
 changed=0
+
+if [ "$ONLY" = switch_capsule ]; then
+    # Independent of the other seams: stage-check on a disposable core.py, then touch only this seam.
+    only_src="$SEAMS_DIR/switch_capsule.py"
+    only_dst="$PKG/orchestrator/switch_capsule.py"
+    only_patch="$SEAMS_DIR/switch_capsule_core.patch"
+    [ -f "$only_src" ] && [ -f "$only_patch" ] || fail "switch_capsule seam files missing in $SEAMS_DIR"
+    if [ -f "$only_dst" ] && cmp -s "$only_src" "$only_dst"; then only_module=applied; else only_module=missing; fi
+    only_hook="$(patch -d "$SITE" -p1 --fuzz=0 --dry-run --reverse --force -s <"$only_patch" >/dev/null 2>&1 && echo applied \
+        || { patch -d "$SITE" -p1 --fuzz=0 --dry-run --forward --force -s <"$only_patch" >/dev/null 2>&1 && echo missing || echo drifted; })"
+    [ "$only_hook" != drifted ] || fail "switch_capsule: orchestrator/core.py drifted from the seam; regenerate it"
+    echo "switch_capsule: module=$only_module hook=$only_hook"
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        [ "$only_module" = applied ] && [ "$only_hook" = applied ]
+        exit $?
+    fi
+    [ "$only_module" = missing ] && install -m 0644 "$only_src" "$only_dst"
+    [ "$only_hook" = missing ] && patch -d "$SITE" -p1 --fuzz=0 --forward -s <"$only_patch"
+    (cd /tmp && "$PYTHON_BIN" -m py_compile "$only_dst" "$PKG/orchestrator/core.py") || fail "py_compile failed after applying switch_capsule"
+    if [ "$only_module" = missing ] || [ "$only_hook" = missing ]; then
+        echo "ductor-seam-apply: switch_capsule applied to $SITE"
+    else
+        echo "ductor-seam-apply: switch_capsule already applied"
+    fi
+    exit 0
+fi
 
 seam_file_state() {  # $1 = seam source, $2 = installed path
     if [ -f "$2" ] && cmp -s "$1" "$2"; then echo applied; else echo missing; fi
@@ -1812,6 +1843,23 @@ class AppliedSeamTests(unittest.TestCase):
         self.assertEqual(seen[3], "m3")                       # capsule missing: fail open
         self.assertIn("capsule body", seen[4])                # retry delivers it
         self.assertTrue(seen[4].endswith("\n\nm4"))
+
+    def test_only_switch_capsule_touches_nothing_else(self):
+        with tempfile.TemporaryDirectory() as root:
+            site = self.fresh_site(root + "/o") if (Path(root) / "o").mkdir() is None else None
+            before = self.snapshot(site)
+            self.assertEqual(self.apply(site, "--only", "switch_capsule", "--check").returncode, 1)
+            self.assertEqual(self.snapshot(site), before)
+            done = self.apply(site, "--only", "switch_capsule")
+            self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+            after = self.snapshot(site)
+            changed = sorted(k for k in after if before.get(k) != after[k])
+            self.assertEqual(changed, ["ductor_bot/orchestrator/core.py", "ductor_bot/orchestrator/switch_capsule.py"])
+            again = self.apply(site, "--only", "switch_capsule")
+            self.assertIn("switch_capsule already applied", again.stdout)
+            self.assertEqual(self.snapshot(site), after)
+            self.assertEqual(self.apply(site, "--only", "switch_capsule", "--check").returncode, 0)
+            self.assertNotEqual(self.apply(site, "--only", "bogus").returncode, 0)
 
     def test_fail_open_when_seam_module_is_broken_or_missing(self):
         with tempfile.TemporaryDirectory() as root:
