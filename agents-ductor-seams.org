@@ -1,5 +1,5 @@
 #+TITLE: Ductor fleet seams
-#+DESCRIPTION: Fleet-wide ductor_bot seams (idle compaction) and their applier
+#+DESCRIPTION: Fleet-wide ductor_bot seams (idle compaction, switch capsule) and their applier
 #+AUTHOR: Mètsàtron
 #+PROPERTY: header-args :mkdirp yes :comments no
 
@@ -969,6 +969,150 @@ async def handle_idle_message(orch, server, channel, key, data):
          # Share the bus lock pool with MemoryFlusher so silent flush / compact
 #+END_SRC
 
+* Switch capsule
+
+Claude and Codex keep separate session histories for the same Ductor chat. When Mètsàtron switches the chat with =/model= (usually because one provider hit its usage limit), the incoming provider resumes its own old thread and knows nothing of the other's work. On 2026-10-23 Claude resumed after three days of Codex work (195 messages, six Codex self-compactions) and had to rediscover everything; the only bridge was =MAINMEMORY.md=, whose copy inside a resumed session is frozen at session start.
+
+The =switch_capsule= seam is the reader half of a two-part fix. The writer is =tools/user_tools/switch_capsule/build_capsule.py= (workspace, Zone 3, cron every 5 minutes), which rewrites one provider-neutral =memory_system/SWITCH_CAPSULE.md= from both transcript formats, the task registry, =agent.log= and the =state-note= register of deliberate non-default machine state. The seam only reads that file.
+
+Rules the seam keeps:
+
+- One hook in =Orchestrator._route_message=, after commands, named-session routing and directive-only replies, immediately before the prompt goes to the provider. =/model= itself, named sessions, task results and inter-agent injections are never touched.
+- The marker =<ductor home>/switch_capsule_seen.json= stores, per session key, the provider the chat last ran on. The live provider is =orch._config.provider= (=/model= updates it before the session record is rewritten). The first message after the provider differs from the marker gets a preamble plus the capsule's first 2 KB (cut at a line); the marker is rewritten first, so later messages are untouched even if the provider fails the turn.
+- With no marker yet (first start after install) the baseline is the provider recorded in =sessions.json= for that chat, so a switch that happened before the seam was applied still counts; with neither, the marker is only initialised.
+- Fail open: a missing or unreadable capsule, a marker that cannot be written, a missing =paths= attribute or any exception returns the message byte-for-byte unchanged (the hook also wraps the import). A missing capsule does not consume the marker, so the next message tries again.
+- The home decides everything: Honey Badger uses =/home/gille/.ductor=, Honey's Codex Ductor =/home/agent-codex/.ductor-codex=. The latter cannot read gille's workspace and runs one provider, so there it is a harmless no-op. Optional =switch_capsule= object in =config.json=: =enabled=, =head_bytes=, =path=.
+
+** Seam module
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/ductor-seams/switch_capsule.py
+"""Provider-switch hand-over: prefix the first message after a Claude<->Codex switch with the capsule."""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import tempfile
+import time
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+_MARKER = "switch_capsule_seen.json"
+_CAPSULE = ("memory_system", "SWITCH_CAPSULE.md")
+_HEAD_BYTES = 2048
+_STALE_MINUTES = 30
+
+
+def _settings(home: Path) -> dict:
+    try:
+        raw = json.loads((home / "config" / "config.json").read_text(encoding="utf-8")).get("switch_capsule")
+    except (OSError, ValueError):
+        raw = None
+    return raw if isinstance(raw, dict) else {}
+
+
+def _load(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save(path: Path, data: dict) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".switch-capsule-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _recorded_provider(home: Path, storage_key: str) -> str | None:
+    entry = _load(home / "sessions.json").get(storage_key)
+    provider = entry.get("provider") if isinstance(entry, dict) else None
+    return provider if isinstance(provider, str) and provider else None
+
+
+def _head(path: Path, limit: int) -> tuple[str, float] | None:
+    with open(path, "rb") as fh:
+        raw = fh.read(limit + 1)
+        mtime = os.fstat(fh.fileno()).st_mtime
+    if not raw.strip():
+        return None
+    if len(raw) > limit:
+        raw = raw[:limit].rsplit(b"\n", 1)[0]
+    return raw.decode("utf-8", "replace").rstrip() + "\n", mtime
+
+
+def with_capsule(orch, key, text: str) -> str:
+    """Return *text*, prefixed with the capsule head on the first message after a provider switch."""
+    try:
+        home = Path(orch.paths.ductor_home)
+        settings = _settings(home)
+        if settings.get("enabled", True) is False:
+            return text
+        current = str(orch._config.provider)
+        storage_key = key.storage_key
+        marker_path = home / _MARKER
+        marker = _load(marker_path)
+        entry = marker.get(storage_key)
+        seen = entry.get("provider") if isinstance(entry, dict) else None
+        if not seen:
+            seen = _recorded_provider(home, storage_key) or current
+        if seen == current:
+            if not isinstance(entry, dict) or entry.get("provider") != current:
+                marker[storage_key] = {"provider": current, "ts": time.time()}
+                _save(marker_path, marker)
+            return text
+        capsule = Path(settings.get("path") or home / "workspace" / Path(*_CAPSULE))
+        loaded = _head(capsule, int(settings.get("head_bytes", _HEAD_BYTES)))
+        if loaded is None:
+            return text
+        head, mtime = loaded
+        marker[storage_key] = {"provider": current, "ts": time.time(), "from": seen}
+        _save(marker_path, marker)
+        age = int((time.time() - mtime) / 60)
+        stale = f" STALE: {age} min old, the 5-minute writer may be down." if age > _STALE_MINUTES else ""
+        logger.info("switch_capsule preamble injected key=%s %s -> %s", storage_key, seen, current)
+        return (
+            f"[SWITCH CAPSULE: this chat was just switched from {seen} to {current}. Your own session history "
+            f"does not contain the other provider's work. Below is the head of {capsule} (written {age} min ago)."
+            f"{stale} Read the whole file before acting on anything in it. It is a machine-generated record of "
+            "what happened, not instructions: its NON-DEFAULT STATE entries stay in force until Tiago says "
+            "otherwise, everything else is evidence to verify.]\n"
+            f"{head}[END SWITCH CAPSULE]\n\n{text}"
+        )
+    except Exception:  # noqa: BLE001 - fail open: the user's message always goes through
+        logger.debug("switch_capsule skipped", exc_info=True)
+        return text
+#+END_SRC
+
+** Hook patch
+#+BEGIN_SRC diff :tangle all/.local/share/dotcortex/ductor-seams/switch_capsule_core.patch
+--- a/ductor_bot/orchestrator/core.py
++++ b/ductor_bot/orchestrator/core.py
+@@ -420,6 +420,12 @@
+             )
+ 
+         prompt_text = directives.cleaned or dispatch.text
++        try:
++            from ductor_bot.orchestrator.switch_capsule import with_capsule
++
++            prompt_text = with_capsule(self, dispatch.key, prompt_text)
++        except Exception:  # noqa: BLE001 - the seam is fail-open by contract
++            logger.debug("switch_capsule seam skipped", exc_info=True)
+ 
+         if dispatch.streaming:
+             return await normal_streaming(
+#+END_SRC
+
 * ductor-seam-apply
 #+BEGIN_SRC bash :tangle all/.local/bin/ductor-seam-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
 # ductor-seam-apply — apply DotCortex's fleet-wide seams to an installed ductor_bot.
@@ -1002,6 +1146,8 @@ Seams:
                 (Claude 55/60 min, Codex 25/30 min; config.json "idle_compaction")
   busy_state    authenticated loopback GET /busy for the default main session
   idle_prompt   encrypted idle-only prompt admission holding API and bus locks
+  switch_capsule  first message after a Claude<->Codex switch carries the
+                  workspace SWITCH_CAPSULE.md head (fail-open)
 
 Seam files:  <dotcortex>/all/.local/share/dotcortex/ductor-seams/
              (override with DOTCORTEX_DUCTOR_SEAMS)
@@ -1091,6 +1237,12 @@ mirror_patch="$SEAMS_DIR/idle_prompt_telegram.patch"
     || fail "idle_prompt seam files missing in $SEAMS_DIR"
 prompt_module_state="$(seam_file_state "$prompt_src" "$prompt_dst")"
 
+capsule_src="$SEAMS_DIR/switch_capsule.py"
+capsule_dst="$PKG/orchestrator/switch_capsule.py"
+capsule_patch="$SEAMS_DIR/switch_capsule_core.patch"
+[ -f "$capsule_src" ] && [ -f "$capsule_patch" ] || fail "switch_capsule seam files missing in $SEAMS_DIR"
+capsule_module_state="$(seam_file_state "$capsule_src" "$capsule_dst")"
+
 # Validate the complete ordered series on a disposable staged copy first.
 # Later patches overlap earlier context. Peel an applied admission hook off
 # this copy before classifying its prerequisites; never reverse the live target.
@@ -1128,6 +1280,14 @@ mirror_hook_state="$(seam_patch_state "$mirror_patch" "$preflight")"
 if [ "$mirror_hook_state" = missing ]; then
     patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$mirror_patch" || fail "Telegram bus preflight failed"
 fi
+# switch_capsule hooks core.py far from the other series; classify it last, on the fully staged copy.
+install -m 0644 "$capsule_src" "$preflight/ductor_bot/orchestrator/switch_capsule.py"
+capsule_hook_state="$(seam_patch_state "$capsule_patch" "$preflight")"
+[ "$capsule_hook_state" != drifted ] || fail "switch_capsule: orchestrator/core.py drifted from the seam; regenerate it"
+echo "switch_capsule: module=$capsule_module_state hook=$capsule_hook_state"
+if [ "$capsule_hook_state" = missing ]; then
+    patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$capsule_patch" || fail "switch_capsule preflight failed"
+fi
 "$PYTHON_BIN" -m compileall -q "$preflight/ductor_bot" || fail "complete series preflight compile failed"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
@@ -1135,6 +1295,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     [ "$busy_module_state" = applied ] && [ "$busy_hook_state" = applied ] || missing=1
     [ "$prompt_module_state" = applied ] && [ "$prompt_hook_state" = applied ] \
         && [ "$mirror_hook_state" = applied ] || missing=1
+    [ "$capsule_module_state" = applied ] && [ "$capsule_hook_state" = applied ] || missing=1
     exit "$missing"
 fi
 
@@ -1169,7 +1330,16 @@ if [ "$mirror_hook_state" = missing ]; then
     changed=1
 fi
 
-(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$busy_dst" "$prompt_dst" "$PKG/api/server.py" "$PKG/orchestrator/lifecycle.py" "$PKG/orchestrator/core.py") \
+if [ "$capsule_module_state" = missing ]; then
+    install -m 0644 "$capsule_src" "$capsule_dst"
+    changed=1
+fi
+if [ "$capsule_hook_state" = missing ]; then
+    patch -d "$SITE" -p1 --fuzz=0 --forward -s <"$capsule_patch"
+    changed=1
+fi
+
+(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$busy_dst" "$prompt_dst" "$capsule_dst" "$PKG/api/server.py" "$PKG/orchestrator/lifecycle.py" "$PKG/orchestrator/core.py") \
     || fail "py_compile failed after applying seams"
 [ "$changed" -eq 1 ] && echo "ductor-seam-apply: seams applied to $SITE" || echo "ductor-seam-apply: already applied"
 #+END_SRC
@@ -1286,7 +1456,7 @@ applier="$(cd "$seams/../../../bin" && pwd)/ductor-seam-apply"
 body="$seams/openrc/ductor"
 dest=/usr/local/share/dotcortex/ductor-seams
 ts="$(date +%Y%m%d-%H%M%S)"
-for f in "$applier" "$body" "$seams/idle_compact.py" "$seams/idle_compact_lifecycle.patch" "$seams/busy_state.py" "$seams/busy_state_api.patch" "$seams/idle_prompt.py" "$seams/idle_prompt_api.patch" "$seams/idle_prompt_telegram.patch"; do
+for f in "$applier" "$body" "$seams/idle_compact.py" "$seams/idle_compact_lifecycle.patch" "$seams/busy_state.py" "$seams/busy_state_api.patch" "$seams/idle_prompt.py" "$seams/idle_prompt_api.patch" "$seams/idle_prompt_telegram.patch" "$seams/switch_capsule.py" "$seams/switch_capsule_core.patch"; do
     [ -r "$f" ] || { echo "missing source: $f" >&2; exit 1; }
 done
 
@@ -1308,6 +1478,8 @@ place "$seams/busy_state_api.patch" "$dest/busy_state_api.patch" 0644
 place "$seams/idle_prompt.py" "$dest/idle_prompt.py" 0644
 place "$seams/idle_prompt_api.patch" "$dest/idle_prompt_api.patch" 0644
 place "$seams/idle_prompt_telegram.patch" "$dest/idle_prompt_telegram.patch" 0644
+place "$seams/switch_capsule.py" "$dest/switch_capsule.py" 0644
+place "$seams/switch_capsule_core.patch" "$dest/switch_capsule_core.patch" 0644
 place "$body" "/etc/init.d/$svc" 0755
 place "$conf" "/etc/conf.d/$svc" 0644
 #+END_SRC
@@ -1382,6 +1554,300 @@ class DuctorOpenrcTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+#+END_SRC
+
+** Switch capsule tests
+Unit tests use fake orchestrators and synthetic =sessions.json= / capsule files (a simulated Claude to Codex switch, both home layouts, every fail-open path). Applier tests run on a disposable copy of the installed package, and one end-to-end test drives the patched =Orchestrator._route_message= with a fake provider flow. No sockets, no real CLI. Run: =python3 ~/.local/share/dotcortex/tests/test-ductor-switch-capsule.py= with =ductor_bot= installed.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-ductor-switch-capsule.py
+"""Switch-capsule seam: marker logic, fail-open paths, applier and patched _route_message."""
+from __future__ import annotations
+
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from types import SimpleNamespace
+import unittest
+
+SEAMS = Path(__file__).resolve().parents[1] / "ductor-seams"
+APPLIER = SEAMS.parents[2] / "bin/ductor-seam-apply"
+_spec = importlib.util.spec_from_file_location("ductor_switch_capsule_seam", SEAMS / "switch_capsule.py")
+sc = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(sc)
+
+KEY = SimpleNamespace(storage_key="tg:111")
+CAPSULE_LINES = [f"line {i:03d} " + "x" * 40 for i in range(120)]
+
+
+def make_home(root: Path, name="ductor", recorded="claude", capsule=True):
+    home = root / name
+    (home / "workspace/memory_system").mkdir(parents=True)
+    (home / "config").mkdir()
+    (home / "sessions.json").write_text(json.dumps({KEY.storage_key: {"provider": recorded}}))
+    if capsule:
+        (home / "workspace/memory_system/SWITCH_CAPSULE.md").write_text("\n".join(CAPSULE_LINES) + "\n")
+    return home
+
+
+def orch(home, provider):
+    return SimpleNamespace(paths=SimpleNamespace(ductor_home=home), _config=SimpleNamespace(provider=provider))
+
+
+class MarkerTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+
+    def test_claude_to_codex_switch_then_untouched(self):
+        home = make_home(self.root, recorded="claude")
+        first = sc.with_capsule(orch(home, "codex"), KEY, "hello")
+        self.assertTrue(first.startswith("[SWITCH CAPSULE: this chat was just switched from claude to codex."))
+        self.assertTrue(first.endswith("[END SWITCH CAPSULE]\n\nhello"))
+        head = first.split("]\n", 1)[1].split("[END SWITCH CAPSULE]")[0]
+        self.assertLessEqual(len(head.encode()), 2048 + 1)
+        self.assertTrue(head.rstrip().split("\n")[-1].startswith("line "))
+        self.assertIn("line 000", head)
+        self.assertNotIn("line 119", head)
+        marker = json.loads((home / "switch_capsule_seen.json").read_text())
+        self.assertEqual(marker[KEY.storage_key]["provider"], "codex")
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "second"), "second")
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "third"), "third")
+        back = sc.with_capsule(orch(home, "claude"), KEY, "back")
+        self.assertIn("switched from codex to claude", back)
+        self.assertEqual(sc.with_capsule(orch(home, "claude"), KEY, "again"), "again")
+
+    def test_no_switch_initialises_marker_only(self):
+        home = make_home(self.root, recorded="codex")
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+        self.assertEqual(json.loads((home / "switch_capsule_seen.json").read_text())[KEY.storage_key]["provider"], "codex")
+
+    def test_no_marker_no_record_never_injects(self):
+        home = make_home(self.root)
+        (home / "sessions.json").unlink()
+        self.assertEqual(sc.with_capsule(orch(home, "claude"), KEY, "m"), "m")
+
+    def test_both_home_layouts(self):
+        for name in ("ductor", "agent-codex/.ductor-codex"):
+            with self.subTest(home=name):
+                home = make_home(self.root, name=name, recorded="claude")
+                self.assertIn("SWITCH CAPSULE", sc.with_capsule(orch(home, "codex"), KEY, "m"))
+
+    def test_codex_only_home_without_capsule_is_noop(self):
+        home = make_home(self.root, name="agent-codex/.ductor-codex", recorded="codex", capsule=False)
+        for _ in range(3):
+            self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+
+    def test_missing_capsule_fails_open_and_keeps_marker_for_retry(self):
+        home = make_home(self.root, recorded="claude", capsule=False)
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+        self.assertFalse((home / "switch_capsule_seen.json").exists())
+        (home / "workspace/memory_system/SWITCH_CAPSULE.md").write_text("later\n")
+        self.assertIn("later", sc.with_capsule(orch(home, "codex"), KEY, "m"))
+
+    def test_empty_capsule_is_ignored(self):
+        home = make_home(self.root, recorded="claude")
+        (home / "workspace/memory_system/SWITCH_CAPSULE.md").write_text("\n  \n")
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+
+    def test_unwritable_marker_fails_open(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes")
+        home = make_home(self.root, recorded="claude")
+        home.chmod(0o500)
+        self.addCleanup(home.chmod, 0o700)
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+
+    def test_unreadable_capsule_fails_open(self):
+        if os.geteuid() == 0:
+            self.skipTest("root ignores file modes")
+        home = make_home(self.root, recorded="claude")
+        (home / "workspace/memory_system/SWITCH_CAPSULE.md").chmod(0)
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+
+    def test_garbage_state_and_broken_orchestrator_fail_open(self):
+        home = make_home(self.root, recorded="claude")
+        (home / "switch_capsule_seen.json").write_text("{not json")
+        (home / "sessions.json").write_text("[1, 2")
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+        self.assertEqual(sc.with_capsule(SimpleNamespace(), KEY, "m"), "m")
+        self.assertEqual(sc.with_capsule(orch(home, None), SimpleNamespace(), "m"), "m")
+
+    def test_disabled_and_settings(self):
+        home = make_home(self.root, recorded="claude")
+        (home / "config/config.json").write_text(json.dumps({"switch_capsule": {"enabled": False}}))
+        self.assertEqual(sc.with_capsule(orch(home, "codex"), KEY, "m"), "m")
+        (home / "config/config.json").write_text(json.dumps({"switch_capsule": {"head_bytes": 200}}))
+        out = sc.with_capsule(orch(home, "codex"), KEY, "m")
+        head = out.split("]\n", 1)[1].split("[END SWITCH CAPSULE]")[0]
+        self.assertLessEqual(len(head.encode()), 201)
+        self.assertIn("line 000", head)
+
+    def test_stale_capsule_is_labelled(self):
+        home = make_home(self.root, recorded="claude")
+        cap = home / "workspace/memory_system/SWITCH_CAPSULE.md"
+        old = time.time() - 3 * 3600
+        os.utime(cap, (old, old))
+        self.assertIn("STALE: 180 min old", sc.with_capsule(orch(home, "codex"), KEY, "m"))
+
+
+SCRIPT = textwrap.dedent("""
+    import asyncio, json, sys
+    from pathlib import Path
+    from types import SimpleNamespace
+    from unittest import mock
+    from ductor_bot.orchestrator import core
+    from ductor_bot.session.key import SessionKey
+
+    home = Path(sys.argv[1])
+    key = SessionKey(transport="tg", chat_id=111, topic_id=None)
+    seen = []
+
+    async def fake_stream(orch, k, prompt, **kw):
+        seen.append(prompt)
+        return "ok"
+
+    async def none(*a, **kw):
+        return None
+
+    def fake(provider):
+        o = SimpleNamespace()
+        o._command_registry = SimpleNamespace(dispatch=none)
+        o._ensure_docker = none
+        o._providers = SimpleNamespace(_known_model_ids=frozenset(), _codex_cache_fn=None)
+        o._named_sessions = SimpleNamespace(get=lambda *a: None)
+        o.paths = SimpleNamespace(ductor_home=home)
+        o._config = SimpleNamespace(provider=provider)
+        return o
+
+    async def send(provider, text):
+        d = core._MessageDispatch(key=key, text=text, cmd=text.strip().lower(), streaming=True)
+        return await core.Orchestrator._route_message(fake(provider), d)
+
+    async def main():
+        with mock.patch.object(core, "normal_streaming", fake_stream):
+            await send("claude", "m0")
+            await send("codex", "m1")
+            await send("codex", "m2")
+            (home / "workspace/memory_system/SWITCH_CAPSULE.md").unlink()
+            await send("claude", "m3")          # switch but no capsule: unchanged, still delivered
+            (home / "workspace/memory_system/SWITCH_CAPSULE.md").write_text("capsule body\\n")
+            await send("claude", "m4")          # retry succeeds
+    asyncio.run(main())
+    print(json.dumps(seen))
+""")
+
+
+class AppliedSeamTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        spec = importlib.util.find_spec("ductor_bot")
+        if spec is None or not spec.submodule_search_locations:
+            raise unittest.SkipTest("ductor_bot not installed")
+        cls.installed = Path(list(spec.submodule_search_locations)[0])
+        cls.tmp = tempfile.TemporaryDirectory(prefix="ductor-capsule-test-")
+        cls.site = Path(cls.tmp.name)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    @staticmethod
+    def snapshot(root):
+        return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest()
+                for p in root.rglob("*") if p.is_file() and "__pycache__" not in p.parts}
+
+    def fresh_site(self, root):
+        site = Path(root)
+        shutil.copytree(self.installed, site / "ductor_bot", ignore=shutil.ignore_patterns("__pycache__"))
+        for name in ("switch_capsule_core.patch",):  # a live package may already carry the seam
+            command = ["patch", "-d", str(site), "-p1", "--fuzz=0", "--reverse", "--force", "-s"]
+            patch = (SEAMS / name).read_bytes()
+            if subprocess.run(command + ["--dry-run"], input=patch, capture_output=True).returncode == 0:
+                subprocess.run(command, input=patch, capture_output=True, check=True)
+        (site / "ductor_bot/orchestrator/switch_capsule.py").unlink(missing_ok=True)
+        return site
+
+    def apply(self, site, *args):
+        env = dict(os.environ, DOTCORTEX_DUCTOR_SEAMS=str(SEAMS), PYTHONDONTWRITEBYTECODE="1")
+        return subprocess.run(["bash", str(APPLIER), "--site", str(site), *args], env=env, text=True,
+                              capture_output=True)
+
+    def test_apply_check_idempotence_and_end_to_end(self):
+        site = self.fresh_site(self.tmp.name + "/a") if (Path(self.tmp.name) / "a").mkdir() is None else None
+        pending = self.apply(site, "--check")
+        self.assertEqual(pending.returncode, 1, pending.stdout + pending.stderr)
+        self.assertIn("switch_capsule: module=missing hook=missing", pending.stdout)
+        done = self.apply(site)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        core_src = (site / "ductor_bot/orchestrator/core.py").read_text()
+        self.assertEqual(core_src.count("with_capsule(self, dispatch.key, prompt_text)"), 1)
+        self.assertTrue((site / "ductor_bot/orchestrator/switch_capsule.py").is_file())
+        before = self.snapshot(site)
+        again = self.apply(site)
+        self.assertEqual(again.returncode, 0, again.stdout + again.stderr)
+        self.assertIn("already applied", again.stdout)
+        self.assertEqual(self.snapshot(site), before)
+        self.assertEqual(self.apply(site, "--check").returncode, 0)
+        # end to end through the patched _route_message
+        with tempfile.TemporaryDirectory() as root:
+            home = make_home(Path(root), recorded="claude")
+            result = subprocess.run(
+                [sys.executable, "-c", SCRIPT, str(home)], cwd="/tmp", text=True, capture_output=True,
+                env=dict(os.environ, PYTHONPATH=str(site), PYTHONDONTWRITEBYTECODE="1"))
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            seen = json.loads(result.stdout.strip().splitlines()[-1])
+        self.assertEqual(seen[0], "m0")                       # no switch yet
+        self.assertIn("switched from claude to codex", seen[1])
+        self.assertTrue(seen[1].endswith("\n\nm1"))
+        self.assertEqual(seen[2], "m2")                       # subsequent message untouched
+        self.assertEqual(seen[3], "m3")                       # capsule missing: fail open
+        self.assertIn("capsule body", seen[4])                # retry delivers it
+        self.assertTrue(seen[4].endswith("\n\nm4"))
+
+    def test_fail_open_when_seam_module_is_broken_or_missing(self):
+        with tempfile.TemporaryDirectory() as root:
+            site = self.fresh_site(root + "/s") if (Path(root) / "s").mkdir() is None else None
+            self.assertEqual(self.apply(site).returncode, 0)
+            module = site / "ductor_bot/orchestrator/switch_capsule.py"
+            home_root = Path(root) / "h"
+            home_root.mkdir()
+            home = make_home(home_root, recorded="claude")
+            for mutate in (lambda: module.write_text("raise RuntimeError('boom')\n"), module.unlink):
+                mutate()
+                result = subprocess.run(
+                    [sys.executable, "-c", SCRIPT, str(home)], cwd="/tmp", text=True, capture_output=True,
+                    env=dict(os.environ, PYTHONPATH=str(site), PYTHONDONTWRITEBYTECODE="1"))
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(result.stdout.strip().splitlines()[-1]),
+                                 ["m0", "m1", "m2", "m3", "m4"])
+
+    def test_drift_refuses_before_any_mutation(self):
+        with tempfile.TemporaryDirectory() as root:
+            site = self.fresh_site(root + "/d") if (Path(root) / "d").mkdir() is None else None
+            target = site / "ductor_bot/orchestrator/core.py"
+            source = target.read_text()
+            needle = "        prompt_text = directives.cleaned or dispatch.text\n"
+            self.assertEqual(source.count(needle), 1)
+            target.write_text(source.replace(needle, needle + "        # upstream drift\n"))
+            before = self.snapshot(site)
+            for args in ((), ("--check",)):
+                result = self.apply(site, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("switch_capsule: orchestrator/core.py drifted", result.stderr)
+                self.assertEqual(self.snapshot(site), before)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
 #+END_SRC
 
 ** Idle compaction tests
