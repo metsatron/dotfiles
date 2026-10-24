@@ -3193,6 +3193,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 
 HERE = Path(__file__).resolve()
@@ -3214,14 +3215,150 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             directory.mkdir(parents=True)
         self.write_executable("ductor", "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n")
         self.write_executable("node", "#!/bin/sh\nexit 0\n", directory=self.core_bin)
+        # Every fixture process this test spawns directly is registered here
+        # with its kernel start ticks. Cleanup only ever signals a registered,
+        # identity-validated, isolated process group it owns itself.
+        self._owned: list[tuple[subprocess.Popen, str]] = []
+
+    # -- kill-safety helpers (Fable 2026-10-09 three-kill night; hardened
+    #    2026-10-25 after the recurrent gateway SIGTERM) ---------------------
+    # A pid file left by a failed test may contain anything. os.killpg treats
+    # its argument as a process-GROUP id, so a file-read pid whose value
+    # collides with a live group (any session-leader daemon: the gateway, the
+    # coordinator, another agent) is a SIGTERM to that whole bystander group.
+    # Never signal a group from a pid file alone: validate an owned Popen, the
+    # exact kernel start ticks, and an isolated group this fixture created.
+
+    def _stat_fields(self, pid: int) -> list[str] | None:
+        try:
+            return Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        except OSError:
+            return None
+
+    def _proc_ticks(self, pid: int) -> str | None:
+        fields = self._stat_fields(pid)
+        if fields is None or fields[0] == "Z":
+            return None
+        return fields[19]
+
+    def _proc_pgid(self, pid: int) -> int | None:
+        # /proc/<pid>/stat after "pid (comm)": [0]=state [1]=ppid [2]=pgrp
+        # [3]=session ... [19]=starttime. pgrp is overall field 5 -> index 2.
+        fields = self._stat_fields(pid)
+        if fields is None or fields[0] == "Z":
+            return None
+        try:
+            return int(fields[2])
+        except (IndexError, ValueError):
+            return None
+
+    def _proc_cmdline(self, pid: int) -> str:
+        try:
+            return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+        except OSError:
+            return ""
+
+    def _is_ancestor(self, pid: int) -> bool:
+        ancestor = os.getpid()
+        while ancestor > 1:
+            if ancestor == pid:
+                return True
+            fields = self._stat_fields(ancestor)
+            if fields is None:
+                return False
+            try:
+                ancestor = int(fields[1])
+            except (IndexError, ValueError):
+                return False
+        return False
+
+    def _owns_isolated_group(self, proc: subprocess.Popen, ticks: str) -> bool:
+        """True only when proc is still the exact fixture process and the
+        leader of its own isolated process group that is not ours."""
+        pid = proc.pid
+        if pid <= 1 or pid == os.getpid():
+            return False
+        if self._is_ancestor(pid):
+            return False
+        if self._proc_ticks(pid) != str(ticks):
+            return False  # stale or recycled: never signal an unknown process
+        pgid = self._proc_pgid(pid)
+        if pgid != pid:
+            return False  # not an isolated group leader (inherited our group)
+        if pgid == os.getpgid(0):
+            return False  # our own group: would signal the coordinator
+        return True
+
+    def register_owned(self, proc: subprocess.Popen) -> subprocess.Popen:
+        ticks = self._proc_ticks(proc.pid)
+        self._owned.append((proc, ticks if ticks is not None else ""))
+        self.addCleanup(self.terminate_owned_group, proc)
+        return proc
+
+    def terminate_owned_group(self, proc: subprocess.Popen) -> bool:
+        """SIGTERM then bounded SIGKILL of an isolated fixture group we own.
+
+        Returns True when the group is gone or was signalled; returns False
+        (and signals nothing) when ownership cannot be proven -- a bystander,
+        stale/recycled pid, parent/ancestor, or our own group is never touched.
+        """
+        entry = next((item for item in self._owned if item[0] is proc), None)
+        if entry is None:
+            return False  # not a fixture process this test registered
+        if not self._owns_isolated_group(proc, entry[1]):
+            return False
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            return True
+        try:
+            proc.wait(timeout=5)
+            return True
+        except subprocess.TimeoutExpired:
+            pass
+        if self._owns_isolated_group(proc, entry[1]):
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return True
+
+    def _cleanup_pid_file_child(self, pid_file: Path) -> None:
+        """Reap a manager-spawned fixture child WITHOUT a group signal.
+
+        The manager runs in this test's process group, so its children are not
+        isolated group leaders and must never be killpg-ed (a pgid collision
+        would signal the coordinator's group). Prove the pid is really this
+        fixture's child -- its /proc cmdline references the unique temp root --
+        then SIGTERM the single pid only. A stale/recycled/bystander pid whose
+        cmdline does not reference the fixture root is left alone.
+        """
+        try:
+            recorded_pid = int(pid_file.read_text())
+        except (OSError, ValueError):
+            return
+        if recorded_pid <= 1 or recorded_pid == os.getpid() or self._is_ancestor(recorded_pid):
+            return
+        if self._proc_ticks(recorded_pid) is None:
+            return
+        if str(self.root) not in self._proc_cmdline(recorded_pid):
+            return  # not our fixture child: never signal an unknown process
+        try:
+            os.kill(recorded_pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            pass
 
     def tearDown(self) -> None:
         if hasattr(self, "fixture_gateway_cleanup"):
             self.fixture_gateway_cleanup()
-        # Kill-safety guard (Fable 2026-10-09, the three-kill night): a pid
-        # file left behind by a failed test may contain anything — including 1,
-        # whose killpg is a SIGTERM to every process this user owns. Never
-        # signal pid 0/1 or a non-positive value; a stale entry stays stale.
+        # Reap manager-spawned fixture children by single-pid, cmdline-validated
+        # SIGTERM only. Never os.killpg a pid read from a file: killpg's
+        # argument is a group id, and a stale/recycled value would SIGTERM a
+        # bystander group (the 2026-10-25 recurrent gateway SIGTERM class).
         for pid_file in (
             self.state / "telegram-agents/ductor-supervise.pid",
             self.state / "telegram-agents/codex-helmastra-telegram.pid",
@@ -3229,16 +3366,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             self.state / "vibe-telegram/adapter.pid",
         ):
             if pid_file.exists():
-                try:
-                    recorded_pid = int(pid_file.read_text())
-                except ValueError:
-                    continue
-                if recorded_pid <= 1:
-                    continue
-                try:
-                    os.killpg(recorded_pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError, ValueError):
-                    pass
+                self._cleanup_pid_file_child(pid_file)
         self.temp.cleanup()
 
     def read_start_ticks(self, pid: int) -> str:
@@ -3371,6 +3499,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         while time.monotonic() < deadline and not (ready_file.exists() and child_file.exists()):
             time.sleep(0.02)
         self.assertTrue(ready_file.exists() and child_file.exists(), "fixture supervisor did not become ready")
+        self.register_owned(process)
         return process
 
     def test_codex_stop_waits_for_supervisor_after_readiness_disappears(self) -> None:
@@ -3391,7 +3520,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             self.assertNotEqual(replacement, old_supervisor.pid)
         finally:
             if old_supervisor.poll() is None:
-                os.killpg(old_supervisor.pid, signal.SIGKILL)
+                # Owned, isolated, tick-validated group signal only.
+                self.terminate_owned_group(old_supervisor)
                 old_supervisor.wait(timeout=5)
 
     def test_cold_supervisor_waits_for_delayed_child(self) -> None:
@@ -3523,8 +3653,10 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertIn("nanobot: STOPPED", status.stdout)
 
     def start_gateway_stand_in(self, *, ticks: str | None = None, record: bool = True) -> subprocess.Popen[bytes]:
-        gateway = subprocess.Popen(["sleep", "60"])
-        self.addCleanup(lambda: (gateway.poll() is None and gateway.kill(), gateway.wait()))
+        # Own isolated session so fixture cleanup can signal exactly this
+        # group and never the test runner's (coordinator's) group.
+        gateway = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.register_owned(gateway)
         if record:
             hermes_home = self.home / ".hermes"
             hermes_home.mkdir(exist_ok=True)
@@ -3748,8 +3880,10 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         impostor = self.bin / "hermes"
         impostor.write_bytes(Path("/bin/sleep").read_bytes())
         impostor.chmod(0o755)
-        process = subprocess.Popen([str(impostor), "60"])
-        self.addCleanup(lambda: (process.poll() is None and process.kill(), process.wait()))
+        # Own isolated session: an impostor hermes must never share the test
+        # runner's group, or a group signal could reach the coordinator.
+        process = subprocess.Popen([str(impostor), "60"], start_new_session=True)
+        self.register_owned(process)
         return process
 
     def hermes_status_line(self) -> str:
@@ -4613,11 +4747,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             self.assertNotIn("refusing unsafe PID target", stopped.stderr)
 
     def test_manager_and_teardown_kill_sites_are_guarded(self) -> None:
-        # RED test, static half (Fable 2026-10-09, ask 2): every kill site
-        # that can signal a GROUP must be preceded by a guard, and no
-        # bare killpg/kill of a file-read pid without one. The tearDown
-        # guard must refuse pid <= 1, and the shoukichi verified-kill
-        # helper must contain the pid 0/1 refusal case arm. If someone
+        # Static guard (Fable 2026-10-09 ask 2; hardened 2026-10-25): no kill
+        # site may signal a GROUP from a pid read out of a file. tearDown must
+        # never os.killpg a file-read pid (killpg's argument is a group id, so
+        # a stale/recycled value SIGTERMs a bystander group). Group signalling
+        # is allowed ONLY inside terminate_owned_group, after the owned-Popen
+        # + kernel-start-ticks + isolated-group + not-ours validation. The
+        # manager-side shoukichi verified-kill guard is preserved. If someone
         # reverts any guard, this fails at the source level.
         manager_text = (HERE.parents[3] / "bin/telegram-agent-host").read_text(encoding="utf-8")
         test_text = HERE.read_text(encoding="utf-8")
@@ -4627,13 +4763,91 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         # branch; the shoukichi stop path must not contain its own kill.
         shoukichi_stop = manager_text.split("stop_shoukichi() {")[1].split("}\n\n")[0]
         self.assertNotIn("kill -", shoukichi_stop.replace("shoukichi_verified_kill", ""))
-        # tearDown refuses pid <= 1 before killpg.
-        self.assertIn("if recorded_pid <= 1:", test_text)
-        # And no killpg call exists outside the guarded branch.
-        for site in test_text.split("os.killpg("):
-            if site is test_text.split("os.killpg(")[0]:
-                continue
-            self.assertIn("recorded_pid <= 1", test_text)
+        # tearDown reaps pid-file children by single-pid, cmdline-validated
+        # SIGTERM only -- never a group signal from a file. Assert on the
+        # tearDown body, not the whole file: the file contains this guard's
+        # own string literals, so a whole-file assertNotIn would match itself.
+        teardown = test_text.split("    def tearDown(self) -> None:")[1].split("    def read_start_ticks")[0]
+        self.assertNotIn("os.killpg(", teardown)
+        self.assertNotIn("recorded_pid", teardown)
+        self.assertIn("_cleanup_pid_file_child", teardown)
+        # Group signalling lives only inside the ownership-validated helper,
+        # and the ownership validation precedes every killpg.
+        self.assertIn("def terminate_owned_group", test_text)
+        self.assertIn("def _owns_isolated_group", test_text)
+        helper = test_text.split("    def terminate_owned_group")[1].split("    def _cleanup_pid_file_child")[0]
+        self.assertIn("_owns_isolated_group(proc, entry[1])", helper)
+        self.assertLess(helper.index("_owns_isolated_group(proc, entry[1])"), helper.index("os.killpg"))
+
+    @staticmethod
+    def _legacy_pidfile_killpg(pid_value: int) -> None:
+        # Pre-hardening tearDown primitive, kept only to characterise the bug:
+        # read a pid from a file, refuse only pid <= 1, then killpg (a GROUP
+        # signal whose argument is a pgid, not a pid).
+        if pid_value <= 1:
+            return
+        os.killpg(pid_value, signal.SIGTERM)
+
+    def test_legacy_pidfile_killpg_would_signal_a_bystander_group(self) -> None:
+        # RED characterisation, mocked: no real signal is sent. A bystander
+        # daemon in its own session is a group leader (pgid == pid), exactly
+        # like the gateway. The legacy file-driven killpg SIGTERMs its group.
+        bystander = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (bystander.poll() is None and bystander.kill(), bystander.wait()))
+        with mock.patch("os.killpg") as killpg:
+            self._legacy_pidfile_killpg(bystander.pid)
+        killpg.assert_called_once_with(bystander.pid, signal.SIGTERM)
+
+    def test_terminate_owned_group_refuses_unsafe_targets(self) -> None:
+        # GREEN, mocked: the hardened helper signals nothing for a bystander
+        # group, a stale/recycled pid, a non-isolated (own-group) process, or
+        # our own pid. No real signal is sent.
+        bystander = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (bystander.poll() is None and bystander.kill(), bystander.wait()))
+        nonisolated = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (nonisolated.poll() is None and nonisolated.kill(), nonisolated.wait()))
+        owned = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.register_owned(owned)
+        try:
+            with mock.patch("os.killpg") as killpg, mock.patch("os.kill") as kill:
+                # Unregistered bystander group: refused, nothing signalled.
+                self.assertFalse(self.terminate_owned_group(bystander))
+                killpg.assert_not_called()
+                kill.assert_not_called()
+                # Owned but stale/recycled start ticks: refused.
+                self.assertFalse(self._owns_isolated_group(owned, "0"))
+                killpg.assert_not_called()
+                # Non-isolated child (shares our group): refused.
+                self.assertFalse(self._owns_isolated_group(
+                    nonisolated, self._proc_ticks(nonisolated.pid) or ""))
+                killpg.assert_not_called()
+                # Our own pid: refused.
+                self.assertFalse(self._owns_isolated_group(
+                    mock.Mock(pid=os.getpid()), self._proc_ticks(os.getpid()) or ""))
+                killpg.assert_not_called()
+        finally:
+            for proc in (bystander, nonisolated, owned):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+    def test_terminate_owned_group_signals_only_the_owned_isolated_group(self) -> None:
+        # GREEN (positive, real but safe): a registered, isolated, identity-
+        # matching fixture group IS reaped, and a bystander group is not
+        # touched. Only our own fixture sleep is ever signalled.
+        owned = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.register_owned(owned)
+        bystander = subprocess.Popen(["sleep", "60"], start_new_session=True)
+        self.addCleanup(lambda: (bystander.poll() is None and bystander.kill(), bystander.wait()))
+        try:
+            self.assertTrue(self.terminate_owned_group(owned))
+            self.assertIsNotNone(owned.poll(), "owned fixture group was not reaped")
+            self.assertIsNone(bystander.poll(), "bystander group must survive owned cleanup")
+        finally:
+            for proc in (owned, bystander):
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
 
     def test_shoukichi_wrapper_imports_only_allowlisted_env_keys(self) -> None:
         self.prepare_shoukichi()
