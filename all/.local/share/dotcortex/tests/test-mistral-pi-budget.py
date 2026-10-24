@@ -25,7 +25,7 @@ class MistralPiBudgetTest(unittest.TestCase):
         self.assertEqual(json.loads(SETTINGS.read_text())['defaultModel'], 'mistral-large-4')
 
     def test_org_and_models_output_agree(self):
-        source = (ROOT / 'tools-pi.org').read_text()
+        source = (ROOT / 'agents-pi.org').read_text()
         match = re.search(r'^#\+BEGIN_SRC json :tangle all/\.local/share/mistral-pi/models\.json[^\n]*\n(.*?)^#\+END_SRC',
                           source, re.M | re.S)
         self.assertIsNotNone(match)
