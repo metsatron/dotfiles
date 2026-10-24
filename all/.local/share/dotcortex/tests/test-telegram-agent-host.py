@@ -18,6 +18,92 @@ MANAGER = HERE.parents[3] / "bin" / "telegram-agent-host"
 HOST = subprocess.check_output(["hostname"], text=True).strip().lower()
 
 
+class HermesReviewerSafetyTests(unittest.TestCase):
+    def shell(self, names, script):
+        text = MANAGER.read_text()
+        functions = "\n".join(name + "() {" + text.split(name + "() {", 1)[1].split("\n}\n", 1)[0] + "\n}" for name in names)
+        with tempfile.TemporaryDirectory() as root:
+            return subprocess.run(["bash", "-c", "set -euo pipefail\nSTATE_DIR=" + root + "\nHOME=$STATE_DIR\nINTENT_DIR=$STATE_DIR/intent\nKNOWN_AGENTS=hermes\n" + functions + "\n" + script],
+                                  env={"PATH": "/usr/bin:/bin"}, capture_output=True, text=True, timeout=5)
+
+    def test_record_drift_cannot_prove_predecessor_exit(self):
+        names = ["hermes_wait_generation_exit", "hermes_stop_unlocked", "recover_hermes"]
+        for record in ("", "434343:200"):
+            for action in ("stop", "restart"):
+                with self.subTest(record=record, action=action):
+                    script = """
+record=$STATE_DIR/record
+printf '%s' '424242:100' > "$record"
+hermes_gateway_pid() { local v; v=$(cat "$record"); if [ "${1:-}" = identity ]; then echo "$v"; else echo "${v%%:*}"; fi; }
+hermes_proc_identity() { echo '424242:100'; }
+hermes_service_installed() { return 1; }
+ps() { echo 1; }
+kill() { printf '%s' "$DRIFT" > "$record"; echo signal; }
+hermes_signal_identity() { kill; }
+hermes_inspect() { return 1; }
+hermes_preflight() { return 0; }
+hermes_running() { return 0; }
+python3() { return 0; }
+hermes_start_unlocked() { echo UNSAFE_REPLACEMENT; }
+HERMES_STOP_EXIT_TIMEOUT=0
+""" + "DRIFT=" + repr(record) + "\n" + ("hermes_stop_unlocked" if action == "stop" else "recover_hermes restart")
+                    result = self.shell(names, script)
+                    self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("signal", result.stdout, result.stderr)
+                    self.assertNotIn("UNSAFE_REPLACEMENT", result.stdout)
+
+    def test_bulk_stop_propagates_hermes_lock_refusal(self):
+        names = ["stop_all", "stop_agent", "validate_agent", "stop_hermes", "hermes_lifecycle_lock", "hermes_lifecycle_unlock", "mark_intentional_stop"]
+        script = """
+orig=$(declare -f stop_agent); eval "${orig/stop_agent/real_stop_agent}"
+stop_agent() { if [ "$1" = hermes ]; then real_stop_agent "$1"; else return 0; fi; }
+hermes_stop_unlocked() { echo UNSAFE_EFFECT; }
+exec 9>"$STATE_DIR/hermes-recovery.lock"
+flock -n 9
+rc=0
+stop_all || rc=$?
+[ ! -f "$INTENT_DIR/hermes" ] || { echo FALSE_MARKER; exit 99; }
+exit "$rc"
+"""
+        result = self.shell(names, script)
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn("FALSE_MARKER", result.stdout)
+        self.assertNotIn("UNSAFE_EFFECT", result.stdout)
+        self.assertNotIn("hermes stopped", result.stdout)
+        self.assertNotIn("All agents stopped", result.stdout)
+
+    def test_direct_conditional_stop_propagates_failure(self):
+        for rc in (1, 75):
+            result = self.shell(["stop_agent", "validate_agent"], "stop_hermes() { return " + str(rc) + "; }; if stop_agent hermes; then exit 0; else exit $?; fi")
+            self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
+            self.assertNotIn("hermes stopped", result.stdout)
+
+    def test_direct_signal_uses_generation_bound_handle(self):
+        text = MANAGER.read_text()
+        code = text.split("hermes_signal_identity() {", 1)[1].split("<<'PYCODE'\n", 1)[1].split("\nPYCODE", 1)[0]
+        for ticks, expected in (("200", False), ("100", True)):
+            fields = ["S"] + ["0"] * 18 + [ticks]
+            with self.subTest(ticks=ticks), mock.patch("sys.argv", ["signal", "424242:100", "TERM"]), \
+                 mock.patch("os.pidfd_open", return_value=91, create=True), \
+                 mock.patch.object(Path, "read_text", return_value="424242 (fixture) " + " ".join(fields)), \
+                 mock.patch("signal.pidfd_send_signal", create=True) as sent, \
+                 mock.patch("os.close") as closed, mock.patch("os.kill") as numeric:
+                if expected:
+                    exec(compile(code, "signal-fixture", "exec"), {})
+                    sent.assert_called_once_with(91, signal.SIGTERM)
+                else:
+                    with self.assertRaises(SystemExit) as failure:
+                        exec(compile(code, "signal-fixture", "exec"), {})
+                    self.assertEqual(failure.exception.code, 75)
+                    sent.assert_not_called()
+                closed.assert_called_once_with(91)
+                numeric.assert_not_called()
+
+    def test_pid_reuse_is_a_different_predecessor_generation(self):
+        result = self.shell(["hermes_wait_generation_exit"], "hermes_gateway_pid() { echo 424242:100; }; hermes_proc_identity() { echo 424242:200; }; hermes_wait_generation_exit 424242:100 0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
 class TelegramAgentHostColdStartTest(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -145,14 +231,12 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         return True
 
     def _cleanup_pid_file_child(self, pid_file: Path) -> None:
-        """Reap a manager-spawned fixture child WITHOUT a group signal.
+        """Signal only a pidfd-bound fixture child, never a numeric PID.
 
-        The manager runs in this test's process group, so its children are not
-        isolated group leaders and must never be killpg-ed (a pgid collision
-        would signal the coordinator's group). Prove the pid is really this
-        fixture's child -- its /proc cmdline references the unique temp root --
-        then SIGTERM the single pid only. A stale/recycled/bystander pid whose
-        cmdline does not reference the fixture root is left alone.
+        A unique fixture-root argv establishes fixture ownership, not kernel
+        identity. Open the handle before inspecting argv and revalidate start
+        ticks afterwards. Reuse after validation cannot retarget the handle.
+        Unsupported pidfds fail closed (no unsafe numeric fallback).
         """
         try:
             recorded_pid = int(pid_file.read_text())
@@ -160,14 +244,52 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             return
         if recorded_pid <= 1 or recorded_pid == os.getpid() or self._is_ancestor(recorded_pid):
             return
-        if self._proc_ticks(recorded_pid) is None:
+        ticks = self._proc_ticks(recorded_pid)
+        if ticks is None:
             return
-        if str(self.root) not in self._proc_cmdline(recorded_pid):
-            return  # not our fixture child: never signal an unknown process
+        fd = None
         try:
-            os.kill(recorded_pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError):
+            fd = os.pidfd_open(recorded_pid, 0)
+            if str(self.root) not in self._proc_cmdline(recorded_pid):
+                return
+            if self._proc_ticks(recorded_pid) != ticks:
+                return
+            signal.pidfd_send_signal(fd, signal.SIGTERM)
+        except (OSError, AttributeError):
             pass
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def test_pidfile_cleanup_is_identity_bound(self):
+        pidfile = self.root / "cleanup.pid"
+        pidfile.write_text("424242")
+        for ticks, expected in ((("100", "200"), False), (("100", "100"), True)):
+            with self.subTest(ticks=ticks), mock.patch.object(self, "_is_ancestor", return_value=False), \
+                 mock.patch.object(self, "_proc_ticks", side_effect=ticks), \
+                 mock.patch.object(self, "_proc_cmdline", return_value=str(self.root / "owned-fixture")), \
+                 mock.patch("os.pidfd_open", return_value=91, create=True) as opened, \
+                 mock.patch("signal.pidfd_send_signal", create=True) as sent, \
+                 mock.patch("os.close") as closed, mock.patch("os.kill") as numeric:
+                self._cleanup_pid_file_child(pidfile)
+                numeric.assert_not_called()
+                opened.assert_called_once_with(424242, 0)
+                closed.assert_called_once_with(91)
+                if expected:
+                    sent.assert_called_once_with(91, signal.SIGTERM)
+                else:
+                    sent.assert_not_called()
+
+    def test_pidfile_cleanup_refuses_without_pidfd(self):
+        pidfile = self.root / "cleanup.pid"
+        pidfile.write_text("424242")
+        with mock.patch.object(self, "_is_ancestor", return_value=False), \
+             mock.patch.object(self, "_proc_ticks", return_value="100"), \
+             mock.patch.object(self, "_proc_cmdline", return_value=str(self.root)), \
+             mock.patch("os.pidfd_open", side_effect=OSError("unsupported"), create=True), \
+             mock.patch("os.kill") as numeric:
+            self._cleanup_pid_file_child(pidfile)
+            numeric.assert_not_called()
 
     def tearDown(self) -> None:
         if hasattr(self, "fixture_gateway_cleanup"):
