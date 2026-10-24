@@ -5320,6 +5320,50 @@ hermes_running() {
     [ -n "$(hermes_gateway_pid)" ]
 }
 
+# Exact process identity (pid plus kernel start ticks) for a live pid.
+hermes_proc_identity() {
+    python3 - "$1" <<'PY'
+import sys
+from pathlib import Path
+
+try:
+    pid = int(sys.argv[1])
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    if fields[0] == "Z":
+        raise ValueError()
+    print(f"{pid}:{fields[19]}")
+except (OSError, ValueError, IndexError, TypeError):
+    raise SystemExit(1)
+PY
+}
+
+# The installed default unit file does not prove the unit owns the admitted
+# generation: a detached fenced gateway survives `systemctl stop` while the
+# unit reports success. Verify the unit's MainPID and its kernel start ticks
+# against the admitted identity before any service mutation.
+hermes_service_owns_identity() {
+    local identity="$1" main_pid
+    [ -n "$identity" ] || return 1
+    hermes_service_installed || return 1
+    main_pid="$(systemctl --user show hermes-gateway.service --property=MainPID --value 2>/dev/null)" || return 1
+    case "$main_pid" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$main_pid" -gt 1 ] || return 1
+    [ "$(hermes_proc_identity "$main_pid")" = "$identity" ]
+}
+
+# Bounded proof that an exact generation exited (HERMES_STOP_EXIT_TIMEOUT,
+# default 30s): a stop that leaves the admitted process alive is a failure,
+# never a silent success.
+hermes_wait_generation_exit() {
+    local identity="$1" timeout="${2:-${HERMES_STOP_EXIT_TIMEOUT:-30}}" i
+    case "$timeout" in ''|*[!0-9]*) timeout=30 ;; esac
+    for ((i=0; i<timeout; i++)); do
+        [ "$(hermes_gateway_pid identity)" != "$identity" ] && return 0
+        sleep 1
+    done
+    [ "$(hermes_gateway_pid identity)" != "$identity" ]
+}
+
 # Read-only structural preflight and generation-bound readiness. Never imports
 # the runtime (which may refresh credentials/install dependencies), calls an LLM,
 # or opens a second Telegram consumer. Diagnostics are fixed labels, not config.
@@ -5428,16 +5472,56 @@ hermes_wait_ready() {
     for ((i=0; i<=timeout; i++)); do
         rc=0
         hermes_inspect status && return 0 || rc=$?
-        case "$rc" in 78|69) return "$rc" ;; esac
+        case "$rc" in
+            78) return "$rc" ;;
+            69)
+                # UNKNOWN is not always fatal: a new gateway.pid can precede
+                # its gateway_state.json snapshot while the old snapshot
+                # remains. While a live generation exists, wait out that
+                # bounded publication lag — never admitting the stale
+                # snapshot as ready — and fail persistent ambiguity at the
+                # timeout.
+                if [ -n "$(hermes_gateway_pid identity)" ]; then
+                    [ "$i" -eq "$timeout" ] || sleep 1
+                    continue
+                fi
+                return "$rc"
+                ;;
+        esac
         [ "$i" -eq "$timeout" ] || sleep 1
     done
     return 1
 }
 
+# One lock owns every Hermes lifecycle mutation: recover/restart, direct start
+# and direct stop all serialize on the same recovery lock. The
+# hermes_*_unlocked helpers below are internal and never lock, so an owner
+# that already holds the lock (recover_hermes) cannot deadlock on itself.
+hermes_lifecycle_lock() {
+    command -v flock >/dev/null 2>&1 || {
+        echo "Hermes lifecycle lock requires flock" >&2
+        return 1
+    }
+    exec {HERMES_LIFECYCLE_LOCK_FD}>"$STATE_DIR/hermes-recovery.lock"
+    if ! flock -n "$HERMES_LIFECYCLE_LOCK_FD"; then
+        eval "exec ${HERMES_LIFECYCLE_LOCK_FD}>&-"
+        HERMES_LIFECYCLE_LOCK_FD=""
+        echo "Refusing Hermes lifecycle mutation: another owner holds $STATE_DIR/hermes-recovery.lock" >&2
+        return 75
+    fi
+}
+
+hermes_lifecycle_unlock() {
+    if [ -n "${HERMES_LIFECYCLE_LOCK_FD:-}" ]; then
+        eval "exec ${HERMES_LIFECYCLE_LOCK_FD}>&-"
+        HERMES_LIFECYCLE_LOCK_FD=""
+    fi
+}
+
 # The lifecycle owner decides whether recovery is warranted. A healthy explicit
 # revive never bounces work. Config/unknown/startup states are not restart causes.
 recover_hermes() {
-    local force="${1:-}" expected="${2:-}" generation state rc=0 lock_fd
+    local force="${1:-}" expected="${2:-}" generation state rc=0 lock_fd start_rc=0
     exec {lock_fd}>"$STATE_DIR/hermes-recovery.lock"
     flock -n "$lock_fd" || return 75
     generation=$(hermes_gateway_pid identity)
@@ -5463,14 +5547,23 @@ except (OSError, ValueError, TypeError):
     sys.exit(75)
 PY
         [ "$?" -eq 0 ] || return 75
-        stop_hermes "$generation" || return $?
+        hermes_stop_unlocked "$generation" || return $?
     fi
     # The parent owns the recovery lock until readiness; the replacement must
     # not inherit it, or all later recovery calls stay locked for its lifetime.
-    (eval "exec ${lock_fd}>&-"; start_hermes)
+    (eval "exec ${lock_fd}>&-"; hermes_start_unlocked) || start_rc=$?
+    if [ "$start_rc" -eq 0 ] && [ "$force" = restart ] && [ "$(hermes_gateway_pid identity)" = "$generation" ]; then
+        # An explicit restart must land on a different ready generation; a
+        # start that leaves the old generation in place is not a restart.
+        echo 'Hermes restart did not land on a different ready generation' >&2
+        return 1
+    fi
+    return "$start_rc"
 }
 
-start_hermes() {
+# Internal unlocked start: the caller must already own the lifecycle lock
+# (the start_hermes boundary below, or recover_hermes until readiness).
+hermes_start_unlocked() {
     hermes_preflight || return $?
     if hermes_running; then
         hermes_inspect status
@@ -5496,7 +5589,19 @@ start_hermes() {
     hermes_wait_ready
 }
 
-stop_hermes() {
+# Lock-owning boundary for every external Hermes start. The unlocked start
+# runs with the lock descriptor closed so the detached replacement never
+# inherits it, or later lifecycle calls would stay locked for its lifetime.
+start_hermes() {
+    hermes_lifecycle_lock || return $?
+    local rc=0
+    ( eval "exec ${HERMES_LIFECYCLE_LOCK_FD}>&-"; hermes_start_unlocked ) || rc=$?
+    hermes_lifecycle_unlock
+    return "$rc"
+}
+
+# Internal unlocked stop: the caller must already own the lifecycle lock.
+hermes_stop_unlocked() {
     local expected="${1:-}" identity owner ancestor="$$"
     identity=$(hermes_gateway_pid identity)
     if [ -n "$expected" ] && [ "$identity" != "$expected" ]; then return 75; fi
@@ -5510,8 +5615,19 @@ stop_hermes() {
     done
     if hermes_service_installed; then
         [ -n "$identity" ] && [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 75
-        systemctl --user stop hermes-gateway.service
-        return
+        if hermes_service_owns_identity "$identity"; then
+            systemctl --user stop hermes-gateway.service || return 1
+            # Prove the old exact generation exits; a service stop that
+            # leaves it alive is a failure, never a silent success.
+            if ! hermes_wait_generation_exit "$identity"; then
+                echo "hermes-gateway.service stopped but generation $identity survived" >&2
+                return 1
+            fi
+            return 0
+        fi
+        # The unit does not own the admitted generation (a detached fenced
+        # gateway beside an installed unit): fall through to the direct
+        # signal path, which targets exactly the recorded process.
     fi
     # Signal only the gateway Hermes recorded for itself; never every process
     # named hermes, which would also end interactive sessions.
@@ -5520,13 +5636,22 @@ stop_hermes() {
     [ -n "$pid" ] || return 0
     [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 75
     kill -TERM "$pid" 2>/dev/null || true
-    for _ in {1..30}; do
-        [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 0
-        sleep 1
-    done
+    if hermes_wait_generation_exit "$identity"; then return 0; fi
     echo "hermes gateway did not stop gracefully; forcing pid $pid" >&2
     [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 75
     kill -KILL "$pid" 2>/dev/null || true
+    if hermes_wait_generation_exit "$identity"; then return 0; fi
+    echo "hermes gateway generation $identity survived SIGKILL; refusing to claim a stop" >&2
+    return 1
+}
+
+# Lock-owning boundary for every external Hermes stop.
+stop_hermes() {
+    hermes_lifecycle_lock || return $?
+    local rc=0
+    hermes_stop_unlocked "$@" || rc=$?
+    hermes_lifecycle_unlock
+    return "$rc"
 }
 
 check_claudecode() {
