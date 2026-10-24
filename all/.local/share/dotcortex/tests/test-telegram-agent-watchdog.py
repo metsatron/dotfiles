@@ -90,6 +90,12 @@ class HermesRecoveryJournalTests(unittest.TestCase):
         with patch.object(Path, "read_text", side_effect=PermissionError("fixture")):
             self.assertEqual(self.w.hermes_unresolved_journal(self.root), owned)
 
+    def test_reconciliation_notice_preserves_unreadable_journal_evidence(self):
+        journal = self.root / "retained.json"
+        journal.write_text("partial-journal-evidence")
+        self.w.hermes_reconcile_notice(self.args, journal, self.request, "fixture", self.when)
+        self.assertEqual(journal.read_text(), "partial-journal-evidence")
+
     def test_status_reason_cannot_masquerade_as_readiness(self):
         self.assertEqual(self.w.classify("hermes", "  hermes gateway run: UNKNOWN (previous RUNNING)\n"), "unknown")
 
