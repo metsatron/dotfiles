@@ -361,6 +361,59 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "platforms": {"telegram": {"enabled": True, "token": "fixture-token"}},
         }))
 
+    def test_hermes_connected_transport_does_not_verify_reply_credentials(self):
+        gateway = self.ready_hermes()
+        result = self.run_manager("status", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("UNKNOWN", result.stdout)
+        self.assertIn("reply credential usability NOT-VERIFIED", result.stdout)
+        self.assertNotIn("RUNNING", result.stdout)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_cold_boot_discard_is_rejected_before_stop(self):
+        gateway = self.ready_hermes()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIn("queued-input retention", result.stdout)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_retention_alone_does_not_authorize_runtime_mutation(self):
+        self.ready_hermes()
+        path = self.home / ".hermes/config.yaml"
+        config = json.loads(path.read_text())
+        config["platforms"]["telegram"]["extra"] = {"drop_pending_on_cold_boot": False}
+        path.write_text(json.dumps(config))
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("native startup dependencies and capability continuity NOT-VERIFIED", result.stdout)
+
+    def test_hermes_adoption_gate_preserves_degraded_predecessor(self):
+        gateway = self.ready_hermes(gateway_state="degraded")
+        path = self.home / ".hermes/config.yaml"
+        config = json.loads(path.read_text())
+        config["platforms"]["telegram"]["extra"] = {"drop_pending_on_cold_boot": False}
+        path.write_text(json.dumps(config))
+        marker = self.root / "unsafe-start"
+        self.write_executable("hermes", f"#!/bin/sh\ntouch {marker}\nexit 99\n")
+        result = self.run_manager("recover", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+        self.assertFalse(marker.exists(), "unverified native startup must never execute")
+
+    def test_hermes_unknown_reply_path_is_never_restarted(self):
+        gateway = self.ready_hermes()
+        result = self.run_manager("recover", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_cron_only_cannot_bypass_enabled_telegram_adoption(self):
+        gateway = self.ready_hermes()
+        original_environment = self.environment
+        self.environment = lambda timeout: dict(original_environment(timeout), HERMES_GATEWAY_MODE="cron-only")
+        result = self.run_manager("restart", "hermes")
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+
     def test_hermes_missing_reply_route_is_blocked_not_running(self):
         self.start_gateway_stand_in()
         self.hermes_config({"platforms": {"telegram": {"enabled": True, "token": "fixture-token"}}})
@@ -391,6 +444,9 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
 
     def test_hermes_healthy_recover_does_not_restart(self):
         gateway = self.ready_hermes(active_agents=2)
+        self.hermes_config({})
+        original_environment = self.environment
+        self.environment = lambda timeout: dict(original_environment(timeout), HERMES_GATEWAY_MODE="cron-only")
         result = self.run_manager("recover", "hermes")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertIsNone(gateway.poll())
@@ -410,7 +466,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         state["platforms"]["api_server"] = {"state": "failed", "writer_pid": 1}
         path.write_text(json.dumps(state))
         status = self.run_manager("status", "hermes")
-        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertEqual(status.returncode, 69, status.stdout + status.stderr)
+        self.assertIn("Telegram connected", status.stdout)
         self.assertIsNone(gateway.poll())
 
     def test_hermes_startup_grace_does_not_restart(self):
@@ -461,6 +518,9 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
 
     def test_hermes_restart_does_not_leak_recovery_lock_to_replacement(self):
         self.ready_hermes()
+        self.hermes_config({})
+        original_environment = self.environment
+        self.environment = lambda timeout: dict(original_environment(timeout), HERMES_GATEWAY_MODE="cron-only")
         self.write_executable("systemctl", "#!/bin/sh\nexit 1\n")
         self.write_executable("hermes", "#!/usr/bin/env python3\n"
             "import json, os, pathlib, signal, time\n"
@@ -494,6 +554,9 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
 
     def test_hermes_explicit_restart_preserves_active_work(self):
         gateway = self.ready_hermes(active_agents=1)
+        self.hermes_config({})
+        original_environment = self.environment
+        self.environment = lambda timeout: dict(original_environment(timeout), HERMES_GATEWAY_MODE="cron-only")
         result = self.run_manager("restart", "hermes")
         self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
         self.assertIsNone(gateway.poll())
@@ -512,11 +575,11 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
 
     def test_hermes_status_trusts_the_gateway_pid_record(self) -> None:
         self.ready_hermes()
-        self.assertIn("hermes gateway run: RUNNING", self.hermes_status_line())
+        self.assertIn("Telegram connected; reply credential usability NOT-VERIFIED", self.hermes_status_line())
 
     def test_hermes_status_accepts_native_gateway_state_record(self) -> None:
         self.ready_hermes()
-        self.assertIn("hermes gateway run: RUNNING", self.hermes_status_line())
+        self.assertIn("Telegram connected; reply credential usability NOT-VERIFIED", self.hermes_status_line())
 
     def test_hermes_stop_uses_native_gateway_state_record(self) -> None:
         gateway = self.start_gateway_stand_in()
