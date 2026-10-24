@@ -998,6 +998,66 @@ def request_main(argv: list[str]) -> int:
     return 0
 
 
+# Journal phases whose outcome is resolved: the request was consumed (or the
+# recovery completed), so nothing is left owning the next lifecycle decision.
+RESOLVED_REVIVAL_PHASES = {"ready", "blocked", "stale"}
+
+
+def hermes_unresolved_journal(state_dir: Path, identity: object = None) -> Path | None:
+    """Path of a retained Hermes revival journal whose outcome is unresolved.
+
+    An unresolved journal owns the recovery: the generation drift it left
+    behind is expected residue of an uncertain restart, so the request must be
+    retained for explicit reconciliation and the generic healer must stand down
+    even when the request file is absent. An unreadable retained journal fails
+    closed; a resolved phase never fences anything.
+    """
+    revivals = Path(state_dir) / "revivals"
+    if identity is not None:
+        if not re.fullmatch(r"[a-f0-9]{32}", str(identity)):
+            return None
+        candidates = [revivals / ("hermes.%s.json" % identity)]
+        if not candidates[0].exists():
+            return None
+    else:
+        candidates = sorted(revivals.glob("hermes.*.json"))
+    for path in candidates:
+        try:
+            journal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return path
+        if not isinstance(journal, dict) or journal.get("phase") not in RESOLVED_REVIVAL_PHASES:
+            return path
+    return None
+
+
+def hermes_reconcile_notice(args, journal_path: Path, request: dict, host: str, when: dt.datetime) -> list[dict]:
+    """One critical notice per unresolved journal, then silent retention.
+
+    Mirrors the renewal journal's last_notice dedupe: the operator is alerted
+    once that explicit reconciliation is required; no automatic replay follows.
+    """
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        journal = {}
+    if not isinstance(journal, dict):
+        journal = {}
+    key = hashlib.sha256(("revive_reconcile:%s:%s" % (journal.get("phase"), journal.get("reason"))).encode()).hexdigest()
+    if journal.get("last_notice") == key:
+        return []
+    if not args.dry_run:
+        journal["last_notice"] = key
+        renew_journal_write(journal_path, journal)
+    return [make_event(host, "hermes", "revive_reconcile", "critical",
+                       "Hermes recovery needs explicit reconciliation",
+                       "A retained revival journal is unresolved and the recorded generation fence drifted; "
+                       "the request is retained and no automatic recovery was attempted",
+                       {"request": request.get("id"), "recovery": str(journal_path),
+                        "reason": str(journal.get("reason") or "inspect the retained journal and generation; no automatic replay")},
+                       when)]
+
+
 def process_hermes_request(args, request, path, host, when, now):
     """One owner-mediated attempt; uncertain effects never replay on next cron.
 
@@ -1098,6 +1158,16 @@ def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.
             current_generation, _ = warm_resume_identity(warm_name, current_member)
         else:
             current_generation = generation_of(agent, Path(args.pid_dir))
+        if agent == "hermes":
+            # Resolve unresolved journal ownership FIRST: an uncertain
+            # restart leaves a retained journal whose generation drift is
+            # expected residue, not staleness. Retain the request for
+            # explicit reconciliation; never delete it or replay recovery.
+            journal = hermes_unresolved_journal(args.state_dir, request.get("id"))
+            if journal is not None:
+                if request.get("generation") != current_generation:
+                    events.extend(hermes_reconcile_notice(args, journal, request, host, when))
+                continue
         fence = request.get("generation")
         if warm_target and not isinstance(fence, str):
             path.unlink(missing_ok=True)
@@ -1249,9 +1319,15 @@ def main(argv: list[str]) -> int:
     supervised = {agent for agent, _, _ in targets}
 
     for agent, verdict, start_cmd in targets:
-        if agent == "hermes" and (state_dir / "requests/hermes.json").exists():
-            outcomes[agent] = "revive-pending"
-            continue
+        if agent == "hermes":
+            if (state_dir / "requests/hermes.json").exists():
+                outcomes[agent] = "revive-pending"
+                continue
+            if hermes_unresolved_journal(state_dir) is not None:
+                # A retained journal owns an unresolved recovery even with no
+                # request file; the generic healer must not call recover behind it.
+                outcomes[agent] = "recovery-unresolved"
+                continue
         if agent == "codex":
             # The durable renewal state machine exclusively owns stop/start
             # while pending. Generic liveness repair must not race its pause,
