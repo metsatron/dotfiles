@@ -1086,7 +1086,12 @@ def hermes_unresolved_journal(state_dir: Path, identity: object = None) -> Path 
         if not candidates[0].exists():
             return None
     else:
-        candidates = sorted(revivals.glob("hermes.*.json"))
+        # Only owner-issued 32-hex journal names claim lifecycle ownership.
+        # Unreadable/unknown content at that namespace requires explicit
+        # reconciliation (inspect then resolve/archive); no age-based expiry.
+        # Other malformed or unrelated filenames never acquire this fence.
+        candidates = sorted(p for p in revivals.glob("hermes.*.json")
+                            if re.fullmatch(r"hermes\.[a-f0-9]{32}\.json", p.name))
     for path in candidates:
         try:
             journal = json.loads(path.read_text(encoding="utf-8"))
@@ -1142,7 +1147,7 @@ def process_hermes_request(args, request, path, host, when, now):
         return [make_event(host, "hermes", kind, "notice" if kind == "revive_done" else "critical",
                           "Hermes recovery " + kind, reason,
                           {"request": identity, "recovery": str(journal_path), "reason": reason}, when)]
-    if journal_path.exists():
+    if hermes_unresolved_journal(args.state_dir) is not None or journal_path.exists():
         # A crash after intent may have stopped or started a generation. Observe
         # only; never repeat an effect whose completion is not known.
         return []
@@ -1197,6 +1202,14 @@ def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.
             events.append(make_event(host, "*", "revive_rejected", "warning", "Malformed revive request dropped",
                                      "A revive request in the watchdog queue was unreadable and was dropped", {}, when))
             continue
+        if agent == "hermes":
+            # Global ownership precedes even request expiry/renewal handling.
+            # A different pending request cannot replay uncertain old effects.
+            journal = hermes_unresolved_journal(args.state_dir)
+            if journal is not None:
+                if journal.name == "hermes.%s.json" % request.get("id") and request.get("generation") != generation_of("hermes", Path(args.pid_dir)):
+                    events.extend(hermes_reconcile_notice(args, journal, request, host, when))
+                continue
         if request.get("mode") == "renew":
             # Requester-shell exit does not prove handler or delivery cleanup.
             events.extend(process_renewal(args, request, path, host, state, when, now))
@@ -2186,6 +2199,18 @@ class HermesRecoveryJournalTests(unittest.TestCase):
                                                  "fixture", self.when, 1000)
         return events, calls
 
+    def test_only_owned_journal_names_fence_and_resolved_phases_release(self):
+        directory = self.root / "revivals"
+        directory.mkdir()
+        (directory / "hermes.stale-not-an-issued-id.json").write_text("broken")
+        self.assertIsNone(self.w.hermes_unresolved_journal(self.root))
+        owned = directory / ("hermes." + "b" * 32 + ".json")
+        for phase in ("ready", "blocked", "stale"):
+            owned.write_text(json.dumps({"phase": phase}))
+            self.assertIsNone(self.w.hermes_unresolved_journal(self.root))
+        with patch.object(Path, "read_text", side_effect=PermissionError("fixture")):
+            self.assertEqual(self.w.hermes_unresolved_journal(self.root), owned)
+
     def test_status_reason_cannot_masquerade_as_readiness(self):
         self.assertEqual(self.w.classify("hermes", "  hermes gateway run: UNKNOWN (previous RUNNING)\n"), "unknown")
 
@@ -2452,6 +2477,24 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotIn("stop:hermes", self.calls())
         self.assertNotIn("start:hermes", self.calls())
         self.assertIn("revive_rejected", [e["kind"] for e in self.events()])
+
+    def test_old_unresolved_journal_fences_new_request_entrypoint(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: DEGRADED (fixture)\n")
+        self.assertEqual(self.request("hermes", self.dead_pid()).returncode, 0)
+        request = self.root / "state/requests/hermes.json"
+        original = request.read_bytes()
+        journals = self.root / "state/revivals"
+        journals.mkdir()
+        journal = journals / ("hermes." + "b" * 32 + ".json")
+        for content in (json.dumps({"phase": "restart-intent", "reason": "uncertain"}), "unreadable-json", json.dumps({"phase": "future-phase"})):
+            with self.subTest(content=content):
+                journal.write_text(content)
+                result = self.run_watchdog()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(request.read_bytes(), original)
+                self.assertEqual(journal.read_text(), content)
 
     def test_hermes_degraded_routes_recovery_to_owner_not_blind_start(self):
         (self.root / "enabled").write_text("hermes\n")
