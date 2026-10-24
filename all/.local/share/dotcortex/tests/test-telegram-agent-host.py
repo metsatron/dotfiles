@@ -367,6 +367,28 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.start_gateway_stand_in()
         self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: RUNNING")
 
+    def test_hermes_status_accepts_native_gateway_state_record(self) -> None:
+        self.start_gateway_stand_in()
+        home = self.home / ".hermes"
+        (home / "gateway.pid").rename(home / "gateway_state.json")
+        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: RUNNING")
+
+    def test_hermes_stop_uses_native_gateway_state_record(self) -> None:
+        gateway = self.start_gateway_stand_in()
+        home = self.home / ".hermes"
+        (home / "gateway.pid").rename(home / "gateway_state.json")
+        stopped = self.run_manager("stop", "hermes", timeout=20)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
+        gateway.wait(timeout=5)
+
+    def test_hermes_status_rejects_wrong_record_kind(self) -> None:
+        self.start_gateway_stand_in()
+        path = self.home / ".hermes/gateway.pid"
+        record = json.loads(path.read_text())
+        record["kind"] = "not-a-gateway"
+        path.write_text(json.dumps(record))
+        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: STOPPED")
+
     def test_hermes_status_rejects_a_recycled_pid(self) -> None:
         self.start_gateway_stand_in(ticks="1")
         self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: STOPPED")
