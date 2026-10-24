@@ -141,6 +141,9 @@ def run_manager(manager: str, args: list[str], timeout: int) -> subprocess.Compl
 
 def classify(agent: str, status_text: str) -> str:
     """Return up, down, or unknown from the agent's own status line."""
+    if agent == "hermes":
+        states = re.findall(r"(?m)^\s*hermes gateway run: ([A-Z]+)(?:\s|$)", status_text)
+        return {"RUNNING": "up", "STOPPED": "down", "DEGRADED": "down"}.get(states[0], "unknown") if len(states) == 1 else "unknown"
     pattern = STATUS_LABELS.get(agent)
     if pattern is None:
         return "unknown"
@@ -354,6 +357,24 @@ def boot_owns_lock(path: Path) -> bool:
 
 def generation_of(agent: str, pid_dir: Path) -> str | None:
     """Identity of the agent's supervisor: pid plus kernel start-time, or None when unfenced."""
+    if agent == "hermes":
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        override = os.environ.get("HERMES_GATEWAY_PID_FILE")
+        paths = [Path(override)] if override else [home / "gateway_state.json", home / "gateway.pid"]
+        for path in paths:
+            try:
+                record = json.loads(path.read_text())
+                pid = record["pid"]
+                if record.get("kind") != "hermes-gateway" or type(pid) is not int or pid <= 1:
+                    continue
+                if record.get("hermes_home") and Path(record["hermes_home"]).resolve() != home.resolve():
+                    continue
+                generation = proc_generation(pid)
+                if generation == f"{pid}:{record['start_time']}":
+                    return generation
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return "absent"
     name = PID_FILES.get(agent)
     if name is None:
         return None
@@ -977,6 +998,62 @@ def request_main(argv: list[str]) -> int:
     return 0
 
 
+def process_hermes_request(args, request, path, host, when, now):
+    """One owner-mediated attempt; uncertain effects never replay on next cron.
+
+    No config or credential rollback: without a reviewed prior artifact there is
+    no safe automatic rollback. Retain failure for inspection, not another bounce.
+    """
+    identity = request.get("id")
+    if not re.fullmatch(r"[a-f0-9]{32}", str(identity)):
+        return [make_event(host, "hermes", "revive_rejected", "critical",
+                           "Hermes revive refused", "Invalid request identity; no lifecycle effects", {}, when)]
+    journal_path = Path(args.state_dir) / "revivals" / ("hermes." + identity + ".json")
+    def save(phase, reason):
+        renew_journal_write(journal_path, {"request": identity, "phase": phase,
+                    "generation": request.get("generation"), "reason": reason, "updated_at": now})
+    def event(kind, reason):
+        return [make_event(host, "hermes", kind, "notice" if kind == "revive_done" else "critical",
+                          "Hermes recovery " + kind, reason,
+                          {"request": identity, "recovery": str(journal_path), "reason": reason}, when)]
+    if journal_path.exists():
+        # A crash after intent may have stopped or started a generation. Observe
+        # only; never repeat an effect whose completion is not known.
+        return []
+    if args.dry_run:
+        return []
+    try:
+        preflight = run_manager(args.manager, ["preflight", "hermes"], 30)
+        if preflight.returncode:
+            reason = "Candidate preflight refused; running generation preserved; repair configuration before a new request"
+            save("blocked", reason)
+            path.unlink(missing_ok=True)
+            return event("revive_rejected", reason)
+        before = generation_of("hermes", Path(args.pid_dir))
+        if before == "absent" or request.get("generation") != before:
+            reason = "Missing or changed Hermes generation fence; no restart attempted"
+            save("stale", reason)
+            path.unlink(missing_ok=True)
+            return event("revive_stale", reason)
+        save("restart-intent", "Owner restart pending; interrupted outcomes require inspection, no automatic replay")
+        started = run_manager(args.manager, ["restart", "hermes", before], args.start_timeout)
+        after = generation_of("hermes", Path(args.pid_dir))
+        probe = run_manager(args.manager, ["status", "hermes"], 60)
+        ok = (started.returncode == 0 and probe.returncode == 0 and classify("hermes", probe.stdout) == "up"
+              and after not in {"absent", before})
+        if ok:
+            save("ready", "Replacement generation and structural/transport readiness verified; reply delivery not exercised")
+            path.unlink(missing_ok=True)
+            return event("revive_done", "Replacement generation ready; no inference canary was issued")
+        reason = "Owner restart failed or replacement readiness unverified; inspect retained journal and generation; no automatic rollback or second restart"
+        save("recovery-required", reason)
+        return event("revive_failed", reason)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        reason = "Recovery outcome unknown; inspect owner and retained journal; no automatic replay or rollback"
+        save("recovery-required", reason)
+        return event("revive_failed", reason)
+
+
 def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.datetime, now: float) -> list[dict]:
     """Execute pending self-revive requests from outside the requesting process group."""
     events: list[dict] = []
@@ -1039,6 +1116,12 @@ def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.
             events.append(make_event(host, agent, "revive_rejected", "warning", "%s revive is cooling down" % agent,
                                      "%s was self-revived less than %ss ago; request refused" % (agent, args.revive_cooldown),
                                      {"request": request.get("id")}, when))
+            continue
+        if agent == "hermes":
+            result = process_hermes_request(args, request, path, host, when, now)
+            events.extend(result)
+            if any(e["kind"] in {"revive_done", "revive_failed"} for e in result) and not args.dry_run:
+                revive[agent] = int(now)
             continue
         if warm_target:
             # Live-session guard before anything is killed: a warm revive whose
@@ -1158,13 +1241,17 @@ def main(argv: list[str]) -> int:
     status_text = status_run.stdout if status_run is not None else ""
 
     # Telegram agents relaunch through the host manager; warm Claude sessions through nurse-joy.
-    targets = [(agent, classify(agent, status_text), [args.manager, "start", agent]) for agent in enabled]
+    targets = [(agent, classify(agent, status_text),
+                [args.manager, "recover" if agent == "hermes" else "start", agent]) for agent in enabled]
     warm = read_warm_sessions(Path(args.warm_file))
     warm_status = warm_verdicts(args.nurse, warm, 60, args.tmux)
     targets += [("warm-" + name.lower(), warm_status[name], [args.nurse, "revive", "--no-visit", name.lower()]) for name in warm]
     supervised = {agent for agent, _, _ in targets}
 
     for agent, verdict, start_cmd in targets:
+        if agent == "hermes" and (state_dir / "requests/hermes.json").exists():
+            outcomes[agent] = "revive-pending"
+            continue
         if agent == "codex":
             # The durable renewal state machine exclusively owns stop/start
             # while pending. Generic liveness repair must not race its pause,
@@ -1225,6 +1312,9 @@ def main(argv: list[str]) -> int:
         try:
             started = run_manager(start_cmd[0], start_cmd[1:], args.start_timeout)
             outcomes[agent] = "relaunched" if started.returncode == 0 else "relaunch-failed"
+            if agent == "hermes" and started.returncode == 0:
+                probe = run_manager(args.manager, ["status", "hermes"], 60)
+                outcomes[agent] = "owner-ready" if probe.returncode == 0 and classify(agent, probe.stdout) == "up" else "relaunch-failed"
             entry["last_result"] = started.returncode
         except (OSError, subprocess.SubprocessError) as exc:
             outcomes[agent] = "relaunch-failed"
