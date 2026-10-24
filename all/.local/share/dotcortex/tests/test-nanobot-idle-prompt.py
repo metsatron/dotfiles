@@ -310,6 +310,112 @@ class NanoIdlePromptSeamTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(any(m.channel == "telegram" and m.chat_id == "YOUR_CHAT_ID"
                             and m.content == "fixture reply" for m in outbound))
 
+    async def test_long_provider_wait_returns_failure_without_retry(self):
+        from unittest import mock
+        from nanobot.providers.base import LLMProvider, LLMResponse
+        class Provider(LLMProvider):
+            def get_default_model(inner): return "fixture"
+            async def chat(inner, **kwargs): return failure
+        failure = LLMResponse(content="fixture quota exhausted", finish_reason="error",
+                              error_status_code=429, error_should_retry=True,
+                              error_retry_after_s=138341)
+        for mode in ("standard", "persistent"):
+            provider = Provider(provider_name="fixture")
+            provider.chat = mock.AsyncMock(return_value=failure)
+            provider._sleep_with_heartbeat = mock.AsyncMock()
+            exhausted, statuses = mock.AsyncMock(), mock.AsyncMock()
+            result = await provider.chat_with_retry(
+                messages=[{"role": "user", "content": "fixture"}], retry_mode=mode,
+                on_retry_exhausted=exhausted, on_retry_status=statuses)
+            self.assertIs(result, failure)
+            self.assertEqual(provider.chat.await_count, 1)
+            provider._sleep_with_heartbeat.assert_not_awaited()
+            exhausted.assert_awaited_once()
+            self.assertIn("choose another model", exhausted.call_args.args[0])
+            self.assertEqual(statuses.call_args.args[0].state, "exhausted")
+
+    async def test_short_provider_wait_keeps_existing_retry(self):
+        from unittest import mock
+        from nanobot.providers.base import LLMProvider, LLMResponse
+        class Provider(LLMProvider):
+            def get_default_model(inner): return "fixture"
+            async def chat(inner, **kwargs): raise AssertionError("mock only")
+        provider = Provider(provider_name="fixture")
+        failure = LLMResponse(content="fixture transient", finish_reason="error",
+                              error_should_retry=True, error_retry_after_s=2)
+        success = LLMResponse(content="recovered")
+        provider.chat = mock.AsyncMock(side_effect=[failure, success])
+        provider._sleep_with_heartbeat = mock.AsyncMock()
+        self.assertIs(await provider.chat_with_retry(messages=[]), success)
+        self.assertEqual(provider.chat.await_count, 2)
+        self.assertEqual(provider._sleep_with_heartbeat.call_args.args[0], 3)
+
+    async def test_quota_release_preserves_tool_followups_and_next_model(self):
+        from nanobot.providers.base import LLMResponse, ToolCallRequest
+        from nanobot.agent.tools.base import Tool
+        loop, calls, root = self.make_runtime_loop()
+        old = loop.runtime_for_session(loop.sessions.get_or_create("unified:default")).provider
+        entered, release = asyncio.Event(), asyncio.Event()
+        count, tool_calls = 0, []
+        class Once(Tool):
+            @property
+            def name(inner): return "fixture_once"
+            @property
+            def description(inner): return "Synthetic single effect"
+            @property
+            def parameters(inner): return {"type": "object", "properties": {}}
+            async def execute(inner, **kwargs):
+                tool_calls.append("completed")
+                return "COMPLETED_TOOL_RESULT"
+        loop.tools.register(Once())
+        async def chat(inner, messages, tools=None, model=None, **kwargs):
+            nonlocal count
+            count += 1
+            if count == 1:
+                return LLMResponse(content=None, finish_reason="tool_calls",
+                                   tool_calls=[ToolCallRequest("fixture-once", "fixture_once", {})])
+            entered.set()
+            await release.wait()
+            return LLMResponse(content="fixture quota exhausted", finish_reason="error",
+                               error_should_retry=True, error_status_code=429,
+                               error_retry_after_s=138341)
+        old.chat = MethodType(chat, old)
+        slept = []
+        async def forbidden_sleep(*args, **kwargs):
+            slept.append(args)
+            raise AssertionError("unbounded retry sleep reached")
+        old._sleep_with_heartbeat = forbidden_sleep
+        first = loop.idle_prompt_message("YOUR_CHAT_ID", "run fixture tool")
+        task = asyncio.create_task(loop._dispatch(first))
+        self.addAsyncCleanup(lambda: asyncio.gather(task, return_exceptions=True))
+        self.addCleanup(release.set)
+        await asyncio.wait_for(entered.wait(), timeout=5)
+        loop.set_session_model_preset("unified:default", "later")
+        for text in ("FOLLOWUP_ONE", "FOLLOWUP_TWO", "FOLLOWUP_THREE"):
+            await loop._pending_queues["unified:default"].put(
+                loop.idle_prompt_message("YOUR_CHAT_ID", text))
+        release.set()
+        await asyncio.wait_for(task, timeout=5)
+        self.assertEqual(slept, [])
+        self.assertEqual(tool_calls, ["completed"])
+        session = loop.sessions.get_or_create("unified:default")
+        self.assertEqual(sum(m.get("role") == "tool" and m.get("content") == "COMPLETED_TOOL_RESULT"
+                             for m in session.messages), 1)
+        # Follow-ups are either saved as injected input or re-published by the
+        # native dispatcher, never dropped or copied into a second queue.
+        persisted = str(session.messages)
+        queued = []
+        while loop.bus.inbound_size:
+            queued.append((await loop.bus.consume_inbound()).content)
+        for text in ("FOLLOWUP_ONE", "FOLLOWUP_TWO", "FOLLOWUP_THREE"):
+            self.assertEqual(persisted.count(text) + queued.count(text), 1)
+        await asyncio.wait_for(loop._dispatch(
+            loop.idle_prompt_message("YOUR_CHAT_ID", "continue with saved model")), timeout=5)
+        self.assertEqual(calls[-1][:2], ("later", "LaterCodex"))
+        self.assertIn("COMPLETED_TOOL_RESULT", str(calls[-1][2]))
+        self.assertEqual(tool_calls, ["completed"])
+        self.assertFalse(loop._get_session_lock("unified:default").locked())
+
     async def test_endpoint_nonunified_keeps_exact_telegram_session(self):
         loop, calls, root = self.make_runtime_loop(unified=False)
         self.token_file(root)
