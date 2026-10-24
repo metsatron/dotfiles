@@ -27,7 +27,8 @@ class AuthenticatedWakeTests(unittest.TestCase):
         self.base = Path(self.temp.name)
         self.env = mock.patch.dict(os.environ, {
             'AGENT_PEER_REGISTRY_FILE': str(self.base/'registry.json'),
-            'AGENT_PEER_STATE_DIR': str(self.base/'store')})
+            'AGENT_PEER_STATE_DIR': str(self.base/'store'),
+            'AGENT_PEER_COORDINATOR_TRUST_FILE': str(self.base/'trust.json')})
         self.env.start()
         self.addCleanup(self.env.stop)
         self.peer = load('fixture_peer', ROOT/'all/.local/bin/agent-peer')
@@ -38,13 +39,15 @@ class AuthenticatedWakeTests(unittest.TestCase):
         key.chmod(0o600)
         self.grant = {'source': self.source, 'destination': self.dest,
             'repo': 'fixture', 'repo_root': str(self.base), 'checkout_id': 'fixture:checkout',
-            'capabilities': ['status','nudge'], 'secret_file': str(key)}
+            'capabilities': ['status','nudge'], 'secret_file': str(key),
+            'root_identity': {'device':self.base.stat().st_dev,'inode':self.base.stat().st_ino}}
         self.registry = self.peer.blank_registry('kikin')
         self.registry['coordinator_keys'] = {'fixture-key': self.grant}
         self.registry['endpoints'][self.dest] = {'delivery': 'store',
             'repo_root': str(self.base), 'accept_from': [],
             'herdr_session': 'unused', 'herdr_target': 'unused'}
         self.peer.write_registry(self.registry)
+        self.write_trust()
         handoff = {'schema_version':'1.0', 'id':'fixture', 'scope':'fixture',
             'goal':'Report fixture status only', 'working_directory':str(self.base),
             'constraints':{'read_only':True,'allow_git':'none','forbidden_paths':['LOGS/','NEXUS/']},
@@ -53,6 +56,79 @@ class AuthenticatedWakeTests(unittest.TestCase):
             repo='fixture',repo_root=str(self.base),checkout_id='fixture:checkout', access='read',
             body='Fixture status',handoff=handoff,allow_git=False,allow_push=False,
             allow_pull=False,lease_id=None)
+
+    def write_trust(self):
+        self.peer.atomic_json(self.base/'trust.json',
+            {'schema':'dotcortex.coordinator-trust.v1',
+             'coordinator_keys':self.registry['coordinator_keys']})
+
+    def test_shared_registry_cannot_replace_protected_grant(self):
+        trust = self.base/'trust.json'
+        self.peer.atomic_json(trust, {'schema':'dotcortex.coordinator-trust.v1',
+            'coordinator_keys':{'fixture-key':self.grant}})
+        with mock.patch.dict(os.environ, AGENT_PEER_COORDINATOR_TRUST_FILE=str(trust)):
+            signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+            attacker = self.base/'attacker.key'
+            attacker.write_bytes(b'ISOLATED-ATTACKER-FIXTURE-KEY-ONLY-0000');attacker.chmod(0o600)
+            self.registry['coordinator_keys']['fixture-key'] = dict(self.grant, secret_file=str(attacker))
+            self.peer.write_registry(self.registry)
+            (self.base/'registry.json').chmod(0o666)
+            self.assertEqual(self.peer.verify_coordinator(signed)['secret_file'], self.grant['secret_file'])
+            (self.base/'registry.json').chmod(0o660)
+            self.assertEqual(self.peer.verify_coordinator(signed)['secret_file'], self.grant['secret_file'])
+
+    def test_private_trust_owner_modes_links_parents_and_read_race(self):
+        trust=self.base/'trust.json'
+        for mode in (0o666,0o660,0o640):
+            trust.chmod(mode)
+            with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(self.envelope,'fixture-key')
+        trust.chmod(0o600)
+        link=self.base/'linked';link.symlink_to(self.base, target_is_directory=True)
+        with mock.patch.dict(os.environ,AGENT_PEER_COORDINATOR_TRUST_FILE=str(link/'trust.json')):
+            with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(self.envelope,'fixture-key')
+        unsafe=self.base/'unsafe';unsafe.mkdir();unsafe.chmod(0o777)
+        self.peer.atomic_json(unsafe/'trust.json',{'schema':'dotcortex.coordinator-trust.v1','coordinator_keys':{'fixture-key':self.grant}})
+        with mock.patch.dict(os.environ,AGENT_PEER_COORDINATOR_TRUST_FILE=str(unsafe/'trust.json')):
+            with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(self.envelope,'fixture-key')
+        real_fstat=self.peer.os.fstat
+        def wrong_owner(fd):
+            info=real_fstat(fd)
+            if self.peer.stat.S_ISREG(info.st_mode):
+                values=list(info);values[4]=os.geteuid()+1
+                return os.stat_result(values)
+            return info
+        with mock.patch.object(self.peer.os,'fstat',side_effect=wrong_owner):
+            with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(self.envelope,'fixture-key')
+        real_read=self.peer.os.read
+        def mutate(fd,n):
+            value=real_read(fd,n)
+            with trust.open('ab') as handle: handle.write(b' ')
+            return value
+        with mock.patch.object(self.peer.os,'read',side_effect=mutate):
+            with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(self.envelope,'fixture-key')
+        self.write_trust()
+        trust.unlink();trust.symlink_to(self.base/'fixture.key')
+        with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(self.envelope,'fixture-key')
+
+    def test_physical_root_alias_and_replaced_checkout_are_refused(self):
+        signed=self.peer.sign_coordinator(self.envelope,'fixture-key')
+        self.grant['root_identity']['inode']+=1;self.write_trust()
+        with self.assertRaises(self.peer.PeerError): self.peer.receive_coordinator(signed)
+        self.grant['root_identity']['inode']-=1
+        link=self.base/'checkout-alias';link.symlink_to(self.base,target_is_directory=True)
+        self.grant['repo_root']=str(link);self.write_trust()
+        envelope=copy.deepcopy(self.envelope);envelope['workspace']['repo_root']=str(link)
+        with self.assertRaises(self.peer.PeerError): self.peer.sign_coordinator(envelope,'fixture-key')
+
+    def test_missing_trust_is_retryable_but_unknown_and_revoked_are_refused(self):
+        signed=self.peer.sign_coordinator(self.envelope,'fixture-key')
+        trust=self.base/'trust.json';value=trust.read_bytes();trust.unlink()
+        with self.assertRaises(self.peer.CoordinatorUnavailable): self.peer.receive_coordinator(signed)
+        trust.write_bytes(value);trust.chmod(0o600)
+        self.assertEqual(self.peer.receive_coordinator(signed)['state'],'stored')
+        self.registry['coordinator_keys']={};self.write_trust()
+        with self.assertRaises(self.peer.PeerError) as refused: self.peer.verify_coordinator(signed)
+        self.assertNotIsInstance(refused.exception,self.peer.CoordinatorUnavailable)
 
     def test_attested_store_exact_duplicate_and_reverification(self):
         signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
@@ -82,7 +158,7 @@ class AuthenticatedWakeTests(unittest.TestCase):
         with mock.patch.object(self.peer.uuid,'uuid4',return_value=signed['nonce']):
             replay=self.peer.sign_coordinator(replay,'fixture-key')
         with self.assertRaises(self.peer.PeerError): self.peer.receive_coordinator(replay)
-        self.registry['coordinator_keys']={};self.peer.write_registry(self.registry)
+        self.registry['coordinator_keys']={};self.write_trust()
         with self.assertRaises(self.peer.PeerError): self.peer.verified_coordinator_record(self.envelope['message_id'])
 
     def test_mail_transport_poison_then_valid_stores_once_without_model(self):
@@ -99,10 +175,12 @@ class AuthenticatedWakeTests(unittest.TestCase):
             msg=EmailMessage();msg['From']='forged-author@example.invalid';msg['Message-ID']=f'<{name}@fixture>'
             msg.set_content(body);(mailbox/'new'/name).write_bytes(msg.as_bytes())
         with mock.patch.dict(os.environ,MAILCORTEX_ROOT=str(mailroot),MAILCORTEX_RUNTIME=str(self.base/'runtime')):
-            self.registry['coordinator_keys']={};self.peer.write_registry(self.registry)
+            trust_bytes=(self.base/'trust.json').read_bytes()
+            (self.base/'trust.json').unlink()
             self.assertEqual(watcher.scan_once(registry, watcher.TransportAdapters(),now=99),0)
             self.assertEqual(watcher.MAILCORTEX.load_receipt('astra','<b-valid@fixture>')['reason'],'transport_unavailable')
-            self.registry['coordinator_keys']={'fixture-key':self.grant};self.peer.write_registry(self.registry)
+            (self.base/'trust.json').write_bytes(trust_bytes)
+            (self.base/'trust.json').chmod(0o600)
             self.assertEqual(watcher.scan_once(registry, watcher.TransportAdapters(),now=100),1)
             self.assertEqual(watcher.scan_once(registry, watcher.TransportAdapters(),now=101),0)
             receipt=watcher.MAILCORTEX.load_receipt('astra','<b-valid@fixture>')

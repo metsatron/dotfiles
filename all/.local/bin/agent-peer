@@ -16,6 +16,9 @@ import json
 import os
 import pathlib
 import platform
+import stat
+import pwd
+import grp
 import re
 import shlex
 import shutil
@@ -1416,23 +1419,83 @@ def coordinator_material(value: dict) -> bytes:
                       separators=(",", ":"), allow_nan=False).encode("ascii")
 
 
+def coordinator_private_bytes(path: pathlib.Path) -> bytes:
+    """Open every component without following links; trust only root/this UID.
+
+    Shared fleet metadata is deliberately NOT a trust document. No writable
+    ancestor (including sticky directories) is accepted for private authority.
+    File ownership is this effective service UID, never a value from metadata.
+    """
+    if not path.is_absolute() or ".." in path.parts or str(path) != str(path.absolute()):
+        raise PeerError("coordinator private path must be absolute")
+    descriptor = None
+    # Explicit OS-account private-primary-group semantics, not a file-local
+    # inference: no other primary or supplementary member may be a principal.
+    gid = os.getgid()
+    group = grp.getgrgid(gid)
+    members = {entry.pw_uid for entry in pwd.getpwall() if entry.pw_gid == gid}
+    try:
+        members.update(pwd.getpwnam(name).pw_uid for name in group.gr_mem)
+    except KeyError:
+        members.add(-1)
+    private_group = members == {os.geteuid()}
+    try:
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for component in path.parts[1:-1]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor); descriptor = child
+            info = os.fstat(descriptor)
+            if (info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o002
+                    or (info.st_mode & 0o020 and not (
+                        private_group and info.st_uid == os.geteuid() and info.st_gid == gid))):
+                raise PeerError("coordinator private path has an unsafe parent")
+        child = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=descriptor)
+        os.close(descriptor); descriptor = child
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) != 0o600):
+            raise PeerError("coordinator private file must be service-owned mode 0600")
+        data = os.read(descriptor, MAX_MESSAGE_BYTES + 1)
+        after = os.fstat(descriptor)
+        if (len(data) > MAX_MESSAGE_BYTES or
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise PeerError("coordinator private file changed during read")
+        return data
+    except (FileNotFoundError, PermissionError) as error:
+        raise CoordinatorUnavailable("coordinator private trust/credential unavailable") from error
+    except OSError as error:
+        raise PeerError("coordinator private path refused") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
 def coordinator_grant(key_id: str) -> tuple[dict, bytes]:
     validate_component(key_id, "coordinator key ID")
-    registry = read_registry()
-    grant = registry.get("coordinator_keys", {}).get(key_id)
+    path = pathlib.Path(os.environ.get("AGENT_PEER_COORDINATOR_TRUST_FILE",
+        str(pathlib.Path.home() / ".config/agent-peer/coordinator-trust.json")))
+    try:
+        trust = json.loads(coordinator_private_bytes(path))
+    except (ValueError, UnicodeError) as error:
+        raise PeerError("invalid coordinator trust document") from error
+    if (not isinstance(trust, dict) or trust.get("schema") != "dotcortex.coordinator-trust.v1"
+            or not isinstance(trust.get("coordinator_keys"), dict)):
+        raise PeerError("invalid coordinator trust schema")
+    grant = trust["coordinator_keys"].get(key_id)
     if not isinstance(grant, dict) or set(grant) != {
             "source", "destination", "repo", "repo_root", "checkout_id",
-            "capabilities", "secret_file"}:
-        raise CoordinatorUnavailable("coordinator key is not provisioned")
+            "capabilities", "secret_file", "root_identity"}:
+        # An available document is authoritative: unknown/removed IDs are
+        # refused permanently, NOT treated as indefinitely pending provisioning.
+        raise PeerError("coordinator key is unknown or revoked")
     parse_peer_id(grant["source"])
     if (grant["destination"] != COORDINATOR_DESTINATION
-            or set(grant["capabilities"]) != {"status", "nudge"}):
+            or grant["capabilities"] != ["status", "nudge"]):
         raise PeerError("coordinator grant exceeds status,nudge scope")
-    path = pathlib.Path(grant["secret_file"])
-    if (path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077
-            or path.stat().st_uid != os.getuid()):
-        raise PeerError("coordinator credential is not an owned private regular file")
-    secret = path.read_bytes()
+    secret = coordinator_private_bytes(pathlib.Path(grant["secret_file"]))
     if len(secret) < 32 or len(secret) > 4096:
         raise PeerError("coordinator credential has invalid length")
     return grant, secret
@@ -1451,8 +1514,14 @@ def coordinator_scope(envelope: dict, grant: dict) -> None:
             or envelope.get("lease") is not None):
         raise PeerError("coordinator provenance endpoint/workspace/authority mismatch")
     root = grant["repo_root"]
-    if str(pathlib.Path(root)) != root or ".." in pathlib.Path(root).parts:
-        raise PeerError("coordinator root is not canonical")
+    try:
+        physical = pathlib.Path(root).resolve(strict=True)
+        info = physical.stat()
+    except OSError as error:
+        raise CoordinatorUnavailable("coordinator destination checkout unavailable") from error
+    if (str(physical) != root or not physical.is_dir()
+            or grant["root_identity"] != {"device": info.st_dev, "inode": info.st_ino}):
+        raise PeerError("coordinator root is not the pinned physical checkout")
 
 
 def sign_coordinator(envelope: dict, key_id: str) -> dict:
@@ -1518,6 +1587,8 @@ def receive_envelope(envelope: object, origin_host: str | None = None, *, _attes
     if _attestation and _attestation["envelope"] != envelope:
         raise PeerError("intake envelope differs from signed event")
     validated = validate_envelope(envelope)
+    if authenticated and not registry_path().exists():
+        raise CoordinatorUnavailable("coordinator endpoint registry unavailable")
     registry = read_registry()
     destination = validated["to"]
     source = validated["from"]
@@ -3414,6 +3485,9 @@ def main() -> int:
             )
         if args.command == "lease-release":
             return command_lease_release(args.lease_id)
+    except CoordinatorUnavailable as error:
+        emit({"schema": "dotcortex.peer-error.v1", "error": str(error)})
+        return 75  # temporary private trust availability, never authorization
     except (PeerError, OSError, ValueError) as error:
         emit({"schema": "dotcortex.peer-error.v1", "error": str(error)})
         return 1
