@@ -78,6 +78,18 @@ class HermesRecoveryJournalTests(unittest.TestCase):
                                                  "fixture", self.when, 1000)
         return events, calls
 
+    def test_only_owned_journal_names_fence_and_resolved_phases_release(self):
+        directory = self.root / "revivals"
+        directory.mkdir()
+        (directory / "hermes.stale-not-an-issued-id.json").write_text("broken")
+        self.assertIsNone(self.w.hermes_unresolved_journal(self.root))
+        owned = directory / ("hermes." + "b" * 32 + ".json")
+        for phase in ("ready", "blocked", "stale"):
+            owned.write_text(json.dumps({"phase": phase}))
+            self.assertIsNone(self.w.hermes_unresolved_journal(self.root))
+        with patch.object(Path, "read_text", side_effect=PermissionError("fixture")):
+            self.assertEqual(self.w.hermes_unresolved_journal(self.root), owned)
+
     def test_status_reason_cannot_masquerade_as_readiness(self):
         self.assertEqual(self.w.classify("hermes", "  hermes gateway run: UNKNOWN (previous RUNNING)\n"), "unknown")
 
@@ -344,6 +356,24 @@ class WatchdogTests(unittest.TestCase):
         self.assertNotIn("stop:hermes", self.calls())
         self.assertNotIn("start:hermes", self.calls())
         self.assertIn("revive_rejected", [e["kind"] for e in self.events()])
+
+    def test_old_unresolved_journal_fences_new_request_entrypoint(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: DEGRADED (fixture)\n")
+        self.assertEqual(self.request("hermes", self.dead_pid()).returncode, 0)
+        request = self.root / "state/requests/hermes.json"
+        original = request.read_bytes()
+        journals = self.root / "state/revivals"
+        journals.mkdir()
+        journal = journals / ("hermes." + "b" * 32 + ".json")
+        for content in (json.dumps({"phase": "restart-intent", "reason": "uncertain"}), "unreadable-json", json.dumps({"phase": "future-phase"})):
+            with self.subTest(content=content):
+                journal.write_text(content)
+                result = self.run_watchdog()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(request.read_bytes(), original)
+                self.assertEqual(journal.read_text(), content)
 
     def test_hermes_degraded_routes_recovery_to_owner_not_blind_start(self):
         (self.root / "enabled").write_text("hermes\n")
