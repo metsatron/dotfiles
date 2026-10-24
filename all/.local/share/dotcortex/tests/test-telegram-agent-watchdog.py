@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import importlib.util
+from importlib.machinery import SourceFileLoader
+from types import SimpleNamespace
+from unittest.mock import patch
+import datetime as dt
 import os
 from pathlib import Path
 import socket
@@ -20,6 +25,8 @@ case "$1" in
   status) cat "$root/status"; [ ! -f "$root/status_fail" ] || exit 1 ;;
   start) echo "$2" >> "$root/starts"; echo "start:$2" >> "$root/calls"; if [ -f "$root/start_fail" ]; then exit 1; fi
          [ ! -f "$root/status_after_start" ] || cp "$root/status_after_start" "$root/status" ;;
+  preflight) echo "preflight:$2" >> "$root/calls"; [ ! -f "$root/preflight_fail" ] || exit 78 ;;
+  recover) echo "recover:$2" >> "$root/calls"; [ ! -f "$root/start_fail" ] || exit 1 ;;
   stop) echo "stop:$2" >> "$root/calls"; [ ! -f "$root/stop_fail" ] || exit 1 ;;
   *) exit 2 ;;
 esac
@@ -42,6 +49,66 @@ if [ -f "$FAKE_ROOT/tmux_dead" ]; then echo "no server running on /tmp/tmux-1000
 if [ -f "$FAKE_ROOT/tmux_broken" ]; then echo "some other failure" >&2; exit 1; fi
 echo "Fable: 1 windows"
 """
+
+
+class HermesRecoveryJournalTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_loader("watchdog_recovery", SourceFileLoader("watchdog_recovery", str(WATCHDOG)))
+        self.w = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.w)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.args = SimpleNamespace(state_dir=str(self.root), pid_dir=str(self.root),
+                                    manager="fixture-manager", dry_run=False, start_timeout=1)
+        self.request = {"id": "a" * 32, "generation": "123:456"}
+        self.path = self.root / "request.json"
+        self.path.write_text(json.dumps(self.request))
+        self.when = dt.datetime.now(dt.timezone.utc)
+
+    def invoke(self, generations, probe="RUNNING", restart_code=0):
+        calls = []
+        def manager(command, args, timeout):
+            calls.append(args)
+            return SimpleNamespace(returncode=restart_code if args[0] == "restart" else 0,
+                                   stdout=f"  hermes gateway run: {probe}\n")
+        with patch.object(self.w, "run_manager", side_effect=manager), \
+             patch.object(self.w, "generation_of", side_effect=generations):
+            events = self.w.process_hermes_request(self.args, self.request, self.path,
+                                                 "fixture", self.when, 1000)
+        return events, calls
+
+    def test_status_reason_cannot_masquerade_as_readiness(self):
+        self.assertEqual(self.w.classify("hermes", "  hermes gateway run: UNKNOWN (previous RUNNING)\n"), "unknown")
+
+    def test_new_generation_and_ready_transport_required_for_success(self):
+        events, calls = self.invoke(["123:456", "234:567"])
+        self.assertEqual(events[0]["kind"], "revive_done")
+        self.assertEqual(calls, [["preflight", "hermes"], ["restart", "hermes", "123:456"], ["status", "hermes"]])
+        self.assertFalse(self.path.exists())
+
+    def test_pid_only_success_is_failed_and_never_replayed(self):
+        events, calls = self.invoke(["123:456", "123:456"])
+        self.assertEqual(events[0]["kind"], "revive_failed")
+        self.assertTrue(self.path.exists())
+        again, calls = self.invoke([])
+        self.assertEqual(calls, [])
+        journal = json.loads((self.root / "revivals" / ("hermes." + "a" * 32 + ".json")).read_text())
+        self.assertEqual(journal["phase"], "recovery-required")
+
+    def test_replacement_degraded_never_reports_up(self):
+        events, _ = self.invoke(["123:456", "234:567"], probe="DEGRADED")
+        self.assertEqual(events[0]["kind"], "revive_failed")
+        self.assertTrue(self.path.exists())
+
+    def test_changed_fence_never_restarts(self):
+        events, calls = self.invoke(["234:567"])
+        self.assertEqual(events[0]["kind"], "revive_stale")
+        self.assertEqual(calls, [["preflight", "hermes"]])
+
+    def test_owner_refusal_is_not_success_even_with_ready_snapshot(self):
+        events, _ = self.invoke(["123:456", "234:567"], restart_code=75)
+        self.assertEqual(events[0]["kind"], "revive_failed")
 
 
 class WatchdogTests(unittest.TestCase):
@@ -267,6 +334,22 @@ class WatchdogTests(unittest.TestCase):
         self.run_watchdog()
         self.assertFalse((self.root / "intent/codex").exists())
         self.assertIn("revive_failed", [e["kind"] for e in self.events()])
+
+    def test_hermes_request_preflight_refusal_never_stops_gateway(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: BLOCKED (missing reply route)\n")
+        (self.root / "preflight_fail").touch()
+        self.request("hermes", self.dead_pid())
+        self.run_watchdog()
+        self.assertNotIn("stop:hermes", self.calls())
+        self.assertNotIn("start:hermes", self.calls())
+        self.assertIn("revive_rejected", [e["kind"] for e in self.events()])
+
+    def test_hermes_degraded_routes_recovery_to_owner_not_blind_start(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: DEGRADED (transport failed)\n")
+        self.run_watchdog()
+        self.assertEqual(self.calls(), ["recover:hermes"])
 
     def test_request_is_self_targeted_by_default(self) -> None:
         refused = self.request("ductor", self.dead_pid(), env={"TELEGRAM_AGENT_SELF": "codex"})

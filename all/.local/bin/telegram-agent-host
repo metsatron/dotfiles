@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# [[file:../../../agents-bots.org::*Shoukichi Instance Wrapper][Shoukichi Instance Wrapper:2]]
+# [[file:../../../agents-bots.org::*Shoukichi Instance Wrapper][Shoukichi Instance Wrapper:1]]
 # Agent Control Script
 
 
@@ -96,6 +96,9 @@ Usage: telegram-agent-host <command> [agent]
 Commands:
   list              List all known agents
   status            Show which agents are running
+  preflight hermes  Check candidate configuration without runtime effects
+  recover hermes    Recover an unhealthy idle gateway through its owner
+  restart hermes    Explicit fenced idle restart (self-request owner only)
   enabled           Print enabled agents for this host
   enable <agent>    Enable agent on this machine
   disable <agent>   Disable agent on this machine
@@ -318,7 +321,8 @@ hermes_service_unit() {
 }
 
 hermes_service_installed() {
-    command -v systemctl >/dev/null 2>&1 && [ -f "$(hermes_service_unit)" ]
+    [ "${HERMES_HOME:-$HOME/.hermes}" = "$HOME/.hermes" ] &&
+        command -v systemctl >/dev/null 2>&1 && [ -f "$(hermes_service_unit)" ]
 }
 
 # Hermes publishes its generation identity in gateway_state.json in current
@@ -328,7 +332,7 @@ hermes_service_installed() {
 HERMES_GATEWAY_PID_FILE="${HERMES_GATEWAY_PID_FILE:-}"
 
 hermes_gateway_pid() {
-    python3 - "$HERMES_GATEWAY_PID_FILE" "${HERMES_HOME:-$HOME/.hermes}" <<'PY'
+    python3 - "$HERMES_GATEWAY_PID_FILE" "${HERMES_HOME:-$HOME/.hermes}" "${1:-pid}" <<'PY'
 import json
 from pathlib import Path
 import sys
@@ -340,13 +344,15 @@ for path in paths:
         record = json.loads(path.read_text(encoding="utf-8"))
         if record.get("kind") != "hermes-gateway":
             continue
+        if record.get("hermes_home") and Path(record["hermes_home"]).resolve() != Path(sys.argv[2]).expanduser().resolve():
+            continue
         pid = record["pid"]
         if type(pid) is not int or pid <= 1:
             continue
         with open(f"/proc/{pid}/stat", encoding="utf-8") as handle:
             fields = handle.read().rsplit(")", 1)[1].split()
         if fields[0] != "Z" and str(record["start_time"]) == fields[19]:
-            print(pid)
+            print(f"{pid}:{fields[19]}" if sys.argv[3] == "identity" else pid)
             break
     except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
         continue
@@ -360,7 +366,140 @@ hermes_running() {
     [ -n "$(hermes_gateway_pid)" ]
 }
 
+# Read-only structural preflight and generation-bound readiness. Never imports
+# the runtime (which may refresh credentials/install dependencies), calls an LLM,
+# or opens a second Telegram consumer. Diagnostics are fixed labels, not config.
+hermes_inspect() {
+    python3 - "${1:-status}" "${HERMES_HOME:-$HOME/.hermes}" "$(hermes_gateway_pid)" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+
+mode, root, pid = sys.argv[1:]
+home = Path(root).expanduser().resolve()
+def finish(state, reason, code):
+    print(f"  hermes gateway run: {state} ({reason})")
+    raise SystemExit(code)
+try:
+    import yaml
+    config = yaml.safe_load((home / "config.yaml").read_text())
+    if not isinstance(config, dict):
+        raise ValueError()
+except ImportError:
+    finish("UNKNOWN", "YAML reader unavailable; use managed dependency lane", 69)
+except (OSError, ValueError, yaml.YAMLError):
+    finish("BLOCKED", "configuration missing or invalid", 78)
+try:
+    cron_only = os.environ.get("HERMES_GATEWAY_MODE") == "cron-only"
+    if os.environ.get("HERMES_GATEWAY_MODE", "telegram") not in {"telegram", "cron-only"}:
+        finish("BLOCKED", "invalid gateway mode", 78)
+    platforms = config.get("platforms") or {}
+    telegram = platforms.get("telegram") or config.get("telegram") or {}
+    # Inspect presence only; dotenv is data, never shell-evaluated or printed.
+    token_present = bool(os.environ.get("TELEGRAM_BOT_TOKEN"))
+    env_file = home / ".env"
+    if env_file.exists():
+        from dotenv import dotenv_values
+        token_present = token_present or bool(dotenv_values(env_file).get("TELEGRAM_BOT_TOKEN"))
+    if not cron_only:
+        if telegram.get("enabled") is False or not (telegram.get("token") or token_present):
+            finish("BLOCKED", "Telegram configuration unavailable", 78)
+        model = config.get("model")
+        if not isinstance(model, dict) or not all(isinstance(model.get(k), str) and model[k].strip()
+                                                   for k in ("provider", "default")):
+            finish("BLOCKED", "main reply provider and model required; delegation is not a reply route", 78)
+        provider_config = (config.get("providers") or {}).get(model["provider"]) or {}
+        if provider_config.get("enabled") is False:
+            finish("BLOCKED", "main reply provider disabled", 78)
+    if mode == "preflight":
+        finish("READY", "structural preflight only; credentials and delivery not exercised", 0)
+    if not pid:
+        finish("STOPPED", "no verified gateway generation", 1)
+    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+    ticks = fields[19]
+    age = float(Path("/proc/uptime").read_text().split()[0]) - int(ticks) / os.sysconf("SC_CLK_TCK")
+    state = json.loads((home / "gateway_state.json").read_text())
+    if state.get("pid") != int(pid) or str(state.get("start_time")) != ticks:
+        finish("UNKNOWN", "runtime snapshot belongs to another generation", 69)
+    if state.get("hermes_home") and Path(state["hermes_home"]).resolve() != home:
+        finish("UNKNOWN", "runtime snapshot belongs to another home", 69)
+    gateway_state = state.get("gateway_state")
+    if gateway_state == "starting":
+        finish("STARTING" if age < 90 else "DEGRADED", "gateway startup", 75 if age < 90 else 1)
+    if gateway_state != "running":
+        finish("DEGRADED" if gateway_state in {"degraded", "startup_failed"} else "UNKNOWN",
+               "gateway not ready", 1 if gateway_state in {"degraded", "startup_failed"} else 69)
+    if not cron_only:
+        platform = (state.get("platforms") or {}).get("telegram") or {}
+        if platform.get("writer_pid") != int(pid) or str(platform.get("writer_start_time")) != ticks:
+            finish("STARTING" if age < 90 else "UNKNOWN", "Telegram writer generation unverified", 75 if age < 90 else 69)
+        if platform.get("state") != "connected" or platform.get("needs_attention") is True:
+            finish("STARTING" if age < 90 else "DEGRADED", "Telegram not ready", 75 if age < 90 else 1)
+    finish("RUNNING", "cron-only" if cron_only else "Telegram connected; reply route configured", 0)
+except ImportError:
+    finish("UNKNOWN", "dotenv reader unavailable; use managed dependency lane", 69)
+except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError):
+    finish("UNKNOWN", "configuration or runtime schema unverified", 69)
+PY
+}
+
+hermes_preflight() { hermes_inspect preflight; }
+
+hermes_wait_ready() {
+    local timeout="${HERMES_READY_TIMEOUT:-90}" i rc
+    case "$timeout" in ''|*[!0-9]*) echo 'Invalid HERMES_READY_TIMEOUT' >&2; return 1 ;; esac
+    for ((i=0; i<=timeout; i++)); do
+        rc=0
+        hermes_inspect status && return 0 || rc=$?
+        case "$rc" in 78|69) return "$rc" ;; esac
+        [ "$i" -eq "$timeout" ] || sleep 1
+    done
+    return 1
+}
+
+# The lifecycle owner decides whether recovery is warranted. A healthy explicit
+# revive never bounces work. Config/unknown/startup states are not restart causes.
+recover_hermes() {
+    local force="${1:-}" expected="${2:-}" generation state rc=0 lock_fd
+    exec {lock_fd}>"$STATE_DIR/hermes-recovery.lock"
+    flock -n "$lock_fd" || return 75
+    generation=$(hermes_gateway_pid identity)
+    if [ -n "$expected" ] && [ "$generation" != "$expected" ]; then
+        echo 'Hermes generation changed before recovery; no effects' >&2
+        return 75
+    fi
+    state=$(hermes_inspect status) || rc=$?
+    printf '%s\n' "$state"
+    if [ "$rc" -eq 0 ] && [ "$force" != restart ]; then return 0; fi
+    case "$rc" in 69|75|78) return "$rc" ;; esac
+    hermes_preflight || return $?
+    if hermes_running; then
+        # No restart while active_agents is nonzero or absent, even degraded.
+        python3 - "${HERMES_HOME:-$HOME/.hermes}/gateway_state.json" "$generation" <<'PY'
+import json, sys
+from pathlib import Path
+try:
+    data = json.loads(Path(sys.argv[1]).read_text())
+    if f"{data.get('pid')}:{data.get('start_time')}" != sys.argv[2] or type(data.get("active_agents")) is not int or data["active_agents"] != 0:
+        raise ValueError()
+except (OSError, ValueError, TypeError):
+    sys.exit(75)
+PY
+        [ "$?" -eq 0 ] || return 75
+        stop_hermes "$generation" || return $?
+    fi
+    # The parent owns the recovery lock until readiness; the replacement must
+    # not inherit it, or all later recovery calls stay locked for its lifetime.
+    (eval "exec ${lock_fd}>&-"; start_hermes)
+}
+
 start_hermes() {
+    hermes_preflight || return $?
+    if hermes_running; then
+        hermes_inspect status
+        return $?
+    fi
     if ! command -v hermes >/dev/null 2>&1; then
         echo "hermes not found in PATH"
         return 1
@@ -369,7 +508,7 @@ start_hermes() {
     if hermes_service_installed; then
         echo "Starting supervised Hermes gateway..."
         systemctl --user enable --now hermes-gateway.service
-    elif command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
+    elif [ "${HERMES_HOME:-$HOME/.hermes}" = "$HOME/.hermes" ] && command -v systemctl >/dev/null 2>&1 && systemctl --user show-environment >/dev/null 2>&1; then
         echo "Installing supervised Hermes gateway service..."
         hermes gateway install --start-now --start-on-login
     elif hermes_running; then
@@ -378,10 +517,23 @@ start_hermes() {
         echo "No user service manager available; starting Hermes gateway detached..."
         nohup setsid hermes gateway run > "$STATE_DIR/hermes.log" 2>&1 </dev/null &
     fi
+    hermes_wait_ready
 }
 
 stop_hermes() {
+    local expected="${1:-}" identity owner ancestor="$$"
+    identity=$(hermes_gateway_pid identity)
+    if [ -n "$expected" ] && [ "$identity" != "$expected" ]; then return 75; fi
+    owner="${identity%%:*}"
+    while [ -n "$owner" ] && [ "$ancestor" -gt 1 ] 2>/dev/null; do
+        if [ "$ancestor" = "$owner" ]; then
+            echo 'Hermes cannot stop itself; queue telegram-agent-watchdog request hermes' >&2
+            return 75
+        fi
+        ancestor=$(ps -o ppid= -p "$ancestor" | tr -d ' ')
+    done
     if hermes_service_installed; then
+        [ -n "$identity" ] && [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 75
         systemctl --user stop hermes-gateway.service
         return
     fi
@@ -390,12 +542,14 @@ stop_hermes() {
     local pid
     pid=$(hermes_gateway_pid)
     [ -n "$pid" ] || return 0
+    [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 75
     kill -TERM "$pid" 2>/dev/null || true
     for _ in {1..30}; do
-        [ "$(hermes_gateway_pid)" = "$pid" ] || return 0
+        [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 0
         sleep 1
     done
     echo "hermes gateway did not stop gracefully; forcing pid $pid" >&2
+    [ "$(hermes_gateway_pid identity)" = "$identity" ] || return 75
     kill -KILL "$pid" 2>/dev/null || true
 }
 
@@ -409,9 +563,10 @@ check_claudecode() {
 
 check_hermes() {
     if hermes_running; then
-        echo "  hermes gateway run: RUNNING"
+        hermes_inspect status
     else
         echo "  hermes gateway run: STOPPED"
+        return 1
     fi
 }
 
@@ -1457,6 +1612,10 @@ status_cmd() {
     local requested="${1:-}"
     local host
     host=$(get_hostname)
+    if [ "$requested" = "hermes" ]; then
+        check_hermes
+        return
+    fi
     if [ "$requested" = "opencode" ]; then
         check_opencode
         return
@@ -1738,7 +1897,7 @@ start_agent() {
             echo "Access control: ~/.claude/channels/telegram/access.json"
             ;;
         hermes)
-            start_hermes
+            start_hermes || return $?
             ;;
         codex)
             local wrapper="${CODEX_HELMASTRA_WRAPPER:-$HOME/HelmCortex/FORGE/bin/codex-helmastra}"
@@ -2129,6 +2288,9 @@ mkdir -p "$STATE_DIR"
 case "$COMMAND" in
     list) list_agents ;;
     status) status_cmd "${1:-}" ;;
+    preflight) [ "${1:-}" = hermes ] || exit 2; hermes_preflight ;;
+    recover) [ "${1:-}" = hermes ] || exit 2; recover_hermes ;;
+    restart) [ "${1:-}" = hermes ] || exit 2; recover_hermes restart "${2:-}" ;;
     enable) enable_agent "${1:-}" ;;
     disable) disable_agent "${1:-}" ;;
     sync) sync_configs "${1:-}" ;;
@@ -2160,4 +2322,4 @@ case "$COMMAND" in
     *) usage; exit 1 ;;
 esac
 # Agent Control Script:1 ends here
-# Shoukichi Instance Wrapper:2 ends here
+# Shoukichi Instance Wrapper:1 ends here

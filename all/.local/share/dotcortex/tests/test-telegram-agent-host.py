@@ -33,6 +33,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.write_executable("node", "#!/bin/sh\nexit 0\n", directory=self.core_bin)
 
     def tearDown(self) -> None:
+        if hasattr(self, "fixture_gateway_cleanup"):
+            self.fixture_gateway_cleanup()
         # Kill-safety guard (Fable 2026-10-09, the three-kill night): a pid
         # file left behind by a failed test may contain anything — including 1,
         # whose killpg is a SIGTERM to every process this user owns. Never
@@ -351,6 +353,151 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             }), encoding="utf-8")
         return gateway
 
+    def hermes_config(self, config=None):
+        home = self.home / ".hermes"
+        home.mkdir(exist_ok=True)
+        (home / "config.yaml").write_text(json.dumps(config if config is not None else {
+            "model": {"provider": "openai-codex", "default": "fixture-model"},
+            "platforms": {"telegram": {"enabled": True, "token": "fixture-token"}},
+        }))
+
+    def test_hermes_missing_reply_route_is_blocked_not_running(self):
+        self.start_gateway_stand_in()
+        self.hermes_config({"platforms": {"telegram": {"enabled": True, "token": "fixture-token"}}})
+        result = self.run_manager("status", "hermes")
+        self.assertIn("hermes gateway run: BLOCKED", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+
+    def ready_hermes(self, **updates):
+        gateway = self.start_gateway_stand_in()
+        self.hermes_config()
+        home = self.home / ".hermes"
+        state = json.loads((home / "gateway.pid").read_text())
+        state.update(gateway_state="running", active_agents=0, platforms={"telegram": {
+            "state": "connected", "writer_pid": gateway.pid,
+            "writer_start_time": self.read_start_ticks(gateway.pid),
+        }})
+        state.update(updates)
+        (home / "gateway_state.json").write_text(json.dumps(state))
+        return gateway
+
+    def test_hermes_missing_telegram_preflight_preserves_generation(self):
+        gateway = self.ready_hermes()
+        self.hermes_config({"model": {"provider": "openai-codex", "default": "fixture-model"}})
+        result = self.run_manager("recover", "hermes")
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+        self.assertIn("Telegram configuration unavailable", result.stdout)
+
+    def test_hermes_healthy_recover_does_not_restart(self):
+        gateway = self.ready_hermes(active_agents=2)
+        result = self.run_manager("recover", "hermes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_stale_telegram_writer_is_not_ready(self):
+        self.ready_hermes(platforms={"telegram": {"state": "connected", "writer_pid": 1,
+                                                "writer_start_time": "1"}})
+        status = self.run_manager("status", "hermes")
+        self.assertNotEqual(status.returncode, 0)
+        self.assertNotIn("RUNNING", status.stdout)
+        self.assertNotIn("opencode", status.stdout)
+
+    def test_hermes_stale_unconfigured_platform_does_not_poison_telegram(self):
+        gateway = self.ready_hermes()
+        path = self.home / ".hermes/gateway_state.json"
+        state = json.loads(path.read_text())
+        state["platforms"]["api_server"] = {"state": "failed", "writer_pid": 1}
+        path.write_text(json.dumps(state))
+        status = self.run_manager("status", "hermes")
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_startup_grace_does_not_restart(self):
+        gateway = self.ready_hermes(gateway_state="starting")
+        status = self.run_manager("recover", "hermes")
+        self.assertEqual(status.returncode, 75, status.stdout + status.stderr)
+        self.assertIn("STARTING", status.stdout)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_intentional_cron_only_is_valid_without_telegram(self):
+        self.ready_hermes(platforms={})
+        self.hermes_config({})
+        env = self.environment(2)
+        env["HERMES_GATEWAY_MODE"] = "cron-only"
+        status = subprocess.run([str(MANAGER), "status", "hermes"], env=env,
+                                text=True, capture_output=True, timeout=5)
+        self.assertEqual(status.returncode, 0, status.stdout + status.stderr)
+        self.assertIn("RUNNING (cron-only)", status.stdout)
+
+    def test_hermes_disabled_main_provider_is_blocked(self):
+        gateway = self.ready_hermes()
+        path = self.home / ".hermes/config.yaml"
+        config = json.loads(path.read_text())
+        config["providers"] = {"openai-codex": {"enabled": False}}
+        path.write_text(json.dumps(config))
+        result = self.run_manager("recover", "hermes")
+        self.assertEqual(result.returncode, 78, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_pid_only_is_unknown_not_recovered(self):
+        self.start_gateway_stand_in()
+        self.hermes_config()
+        result = self.run_manager("status", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("UNKNOWN", result.stdout)
+
+    def test_hermes_profile_does_not_borrow_default_generation(self):
+        gateway = self.ready_hermes()
+        isolated = self.home / ".hermes/profiles/fixture"
+        isolated.mkdir(parents=True)
+        (isolated / "config.yaml").write_bytes((self.home / ".hermes/config.yaml").read_bytes())
+        env = self.environment(2)
+        env["HERMES_HOME"] = str(isolated)
+        result = subprocess.run([str(MANAGER), "status", "hermes"], env=env,
+                                text=True, capture_output=True, timeout=5)
+        self.assertIn("STOPPED", result.stdout)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_restart_does_not_leak_recovery_lock_to_replacement(self):
+        self.ready_hermes()
+        self.write_executable("systemctl", "#!/bin/sh\nexit 1\n")
+        self.write_executable("hermes", "#!/usr/bin/env python3\n"
+            "import json, os, pathlib, signal, time\n"
+            "home = pathlib.Path(os.environ['HOME']) / '.hermes'\n"
+            "pid = os.getpid()\n"
+            "ticks = pathlib.Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
+            "record = dict(kind='hermes-gateway', pid=pid, start_time=ticks, gateway_state='running', active_agents=0, "
+            "platforms={'telegram': dict(state='connected', writer_pid=pid, writer_start_time=ticks)})\n"
+            "(home / 'gateway_state.json').write_text(json.dumps(record))\n"
+            "signal.signal(signal.SIGTERM, lambda *_: exit(0))\n"
+            "time.sleep(30)\n")
+        def cleanup():
+            record = json.loads((self.home / ".hermes/gateway_state.json").read_text())
+            pid = record["pid"]
+            try:
+                if pid > 1 and self.read_start_ticks(pid) == str(record["start_time"]):
+                    os.kill(pid, signal.SIGTERM)
+            except (FileNotFoundError, ProcessLookupError):
+                pass
+        self.fixture_gateway_cleanup = cleanup
+        restarted = self.run_manager("restart", "hermes", timeout=3)
+        self.assertEqual(restarted.returncode, 0, restarted.stdout + restarted.stderr)
+        recovered = self.run_manager("recover", "hermes", timeout=3)
+        self.assertEqual(recovered.returncode, 0, recovered.stdout + recovered.stderr)
+
+    def test_hermes_restart_rejects_changed_expected_generation(self):
+        gateway = self.ready_hermes()
+        result = self.run_manager("restart", "hermes", f"{gateway.pid}:1")
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_explicit_restart_preserves_active_work(self):
+        gateway = self.ready_hermes(active_agents=1)
+        result = self.run_manager("restart", "hermes")
+        self.assertEqual(result.returncode, 75, result.stdout + result.stderr)
+        self.assertIsNone(gateway.poll())
+
     def start_process_named_hermes(self) -> subprocess.Popen[bytes]:
         impostor = self.bin / "hermes"
         impostor.write_bytes(Path("/bin/sleep").read_bytes())
@@ -364,14 +511,12 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         return next(line for line in result.stdout.splitlines() if "hermes gateway run" in line)
 
     def test_hermes_status_trusts_the_gateway_pid_record(self) -> None:
-        self.start_gateway_stand_in()
-        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: RUNNING")
+        self.ready_hermes()
+        self.assertIn("hermes gateway run: RUNNING", self.hermes_status_line())
 
     def test_hermes_status_accepts_native_gateway_state_record(self) -> None:
-        self.start_gateway_stand_in()
-        home = self.home / ".hermes"
-        (home / "gateway.pid").rename(home / "gateway_state.json")
-        self.assertEqual(self.hermes_status_line().strip(), "hermes gateway run: RUNNING")
+        self.ready_hermes()
+        self.assertIn("hermes gateway run: RUNNING", self.hermes_status_line())
 
     def test_hermes_stop_uses_native_gateway_state_record(self) -> None:
         gateway = self.start_gateway_stand_in()
