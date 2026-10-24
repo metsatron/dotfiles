@@ -1167,6 +1167,38 @@ class WatcherTests(unittest.TestCase):
                         with self.assertRaises(self.watcher.WatcherError):
                             adapter.resolve_idle_pane(record)
 
+    def test_herdr_foreground_identity_not_arbitrary_arguments(self):
+        record = self.registry["seats"]["builder"]
+        cases = [
+            (False, [{"pid": 11, "name": "python3", "argv": ["python3", "inspect.py", "codex"]}]),
+            (False, [{"pid": 11, "name": "inspect", "argv": ["inspect", "--label=codex"]}]),
+            (False, [{"pid": 11, "name": "not-codex", "argv": ["/bin/not-codex"]}]),
+            (False, [{"pid": 11, "name": "node", "argv": ["node", "inspect.js", "/pkg/@openai/codex/bin/codex.js"]}]),
+            (False, [{"pid": 10, "name": "codex", "argv": ["codex"]}]),
+            (False, [{"pid": 0, "name": "codex", "argv": ["codex"]}]),
+            (False, [{"pid": 11, "name": "codex", "argv": ["python3", "inspect.py"]}]),
+            (False, [{"pid": 11, "name": "codex"}]),
+            (False, []),
+            (True, [{"pid": 11, "name": "codex", "argv": ["/opt/bin/codex"]}]),
+            (True, [{"pid": 11, "name": "codex.exe", "argv": ["/opt/bin/codex.exe"]}]),
+            (True, [{"pid": 11, "name": "node", "argv": ["/usr/bin/node", "/pkg/@openai/codex/bin/codex.js"]}]),
+        ]
+        for status in ("idle", "done"):
+            for accepted, foreground in cases:
+                with self.subTest(status=status, foreground=foreground):
+                    def runner(command, **kwargs):
+                        value = ({"agent": {"name": "builder-agent", "pane_id": "wT:p1", "agent_status": status}}
+                                 if command[3:5] == ["agent", "get"] else
+                                 {"process_info": {"pane_id": "wT:p1", "shell_pid": 10,
+                                                   "foreground_processes": foreground}})
+                        return subprocess.CompletedProcess(command, 0, json.dumps({"result": value}), "")
+                    adapter = self.watcher.HerdrAdapter(runner=runner)
+                    if accepted:
+                        self.assertEqual(adapter.resolve_idle_pane(record), "wT:p1")
+                    else:
+                        with self.assertRaises(self.watcher.WatcherError):
+                            adapter.resolve_idle_pane(record)
+
     def test_herdr_missing_target_and_session_mismatch_fail_closed(self):
         record = self.registry["seats"]["builder"]
         for agent in (None, {}, {"name": "other"},
