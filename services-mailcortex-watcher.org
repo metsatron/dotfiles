@@ -772,7 +772,7 @@ SPEC.loader.exec_module(MAILCORTEX)
 
 SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
-TRANSPORTS = {"opencode", "herdr", "hermes", "nanobot", "ductor", "deepseek", "claude-ssh", "claude-local"}
+TRANSPORTS = {"agent-peer-native", "opencode", "herdr", "hermes", "nanobot", "ductor", "deepseek", "claude-ssh", "claude-local"}
 
 
 class WatcherError(Exception):
@@ -860,6 +860,7 @@ def load_registry(path: Path, host: str) -> dict:
         required = {
             "host", "mailbox", "harness", "transport", "rate_limit_seconds",
         } | {
+            "agent-peer-native": {"native_endpoint"},
             "herdr": {"herdr_session", "herdr_target"},
             "opencode": {"opencode_url", "opencode_session", "opencode_directory"},
             "hermes": {"hermes_url", "hermes_api_key_file", "hermes_target"},
@@ -878,7 +879,10 @@ def load_registry(path: Path, host: str) -> dict:
             or record["harness"] not in {"opencode", "claude", "codex", "hermes", "nanobot", "ductor", "deepseek"}
         ):
             raise WatcherError("seat registry ownership or transport mismatch")
-        if transport == "herdr":
+        if transport == "agent-peer-native":
+            if record["harness"] != "codex" or record["native_endpoint"] != "kikin/codex/helmastra-coordinator":
+                raise WatcherError("invalid native coordinator endpoint")
+        elif transport == "herdr":
             if record["harness"] not in {"claude", "codex"}:
                 raise WatcherError("seat registry ownership or transport mismatch")
             if not all(isinstance(record[key], str) and record[key] and len(record[key]) <= 128 for key in ("herdr_session", "herdr_target")):
@@ -1213,13 +1217,45 @@ class HerdrAdapter:
             raise WatcherError("Herdr target response is not JSON") from error
         except (KeyError, TypeError) as error:
             raise WatcherError("Herdr target response is invalid") from error
+        if not isinstance(agent, dict):
+            raise WatcherError("Herdr target response is invalid")
+        if agent.get("session", record["herdr_session"]) != record["herdr_session"]:
+            raise WatcherError("Herdr resolved a different session")
         if agent.get("name") != record["herdr_target"]:
             raise WatcherError("Herdr resolved a different target")
-        if agent.get("agent_status") not in {"idle", "done"}:
+        status = agent.get("agent_status")
+        if status in {"working", "busy", "blocked"}:
             return None
+        if status not in {"idle", "done"}:
+            raise WatcherError("Herdr attached-agent status is unknown")
         pane_id = agent.get("pane_id")
         if not isinstance(pane_id, str) or not PANE.fullmatch(pane_id):
             raise WatcherError("Herdr target has no valid pane")
+        process = self.runner(
+            ["herdr", "--session", record["herdr_session"], "pane", "process-info", "--pane", pane_id],
+            text=True, capture_output=True, check=False, timeout=15)
+        try:
+            info = json.loads(process.stdout)["result"]["process_info"]
+            foreground = info["foreground_processes"]
+            def is_harness(item):
+                if (not isinstance(item, dict) or type(item.get("pid")) is not int
+                        or item["pid"] <= 0 or item["pid"] == info.get("shell_pid")):
+                    return False
+                argv = item.get("argv")
+                if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+                    return False
+                executable = Path(argv[0]).name
+                if executable in {record["harness"], record["harness"] + ".exe"}:
+                    return True
+                # npm Codex launcher: node followed immediately by its package script.
+                return (record["harness"] == "codex" and executable in {"node", "node.exe"}
+                        and len(argv) > 1
+                        and Path(argv[1]).parts[-4:] == ("@openai", "codex", "bin", "codex.js"))
+            attached = any(is_harness(item) for item in foreground)
+            if process.returncode != 0 or info.get("pane_id") != pane_id or not attached:
+                raise WatcherError("Herdr pane has no verified attached agent")
+        except (ValueError, KeyError, TypeError, AttributeError) as error:
+            raise WatcherError("Herdr attached-agent process evidence is unavailable") from error
         return pane_id
 
     def deliver(self, record: dict, pane_id: str, prompt: str) -> None:
@@ -1695,6 +1731,31 @@ class DeepSeekAdapter:
             raise WatcherError("DeepSeek prompt was not accepted")
 
 
+class NativePeerAdapter:
+    """Store authenticated mail only; the owning native idle poll admits it.
+
+    A store ACK is not native acceptance, start or terminal success. No model,
+    token refresh, Telegram API or pane operation runs in this transport.
+    """
+    def __init__(self):
+        loader = importlib.machinery.SourceFileLoader(
+            "mailcortex_native_peer", str(HERE / "agent-peer"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.peer = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.peer)
+
+    def store(self, record: dict, path: Path) -> dict:
+        # MIME is only a carrier; neither From nor Message-ID grants authority.
+        message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+        if message.is_multipart() or message.get_content_type() != "text/plain":
+            raise WatcherError("native mail requires one signed text/plain envelope")
+        value = json.loads(message.get_content())
+        self.peer.verify_coordinator(value)
+        if value["envelope"]["to"]["peer_id"] != record["native_endpoint"]:
+            raise WatcherError("signed destination differs from configured native seat")
+        return self.peer.receive_coordinator(value)
+
+
 class TransportAdapters:
     def __init__(self):
         self.adapters = {
@@ -1708,6 +1769,8 @@ class TransportAdapters:
         }
 
     def for_record(self, record: dict) -> object:
+        if record["transport"] == "agent-peer-native":
+            return NativePeerAdapter()
         if record["transport"] == "claude-ssh":
             return claude_wake().ClaudeSSHAdapter(
                 error_type=WatcherError, refusal_type=PromptNotAdmittedError)
@@ -1823,6 +1886,24 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             if not path.is_file() or path.is_symlink() or path.name.startswith("."):
                 continue
             mid = message_id(path)
+            if record["transport"] == "agent-peer-native":
+                old = safe_receipt(seat, mid)
+                if old and (old["wake_state"] in {"injecting", "injected", "delivery_unknown"}
+                            or old.get("reason") == "authentication_refused"):
+                    continue
+                try:
+                    ack = transport_adapter.store(record, path)
+                except Exception as error:
+                    unavailable = isinstance(error, (OSError, transport_adapter.peer.CoordinatorUnavailable))
+                    MAILCORTEX.write_wake_receipt(seat, mid, "queued",
+                        reason="transport_unavailable" if unavailable else "authentication_refused", wake_error=type(error).__name__,
+                        wake_updated_at=now)
+                    continue
+                MAILCORTEX.write_wake_receipt(seat, mid, "injected", filename=path.name,
+                    transport_ack=ack["state"], peer_message_id=ack["message_id"],
+                    native_accepted=False, wake_updated_at=now)
+                count += 1
+                continue
             parsed = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
             if (seat, mid) in seen:
                 continue
@@ -1847,7 +1928,7 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             try:
                 pane_id = transport_adapter.resolve_idle_pane(record)
             except Exception as error:
-                if record["transport"] not in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local"}:
+                if record["transport"] not in {"herdr", "deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local"}:
                     raise
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
                                               wake_error=diagnostic(error), wake_updated_at=now)
