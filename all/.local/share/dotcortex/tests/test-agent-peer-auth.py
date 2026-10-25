@@ -62,6 +62,56 @@ class AuthenticatedWakeTests(unittest.TestCase):
             {'schema':'dotcortex.coordinator-trust.v1',
              'coordinator_keys':self.registry['coordinator_keys']})
 
+    def task_execution_grant(self):
+        handoff = self.envelope['payload']['task_handoff']
+        handoff['constraints']['allowed_paths'] = {'read':['FORGE/fixture.py'], 'write':[]}
+        self.grant.update(capabilities=['taskExecution'],
+            execution_authority='existing_session_permissions',
+            task_execution={'schema':'dotcortex.task-execution.v1',
+                'thread_id':'thread-coordinator', 'task_id':handoff['id'],
+                'handoff_sha256':self.peer.hashlib.sha256(self.peer.coordinator_material(handoff)).hexdigest(),
+                'allowed_paths':handoff['constraints']['allowed_paths'],
+                'access':'read', 'expires':int(time.time())+300})
+        self.write_trust()
+
+    def test_distinct_task_execution_signed_grant_and_readonly_separation(self):
+        self.task_execution_grant()
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.assertEqual(signed['schema'], 'dotcortex.coordinator-task-attestation.v1')
+        self.assertEqual(self.peer.receive_coordinator(signed)['state'], 'stored')
+        auth = self.peer.verified_coordinator_record(self.envelope['message_id'])['coordinator_auth']
+        self.assertEqual(auth['execution_authority'], 'existing_session_permissions')
+        self.assertEqual(auth['task_execution'], self.grant['task_execution'])
+        for field, value in [('thread_id','other'), ('handoff_sha256','0'*64),
+                             ('allowed_paths',{'read':['NEXUS/secret'], 'write':[]})]:
+            changed=copy.deepcopy(self.grant)
+            changed['task_execution'][field]=value
+            self.registry['coordinator_keys']['fixture-key']=changed;self.write_trust()
+            with self.assertRaises(self.peer.PeerError): self.peer.verify_coordinator(signed)
+        self.registry['coordinator_keys']['fixture-key']=self.grant
+        self.grant['capabilities']=['status','nudge'];self.write_trust()
+        with self.assertRaises(self.peer.PeerError): self.peer.verify_coordinator(signed)
+
+    def test_write_task_requires_existing_checkout_lease_and_exact_policy(self):
+        self.task_execution_grant()
+        handoff=self.envelope['payload']['task_handoff']
+        handoff['constraints'].update(read_only=False,allow_git='commit_via_skill',
+            allowed_paths={'read':['FORGE/fixture.py'],'write':['FORGE/fixture.py']})
+        self.envelope['workspace']['access']='write'
+        self.envelope['authority']['allow_git']=True
+        self.grant['task_execution'].update(access='write',
+            allowed_paths=handoff['constraints']['allowed_paths'],
+            handoff_sha256=self.peer.hashlib.sha256(self.peer.coordinator_material(handoff)).hexdigest())
+        self.write_trust()
+        with mock.patch.object(self.peer,'emit') as emitted:
+            self.peer.command_lease_acquire(['checkout-write'],'fixture:checkout',self.dest,300)
+        lease=emitted.call_args.args[0]
+        self.envelope['lease']={k:lease[k] for k in ('lease_id','scopes')}
+        signed=self.peer.sign_coordinator(self.envelope,'fixture-key')
+        self.assertEqual(self.peer.verify_coordinator(signed)['task_execution']['access'],'write')
+        self.peer.command_lease_release(lease['lease_id'])
+        with self.assertRaises(self.peer.PeerError):self.peer.verify_coordinator(signed)
+
     def test_shared_registry_cannot_replace_protected_grant(self):
         trust = self.base/'trust.json'
         self.peer.atomic_json(trust, {'schema':'dotcortex.coordinator-trust.v1',
