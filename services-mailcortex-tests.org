@@ -1513,6 +1513,10 @@ class WatcherTests(unittest.TestCase):
                 payload = {"result": {"agent": {"name": "builder-agent",
                            "pane_id": "wT:p1", "agent_status": "idle"}}}
                 return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+            if command[3:5] == ["pane", "process-info"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"result": {"process_info": {
+                    "pane_id": "wT:p1", "shell_pid": 10, "foreground_processes": [
+                        {"pid": 11, "name": "codex", "argv": ["codex"]}]}}}), "")
             if command[3:5] == ["pane", "run"]:
                 return subprocess.CompletedProcess(command, 0, "{}", "")
             self.fail(f"unexpected Herdr command: {command}")
@@ -1524,6 +1528,7 @@ class WatcherTests(unittest.TestCase):
         adapter.deliver(record, pane, "/inbox")
         self.assertEqual(calls, [
             ["herdr", "--session", "builder-session", "agent", "get", "builder-agent"],
+            ["herdr", "--session", "builder-session", "pane", "process-info", "--pane", "wT:p1"],
             ["herdr", "--session", "builder-session", "pane", "run", "wT:p1", "/inbox"],
         ])
 
@@ -1531,6 +1536,10 @@ class WatcherTests(unittest.TestCase):
         states = iter(("done", "unknown"))
 
         def runner(command, **kwargs):
+            if command[3:5] == ["pane", "process-info"]:
+                return subprocess.CompletedProcess(command, 0, json.dumps({"result": {"process_info": {
+                    "pane_id": "wT:p1", "shell_pid": 10, "foreground_processes": [
+                        {"pid": 11, "name": "codex", "argv": ["codex"]}]}}}), "")
             payload = {"result": {"agent": {"name": "builder-agent",
                        "pane_id": "wT:p1", "agent_status": next(states)}}}
             return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
@@ -1538,7 +1547,83 @@ class WatcherTests(unittest.TestCase):
         record = self.registry["seats"]["builder"]
         adapter = self.watcher.HerdrAdapter(runner=runner)
         self.assertEqual(adapter.resolve_idle_pane(record), "wT:p1")
-        self.assertIsNone(adapter.resolve_idle_pane(record))
+        with self.assertRaises(self.watcher.WatcherError):
+            adapter.resolve_idle_pane(record)
+
+    def test_herdr_transport_truth_and_shell_lookalike(self):
+        record = self.registry["seats"]["builder"]
+        for status in ("unknown", None, "idle", "done", "working", "busy", "blocked"):
+            for shell_only in (False, True):
+                with self.subTest(status=status, shell_only=shell_only):
+                    def runner(command, **kwargs):
+                        if command[3:5] == ["agent", "get"]:
+                            value = {"agent": {"name": "builder-agent", "pane_id": "wT:p1",
+                                               "agent_status": status}}
+                        else:
+                            value = {"process_info": {"pane_id": "wT:p1", "shell_pid": 10,
+                                "foreground_processes": [{"pid": 10 if shell_only else 11,
+                                    "name": "bash" if shell_only else "codex",
+                                    "argv": ["bash" if shell_only else "codex"]}]}}
+                        return subprocess.CompletedProcess(command, 0, json.dumps({"result": value}), "")
+                    adapter = self.watcher.HerdrAdapter(runner=runner)
+                    if status in {"working", "busy", "blocked"}:
+                        self.assertIsNone(adapter.resolve_idle_pane(record))
+                    elif status in {"idle", "done"} and not shell_only:
+                        self.assertEqual(adapter.resolve_idle_pane(record), "wT:p1")
+                    else:
+                        with self.assertRaises(self.watcher.WatcherError):
+                            adapter.resolve_idle_pane(record)
+
+    def test_herdr_foreground_identity_not_arbitrary_arguments(self):
+        record = self.registry["seats"]["builder"]
+        cases = [
+            (False, [{"pid": 11, "name": "python3", "argv": ["python3", "inspect.py", "codex"]}]),
+            (False, [{"pid": 11, "name": "inspect", "argv": ["inspect", "--label=codex"]}]),
+            (False, [{"pid": 11, "name": "not-codex", "argv": ["/bin/not-codex"]}]),
+            (False, [{"pid": 11, "name": "node", "argv": ["node", "inspect.js", "/pkg/@openai/codex/bin/codex.js"]}]),
+            (False, [{"pid": 10, "name": "codex", "argv": ["codex"]}]),
+            (False, [{"pid": 0, "name": "codex", "argv": ["codex"]}]),
+            (False, [{"pid": 11, "name": "codex", "argv": ["python3", "inspect.py"]}]),
+            (False, [{"pid": 11, "name": "codex"}]),
+            (False, []),
+            (True, [{"pid": 11, "name": "codex", "argv": ["/opt/bin/codex"]}]),
+            (True, [{"pid": 11, "name": "codex.exe", "argv": ["/opt/bin/codex.exe"]}]),
+            (True, [{"pid": 11, "name": "node", "argv": ["/usr/bin/node", "/pkg/@openai/codex/bin/codex.js"]}]),
+        ]
+        for status in ("idle", "done"):
+            for accepted, foreground in cases:
+                with self.subTest(status=status, foreground=foreground):
+                    def runner(command, **kwargs):
+                        value = ({"agent": {"name": "builder-agent", "pane_id": "wT:p1", "agent_status": status}}
+                                 if command[3:5] == ["agent", "get"] else
+                                 {"process_info": {"pane_id": "wT:p1", "shell_pid": 10,
+                                                   "foreground_processes": foreground}})
+                        return subprocess.CompletedProcess(command, 0, json.dumps({"result": value}), "")
+                    adapter = self.watcher.HerdrAdapter(runner=runner)
+                    if accepted:
+                        self.assertEqual(adapter.resolve_idle_pane(record), "wT:p1")
+                    else:
+                        with self.assertRaises(self.watcher.WatcherError):
+                            adapter.resolve_idle_pane(record)
+
+    def test_herdr_missing_target_and_session_mismatch_fail_closed(self):
+        record = self.registry["seats"]["builder"]
+        for agent in (None, {}, {"name": "other"},
+                      {"name": "builder-agent", "session": "other", "agent_status": "idle"}):
+            with self.subTest(agent=agent):
+                runner = mock.Mock(return_value=subprocess.CompletedProcess([], 0,
+                    json.dumps({"result": {"agent": agent}}), ""))
+                with self.assertRaises(self.watcher.WatcherError):
+                    self.watcher.HerdrAdapter(runner=runner).resolve_idle_pane(record)
+
+    def test_unknown_herdr_is_unavailable_receipt_not_busy(self):
+        self.mail("<unknown@node.helm>", "unknown")
+        def runner(command, **kwargs):
+            return subprocess.CompletedProcess(command, 0, json.dumps({"result": {"agent": {
+                "name": "builder-agent", "pane_id": "wT:p1", "agent_status": "unknown"}}}), "")
+        self.assertEqual(self.watcher.locked_scan(self.registry,
+            self.watcher.HerdrAdapter(runner=runner), now=10), 0)
+        self.assertEqual(self.receipt("<unknown@node.helm>")["reason"], "transport_unavailable")
 
 
 if __name__ == "__main__":

@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import argparse
 import contextlib
 import datetime as dt
@@ -14,6 +16,9 @@ import json
 import os
 import pathlib
 import platform
+import stat
+import pwd
+import grp
 import re
 import shlex
 import shutil
@@ -1400,8 +1405,239 @@ def match_endpoint_repo(
     return matched
 
 
-def receive_envelope(envelope: object, origin_host: str | None = None) -> dict[str, object]:
+class CoordinatorUnavailable(PeerError):
+    """Private coordinator identity has not been provisioned."""
+
+
+COORDINATOR_DESTINATION = "kikin/codex/helmastra-coordinator"
+COORDINATOR_LEGACY_SOURCE = "kikin/claude/fable-coordinator"
+COORDINATOR_ATTESTATION = "dotcortex.coordinator-attestation.v1"
+COORDINATOR_TASK_ATTESTATION = "dotcortex.coordinator-task-attestation.v1"
+
+
+def coordinator_material(value: dict) -> bytes:
+    return json.dumps(value, sort_keys=True, ensure_ascii=True,
+                      separators=(",", ":"), allow_nan=False).encode("ascii")
+
+
+def coordinator_private_bytes(path: pathlib.Path) -> bytes:
+    """Open every component without following links; trust only root/this UID.
+
+    Shared fleet metadata is deliberately NOT a trust document. No writable
+    ancestor (including sticky directories) is accepted for private authority.
+    File ownership is this effective service UID, never a value from metadata.
+    """
+    if not path.is_absolute() or ".." in path.parts or str(path) != str(path.absolute()):
+        raise PeerError("coordinator private path must be absolute")
+    descriptor = None
+    # Explicit OS-account private-primary-group semantics, not a file-local
+    # inference: no other primary or supplementary member may be a principal.
+    gid = os.getgid()
+    group = grp.getgrgid(gid)
+    members = {entry.pw_uid for entry in pwd.getpwall() if entry.pw_gid == gid}
+    try:
+        members.update(pwd.getpwnam(name).pw_uid for name in group.gr_mem)
+    except KeyError:
+        members.add(-1)
+    private_group = members == {os.geteuid()}
+    try:
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        for component in path.parts[1:-1]:
+            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                            dir_fd=descriptor)
+            os.close(descriptor); descriptor = child
+            info = os.fstat(descriptor)
+            if (info.st_uid not in {0, os.geteuid()} or info.st_mode & 0o002
+                    or (info.st_mode & 0o020 and not (
+                        private_group and info.st_uid == os.geteuid() and info.st_gid == gid))):
+                raise PeerError("coordinator private path has an unsafe parent")
+        child = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=descriptor)
+        os.close(descriptor); descriptor = child
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.geteuid()
+                or stat.S_IMODE(before.st_mode) != 0o600):
+            raise PeerError("coordinator private file must be service-owned mode 0600")
+        data = os.read(descriptor, MAX_MESSAGE_BYTES + 1)
+        after = os.fstat(descriptor)
+        if (len(data) > MAX_MESSAGE_BYTES or
+                (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise PeerError("coordinator private file changed during read")
+        return data
+    except (FileNotFoundError, PermissionError) as error:
+        raise CoordinatorUnavailable("coordinator private trust/credential unavailable") from error
+    except OSError as error:
+        raise PeerError("coordinator private path refused") from error
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+
+
+def coordinator_grant(key_id: str) -> tuple[dict, bytes]:
+    validate_component(key_id, "coordinator key ID")
+    path = pathlib.Path(os.environ.get("AGENT_PEER_COORDINATOR_TRUST_FILE",
+        str(pathlib.Path.home() / ".config/agent-peer/coordinator-trust.json")))
+    try:
+        trust = json.loads(coordinator_private_bytes(path))
+    except (ValueError, UnicodeError) as error:
+        raise PeerError("invalid coordinator trust document") from error
+    if (not isinstance(trust, dict) or trust.get("schema") != "dotcortex.coordinator-trust.v1"
+            or not isinstance(trust.get("coordinator_keys"), dict)):
+        raise PeerError("invalid coordinator trust schema")
+    grant = trust["coordinator_keys"].get(key_id)
+    task = isinstance(grant, dict) and grant.get("capabilities") == ["taskExecution"]
+    if not isinstance(grant, dict) or set(grant) != {
+            "source", "destination", "repo", "repo_root", "checkout_id",
+            "capabilities", "secret_file", "root_identity"} | (
+                {"execution_authority", "task_execution"} if task else set()):
+        # An available document is authoritative: unknown/removed IDs are
+        # refused permanently, NOT treated as indefinitely pending provisioning.
+        raise PeerError("coordinator key is unknown or revoked")
+    parse_peer_id(grant["source"])
+    if (grant["destination"] != COORDINATOR_DESTINATION
+            or grant["capabilities"] not in (["status", "nudge"], ["taskExecution"])):
+        raise PeerError("coordinator grant exceeds status,nudge scope")
+    if task and grant.get("execution_authority") != "existing_session_permissions":
+        raise PeerError("task execution requires explicit existing-session authority")
+    secret = coordinator_private_bytes(pathlib.Path(grant["secret_file"]))
+    if len(secret) < 32 or len(secret) > 4096:
+        raise PeerError("coordinator credential has invalid length")
+    return grant, secret
+
+
+def coordinator_scope(envelope: dict, grant: dict) -> None:
+    # Exact lexical identity, not aliases or overlapping root-prefix grants.
+    task = grant["capabilities"] == ["taskExecution"]
+    access = grant.get("task_execution", {}).get("access") if task else "read"
+    if (envelope.get("from") != peer_object(grant["source"])
+            or envelope.get("to") != peer_object(grant["destination"])
+            or envelope.get("workspace") != {
+                "repo": grant["repo"], "repo_root": grant["repo_root"],
+                "checkout_id": grant["checkout_id"], "access": access}
+            or envelope.get("authority") != {
+                "origin": "peer", "user_authority": False, "allow_git": access == "write",
+                "allow_push": False, "allow_pull": False, "allow_destructive": False}
+            or (envelope.get("lease") is not None and not (task and access == "write"))):
+        raise PeerError("coordinator provenance endpoint/workspace/authority mismatch")
+    root = grant["repo_root"]
+    try:
+        physical = pathlib.Path(root).resolve(strict=True)
+        info = physical.stat()
+    except OSError as error:
+        raise CoordinatorUnavailable("coordinator destination checkout unavailable") from error
+    if (str(physical) != root or not physical.is_dir()
+            or grant["root_identity"] != {"device": info.st_dev, "inode": info.st_ino}):
+        raise PeerError("coordinator root is not the pinned physical checkout")
+    if task:
+        policy = grant.get("task_execution")
+        if (not isinstance(policy, dict) or set(policy) != {
+                "schema", "thread_id", "task_id", "handoff_sha256", "allowed_paths", "access", "expires"}
+                or policy["schema"] != "dotcortex.task-execution.v1"
+                or access not in {"read", "write"}
+                or type(policy["expires"]) is not int or time.time() >= policy["expires"]
+                or not isinstance(policy["thread_id"], str) or not policy["thread_id"].strip()):
+            raise PeerError("task execution policy invalid or expired")
+        payload = envelope.get("payload", {})
+        if payload.get("type") != "task_handoff":
+            raise PeerError("task execution requires a TaskHandoff")
+        handoff = validate_task_handoff(payload.get("task_handoff"), access)
+        paths = handoff["constraints"].get("allowed_paths")
+        if (handoff.get("id") != policy["task_id"] or handoff["working_directory"] != root
+                or hashlib.sha256(coordinator_material(handoff)).hexdigest() != policy["handoff_sha256"]
+                or paths != policy["allowed_paths"] or not isinstance(paths, dict)
+                or set(paths) != {"read", "write"} or (access == "read" and paths["write"])
+                or (access == "write" and not paths["write"])):
+            raise PeerError("task execution handoff digest/path/identity mismatch")
+        for values in paths.values():
+            if not isinstance(values, list) or any(
+                    not isinstance(p, str) or not pathlib.Path(p).parts
+                    or pathlib.Path(p).is_absolute() or ".." in pathlib.Path(p).parts
+                    or pathlib.Path(p).parts[0] in {"LOGS", "NEXUS", ".git"} for p in values):
+                raise PeerError("task execution paths unsafe")
+        # Execution authority does not replace exclusive local writer ownership.
+        verify_envelope_leases(envelope)
+
+
+def sign_coordinator(envelope: dict, key_id: str) -> dict:
+    """The provisioned key selects the real source; --from grants no identity."""
+    grant, secret = coordinator_grant(key_id)
+    coordinator_scope(envelope, grant)
+    task = grant["capabilities"] == ["taskExecution"]
+    value = {"schema": COORDINATOR_TASK_ATTESTATION if task else COORDINATOR_ATTESTATION, "key_id": key_id,
+             "nonce": str(uuid.uuid4()), "expires": int(time.time()) + 300,
+             "capabilities": grant["capabilities"], "envelope": envelope}
+    if task:
+        value["task_execution"] = grant["task_execution"]
+        value["execution_authority"] = grant["execution_authority"]
+        value["expires"] = min(value["expires"], grant["task_execution"]["expires"])
+    value["mac"] = hmac.new(secret, coordinator_material(value), hashlib.sha256).hexdigest()
+    return value
+
+
+def verify_coordinator(value: object, *, check_expiry: bool = True) -> dict:
+    task = isinstance(value, dict) and value.get("schema") == COORDINATOR_TASK_ATTESTATION
+    if (not isinstance(value, dict) or set(value) != {
+            "schema", "key_id", "nonce", "expires", "capabilities", "envelope", "mac"} | (
+                {"task_execution", "execution_authority"} if task else set())
+            or value.get("schema") not in {COORDINATOR_ATTESTATION, COORDINATOR_TASK_ATTESTATION}):
+        raise PeerError("invalid coordinator attestation")
+    grant, secret = coordinator_grant(value["key_id"])
+    if (task != (grant["capabilities"] == ["taskExecution"])
+            or (task and any(value[k] != grant[k] for k in ("task_execution", "execution_authority")))):
+        raise PeerError("task execution grant binding mismatch")
+    supplied = value["mac"]
+    unsigned = {k: v for k, v in value.items() if k != "mac"}
+    expected = hmac.new(secret, coordinator_material(unsigned), hashlib.sha256).hexdigest()
+    if not isinstance(supplied, str) or not re.fullmatch(r"[0-9a-f]{64}", supplied) or not hmac.compare_digest(supplied, expected):
+        raise PeerError("coordinator signature refused")
+    try:
+        uuid.UUID(value["nonce"])
+    except (ValueError, TypeError, AttributeError) as error:
+        raise PeerError("invalid coordinator nonce") from error
+    if (type(value["expires"]) is not int
+            or (check_expiry and not time.time() < value["expires"] <= time.time() + 300)
+            or value["capabilities"] != grant["capabilities"]):
+        raise PeerError("coordinator expiry/capability refused")
+    if not isinstance(value["envelope"], dict):
+        raise PeerError("coordinator envelope is absent")
+    coordinator_scope(value["envelope"], grant)
+    # Cryptographic provenance verified before envelope/TaskHandoff parsing.
+    return grant
+
+
+def receive_coordinator(value: object) -> dict:
+    verify_coordinator(value)
+    return receive_envelope(value["envelope"], _attestation=value)
+
+
+def verified_coordinator_record(message_id: str) -> dict:
+    record = read_record("inbox", message_id)
+    if not record or record.get("state") != "stored":
+        raise PeerError("coordinator record is not stored")
+    attestation = record.get("coordinator_attestation")
+    if not attestation:
+        raise PeerError("coordinator record lacks endpoint authentication")
+    grant = verify_coordinator(attestation)
+    if not registry_path().exists():
+        raise CoordinatorUnavailable("coordinator endpoint registry unavailable")
+    if attestation["envelope"] != record["envelope"]:
+        raise PeerError("stored coordinator envelope differs from authenticated event")
+    result = dict(record)
+    result["coordinator_auth"] = {k: grant[k] for k in (
+        "source", "destination", "repo", "repo_root", "checkout_id", "capabilities")}
+    if grant["capabilities"] == ["taskExecution"]:
+        result["coordinator_auth"].update({k: grant[k] for k in ("task_execution", "execution_authority")})
+    return result
+
+
+def receive_envelope(envelope: object, origin_host: str | None = None, *, _attestation: dict | None = None) -> dict[str, object]:
+    authenticated = verify_coordinator(_attestation) if _attestation else None
+    if _attestation and _attestation["envelope"] != envelope:
+        raise PeerError("intake envelope differs from signed event")
     validated = validate_envelope(envelope)
+    if authenticated and not registry_path().exists():
+        raise CoordinatorUnavailable("coordinator endpoint registry unavailable")
     registry = read_registry()
     destination = validated["to"]
     source = validated["from"]
@@ -1425,8 +1661,13 @@ def receive_envelope(envelope: object, origin_host: str | None = None) -> dict[s
     endpoint = endpoints.get(destination.get("peer_id"))
     if not isinstance(endpoint, dict):
         raise PeerError("destination peer is not registered locally")
+    if (destination.get("peer_id") == COORDINATOR_DESTINATION
+            and source.get("peer_id") != COORDINATOR_LEGACY_SOURCE and not authenticated):
+        raise PeerError("native coordinator requires endpoint authentication")
+    if authenticated and endpoint.get("delivery") != "store":
+        raise PeerError("authenticated coordinator requires store-only delivery")
     accepted = endpoint.get("accept_from")
-    if not isinstance(accepted, list) or source.get("peer_id") not in accepted:
+    if not authenticated and (not isinstance(accepted, list) or source.get("peer_id") not in accepted):
         raise PeerError("sender is not allowed by the destination endpoint")
     workspace = validated["workspace"]
     payload = validated["payload"]
@@ -1453,6 +1694,8 @@ def receive_envelope(envelope: object, origin_host: str | None = None) -> dict[s
     try:
         existing = read_record("inbox", message_id)
         if existing:
+            if _attestation and existing.get("coordinator_attestation") != _attestation:
+                raise PeerError("coordinator event ID collision")
             state = str(existing.get("state"))
             if state in {"delivered", "stored"}:
                 prior = existing.get("receipt")
@@ -1463,7 +1706,19 @@ def receive_envelope(envelope: object, origin_host: str | None = None) -> dict[s
             raise PeerError(
                 f"message {message_id} is already recorded as {state}; refusing duplicate injection"
             )
-        write_record("inbox", validated, "delivering", origin_host=origin_host)
+        if _attestation:
+            for path in (state_root() / "inbox").glob("*.json"):
+                try:
+                    candidate = load_json(path)
+                except PeerError:
+                    continue  # Retain poison evidence; never delete or replay it.
+                prior = candidate.get("coordinator_attestation") if isinstance(candidate, dict) else None
+                if not isinstance(prior, dict):
+                    continue
+                if prior.get("key_id") == _attestation["key_id"] and prior.get("nonce") == _attestation["nonce"]:
+                    raise PeerError("coordinator nonce replay")
+        auth_details = {"coordinator_attestation": _attestation} if _attestation else {}
+        write_record("inbox", validated, "delivering", origin_host=origin_host, **auth_details)
     finally:
         lock.close()
 
@@ -1474,14 +1729,14 @@ def receive_envelope(envelope: object, origin_host: str | None = None) -> dict[s
         result = receipt(validated, state, delivery=delivery, duplicate=False, **extra)
         lock = ledger_lock()
         try:
-            write_record("inbox", validated, state, receipt=result, origin_host=origin_host)
+            write_record("inbox", validated, state, receipt=result, origin_host=origin_host, **auth_details)
         finally:
             lock.close()
         return result
     except PeerError as error:
         lock = ledger_lock()
         try:
-            write_record("inbox", validated, "failed", error=str(error))
+            write_record("inbox", validated, "failed", error=str(error), **auth_details)
         finally:
             lock.close()
         raise
@@ -3110,6 +3365,14 @@ def build_parser() -> argparse.ArgumentParser:
     peer_start.add_argument("--accept-from", action="append", default=[])
     peer_start.add_argument("peer_command", nargs=argparse.REMAINDER)
 
+    sign = sub.add_parser("coordinator-sign")
+    sign.add_argument("--key-id", required=True)
+    sign.add_argument("path")
+    receive_auth = sub.add_parser("coordinator-receive")
+    receive_auth.add_argument("path")
+    verify_auth = sub.add_parser("coordinator-verify")
+    verify_auth.add_argument("message_id")
+
     send = sub.add_parser("send")
     send.add_argument("--from", dest="from_peer", required=True)
     send.add_argument("--to", dest="to_peer", required=True)
@@ -3218,6 +3481,15 @@ def main() -> int:
                 peer_id=args.peer_id,
                 accept_from=args.accept_from,
             )
+        if args.command == "coordinator-sign":
+            emit(sign_coordinator(load_json(pathlib.Path(args.path)), args.key_id))
+            return 0
+        if args.command == "coordinator-receive":
+            emit(receive_coordinator(load_json(pathlib.Path(args.path))))
+            return 0
+        if args.command == "coordinator-verify":
+            emit({"box": "inbox", "record": verified_coordinator_record(args.message_id)})
+            return 0
         if args.command == "send":
             return command_send(args)
         if args.command == "reply":
@@ -3262,6 +3534,9 @@ def main() -> int:
             )
         if args.command == "lease-release":
             return command_lease_release(args.lease_id)
+    except CoordinatorUnavailable as error:
+        emit({"schema": "dotcortex.peer-error.v1", "error": str(error)})
+        return 75  # temporary private trust availability, never authorization
     except (PeerError, OSError, ValueError) as error:
         emit({"schema": "dotcortex.peer-error.v1", "error": str(error)})
         return 1
