@@ -1,0 +1,225 @@
+--- a/server.ts
++++ b/server.ts
+@@ -19,6 +19,7 @@
+ import { Bot, GrammyError, InlineKeyboard, InputFile, type Context } from 'grammy'
+ import type { ReactionTypeEmoji } from 'grammy/types'
+ import { randomBytes } from 'crypto'
++import { openSync, fstatSync, constants as fsConstants } from 'fs'
+ import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
+ import { homedir } from 'os'
+ import { execFileSync } from 'child_process'
+@@ -53,6 +54,84 @@
+   process.exit(1)
+ }
+ const INBOX_DIR = join(STATE_DIR, 'inbox')
++// DOTCORTEX_ATTACHMENT_CUSTODY_BEGIN
++const attachmentNonce = randomBytes(16).toString('hex')
++const attachmentHelper = join(homedir(), '.local/share/dotcortex/telegram-attachments/custody.py')
++function attachmentCustody(op, data) {
++  return JSON.parse(execFileSync('/usr/bin/python3', [attachmentHelper, op], {
++    input: JSON.stringify(data), encoding: 'utf8', timeout: 5000,
++    maxBuffer: 2 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
++  }))
++}
++// Missing owner/unsupported platform must not take down messaging. Downloads
++// remain disabled; initialization is retried only by a fresh plugin generation.
++let attachmentReady = false
++let attachmentInboxFD
++try {
++  const root = attachmentCustody('begin', {state: STATE_DIR, nonce: attachmentNonce})
++  attachmentInboxFD = openSync(INBOX_DIR, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW)
++  const info = fstatSync(attachmentInboxFD)
++  if (info.dev !== root.dev || info.ino !== root.ino) throw new Error('inbox race')
++  attachmentCustody('anchor', {nonce: attachmentNonce, fd: attachmentInboxFD})
++  attachmentReady = true
++} catch { process.stderr.write('telegram: attachment custody unavailable; downloads disabled\n') }
++async function safeAttachmentDownload(args) {
++  if (!attachmentReady || !args || typeof args !== 'object' || Array.isArray(args)
++      || Object.keys(args).length !== 1 || !Object.hasOwn(args, 'file_id')
++      || typeof args.file_id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(args.file_id)) {
++    throw new Error('attachment arguments or owner refused')
++  }
++  const file_id = args.file_id
++  attachmentCustody('check', {nonce: attachmentNonce, file_id})
++  const limit = 20 * 1024 * 1024
++  const controller = new AbortController()
++  const timeout = new Promise((_, reject) => {
++    controller.signal.addEventListener('abort', () => reject(new Error('attachment deadline')), {once:true})
++  })
++  const timer = setTimeout(() => controller.abort(), 30000)
++  let reader
++  try {
++    const file = await Promise.race([bot.api.getFile(file_id, controller.signal), timeout])
++    if (!file || typeof file.file_path !== 'string'
++        || !/^[A-Za-z0-9_-]+\/[A-Za-z0-9_.-]+$/.test(file.file_path)
++        || file.file_path.includes('..')
++        || file.file_size != null && (!Number.isSafeInteger(file.file_size) || file.file_size < 0 || file.file_size > limit)) {
++      throw new Error('attachment metadata refused')
++    }
++    const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
++    const res = await Promise.race([fetch(url, {signal: controller.signal, redirect:'error'}), timeout])
++    if (!res.ok || !res.body) throw new Error('attachment response refused')
++    const length = res.headers.get('content-length')
++    if (length !== null && (!/^[0-9]{1,10}$/.test(length) || Number(length) > limit)) throw new Error('attachment too large')
++    reader = res.body.getReader()
++    const chunks = []
++    let size = 0
++    for (;;) {
++      const part = await Promise.race([reader.read(), timeout])
++      if (part.done) break
++      size += part.value.byteLength
++      if (size > limit) throw new Error('attachment too large')
++      chunks.push(Buffer.from(part.value))
++    }
++    attachmentCustody('check', {nonce: attachmentNonce, file_id})
++    return attachmentCustody('store', {nonce: attachmentNonce, file_id,
++      bytes: Buffer.concat(chunks, size).toString('base64')})
++  } finally {
++    clearTimeout(timer)
++    controller.abort()
++    if (reader) void reader.cancel().catch(() => {})
++  }
++}
++function safeAttachmentRead(args) {
++  if (!attachmentReady || !args || typeof args !== 'object' || Array.isArray(args)
++      || Object.keys(args).length !== 1 || !Object.hasOwn(args, 'file_id')
++      || typeof args.file_id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(args.file_id)) {
++    throw new Error('attachment arguments or owner refused')
++  }
++  return attachmentCustody('read', {nonce: attachmentNonce, file_id: args.file_id})
++}
++// DOTCORTEX_ATTACHMENT_CUSTODY_END
++
+ const PID_FILE = join(STATE_DIR, 'bot.pid')
+
+ // Telegram allows exactly one getUpdates consumer per token. If a previous
+@@ -406,7 +485,7 @@
+     instructions: [
+       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
+       '',
+-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
++      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then call read_attachment with the same file_id (UTF-8 text only, at most 256 KiB; images and PDFs are unsupported). Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+       '',
+       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+       '',
+@@ -495,13 +574,26 @@
+     },
+     {
+       name: 'download_attachment',
+-      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
++      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns a download confirmation, not a filesystem path; then use read_attachment. Images/PDFs cannot be read by this text-only attachment interface. Telegram caps bot downloads at 20MB.',
+       inputSchema: {
+         type: 'object',
+         properties: {
+-          file_id: { type: 'string', description: 'The attachment_file_id from inbound meta' },
++          file_id: { type: 'string', minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9_-]+$', description: 'The attachment_file_id from inbound meta' },
+         },
+         required: ['file_id'],
++        additionalProperties: false,
++      },
++    },
++    {
++      name: 'read_attachment',
++      description: 'Read a previously downloaded, provenance-bound attachment as bounded MCP text, not native Read. UTF-8 text up to 256 KiB only; PNG, JPEG, PDF and binary formats fail closed. Never pass paths, URLs or provenance.',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          file_id: {type: 'string', minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9_-]+$'},
++        },
++        required: ['file_id'],
++        additionalProperties: false,
+       },
+     },
+     {
+@@ -604,22 +696,11 @@
+         return { content: [{ type: 'text', text: 'reacted' }] }
+       }
+       case 'download_attachment': {
+-        const file_id = args.file_id as string
+-        const file = await bot.api.getFile(file_id)
+-        if (!file.file_path) throw new Error('Telegram returned no file_path — file may have expired')
+-        const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+-        const res = await fetch(url)
+-        if (!res.ok) throw new Error(`download failed: HTTP ${res.status}`)
+-        const buf = Buffer.from(await res.arrayBuffer())
+-        // file_path is from Telegram (trusted), but strip to safe chars anyway
+-        // so nothing downstream can be tricked by an unexpected extension.
+-        const rawExt = file.file_path.includes('.') ? file.file_path.split('.').pop()! : 'bin'
+-        const ext = rawExt.replace(/[^a-zA-Z0-9]/g, '') || 'bin'
+-        const uniqueId = (file.file_unique_id ?? '').replace(/[^a-zA-Z0-9_-]/g, '') || 'dl'
+-        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
+-        mkdirSync(INBOX_DIR, { recursive: true })
+-        writeFileSync(path, buf)
+-        return { content: [{ type: 'text', text: path }] }
++        await safeAttachmentDownload(args)
++        return { content: [{ type: 'text', text: 'Downloaded attachment. Call read_attachment with the same file_id; no native Read path is returned.' }] }
++      }
++      case 'read_attachment': {
++        return safeAttachmentRead(args)
+       }
+       case 'edit_message': {
+         assertAllowedChat(args.chat_id as string)
+@@ -796,28 +877,9 @@
+ })
+
+ bot.on('message:photo', async ctx => {
+-  const caption = ctx.message.caption ?? '(photo)'
+-  // Defer download until after the gate approves — any user can send photos,
+-  // and we don't want to burn API quota or fill the inbox for dropped messages.
+-  await handleInbound(ctx, caption, async () => {
+-    // Largest size is last in the array.
+-    const photos = ctx.message.photo
+-    const best = photos[photos.length - 1]
+-    try {
+-      const file = await ctx.api.getFile(best.file_id)
+-      if (!file.file_path) return undefined
+-      const url = `https://api.telegram.org/file/bot${TOKEN}/${file.file_path}`
+-      const res = await fetch(url)
+-      const buf = Buffer.from(await res.arrayBuffer())
+-      const ext = file.file_path.split('.').pop() ?? 'jpg'
+-      const path = join(INBOX_DIR, `${Date.now()}-${best.file_unique_id}.${ext}`)
+-      mkdirSync(INBOX_DIR, { recursive: true })
+-      writeFileSync(path, buf)
+-      return path
+-    } catch (err) {
+-      process.stderr.write(`telegram channel: photo download failed: ${err}\n`)
+-      return undefined
+-    }
++  const best = ctx.message.photo[ctx.message.photo.length - 1]
++  await handleInbound(ctx, ctx.message.caption ?? '(photo)', undefined, {
++    kind: 'photo', file_id: best.file_id, size: best.file_size,
+   })
+ })
+
+@@ -963,11 +1025,20 @@
+       .catch(() => {})
+   }
+
++  if (attachment) {
++    try {
++      if (!attachmentReady) throw new Error('custody unavailable')
++      if (ctx.chat?.type === 'private' && String(ctx.chat.id) !== String(ctx.from!.id)) throw new Error('chat mismatch')
++      attachmentCustody('receive', {nonce: attachmentNonce, file_id: attachment.file_id,
++        sender: String(ctx.from!.id), chat: String(ctx.chat!.id),
++        message: String(ctx.message?.message_id), size: attachment.size ?? null})
++    } catch { attachment = undefined }
++  }
+   const imagePath = downloadImage ? await downloadImage() : undefined
+
+   // image_path goes in meta only — an in-content "[image attached — read: PATH]"
+   // annotation is forgeable by any allowlisted sender typing that string.
+-  mcp.notification({
++  await mcp.notification({
+     method: 'notifications/claude/channel',
+     params: {
+       content: text,
+@@ -988,6 +1059,9 @@
+       },
+     },
+   }).catch(err => {
++    if (attachment) {
++      try { attachmentCustody('revoke', {nonce: attachmentNonce, file_id: attachment.file_id}) } catch {}
++    }
+     process.stderr.write(`telegram channel: failed to deliver inbound to Claude: ${err}\n`)
+   })
+ }

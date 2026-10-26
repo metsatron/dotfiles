@@ -1,0 +1,93 @@
+#!/usr/bin/env python3
+"""Preflight the FULL ordered pinned series before an explicit --apply.
+Only server.ts is managed. No bot startup, credential read, install or restart.
+"""
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import stat
+import subprocess
+import tempfile
+
+def require(ok, message='attachment patch refused'):
+    if not ok:
+        raise ValueError(message)
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument('runtime', type=Path)
+    p.add_argument('--apply', action='store_true')
+    p.add_argument('--rollback', action='store_true')
+    p.add_argument('--engine', choices=('git', 'patch'), default='git')
+    a = p.parse_args()
+    assets = Path(__file__).resolve().parents[1] / 'share/dotcortex/telegram-attachments'
+    m = json.loads((assets / 'manifest.json').read_text())
+    pristine = (assets / 'server.ts.pristine').read_bytes()
+    require(sha(pristine) == m['pristine_sha256'], 'pristine drift')
+    with tempfile.TemporaryDirectory(prefix='telegram-series-', dir=os.environ.get('TMPDIR')) as scratch:
+        stage = Path(scratch)
+        (stage / 'server.ts').write_bytes(pristine)
+        for name in m['series']:
+            patch = assets / name
+            argv = (['git', 'apply', '--verbose', str(patch)] if a.engine == 'git'
+                    else ['patch', '--batch', '--fuzz=0', '-p1', '-i', str(patch)])
+            r = subprocess.run(argv, cwd=stage, capture_output=True, text=True, check=True)
+            require(not any((x in (r.stdout + r.stderr).lower() for x in ('offset', 'fuzz', 'reversed'))), 'nonexact patch')
+        expected = (stage / 'server.ts').read_bytes()
+        require(sha(expected) == m['expected_sha256'], 'series drift')
+        # Compile only; external packages stay external and no code is executed.
+        subprocess.run(['bun', 'build', str(stage / 'server.ts'), '--target=bun', '--packages=external',
+                        '--outfile', str(stage / 'check.js')], capture_output=True, check=True)
+        require(expected.count(b'await safeAttachmentDownload(args)') == 1)
+        require(expected.count(b"case 'read_attachment':") == 1)
+        require(expected.count(b"attachmentCustody('receive'") == 1)
+        require(sha((assets / 'custody.py').read_bytes()) == m['custody_sha256'], 'custody helper drift')
+        for name, expected_sha in m['upstream_metadata'].items():
+            require(sha((a.runtime / name).read_bytes()) == expected_sha, 'runtime metadata incompatible')
+        compile((assets / 'custody.py').read_text(), 'custody.py', 'exec')
+        # Walk fixed descriptors: no leaf/parent symlink or shared runtime writer.
+        fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for part in a.runtime.absolute().parts[1:]:
+                require(part not in ('', '.', '..'))
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                os.close(fd)
+                fd = child
+            root = os.fstat(fd)
+            require(root.st_uid == os.getuid() and (not root.st_mode & 0o022), 'unsafe runtime directory')
+            f = os.open('server.ts', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            with os.fdopen(f, 'rb') as src:
+                st = os.fstat(src.fileno())
+                require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and (st.st_uid == os.getuid()) and (not st.st_mode & 0o022))
+                current = src.read()
+            require(sha(current) in (m['pristine_sha256'], m['expected_sha256']), 'live drift; unchanged')
+            desired = pristine if a.rollback else expected
+            if a.apply and current != desired:
+                # One-file atomic promotion only AFTER whole-series preflight.
+                temp = '.server.ts.custody-' + os.urandom(16).hex()
+                out = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, stat.S_IMODE(st.st_mode), dir_fd=fd)
+                with os.fdopen(out, 'wb') as dest:
+                    os.fchmod(dest.fileno(), stat.S_IMODE(st.st_mode))
+                    os.fchown(dest.fileno(), -1, st.st_gid)
+                    dest.write(desired); dest.flush(); os.fsync(dest.fileno())
+                # Recheck exact source inode/bytes before atomic replacement.
+                check = os.open('server.ts', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+                with os.fdopen(check, 'rb') as src:
+                    now = os.fstat(src.fileno())
+                    require((now.st_dev, now.st_ino) == (st.st_dev, st.st_ino) and src.read() == current, 'concurrent drift')
+                os.rename(temp, 'server.ts', src_dir_fd=fd, dst_dir_fd=fd)
+                os.fsync(fd)
+            print(json.dumps({'preflight':'complete-series', 'changed':bool(a.apply and current != desired),
+                              'target_sha256':sha(desired), 'mode':oct(stat.S_IMODE(st.st_mode)),
+                              'action':'rollback' if a.rollback else 'adopt'}))
+        finally:
+            os.close(fd)
+
+if __name__ == '__main__':
+    main()
