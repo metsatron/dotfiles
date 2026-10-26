@@ -5531,8 +5531,14 @@ def _compound_approval(event, manifest, judge=None):
     stages = []
     variables = {}
     previous_result = None
+    mail_status = (len(segments) == 2 and segments[0][1].startswith('mailcortex ')
+                   and segments[1] == (';', 'echo "exit=$?"')
+                   and command.endswith('; echo "exit=$?"'))
     for index, (separator, text) in enumerate(segments, 1):
-        if _fleet_environment_export(text):
+        # The diagnostic proves and final-judges the original mail operation.
+        # Rewriting even a literal '$HOME' changes data; rewriting "$HOME"
+        # would hide a standalone floor refusal before the suffix proof.
+        if (mail_status and index == 1) or _fleet_environment_export(text):
             expanded_text = text
         else:
             expanded = _literal_variable_expansion(text, current, manifest, variables)
@@ -5543,13 +5549,15 @@ def _compound_approval(event, manifest, judge=None):
         stage = {**event, 'cwd': current, 'tool_input': {**payload, 'command': expanded_text}}
         # Only this terminal, literal readout of a proven mail operation is
         # special. Never evaluate $? or permit generic echo/body interpolation.
-        diagnostic = (len(segments) == 2 and index == 2 and separator == ';'
-                      and text == 'echo "exit=$?"'
-                      and command.endswith('; echo "exit=$?"')
-                      and segments[0][1].startswith('mailcortex ')
-                      and previous_result in {(True, 'coordinator_mail_send'),
-                                              (True, 'coordinator_mail_help'),
-                                              (True, 'coordinator_mail_receipt'), (True, 'local_read')}
+        mail_words = (_coordinator_mail_words(segments[0][1]) or []) if mail_status else []
+        own_read = (previous_result == (True, 'local_read')
+                    and mail_words[:2] in (['mailcortex', 'inbox'], ['mailcortex', 'read'])
+                    and len(mail_words) == (3 if mail_words[1] == 'inbox' else 4)
+                    and mail_words[2] == manifest.get('coordinator_ops', {}).get('seat_account'))
+        diagnostic = (mail_status and index == 2
+                      and (previous_result in {(True, 'coordinator_mail_send'),
+                                               (True, 'coordinator_mail_help'),
+                                               (True, 'coordinator_mail_receipt')} or own_read)
                       and not _admiral_floor(stage, stage_manifest))
         if text.startswith('echo ') and '$?' in text and _dynamic_shell(text) and not diagnostic:
             return False, _compound_segment_reason(index, text, 'true_floor') if judge else 'true_floor'
