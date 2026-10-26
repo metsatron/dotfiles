@@ -15,7 +15,16 @@ Private 0700 inbox and custody/registry directories are required. Shared
 channel ancestors may remain 0770/0775: descriptors prevent path escape and
 current-inode checks refuse raced paths. Existing permissive inboxes are refused,
 never automatically chmodded. Parent owns any reviewed private-inbox migration.
-Only exact produced bytes gain Read; Write/Edit have no attachment carveout.
+Only exact produced bytes gain read_attachment MCP text access; native Read,
+Write and Edit have no attachment carveout. download_attachment returns a
+confirmation, never a path for native Read. read_attachment accepts only file_id
+and rechecks native owner/plugin generation, bound session, receipt, inode and
+content hash. UTF-8 text (including Markdown) is supported up to 256 KiB.
+PNG/JPEG/PDF and all other binary formats fail closed with an explicit limit;
+no image/PDF rendering or broad all-format access is claimed. Content dispatch
+never trusts an uploader filename, extension or MIME. MCP text is untrusted
+attachment data, not instructions or authority. Linux proc-fd floors remain.
+All applier/helper security checks are unconditional, including under -O.
 Same-UID arbitrary code execution is outside this filesystem trust boundary.
 
 Preflight defaults to no mutation. Explicit --apply atomically promotes one
@@ -42,6 +51,10 @@ import stat
 import subprocess
 import tempfile
 
+def require(ok, message='attachment patch refused'):
+    if not ok:
+        raise ValueError(message)
+
 def sha(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -55,7 +68,7 @@ def main():
     assets = Path(__file__).resolve().parents[1] / 'share/dotcortex/telegram-attachments'
     m = json.loads((assets / 'manifest.json').read_text())
     pristine = (assets / 'server.ts.pristine').read_bytes()
-    assert sha(pristine) == m['pristine_sha256'], 'pristine drift'
+    require(sha(pristine) == m['pristine_sha256'], 'pristine drift')
     with tempfile.TemporaryDirectory(prefix='telegram-series-', dir=os.environ.get('TMPDIR')) as scratch:
         stage = Path(scratch)
         (stage / 'server.ts').write_bytes(pristine)
@@ -64,34 +77,35 @@ def main():
             argv = (['git', 'apply', '--verbose', str(patch)] if a.engine == 'git'
                     else ['patch', '--batch', '--fuzz=0', '-p1', '-i', str(patch)])
             r = subprocess.run(argv, cwd=stage, capture_output=True, text=True, check=True)
-            assert not any(x in (r.stdout+r.stderr).lower() for x in ('offset', 'fuzz', 'reversed')), 'nonexact patch'
+            require(not any((x in (r.stdout + r.stderr).lower() for x in ('offset', 'fuzz', 'reversed'))), 'nonexact patch')
         expected = (stage / 'server.ts').read_bytes()
-        assert sha(expected) == m['expected_sha256'], 'series drift'
+        require(sha(expected) == m['expected_sha256'], 'series drift')
         # Compile only; external packages stay external and no code is executed.
         subprocess.run(['bun', 'build', str(stage / 'server.ts'), '--target=bun', '--packages=external',
                         '--outfile', str(stage / 'check.js')], capture_output=True, check=True)
-        assert expected.count(b'await safeAttachmentDownload(args)') == 1
-        assert expected.count(b"attachmentCustody('receive'") == 1
-        assert sha((assets / 'custody.py').read_bytes()) == m['custody_sha256'], 'custody helper drift'
+        require(expected.count(b'await safeAttachmentDownload(args)') == 1)
+        require(expected.count(b"case 'read_attachment':") == 1)
+        require(expected.count(b"attachmentCustody('receive'") == 1)
+        require(sha((assets / 'custody.py').read_bytes()) == m['custody_sha256'], 'custody helper drift')
         for name, expected_sha in m['upstream_metadata'].items():
-            assert sha((a.runtime / name).read_bytes()) == expected_sha, 'runtime metadata incompatible'
+            require(sha((a.runtime / name).read_bytes()) == expected_sha, 'runtime metadata incompatible')
         compile((assets / 'custody.py').read_text(), 'custody.py', 'exec')
         # Walk fixed descriptors: no leaf/parent symlink or shared runtime writer.
         fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
         try:
             for part in a.runtime.absolute().parts[1:]:
-                assert part not in ('', '.', '..')
+                require(part not in ('', '.', '..'))
                 child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
                 os.close(fd)
                 fd = child
             root = os.fstat(fd)
-            assert root.st_uid == os.getuid() and not root.st_mode & 0o022, 'unsafe runtime directory'
+            require(root.st_uid == os.getuid() and (not root.st_mode & 0o022), 'unsafe runtime directory')
             f = os.open('server.ts', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
             with os.fdopen(f, 'rb') as src:
                 st = os.fstat(src.fileno())
-                assert stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid() and not st.st_mode & 0o022
+                require(stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and (st.st_uid == os.getuid()) and (not st.st_mode & 0o022))
                 current = src.read()
-            assert sha(current) in (m['pristine_sha256'],m['expected_sha256']), 'live drift; unchanged'
+            require(sha(current) in (m['pristine_sha256'], m['expected_sha256']), 'live drift; unchanged')
             desired = pristine if a.rollback else expected
             if a.apply and current != desired:
                 # One-file atomic promotion only AFTER whole-series preflight.
@@ -105,7 +119,7 @@ def main():
                 check = os.open('server.ts', os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
                 with os.fdopen(check, 'rb') as src:
                     now = os.fstat(src.fileno())
-                    assert (now.st_dev,now.st_ino) == (st.st_dev,st.st_ino) and src.read() == current, 'concurrent drift'
+                    require((now.st_dev, now.st_ino) == (st.st_dev, st.st_ino) and src.read() == current, 'concurrent drift')
                 os.rename(temp, 'server.ts', src_dir_fd=fd, dst_dir_fd=fd)
                 os.fsync(fd)
             print(json.dumps({'preflight':'complete-series', 'changed':bool(a.apply and current != desired),
@@ -143,6 +157,8 @@ LIMIT = 20 * 1024 * 1024
 TTL = 900
 ID = re.compile(r'[A-Za-z0-9_-]{1,256}\Z')
 DOWNLOAD = 'mcp__plugin_telegram_telegram__download_attachment'
+READ = 'mcp__plugin_telegram_telegram__read_attachment'
+TEXT_LIMIT = 256 * 1024
 
 def require(ok):
     if not ok:
@@ -302,6 +318,44 @@ def with_record(action):
         os.close(lock)
         reg.close()
 
+def verified_bytes(index, r, fid):
+    now = time.time()
+    require(fid in r['receipts'] and 0 <= now-r['receipts'][fid]['at'] < TTL)
+    matches = [(name, rec) for name, rec in r['files'].items() if rec['id'] == fid]
+    require(bool(matches))
+    name, rec = matches[-1]
+    require(re.fullmatch(r'attachment-[a-f0-9]{48}\.bin', name) and 0 <= now-rec['at'] < TTL)
+    inbox = Directory(index['state'] + '/inbox')
+    try:
+        anchor = os.stat(r['anchor'])
+        require((anchor.st_dev, anchor.st_ino) == (inbox.info.st_dev, inbox.info.st_ino)
+                == (r['root']['dev'], r['root']['ino']))
+        fd = inbox.regular(name)
+        with os.fdopen(fd, 'rb') as f:
+            st = os.fstat(f.fileno())
+            require((st.st_dev, st.st_ino, st.st_size) == (rec['dev'], rec['ino'], rec['size']) and st.st_size <= LIMIT)
+            raw = f.read(LIMIT+1)
+        require(len(raw) == rec['size'] and hashlib.sha256(raw).hexdigest() == rec['sha'])
+        inbox.current()
+        return raw
+    finally:
+        inbox.close()
+
+def text_content(raw):
+    # Content, never uploader filename/MIME, determines this bounded capability.
+    # Image/PDF decoding is deliberately NOT implemented by this text-only tool.
+    unsupported = {'content': [{'type': 'text', 'text':
+        'Unsupported attachment format or size: read_attachment supports only UTF-8 text up to 256 KiB; PNG, JPEG, PDF and other binary formats are not supported.'}], 'isError': True}
+    if len(raw) > TEXT_LIMIT or raw.startswith((b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'%PDF-')):
+        return unsupported
+    try:
+        text = raw.decode('utf-8', errors='strict')
+    except UnicodeDecodeError:
+        return unsupported
+    if any(ord(ch) < 32 and ch not in '\t\r\n' or 127 <= ord(ch) <= 159 for ch in text):
+        return unsupported
+    return {'content': [{'type': 'text', 'text': text}]}
+
 def producer(op, data):
     def act(index, r):
         require(identity(os.getppid())[0] == r['plugin'] and data['nonce'] == r['nonce'])
@@ -327,7 +381,11 @@ def producer(op, data):
             r['receipts'].pop(fid, None)
             return True, True
         require(fid in r['receipts'] and isinstance(r['session'], str) and isinstance(r['anchor'], str))
+        if op == 'read':
+            require(set(data) == {'nonce', 'file_id'})
+            return text_content(verified_bytes(index, r, fid)), False
         if op == 'check':
+            require(set(data) == {'nonce', 'file_id'})
             return True, False
         require(op == 'store' and set(data) == {'nonce', 'file_id', 'bytes'})
         buf = base64.b64decode(data['bytes'], validate=True)
@@ -356,14 +414,8 @@ def approval(event, bind=False):
     require(event.get('hook_event_name') == 'PermissionRequest' and isinstance(args, dict))
     sid = event.get('session_id')
     require(isinstance(sid, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', sid))
-    require(tool in (DOWNLOAD, 'Read'))
-    if tool == DOWNLOAD:
-        require(set(args) == {'file_id'} and isinstance(args['file_id'], str) and ID.fullmatch(args['file_id']))
-    else:
-        require(set(args) <= {'file_path', 'offset', 'limit', 'pages'} and isinstance(args.get('file_path'), str))
-        for k in ('offset', 'limit'):
-            require(k not in args or type(args[k]) is int and 1 <= args[k] <= 100000)
-        require('pages' not in args or isinstance(args['pages'], str) and re.fullmatch(r'[0-9,-]{1,64}', args['pages']))
+    require(tool in (DOWNLOAD, READ))
+    require(set(args) == {'file_id'} and isinstance(args['file_id'], str) and ID.fullmatch(args['file_id']))
     def act(index, r):
         dirty = False
         # First trusted native PermissionRequest pins this Claude generation to
@@ -377,24 +429,8 @@ def approval(event, bind=False):
             rec = r['receipts'][args['file_id']]
             require(0 <= now-rec['at'] < TTL)
             return True, dirty
-        raw = args['file_path']
-        require(isinstance(r['anchor'], str) and os.path.dirname(raw) == r['anchor'])
-        name = os.path.basename(raw)
-        require(re.fullmatch(r'attachment-[a-f0-9]{48}\.bin', name))
-        rec = r['files'][name]
-        require(0 <= now-rec['at'] < TTL)
-        inbox = Directory(index['state'] + '/inbox')
-        try:
-            fd = inbox.regular(name)
-            with os.fdopen(fd, 'rb') as f:
-                st = os.fstat(f.fileno())
-                require((st.st_dev, st.st_ino, st.st_size) == (rec['dev'],rec['ino'],rec['size']) and st.st_size <= LIMIT)
-                digest = hashlib.sha256(f.read(LIMIT+1)).hexdigest()
-            require(digest == rec['sha'])
-            inbox.current()
-            return True, False
-        finally:
-            inbox.close()
+        verified_bytes(index, r, args['file_id'])
+        return True, False
     return with_record(act)
 
 def main():
@@ -420,9 +456,9 @@ if __name__ == '__main__':
 
 #+BEGIN_SRC json :tangle all/.local/share/dotcortex/telegram-attachments/manifest.json
 {
-  "version": "telegram-cache-0.0.7-custody-v1",
+  "version": "telegram-cache-0.0.7-custody-v2-text-mcp",
   "pristine_sha256": "d902d7195a527b579b889cfdbf251fc24fd224a68e319ac6b7c3b691515c3458",
-  "expected_sha256": "cf05f92e858392683e3de24548247fe5d8acc92548d52cd9cea4f77e46ef6178",
+  "expected_sha256": "94d0d5bb7f4e8018de8d8d287a9d67cc682dacd23907e060a35518278d1af01c",
   "series": [
     "0001-custody.patch"
   ],
@@ -436,7 +472,7 @@ if __name__ == '__main__':
     "receipt_ttl_seconds": 900,
     "receipts": 128
   },
-  "custody_sha256": "b1e47f8a86624550e95f0caf15b68c2f79d5b5a2ab1d7097532676e6912685c5",
+  "custody_sha256": "1cc97967f2e5c9e841e01cdd7c542e6ccffa68d4054a1424154789a118292ff9",
   "upstream_metadata": {
     ".mcp.json": "0ee637b9a76aa35b3b9eb9a76b4b8fb036bc61651711e1af72badedde5e3c875",
     "package.json": "5e8b32eab6f4e168524204955a9458158401bc1c369816076b1a8dc9f9727c72"
@@ -457,7 +493,7 @@ if __name__ == '__main__':
  import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync, renameSync, realpathSync, chmodSync } from 'fs'
  import { homedir } from 'os'
  import { execFileSync } from 'child_process'
-@@ -53,6 +54,76 @@
+@@ -53,6 +54,84 @@
    process.exit(1)
  }
  const INBOX_DIR = join(STATE_DIR, 'inbox')
@@ -467,7 +503,7 @@ if __name__ == '__main__':
 +function attachmentCustody(op, data) {
 +  return JSON.parse(execFileSync('/usr/bin/python3', [attachmentHelper, op], {
 +    input: JSON.stringify(data), encoding: 'utf8', timeout: 5000,
-+    maxBuffer: 4096, stdio: ['pipe', 'pipe', 'pipe'],
++    maxBuffer: 2 * 1024 * 1024, stdio: ['pipe', 'pipe', 'pipe'],
 +  }))
 +}
 +// Missing owner/unsupported platform must not take down messaging. Downloads
@@ -529,12 +565,34 @@ if __name__ == '__main__':
 +    if (reader) void reader.cancel().catch(() => {})
 +  }
 +}
++function safeAttachmentRead(args) {
++  if (!attachmentReady || !args || typeof args !== 'object' || Array.isArray(args)
++      || Object.keys(args).length !== 1 || !Object.hasOwn(args, 'file_id')
++      || typeof args.file_id !== 'string' || !/^[A-Za-z0-9_-]{1,256}$/.test(args.file_id)) {
++    throw new Error('attachment arguments or owner refused')
++  }
++  return attachmentCustody('read', {nonce: attachmentNonce, file_id: args.file_id})
++}
 +// DOTCORTEX_ATTACHMENT_CUSTODY_END
 +
  const PID_FILE = join(STATE_DIR, 'bot.pid')
 
  // Telegram allows exactly one getUpdates consumer per token. If a previous
-@@ -499,9 +570,10 @@
+@@ -406,7 +485,7 @@
+     instructions: [
+       'The sender reads Telegram, not this session. Anything you want them to see must go through the reply tool — your transcript output never reaches their chat.',
+       '',
+-      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then Read the returned path. Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
++      'Messages from Telegram arrive as <channel source="telegram" chat_id="..." message_id="..." user="..." ts="...">. If the tag has an image_path attribute, Read that file — it is a photo the sender attached. If the tag has attachment_file_id, call download_attachment with that file_id to fetch the file, then call read_attachment with the same file_id (UTF-8 text only, at most 256 KiB; images and PDFs are unsupported). Reply with the reply tool — pass chat_id back. Use reply_to (set to a message_id) only when replying to an earlier message; the latest message doesn\'t need a quote-reply, omit reply_to for normal responses.',
+       '',
+       'reply accepts file paths (files: ["/abs/path.png"]) for attachments. Use react to add emoji reactions, and edit_message for interim progress updates. Edits don\'t trigger push notifications — when a long task completes, send a new reply so the user\'s device pings.',
+       '',
+@@ -495,13 +574,26 @@
+     },
+     {
+       name: 'download_attachment',
+-      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns the local file path ready to Read. Telegram caps bot downloads at 20MB.',
++      description: 'Download a file attachment from a Telegram message to the local inbox. Use when the inbound <channel> meta shows attachment_file_id. Returns a download confirmation, not a filesystem path; then use read_attachment. Images/PDFs cannot be read by this text-only attachment interface. Telegram caps bot downloads at 20MB.',
        inputSchema: {
          type: 'object',
          properties: {
@@ -543,10 +601,22 @@ if __name__ == '__main__':
          },
          required: ['file_id'],
 +        additionalProperties: false,
++      },
++    },
++    {
++      name: 'read_attachment',
++      description: 'Read a previously downloaded, provenance-bound attachment as bounded MCP text, not native Read. UTF-8 text up to 256 KiB only; PNG, JPEG, PDF and binary formats fail closed. Never pass paths, URLs or provenance.',
++      inputSchema: {
++        type: 'object',
++        properties: {
++          file_id: {type: 'string', minLength: 1, maxLength: 256, pattern: '^[A-Za-z0-9_-]+$'},
++        },
++        required: ['file_id'],
++        additionalProperties: false,
        },
      },
      {
-@@ -604,21 +676,7 @@
+@@ -604,22 +696,11 @@
          return { content: [{ type: 'text', text: 'reacted' }] }
        }
        case 'download_attachment': {
@@ -565,11 +635,16 @@ if __name__ == '__main__':
 -        const path = join(INBOX_DIR, `${Date.now()}-${uniqueId}.${ext}`)
 -        mkdirSync(INBOX_DIR, { recursive: true })
 -        writeFileSync(path, buf)
-+        const path = await safeAttachmentDownload(args)
-         return { content: [{ type: 'text', text: path }] }
+-        return { content: [{ type: 'text', text: path }] }
++        await safeAttachmentDownload(args)
++        return { content: [{ type: 'text', text: 'Downloaded attachment. Call read_attachment with the same file_id; no native Read path is returned.' }] }
++      }
++      case 'read_attachment': {
++        return safeAttachmentRead(args)
        }
        case 'edit_message': {
-@@ -796,28 +854,9 @@
+         assertAllowedChat(args.chat_id as string)
+@@ -796,28 +877,9 @@
  })
 
  bot.on('message:photo', async ctx => {
@@ -601,7 +676,7 @@ if __name__ == '__main__':
    })
  })
 
-@@ -963,11 +1002,20 @@
+@@ -963,11 +1025,20 @@
        .catch(() => {})
    }
 
@@ -623,7 +698,7 @@ if __name__ == '__main__':
      method: 'notifications/claude/channel',
      params: {
        content: text,
-@@ -988,6 +1036,9 @@
+@@ -988,6 +1059,9 @@
        },
      },
    }).catch(err => {
@@ -1754,7 +1829,9 @@ const STATE_DIR=process.env.TELEGRAM_STATE_DIR;
 const INBOX_DIR=join(STATE_DIR,'inbox');
 const TOKEN='synthetic-no-network';
 const PERMISSION_REPLY_RE=/^NEVER_MATCH_SYNTHETIC$/;
-let apiIds=[],mode='normal',notifications=[],lastArgs;
+let apiIds=[],mode='normal',notifications=[],lastArgs,payload;
+let callTool,listTools;
+const ListToolsRequestSchema='list',CallToolRequestSchema='call';
 const access={dmPolicy:'allowlist',allowFrom:['101'],groups:{},pending:{}};
 function loadAccess(){return access}
 function pruneExpired(){return false}
@@ -1764,11 +1841,12 @@ const bot={api:{sendChatAction:async()=>{},setMessageReaction:async()=>{},
   getFile:async(id)=>{apiIds.push(id); if(mode==='get-timeout') return new Promise(()=>{});
     return {file_path:mode==='url'?'https://fixture.invalid/x':'documents/fixture.bin',
     file_size:mode==='large-meta'?20971521:17};}}};
-const mcp={notification:async v=>{if(mode==='notification-fail')throw new Error('fixture');notifications.push(v)}};
+const mcp={setRequestHandler:(schema,handler)=>{if(schema==='list')listTools=handler;else callTool=handler},
+ notification:async v=>{if(mode==='notification-fail')throw new Error('fixture');notifications.push(v)}};
 const fetch=async (url,opts)=>{
   lastArgs=opts;
   if(mode==='fetch-timeout')return new Promise(()=>{});
-  const body=mode==='large-stream'?new Uint8Array(20971521):Buffer.from('synthetic payload');
+  const body=mode==='large-stream'?new Uint8Array(20971521):payload??Buffer.from('synthetic payload');
   return {ok:mode!=='http-error',headers:{get:()=>mode==='large-header'?'20971521':null},
     body:{getReader:()=>{let sent=false;return {cancel:async()=>{},read:async()=>{
       if(mode==='stream-timeout')return new Promise(()=>{});
@@ -1782,6 +1860,7 @@ PLUGIN_SUFFIX=r"""
 console.log(JSON.stringify({ready:true,attachmentReady}));
 for await(const line of createInterface({input:process.stdin})){
   const request=JSON.parse(line);mode=request.mode??'normal';
+  payload=request.bytes?Buffer.from(request.bytes,'base64'):undefined;
   try{
     let out;
     if(request.op==='incoming'){
@@ -1789,7 +1868,11 @@ for await(const line of createInterface({input:process.stdin})){
         message:{message_id:request.message??202,date:1},reply:async()=>{}};
       await handleInbound(c,'synthetic message',undefined,{kind:'document',file_id:request.id??'SyntheticAttachment_123',size:request.size??17});
       out={notifications:notifications.length,attachment:notifications.at(-1)?.params?.meta?.attachment_file_id??null};
-    }else if(request.op==='download')out=await download(request.args);
+    }else if(request.op==='download'){
+      out=await callTool({params:{name:'download_attachment',arguments:request.args}});
+      if(out.isError)throw new Error(out.content[0].text);
+    }else if(request.op==='read')out=await callTool({params:{name:'read_attachment',arguments:request.args}});
+    else if(request.op==='tools')out=await listTools();
     else throw new Error('unknown fixture op');
     console.log(JSON.stringify({ok:true,out,apiIds,fetchOptions:lastArgs?{redirect:lastArgs.redirect,signal:!!lastArgs.signal}:null}));
   }catch(e){console.log(JSON.stringify({ok:false,error:String(e.message),apiIds}));}
@@ -1798,11 +1881,12 @@ for await(const line of createInterface({input:process.stdin})){
 
 def extract_plugin(source):
     custody=source.split('// DOTCORTEX_ATTACHMENT_CUSTODY_BEGIN',1)[1].split('// DOTCORTEX_ATTACHMENT_CUSTODY_END',1)[0]
-    handler=source.split("      case 'download_attachment': {",1)[1].split("      case 'edit_message':",1)[0].rsplit('      }',1)[0]
+    handlers=source.split('mcp.setRequestHandler(ListToolsRequestSchema',1)[1].split('await mcp.connect(',1)[0]
+    handlers='mcp.setRequestHandler(ListToolsRequestSchema'+handlers
     gate=source.split('function gate(ctx: Context): GateResult {',1)[1].split('// Like gate()',1)[0]
     inbound=source.split('async function handleInbound(',1)[1].split('// Without this, any throw',1)[0]
     return (PLUGIN_PREFIX+custody+'\nfunction gate(ctx: any): any {'+gate+
-            '\nasync function handleInbound('+inbound+'\nasync function download(args){'+handler+'}\n'+PLUGIN_SUFFIX)
+            '\nasync function handleInbound('+inbound+'\n'+handlers+'\n'+PLUGIN_SUFFIX)
 
 class CustodyTests(unittest.TestCase):
     @classmethod
@@ -1840,7 +1924,16 @@ class CustodyTests(unittest.TestCase):
         self.plugin.stdout.close();self.plugin.stderr.close()
     def call(self,op,**data):
         self.plugin.stdin.write(json.dumps({'op':op,**data})+'\n');self.plugin.stdin.flush()
-        return json.loads(self.plugin.stdout.readline())
+        result=json.loads(self.plugin.stdout.readline())
+        # Optional installed SDK witness; validates actual handler results, not
+        # a fabricated response. Set ATTACHMENT_MCP_TYPES to installed types.js.
+        types=os.environ.get('ATTACHMENT_MCP_TYPES')
+        if types and result.get('ok') and op in ('read','download','tools'):
+            schema='ListToolsResultSchema' if op=='tools' else 'CallToolResultSchema'
+            code=('import {'+schema+' as schema} from '+json.dumps(types)+';'
+                  'const result=JSON.parse(await Bun.stdin.text());schema.parse(result);')
+            subprocess.run([BUN,'-e',code],input=json.dumps(result['out']),text=True,capture_output=True,check=True)
+        return result
     def event(self,args=None,tool=None,sid='synthetic_session'):
         return {'hook_event_name':'PermissionRequest','tool_name':tool or self.c.DOWNLOAD,
                 'tool_input':args or {'file_id':'SyntheticAttachment_123'},'session_id':sid,'cwd':str(self.root)}
@@ -1854,8 +1947,20 @@ class CustodyTests(unittest.TestCase):
         self.grant()
         result=self.call('download',args={'file_id':'SyntheticAttachment_123'})
         self.assertTrue(result['ok'],result)
-        path=Path(result['out']['content'][0]['text'])
+        # Internal descriptor spelling is ONLY a filesystem adversary fixture;
+        # the public MCP download response deliberately returns no path.
+        reg=self.c.registry()
+        try:index=reg.read(self.c.key(self.c.owner()))
+        finally:reg.close()
+        proof=self.c.generation(index['state'],index['nonce'])
+        try:record=proof.read(index['nonce']+'.json')
+        finally:proof.close()
+        path=Path(record['anchor'])/list(record['files'])[-1]
         return path,result
+    def read_event(self,**extra):
+        return self.event({'file_id':'SyntheticAttachment_123',**extra},self.c.READ)
+    def read(self,**extra):
+        return self.call('read',args={'file_id':'SyntheticAttachment_123',**extra})
     def mutate(self,fn):
         reg=self.c.registry();o=self.c.owner()
         try:index=reg.read(self.c.key(o))
@@ -1870,9 +1975,49 @@ class CustodyTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777,0o600)
         self.assertEqual(result['apiIds'],['SyntheticAttachment_123'])
         self.assertEqual(result['fetchOptions'],{'redirect':'error','signal':True})
-        event=self.event({'file_path':str(path)},'Read')
+        event=self.read_event()
         self.assertEqual(self.decision(event),(True,'telegram_attachment_read'))
         self.assertEqual(self.e.classify(event,self.manifest),(True,'telegram_attachment_read'))
+        self.assertEqual(self.read()['out'],{'content':[{'type':'text','text':'synthetic payload'}]})
+        self.assertNotIn('/proc/',result['out']['content'][0]['text'])
+        self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+    def test_mcp_read_exact_schema_and_provenance(self):
+        tools=self.call('tools')['out']['tools']
+        schema=next(t['inputSchema'] for t in tools if t['name']=='read_attachment')
+        self.assertEqual(schema['required'],['file_id'])
+        self.assertEqual(set(schema['properties']),{'file_id'})
+        self.assertIs(schema['additionalProperties'],False)
+        self.assertTrue(self.read()['out']['isError']) # no receipt/download
+        self.download()
+        for extra in ({'path':'/fixture'}, {'url':'https://fixture.invalid'},
+                      {'owner':self.c.owner()}, {'session_id':'synthetic_session'},
+                      {'authorized':True}):
+            with self.subTest(extra=extra):
+                self.assertFalse(self.decision(self.read_event(**extra))[0])
+                self.assertTrue(self.read(**extra)['out']['isError'])
+        self.assertFalse(self.decision(self.event({'file_id':'SyntheticAttachment_123'},self.c.READ,sid='foreign'))[0])
+        self.assertTrue(self.call('read',args={'file_id':'UnknownSynthetic'})['out']['isError'])
+        self.mutate(lambda r:r['files'][next(iter(r['files']))].update(at=0))
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
+
+    def test_mcp_markdown_text_and_truthful_format_limits(self):
+        import base64
+        self.grant()
+        samples=[(b'# Synthetic Markdown\n\nTrusted transport, untrusted content.\n',True),
+                 (b'\x89PNG\r\n\x1a\n'+b'fixture',False),
+                 (b'\xff\xd8\xff'+b'fixture',False),
+                 (b'%PDF-1.4\nfixture',False), (b'abc\x00binary',False),
+                 (b'\xffinvalid-utf8',False), (b'a'*(256*1024+1),False)]
+        for raw,allowed in samples:
+            with self.subTest(prefix=raw[:12],allowed=allowed):
+                out=self.call('download',args={'file_id':'SyntheticAttachment_123'},bytes=base64.b64encode(raw).decode())
+                self.assertTrue(out['ok'],out)
+                result=self.read()['out']
+                self.assertEqual(not result.get('isError',False),allowed,result)
+                if allowed:self.assertEqual(result['content'][0],{'type':'text','text':raw.decode()})
+                else:self.assertIn('UTF-8 text up to 256 KiB',result['content'][0]['text'])
+
     def test_unproven_id_and_extra_arguments_no_api_calls(self):
         for args in ({'file_id':'UnknownSynthetic'},{'file_id':'https://fixture.invalid'},
                      {'file_id':'../escape'},{'file_id':'x'*257},{'file_id':None},
@@ -1931,12 +2076,20 @@ class CustodyTests(unittest.TestCase):
         neighbor=self.root/'neighbor';neighbor.write_bytes(original);neighbor.chmod(0o600)
         path.symlink_to(neighbor)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
         path.unlink();os.link(neighbor,path)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
         path.unlink();os.mkfifo(path,0o600)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
         path.unlink();path.write_bytes(b'changed synthetic');path.chmod(0o600)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
     def test_stream_metadata_header_bounds_urls_timeouts(self):
         self.grant()
         for mode in ('large-meta','large-header','large-stream','url','http-error','get-timeout','fetch-timeout','stream-timeout'):
@@ -1944,16 +2097,15 @@ class CustodyTests(unittest.TestCase):
                 result=self.call('download',args={'file_id':'SyntheticAttachment_123'},mode=mode)
                 self.assertFalse(result['ok'],result)
         self.assertEqual(list((self.state/'inbox').glob('attachment-*')),[])
-    def test_anchor_preserves_native_read_after_approval_parent_rename(self):
+    def test_mcp_read_rechecks_after_approval_parent_rename(self):
         path,_=self.download()
-        self.assertTrue(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertTrue(self.decision(self.read_event())[0])
         inbox=self.state/'inbox'
         inbox.rename(self.state/'inbox-moved')
         inbox.symlink_to(self.root/'race-neighbor')
-        # Native Read uses the pinned directory descriptor, not a re-resolved
-        # path through group-writable channel ancestors after hook approval.
-        self.assertEqual(path.read_bytes(),b'synthetic payload')
-        self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
+        self.assertEqual(list((self.root/'race-neighbor').iterdir()),[])
 
     def test_parent_race_refused_without_neighbor_write(self):
         self.grant()
@@ -2050,6 +2202,74 @@ class CustodyTests(unittest.TestCase):
         self.assertFalse(self.decision(self.event({'file_id':'UnknownSynthetic','owner':actual}))[0])
 
 class ApplierTests(unittest.TestCase):
+    def test_optimization_never_overrides_unknown_drift(self):
+        root=Path(os.environ['ATTACHMENT_TEST_ROOT'])
+        for variant,flags,extra in (('normal',[],{}),('optimized',['-O'],{}),
+                                   ('environment',[],{'PYTHONOPTIMIZE':'1'})):
+            for rollback in (False,True):
+                with self.subTest(variant=variant,rollback=rollback):
+                    runtime=root/('unknown-'+variant+str(rollback));runtime.mkdir(mode=0o700)
+                    for name in ('.mcp.json','package.json'):
+                        shutil.copy2(ASSETS/'fixtures'/name,runtime/name)
+                    target=runtime/'server.ts';unknown=b'// unknown synthetic drift\n'
+                    target.write_bytes(unknown);target.chmod(0o640)
+                    argv=[sys.executable,*flags,str(APPLIER),str(runtime),'--apply']
+                    if rollback:argv.append('--rollback')
+                    result=subprocess.run(argv,env={**os.environ,**extra},capture_output=True,text=True)
+                    self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
+                    self.assertEqual(target.read_bytes(),unknown)
+
+    def test_all_applier_pins_survive_optimization(self):
+        root=Path(os.environ['ATTACHMENT_TEST_ROOT'])
+        for variant,flags,extra in (('normal',[],{}),('optimized',['-O'],{}),
+                                   ('environment',[],{'PYTHONOPTIMIZE':'1'})):
+            for rollback in (False,True):
+                for fault in ('pristine','helper','metadata','series','permissions','concurrent'):
+                    with self.subTest(variant=variant,rollback=rollback,fault=fault):
+                        base=root/('pins-'+variant+str(rollback)+fault)
+                        assets=base/'share/dotcortex/telegram-attachments'
+                        shutil.copytree(ASSETS,assets)
+                        applier=base/'bin/patch';applier.parent.mkdir()
+                        applier.write_bytes(APPLIER.read_bytes())
+                        runtime=base/'runtime';runtime.mkdir(mode=0o700)
+                        for name in ('.mcp.json','package.json'):
+                            shutil.copy2(ASSETS/'fixtures'/name,runtime/name)
+                        target=runtime/'server.ts'
+                        # Both operations have a legitimate transition available.
+                        target.write_bytes(Path(os.environ['ATTACHMENT_PATCHED_SOURCE']).read_bytes()
+                                           if rollback else (ASSETS/'server.ts.pristine').read_bytes())
+                        target.chmod(0o640)
+                        if fault=='pristine':(assets/'server.ts.pristine').write_text('// unknown fixture')
+                        elif fault=='helper':(assets/'custody.py').write_text('# unknown fixture')
+                        elif fault=='metadata':(runtime/'package.json').write_text('{}')
+                        elif fault=='series':(assets/'0001-custody.patch').write_text('invalid fixture patch')
+                        elif fault=='permissions':runtime.chmod(0o770)
+                        argv=[sys.executable,*flags,str(applier),str(runtime),'--apply']
+                        expected=target.read_bytes()
+                        if rollback:argv.append('--rollback')
+                        if fault=='concurrent':
+                            # Inject an actual concurrent target mutation at the
+                            # final recheck open, without changing production code.
+                            code=('import os,runpy,sys; real=os.open; target='+repr(str(target))+'; count=0\n'
+                                  'def opened(path,*a,**kw):\n'
+                                  ' global count\n'
+                                  ' if path=="server.ts":\n'
+                                  '  count+=1\n'
+                                  '  if count==2: open(target,"wb").write(b"concurrent fixture")\n'
+                                  ' return real(path,*a,**kw)\n'
+                                  'os.open=opened;sys.argv='+repr([str(applier),str(runtime),'--apply']+(['--rollback'] if rollback else []))+';runpy.run_path(sys.argv[0],run_name="__main__")')
+                            argv=[sys.executable,*flags,'-c',code];expected=b'concurrent fixture'
+                        result=subprocess.run(argv,env={**os.environ,**extra},capture_output=True,text=True)
+                        self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
+                        self.assertEqual(target.read_bytes(),expected)
+
+    def test_native_consumer_contract_is_not_procfd_read(self):
+        source=Path(os.environ['ATTACHMENT_PATCHED_SOURCE']).read_text()
+        self.assertIn("name: 'read_attachment'",source)
+        self.assertIn("case 'read_attachment':",source)
+        self.assertNotIn('then Read the returned path',source)
+        self.assertNotIn('Returns the local file path ready to Read',source)
+
     def test_both_engines_idempotence_rollback_drift_and_permissions(self):
         root=Path(os.environ['ATTACHMENT_TEST_ROOT'])
         outputs=[]

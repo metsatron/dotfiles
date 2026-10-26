@@ -31,7 +31,9 @@ const STATE_DIR=process.env.TELEGRAM_STATE_DIR;
 const INBOX_DIR=join(STATE_DIR,'inbox');
 const TOKEN='synthetic-no-network';
 const PERMISSION_REPLY_RE=/^NEVER_MATCH_SYNTHETIC$/;
-let apiIds=[],mode='normal',notifications=[],lastArgs;
+let apiIds=[],mode='normal',notifications=[],lastArgs,payload;
+let callTool,listTools;
+const ListToolsRequestSchema='list',CallToolRequestSchema='call';
 const access={dmPolicy:'allowlist',allowFrom:['101'],groups:{},pending:{}};
 function loadAccess(){return access}
 function pruneExpired(){return false}
@@ -41,11 +43,12 @@ const bot={api:{sendChatAction:async()=>{},setMessageReaction:async()=>{},
   getFile:async(id)=>{apiIds.push(id); if(mode==='get-timeout') return new Promise(()=>{});
     return {file_path:mode==='url'?'https://fixture.invalid/x':'documents/fixture.bin',
     file_size:mode==='large-meta'?20971521:17};}}};
-const mcp={notification:async v=>{if(mode==='notification-fail')throw new Error('fixture');notifications.push(v)}};
+const mcp={setRequestHandler:(schema,handler)=>{if(schema==='list')listTools=handler;else callTool=handler},
+ notification:async v=>{if(mode==='notification-fail')throw new Error('fixture');notifications.push(v)}};
 const fetch=async (url,opts)=>{
   lastArgs=opts;
   if(mode==='fetch-timeout')return new Promise(()=>{});
-  const body=mode==='large-stream'?new Uint8Array(20971521):Buffer.from('synthetic payload');
+  const body=mode==='large-stream'?new Uint8Array(20971521):payload??Buffer.from('synthetic payload');
   return {ok:mode!=='http-error',headers:{get:()=>mode==='large-header'?'20971521':null},
     body:{getReader:()=>{let sent=false;return {cancel:async()=>{},read:async()=>{
       if(mode==='stream-timeout')return new Promise(()=>{});
@@ -59,6 +62,7 @@ PLUGIN_SUFFIX=r"""
 console.log(JSON.stringify({ready:true,attachmentReady}));
 for await(const line of createInterface({input:process.stdin})){
   const request=JSON.parse(line);mode=request.mode??'normal';
+  payload=request.bytes?Buffer.from(request.bytes,'base64'):undefined;
   try{
     let out;
     if(request.op==='incoming'){
@@ -66,7 +70,11 @@ for await(const line of createInterface({input:process.stdin})){
         message:{message_id:request.message??202,date:1},reply:async()=>{}};
       await handleInbound(c,'synthetic message',undefined,{kind:'document',file_id:request.id??'SyntheticAttachment_123',size:request.size??17});
       out={notifications:notifications.length,attachment:notifications.at(-1)?.params?.meta?.attachment_file_id??null};
-    }else if(request.op==='download')out=await download(request.args);
+    }else if(request.op==='download'){
+      out=await callTool({params:{name:'download_attachment',arguments:request.args}});
+      if(out.isError)throw new Error(out.content[0].text);
+    }else if(request.op==='read')out=await callTool({params:{name:'read_attachment',arguments:request.args}});
+    else if(request.op==='tools')out=await listTools();
     else throw new Error('unknown fixture op');
     console.log(JSON.stringify({ok:true,out,apiIds,fetchOptions:lastArgs?{redirect:lastArgs.redirect,signal:!!lastArgs.signal}:null}));
   }catch(e){console.log(JSON.stringify({ok:false,error:String(e.message),apiIds}));}
@@ -75,11 +83,12 @@ for await(const line of createInterface({input:process.stdin})){
 
 def extract_plugin(source):
     custody=source.split('// DOTCORTEX_ATTACHMENT_CUSTODY_BEGIN',1)[1].split('// DOTCORTEX_ATTACHMENT_CUSTODY_END',1)[0]
-    handler=source.split("      case 'download_attachment': {",1)[1].split("      case 'edit_message':",1)[0].rsplit('      }',1)[0]
+    handlers=source.split('mcp.setRequestHandler(ListToolsRequestSchema',1)[1].split('await mcp.connect(',1)[0]
+    handlers='mcp.setRequestHandler(ListToolsRequestSchema'+handlers
     gate=source.split('function gate(ctx: Context): GateResult {',1)[1].split('// Like gate()',1)[0]
     inbound=source.split('async function handleInbound(',1)[1].split('// Without this, any throw',1)[0]
     return (PLUGIN_PREFIX+custody+'\nfunction gate(ctx: any): any {'+gate+
-            '\nasync function handleInbound('+inbound+'\nasync function download(args){'+handler+'}\n'+PLUGIN_SUFFIX)
+            '\nasync function handleInbound('+inbound+'\n'+handlers+'\n'+PLUGIN_SUFFIX)
 
 class CustodyTests(unittest.TestCase):
     @classmethod
@@ -117,7 +126,16 @@ class CustodyTests(unittest.TestCase):
         self.plugin.stdout.close();self.plugin.stderr.close()
     def call(self,op,**data):
         self.plugin.stdin.write(json.dumps({'op':op,**data})+'\n');self.plugin.stdin.flush()
-        return json.loads(self.plugin.stdout.readline())
+        result=json.loads(self.plugin.stdout.readline())
+        # Optional installed SDK witness; validates actual handler results, not
+        # a fabricated response. Set ATTACHMENT_MCP_TYPES to installed types.js.
+        types=os.environ.get('ATTACHMENT_MCP_TYPES')
+        if types and result.get('ok') and op in ('read','download','tools'):
+            schema='ListToolsResultSchema' if op=='tools' else 'CallToolResultSchema'
+            code=('import {'+schema+' as schema} from '+json.dumps(types)+';'
+                  'const result=JSON.parse(await Bun.stdin.text());schema.parse(result);')
+            subprocess.run([BUN,'-e',code],input=json.dumps(result['out']),text=True,capture_output=True,check=True)
+        return result
     def event(self,args=None,tool=None,sid='synthetic_session'):
         return {'hook_event_name':'PermissionRequest','tool_name':tool or self.c.DOWNLOAD,
                 'tool_input':args or {'file_id':'SyntheticAttachment_123'},'session_id':sid,'cwd':str(self.root)}
@@ -131,8 +149,20 @@ class CustodyTests(unittest.TestCase):
         self.grant()
         result=self.call('download',args={'file_id':'SyntheticAttachment_123'})
         self.assertTrue(result['ok'],result)
-        path=Path(result['out']['content'][0]['text'])
+        # Internal descriptor spelling is ONLY a filesystem adversary fixture;
+        # the public MCP download response deliberately returns no path.
+        reg=self.c.registry()
+        try:index=reg.read(self.c.key(self.c.owner()))
+        finally:reg.close()
+        proof=self.c.generation(index['state'],index['nonce'])
+        try:record=proof.read(index['nonce']+'.json')
+        finally:proof.close()
+        path=Path(record['anchor'])/list(record['files'])[-1]
         return path,result
+    def read_event(self,**extra):
+        return self.event({'file_id':'SyntheticAttachment_123',**extra},self.c.READ)
+    def read(self,**extra):
+        return self.call('read',args={'file_id':'SyntheticAttachment_123',**extra})
     def mutate(self,fn):
         reg=self.c.registry();o=self.c.owner()
         try:index=reg.read(self.c.key(o))
@@ -147,9 +177,49 @@ class CustodyTests(unittest.TestCase):
         self.assertEqual(path.stat().st_mode & 0o777,0o600)
         self.assertEqual(result['apiIds'],['SyntheticAttachment_123'])
         self.assertEqual(result['fetchOptions'],{'redirect':'error','signal':True})
-        event=self.event({'file_path':str(path)},'Read')
+        event=self.read_event()
         self.assertEqual(self.decision(event),(True,'telegram_attachment_read'))
         self.assertEqual(self.e.classify(event,self.manifest),(True,'telegram_attachment_read'))
+        self.assertEqual(self.read()['out'],{'content':[{'type':'text','text':'synthetic payload'}]})
+        self.assertNotIn('/proc/',result['out']['content'][0]['text'])
+        self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+    def test_mcp_read_exact_schema_and_provenance(self):
+        tools=self.call('tools')['out']['tools']
+        schema=next(t['inputSchema'] for t in tools if t['name']=='read_attachment')
+        self.assertEqual(schema['required'],['file_id'])
+        self.assertEqual(set(schema['properties']),{'file_id'})
+        self.assertIs(schema['additionalProperties'],False)
+        self.assertTrue(self.read()['out']['isError']) # no receipt/download
+        self.download()
+        for extra in ({'path':'/fixture'}, {'url':'https://fixture.invalid'},
+                      {'owner':self.c.owner()}, {'session_id':'synthetic_session'},
+                      {'authorized':True}):
+            with self.subTest(extra=extra):
+                self.assertFalse(self.decision(self.read_event(**extra))[0])
+                self.assertTrue(self.read(**extra)['out']['isError'])
+        self.assertFalse(self.decision(self.event({'file_id':'SyntheticAttachment_123'},self.c.READ,sid='foreign'))[0])
+        self.assertTrue(self.call('read',args={'file_id':'UnknownSynthetic'})['out']['isError'])
+        self.mutate(lambda r:r['files'][next(iter(r['files']))].update(at=0))
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
+
+    def test_mcp_markdown_text_and_truthful_format_limits(self):
+        import base64
+        self.grant()
+        samples=[(b'# Synthetic Markdown\n\nTrusted transport, untrusted content.\n',True),
+                 (b'\x89PNG\r\n\x1a\n'+b'fixture',False),
+                 (b'\xff\xd8\xff'+b'fixture',False),
+                 (b'%PDF-1.4\nfixture',False), (b'abc\x00binary',False),
+                 (b'\xffinvalid-utf8',False), (b'a'*(256*1024+1),False)]
+        for raw,allowed in samples:
+            with self.subTest(prefix=raw[:12],allowed=allowed):
+                out=self.call('download',args={'file_id':'SyntheticAttachment_123'},bytes=base64.b64encode(raw).decode())
+                self.assertTrue(out['ok'],out)
+                result=self.read()['out']
+                self.assertEqual(not result.get('isError',False),allowed,result)
+                if allowed:self.assertEqual(result['content'][0],{'type':'text','text':raw.decode()})
+                else:self.assertIn('UTF-8 text up to 256 KiB',result['content'][0]['text'])
+
     def test_unproven_id_and_extra_arguments_no_api_calls(self):
         for args in ({'file_id':'UnknownSynthetic'},{'file_id':'https://fixture.invalid'},
                      {'file_id':'../escape'},{'file_id':'x'*257},{'file_id':None},
@@ -208,12 +278,20 @@ class CustodyTests(unittest.TestCase):
         neighbor=self.root/'neighbor';neighbor.write_bytes(original);neighbor.chmod(0o600)
         path.symlink_to(neighbor)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
         path.unlink();os.link(neighbor,path)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
         path.unlink();os.mkfifo(path,0o600)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
         path.unlink();path.write_bytes(b'changed synthetic');path.chmod(0o600)
         self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
     def test_stream_metadata_header_bounds_urls_timeouts(self):
         self.grant()
         for mode in ('large-meta','large-header','large-stream','url','http-error','get-timeout','fetch-timeout','stream-timeout'):
@@ -221,16 +299,15 @@ class CustodyTests(unittest.TestCase):
                 result=self.call('download',args={'file_id':'SyntheticAttachment_123'},mode=mode)
                 self.assertFalse(result['ok'],result)
         self.assertEqual(list((self.state/'inbox').glob('attachment-*')),[])
-    def test_anchor_preserves_native_read_after_approval_parent_rename(self):
+    def test_mcp_read_rechecks_after_approval_parent_rename(self):
         path,_=self.download()
-        self.assertTrue(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertTrue(self.decision(self.read_event())[0])
         inbox=self.state/'inbox'
         inbox.rename(self.state/'inbox-moved')
         inbox.symlink_to(self.root/'race-neighbor')
-        # Native Read uses the pinned directory descriptor, not a re-resolved
-        # path through group-writable channel ancestors after hook approval.
-        self.assertEqual(path.read_bytes(),b'synthetic payload')
-        self.assertFalse(self.decision(self.event({'file_path':str(path)},'Read'))[0])
+        self.assertFalse(self.decision(self.read_event())[0])
+        self.assertTrue(self.read()['out']['isError'])
+        self.assertEqual(list((self.root/'race-neighbor').iterdir()),[])
 
     def test_parent_race_refused_without_neighbor_write(self):
         self.grant()
@@ -327,6 +404,74 @@ class CustodyTests(unittest.TestCase):
         self.assertFalse(self.decision(self.event({'file_id':'UnknownSynthetic','owner':actual}))[0])
 
 class ApplierTests(unittest.TestCase):
+    def test_optimization_never_overrides_unknown_drift(self):
+        root=Path(os.environ['ATTACHMENT_TEST_ROOT'])
+        for variant,flags,extra in (('normal',[],{}),('optimized',['-O'],{}),
+                                   ('environment',[],{'PYTHONOPTIMIZE':'1'})):
+            for rollback in (False,True):
+                with self.subTest(variant=variant,rollback=rollback):
+                    runtime=root/('unknown-'+variant+str(rollback));runtime.mkdir(mode=0o700)
+                    for name in ('.mcp.json','package.json'):
+                        shutil.copy2(ASSETS/'fixtures'/name,runtime/name)
+                    target=runtime/'server.ts';unknown=b'// unknown synthetic drift\n'
+                    target.write_bytes(unknown);target.chmod(0o640)
+                    argv=[sys.executable,*flags,str(APPLIER),str(runtime),'--apply']
+                    if rollback:argv.append('--rollback')
+                    result=subprocess.run(argv,env={**os.environ,**extra},capture_output=True,text=True)
+                    self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
+                    self.assertEqual(target.read_bytes(),unknown)
+
+    def test_all_applier_pins_survive_optimization(self):
+        root=Path(os.environ['ATTACHMENT_TEST_ROOT'])
+        for variant,flags,extra in (('normal',[],{}),('optimized',['-O'],{}),
+                                   ('environment',[],{'PYTHONOPTIMIZE':'1'})):
+            for rollback in (False,True):
+                for fault in ('pristine','helper','metadata','series','permissions','concurrent'):
+                    with self.subTest(variant=variant,rollback=rollback,fault=fault):
+                        base=root/('pins-'+variant+str(rollback)+fault)
+                        assets=base/'share/dotcortex/telegram-attachments'
+                        shutil.copytree(ASSETS,assets)
+                        applier=base/'bin/patch';applier.parent.mkdir()
+                        applier.write_bytes(APPLIER.read_bytes())
+                        runtime=base/'runtime';runtime.mkdir(mode=0o700)
+                        for name in ('.mcp.json','package.json'):
+                            shutil.copy2(ASSETS/'fixtures'/name,runtime/name)
+                        target=runtime/'server.ts'
+                        # Both operations have a legitimate transition available.
+                        target.write_bytes(Path(os.environ['ATTACHMENT_PATCHED_SOURCE']).read_bytes()
+                                           if rollback else (ASSETS/'server.ts.pristine').read_bytes())
+                        target.chmod(0o640)
+                        if fault=='pristine':(assets/'server.ts.pristine').write_text('// unknown fixture')
+                        elif fault=='helper':(assets/'custody.py').write_text('# unknown fixture')
+                        elif fault=='metadata':(runtime/'package.json').write_text('{}')
+                        elif fault=='series':(assets/'0001-custody.patch').write_text('invalid fixture patch')
+                        elif fault=='permissions':runtime.chmod(0o770)
+                        argv=[sys.executable,*flags,str(applier),str(runtime),'--apply']
+                        expected=target.read_bytes()
+                        if rollback:argv.append('--rollback')
+                        if fault=='concurrent':
+                            # Inject an actual concurrent target mutation at the
+                            # final recheck open, without changing production code.
+                            code=('import os,runpy,sys; real=os.open; target='+repr(str(target))+'; count=0\n'
+                                  'def opened(path,*a,**kw):\n'
+                                  ' global count\n'
+                                  ' if path=="server.ts":\n'
+                                  '  count+=1\n'
+                                  '  if count==2: open(target,"wb").write(b"concurrent fixture")\n'
+                                  ' return real(path,*a,**kw)\n'
+                                  'os.open=opened;sys.argv='+repr([str(applier),str(runtime),'--apply']+(['--rollback'] if rollback else []))+';runpy.run_path(sys.argv[0],run_name="__main__")')
+                            argv=[sys.executable,*flags,'-c',code];expected=b'concurrent fixture'
+                        result=subprocess.run(argv,env={**os.environ,**extra},capture_output=True,text=True)
+                        self.assertNotEqual(result.returncode,0,result.stdout+result.stderr)
+                        self.assertEqual(target.read_bytes(),expected)
+
+    def test_native_consumer_contract_is_not_procfd_read(self):
+        source=Path(os.environ['ATTACHMENT_PATCHED_SOURCE']).read_text()
+        self.assertIn("name: 'read_attachment'",source)
+        self.assertIn("case 'read_attachment':",source)
+        self.assertNotIn('then Read the returned path',source)
+        self.assertNotIn('Returns the local file path ready to Read',source)
+
     def test_both_engines_idempotence_rollback_drift_and_permissions(self):
         root=Path(os.environ['ATTACHMENT_TEST_ROOT'])
         outputs=[]

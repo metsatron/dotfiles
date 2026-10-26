@@ -5628,8 +5628,9 @@ def _telegram_attachment_policy(event, manifest, bind=False):
     """
     tool, payload = event.get('tool_name'), event.get('tool_input')
     download = tool == 'mcp__plugin_telegram_telegram__download_attachment'
+    attachment_read = tool == 'mcp__plugin_telegram_telegram__read_attachment'
     raw = payload.get('command' if tool == 'Bash' else 'file_path') if isinstance(payload, dict) else None
-    if not download and raw is None:
+    if not download and not attachment_read and raw is None:
         return None
     default = str(Path.home() / '.claude/channels/telegram')
     channel_target = isinstance(raw, str) and (default in raw
@@ -5675,14 +5676,13 @@ def _telegram_attachment_policy(event, manifest, bind=False):
                 reg.close()
     except (OSError, ValueError, KeyError, ImportError):
         helper = None
-    if not download and not channel_target and not named:
+    if not download and not attachment_read and not channel_target and not named:
         return None
-    # The sole proc-fd Read carve-out is re-proved against the exact produced
-    # inode/content below; all other metadata/credential floors remain intact.
-    floor_event = ({**event, 'tool_input': {**payload, 'file_path': 'attachment.bin'}}
-                   if tool == 'Read' and named else event)
-    if _admiral_floor(floor_event, manifest) or helper is None or tool not in {
-            'mcp__plugin_telegram_telegram__download_attachment', 'Read'}:
+    # Native Read proc-fd paths remain forbidden. Only the declared text MCP
+    # tool can consume verified bytes, without exposing a pathname to a reader.
+    if _admiral_floor(event, manifest) or helper is None or tool not in {
+            'mcp__plugin_telegram_telegram__download_attachment',
+            'mcp__plugin_telegram_telegram__read_attachment'}:
         return False, 'true_floor'
     try:
         if helper.approval(event, bind=bind):
@@ -5692,7 +5692,7 @@ def _telegram_attachment_policy(event, manifest, bind=False):
     return False, 'true_floor'
 
 
-TELEGRAM_CUSTODY_SHA256 = 'b1e47f8a86624550e95f0caf15b68c2f79d5b5a2ab1d7097532676e6912685c5'
+TELEGRAM_CUSTODY_SHA256 = '1cc97967f2e5c9e841e01cdd7c542e6ccffa68d4054a1424154789a118292ff9'
 
 
 def classify(event, manifest):

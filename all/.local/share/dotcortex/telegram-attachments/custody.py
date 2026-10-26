@@ -20,6 +20,8 @@ LIMIT = 20 * 1024 * 1024
 TTL = 900
 ID = re.compile(r'[A-Za-z0-9_-]{1,256}\Z')
 DOWNLOAD = 'mcp__plugin_telegram_telegram__download_attachment'
+READ = 'mcp__plugin_telegram_telegram__read_attachment'
+TEXT_LIMIT = 256 * 1024
 
 def require(ok):
     if not ok:
@@ -179,6 +181,44 @@ def with_record(action):
         os.close(lock)
         reg.close()
 
+def verified_bytes(index, r, fid):
+    now = time.time()
+    require(fid in r['receipts'] and 0 <= now-r['receipts'][fid]['at'] < TTL)
+    matches = [(name, rec) for name, rec in r['files'].items() if rec['id'] == fid]
+    require(bool(matches))
+    name, rec = matches[-1]
+    require(re.fullmatch(r'attachment-[a-f0-9]{48}\.bin', name) and 0 <= now-rec['at'] < TTL)
+    inbox = Directory(index['state'] + '/inbox')
+    try:
+        anchor = os.stat(r['anchor'])
+        require((anchor.st_dev, anchor.st_ino) == (inbox.info.st_dev, inbox.info.st_ino)
+                == (r['root']['dev'], r['root']['ino']))
+        fd = inbox.regular(name)
+        with os.fdopen(fd, 'rb') as f:
+            st = os.fstat(f.fileno())
+            require((st.st_dev, st.st_ino, st.st_size) == (rec['dev'], rec['ino'], rec['size']) and st.st_size <= LIMIT)
+            raw = f.read(LIMIT+1)
+        require(len(raw) == rec['size'] and hashlib.sha256(raw).hexdigest() == rec['sha'])
+        inbox.current()
+        return raw
+    finally:
+        inbox.close()
+
+def text_content(raw):
+    # Content, never uploader filename/MIME, determines this bounded capability.
+    # Image/PDF decoding is deliberately NOT implemented by this text-only tool.
+    unsupported = {'content': [{'type': 'text', 'text':
+        'Unsupported attachment format or size: read_attachment supports only UTF-8 text up to 256 KiB; PNG, JPEG, PDF and other binary formats are not supported.'}], 'isError': True}
+    if len(raw) > TEXT_LIMIT or raw.startswith((b'\x89PNG\r\n\x1a\n', b'\xff\xd8\xff', b'%PDF-')):
+        return unsupported
+    try:
+        text = raw.decode('utf-8', errors='strict')
+    except UnicodeDecodeError:
+        return unsupported
+    if any(ord(ch) < 32 and ch not in '\t\r\n' or 127 <= ord(ch) <= 159 for ch in text):
+        return unsupported
+    return {'content': [{'type': 'text', 'text': text}]}
+
 def producer(op, data):
     def act(index, r):
         require(identity(os.getppid())[0] == r['plugin'] and data['nonce'] == r['nonce'])
@@ -204,7 +244,11 @@ def producer(op, data):
             r['receipts'].pop(fid, None)
             return True, True
         require(fid in r['receipts'] and isinstance(r['session'], str) and isinstance(r['anchor'], str))
+        if op == 'read':
+            require(set(data) == {'nonce', 'file_id'})
+            return text_content(verified_bytes(index, r, fid)), False
         if op == 'check':
+            require(set(data) == {'nonce', 'file_id'})
             return True, False
         require(op == 'store' and set(data) == {'nonce', 'file_id', 'bytes'})
         buf = base64.b64decode(data['bytes'], validate=True)
@@ -233,14 +277,8 @@ def approval(event, bind=False):
     require(event.get('hook_event_name') == 'PermissionRequest' and isinstance(args, dict))
     sid = event.get('session_id')
     require(isinstance(sid, str) and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', sid))
-    require(tool in (DOWNLOAD, 'Read'))
-    if tool == DOWNLOAD:
-        require(set(args) == {'file_id'} and isinstance(args['file_id'], str) and ID.fullmatch(args['file_id']))
-    else:
-        require(set(args) <= {'file_path', 'offset', 'limit', 'pages'} and isinstance(args.get('file_path'), str))
-        for k in ('offset', 'limit'):
-            require(k not in args or type(args[k]) is int and 1 <= args[k] <= 100000)
-        require('pages' not in args or isinstance(args['pages'], str) and re.fullmatch(r'[0-9,-]{1,64}', args['pages']))
+    require(tool in (DOWNLOAD, READ))
+    require(set(args) == {'file_id'} and isinstance(args['file_id'], str) and ID.fullmatch(args['file_id']))
     def act(index, r):
         dirty = False
         # First trusted native PermissionRequest pins this Claude generation to
@@ -254,24 +292,8 @@ def approval(event, bind=False):
             rec = r['receipts'][args['file_id']]
             require(0 <= now-rec['at'] < TTL)
             return True, dirty
-        raw = args['file_path']
-        require(isinstance(r['anchor'], str) and os.path.dirname(raw) == r['anchor'])
-        name = os.path.basename(raw)
-        require(re.fullmatch(r'attachment-[a-f0-9]{48}\.bin', name))
-        rec = r['files'][name]
-        require(0 <= now-rec['at'] < TTL)
-        inbox = Directory(index['state'] + '/inbox')
-        try:
-            fd = inbox.regular(name)
-            with os.fdopen(fd, 'rb') as f:
-                st = os.fstat(f.fileno())
-                require((st.st_dev, st.st_ino, st.st_size) == (rec['dev'],rec['ino'],rec['size']) and st.st_size <= LIMIT)
-                digest = hashlib.sha256(f.read(LIMIT+1)).hexdigest()
-            require(digest == rec['sha'])
-            inbox.current()
-            return True, False
-        finally:
-            inbox.close()
+        verified_bytes(index, r, args['file_id'])
+        return True, False
     return with_record(act)
 
 def main():
