@@ -75,7 +75,9 @@ def _protected(value):
     parts = tuple(part for part in lowered.split("/") if part)
     if ("palmcortex" in parts and "clients" in parts) or any(parts[i:i + 3] == ("logs", "telegram", "personal") for i in range(max(0, len(parts) - 2))):
         return True
-    if re.search(r"secret[\W_]*vault", lowered) or "nexus/keys" in posixpath.normpath(lowered):
+    if ('.custody' in parts or '.local/state/dotcortex/telegram-attachments' in lowered
+            or re.search(r'/proc/[0-9]+/fd/[0-9]+(?:/|$|[\s\"\'])', lowered)
+            or re.search(r"secret[\W_]*vault", lowered) or "nexus/keys" in posixpath.normpath(lowered)):
         return True
     if ".claude.json" in lowered:
         return True
@@ -856,7 +858,8 @@ def _protected_write_target(value):
     lowered_parts = {part.casefold() for part in parts}
     return (_protected(path) or 'palmcortex' in lowered_parts or '.git' in parts
         or name.startswith(('agents-approval', 'claude-approval', 'claude_approval', 'claude-hook-approval', 'claude-hook-admiral-presence', 'approval-presence', 'approval-queue', 'approval-morning-queue', 'approval-telegram', 'admiral-last-seen', 'approval-away'))
-        or name == 'agents-hooks.org'
+        or name in {'agents-hooks.org', 'agents-hooks-telegram-attachments.org', 'claude-telegram-attachment-patch'}
+        or 'telegram-attachments' in parts
         or name in {'settings.json', 'settings.local.json', 'settings.shared.json', 'access.json'} and any(x in parts for x in ('.claude', '.config')))
 
 
@@ -5641,9 +5644,88 @@ def _substitutions_approval(event, manifest, judge):
     return None
 
 
+def _telegram_attachment_policy(event, manifest, bind=False):
+    """Native producer proof only; never a caller JSON or transcript authority.
+
+    The helper is source-pinned at integration. It reads only private custody
+    metadata and exact produced bytes; never the bot's access/config/env files.
+    Unknown download proofs are a hard refusal, not a model-judge fallback.
+    """
+    tool, payload = event.get('tool_name'), event.get('tool_input')
+    download = tool == 'mcp__plugin_telegram_telegram__download_attachment'
+    attachment_read = tool == 'mcp__plugin_telegram_telegram__read_attachment'
+    raw = payload.get('command' if tool == 'Bash' else 'file_path') if isinstance(payload, dict) else None
+    if not download and not attachment_read and raw is None:
+        return None
+    default = str(Path.home() / '.claude/channels/telegram')
+    channel_target = isinstance(raw, str) and (default in raw
+        or re.search(r'/proc/[0-9]+/fd/[0-9]+(?:/|$)', raw) is not None)
+    named = isinstance(raw, str) and bool(re.fullmatch(r'attachment-[a-f0-9]{48}\.bin', os.path.basename(raw)))
+    helper = None
+    try:
+        import importlib.util
+        import hashlib
+        path = Path.home() / '.local/share/dotcortex/telegram-attachments/custody.py'
+        source = path.read_bytes()
+        if hashlib.sha256(source).hexdigest() != TELEGRAM_CUSTODY_SHA256:
+            raise ValueError('unreviewed custody helper')
+        spec = importlib.util.spec_from_file_location('telegram_attachment_custody', path)
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+        # Custom STATE_DIR is discovered only from the native producer index.
+        if isinstance(raw, str):
+            reg = helper.registry()
+            try:
+                native_owner = helper.owner()
+                index = reg.read(helper.key(native_owner))
+                helper.require(index['owner'] == native_owner)
+                state = index['state']
+                helper.require(isinstance(state, str) and state.startswith('/')
+                               and state != '/' and os.path.normpath(state) == state)
+                # Bash carries a command, not a file_path. Match actual lexical
+                # and resolved operands, never startswith(command) or an
+                # arbitrary substring that also catches same-prefix siblings.
+                cwd = event.get('cwd') or '/'
+                operands = ([word for stage in (_shell_stages(raw) or []) for word in stage[1:]]
+                            if tool == 'Bash' else [raw])
+                for operand in operands:
+                    target = operand.split('=', 1)[1] if operand.startswith('-') and '=' in operand else operand
+                    if (tool == 'Bash' and not target.startswith(('/', '~')) and '/' not in target
+                            and target not in {'.', '..'} and not os.path.lexists(posixpath.join(cwd, target))):
+                        continue
+                    lexical = _lexical(target, cwd)
+                    if lexical is not None and (_inside(lexical, state)
+                            or _inside(os.path.realpath(lexical), os.path.realpath(state))):
+                        channel_target = True
+            finally:
+                reg.close()
+    except (OSError, ValueError, KeyError, ImportError):
+        helper = None
+    if not download and not attachment_read and not channel_target and not named:
+        return None
+    # Native Read proc-fd paths remain forbidden. Only the declared text MCP
+    # tool can consume verified bytes, without exposing a pathname to a reader.
+    if _admiral_floor(event, manifest) or helper is None or tool not in {
+            'mcp__plugin_telegram_telegram__download_attachment',
+            'mcp__plugin_telegram_telegram__read_attachment'}:
+        return False, 'true_floor'
+    try:
+        if helper.approval(event, bind=bind):
+            return True, 'telegram_attachment_download' if download else 'telegram_attachment_read'
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    return False, 'true_floor'
+
+
+TELEGRAM_CUSTODY_SHA256 = '1cc97967f2e5c9e841e01cdd7c542e6ccffa68d4054a1424154789a118292ff9'
+
+
 def classify(event, manifest):
     if not isinstance(event, dict) or event.get('hook_event_name') != 'PermissionRequest':
         return False, 'not_permission_request'
+    attachment = _telegram_attachment_policy(event, manifest)
+    if attachment is not None:
+        return attachment
     if _mail_read_batch_proven(event, manifest):
         return True, 'coordinator_mail_read_batch'
     if _for_readonly(event, manifest):
@@ -5678,6 +5760,10 @@ def _decide_request(event, manifest):
     if not isinstance(event, dict) or event.get('hook_event_name') != 'PermissionRequest':
         _log_decision.extras = {'decision_path': 'floor', 'judge_verdict': 'not_consulted'}
         return False, 'not_permission_request'
+    attachment = _telegram_attachment_policy(event, manifest, bind=True)
+    if attachment is not None:
+        _log_decision.extras = {'decision_path': 'deterministic', 'judge_verdict': 'not_needed'}
+        return attachment
     payload = event.get('tool_input') if isinstance(event, dict) else None
     command = payload.get('command') if isinstance(payload, dict) else None
     if _mail_read_batch_proven(event, manifest):
