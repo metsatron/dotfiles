@@ -731,7 +731,7 @@ def _floor_verb(lowered, coordinator=None):
             and lowered[4] in {'handling_completed', 'handling_deferred', 'handling_failed', 'handling_rejected'}
             and not any(ch in word for word in lowered for ch in '`$\\')):
         return False
-    if lowered and lowered[0] == 'mailcortex' and lowered[1:2] not in (['inbox'], ['read']) and not (lowered[-1:] in (['--help'], ['--version'], ['-h']) and len(lowered) <= 3) and coordinator not in {'coordinator_mail_send', 'coordinator_remote_mail_send'}:
+    if lowered and lowered[0] == 'mailcortex' and lowered[1:2] not in (['inbox'], ['read']) and not (lowered[-1:] in (['--help'], ['--version'], ['-h']) and len(lowered) <= 3) and coordinator not in {'coordinator_mail_send', 'coordinator_remote_mail_send', 'coordinator_mail_help'}:
         return True
     if lowered[:1] in (['eval'], ['source'], ['.'], ['xargs']):
         return True  # opaque execution cannot erase the floor
@@ -1706,7 +1706,7 @@ def _plain_observation_words(words, cwd, manifest, *, piped=False):
         return (len(args) == 2 and args[0] == '-v' if verb == 'command'
                 else len(args) == 1) and bool(re.fullmatch(r'[A-Za-z0-9_.+-]+', args[-1]))
     if len(args) == 1 and args[0] in {'--help', '-h', '--version'}:
-        return verb not in REMOTE | SERVICE | PACKAGE | OPAQUE_COMMANDS | WRITE_COMMANDS
+        return verb != 'mailcortex' and verb not in REMOTE | SERVICE | PACKAGE | OPAQUE_COMMANDS | WRITE_COMMANDS
     if verb == 'crontab':
         return args == ['-l']
     if verb == 'git':
@@ -1726,7 +1726,7 @@ def _plain_observation_words(words, cwd, manifest, *, piped=False):
             arg in {'-p', '-e', '-t'} or (i > 0 and args[i - 1] == '-t' and not arg.startswith('-'))
             for i, arg in enumerate(args[1:], 1))
     if verb == 'mailcortex':
-        return bool(args) and args[0] in {'inbox', 'read'} and not any(
+        return bool(args) and args[0] in {'inbox', 'read'} and not any(arg in {'--help', '-h', '--version'} for arg in args) and not any(
             any(ch in arg for ch in '><;&|`$\\') for arg in args)
     if verb in {'pgrep', 'ps'}:
         return bool(args) and not any(arg in {'-o', '--signal', '-signal'} for arg in args)
@@ -1966,15 +1966,15 @@ def _local_match(event, manifest, words=None):
     verb, args = words[0].rsplit("/", 1)[-1], words[1:]
     if (len(words) == 2 and args[0] in {'--help', '--version', '-h'}
             and re.fullmatch(r'[A-Za-z0-9_.+-]+', verb)
-            and verb not in REMOTE | SERVICE | PACKAGE | OPAQUE_COMMANDS | WRITE_COMMANDS):
+            and verb != 'mailcortex' and verb not in REMOTE | SERVICE | PACKAGE | OPAQUE_COMMANDS | WRITE_COMMANDS):
         return True
     if verb not in reviewed_verbs:
         return False
     if verb in SYSTEM_READERS:
         return _system_read_match(verb, args)
     if verb == "mailcortex":
-        return ((len(args) >= 1 and args[0] in {"inbox", "read"}) or
-                (len(args) == 2 and args[1] in {"--help", "--version", "-h"})) and all(
+        return (len(args) >= 1 and args[0] in {"inbox", "read"}
+                and not any(arg in {'--help', '-h', '--version'} for arg in args)) and all(
             not any(char in arg for char in "><;&`$\\") for arg in args[1:])
     if verb == "tmux":
         if not args:
@@ -4868,7 +4868,7 @@ def _coordinator_candidate(command):
         if args[:1] == ['-C']:
             args = args[2:]
         return bool(args and args[0] in {'commit', 'worktree', 'merge', 'push'})
-    return words[0] in {'codex', 'nohup', 'scp'} or words[:2] == ['mailcortex', 'send']
+    return words[0] in {'codex', 'nohup', 'scp'} or words[:1] == ['mailcortex']
 
 
 def _coordinator_mail_filter(words):
@@ -4956,8 +4956,28 @@ def _coordinator_mail_words(command):
         return None
 
 
+def _coordinator_mail_help(words):
+    """Only argparse help at a declared CLI node, never help after operands.
+
+    services-mailcortex.org build_parser has no --version action. Keep this
+    schema explicit: tool names and suffix flags do not prove inert effects.
+    """
+    paths = {(), ('provision',), ('send',), ('inbox',), ('read',), ('receipt',),
+             ('bbs',), ('bbs', 'alert'), ('bbs', 'alert', 'post'),
+             ('bbs', 'alert', 'list'), ('bbs', 'alert', 'current'),
+             ('bbs', 'alert', 'emit-reset')}
+    return bool(words and words[0] == 'mailcortex' and words[-1] in {'--help', '-h'}
+                and tuple(words[1:-1]) in paths)
+
+
+def _coordinator_message_id(value):
+    """Bounded shell-inert subset of the CLI's angle-bracket Message-ID."""
+    return (isinstance(value, str) and len(value) <= 256
+            and re.fullmatch(r'<[A-Za-z0-9_.+-]+@[A-Za-z0-9_.-]+>', value) is not None)
+
+
 def _coordinator_mail_fields(words, config):
-    """Accept the four required mail fields and the single inert print-ID flag."""
+    """Require owned mail fields; optionally print ID and thread a native reply."""
     if not isinstance(words, list) or words[:2] != ['mailcortex', 'send']:
         return None
     fields = {}
@@ -4971,20 +4991,22 @@ def _coordinator_mail_fields(words, config):
             print_id = True
             index += 1
             continue
-        if option not in {'--from', '--to', '--subject', '--body-file'} or option in fields:
+        if option not in {'--from', '--to', '--subject', '--body-file', '--in-reply-to'} or option in fields:
             return None
-        if index + 1 >= len(words) or not words[index + 1]:
+        if index + 1 >= len(words) or not words[index + 1] or words[index + 1].startswith('-'):
             return None
         value = words[index + 1]
         if any(ord(char) < 32 or ord(char) == 127 for char in value):
             return None
         fields[option] = value
         index += 2
-    if set(fields) != {'--from', '--to', '--subject', '--body-file'}:
+    if set(fields) - {'--in-reply-to'} != {'--from', '--to', '--subject', '--body-file'}:
         return None
     if (fields['--from'] != config['seat_account']
             or not _mail_recipient_allowed(fields['--to'], config)
             or not fields['--subject']):
+        return None
+    if '--in-reply-to' in fields and not _coordinator_message_id(fields['--in-reply-to']):
         return None
     return fields
 
@@ -5070,11 +5092,20 @@ def _ops_redirect_target(target, config):
 def _coordinator_match(event, manifest):
     config = _coordinator_config(manifest)
     tool_input, cwd = event.get('tool_input'), event.get('cwd')
-    if (config is None or event.get('tool_name') != 'Bash' or not isinstance(tool_input, dict)
+    if (event.get('tool_name') != 'Bash' or not isinstance(tool_input, dict)
             or not set(tool_input) <= TOOL_INPUT_KEYS or not isinstance(cwd, str) or not cwd.startswith('/')):
         return None
     command = tool_input.get('command')
     if not isinstance(command, str) or any(ord(c) < 32 or ord(c) == 127 for c in command):
+        return None
+    # CLI discovery is also an ordinary local observation when reads are on;
+    # it needs no send authority, but still proves the complete shell grammar.
+    if (_coordinator_mail_help(_coordinator_mail_words(command))
+            and (manifest['entries']['local_read']['enabled']
+                 or config is not None and config['classes']['mail_send'])
+            and any(_inside(os.path.realpath(cwd), root) for root in _policy_roots(manifest))):
+        return 'coordinator_mail_help'
+    if config is None:
         return None
     redirect = OPS_REDIRECT.fullmatch(command)
     if redirect and config['classes'].get('ops_tool') is True:
@@ -5096,6 +5127,19 @@ def _coordinator_match(event, manifest):
     if words is None:
         return None
     flags = config['classes']
+    if words[:1] == ['mailcortex'] and flags['mail_send']:
+        mail_words = _coordinator_mail_words(command)
+        # Native receipt takes a seat component, not an address or filename.
+        # Only this manifest's own seat and completion state are authorized;
+        # no shell redirects/pipelines or alternate lifecycle states here.
+        seat = config['seat_account'].split('@', 1)[0]
+        if (mail_words is not None and len(mail_words) == 5
+                and mail_words[:3] == ['mailcortex', 'receipt', seat]
+                and re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', seat)
+                and _coordinator_message_id(mail_words[3])
+                and mail_words[4] == 'handling_completed'
+                and _coordinator_mail_operators(command) == []):
+            return 'coordinator_mail_receipt'
     remote_grant = _peer_coordinator_match(command, words, config, manifest)
     if remote_grant is not None:
         return remote_grant
