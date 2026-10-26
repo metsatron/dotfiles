@@ -1474,7 +1474,10 @@ def coordinator_private_bytes(path: pathlib.Path) -> bytes:
             os.close(descriptor)
 
 
-def coordinator_grant(key_id: str) -> tuple[dict, bytes]:
+def coordinator_grant(key_id: str, *, destination: str = COORDINATOR_DESTINATION) -> tuple[dict, bytes]:
+    if not isinstance(destination, str):
+        raise PeerError("coordinator destination must be an exact peer ID")
+    parse_peer_id(destination)
     validate_component(key_id, "coordinator key ID")
     path = pathlib.Path(os.environ.get("AGENT_PEER_COORDINATOR_TRUST_FILE",
         str(pathlib.Path.home() / ".config/agent-peer/coordinator-trust.json")))
@@ -1495,7 +1498,7 @@ def coordinator_grant(key_id: str) -> tuple[dict, bytes]:
         # refused permanently, NOT treated as indefinitely pending provisioning.
         raise PeerError("coordinator key is unknown or revoked")
     parse_peer_id(grant["source"])
-    if (grant["destination"] != COORDINATOR_DESTINATION
+    if (grant["destination"] != destination
             or grant["capabilities"] not in (["status", "nudge"], ["taskExecution"])):
         raise PeerError("coordinator grant exceeds status,nudge scope")
     if task and grant.get("execution_authority") != "existing_session_permissions":
@@ -1559,9 +1562,9 @@ def coordinator_scope(envelope: dict, grant: dict) -> None:
         verify_envelope_leases(envelope)
 
 
-def sign_coordinator(envelope: dict, key_id: str) -> dict:
+def sign_coordinator(envelope: dict, key_id: str, *, destination: str = COORDINATOR_DESTINATION) -> dict:
     """The provisioned key selects the real source; --from grants no identity."""
-    grant, secret = coordinator_grant(key_id)
+    grant, secret = coordinator_grant(key_id, destination=destination)
     coordinator_scope(envelope, grant)
     task = grant["capabilities"] == ["taskExecution"]
     value = {"schema": COORDINATOR_TASK_ATTESTATION if task else COORDINATOR_ATTESTATION, "key_id": key_id,
@@ -1575,14 +1578,15 @@ def sign_coordinator(envelope: dict, key_id: str) -> dict:
     return value
 
 
-def verify_coordinator(value: object, *, check_expiry: bool = True) -> dict:
+def verify_coordinator(value: object, *, check_expiry: bool = True,
+                       destination: str = COORDINATOR_DESTINATION) -> dict:
     task = isinstance(value, dict) and value.get("schema") == COORDINATOR_TASK_ATTESTATION
     if (not isinstance(value, dict) or set(value) != {
             "schema", "key_id", "nonce", "expires", "capabilities", "envelope", "mac"} | (
                 {"task_execution", "execution_authority"} if task else set())
             or value.get("schema") not in {COORDINATOR_ATTESTATION, COORDINATOR_TASK_ATTESTATION}):
         raise PeerError("invalid coordinator attestation")
-    grant, secret = coordinator_grant(value["key_id"])
+    grant, secret = coordinator_grant(value["key_id"], destination=destination)
     if (task != (grant["capabilities"] == ["taskExecution"])
             or (task and any(value[k] != grant[k] for k in ("task_execution", "execution_authority")))):
         raise PeerError("task execution grant binding mismatch")
@@ -1606,21 +1610,28 @@ def verify_coordinator(value: object, *, check_expiry: bool = True) -> dict:
     return grant
 
 
-def receive_coordinator(value: object) -> dict:
-    verify_coordinator(value)
-    return receive_envelope(value["envelope"], _attestation=value)
+def receive_coordinator(value: object, *, destination: str = COORDINATOR_DESTINATION) -> dict:
+    verify_coordinator(value, destination=destination)
+    return receive_envelope(value["envelope"], _attestation=value,
+                            _coordinator_destination=destination)
 
 
-def verified_coordinator_record(message_id: str) -> dict:
+def verified_coordinator_record(message_id: str, *, destination: str = COORDINATOR_DESTINATION) -> dict:
     record = read_record("inbox", message_id)
     if not record or record.get("state") != "stored":
         raise PeerError("coordinator record is not stored")
     attestation = record.get("coordinator_attestation")
     if not attestation:
         raise PeerError("coordinator record lacks endpoint authentication")
-    grant = verify_coordinator(attestation)
+    grant = verify_coordinator(attestation, destination=destination)
     if not registry_path().exists():
         raise CoordinatorUnavailable("coordinator endpoint registry unavailable")
+    registry = read_registry()
+    endpoint = registry["endpoints"].get(destination)
+    if (parse_peer_id(destination)[0] != registry["local_host_id"]
+            or not isinstance(endpoint, dict) or endpoint.get("delivery") != "store"):
+        raise PeerError("coordinator destination is not registered locally for store-only delivery")
+    match_endpoint_repo(endpoint, attestation["envelope"]["workspace"], destination)
     if attestation["envelope"] != record["envelope"]:
         raise PeerError("stored coordinator envelope differs from authenticated event")
     result = dict(record)
@@ -1631,8 +1642,9 @@ def verified_coordinator_record(message_id: str) -> dict:
     return result
 
 
-def receive_envelope(envelope: object, origin_host: str | None = None, *, _attestation: dict | None = None) -> dict[str, object]:
-    authenticated = verify_coordinator(_attestation) if _attestation else None
+def receive_envelope(envelope: object, origin_host: str | None = None, *, _attestation: dict | None = None,
+                     _coordinator_destination: str = COORDINATOR_DESTINATION) -> dict[str, object]:
+    authenticated = verify_coordinator(_attestation, destination=_coordinator_destination) if _attestation else None
     if _attestation and _attestation["envelope"] != envelope:
         raise PeerError("intake envelope differs from signed event")
     validated = validate_envelope(envelope)
@@ -3372,6 +3384,9 @@ def build_parser() -> argparse.ArgumentParser:
     receive_auth.add_argument("path")
     verify_auth = sub.add_parser("coordinator-verify")
     verify_auth.add_argument("message_id")
+    for command in (sign, receive_auth, verify_auth):
+        command.add_argument("--destination", default=COORDINATOR_DESTINATION,
+                             help="exact authenticated destination; requires a matching private grant")
 
     send = sub.add_parser("send")
     send.add_argument("--from", dest="from_peer", required=True)
@@ -3482,13 +3497,13 @@ def main() -> int:
                 accept_from=args.accept_from,
             )
         if args.command == "coordinator-sign":
-            emit(sign_coordinator(load_json(pathlib.Path(args.path)), args.key_id))
+            emit(sign_coordinator(load_json(pathlib.Path(args.path)), args.key_id, destination=args.destination))
             return 0
         if args.command == "coordinator-receive":
-            emit(receive_coordinator(load_json(pathlib.Path(args.path))))
+            emit(receive_coordinator(load_json(pathlib.Path(args.path)), destination=args.destination))
             return 0
         if args.command == "coordinator-verify":
-            emit({"box": "inbox", "record": verified_coordinator_record(args.message_id)})
+            emit({"box": "inbox", "record": verified_coordinator_record(args.message_id, destination=args.destination)})
             return 0
         if args.command == "send":
             return command_send(args)

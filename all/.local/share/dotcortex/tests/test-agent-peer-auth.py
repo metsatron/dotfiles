@@ -241,4 +241,98 @@ class AuthenticatedWakeTests(unittest.TestCase):
             self.assertEqual(poison['reason'],'authentication_refused')
         self.assertIsNotNone(self.peer.verified_coordinator_record(self.envelope['message_id']))
 
+class GemmaDestinationTests(AuthenticatedWakeTests):
+    """Run the original auth contract against an explicitly selected fixture."""
+    def setUp(self):
+        super().setUp()
+        from functools import partial
+        self.dest = 'kikin/pi/gemma-fixture'
+        endpoint = self.registry['endpoints'].pop(self.grant['destination'])
+        self.registry['endpoints'][self.dest] = endpoint
+        self.grant['destination'] = self.dest
+        self.envelope['to'] = self.peer.peer_object(self.dest)
+        self.peer.write_registry(self.registry)
+        self.write_trust()
+        for name in ('sign_coordinator', 'verify_coordinator', 'receive_coordinator',
+                     'verified_coordinator_record'):
+            setattr(self.peer, name, partial(getattr(self.peer, name), destination=self.dest))
+
+    def test_mail_transport_poison_then_valid_stores_once_without_model(self):
+        # Watcher seat expansion belongs to the adapter owner, not this change.
+        # Exercise the actual CLI used by NativePeerInbox instead, without mail.
+        import subprocess
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.peer.receive_coordinator(signed)
+        command = ['python3', str(ROOT/'all/.local/bin/agent-peer'),
+                   'coordinator-verify', self.envelope['message_id']]
+        result = subprocess.run(command + ['--destination', self.dest],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {'box', 'record'})
+        self.assertEqual(value['record']['coordinator_auth']['destination'], self.dest)
+        self.assertNotEqual(subprocess.run(command, capture_output=True,
+                            text=True, check=False).returncode, 0)
+
+    def test_configuration_is_not_a_grant_and_default_does_not_authorize_gemma(self):
+        raw = load('default_fixture_peer', ROOT/'all/.local/bin/agent-peer')
+        with self.assertRaises(raw.PeerError):
+            raw.sign_coordinator(self.envelope, 'fixture-key')
+        self.registry['coordinator_keys'] = {}; self.write_trust()
+        with self.assertRaises(self.peer.PeerError):
+            self.peer.sign_coordinator(self.envelope, 'fixture-key')
+
+    def test_pickup_rechecks_endpoint_registration_delivery_host_and_root(self):
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.peer.receive_coordinator(signed)
+        original = copy.deepcopy(self.registry)
+        for change in ('missing', 'pane', 'host', 'root'):
+            self.registry = copy.deepcopy(original)
+            if change == 'missing': self.registry['endpoints'].pop(self.dest)
+            elif change == 'pane': self.registry['endpoints'][self.dest]['delivery'] = 'pane'
+            elif change == 'host': self.registry['local_host_id'] = 'other-fixture'
+            else:
+                other = self.base/'other'; other.mkdir(exist_ok=True)
+                self.registry['endpoints'][self.dest]['repo_root'] = str(other)
+            self.peer.write_registry(self.registry)
+            with self.subTest(change=change), self.assertRaises(self.peer.PeerError):
+                self.peer.verified_coordinator_record(self.envelope['message_id'])
+
+    def test_bad_destination_selection_fails_closed(self):
+        raw = load('selection_fixture_peer', ROOT/'all/.local/bin/agent-peer')
+        for destination in ('', '*', 'fixture/pi', 'fixture/pi/session/extra',
+                            'fixture/pi/other', None):
+            with self.subTest(destination=destination), self.assertRaises(raw.PeerError):
+                raw.sign_coordinator(self.envelope, 'fixture-key', destination=destination)
+
+    def test_changed_handoff_and_current_grant_are_refused_at_pickup(self):
+        self.task_execution_grant()
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.peer.receive_coordinator(signed)
+        mid = self.envelope['message_id']
+        for field, value in [('source', 'fixture/hermes/other'),
+                             ('destination', 'kikin/pi/other'),
+                             ('checkout_id', 'fixture:other')]:
+            original = self.grant[field]; self.grant[field] = value; self.write_trust()
+            with self.subTest(field=field), self.assertRaises(self.peer.PeerError):
+                self.peer.verified_coordinator_record(mid)
+            self.grant[field] = original
+        self.write_trust()
+        record = self.peer.read_record('inbox', mid)
+        record['envelope']['payload']['task_handoff']['goal'] = 'Changed payload'
+        self.peer.atomic_json(self.peer.record_path('inbox', mid), record)
+        with self.assertRaises(self.peer.PeerError): self.peer.verified_coordinator_record(mid)
+
+    def test_stale_cli_cannot_claim_destination_support(self):
+        import subprocess
+        # Hermetic stale-host capability fixture: no fallback to ordinary show.
+        stale = self.base/'stale-peer.py'
+        stale.write_text('import argparse\np=argparse.ArgumentParser()\n'
+                         'p.add_argument("verb",choices=["show"])\np.parse_args()\n')
+        result = subprocess.run(['python3', str(stale), 'coordinator-verify',
+                                 self.envelope['message_id'], '--destination', self.dest],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, '')
+
 if __name__=='__main__': unittest.main()

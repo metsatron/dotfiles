@@ -70,6 +70,19 @@ protected trust, expiry, root and exact pinned thread at the actual turn/start
 boundary; it never creates/resumes a replacement thread or impersonates the human.
 Accepted/unknown turns and uncertain notices are not automatically replayed.
 
+Alternate native owners (including Gemma) must explicitly select the exact
+private endpoint with =--destination HOST/PROVIDER/SESSION= on each of
+=coordinator-sign=, =coordinator-receive= and =coordinator-verify=. The Python
+entry points take the same keyword-only =destination=. Omitting it retains the
+existing HelmAstra destination; there is no wildcard, inferred endpoint, registry
+trust or default Gemma grant. Selection only narrows the expected destination:
+protected trust must independently grant that exact source/destination/scope.
+Native pickup also rechecks current local endpoint registration, store-only
+delivery and declared checkout. The owner adapter must request the destination
+on every physical-dispatch re-verification under its existing command/turn lock.
+A stale installed CLI that lacks the verb or flag must fail closed, never fall
+back to =show= or cached capability evidence. This is not deployment or a grant.
+
 ** Safety invariants
 
 - Every received envelope is peer-origin input with =user_authority=false=.
@@ -2570,7 +2583,10 @@ def coordinator_private_bytes(path: pathlib.Path) -> bytes:
             os.close(descriptor)
 
 
-def coordinator_grant(key_id: str) -> tuple[dict, bytes]:
+def coordinator_grant(key_id: str, *, destination: str = COORDINATOR_DESTINATION) -> tuple[dict, bytes]:
+    if not isinstance(destination, str):
+        raise PeerError("coordinator destination must be an exact peer ID")
+    parse_peer_id(destination)
     validate_component(key_id, "coordinator key ID")
     path = pathlib.Path(os.environ.get("AGENT_PEER_COORDINATOR_TRUST_FILE",
         str(pathlib.Path.home() / ".config/agent-peer/coordinator-trust.json")))
@@ -2591,7 +2607,7 @@ def coordinator_grant(key_id: str) -> tuple[dict, bytes]:
         # refused permanently, NOT treated as indefinitely pending provisioning.
         raise PeerError("coordinator key is unknown or revoked")
     parse_peer_id(grant["source"])
-    if (grant["destination"] != COORDINATOR_DESTINATION
+    if (grant["destination"] != destination
             or grant["capabilities"] not in (["status", "nudge"], ["taskExecution"])):
         raise PeerError("coordinator grant exceeds status,nudge scope")
     if task and grant.get("execution_authority") != "existing_session_permissions":
@@ -2655,9 +2671,9 @@ def coordinator_scope(envelope: dict, grant: dict) -> None:
         verify_envelope_leases(envelope)
 
 
-def sign_coordinator(envelope: dict, key_id: str) -> dict:
+def sign_coordinator(envelope: dict, key_id: str, *, destination: str = COORDINATOR_DESTINATION) -> dict:
     """The provisioned key selects the real source; --from grants no identity."""
-    grant, secret = coordinator_grant(key_id)
+    grant, secret = coordinator_grant(key_id, destination=destination)
     coordinator_scope(envelope, grant)
     task = grant["capabilities"] == ["taskExecution"]
     value = {"schema": COORDINATOR_TASK_ATTESTATION if task else COORDINATOR_ATTESTATION, "key_id": key_id,
@@ -2671,14 +2687,15 @@ def sign_coordinator(envelope: dict, key_id: str) -> dict:
     return value
 
 
-def verify_coordinator(value: object, *, check_expiry: bool = True) -> dict:
+def verify_coordinator(value: object, *, check_expiry: bool = True,
+                       destination: str = COORDINATOR_DESTINATION) -> dict:
     task = isinstance(value, dict) and value.get("schema") == COORDINATOR_TASK_ATTESTATION
     if (not isinstance(value, dict) or set(value) != {
             "schema", "key_id", "nonce", "expires", "capabilities", "envelope", "mac"} | (
                 {"task_execution", "execution_authority"} if task else set())
             or value.get("schema") not in {COORDINATOR_ATTESTATION, COORDINATOR_TASK_ATTESTATION}):
         raise PeerError("invalid coordinator attestation")
-    grant, secret = coordinator_grant(value["key_id"])
+    grant, secret = coordinator_grant(value["key_id"], destination=destination)
     if (task != (grant["capabilities"] == ["taskExecution"])
             or (task and any(value[k] != grant[k] for k in ("task_execution", "execution_authority")))):
         raise PeerError("task execution grant binding mismatch")
@@ -2702,21 +2719,28 @@ def verify_coordinator(value: object, *, check_expiry: bool = True) -> dict:
     return grant
 
 
-def receive_coordinator(value: object) -> dict:
-    verify_coordinator(value)
-    return receive_envelope(value["envelope"], _attestation=value)
+def receive_coordinator(value: object, *, destination: str = COORDINATOR_DESTINATION) -> dict:
+    verify_coordinator(value, destination=destination)
+    return receive_envelope(value["envelope"], _attestation=value,
+                            _coordinator_destination=destination)
 
 
-def verified_coordinator_record(message_id: str) -> dict:
+def verified_coordinator_record(message_id: str, *, destination: str = COORDINATOR_DESTINATION) -> dict:
     record = read_record("inbox", message_id)
     if not record or record.get("state") != "stored":
         raise PeerError("coordinator record is not stored")
     attestation = record.get("coordinator_attestation")
     if not attestation:
         raise PeerError("coordinator record lacks endpoint authentication")
-    grant = verify_coordinator(attestation)
+    grant = verify_coordinator(attestation, destination=destination)
     if not registry_path().exists():
         raise CoordinatorUnavailable("coordinator endpoint registry unavailable")
+    registry = read_registry()
+    endpoint = registry["endpoints"].get(destination)
+    if (parse_peer_id(destination)[0] != registry["local_host_id"]
+            or not isinstance(endpoint, dict) or endpoint.get("delivery") != "store"):
+        raise PeerError("coordinator destination is not registered locally for store-only delivery")
+    match_endpoint_repo(endpoint, attestation["envelope"]["workspace"], destination)
     if attestation["envelope"] != record["envelope"]:
         raise PeerError("stored coordinator envelope differs from authenticated event")
     result = dict(record)
@@ -2727,8 +2751,9 @@ def verified_coordinator_record(message_id: str) -> dict:
     return result
 
 
-def receive_envelope(envelope: object, origin_host: str | None = None, *, _attestation: dict | None = None) -> dict[str, object]:
-    authenticated = verify_coordinator(_attestation) if _attestation else None
+def receive_envelope(envelope: object, origin_host: str | None = None, *, _attestation: dict | None = None,
+                     _coordinator_destination: str = COORDINATOR_DESTINATION) -> dict[str, object]:
+    authenticated = verify_coordinator(_attestation, destination=_coordinator_destination) if _attestation else None
     if _attestation and _attestation["envelope"] != envelope:
         raise PeerError("intake envelope differs from signed event")
     validated = validate_envelope(envelope)
@@ -4468,6 +4493,9 @@ def build_parser() -> argparse.ArgumentParser:
     receive_auth.add_argument("path")
     verify_auth = sub.add_parser("coordinator-verify")
     verify_auth.add_argument("message_id")
+    for command in (sign, receive_auth, verify_auth):
+        command.add_argument("--destination", default=COORDINATOR_DESTINATION,
+                             help="exact authenticated destination; requires a matching private grant")
 
     send = sub.add_parser("send")
     send.add_argument("--from", dest="from_peer", required=True)
@@ -4578,13 +4606,13 @@ def main() -> int:
                 accept_from=args.accept_from,
             )
         if args.command == "coordinator-sign":
-            emit(sign_coordinator(load_json(pathlib.Path(args.path)), args.key_id))
+            emit(sign_coordinator(load_json(pathlib.Path(args.path)), args.key_id, destination=args.destination))
             return 0
         if args.command == "coordinator-receive":
-            emit(receive_coordinator(load_json(pathlib.Path(args.path))))
+            emit(receive_coordinator(load_json(pathlib.Path(args.path)), destination=args.destination))
             return 0
         if args.command == "coordinator-verify":
-            emit({"box": "inbox", "record": verified_coordinator_record(args.message_id)})
+            emit({"box": "inbox", "record": verified_coordinator_record(args.message_id, destination=args.destination)})
             return 0
         if args.command == "send":
             return command_send(args)
@@ -4927,6 +4955,100 @@ class AuthenticatedWakeTests(unittest.TestCase):
             poison=watcher.MAILCORTEX.load_receipt('astra','<a-poison@fixture>')
             self.assertEqual(poison['reason'],'authentication_refused')
         self.assertIsNotNone(self.peer.verified_coordinator_record(self.envelope['message_id']))
+
+class GemmaDestinationTests(AuthenticatedWakeTests):
+    """Run the original auth contract against an explicitly selected fixture."""
+    def setUp(self):
+        super().setUp()
+        from functools import partial
+        self.dest = 'kikin/pi/gemma-fixture'
+        endpoint = self.registry['endpoints'].pop(self.grant['destination'])
+        self.registry['endpoints'][self.dest] = endpoint
+        self.grant['destination'] = self.dest
+        self.envelope['to'] = self.peer.peer_object(self.dest)
+        self.peer.write_registry(self.registry)
+        self.write_trust()
+        for name in ('sign_coordinator', 'verify_coordinator', 'receive_coordinator',
+                     'verified_coordinator_record'):
+            setattr(self.peer, name, partial(getattr(self.peer, name), destination=self.dest))
+
+    def test_mail_transport_poison_then_valid_stores_once_without_model(self):
+        # Watcher seat expansion belongs to the adapter owner, not this change.
+        # Exercise the actual CLI used by NativePeerInbox instead, without mail.
+        import subprocess
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.peer.receive_coordinator(signed)
+        command = ['python3', str(ROOT/'all/.local/bin/agent-peer'),
+                   'coordinator-verify', self.envelope['message_id']]
+        result = subprocess.run(command + ['--destination', self.dest],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        value = json.loads(result.stdout)
+        self.assertEqual(set(value), {'box', 'record'})
+        self.assertEqual(value['record']['coordinator_auth']['destination'], self.dest)
+        self.assertNotEqual(subprocess.run(command, capture_output=True,
+                            text=True, check=False).returncode, 0)
+
+    def test_configuration_is_not_a_grant_and_default_does_not_authorize_gemma(self):
+        raw = load('default_fixture_peer', ROOT/'all/.local/bin/agent-peer')
+        with self.assertRaises(raw.PeerError):
+            raw.sign_coordinator(self.envelope, 'fixture-key')
+        self.registry['coordinator_keys'] = {}; self.write_trust()
+        with self.assertRaises(self.peer.PeerError):
+            self.peer.sign_coordinator(self.envelope, 'fixture-key')
+
+    def test_pickup_rechecks_endpoint_registration_delivery_host_and_root(self):
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.peer.receive_coordinator(signed)
+        original = copy.deepcopy(self.registry)
+        for change in ('missing', 'pane', 'host', 'root'):
+            self.registry = copy.deepcopy(original)
+            if change == 'missing': self.registry['endpoints'].pop(self.dest)
+            elif change == 'pane': self.registry['endpoints'][self.dest]['delivery'] = 'pane'
+            elif change == 'host': self.registry['local_host_id'] = 'other-fixture'
+            else:
+                other = self.base/'other'; other.mkdir(exist_ok=True)
+                self.registry['endpoints'][self.dest]['repo_root'] = str(other)
+            self.peer.write_registry(self.registry)
+            with self.subTest(change=change), self.assertRaises(self.peer.PeerError):
+                self.peer.verified_coordinator_record(self.envelope['message_id'])
+
+    def test_bad_destination_selection_fails_closed(self):
+        raw = load('selection_fixture_peer', ROOT/'all/.local/bin/agent-peer')
+        for destination in ('', '*', 'fixture/pi', 'fixture/pi/session/extra',
+                            'fixture/pi/other', None):
+            with self.subTest(destination=destination), self.assertRaises(raw.PeerError):
+                raw.sign_coordinator(self.envelope, 'fixture-key', destination=destination)
+
+    def test_changed_handoff_and_current_grant_are_refused_at_pickup(self):
+        self.task_execution_grant()
+        signed = self.peer.sign_coordinator(self.envelope, 'fixture-key')
+        self.peer.receive_coordinator(signed)
+        mid = self.envelope['message_id']
+        for field, value in [('source', 'fixture/hermes/other'),
+                             ('destination', 'kikin/pi/other'),
+                             ('checkout_id', 'fixture:other')]:
+            original = self.grant[field]; self.grant[field] = value; self.write_trust()
+            with self.subTest(field=field), self.assertRaises(self.peer.PeerError):
+                self.peer.verified_coordinator_record(mid)
+            self.grant[field] = original
+        self.write_trust()
+        record = self.peer.read_record('inbox', mid)
+        record['envelope']['payload']['task_handoff']['goal'] = 'Changed payload'
+        self.peer.atomic_json(self.peer.record_path('inbox', mid), record)
+        with self.assertRaises(self.peer.PeerError): self.peer.verified_coordinator_record(mid)
+
+    def test_stale_cli_cannot_claim_destination_support(self):
+        import subprocess
+        # Hermetic stale-host capability fixture: no fallback to ordinary show.
+        stale = self.base/'stale-peer.py'
+        stale.write_text('import argparse\np=argparse.ArgumentParser()\n'
+                         'p.add_argument("verb",choices=["show"])\np.parse_args()\n')
+        result = subprocess.run(['python3', str(stale), 'coordinator-verify',
+                                 self.envelope['message_id'], '--destination', self.dest],
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, '')
 
 if __name__=='__main__': unittest.main()
 #+END_SRC
