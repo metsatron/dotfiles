@@ -181,8 +181,24 @@ class CustodyTests(unittest.TestCase):
         other.write_text('unproven synthetic bytes');other.chmod(0o600)
         for raw in (str(neighbor),str(self.state/'.env'),str(other),str(path.parent/'..'/'access.json')):
             self.assertFalse(self.decision(self.event({'file_path':raw},'Read'))[0],raw)
-        for command in ('cat '+str(neighbor),'cat '+str(path.parent/'..'/'access.json')):
-            self.assertFalse(self.decision(self.event({'command':command},'Bash'))[0],command)
+        alias=self.root/'channel-alias';alias.symlink_to(self.state,target_is_directory=True)
+        protected={**self.manifest,'entries':{k:{**v,'enabled':True} if k=='local_read' else v
+                   for k,v in self.manifest['entries'].items()}}
+        commands=('cat '+str(neighbor), 'cat "'+str(neighbor)+'"',
+                  'cat '+str(path.parent/'..'/'access.json'),
+                  'cat '+str(alias/'access.json'), 'cat access.json')
+        for command in commands:
+            event=self.event({'command':command},'Bash')
+            if command=='cat access.json':event['cwd']=str(self.state)
+            for check in (self.e.classify,self.e._decide_request):
+                self.assertEqual(check(event,protected),(False,'true_floor'),command)
+        # A same-prefix sibling is unrelated ordinary work, not channel state.
+        sibling=Path(str(self.state)+'-unrelated');sibling.mkdir()
+        ordinary=sibling/'notes.txt';ordinary.write_text('ordinary synthetic work')
+        for check in (self.e.classify,self.e._decide_request):
+            self.assertIsNone(self.e._telegram_attachment_policy(
+                self.event({'command':'cat '+str(ordinary)},'Bash'),protected))
+            self.assertTrue(check(self.event({'command':'cat '+str(ordinary)},'Bash'),protected)[0])
         for tool in ('Write','Edit'):
             self.assertFalse(self.decision(self.event({'file_path':str(path)},tool))[0])
         self.assertFalse(self.decision(self.event({'file_path':str(path),'authorized':True},'Read'))[0])

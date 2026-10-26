@@ -76,6 +76,7 @@ def _protected(value):
     if ("palmcortex" in parts and "clients" in parts) or any(parts[i:i + 3] == ("logs", "telegram", "personal") for i in range(max(0, len(parts) - 2))):
         return True
     if ('.custody' in parts or '.local/state/dotcortex/telegram-attachments' in lowered
+            or re.search(r'/proc/[0-9]+/fd/[0-9]+(?:/|$|[\s\"\'])', lowered)
             or re.search(r"secret[\W_]*vault", lowered) or "nexus/keys" in posixpath.normpath(lowered)):
         return True
     if ".claude.json" in lowered:
@@ -5627,12 +5628,12 @@ def _telegram_attachment_policy(event, manifest, bind=False):
     """
     tool, payload = event.get('tool_name'), event.get('tool_input')
     download = tool == 'mcp__plugin_telegram_telegram__download_attachment'
-    raw = payload.get('file_path') if isinstance(payload, dict) else None
+    raw = payload.get('command' if tool == 'Bash' else 'file_path') if isinstance(payload, dict) else None
     if not download and raw is None:
         return None
     default = str(Path.home() / '.claude/channels/telegram')
-    channel_target = isinstance(raw, str) and (raw == default or raw.startswith(default + '/')
-        or re.match(r'^/proc/[0-9]+/fd/[0-9]+(?:/|$)', raw) is not None)
+    channel_target = isinstance(raw, str) and (default in raw
+        or re.search(r'/proc/[0-9]+/fd/[0-9]+(?:/|$)', raw) is not None)
     named = isinstance(raw, str) and bool(re.fullmatch(r'attachment-[a-f0-9]{48}\.bin', os.path.basename(raw)))
     helper = None
     try:
@@ -5649,16 +5650,38 @@ def _telegram_attachment_policy(event, manifest, bind=False):
         if isinstance(raw, str):
             reg = helper.registry()
             try:
-                index = reg.read(helper.key(helper.owner()))
+                native_owner = helper.owner()
+                index = reg.read(helper.key(native_owner))
+                helper.require(index['owner'] == native_owner)
                 state = index['state']
-                channel_target = channel_target or raw == state or raw.startswith(state + '/')
+                helper.require(isinstance(state, str) and state.startswith('/')
+                               and state != '/' and os.path.normpath(state) == state)
+                # Bash carries a command, not a file_path. Match actual lexical
+                # and resolved operands, never startswith(command) or an
+                # arbitrary substring that also catches same-prefix siblings.
+                cwd = event.get('cwd') or '/'
+                operands = ([word for stage in (_shell_stages(raw) or []) for word in stage[1:]]
+                            if tool == 'Bash' else [raw])
+                for operand in operands:
+                    target = operand.split('=', 1)[1] if operand.startswith('-') and '=' in operand else operand
+                    if (tool == 'Bash' and not target.startswith(('/', '~')) and '/' not in target
+                            and target not in {'.', '..'} and not os.path.lexists(posixpath.join(cwd, target))):
+                        continue
+                    lexical = _lexical(target, cwd)
+                    if lexical is not None and (_inside(lexical, state)
+                            or _inside(os.path.realpath(lexical), os.path.realpath(state))):
+                        channel_target = True
             finally:
                 reg.close()
     except (OSError, ValueError, KeyError, ImportError):
         helper = None
     if not download and not channel_target and not named:
         return None
-    if _admiral_floor(event, manifest) or helper is None or tool not in {
+    # The sole proc-fd Read carve-out is re-proved against the exact produced
+    # inode/content below; all other metadata/credential floors remain intact.
+    floor_event = ({**event, 'tool_input': {**payload, 'file_path': 'attachment.bin'}}
+                   if tool == 'Read' and named else event)
+    if _admiral_floor(floor_event, manifest) or helper is None or tool not in {
             'mcp__plugin_telegram_telegram__download_attachment', 'Read'}:
         return False, 'true_floor'
     try:
