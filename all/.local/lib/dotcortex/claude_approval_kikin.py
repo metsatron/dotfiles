@@ -284,8 +284,9 @@ def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None)
         return True
     command = payload.get('command')
     metadata = {key: value for key, value in payload.items() if key != 'command'}
+    protected_metadata = {key: value for key, value in metadata.items() if key != 'description'}
     try:
-        raw = json.dumps(metadata, ensure_ascii=False, sort_keys=True, default=str).casefold()
+        raw = json.dumps(protected_metadata, ensure_ascii=False, sort_keys=True, default=str).casefold()
     except (TypeError, ValueError):
         return True
     normalized_raw = re.sub(r'\\x([0-9a-fA-F]{2})', lambda match: chr(int(match.group(1), 16)), raw)
@@ -468,7 +469,9 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
     command = tool_input.get("command") if isinstance(tool_input, dict) else None
     floor_event = event
     try:
-        raw = json.dumps(event.get("tool_input", {}), ensure_ascii=False, sort_keys=True).casefold()
+        path_metadata = {key: value for key, value in event.get("tool_input", {}).items()
+                         if key != "description"} if isinstance(event.get("tool_input"), dict) else {}
+        raw = json.dumps(path_metadata, ensure_ascii=False, sort_keys=True).casefold()
     except (TypeError, ValueError):
         return True
     if isinstance(command, str):
@@ -823,7 +826,7 @@ def _floor_verb(lowered, coordinator=None):
         return True
     if "nurse-joy" in lowered and "revive" in lowered:
         return True
-    if "tmux" in lowered and any(
+    if coordinator != "coordinator_auryn_sibling" and "tmux" in lowered and any(
         word.startswith("kill-") or word in {
             "send-keys", "respawn-pane", "respawn-window", "new-session",
             "attach-session", "switch-client",
@@ -1751,6 +1754,35 @@ def _plain_observation_words(words, cwd, manifest, *, piped=False):
                for arg in args):
             return False
         operands = [arg for arg in args if not arg.startswith('-')]
+        recursive = (verb == 'rg' and (len(operands) < 2 or any(
+            os.path.isdir(_lexical(path, cwd) or '') for path in operands[1:]))
+            or any(re.search(r'[rR]', flag) for flag in args if flag.startswith('-')))
+        if recursive:
+            paths = operands[1:]
+            roots = tuple(os.path.realpath(root) for root in _read_roots(manifest))
+            if (not paths or len(paths) > 8
+                    or verb == 'grep' and any('R' in flag for flag in args if flag.startswith('-'))
+                    or any(path in {'.', '..'} or '..' in Path(path).parts for path in paths)):
+                return False
+            for raw in paths:
+                if PATH_META.search(raw):
+                    matches = _glob_targets(raw, cwd, manifest)
+                    if matches is None or not matches or len(matches) > 8:
+                        return False
+                else:
+                    lexical = _lexical(raw, cwd)
+                    if lexical is None:
+                        return False
+                    current = '/'
+                    for component in Path(lexical).parts[1:]:
+                        current = posixpath.join(current, component)
+                        if os.path.islink(current):
+                            return False
+                    matches = [os.path.realpath(lexical)]
+                for resolved in matches:
+                    if (not os.path.isdir(resolved)
+                            or not any(resolved != root and _inside(resolved, root) for root in roots)):
+                        return False
     for arg in args:
         if arg.startswith('-'):
             continue
@@ -3401,7 +3433,17 @@ def _queue_authorize(item_id, sender, manifest):
     return accepted
 
 
-def _queue_claim(item_id, confirmation):
+def _queue_claim(item_id, confirmation, manifest=None):
+    if manifest is None:
+        try:
+            manifest = _runtime_manifest()
+        except (OSError, ValueError, TypeError):
+            return False, None
+    try:
+        approval_window = _desk_window_seconds(manifest)
+        seat = _queue_seat(manifest)
+    except (ValueError, TypeError, OSError):
+        return False, None
     result = None
     def update(item):
         nonlocal result
@@ -3413,12 +3455,28 @@ def _queue_claim(item_id, confirmation):
         if reason:
             item.update(status='obsolete', resolution=reason, resolved_at=_utc(), ignored_approval_at=_utc())
             return
-        request_sha = _queue_identity(item['request'], {'unattended':{}})[1]
-        if (not item.get('approved_by') or item.get('approved_request_sha') != request_sha
-                or not 0 <= time.time()-item.get('approved_at',0) <= 120):
+        request = item.get('request')
+        if (item.get('seat') != seat or not isinstance(request, dict)
+                or request.get('cwd') != item.get('cwd')
+                or request.get('session_id') != item.get('session')
+                or not isinstance(request.get('tool_input'), dict)):
             return False
+        request_sha = _request_sha(request.get('tool_name'), request.get('cwd'), request['tool_input'])
+        approved_at = item.get('approved_at')
+        now = time.time()
+        if (not item.get('approved_by') or item.get('approved_request_sha') != request_sha
+                or isinstance(approved_at, bool) or not isinstance(approved_at, (int, float))
+                or not math.isfinite(approved_at) or now < approved_at):
+            return False
+        if now - approved_at > approval_window:
+            item.update(status='obsolete', resolution='desk approval expired', resolved_at=_utc(),
+                        ignored_approval_at=_utc())
+            return
         if (not confirmation or item.get('confirmation') != confirmation
-                or not 0 <= time.time() - item.get('confirmed_at', 0) <= 60):
+                or item.get('confirmed_session') != item.get('session')
+                or isinstance(item.get('confirmed_at'), bool)
+                or not isinstance(item.get('confirmed_at'), (int, float))
+                or not 0 <= now - item['confirmed_at'] <= 60):
             return False
         item.update(status='replay_claimed', claimed_at=_utc())
         item.pop('confirmation', None)
@@ -3945,7 +4003,7 @@ def queue_main():
         if args.action == 'approve':
             return 0 if _queue_authorize(args.id,args.sender,_runtime_manifest()) else 1
         if args.action == 'claim':
-            ok, request = _queue_claim(args.id, args.confirmation)
+            ok, request = _queue_claim(args.id, args.confirmation, _runtime_manifest())
             if ok: print(json.dumps(request, ensure_ascii=True))
             return 0 if ok else 1
         if args.action == 'session-ended':
@@ -4813,6 +4871,124 @@ def _coordinator_candidate(command):
     return words[0] in {'codex', 'nohup', 'scp'} or words[:2] == ['mailcortex', 'send']
 
 
+def _coordinator_mail_filter(words):
+    """Only bounded head/tail counts or a literal cut character range on stdin.
+
+    No filenames, follow modes, programs (AWK/sed), or general filter proof.
+    """
+    if not words:
+        return False
+    count = r'[1-9][0-9]{0,5}'
+    if words[0] in {'head', 'tail'}:
+        args = words[1:]
+        return (not args
+                or (len(args) == 1 and re.fullmatch(r'-(?:n)?' + count, args[0]) is not None)
+                or (len(args) == 2 and args[0] == '-n' and re.fullmatch(count, args[1]) is not None))
+    if words[0] == 'cut' and len(words) == 2:
+        match = re.fullmatch(r'-c([1-9][0-9]{0,5})-([1-9][0-9]{0,5})', words[1])
+        return match is not None and int(match[1]) <= int(match[2])
+    return False
+
+
+def _coordinator_mail_operators(command):
+    """Locate unquoted shell syntax, including operators attached to words.
+
+    Unlike shlex.split, retain whether > and | were syntax or quoted data.
+    This recognizer never expands or executes shell text.
+    """
+    operators = []
+    quote = None
+    index = 0
+    while index < len(command):
+        char = command[index]
+        if quote == "'":
+            if char == "'":
+                quote = None
+        elif char == chr(92):
+            index += 1
+            if index == len(command):
+                return None
+        elif quote == '"':
+            if char == '"':
+                quote = None
+        elif char in {"'", '"'}:
+            quote = char
+        elif char in '<>|&;(){}' or (char == '#' and (index == 0 or command[index - 1].isspace())):
+            operators.append(index)
+        index += 1
+    return None if quote is not None else operators
+
+
+def _coordinator_mail_words(command):
+    """Parse one approved mail argv after proving its shell syntax inert."""
+    if (not isinstance(command, str) or _dynamic_shell(command)
+            or any(ord(char) < 32 or ord(char) == 127 for char in command)):
+        return None
+    operators = _coordinator_mail_operators(command)
+    if operators is None:
+        return None
+    pipes = [index for index in operators if command[index] == '|']
+    if len(pipes) > 1:
+        return None
+    base = command
+    if pipes:
+        split = pipes[0]
+        base, filter_command = command[:split].rstrip(), command[split + 1:].strip()
+        if _coordinator_mail_operators(filter_command) != []:
+            return None
+        try:
+            filter_words = shlex.split(filter_command, posix=True)
+        except ValueError:
+            return None
+        if not _coordinator_mail_filter(filter_words):
+            return None
+    base = base.rstrip()
+    operators = _coordinator_mail_operators(base)
+    terminal = re.search(r'\s2>&1$', base)
+    # Only this exact, unquoted terminal descriptor duplication is allowed.
+    if terminal and operators is not None and operators[-2:] == [terminal.start() + 2, terminal.start() + 3]:
+        base = base[:terminal.start()]
+    if _coordinator_mail_operators(base) != []:
+        return None
+    try:
+        return shlex.split(base, posix=True)
+    except ValueError:
+        return None
+
+
+def _coordinator_mail_fields(words, config):
+    """Accept the four required mail fields and the single inert print-ID flag."""
+    if not isinstance(words, list) or words[:2] != ['mailcortex', 'send']:
+        return None
+    fields = {}
+    print_id = False
+    index = 2
+    while index < len(words):
+        option = words[index]
+        if option == '--print-id':
+            if print_id:
+                return None
+            print_id = True
+            index += 1
+            continue
+        if option not in {'--from', '--to', '--subject', '--body-file'} or option in fields:
+            return None
+        if index + 1 >= len(words) or not words[index + 1]:
+            return None
+        value = words[index + 1]
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            return None
+        fields[option] = value
+        index += 2
+    if set(fields) != {'--from', '--to', '--subject', '--body-file'}:
+        return None
+    if (fields['--from'] != config['seat_account']
+            or not _mail_recipient_allowed(fields['--to'], config)
+            or not fields['--subject']):
+        return None
+    return fields
+
+
 
 def _peer_coordinator_match(command, words, config, manifest):
     """An SSH argv transport, never an arbitrary script or near-match carve-out."""
@@ -4824,7 +5000,7 @@ def _peer_coordinator_match(command, words, config, manifest):
         remote_text = words[2]
     else:
         remote_text = ' '.join(words[2:])  # OpenSSH joins argv; it does NOT shell-quote it
-        if SHELL_META.search(command) or _dynamic_shell(command): return None
+        if _dynamic_shell(command): return None
     try:
         remote = shlex.split(remote_text)
     except ValueError:
@@ -4842,16 +5018,16 @@ def _peer_coordinator_match(command, words, config, manifest):
             return 'coordinator_ops_tool'
         return None
     if remote[:2] == ['mailcortex','send'] and config['classes']['mail_send']:
-        if (SHELL_META.search(remote_text) or _dynamic_shell(remote_text) or len(remote) != 10
-                or remote[2::2] != ['--from','--to','--subject','--body-file']
-                or remote[3] != config['seat_account'] or not _mail_recipient_allowed(remote[5], config)
-                or not remote[7] or not _coordinator_remote_path(remote[9], config)):
+        mail_words = _coordinator_mail_words(remote_text)
+        fields = _coordinator_mail_fields(mail_words, config) if mail_words is not None else None
+        if fields is None or not _coordinator_remote_path(fields['--body-file'], config):
             return None
-        planned = (peer,remote[9]) in manifest.get('_compound_remote_created_files',())
+        body = fields['--body-file']
+        planned = (peer,body) in manifest.get('_compound_remote_created_files',())
         # SCP's proof guarantees this will be a regular nonsymlink destination;
         # only the internal compound walker may carry that future-file fact.
-        proven = (_coordinator_remote_proof(config,[remote[9]],host=peer,copied_output=remote[9]) if planned
-            else _coordinator_remote_proof(config,[remote[9]],regular_input=remote[9],host=peer))
+        proven = (_coordinator_remote_proof(config,[body],host=peer,copied_output=body) if planned
+            else _coordinator_remote_proof(config,[body],regular_input=body,host=peer))
         return 'coordinator_remote_mail_send' if proven else None
     if not config['classes']['codex_dispatch']:
         return None
@@ -4898,7 +5074,7 @@ def _coordinator_match(event, manifest):
             or not set(tool_input) <= TOOL_INPUT_KEYS or not isinstance(cwd, str) or not cwd.startswith('/')):
         return None
     command = tool_input.get('command')
-    if not isinstance(command, str) or not command.isascii() or any(ord(c) < 32 or ord(c) == 127 for c in command):
+    if not isinstance(command, str) or any(ord(c) < 32 or ord(c) == 127 for c in command):
         return None
     redirect = OPS_REDIRECT.fullmatch(command)
     if redirect and config['classes'].get('ops_tool') is True:
@@ -4923,10 +5099,19 @@ def _coordinator_match(event, manifest):
     remote_grant = _peer_coordinator_match(command, words, config, manifest)
     if remote_grant is not None:
         return remote_grant
-    if words[:2] == ['mailcortex', 'send'] and flags['mail_send'] and not SHELL_META.search(command):
-        if (len(words) == 10 and words[2::2] == ['--from', '--to', '--subject', '--body-file']
-                and words[3] == config['seat_account'] and _mail_recipient_allowed(words[5], config)
-                and words[7] and _coordinator_regular_input(words[9], config, manifest, allow_policy=True)):
+    # Exact commands from claude-auryn's documented weights-sibling tmux lane.
+    # The wrapper binds each session name to one model, forbids Telegram for
+    # siblings, uses its read-only preservation mode, and a plain new-session
+    # refuses an existing session rather than attaching or replacing it.
+    if flags['codex_dispatch'] and command in {
+            "tmux new-session -d -s auryn-46 'claude-auryn --weights 4.6'",
+            "tmux new-session -d -s auryn-45 'claude-auryn --weights 4.5'"}:
+        return 'coordinator_auryn_sibling'
+    if words[:2] == ['mailcortex', 'send'] and flags['mail_send']:
+        mail_words = _coordinator_mail_words(command)
+        fields = _coordinator_mail_fields(mail_words, config) if mail_words is not None else None
+        if (fields is not None and _coordinator_regular_input(
+                fields['--body-file'], config, manifest, allow_policy=True)):
             return 'coordinator_mail_send'
         return None
     dispatch = DISPATCH_RE.fullmatch(command)
@@ -5120,6 +5305,55 @@ def _inversion_scope(event, manifest):
     return True
 
 
+def _mail_read_batch_proven(event, manifest):
+    """One bounded own-mail read grammar, not a grant for /tmp or shell loops.
+
+    The optional cd cannot affect any operand: mailbox and message IDs are
+    literal, and cut consumes stdin only. No shell is expanded or executed.
+    """
+    payload = event.get('tool_input') if isinstance(event, dict) else None
+    cwd = event.get('cwd') if isinstance(event, dict) else None
+    config = _coordinator_config(manifest)
+    if (config is None or event.get('hook_event_name') != 'PermissionRequest'
+            or event.get('tool_name') != 'Bash' or not isinstance(payload, dict)
+            or not set(payload) <= TOOL_INPUT_KEYS or not isinstance(cwd, str)
+            or not cwd.startswith('/') or not manifest['entries']['local_read']['enabled']
+            or not any(_inside(os.path.realpath(cwd), root) for root in _policy_roots(manifest))):
+        return False
+    command = payload.get('command')
+    if not isinstance(command, str) or len(command) > 8192:
+        return False
+    match = re.fullmatch(
+        r'(?:cd /tmp; )?for m in (?P<ids>[A-Za-z0-9_. -]+); '
+        r'do echo "=========== \$m"; mailcortex read (?P<seat>[A-Za-z0-9_.@-]+) '
+        r'"\$m" 2>&1 \| cut -c1-1500; done', command)
+    if match is None or match['seat'] != config['seat_account']:
+        return False
+    items = match['ids'].split(' ')
+    if not 1 <= len(items) <= 32 or any(
+            not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,127}', item)
+            or _protected(item) for item in items):
+        return False
+    # Keep the full metadata/credential floor. The only omitted syntax is the
+    # exact fixed loop and cwd shim proved above; neither can hide an operand.
+    proof = {**event, 'tool_input': {**payload,
+             'command': 'mailcortex read ' + match['seat'] + ' ' + items[0]}}
+    return not _admiral_floor(proof, manifest)
+
+
+def _agentify_status_readonly(event):
+    """Grant only the declared Agentify status query and its inert selectors."""
+    if not isinstance(event, dict) or event.get('tool_name') != 'mcp__agentify__agentify_status':
+        return False
+    payload = event.get('tool_input')
+    allowed = {'model', 'tabId', 'key', 'vendorId'}
+    if not isinstance(payload, dict) or not set(payload) <= allowed:
+        return False
+    return all(isinstance(value, str) and 0 < len(value) <= 256
+               and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+               for value in payload.values())
+
+
 def _classify_single(event, manifest):
     """Return (allow, reason). The reason names the class that matched, or why none did.
 
@@ -5139,6 +5373,8 @@ def _classify_single(event, manifest):
     # scanned again on the FULL original request and still win.
     if floor and (coordinator is None or _true_floor(event, manifest, coordinator, readonly_proven=readonly_proven)):
         return False, "true_floor"
+    if _agentify_status_readonly(event):
+        return True, 'agentify_status_readonly'
     if coordinator is not None:
         return True, coordinator
     if readonly_proven:
@@ -5327,6 +5563,8 @@ def _substitutions_approval(event, manifest, judge):
 def classify(event, manifest):
     if not isinstance(event, dict) or event.get('hook_event_name') != 'PermissionRequest':
         return False, 'not_permission_request'
+    if _mail_read_batch_proven(event, manifest):
+        return True, 'coordinator_mail_read_batch'
     if _for_readonly(event, manifest):
         return True, 'local_read'
     if _for_loop_body_floor(event, manifest):
@@ -5361,6 +5599,9 @@ def _decide_request(event, manifest):
         return False, 'not_permission_request'
     payload = event.get('tool_input') if isinstance(event, dict) else None
     command = payload.get('command') if isinstance(payload, dict) else None
+    if _mail_read_batch_proven(event, manifest):
+        _log_decision.extras = {'decision_path': 'deterministic', 'judge_verdict': 'not_needed'}
+        return True, 'coordinator_mail_read_batch'
     safe_observation = (event.get('tool_name') == 'Bash' and isinstance(command, str)
                         and not _protected(command) and not _credential_content(payload)
                         and _plain_observation_compound(event, manifest))
@@ -5996,7 +6237,8 @@ def _floor_rule_for_record(event, manifest, reason):
     payload = event.get('tool_input') if isinstance(event, dict) else None
     if not isinstance(payload, dict):
         return 'invalid-input'
-    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).casefold()
+    path_metadata = {key: value for key, value in payload.items() if key != 'description'}
+    raw = json.dumps(path_metadata, ensure_ascii=False, sort_keys=True, default=str).casefold()
     command = payload.get('command')
     if not isinstance(command, str):
         return 'protected'
@@ -6087,7 +6329,7 @@ def _log_decision(event, allow, reason):
         pass
 
 
-def _notify_admiral(event, reason, away, queued, manifest):
+def _notify_admiral(event, reason, away, queued, manifest, queue_id=None):
     """Fixed seat-owned bridge reads a hash-only JSON message on stdin.
 
     The bridge owns Telegram credentials; the hook never opens any secret.
@@ -6105,11 +6347,14 @@ def _notify_admiral(event, reason, away, queued, manifest):
         'request_sha': hashlib.sha256(json.dumps(event, sort_keys=True, default=str).encode()).hexdigest()[:16],
         'input_sha': hashlib.sha256(json.dumps(payload.get('tool_input'), sort_keys=True, default=str).encode()).hexdigest()[:12],
         'reason': reason, 'away': away, 'queued': queued,
-        'message': 'Approval deferred; review the private queue on the Desk/Telegram.'}
+        'queue_id': queue_id if isinstance(queue_id, str) and re.fullmatch(r'[0-9a-f]{24}', queue_id) else None}
     try:
         result = subprocess.run(argv, input=json.dumps(message, ensure_ascii=True), text=True,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=0.75, check=False)
-        return 'sent' if result.returncode == 0 else 'failed'
+        if result.returncode == 0:
+            return 'sent'
+        return {2: 'unconfigured', 3: 'unavailable', 4: 'sent_receipt_unavailable'}.get(
+            result.returncode, 'failed')
     except (OSError, subprocess.TimeoutExpired):
         return 'unavailable'
 
@@ -6219,14 +6464,21 @@ def main():
         except (OSError, ValueError, TypeError, TimeoutError):
             item_id = None
         queued = item_id is not None
-        notification = _notify_admiral(event, reason, away, queued, manifest)
-        note = "queued for the Admiral's morning review" if away or hold_status else "awaiting the Admiral's approval on the Desk/Telegram"
+        notification = _notify_admiral(event, reason, away, queued, manifest, item_id)
         if item_id:
-            note += '; queue item ' + item_id + '; record intent with approval-queue intent ' + item_id + ' --text <one-line-intent>; after achieving it in policy: approval-queue resolve ' + item_id + ' --how <one-line-method>'
+            note = "queued for the Admiral's review; queue item " + item_id + '; review with approval-queue list --json; record intent with approval-queue intent ' + item_id + ' --text <one-line-intent>; after achieving it in policy: approval-queue resolve ' + item_id + ' --how <one-line-method>'
         else:
-            note += '; morning queue unavailable'
-        if notification != 'sent':
-            note += '; Telegram notification unavailable (' + notification + ')'
+            note = 'approval queue unavailable; no pending item was created'
+        if notification == 'sent':
+            note += '; Telegram notification delivered'
+        elif notification == 'sent_receipt_unavailable':
+            note += '; Telegram notification delivered, but its local outcome receipt was unavailable'
+        elif notification == 'unconfigured':
+            note += '; Telegram notification not delivered (unconfigured)'
+        else:
+            note += '; Telegram notification delivery unconfirmed (' + notification + '); do not retry blindly'
+        if not item_id:
+            note += '; this refusal is not pending approval and cannot be replayed'
         message = 'deferred: ' + note + '; ' + DEFERRED_ACTION
         sys.stdout.write(json.dumps(_deny_output(message), separators=(',', ':')) + '\n')
         _log_decision.extras.update(decision='deny', away_reason=away_reason, morning_queued=queued, queue_id=item_id, hold_status=hold_status, notification_status=notification)

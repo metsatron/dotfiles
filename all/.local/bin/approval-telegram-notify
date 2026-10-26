@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Private-environment Telegram adapter; never logs credentials."""
+"""Send a hash-only approval notice using the existing private channel identity."""
 import json
 import os
 from pathlib import Path
@@ -8,7 +8,77 @@ import stat
 import sys
 import time
 import hashlib
+import urllib.error
 import urllib.request
+
+
+STATE_SEATS = {'opus', 'fable', 'haiku', 'auryn'}
+PRIVATE_FILE_LIMIT = 16384
+
+
+def _private_text(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > PRIVATE_FILE_LIMIT):
+            return None
+        chunks = []
+        remaining = PRIVATE_FILE_LIMIT + 1
+        while remaining:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b''.join(chunks)
+        return raw.decode('utf-8') if len(raw) <= PRIVATE_FILE_LIMIT else None
+    finally:
+        os.close(fd)
+
+
+def _state_credentials():
+    raw_state = os.environ.get('TELEGRAM_STATE_DIR')
+    if not raw_state:
+        return None
+    home = Path.home()
+    state = Path(raw_state).expanduser()
+    channels = home / '.claude/channels'
+    if state.parent != channels or not re.fullmatch(r'telegram-(?:' + '|'.join(STATE_SEATS) + r')', state.name):
+        return None
+    for directory in (home, home / '.claude', channels, state):
+        try:
+            info = directory.lstat()
+        except OSError:
+            return None
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            return None
+    try:
+        env_text = _private_text(state / '.env')
+        access_text = _private_text(state / 'access.json')
+        access = json.loads(access_text) if access_text is not None else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    tokens = [line.partition('=')[2].strip() for line in (env_text or '').splitlines()
+              if line.startswith('TELEGRAM_BOT_TOKEN=')]
+    chats = access.get('allowFrom') if isinstance(access, dict) else None
+    if len(tokens) != 1 or not tokens[0] or not isinstance(chats, list) or len(chats) != 1:
+        return None
+    chat = chats[0]
+    if isinstance(chat, bool) or not isinstance(chat, (str, int)):
+        return None
+    return tokens[0], str(chat)
+
+
+def _credentials():
+    token = os.environ.get('APPROVAL_TELEGRAM_BOT_TOKEN')
+    chat = os.environ.get('APPROVAL_TELEGRAM_CHAT_ID')
+    if token or chat:
+        if not token or not chat:
+            raise ValueError('incomplete private Telegram environment')
+        return token, chat
+    return _state_credentials()
 
 
 def _receipt(digest, message_id, bot_key):
@@ -31,23 +101,41 @@ def main():
         if not isinstance(message,dict) or message.get('schema')!='dotcortex.approval.notification.v1':return 1
         digest=message.get('request_sha')
         if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{16}',digest):return 1
-        token=os.environ.get('APPROVAL_TELEGRAM_BOT_TOKEN','YOUR_BOT_TOKEN')
-        chat=os.environ.get('APPROVAL_TELEGRAM_CHAT_ID','YOUR_ADMIRAL_CHAT')
-        base=os.environ.get('APPROVAL_TELEGRAM_API_BASE','YOUR_TELEGRAM_API_BASE')
-        if any(not value or 'YOUR_' in value for value in (token,chat,base)):return 1
+        base=os.environ.get('APPROVAL_TELEGRAM_API_BASE') or os.environ.get('TELEGRAM_API_BASE')
+        if not base:return 2
+        base=base.rstrip('/')
+        credentials = _credentials()
+        if credentials is None:return 2
+        token,chat=credentials
         if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+',token) or not re.fullmatch(r'-?[0-9]+',chat):return 1
         if not re.fullmatch(r'https://[A-Za-z0-9.-]+',base):return 1
-        text='Deferred approval '+digest+'. '
-        text += "Queued for morning review. " if message.get('away') is True else "Awaiting the Admiral's approval on the Desk/Telegram. "
-        text += 'Review the private approval queue.' if message.get('queued') is True else 'Queue unavailable; inspect the seat.'
+        queued=message.get('queued') is True
+        queue_id=message.get('queue_id')
+        if queue_id is not None and (not isinstance(queue_id,str) or not re.fullmatch('[0-9a-f]{24}',queue_id)):return 1
+        text='Approval request '+digest+'. '
+        if queued:
+            text += 'Queued for review. '
+            text += ('Review item '+queue_id+' with approval-queue list --json. ' if queue_id
+                     else 'Review the pending item with approval-queue list --json. ')
+            text += 'This notification is informational and does not approve the request.'
+        else:
+            text += 'Approval queue unavailable; no pending item was created. Contact the seat owner; this alert is informational only and cannot approve the request.'
         text=re.sub(r'([_\*\[\]()~`>#+\-=|{}.!\\])',r'\\\1',text)
         body=json.dumps({'chat_id':chat,'text':text,'parse_mode':'MarkdownV2'}).encode()
         request=urllib.request.Request(base+'/bot'+token+'/sendMessage',data=body,
             headers={'Content-Type':'application/json'},method='POST')
-        with urllib.request.urlopen(request,timeout=0.5) as response:result=json.loads(response.read(4096))
+        try:
+            with urllib.request.urlopen(request,timeout=0.5) as response:result=json.loads(response.read(4096))
+        except urllib.error.HTTPError:
+            return 1
+        except (urllib.error.URLError, OSError, TimeoutError):
+            return 3
         message_id=result.get('result',{}).get('message_id') if isinstance(result,dict) else None
         if result.get('ok') is not True or type(message_id) is not int or message_id<=0:return 1
-        _receipt(digest,message_id,hashlib.sha256((token+':'+chat).encode()).hexdigest())
+        try:
+            _receipt(digest,message_id,hashlib.sha256((token+':'+chat).encode()).hexdigest())
+        except OSError:
+            return 4
         return 0
     except Exception:
         # HTTP exception text may contain the credential-bearing URL.
