@@ -1708,6 +1708,144 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.manifest['classes'][0]['enabled'] = False
         self.assertFalse(e._decide_request(self.event(command), self.loaded())[0])
 
+    def test_own_seat_mail_exit_status_diagnostic_is_deterministic(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['gate_inversion']['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        seat_cwd = self.repo / 'FORGE' / 'brain' / 'your_seat'
+        seat_cwd.mkdir(parents=True)
+        commands = [
+            self.inline_mail().removesuffix(' | tail -5'),
+            self.mail().replace('YOUR_SEAT@', 'your_seat@').replace('YOUR_HOST.helm', 'fixture-host.helm') + ' 2>&1',
+            'mailcortex inbox your_seat@fixture-host.helm 2>&1 | head -25',
+            'mailcortex read your_seat@fixture-host.helm fixture-message 2>&1 | cut -c1-1500',
+            'mailcortex send --help 2>&1 | head -25',
+            self.inline_mail().removesuffix(' 2>&1 | tail -5') + " --in-reply-to '<fixture-message@fixture-host.helm>' 2>&1",
+            "mailcortex receipt your_seat '<fixture-message@fixture-host.helm>' handling_completed",
+        ]
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('classify only')):
+            for command in commands:
+                request = self.event(command + '; echo "exit=$?"', cwd=str(seat_cwd))
+                with self.subTest(command=command):
+                    # Real route shape: command-only payload, seat cwd inside the
+                    # reviewed repo, enabled local-read/coordinator classes, no model.
+                    prior = e.classify(self.event(command, cwd=str(seat_cwd)), manifest)
+                    self.assertTrue(prior[0], prior)
+                    expected = (True, 'compound:' + '+'.join(sorted({prior[1], 'exit_status_diagnostic'})))
+                    self.assertEqual(e.classify(request, manifest), expected)
+                    self.assertEqual(e._decide_request(request, manifest), expected)
+                    # Even a preflight-proven send still needs its own final
+                    # decision; the readout cannot erase an operation veto.
+                    with mock.patch.object(e, '_classify_scoped', return_value=(False, 'fixture_veto')):
+                        self.assertEqual(e._compound_approval(request, manifest, judge=e._classify_scoped),
+                                         (False, 'compound_refused:segment_1:mailcortex:fixture_veto'))
+
+    def test_exit_status_original_dynamic_body_is_not_rewritten(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['gate_inversion']['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        base = self.inline_mail('fixture status').removesuffix(' | tail -5')
+        status = '; echo "exit=$?"'
+        # An approved HOME must not turn the originally dynamic body into data.
+        with mock.patch.dict(os.environ, {'HOME': str(self.scratch)}), \
+                mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('classify only')):
+            for body in ['"$HOME"', '"${HOME}"', '"$HOME/report"']:
+                command = base.replace("'fixture status'", body)
+                for decide in [e.classify, e._decide_request]:
+                    with self.subTest(body=body, decision=decide.__name__):
+                        self.assertFalse(decide(self.event(command), manifest)[0])
+                        self.assertFalse(decide(self.event(command + status), manifest)[0])
+            literal = base.replace("'fixture status'", "'$HOME'")
+            for decide in [e.classify, e._decide_request]:
+                with self.subTest(literal=True, decision=decide.__name__):
+                    self.assertTrue(decide(self.event(literal + status), manifest)[0])
+            judged = []
+            def judge_original(stage, stage_manifest):
+                judged.append(stage['tool_input']['command'])
+                return e.classify(stage, stage_manifest)
+            self.assertTrue(e._compound_approval(self.event(literal + status), manifest,
+                                                judge=judge_original)[0])
+            self.assertEqual(judged, [literal])
+
+    def test_exit_status_reads_bind_own_mailbox_only(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['gate_inversion']['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('classify only')):
+            for command in ['mailcortex inbox other_seat@fixture-host.helm 2>&1',
+                            'mailcortex read other_seat@fixture-host.helm fixture-message 2>&1']:
+                for decide in [e.classify, e._decide_request]:
+                    with self.subTest(command=command, decision=decide.__name__):
+                        # Preserve the pre-existing standalone read policy.
+                        self.assertTrue(decide(self.event(command), manifest)[0])
+                        self.assertFalse(decide(self.event(command + '; echo "exit=$?"'), manifest)[0])
+                        own = command.replace('other_seat@', 'your_seat@')
+                        self.assertTrue(decide(self.event(own + '; echo "exit=$?"'), manifest)[0])
+
+    def test_exit_status_diagnostic_keeps_expansions_effects_and_identity_refused(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['gate_inversion']['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        base = self.inline_mail('fixture status').removesuffix(' | tail -5')
+        status = '; echo "exit=$?"'
+        denied = ['echo "exit=$?"', 'true' + status, 'fixture-command' + status]
+        denied += [base + suffix for suffix in [
+            '; echo "$?"', '; echo exit=$?', '; echo "exit=${?}"',
+            '; echo "exit=$? $HOME"', '; echo "exit=$API_TOKEN"',
+            '; echo "exit=$?$(fixture-command)"', '; echo "exit=$?`fixture-command`"',
+            '; echo "exit=$?" extra', '; echo -n "exit=$?"',
+            '; printf "exit=%s" "$?"', '; /bin/echo "exit=$?"',
+            ' && echo "exit=$?"', ' || echo "exit=$?"', ' | echo "exit=$?"',
+            '\n echo "exit=$?"', '; echo "exit=$?" > fixture-output',
+            '; echo "exit=$?" >> fixture-output', '; echo "exit=$?" < fixture-input',
+            '; echo "exit=$?" 2>&1', '; echo "exit=$?" 2>/dev/null',
+            '; echo "exit=$?" | sh', '; echo "exit=$?"; fixture-command',
+            '; echo "exit=$?" && fixture-command', '; echo "exit=$?" || fixture-command',
+            '; echo "exit=$?" &', '; echo "exit=$?" # suffix',
+            '; echo "exit=$?"; echo "exit=$?"',
+            ';  echo "exit=$?"', ';\techo "exit=$?"', '; echo  "exit=$?"',
+            '; echo "exit=$?" ', '; echo "exit=$?', '; echo "exit=$?\' ',
+        ]]
+        denied += [command + status for command in [
+            base.replace('your_seat@', 'other_seat@'),
+            base.replace('--to reviewer@', '--to outsider@').replace('outsider@fixture-host.helm', 'outsider@example.invalid'),
+            *[base.replace("'fixture status'", body) for body in
+              ['"$API_TOKEN"', '"$HOME"', '"$?"', '"$(fixture-command)"', '"`fixture-command`"']],
+            base + ' --cc other_seat@fixture-host.helm',
+            base.replace(' 2>&1', ' 2>&1>fixture-output'),
+            base.replace(' 2>&1', ' >fixture-output'),
+            'sudo fixture-command', 'cat .env',
+        ]]
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('classify only')):
+            for command in denied:
+                with self.subTest(command=command):
+                    self.assertFalse(e.classify(self.event(command), manifest)[0])
+                    self.assertFalse(e._decide_request(self.event(command), manifest)[0])
+            for key, value in [('description', 'API_KEY=syntheticvalue'), ('file_path', '.env')]:
+                request = self.event(base + status)
+                request['tool_input'][key] = value
+                self.assertFalse(e.classify(request, manifest)[0])
+                self.assertFalse(e._decide_request(request, manifest)[0])
+            request = self.event(base + status, cwd=str(self.base))
+            self.assertFalse(e.classify(request, manifest)[0])
+            self.assertFalse(e._decide_request(request, manifest)[0])
+            # A Fable-shaped route cannot approve another seat's send.
+            manifest['coordinator_ops']['seat_account'] = 'other_seat@fixture-host.helm'
+            self.assertFalse(e.classify(self.event(base + status), manifest)[0])
+            self.assertFalse(e._decide_request(self.event(base + status), manifest)[0])
+            manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+            manifest['coordinator_ops']['classes']['mail_send'] = False
+            self.assertFalse(e.classify(self.event(base + status), manifest)[0])
+            self.assertFalse(e._decide_request(self.event(base + status), manifest)[0])
+
     def inline_mail(self, body='The fixture user asked for gate status. A read-only tabs call was deferred; notifier unconfigured. I have not retried. Please report when the gate and notifier are fixed.'):
         import shlex
         return ('mailcortex send --from your_seat@fixture-host.helm --to reviewer@fixture-host.helm '
