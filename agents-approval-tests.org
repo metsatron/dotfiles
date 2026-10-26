@@ -124,7 +124,7 @@ class KikinApprovalHookTests(unittest.TestCase):
             f"cat README.md || cd {root}",
             "cat README.md >/dev/null; cat README.md > copy",
             "cat README.md | head -n 5",
-            "grep -rn synthetic . | head",
+            "grep -rn synthetic FORGE/bin | head",
             "ls -la / && cat README.md",
         ])
         for command in allow[11:]:
@@ -1548,6 +1548,415 @@ class UnattendedCoordinatorTests(unittest.TestCase):
                     self.mail() + '; rm README.org']:
             self.ask(bad)
 
+    def mail_read_batch(self):
+        return ('cd /tmp; for m in fixture-message-one fixture-message-two fixture-message-three; '
+                'do echo "=========== $m"; mailcortex read YOUR_SEAT@YOUR_HOST.helm "$m" '
+                '2>&1 | cut -c1-1500; done')
+
+    def test_mail_read_batch_exact_incident_shape_is_deterministic(self):
+        self.manifest['classes'][0]['enabled'] = True
+        manifest = self.loaded()
+        command = self.mail_read_batch()
+        # Only classify strings: never invoke mail, change cwd, or expand a shell.
+        with mock.patch.object(e, '_decider_decide') as judge, \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no command execution')):
+            self.assertEqual(e._decide_request(self.event(command), manifest),
+                             (True, 'coordinator_mail_read_batch'))
+            self.assertEqual(e.classify(self.event(command), manifest),
+                             (True, 'coordinator_mail_read_batch'))
+            judge.assert_not_called()
+
+    def test_mail_read_batch_keeps_malicious_loops_secrets_writes_and_pipelines_refused(self):
+        self.manifest['classes'][0]['enabled'] = True
+        manifest = self.loaded()
+        command = self.mail_read_batch()
+        unsafe = [
+            command.replace('YOUR_SEAT@', 'OTHER_SEAT@'),
+            command.replace('fixture-message-one', '../.env'),
+            command.replace('fixture-message-one', '$(cat .env)'),
+            command.replace('fixture-message-one', '*'),
+            command.replace('fixture-message-one', '--help'),
+            command.replace('fixture-message-one', 'x' * 129),
+            command.replace('fixture-message-one fixture-message-two fixture-message-three',
+                            ' '.join('fixture-' + str(i) for i in range(33))),
+            command.replace('cut -c1-1500', 'sh'),
+            command.replace('cut -c1-1500', 'tee /tmp/fixture-output'),
+            command.replace('cut -c1-1500', 'cut -c1-1500 .env'),
+            command.replace('2>&1', '2>/tmp/fixture-error'),
+            command.replace('mailcortex read', 'mailcortex send'),
+            command.replace('echo "=========== $m"', 'cat ~/.ssh/id_rsa'),
+            command.replace('; done', '; rm README.org; done'),
+            command + '; git push --force origin master',
+            command + ' > /tmp/fixture-output',
+            command.replace('cd /tmp;', 'cd /;'),
+            command.replace('cd /tmp;', 'cd /tmp; cat .env;'),
+            'cd /tmp; cat .env',
+            'cd /tmp; for m in fixture-message-one; do rm "$m"; done',
+        ]
+        with mock.patch.object(e, '_decider_decide', return_value=(True, 'accepted', 0, 'allow')):
+            for bad in unsafe:
+                with self.subTest(refused=bad):
+                    self.assertFalse(e._decide_request(self.event(bad), manifest)[0])
+        request = self.event(command)
+        request['tool_input']['description'] = 'API_KEY=syntheticvalue'
+        with mock.patch.object(e, '_decider_decide') as judge:
+            self.assertEqual(e._decide_request(request, manifest), (False, 'true_floor'))
+            judge.assert_not_called()
+        self.manifest['classes'][0]['enabled'] = False
+        self.assertFalse(e._decide_request(self.event(command), self.loaded())[0])
+
+    def test_mail_inert_variants_are_deterministic_and_effects_stay_refused(self):
+        variants = [
+            self.mail() + ' --print-id',
+            f'mailcortex send --subject "review ready" --body-file {self.prompt} '
+            '--to YOUR_REVIEWER@YOUR_HOST.helm --from YOUR_SEAT@YOUR_HOST.helm',
+            self.mail().replace('review ready', 'review ready — café ✓'),
+            self.mail() + ' --print-id 2>&1 | tail -4',
+        ]
+        manifest = self.loaded()
+        for command in variants:
+            with self.subTest(command=command), mock.patch.object(e, '_decider_decide') as judge:
+                self.assertEqual(e._decide_request(self.event(command), manifest),
+                                 (True, 'coordinator_mail_send'))
+                judge.assert_not_called()
+        for command in [self.mail() + ' --cc YOUR_REVIEWER@YOUR_HOST.helm',
+                        self.mail() + ' | sh', self.mail() + ' > output.txt',
+                        self.mail() + '; rm README.org']:
+            with self.subTest(refused=command):
+                self.assertFalse(e.classify(self.event(command), manifest)[0], command)
+
+    def test_mail_send_filters_are_small_stdin_grammar_local_and_remote(self):
+        import shlex
+        self.manifest['coordinator_ops']['peer_host'] = 'YOUR_PEER_HOST'
+        manifest = self.loaded()
+        remote = self.mail().replace(str(self.prompt), '/tmp/YOUR_SEAT/report.md')
+        allowed = ['head', 'head -4', 'head -n 4', 'tail -4', 'tail -n 4', 'cut -c1-1500']
+        denied = ["awk 'BEGIN { system (\"fixture-command\") }'",
+                  "awk 'function f() { system (\"fixture-command\") } BEGIN { f() }'",
+                  "awk 'BEGIN { print \"fixture\" }'", "awk '{print}' fixture-input",
+                  "awk '{print | \"fixture-command\"}'",
+                  "sed -n '1p'", 'head fixture-input', 'tail -f',
+                  'cut -c1-1500 fixture-input', 'head -4 | sh']
+        # Classification only: hostile programs are never passed to a shell.
+        with mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')), \
+                mock.patch.object(e, '_coordinator_remote_proof', return_value=True), \
+                mock.patch.object(e, '_decider_decide', return_value=(True, 'accepted', 0, 'allow')):
+            for filters, expected in [(allowed, True), (denied, False)]:
+                for filt in filters:
+                    for lane, command in [('local', self.mail() + ' | ' + filt),
+                                          ('remote', 'ssh YOUR_PEER_HOST ' + shlex.quote(remote + ' | ' + filt))]:
+                        with self.subTest(lane=lane, filter=filt):
+                            self.assertEqual(e.classify(self.event(command), manifest)[0], expected)
+                            self.assertEqual(e._decide_request(self.event(command), manifest)[0], expected)
+
+    def test_mail_shell_operators_are_quote_aware_local_and_remote(self):
+        import shlex
+        self.manifest['coordinator_ops']['peer_host'] = 'YOUR_PEER_HOST'
+        manifest = self.loaded()
+        allowed = [self.mail(), self.mail() + ' 2>&1', self.mail() + ' 2>&1 | tail -4',
+                   self.mail().replace('review ready', 'review > literal >> < 3>&1'),
+                   self.mail().replace('review ready', 'review | tail -4'),
+                   self.mail().replace('review ready', 'review 2>&1')]
+        denied = [self.mail().replace('"review ready"', 'review' + op + str(self.scratch / 'clobber'))
+                  for op in ['>', '>>', '<', '2>', '3>>', '0<', '>&', '<>']]
+        denied += [self.mail() + suffix for suffix in [
+            '>/tmp/fixture-clobber', '>>/etc/fixture-clobber', '</tmp/fixture-input',
+            ' 3>&1', ' 2>&1>/tmp/fixture-clobber', ' | tail -4>/tmp/fixture-clobber',
+            '; fixture-command', ' && fixture-command', ' & fixture-command',
+            ' | tail -4; fixture-command', ' $(fixture-command)', ' `fixture-command`']]
+        with mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')), \
+                mock.patch.object(e, '_coordinator_remote_proof', return_value=True), \
+                mock.patch.object(e, '_decider_decide', return_value=(True, 'accepted', 0, 'allow')):
+            for commands, expected in [(allowed, True), (denied, False)]:
+                for local in commands:
+                    remote = local.replace(str(self.prompt), '/tmp/YOUR_SEAT/report.md')
+                    for lane, command in [('local', local), ('remote', 'ssh YOUR_PEER_HOST ' + shlex.quote(remote))]:
+                        with self.subTest(lane=lane, command=command):
+                            self.assertEqual(e.classify(self.event(command), manifest)[0], expected)
+                            self.assertEqual(e._decide_request(self.event(command), manifest)[0], expected)
+
+    def test_inert_description_is_not_a_secret_path_but_credentials_still_floor(self):
+        manifest = self.loaded()
+        request = self.event(self.mail())
+        request['tool_input']['description'] = 'Send approved task after token check'
+        with mock.patch.object(e, '_decider_decide') as judge:
+            self.assertEqual(e._decide_request(request, manifest), (True, 'coordinator_mail_send'))
+            judge.assert_not_called()
+        request['tool_input']['description'] = 'API_KEY=syntheticvalue'
+        with mock.patch.object(e, '_decider_decide') as judge:
+            self.assertEqual(e._decide_request(request, manifest), (False, 'true_floor'))
+            judge.assert_not_called()
+
+    def test_exact_agentify_status_is_read_only_and_unknown_tools_remain_unapproved(self):
+        manifest = self.loaded()
+        status = self.event('true', tool_name='mcp__agentify__agentify_status', tool_input={
+            'model': 'opencode-go/gpt-6-luna', 'tabId': 't1', 'key': 'fable', 'vendorId': 'chatgpt'})
+        with mock.patch.object(e, '_decider_decide') as judge:
+            self.assertEqual(e._decide_request(status, manifest), (True, 'agentify_status_readonly'))
+            judge.assert_not_called()
+        for event in [self.event('true', tool_name='mcp__agentify__agentify_navigate',
+                                 tool_input={'url': 'https://example.invalid'}),
+                      self.event('true', tool_name='mcp__agentify__agentify_status',
+                                 tool_input={'unexpected': 'value'})]:
+            with self.subTest(tool=event['tool_name'], payload=event['tool_input']), \
+                    mock.patch.object(e, '_decider_decide') as judge:
+                self.assertFalse(e._decide_request(event, manifest)[0])
+                judge.assert_not_called()
+        protected = self.event('true', tool_name='mcp__agentify__agentify_status',
+                               tool_input={'key': '/home/YOUR_USER/.ssh/id_rsa'})
+        with mock.patch.object(e, '_decider_decide') as judge:
+            self.assertEqual(e._decide_request(protected, manifest), (False, 'true_floor'))
+            judge.assert_not_called()
+
+    def test_auryn_incident_readonly_redirect_chain_is_bounded(self):
+        source = self.repo / 'FORGE' / 'brain' / 'auryn'
+        source.mkdir(parents=True)
+        (source / 'weights-note.md').write_text('weights-council fixture\n')
+        outside = self.base / 'outside'
+        outside.mkdir()
+        (outside / 'weights-note.md').write_text('weights-council outside fixture\n')
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['classes'][1]['enabled'] = True
+        manifest = self.loaded()
+        revision = self.git('rev-parse', 'HEAD')
+        command = (
+            f'cd {self.repo}; '
+            f'git log --oneline -3 {revision} 2>&1 | head -3; '
+            f'git show --stat {revision} 2>&1 | head -15; '
+            f"grep -rIl -i 'weights.council\\|weights-council' {source} 2>/dev/null | head")
+        with mock.patch.object(e, '_decider_decide') as judge:
+            allow, reason = e._decide_request(self.event(command), manifest)
+            self.assertTrue(allow, reason)
+            judge.assert_not_called()
+        escape = source / 'escape'
+        escape.symlink_to(outside, target_is_directory=True)
+        for unsafe in [command.replace(str(source), str(outside)),
+                       command.replace(str(source), str(escape)),
+                       command.replace(str(source), str(self.repo)),
+                       command.replace('2>/dev/null | head', '2>/dev/null | tee /tmp/unsafe-output'),
+                       command.replace('head -3', 'sh', 1)]:
+            with self.subTest(unsafe=unsafe), \
+                    mock.patch.object(e, '_decider_decide', return_value=(True, 'accepted', 0, 'allow')) as judge:
+                self.assertFalse(e._decide_request(self.event(unsafe), manifest)[0])
+                judge.assert_not_called()
+
+    def test_only_documented_auryn_weights_sibling_sessions_are_approved(self):
+        manifest = self.loaded()
+        commands = [
+            "tmux new-session -d -s auryn-46 'claude-auryn --weights 4.6'",
+            "tmux new-session -d -s auryn-45 'claude-auryn --weights 4.5'",
+        ]
+        for command in commands:
+            with self.subTest(command=command), mock.patch.object(e, '_decider_decide') as judge:
+                self.assertEqual(e._decide_request(self.event(command), manifest),
+                                 (True, 'coordinator_auryn_sibling'))
+                judge.assert_not_called()
+        self.manifest['coordinator_ops']['classes']['codex_dispatch'] = False
+        disabled = self.loaded()
+        for command in commands:
+            with self.subTest(disabled_sibling=command):
+                self.assertFalse(e._decide_request(self.event(command), disabled)[0])
+        denied = [
+            "tmux new-session -d -s auryn-46 'claude-auryn --weights 4.5'",
+            "tmux new-session -A -d -s auryn-46 'claude-auryn --weights 4.6'",
+            "tmux new-session -d -s auryn-46 'claude-auryn --weights 4.6 --telegram'",
+            "tmux new-session -d -s auryn-46 'claude -p --model claude-haiku'",
+            "tmux new-session -d -s auryn-46 'claude-auryn --weights 4.6; rm README.org'",
+            'tmux new-session -d -s auryn-46 "claude-auryn --weights $(cat model)"',
+            'tmux send-keys -t auryn-46 "claude-auryn --weights 4.6" Enter',
+        ]
+        for command in denied:
+            with self.subTest(denied=command), \
+                    mock.patch.object(e, '_decider_decide', return_value=(True, 'accepted', 0, 'allow')) as judge:
+                allow, reason = e._decide_request(self.event(command), manifest)
+                self.assertFalse(allow, (command, reason))
+                judge.assert_not_called()
+
+    def test_queue_notification_state_is_truthful_and_actionable(self):
+        self.flag.touch()
+        cases = [('sent', 'Telegram notification delivered'),
+                 ('sent_receipt_unavailable', 'Telegram notification delivered, but its local outcome receipt was unavailable'),
+                 ('failed', 'Telegram notification delivery unconfirmed (failed)'),
+                 ('unavailable', 'Telegram notification delivery unconfirmed (unavailable)'),
+                 ('unconfigured', 'Telegram notification not delivered (unconfigured)')]
+        for status, expected in cases:
+            with self.subTest(notification_status=status):
+                command = 'unknown-notify-' + status
+                self.manifest['notifications'] = {'argv': ['/tmp/synthetic-notifier']}
+                self.path.write_text(json.dumps(self.manifest))
+                env = {'SO_APPROVAL_KIKIN_MANIFEST': str(self.path),
+                       'SO_APPROVAL_KIKIN_LOG': str(self.ledger),
+                       'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}
+                out = io.StringIO()
+                with mock.patch.dict(os.environ, env), \
+                        mock.patch.object(e.sys, 'stdin', io.StringIO(json.dumps(self.event(command)))), \
+                        mock.patch.object(e, '_notify_admiral', return_value=status), \
+                        contextlib.redirect_stdout(out):
+                    self.assertEqual(e.main(), 0)
+                decision = json.loads(out.getvalue())['hookSpecificOutput']['decision']
+                record = json.loads(self.ledger.read_text().splitlines()[-1])
+                self.assertEqual(record['notification_status'], status)
+                self.assertIn('approval-queue list --json', decision['message'])
+                self.assertIn(expected, decision['message'])
+                self.assertIn(record['queue_id'], decision['message'])
+                self.assertNotIn('Desk/Telegram', decision['message'])
+
+    def test_notifier_outcomes_distinguish_delivery_configuration_and_transport(self):
+        manifest = self.loaded()
+        manifest['notifications'] = {'argv': ['/tmp/synthetic-notifier']}
+        event = self.event('synthetic refusal')
+        with mock.patch.object(e.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0)):
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'sent')
+        with mock.patch.object(e.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1)):
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'failed')
+        with mock.patch.object(e.subprocess, 'run', return_value=subprocess.CompletedProcess([], 2)):
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'unconfigured')
+        with mock.patch.object(e.subprocess, 'run', return_value=subprocess.CompletedProcess([], 3)):
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'unavailable')
+        with mock.patch.object(e.subprocess, 'run', return_value=subprocess.CompletedProcess([], 4)):
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'sent_receipt_unavailable')
+        with mock.patch.object(e.subprocess, 'run', side_effect=OSError('fixture transport')):
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'unavailable')
+        manifest.pop('notifications')
+        with mock.patch.object(e.subprocess, 'run') as send:
+            self.assertEqual(e._notify_admiral(event, 'no_match_decider', True, True, manifest), 'unconfigured')
+            send.assert_not_called()
+
+    def _telegram_adapter(self):
+        from importlib.machinery import SourceFileLoader
+        path = REPO / 'all/.local/bin/approval-telegram-notify'
+        loader = SourceFileLoader('approval_telegram_adapter_fixture', str(path))
+        spec = importlib.util.spec_from_loader('approval_telegram_adapter_fixture', loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def _telegram_state(self):
+        state = self.base / '.claude' / 'channels' / 'telegram-auryn'
+        state.mkdir(parents=True, mode=0o700)
+        os.chmod(state.parent.parent, 0o700)
+        os.chmod(state.parent, 0o700)
+        (state / '.env').write_text('TELEGRAM_BOT_TOKEN=123:synthetic_token\n')
+        (state / 'access.json').write_text(json.dumps({'allowFrom': ['424242']}))
+        os.chmod(state / '.env', 0o600)
+        os.chmod(state / 'access.json', 0o600)
+        return state
+
+    def test_existing_telegram_channel_state_resolves_offline_credentials(self):
+        adapter = self._telegram_adapter()
+        state = self._telegram_state()
+        payload = {'schema': 'dotcortex.approval.notification.v1', 'request_sha': 'abc123abc123abcd',
+                   'queue_id': 'a' * 24, 'queued': True, 'away': False}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true,"result":{"message_id":7}}'
+        env = {'HOME': str(self.base), 'TELEGRAM_STATE_DIR': str(state),
+               'TELEGRAM_API_BASE': 'https://fixture-telegram-api.invalid'}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(adapter.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                mock.patch.object(adapter.urllib.request, 'urlopen', return_value=response) as send:
+            self.assertEqual(adapter.main(), 0)
+        wire = json.loads(send.call_args.args[0].data.decode())
+        self.assertEqual(wire['chat_id'], '424242')
+        self.assertIn('approval\\-queue list \\-\\-json', wire['text'])
+        self.assertIn('a' * 24, wire['text'])
+        self.assertIn('does not approve', wire['text'])
+        receipts = self.base / '.local/state/dotcortex/approval-telegram-receipts.jsonl'
+        self.assertNotIn('synthetic_token', receipts.read_text())
+
+    def test_telegram_adapter_missing_state_and_transport_failure_are_offline(self):
+        adapter = self._telegram_adapter()
+        payload = {'schema': 'dotcortex.approval.notification.v1', 'request_sha': 'abc123abc123abcd',
+                   'queue_id': 'a' * 24, 'queued': True, 'away': True}
+        with mock.patch.dict(os.environ, {'HOME': str(self.base)}, clear=True), \
+                mock.patch.object(adapter.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                mock.patch.object(adapter.urllib.request, 'urlopen') as send:
+            self.assertEqual(adapter.main(), 2)
+            send.assert_not_called()
+        state = self._telegram_state()
+        env = {'HOME': str(self.base), 'TELEGRAM_STATE_DIR': str(state),
+               'TELEGRAM_API_BASE': 'https://fixture-telegram-api.invalid'}
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(adapter.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                mock.patch.object(adapter.urllib.request, 'urlopen', side_effect=OSError('fixture transport')) as send:
+            self.assertEqual(adapter.main(), 3)
+            send.assert_called_once()
+
+    def test_telegram_requires_private_api_base_without_default_or_credential_reads(self):
+        adapter = self._telegram_adapter()
+        payload = {'schema': 'dotcortex.approval.notification.v1', 'request_sha': 'abc123abc123abcd',
+                   'queue_id': 'a' * 24, 'queued': True, 'away': True}
+        response = mock.MagicMock()
+        response.__enter__.return_value.read.return_value = b'{"ok":true,"result":{"message_id":7}}'
+        for credentials in [
+                {'APPROVAL_TELEGRAM_BOT_TOKEN': '123:synthetic_token', 'APPROVAL_TELEGRAM_CHAT_ID': '424242'},
+                {'TELEGRAM_STATE_DIR': str(self.base / '.claude/channels/telegram-auryn')}]:
+            with self.subTest(route=sorted(credentials)), \
+                    mock.patch.dict(os.environ, {'HOME': str(self.base), **credentials}, clear=True), \
+                    mock.patch.object(adapter.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                    mock.patch.object(adapter, '_credentials', return_value=('123:synthetic_token', '424242')) as read, \
+                    mock.patch.object(adapter, '_receipt'), \
+                    mock.patch.object(adapter.urllib.request, 'urlopen', return_value=response) as send:
+                self.assertEqual(adapter.main(), 2)
+                read.assert_not_called()
+                send.assert_not_called()
+
+    def test_wrapper_delivery_status_is_unconfirmed_on_transport_or_timeout(self):
+        from importlib.machinery import SourceFileLoader
+        loader = SourceFileLoader('approval_wrapper_fixture', str(REPO / 'all/.local/bin/claude-hook-approval-inverted'))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        wrapper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wrapper)
+        manifest = self.loaded()
+        manifest['notifications'] = {'argv': ['/tmp/synthetic-notifier']}
+        cases = [(0, 'Telegram notification delivered'),
+                 (2, 'Telegram notification not delivered (unconfigured)'),
+                 (3, 'Telegram notification delivery unconfirmed (unavailable)'),
+                 (4, 'Telegram notification delivered, but its local outcome receipt was unavailable'),
+                 (1, 'Telegram notification delivery unconfirmed (failed)'),
+                 (subprocess.TimeoutExpired('fixture', 0.75), 'Telegram notification delivery unconfirmed (unavailable)'),
+                 (OSError('fixture transport'), 'Telegram notification delivery unconfirmed (failed)')]
+        for result, expected in cases:
+            with self.subTest(result=repr(result)), \
+                    mock.patch.object(wrapper._runtime, '_runtime_manifest', return_value=manifest), \
+                    mock.patch.object(wrapper, '_away_status', return_value=(True, 'away_flag')), \
+                    mock.patch.object(wrapper._runtime, '_queue_upsert', return_value='a' * 24), \
+                    mock.patch.object(wrapper.subprocess, 'run') as send:
+                if isinstance(result, Exception):
+                    send.side_effect = result
+                else:
+                    send.return_value = subprocess.CompletedProcess([], result)
+                message = wrapper.defer(json.dumps(self.event('fixture-refusal')))['hookSpecificOutput']['decision']['message']
+                self.assertIn(expected, message)
+                send.assert_called_once()  # Never retry an uncertain send.
+                if 'unconfirmed' in expected:
+                    self.assertNotIn('not delivered', message)
+
+    def test_telegram_accepted_send_lost_response_and_receipt_failure_do_not_retry(self):
+        adapter = self._telegram_adapter()
+        payload = {'schema': 'dotcortex.approval.notification.v1', 'request_sha': 'abc123abc123abcd',
+                   'queue_id': 'a' * 24, 'queued': True, 'away': True}
+        env = {'HOME': str(self.base), 'APPROVAL_TELEGRAM_BOT_TOKEN': '123:synthetic_token',
+               'APPROVAL_TELEGRAM_CHAT_ID': '424242', 'TELEGRAM_API_BASE': 'https://fixture-telegram-api.invalid'}
+        response = mock.MagicMock()
+        # The fixture server accepted the request, but the response is lost.
+        response.__enter__.return_value.read.side_effect = TimeoutError('accepted then response lost')
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(adapter.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                mock.patch.object(adapter.urllib.request, 'urlopen', return_value=response) as send, \
+                mock.patch.object(adapter, '_receipt') as receipt:
+            self.assertEqual(adapter.main(), 3)
+            send.assert_called_once()
+            receipt.assert_not_called()
+        response.__enter__.return_value.read.side_effect = None
+        response.__enter__.return_value.read.return_value = b'{"ok":true,"result":{"message_id":7}}'
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch.object(adapter.sys, 'stdin', io.StringIO(json.dumps(payload))), \
+                mock.patch.object(adapter.urllib.request, 'urlopen', return_value=response) as send, \
+                mock.patch.object(adapter, '_receipt', side_effect=OSError('fixture receipt failure')) as receipt:
+            self.assertEqual(adapter.main(), 4)
+            send.assert_called_once()
+            receipt.assert_called_once()
+
     def test_compound_heredoc_coordinator_chain_allows_each_segment(self):
         self.manifest['gate_inversion'] = {'enabled': True, 'present_refusal': 'deny'}
         command = (
@@ -1832,7 +2241,8 @@ class UnattendedCoordinatorTests(unittest.TestCase):
 
     def test_concurrent_queue_appends_keep_complete_json_records(self):
         from concurrent.futures import ThreadPoolExecutor
-        with mock.patch.dict(os.environ, {'SO_APPROVAL_MORNING_QUEUE': str(self.queue)}):
+        with mock.patch.dict(os.environ, {'SO_APPROVAL_MORNING_QUEUE': str(self.queue),
+                                         'SO_APPROVAL_QUEUE_SEAT': 'YOUR_SEAT@YOUR_HOST.helm'}):
             with ThreadPoolExecutor(max_workers=4) as pool:
                 results = list(pool.map(lambda i: e._queue_morning(self.event(f'fixture-{i}'), 'true_floor', 'away_flag'), range(20)))
         self.assertTrue(all(results))
@@ -1864,19 +2274,20 @@ class UnattendedCoordinatorTests(unittest.TestCase):
             self.assertEqual(json.loads(out.getvalue())['hookSpecificOutput']['decision']['behavior'], expected)
 
     def test_admiral_readonly_replay_command_reaches_normal_path(self):
-        scratch = Path('/tmp/claude-1000')
-        scratch.mkdir(parents=True, exist_ok=True)
+        scratch = self.base / 'claude-1000'
+        scratch.mkdir()
+        self.manifest['scratch_roots'].append(str(scratch))
         files = [scratch / 'YOUR_TMP_A', scratch / 'YOUR_TMP_B', scratch / 'YOUR_TMP_C', scratch / 'YOUR_LOG_A', scratch / 'YOUR_LOG_B']
         for path in files:
             path.write_text('new synthetic\nold synthetic\n', encoding='utf-8')
-        command = ("ls -la /tmp/claude-1000/YOUR_TMP_A /tmp/claude-1000/YOUR_TMP_B /tmp/claude-1000/YOUR_TMP_C 2>&1; "
-                   "pgrep -f 'codex exec' | wc -l; tail -3 /tmp/claude-1000/YOUR_LOG_A; "
-                   "tail -3 /tmp/claude-1000/YOUR_LOG_B; mailcortex inbox YOUR_SEAT@kikin.helm 2>&1 | grep '^new' | tail -3")
+        command = (f"ls -la {files[0]} {files[1]} {files[2]} 2>&1; "
+                   f"pgrep -f 'codex exec' | wc -l; tail -3 {files[3]}; "
+                   f"tail -3 {files[4]}; mailcortex inbox YOUR_SEAT@kikin.helm 2>&1 | grep '^new' | tail -3")
         self.manifest['classes'][0]['enabled'] = True
         self.assertEqual(self.run_hook(command)['behavior'], 'allow')
 
     def test_reviewed_state_and_palmcortex_reads_are_not_name_floored(self):
-        state = self.base / '.local/state/dotcortex'
+        state = Path.home() / '.local/state/dotcortex'
         state.mkdir(parents=True, exist_ok=True)
         log = state / 'YOUR_READONLY_LOG'
         log.write_text('synthetic\n')
@@ -1907,7 +2318,8 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(self.run_hook(command)['behavior'], 'deny')
-        for command in ['cat README.md | sed -n 1p > copy', 'cat README.md > /tmp/claude-1000/YOUR_WRITE']:
+        for command in ['cat README.md | sed -n 1p > copy',
+                        f'cat README.md > {self.scratch / "YOUR_WRITE"}']:
             with self.subTest(allowed_write=command):
                 self.assertEqual(self.run_hook(command)['behavior'], 'allow')
 

@@ -118,7 +118,7 @@ class KikinApprovalHookTests(unittest.TestCase):
             f"cat README.md || cd {root}",
             "cat README.md >/dev/null; cat README.md > copy",
             "cat README.md | head -n 5",
-            "grep -rn synthetic . | head",
+            "grep -rn synthetic FORGE/bin | head",
             "ls -la / && cat README.md",
         ])
         for command in allow[11:]:

@@ -178,7 +178,9 @@ class GateInversionTests(unittest.TestCase):
 
     def test_daytime_denies_queue_and_await_desk_telegram(self):
         decision = self.run_hook(self.event('rm README.org'))
-        self.assertIn("awaiting the Admiral's approval on the Desk/Telegram", decision['message'])
+        self.assertIn('approval-queue list --json', decision['message'])
+        self.assertIn('Telegram notification not delivered (unconfigured)', decision['message'])
+        self.assertNotIn('Desk/Telegram', decision['message'])
         self.assertEqual(json.loads(self.queue.read_text())['request'], self.event('rm README.org'))
         self.assertEqual(self.queue.stat().st_mode & 0o777, 0o600)
 
@@ -199,7 +201,7 @@ class GateInversionTests(unittest.TestCase):
         self.queue.symlink_to(self.root / 'README.org')
         decision = self.run_hook(self.event('rm README.org'))
         self.assertIn('queue unavailable', decision['message'])
-        self.assertIn('notification unavailable', decision['message'])
+        self.assertIn('Telegram notification not delivered (unconfigured)', decision['message'])
 
     def test_invalid_request_or_manifest_always_returns_deny(self):
         self.assertEqual(self.run_hook([])['behavior'], 'deny')
@@ -303,7 +305,7 @@ class GateInversionTests(unittest.TestCase):
             self.assertIn(payload['request_sha'], data)
             self.assertNotIn('MUST_NOT_RELAY_THIS', data)
             self.assertEqual(send.call_args.kwargs['timeout'], 0.5)
-        with mock.patch.dict(os.environ, {'APPROVAL_TELEGRAM_BOT_TOKEN': 'YOUR_BOT_TOKEN'}), \
+        with mock.patch.dict(os.environ, {**env, 'APPROVAL_TELEGRAM_BOT_TOKEN': 'YOUR_BOT_TOKEN'}), \
                 mock.patch.object(notifier.sys, 'stdin', io.StringIO(json.dumps(payload))), \
                 mock.patch.object(notifier.urllib.request, 'urlopen') as send:
             self.assertEqual(notifier.main(), 1)
@@ -548,6 +550,8 @@ class GateInversionTests(unittest.TestCase):
                     self.assertEqual(decision['behavior'], 'deny')
                     self.assertIs(decision['interrupt'], False)
                     self.assertIn('morning review', decision['message'])
+                    self.assertIn('approval-queue list --json', decision['message'])
+                    self.assertIn('Telegram notification not delivered (unconfigured)', decision['message'])
                     self.assertTrue(self.queue.exists())
 
     def test_wrapper_and_engine_share_inversion_switch(self):

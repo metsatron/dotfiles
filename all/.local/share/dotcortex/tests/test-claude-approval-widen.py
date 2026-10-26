@@ -127,7 +127,10 @@ class DeciderWideningTests(unittest.TestCase):
                 self.assertEqual(self.run_hook(command), 'deny')
         escaped = self.root / 'CORE' / 'escape'
         escaped.symlink_to(self.outside, target_is_directory=True)
-        self.assertEqual(self.run_hook('grep -rIn synthetic CORE/*/'), 'allow')
+        # A command-line glob expands the symlink into a traversal operand;
+        # unlike a symlink encountered beneath grep -r, grep follows that root.
+        # Keep the valid bounded glob above, but refuse this outside-root escape.
+        self.assertEqual(self.run_hook('grep -rIn synthetic CORE/*/'), 'deny')
 
     def test_git_readers_name_protected_branch_but_writes_still_floor(self):
         self.manifest['classes'][1]['enabled'] = True

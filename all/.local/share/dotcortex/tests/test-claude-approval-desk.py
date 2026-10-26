@@ -106,6 +106,17 @@ class DeskApprovalGateTests(unittest.TestCase):
         self.assertEqual(request['tool_input']['command'], event['tool_input']['command'])
         return item['id']
 
+    def prepare_claim(self, event, *, now, approval_age=0, confirmation_age=0):
+        self.path.write_text(json.dumps(self.manifest))
+        with mock.patch.dict(os.environ, self.env()):
+            item_id = e._queue_upsert(event, 'no_match_decider', 'away_flag', self.manifest)
+            with mock.patch.object(e.time, 'time', return_value=now - approval_age):
+                self.assertTrue(e._queue_authorize(item_id, '424242', self.manifest))
+            with mock.patch.object(e.time, 'time', return_value=now - confirmation_age):
+                token = e._queue_confirm(item_id, True, 'SYNTHETIC_SESSION')
+        self.assertTrue(token)
+        return item_id, token
+
     def test_desk_approved_rerun_is_allowed_exactly_once(self):
         event = self.event()
         self.assertEqual(self.run_hook(event)['behavior'], 'deny')
@@ -174,6 +185,69 @@ class DeskApprovalGateTests(unittest.TestCase):
         expired = next(x for x in self.queue_items() if x['id'] == item_id)
         self.assertEqual(expired['status'], 'obsolete')
         self.assertEqual(expired['resolution'], 'desk approval expired')
+
+    def test_claim_uses_ruled_desk_window_and_fresh_confirmation(self):
+        event = self.event()
+        now = 2_000_000_000.0
+        cases = [(119, True), (121, True), (3600, True), (24 * 3600, True), (24 * 3600 + 1, False)]
+        for age, expected in cases:
+            with self.subTest(approval_age_seconds=age):
+                self.queue.write_text('')
+                item_id, token = self.prepare_claim(event, now=now, approval_age=age)
+                with mock.patch.dict(os.environ, self.env()), mock.patch.object(e.time, 'time', return_value=now):
+                    ok, request = e._queue_claim(item_id, token)
+                self.assertEqual(ok, expected)
+                if expected:
+                    self.assertEqual(request, event)
+                else:
+                    expired = next(x for x in self.queue_items() if x['id'] == item_id)
+                    self.assertEqual(expired['status'], 'obsolete')
+                    self.assertEqual(expired['resolution'], 'desk approval expired')
+
+    def test_claim_rejects_stale_confirmation_and_changed_identity(self):
+        event = self.event()
+        now = 2_000_000_000.0
+        item_id, token = self.prepare_claim(event, now=now, confirmation_age=61)
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(e.time, 'time', return_value=now):
+            self.assertFalse(e._queue_claim(item_id, token)[0])
+
+        self.queue.write_text('')
+        item_id, token = self.prepare_claim(event, now=now)
+        item = next(x for x in self.queue_items() if x['id'] == item_id)
+        item['confirmed_session'] = 'OTHER_SYNTHETIC_SESSION'
+        self.queue_append(item)
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(e.time, 'time', return_value=now):
+            self.assertFalse(e._queue_claim(item_id, token)[0])
+
+        self.queue.write_text('')
+        item_id, token = self.prepare_claim(event, now=now)
+        item = next(x for x in self.queue_items() if x['id'] == item_id)
+        item['request']['cwd'] = str(self.root)
+        self.queue_append(item)
+        with mock.patch.dict(os.environ, self.env()), mock.patch.object(e.time, 'time', return_value=now):
+            self.assertFalse(e._queue_claim(item_id, token)[0])
+
+        for key, value in [('approved_request_sha', '0' * 64), ('seat', 'OTHER_SEAT@YOUR_HOST.helm'),
+                           ('session', 'OTHER_SYNTHETIC_SESSION')]:
+            with self.subTest(changed_identity=key):
+                self.queue.write_text('')
+                item_id, token = self.prepare_claim(event, now=now)
+                item = next(x for x in self.queue_items() if x['id'] == item_id)
+                item[key] = value
+                self.queue_append(item)
+                with mock.patch.dict(os.environ, self.env()), mock.patch.object(e.time, 'time', return_value=now):
+                    self.assertFalse(e._queue_claim(item_id, token)[0])
+
+    def test_racing_claims_consume_the_confirmation_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        now = time.time()
+        item_id, token = self.prepare_claim(self.event(), now=now)
+        with mock.patch.dict(os.environ, self.env()):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: e._queue_claim(item_id, token, self.manifest), range(2)))
+        self.assertEqual(sum(bool(allowed) for allowed, _request in results), 1)
+        self.assertEqual(sum(not allowed for allowed, _request in results), 1)
+        self.assertEqual(next(x for x in self.queue_items() if x['id'] == item_id)['status'], 'replay_claimed')
 
     def test_configured_window_is_honoured(self):
         self.manifest['unattended']['desk_approval_window_hours'] = 2
