@@ -4991,7 +4991,7 @@ def _coordinator_mail_fields(words, config):
             print_id = True
             index += 1
             continue
-        if option not in {'--from', '--to', '--subject', '--body-file', '--in-reply-to'} or option in fields:
+        if option not in {'--from', '--to', '--subject', '--body', '--body-file', '--in-reply-to'} or option in fields:
             return None
         if index + 1 >= len(words) or not words[index + 1] or words[index + 1].startswith('-'):
             return None
@@ -5000,7 +5000,13 @@ def _coordinator_mail_fields(words, config):
             return None
         fields[option] = value
         index += 2
-    if set(fields) - {'--in-reply-to'} != {'--from', '--to', '--subject', '--body-file'}:
+    # Native send requires exactly one body representation. Inline text is
+    # bounded data, never a filename, option stream, or additional authority.
+    body_keys = set(fields) & {'--body', '--body-file'}
+    if (len(body_keys) != 1 or set(fields) - {'--in-reply-to'} - body_keys
+            != {'--from', '--to', '--subject'}):
+        return None
+    if '--body' in fields and len(fields['--body']) > 16384:
         return None
     if (fields['--from'] != config['seat_account']
             or not _mail_recipient_allowed(fields['--to'], config)
@@ -5042,7 +5048,8 @@ def _peer_coordinator_match(command, words, config, manifest):
     if remote[:2] == ['mailcortex','send'] and config['classes']['mail_send']:
         mail_words = _coordinator_mail_words(remote_text)
         fields = _coordinator_mail_fields(mail_words, config) if mail_words is not None else None
-        if fields is None or not _coordinator_remote_path(fields['--body-file'], config):
+        if (fields is None or '--body-file' not in fields
+                or not _coordinator_remote_path(fields['--body-file'], config)):
             return None
         body = fields['--body-file']
         planned = (peer,body) in manifest.get('_compound_remote_created_files',())
@@ -5154,8 +5161,8 @@ def _coordinator_match(event, manifest):
     if words[:2] == ['mailcortex', 'send'] and flags['mail_send']:
         mail_words = _coordinator_mail_words(command)
         fields = _coordinator_mail_fields(mail_words, config) if mail_words is not None else None
-        if (fields is not None and _coordinator_regular_input(
-                fields['--body-file'], config, manifest, allow_policy=True)):
+        if (fields is not None and ('--body' in fields or _coordinator_regular_input(
+                fields['--body-file'], config, manifest, allow_policy=True))):
             return 'coordinator_mail_send'
         return None
     dispatch = DISPATCH_RE.fullmatch(command)
@@ -5419,6 +5426,11 @@ def _classify_single(event, manifest):
         return False, "true_floor"
     if _agentify_status_readonly(event):
         return True, 'agentify_status_readonly'
+    # Installed MCP inputSchema is empty; GET /tabs copies in-memory rows.
+    # Do not accept ignored extras, selectors, or neighboring effectful tools.
+    if (event.get('tool_name') == 'mcp__agentify__agentify_tabs'
+            and isinstance(event.get('tool_input'), dict) and event['tool_input'] == {}):
+        return True, 'agentify_tabs_readonly'
     if coordinator is not None:
         return True, coordinator
     if readonly_proven:
