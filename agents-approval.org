@@ -538,7 +538,9 @@ class GateInversionTests(unittest.TestCase):
 
     def test_daytime_denies_queue_and_await_desk_telegram(self):
         decision = self.run_hook(self.event('rm README.org'))
-        self.assertIn("awaiting the Admiral's approval on the Desk/Telegram", decision['message'])
+        self.assertIn('approval-queue list --json', decision['message'])
+        self.assertIn('Telegram notification not delivered (unconfigured)', decision['message'])
+        self.assertNotIn('Desk/Telegram', decision['message'])
         self.assertEqual(json.loads(self.queue.read_text())['request'], self.event('rm README.org'))
         self.assertEqual(self.queue.stat().st_mode & 0o777, 0o600)
 
@@ -559,7 +561,7 @@ class GateInversionTests(unittest.TestCase):
         self.queue.symlink_to(self.root / 'README.org')
         decision = self.run_hook(self.event('rm README.org'))
         self.assertIn('queue unavailable', decision['message'])
-        self.assertIn('notification unavailable', decision['message'])
+        self.assertIn('Telegram notification not delivered (unconfigured)', decision['message'])
 
     def test_invalid_request_or_manifest_always_returns_deny(self):
         self.assertEqual(self.run_hook([])['behavior'], 'deny')
@@ -663,7 +665,7 @@ class GateInversionTests(unittest.TestCase):
             self.assertIn(payload['request_sha'], data)
             self.assertNotIn('MUST_NOT_RELAY_THIS', data)
             self.assertEqual(send.call_args.kwargs['timeout'], 0.5)
-        with mock.patch.dict(os.environ, {'APPROVAL_TELEGRAM_BOT_TOKEN': 'YOUR_BOT_TOKEN'}), \
+        with mock.patch.dict(os.environ, {**env, 'APPROVAL_TELEGRAM_BOT_TOKEN': 'YOUR_BOT_TOKEN'}), \
                 mock.patch.object(notifier.sys, 'stdin', io.StringIO(json.dumps(payload))), \
                 mock.patch.object(notifier.urllib.request, 'urlopen') as send:
             self.assertEqual(notifier.main(), 1)
@@ -908,6 +910,8 @@ class GateInversionTests(unittest.TestCase):
                     self.assertEqual(decision['behavior'], 'deny')
                     self.assertIs(decision['interrupt'], False)
                     self.assertIn('morning review', decision['message'])
+                    self.assertIn('approval-queue list --json', decision['message'])
+                    self.assertIn('Telegram notification not delivered (unconfigured)', decision['message'])
                     self.assertTrue(self.queue.exists())
 
     def test_wrapper_and_engine_share_inversion_switch(self):
@@ -959,10 +963,7 @@ present. Default =ask= returns no decision so the native Telegram Allow buttons
 remain usable. Explicit =deny= has =interrupt: false=, appends the complete
 private request to the queue and attempts Telegram via a fixed private
 =notifications.argv= bridge. Away or stale presence always uses DENY/queue/notify.
-Daytime deny notes say =awaiting the Admiral's approval on the Desk/Telegram=;
-away notes retain morning review. Queue or notification failure still denies
-in deny mode; failure is explicit in the note and hashed ledger. ASK records an
-=ask= ledger decision without queuing or issuing a duplicate notification.
+Every deny-mode hold names its local queue item and the supported =approval-queue list --json= review path. Telegram delivery is stated only when the adapter confirms acceptance; unconfigured, rejected and transport-failed notifications are distinguished, and a missing queue is stated as no pending approval. ASK records an =ask= ledger decision without queuing or issuing a duplicate notification.
 The bridge receives only
 request/input hashes, refusal reason and queue/away status; it must never
 execute a queued operation, and a notification is not an approval grant.
@@ -979,17 +980,7 @@ private seat copy. Bunta's SSH reader is enabled in this template; it handles
 =2>&1 | grep -v x= after SSH. Remove the broad SSH permission rule only after
 the scoped reader passes local smoke tests and realpath proof on the target.
 
-Replace =YOUR_SEAT_TELEGRAM_NOTIFIER= with an absolute path to a seat-owned
-bridge that accepts =dotcortex.approval.notification.v1= JSON on stdin and
-returns zero only after its existing Telegram bot/channel accepts the alert.
-The gate calls this argv directly without a shell, discards helper stdout/stderr
-and caps delivery at 750 ms. Use the seat's existing credential-owning bot path;
-this worker never reads tokens. If that bot lacks an outbound bridge, the
-coordinator must provision this small adapter privately with =YOUR_BOT_TOKEN=
-and =YOUR_ADMIRAL_CHAT= placeholders filled there, using its existing authenticated
-send-message API. The public manifest deliberately has no usable credentials
-or real identities. Missing routing is reported as =unconfigured= and needs
-deployment completion; branch tests do not establish live Telegram delivery.
+Set the private =notifications.argv= to the installed =approval-telegram-notify= adapter, which accepts =dotcortex.approval.notification.v1= JSON on stdin and returns zero only after Telegram accepts the alert. The gate invokes this fixed argv without a shell and caps it at 750 ms. The adapter resolves the current official main-seat channel from the wrapper-provided =TELEGRAM_STATE_DIR=, reading only its private =.env= token and the one permitted chat in =access.json= at runtime; sibling channel directories are rejected. No credential values are added to DotCortex or to a new approval-specific env file. If the channel state is unavailable, the result is =unconfigured= and the local approval queue remains the supported review path.
 
 Keep =gate_inversion.present_refusal: ask= until the Desk approval consumer is
 installed and verified. Strict-parse private manifest/settings and run all six
@@ -1007,7 +998,7 @@ or session restart is part of this branch.
 * Optional private-environment Telegram adapter
 
 #+BEGIN_SRC python :tangle all/.local/bin/approval-telegram-notify :shebang "#!/usr/bin/env python3" :comments no :tangle-mode (identity #o755)
-"""Private-environment Telegram adapter; never logs credentials."""
+"""Send a hash-only approval notice using the existing private channel identity."""
 import json
 import os
 from pathlib import Path
@@ -1016,7 +1007,77 @@ import stat
 import sys
 import time
 import hashlib
+import urllib.error
 import urllib.request
+
+
+STATE_SEATS = {'opus', 'fable', 'haiku', 'auryn'}
+PRIVATE_FILE_LIMIT = 16384
+
+
+def _private_text(path):
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1
+                or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > PRIVATE_FILE_LIMIT):
+            return None
+        chunks = []
+        remaining = PRIVATE_FILE_LIMIT + 1
+        while remaining:
+            chunk = os.read(fd, min(4096, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        raw = b''.join(chunks)
+        return raw.decode('utf-8') if len(raw) <= PRIVATE_FILE_LIMIT else None
+    finally:
+        os.close(fd)
+
+
+def _state_credentials():
+    raw_state = os.environ.get('TELEGRAM_STATE_DIR')
+    if not raw_state:
+        return None
+    home = Path.home()
+    state = Path(raw_state).expanduser()
+    channels = home / '.claude/channels'
+    if state.parent != channels or not re.fullmatch(r'telegram-(?:' + '|'.join(STATE_SEATS) + r')', state.name):
+        return None
+    for directory in (home, home / '.claude', channels, state):
+        try:
+            info = directory.lstat()
+        except OSError:
+            return None
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) & 0o022):
+            return None
+    try:
+        env_text = _private_text(state / '.env')
+        access_text = _private_text(state / 'access.json')
+        access = json.loads(access_text) if access_text is not None else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+    tokens = [line.partition('=')[2].strip() for line in (env_text or '').splitlines()
+              if line.startswith('TELEGRAM_BOT_TOKEN=')]
+    chats = access.get('allowFrom') if isinstance(access, dict) else None
+    if len(tokens) != 1 or not tokens[0] or not isinstance(chats, list) or len(chats) != 1:
+        return None
+    chat = chats[0]
+    if isinstance(chat, bool) or not isinstance(chat, (str, int)):
+        return None
+    return tokens[0], str(chat)
+
+
+def _credentials():
+    token = os.environ.get('APPROVAL_TELEGRAM_BOT_TOKEN')
+    chat = os.environ.get('APPROVAL_TELEGRAM_CHAT_ID')
+    if token or chat:
+        if not token or not chat:
+            raise ValueError('incomplete private Telegram environment')
+        return token, chat
+    return _state_credentials()
 
 
 def _receipt(digest, message_id, bot_key):
@@ -1039,23 +1100,41 @@ def main():
         if not isinstance(message,dict) or message.get('schema')!='dotcortex.approval.notification.v1':return 1
         digest=message.get('request_sha')
         if not isinstance(digest,str) or not re.fullmatch('[0-9a-f]{16}',digest):return 1
-        token=os.environ.get('APPROVAL_TELEGRAM_BOT_TOKEN','YOUR_BOT_TOKEN')
-        chat=os.environ.get('APPROVAL_TELEGRAM_CHAT_ID','YOUR_ADMIRAL_CHAT')
-        base=os.environ.get('APPROVAL_TELEGRAM_API_BASE','YOUR_TELEGRAM_API_BASE')
-        if any(not value or 'YOUR_' in value for value in (token,chat,base)):return 1
+        base=os.environ.get('APPROVAL_TELEGRAM_API_BASE') or os.environ.get('TELEGRAM_API_BASE')
+        if not base:return 2
+        base=base.rstrip('/')
+        credentials = _credentials()
+        if credentials is None:return 2
+        token,chat=credentials
         if not re.fullmatch(r'[0-9]+:[A-Za-z0-9_-]+',token) or not re.fullmatch(r'-?[0-9]+',chat):return 1
         if not re.fullmatch(r'https://[A-Za-z0-9.-]+',base):return 1
-        text='Deferred approval '+digest+'. '
-        text += "Queued for morning review. " if message.get('away') is True else "Awaiting the Admiral's approval on the Desk/Telegram. "
-        text += 'Review the private approval queue.' if message.get('queued') is True else 'Queue unavailable; inspect the seat.'
+        queued=message.get('queued') is True
+        queue_id=message.get('queue_id')
+        if queue_id is not None and (not isinstance(queue_id,str) or not re.fullmatch('[0-9a-f]{24}',queue_id)):return 1
+        text='Approval request '+digest+'. '
+        if queued:
+            text += 'Queued for review. '
+            text += ('Review item '+queue_id+' with approval-queue list --json. ' if queue_id
+                     else 'Review the pending item with approval-queue list --json. ')
+            text += 'This notification is informational and does not approve the request.'
+        else:
+            text += 'Approval queue unavailable; no pending item was created. Contact the seat owner; this alert is informational only and cannot approve the request.'
         text=re.sub(r'([_\*\[\]()~`>#+\-=|{}.!\\])',r'\\\1',text)
         body=json.dumps({'chat_id':chat,'text':text,'parse_mode':'MarkdownV2'}).encode()
         request=urllib.request.Request(base+'/bot'+token+'/sendMessage',data=body,
             headers={'Content-Type':'application/json'},method='POST')
-        with urllib.request.urlopen(request,timeout=0.5) as response:result=json.loads(response.read(4096))
+        try:
+            with urllib.request.urlopen(request,timeout=0.5) as response:result=json.loads(response.read(4096))
+        except urllib.error.HTTPError:
+            return 1
+        except (urllib.error.URLError, OSError, TimeoutError):
+            return 3
         message_id=result.get('result',{}).get('message_id') if isinstance(result,dict) else None
         if result.get('ok') is not True or type(message_id) is not int or message_id<=0:return 1
-        _receipt(digest,message_id,hashlib.sha256((token+':'+chat).encode()).hexdigest())
+        try:
+            _receipt(digest,message_id,hashlib.sha256((token+':'+chat).encode()).hexdigest())
+        except OSError:
+            return 4
         return 0
     except Exception:
         # HTTP exception text may contain the credential-bearing URL.
@@ -1075,14 +1154,7 @@ APPROVAL_TELEGRAM_CHAT_ID=
 APPROVAL_TELEGRAM_API_BASE=
 #+END_SRC
 
-The optional =approval-telegram-notify= adapter above accepts the same hash-only
-JSON and uses the existing bot launcher's private environment. It never opens
-credential files. Its endpoint, chat identity and token are blank in the public
-environment template. Provision them in the existing credential-owning launcher
-only after review; set =notifications.argv= to this installed helper's absolute
-path if the bot has no equivalent bridge. It performs a bounded HTTPS send and
-returns success only on Telegram's explicit =ok: true=. It emits neither token
-URLs nor exception text. The deployment smoke test must establish actual delivery.
+The =approval-telegram-notify= adapter uses the invoking official Telegram main-seat channel state already named by =TELEGRAM_STATE_DIR=; it accepts only the four existing seat channel names, a private regular =.env= token, and exactly one =allowFrom= chat from =access.json=. It never sources shell text, logs credential values, or accepts a sibling's empty =-none= directory. Alternatively an existing credential-owning launcher may provide the paired =APPROVAL_TELEGRAM_BOT_TOKEN= and =APPROVAL_TELEGRAM_CHAT_ID= variables. Set private =notifications.argv= to the installed adapter; no approval-specific credential file or invented token/chat is required. Missing state/routing, transport failure, Telegram rejection, and accepted delivery have distinct exit/status outcomes. The existing private launcher must also supply =APPROVAL_TELEGRAM_API_BASE= or =TELEGRAM_API_BASE=; there is no source-owned default network address. Without an API base the adapter returns =unconfigured= before reading credentials or attempting transport. A transport error or outer timeout means delivery is unconfirmed, not proven absent: the server may have accepted the send before its response was lost. Do not retry blindly. Accepted delivery with a local receipt-write failure remains a distinct delivered outcome. Offline tests mock the HTTP transport; only the parent can verify delivery against the private seat after rollout.
 
 * Manifest-aware installation wrapper
 
@@ -1187,19 +1259,32 @@ def defer(raw):
         item = _runtime._queue_upsert(event, 'engine_unavailable', away_reason, manifest)
     except (OSError, ValueError, TypeError, TimeoutError):
         item = None
-    notification = False
+    notification = 'unconfigured'
     try:
         argv = manifest.get('notifications', {}).get('argv')
         if isinstance(argv, list) and argv and argv[0].startswith('/') and all(isinstance(a,str) and a and 'YOUR_' not in a for a in argv):
             message = {'schema':'dotcortex.approval.notification.v1', 'request_sha':hashlib.sha256(json.dumps(event,sort_keys=True,default=str).encode()).hexdigest()[:16],
-                'reason':'engine_unavailable', 'away':away, 'queued':item is not None}
-            notification = subprocess.run(argv, input=json.dumps(message), text=True, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, timeout=0.75, check=False).returncode == 0
-    except (OSError, ValueError, TypeError, AttributeError, subprocess.TimeoutExpired):
-        pass
-    note = 'deferred: engine unavailable; '+("queued for the Admiral's morning review" if away or away_reason == 'presence' else "awaiting the Admiral's approval on the Desk/Telegram")
-    note += '; queue item '+item if item else '; morning queue unavailable'
-    if not notification: note += '; Telegram notification unavailable'
+                'reason':'engine_unavailable', 'away':away, 'queued':item is not None, 'queue_id':item}
+            result = subprocess.run(argv, input=json.dumps(message), text=True, stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL, timeout=0.75, check=False)
+            notification = {0:'sent', 2:'unconfigured', 3:'unavailable', 4:'sent_receipt_unavailable'}.get(result.returncode, 'failed')
+    except subprocess.TimeoutExpired:
+        notification = 'unavailable'
+    except (OSError, ValueError, TypeError, AttributeError):
+        notification = 'failed'
+    note = 'deferred: engine unavailable; '
+    if item:
+        note += ("queued for the Admiral's morning review" if away or away_reason == 'presence' else 'queued for local review')
+        note += '; queue item '+item+'; review with approval-queue list --json'
+    else:
+        note += 'approval queue unavailable; no pending item was created'
+    if notification == 'sent': note += '; Telegram notification delivered'
+    elif notification == 'sent_receipt_unavailable': note += '; Telegram notification delivered, but its local outcome receipt was unavailable'
+    elif notification == 'unconfigured': note += '; Telegram notification not delivered (unconfigured)'
+    else:
+        note += '; Telegram notification delivery unconfirmed ('+notification+'); do not retry blindly'
+    if not item:
+        note += '; this refusal is not pending approval and cannot be replayed'
     return {'hookSpecificOutput':{'hookEventName':'PermissionRequest','decision':{'behavior':'deny','message':note+'; '+_runtime.DEFERRED_ACTION,'interrupt':False}}}
 
 
@@ -1669,7 +1754,10 @@ class DeciderWideningTests(unittest.TestCase):
                 self.assertEqual(self.run_hook(command), 'deny')
         escaped = self.root / 'CORE' / 'escape'
         escaped.symlink_to(self.outside, target_is_directory=True)
-        self.assertEqual(self.run_hook('grep -rIn synthetic CORE/*/'), 'allow')
+        # A command-line glob expands the symlink into a traversal operand;
+        # unlike a symlink encountered beneath grep -r, grep follows that root.
+        # Keep the valid bounded glob above, but refuse this outside-root escape.
+        self.assertEqual(self.run_hook('grep -rIn synthetic CORE/*/'), 'deny')
 
     def test_git_readers_name_protected_branch_but_writes_still_floor(self):
         self.manifest['classes'][1]['enabled'] = True
