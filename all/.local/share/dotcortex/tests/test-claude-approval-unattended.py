@@ -222,6 +222,109 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         manifest['coordinator_ops']['classes']['worktree'] = False
         self.assertFalse(e.classify(payload, manifest)[0])
 
+    def test_mail_help_exact_incident_is_deterministic(self):
+        manifest = self.loaded()
+        request = self.event('mailcortex send --help 2>&1 | head -25')
+        request['tool_input']['description'] = 'Check mailcortex send usage'
+        with mock.patch.object(e, '_decider_decide') as judge, \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+            self.assertEqual(e.classify(request, manifest), (True, 'coordinator_mail_help'))
+            self.assertEqual(e._decide_request(request, manifest), (True, 'coordinator_mail_help'))
+            judge.assert_not_called()
+
+    def test_mail_help_documented_schema_only(self):
+        # services-mailcortex.org build_parser: argparse -h/--help, no version action.
+        paths = ['', 'provision', 'send', 'inbox', 'read', 'receipt', 'bbs', 'bbs alert',
+                 'bbs alert post', 'bbs alert list', 'bbs alert current', 'bbs alert emit-reset']
+        manifest = self.loaded()
+        with mock.patch.object(e, '_decider_decide') as judge, \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+            for path in paths:
+                for flag in ['--help', '-h']:
+                    for suffix in ['', ' 2>&1 | head -25', ' | tail -n 4', ' | cut -c1-1500']:
+                        command = ' '.join(part for part in ['mailcortex', path, flag] if part) + suffix
+                        with self.subTest(command=command):
+                            self.assertEqual(e.classify(self.event(command), manifest),
+                                             (True, 'coordinator_mail_help'))
+                            self.assertEqual(e._decide_request(self.event(command), manifest),
+                                             (True, 'coordinator_mail_help'))
+            judge.assert_not_called()
+
+    def test_mail_workflow_own_seat_supported_shapes(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        commands = [
+            ('mailcortex inbox your_seat@fixture-host.helm 2>&1 | head -25', 'local_read'),
+            ('mailcortex read your_seat@fixture-host.helm fixture-message 2>&1 | cut -c1-1500', 'local_read'),
+            ('mailcortex send --help 2>&1 | head -25', 'coordinator_mail_help'),
+            (self.mail().replace('YOUR_SEAT@', 'your_seat@').replace('YOUR_HOST.helm', 'fixture-host.helm') +
+             " --in-reply-to '<fixture-message@fixture-host.helm>' --print-id", 'coordinator_mail_send'),
+            ("mailcortex receipt your_seat '<fixture-message@fixture-host.helm>' handling_completed",
+             'coordinator_mail_receipt'),
+        ]
+        with mock.patch.object(e, '_decider_decide') as judge, \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+            for command, reason in commands:
+                with self.subTest(command=command):
+                    self.assertEqual(e.classify(self.event(command), manifest), (True, reason))
+                    self.assertEqual(e._decide_request(self.event(command), manifest), (True, reason))
+            judge.assert_not_called()
+
+    def test_mail_help_and_receipt_do_not_erase_effects_or_owner_proof(self):
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        help_command = 'mailcortex send --help'
+        reply = self.mail().replace('YOUR_SEAT@', 'your_seat@').replace('YOUR_HOST.helm', 'fixture-host.helm')
+        receipt = "mailcortex receipt your_seat '<fixture-message@fixture-host.helm>' handling_completed"
+        denied = [
+            'mailcortex unknown --help', 'mailcortex bbs unknown --help',
+            'mailcortex --version', 'mailcortex send --version',
+            'mailcortex send --help --from your_seat@fixture-host.helm',
+            'mailcortex send --from your_seat@fixture-host.helm --help',
+            'mailcortex send -- --help', 'mailcortex send --subject --help',
+            'mailcortex send --subject=-h', 'mailcortex send --help=1',
+            reply + ' --help', reply + ' -h',
+            reply.replace('--subject "review ready"', '--subject --help').replace('your_seat@', 'other_seat@'),
+            reply + " --in-reply-to 'invalid-id'", reply + " --in-reply-to '--help'",
+            reply + " --in-reply-to '<a@b>' --in-reply-to '<c@d>'",
+            reply + " --in-reply-to '<a@b>\nX-Injected: yes'",
+            receipt.replace('your_seat ', 'other_seat '),
+            receipt.replace('your_seat ', 'your_seat@fixture-host.helm '),
+            receipt.replace('<fixture-message@fixture-host.helm>', 'fixture-message'),
+            receipt.replace('<fixture-message@fixture-host.helm>', '--help'),
+            receipt.replace('handling_completed', 'handling_failed'), receipt + ' --help',
+            receipt + ' --output fixture-output',
+        ]
+        for base in [help_command, receipt]:
+            denied += [base + suffix for suffix in [
+                ' | awk \'BEGIN { system ("fixture-command") }\'',
+                ' | awk \'BEGIN { system("fixture-command") }\'',
+                ' | awk \'BEGIN { "fixture-command" | getline }\'',
+                " | sed -n '1p'", ' | head fixture-input', ' | tail -f',
+                ' | cut -c1-1500 fixture-input', ' | head -25 | sh',
+                ' | head -25; fixture-command', ' | head -25 && fixture-command',
+                '>/tmp/fixture-clobber', '>>/tmp/fixture-clobber', '</tmp/fixture-input',
+                ' 2>/tmp/fixture-error', ' 2>&1>/tmp/fixture-clobber',
+                ' | head -25>/tmp/fixture-clobber', ' | head -25 <fixture-input',
+                ' $(fixture-command)', ' `fixture-command`', ' # fixture-comment',
+                '; cat .env', ' && cat ~/.ssh/id_rsa', ' | sh',
+            ]]
+        for command in denied:
+            with self.subTest(refused=command), \
+                    mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+                self.assertFalse(e.classify(self.event(command), manifest)[0])
+                self.assertFalse(e._decide_request(self.event(command), manifest)[0])
+        for command in [help_command, receipt]:
+            request = self.event(command)
+            request['tool_input']['description'] = 'API_KEY=syntheticvalue'
+            self.assertEqual(e._decide_request(request, manifest), (False, 'true_floor'))
+            self.assertFalse(e._decide_request(self.event(command, cwd=str(self.base)), manifest)[0])
+        manifest['coordinator_ops']['classes']['mail_send'] = False
+        for command in [help_command, receipt]:
+            self.assertFalse(e.classify(self.event(command), manifest)[0])
+            self.assertFalse(e._decide_request(self.event(command), manifest)[0])
+
     def test_mail_exact_and_deviations(self):
         self.allow(self.mail())
         for bad in [self.mail().replace('YOUR_SEAT@', 'YOUR_OTHER@'),
