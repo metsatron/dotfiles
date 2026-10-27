@@ -5443,6 +5443,7 @@ AGENTIFY_BROWSER_TOOLS = {
     'mcp__agentify__agentify_ensure_ready',
     'mcp__agentify__agentify_query',
     'mcp__agentify__agentify_navigate',
+    'mcp__agentify__agentify_read_page',
 }
 
 
@@ -5496,6 +5497,7 @@ def _agentify_browser_capability(event, manifest):
         'mcp__agentify__agentify_ensure_ready': {'key', 'model', 'timeoutMs'},
         'mcp__agentify__agentify_query': {'key', 'model', 'prompt', 'timeoutMs'},
         'mcp__agentify__agentify_navigate': {'key', 'model', 'url'},
+        'mcp__agentify__agentify_read_page': {'key', 'model', 'maxChars'},
     }
     if (tool not in schemas or not isinstance(payload, dict)
             or not {'key', 'model'} <= set(payload) or not set(payload) <= schemas[tool]
@@ -5504,6 +5506,9 @@ def _agentify_browser_capability(event, manifest):
     if 'timeoutMs' in payload and (type(payload['timeoutMs']) is not int
                                   or not 1 <= payload['timeoutMs'] <= 600000):
         return False
+    if tool == 'mcp__agentify__agentify_read_page':
+        return ('maxChars' not in payload or
+                type(payload['maxChars']) is int and 1 <= payload['maxChars'] <= 200000)
     if tool == 'mcp__agentify__agentify_query':
         prompt = payload.get('prompt')
         # Defence in depth, not a semantic safety classifier: the trusted grant

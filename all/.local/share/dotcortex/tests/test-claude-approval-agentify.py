@@ -43,6 +43,15 @@ class AgentifyCapabilityTests(unittest.TestCase):
             self.assertFalse(e.classify(request, manifest)[0])
             self.assertFalse(e._decide_request(request, manifest)[0])
 
+    def test_keyed_page_read_is_bounded_and_cannot_select_foreign_tabs(self):
+        request = {**self.request, 'tool_name': 'mcp__agentify__agentify_read_page',
+                   'tool_input': {'key': self.request['tool_input']['key'], 'model': 'gemini', 'maxChars': 6000}}
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no judge')):
+            self.assertEqual(e._decide_request(request, self.loaded()), (True, 'agentify_browser_capability'))
+        for change in [{'maxChars': True}, {'maxChars': 0}, {'maxChars': 200001},
+                       {'tabId': 'other-tab'}, {'key': 'default'}, {'url': 'file:///etc/passwd'}]:
+            self.assert_refused({**request, 'tool_input': {**request['tool_input'], **change}})
+
     def test_exact_existing_conversation_navigation_requires_declared_url(self):
         url = 'https://gemini.google.com/app/1234567890abcdef'
         self.policy['agentify_browser']['navigation_urls'] = [url]
