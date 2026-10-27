@@ -618,6 +618,170 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(calls[0][1], 15)
         self.assertEqual(calls[1][1], 15)
 
+    def test_hermes_queued_terminal_handling_blocks_all_admission(self):
+        self.registry["seats"]["builder"] = self.hermes_record() | {"mailbox": "seats/builder"}
+        for handling in ("handling_completed", "handling_rejected"):
+            with self.subTest(handling=handling):
+                mid = f"<{handling}@node.helm>"
+                self.mail(mid, handling)
+                self.watcher.MAILCORTEX.write_wake_receipt(
+                    "builder", mid, "queued", reason="busy", wake_updated_at=1)
+                self.watcher.MAILCORTEX.write_handling_receipt("builder", mid, handling)
+                path = self.watcher.MAILCORTEX.receipt_path("builder", mid)
+                before = path.read_bytes()
+                adapter = mock.Mock()
+                adapter.resolve_idle_pane.return_value = "fixture-target"
+                # No adapter factory: exercise the real watcher with inert boundaries.
+                del adapter.for_record
+                self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 0)
+                adapter.resolve_idle_pane.assert_not_called()
+                adapter.deliver.assert_not_called()
+                self.assertEqual(path.read_bytes(), before)
+                self.assertTrue((self.mailbox / "new" / handling).is_file())
+
+    def test_terminal_handling_preserves_every_wake_state_across_restart(self):
+        originals = {}
+        for wake in sorted(self.watcher.MAILCORTEX.WAKE_STATES):
+            for handling in ("handling_completed", "handling_rejected"):
+                mid = f"<{wake}-{handling}@node.helm>"
+                self.mail(mid, mid)
+                self.mail(mid, mid + "-duplicate")
+                if wake != "manual":
+                    self.watcher.MAILCORTEX.write_wake_receipt(
+                        "builder", mid, wake, wake_updated_at=1, reason="fixture",
+                        retained_metadata={"request_id": "preserved"})
+                self.watcher.MAILCORTEX.write_handling_receipt("builder", mid, handling)
+                path = self.watcher.MAILCORTEX.receipt_path("builder", mid)
+                originals[path] = path.read_bytes()
+        mail_bytes = {p: p.read_bytes() for p in (self.mailbox / "new").iterdir()}
+        for transport in ("hermes", "herdr", "nanobot", "ductor", "deepseek",
+                          "opencode", "agent-peer-native"):
+            with self.subTest(transport=transport):
+                self.registry["seats"]["builder"]["transport"] = transport
+                self.watcher = load_module(WATCHER, "mailcortex_terminal_restart_test")
+                adapter = mock.Mock()
+                del adapter.for_record
+                self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 0)
+                self.assertEqual(adapter.mock_calls, [])
+                for path, before in originals.items():
+                    self.assertEqual(path.read_bytes(), before)
+                self.assertEqual({p: p.read_bytes() for p in mail_bytes}, mail_bytes)
+
+    def test_claude_local_queued_terminal_handling_never_queries_supervisor(self):
+        _record, seam, calls = self.claude_local_fixture([])
+        for handling in ("handling_completed", "handling_rejected"):
+            mid = f"<local-{handling}@node.helm>"
+            self.mail(mid, handling)
+            self.watcher.MAILCORTEX.write_wake_receipt("builder", mid, "queued")
+            self.watcher.MAILCORTEX.write_handling_receipt("builder", mid, handling)
+        self.assertEqual(self.scan_claude_local(seam, 10), 0)
+        self.assertEqual(calls, [])
+
+    def test_uncertain_wake_fences_survive_handling_changes_and_restart(self):
+        for wake in ("injecting", "injected", "delivery_unknown"):
+            for handling in (None, "handling_deferred", "handling_failed"):
+                mid = f"<{wake}-{handling}@node.helm>"
+                self.mail(mid, mid)
+                self.watcher.MAILCORTEX.write_wake_receipt(
+                    "builder", mid, wake, wake_updated_at=1, request_id="uncertain-original")
+                if handling:
+                    self.watcher.MAILCORTEX.write_handling_receipt("builder", mid, handling)
+        originals = {p: p.read_bytes() for p in (self.runtime / "receipts/builder").iterdir()}
+        for now in (10, 11):
+            self.watcher = load_module(WATCHER, "mailcortex_uncertain_restart_test")
+            adapter = FakeAdapter()
+            self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=now), 0)
+            self.assertEqual(adapter.deliveries, [])
+            for path, before in originals.items():
+                self.assertEqual(path.read_bytes(), before)
+
+    def test_queued_deferred_mail_remains_retryable_after_restart(self):
+        mid = "<queued-deferred@node.helm>"
+        self.mail(mid, "deferred")
+        self.watcher.MAILCORTEX.write_wake_receipt(
+            "builder", mid, "queued", wake_updated_at=1, retained_metadata={"value": "keep"})
+        self.watcher.MAILCORTEX.write_handling_receipt("builder", mid, "handling_deferred")
+        handling_at = self.receipt(mid)["handling_updated_at"]
+        self.assertEqual(self.watcher.locked_scan(self.registry, FakeAdapter(busy=True), now=10), 0)
+        self.watcher = load_module(WATCHER, "mailcortex_deferred_restart_test")
+        adapter = FakeAdapter()
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=11), 1)
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=12), 0)
+        self.assertEqual(len(adapter.deliveries), 1)
+        receipt = self.receipt(mid)
+        self.assertEqual(receipt["handling_state"], "handling_deferred")
+        self.assertEqual(receipt["handling_updated_at"], handling_at)
+        self.assertEqual(receipt["retained_metadata"], {"value": "keep"})
+
+    def test_terminal_backlog_allows_fresh_hermes_mail_and_other_seat_once(self):
+        record = self.hermes_record() | {"mailbox": "seats/builder"}
+        self.registry["seats"]["builder"] = record
+        originals = {}
+        for handling in ("handling_completed", "handling_rejected"):
+            mid = f"<backlog-{handling}@node.helm>"
+            self.mail(mid, "a-" + handling)
+            self.watcher.MAILCORTEX.write_wake_receipt("builder", mid, "queued", wake_updated_at=1)
+            self.watcher.MAILCORTEX.write_handling_receipt("builder", mid, handling)
+            path = self.watcher.MAILCORTEX.receipt_path("builder", mid)
+            originals[path] = path.read_bytes()
+        mid = "<fresh-hermes@node.helm>"
+        self.mail(mid, "z-fresh"); self.mail(mid, "zz-duplicate")
+        calls = []
+        def opener(request, timeout):
+            calls.append(request)
+            payload = json.loads(request.data)
+            value = {"protocol": "hermes.gateway_idle_prompt.v1",
+                     "session_key": record["hermes_target"]["session_key"]}
+            if request.full_url.endswith("/status"):
+                return FakeHTTPResponse(value | {"known": True, "busy": False})
+            self.assertIn(mid, payload["text"])
+            return FakeHTTPResponse(value | {"request_id": payload["request_id"],
+                                             "status": "accepted"}, status=202)
+        hermes = self.watcher.HermesAdapter(opener=opener)
+        herdr = self.add_herdr_seat()
+        class Factory:
+            def for_record(inner, record):
+                return hermes if record["transport"] == "hermes" else herdr
+        self.assertEqual(self.watcher.locked_scan(self.registry, Factory(), now=10), 2)
+        self.watcher = load_module(WATCHER, "mailcortex_fresh_restart_test")
+        self.assertEqual(self.watcher.locked_scan(self.registry, Factory(), now=11), 0)
+        self.assertEqual(len(calls), 2)  # One status and one admission, neither live.
+        self.assertEqual(len(herdr.deliveries), 1)
+        self.assertEqual(self.receipt(mid)["wake_state"], "injected")
+        self.assertIsNone(self.receipt(mid)["handling_state"])
+        for path, before in originals.items():
+            self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(len(list((self.mailbox / "new").iterdir())), 4)
+
+    def test_native_terminal_and_malformed_event_do_not_block_fresh_admission(self):
+        self.registry["seats"]["builder"]["transport"] = "agent-peer-native"
+        terminal = "<native-terminal@node.helm>"
+        self.mail(terminal, "a-terminal")
+        self.watcher.MAILCORTEX.write_wake_receipt("builder", terminal, "queued")
+        self.watcher.MAILCORTEX.write_handling_receipt("builder", terminal, "handling_rejected")
+        path = self.watcher.MAILCORTEX.receipt_path("builder", terminal)
+        before = path.read_bytes()
+        self.mail("<native-malformed@node.helm>", "b-malformed")
+        self.mail("<native-fresh@node.helm>", "c-fresh")
+        adapter = mock.Mock()
+        del adapter.for_record
+        adapter.peer.CoordinatorUnavailable = ConnectionError
+        def store(record, path):
+            if path.name == "b-malformed":
+                raise ValueError("invalid signed envelope")
+            return {"state": "stored", "message_id": "fixture-native-id"}
+        adapter.store.side_effect = store
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 1)
+        refused = self.receipt("<native-malformed@node.helm>")
+        self.assertEqual(refused["reason"], "authentication_refused")
+        self.watcher = load_module(WATCHER, "mailcortex_native_restart_test")
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=11), 0)
+        self.assertEqual([call.args[1].name for call in adapter.store.call_args_list],
+                         ["b-malformed", "c-fresh"])
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.receipt("<native-malformed@node.helm>"), refused)
+        self.assertEqual(len(list((self.mailbox / "new").iterdir())), 3)
+
     def test_hermes_busy_is_queued_and_never_interrupts(self):
         record = self.hermes_record() | {"mailbox": "seats/builder"}
         self.registry["seats"]["builder"] = record
