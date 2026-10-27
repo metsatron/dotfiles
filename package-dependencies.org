@@ -58,6 +58,13 @@ NumPy/ABI conflicts, the HelmCortex conda fallback and local hot-path elevation
 remain separate compatibility requirements. Do not merge them into one mutable
 fleet environment. No live application is migrated merely by tangling this module.
 
+Existing public package trees can also be adopted through
+=package-code-commons.org= without changing their dependency versions or backend.
+A user-site alias to that module's canonical root-owned store remains visible in
+=deps:report= as =frozen-runtime=. Its receipt must bind the original source and
+published tree. Guarded pip apply refuses such a site before resolution; upgrades
+must build a new generation rather than writing through the alias.
+
 * Placement policy
 #+BEGIN_SRC toml :tangle all/.config/dotcortex/dependencies.toml
 schema = 1
@@ -184,7 +191,22 @@ def inventory(homes, policy):
                 if not re.fullmatch(r'python\d+\.\d+', py.name) or py.is_symlink():
                     continue
                 site = py / 'site-packages'
-                if site.is_symlink() or not site.is_dir():
+                frozen = False
+                if site.is_symlink():
+                    target = site.resolve(strict=True)
+                    receipt = target.parent / 'receipt.json'
+                    store = Path('/var/lib/dotcortex/code-commons/generations')
+                    if target.name != 'tree' or target.parent.parent != store:
+                        raise Refused('Undeclared redirected user site: ' + str(site))
+                    for protected in [store.parent, store, target.parent, target, receipt]:
+                        info = protected.lstat()
+                        if protected.is_symlink() or info.st_uid != 0 or info.st_mode & 0o022:
+                            raise Refused('Frozen runtime custody changed: ' + str(protected))
+                    record = json.loads(receipt.read_text())
+                    if record.get('source') != str(site) or record.get('tree') != str(target):
+                        raise Refused('Frozen runtime receipt does not bind this user site')
+                    frozen = True
+                if not site.is_dir():
                     continue
                 for dist in sorted(site.iterdir()):
                     if not dist.name.endswith('.dist-info') or dist.is_symlink():
@@ -198,7 +220,7 @@ def inventory(homes, policy):
                         raise Refused('Incomplete installed package metadata: ' + str(dist))
                     rows.append(dict(home=str(home), python=py.name, name=name,
                                      version=msg['Version'], path=str(dist),
-                                     route='declared-runtime' if forbidden(name, policy) else 'review-guix-or-compatible-runtime'))
+                                     route=('frozen-runtime' if frozen else 'declared-runtime' if forbidden(name, policy) else 'review-guix-or-compatible-runtime')))
         except (PermissionError, FileNotFoundError) as exc:
             gaps.append(dict(home=str(home), reason=type(exc).__name__))
     groups = {}
@@ -259,6 +281,11 @@ def locked_report(report, policy):
 
 def pip_apply(args, policy, root):
     python = python_identity(args.python)
+    version = python.get('version', [])
+    if len(version) >= 2:
+        site = Path.home() / '.local/lib' / ('python%d.%d' % tuple(version[:2])) / 'site-packages'
+        if site.is_symlink():
+            raise Refused('User site is a published runtime; build and validate a new generation instead of installing in place')
     manifest = args.manifest or root / 'all/.pip/manifest/packages.ssv'
     installed_code = 'import importlib.metadata as m,json,re;print(json.dumps({re.sub(r"[-_.]+","-",d.metadata["Name"]).lower():d.version for d in m.distributions() if d.metadata["Name"]}))'
     installed = json.loads(subprocess.run([python['executable'], '-c', installed_code],
@@ -463,6 +490,15 @@ POLICY = {'schema': 1, 'user_site': {'forbidden': ['torch', 'triton', 'nvidia-*'
 
 
 class DependencyTests(unittest.TestCase):
+    def test_frozen_user_site_stops_before_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp);site=home/'.local/lib/python3.13/site-packages'
+            site.parent.mkdir(parents=True);site.symlink_to(home/'frozen')
+            args=argparse.Namespace(python='python3',manifest=None,apply=True)
+            with patch.object(d.Path,'home',return_value=home), patch.object(d,'python_identity',return_value={'version':[3,13,0]}), patch.object(d.subprocess,'run') as run:
+                with self.assertRaises(d.Refused):d.pip_apply(args,POLICY,home)
+                run.assert_not_called()
+
     def test_transitive_gpu_rejected_before_install(self):
         for name in ['torch', 'NVIDIA_CUBLAS_CU13', 'cuda-toolkit', 'triton']:
             with self.subTest(name=name), self.assertRaises(d.Refused):

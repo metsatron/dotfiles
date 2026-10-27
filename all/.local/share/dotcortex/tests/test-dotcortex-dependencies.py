@@ -13,6 +13,15 @@ POLICY = {'schema': 1, 'user_site': {'forbidden': ['torch', 'triton', 'nvidia-*'
 
 
 class DependencyTests(unittest.TestCase):
+    def test_frozen_user_site_stops_before_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home=Path(tmp);site=home/'.local/lib/python3.13/site-packages'
+            site.parent.mkdir(parents=True);site.symlink_to(home/'frozen')
+            args=argparse.Namespace(python='python3',manifest=None,apply=True)
+            with patch.object(d.Path,'home',return_value=home), patch.object(d,'python_identity',return_value={'version':[3,13,0]}), patch.object(d.subprocess,'run') as run:
+                with self.assertRaises(d.Refused):d.pip_apply(args,POLICY,home)
+                run.assert_not_called()
+
     def test_transitive_gpu_rejected_before_install(self):
         for name in ['torch', 'NVIDIA_CUBLAS_CU13', 'cuda-toolkit', 'triton']:
             with self.subTest(name=name), self.assertRaises(d.Refused):
