@@ -1,0 +1,258 @@
+#+TITLE: Immutable Code Commons
+#+DESCRIPTION: Publish existing public package trees with verified content sharing
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :comments no :results silent
+
+* Scope and maintenance
+
+This publisher adopts already-installed public package code without resolving or
+changing dependencies. Separate Python ABIs and application closures retain their
+own complete directory trees. Only byte-identical files with identical executable
+bits share root-owned read-only inodes. Credentials and mutable application state
+must never enter this store. Guix and declared locked runtime builders remain the
+preferred sources for new installations.
+
+=dotcortex-code-commons SOURCE --name NAME --store /var/lib/dotcortex/code-commons=
+prints a read-only plan. Explicit =--apply --public-code --expect SHA256= publishes
+that exact plan as root. Publication never redirects consumers or deletes source.
+The coordinator checks idle consumers, publishes, verifies real-account behavior,
+then changes only reviewed aliases and retires the old copies. Interrupted or
+mismatched publications stop for inspection. Never automatically replay cutover.
+
+Adopted package trees are immutable. Upgrades publish a new compatible generation
+and switch its consumer alias after validation; do not run pip against a frozen
+user site or change permissions to force an in-place upgrade. Private writable
+configuration, model caches and credentials remain in the consumer's own home.
+Changing a published file requires a new generation, never an in-place patch.
+
+* Publisher
+#+BEGIN_SRC python :tangle all/.local/bin/dotcortex-code-commons :tangle-mode (identity #o755)
+#!/usr/bin/env python3
+"""Plan or publish an exact local public-code tree into an immutable file commons."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import sys
+import tempfile
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def local(path):
+    if not path.is_absolute() or path.resolve() != path or len(path.parts) < 3:
+        raise Refused('Use an exact absolute directory without symlink ancestry')
+    mounts = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        left, right = line.split(' - ', 1)
+        mount = Path(left.split()[4].replace('\\040', ' '))
+        if path == mount or mount in path.parents:
+            mounts.append((len(mount.parts), right.split()[0]))
+    if mounts and max(mounts)[1] in {'autofs', 'nfs', 'nfs4', 'cifs', 'fuse.sshfs'}:
+        raise Refused('Code roots and stores must be local filesystems')
+
+
+def scan(root):
+    local(root)
+    if not root.is_dir():
+        raise Refused('Source must be an existing directory')
+    device = root.stat().st_dev
+    rows = []
+    for parent, dirs, files in os.walk(root, followlinks=False):
+        for name in sorted(dirs + files):
+            path = Path(parent) / name
+            info = path.lstat()
+            rel = str(path.relative_to(root))
+            row = dict(path=rel, uid=info.st_uid, gid=info.st_gid,
+                       mode=stat.S_IMODE(info.st_mode), mtime_ns=info.st_mtime_ns)
+            if info.st_dev != device:
+                raise Refused('Nested mount in source: ' + rel)
+            if stat.S_ISLNK(info.st_mode):
+                target = os.readlink(path)
+                if Path(target).is_absolute() or not path.resolve().is_relative_to(root):
+                    raise Refused('External or absolute symlink: ' + rel)
+                row.update(kind='link', target=target)
+            elif stat.S_ISDIR(info.st_mode):
+                row.update(kind='dir')
+            elif stat.S_ISREG(info.st_mode):
+                if info.st_nlink != 1 or info.st_mode & 0o6000:
+                    raise Refused('External hardlink or privileged file: ' + rel)
+                with path.open('rb') as stream:
+                    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                after = path.stat()
+                if (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns) != (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns):
+                    raise Refused('Source changed during hashing: ' + rel)
+                row.update(kind='file', sha256=digest, executable=bool(info.st_mode & 0o111),
+                           size=info.st_size, allocated=info.st_blocks * 512)
+            else:
+                raise Refused('Special file in source: ' + rel)
+            rows.append(row)
+    rows.sort(key=lambda r:r['path'])
+    identity = [{k:v for k,v in r.items() if k not in {'uid','gid','mode','mtime_ns','allocated'}} for r in rows]
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    return dict(schema=1, source=str(root), tree_sha256=digest, entries=rows,
+                allocated_bytes=sum(r.get('allocated', 0) for r in rows))
+
+
+def trusted_directory(path):
+    local(path)
+    for parent in [path, *path.parents]:
+        if parent.exists():
+            info = parent.stat()
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise Refused('Store ancestry must be root-owned and not group/world writable')
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o755)
+
+
+def publish(plan, name, store):
+    trusted_directory(store)
+    trusted_directory(store / 'blobs')
+    trusted_directory(store / 'generations')
+    with (store / 'publish.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        generation = store / 'generations' / (name + '-' + plan['tree_sha256'])
+        if generation.exists():
+            raise Refused('Generation already exists; inspect its receipt rather than replaying publication')
+        generation.mkdir(mode=0o755)
+        tree = generation / 'tree'
+        tree.mkdir(mode=0o755)
+        source = Path(plan['source'])
+        verified_blobs = set()
+        for row in plan['entries']:
+            destination = tree / row['path']
+            if row['kind'] == 'dir':
+                destination.mkdir(parents=True, exist_ok=True)
+            elif row['kind'] == 'link':
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.symlink_to(row['target'])
+            else:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                key = row['sha256'] + ('-x' if row['executable'] else '-r')
+                blob = store / 'blobs' / key
+                created = not blob.exists()
+                if created:
+                    fd, temporary = tempfile.mkstemp(prefix='.blob-', dir=store / 'blobs')
+                    digest = hashlib.sha256()
+                    try:
+                        with os.fdopen(fd, 'wb') as output, (source / row['path']).open('rb') as input_file:
+                            for chunk in iter(lambda: input_file.read(1024 * 1024), b''):
+                                digest.update(chunk); output.write(chunk)
+                            output.flush(); os.fsync(output.fileno())
+                        if digest.hexdigest() != row['sha256']:
+                            raise Refused('Source drift during publication: ' + row['path'])
+                        os.chmod(temporary, 0o555 if row['executable'] else 0o444)
+                        os.replace(temporary, blob)
+                    finally:
+                        if os.path.exists(temporary):os.unlink(temporary)
+                # Reusing a blob must still verify the reviewed source, not just the cache.
+                if not created:
+                    with (source / row['path']).open('rb') as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != row['sha256']:
+                            raise Refused('Source drift during publication: ' + row['path'])
+                info = blob.lstat()
+                if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o222:
+                    raise Refused('Blob custody changed: ' + key)
+                if key not in verified_blobs:
+                    with blob.open('rb') as stream:
+                        if hashlib.file_digest(stream, 'sha256').hexdigest() != row['sha256']:
+                            raise Refused('Blob content changed: ' + key)
+                    verified_blobs.add(key)
+                os.link(blob, destination)
+        # Root's umask must not deny consumer traversal.
+        for parent, dirs, files in os.walk(tree, topdown=False, followlinks=False):
+            Path(parent).chmod(0o555)
+        plan = {**plan, 'generation':str(generation), 'tree':str(tree)}
+        receipt = generation / 'receipt.json'
+        receipt.write_text(json.dumps(plan, indent=2) + '\n')
+        receipt.chmod(0o444)
+        generation.chmod(0o555)
+        return plan
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('source', type=Path)
+    parser.add_argument('--name', required=True)
+    parser.add_argument('--store', type=Path, required=True)
+    parser.add_argument('--expect')
+    parser.add_argument('--public-code', action='store_true')
+    parser.add_argument('--apply', action='store_true')
+    args = parser.parse_args()
+    if not re.fullmatch('[a-z][a-z0-9-]{0,63}', args.name):
+        raise Refused('Use a simple explicit generation name')
+    plan = scan(args.source)
+    if args.apply:
+        if os.geteuid() != 0 or not args.public_code:
+            raise Refused('Publication requires root and explicit public-code classification')
+        if args.expect != plan['tree_sha256']:
+            raise Refused('Exact reviewed tree hash is required before publication')
+        plan = publish(plan, args.name, args.store)
+    print(json.dumps({k:v for k,v in plan.items() if k != 'entries'}, indent=2))
+
+
+if __name__ == '__main__':
+    try: main()
+    except (Refused, OSError, ValueError) as exc:
+        print('Code publication stopped: ' + str(exc), file=sys.stderr)
+        raise SystemExit(2)
+#+END_SRC
+
+
+* Offline verification
+
+Run the generated =test-code-commons.py= with system Python. Publication tests
+require root but use only temporary fixtures and never change consumer aliases.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-code-commons.py
+import importlib.machinery
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[5]
+m = importlib.machinery.SourceFileLoader('commons', str(ROOT / 'all/.local/bin/dotcortex-code-commons')).load_module()
+
+
+class CommonsTests(unittest.TestCase):
+    def test_external_links_and_existing_hardlinks_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp);source=root/'source';source.mkdir()
+            (source/'external').symlink_to('/etc/passwd')
+            with self.assertRaises(m.Refused):m.scan(source)
+            (source/'external').unlink()
+            (root/'outside').write_text('mutable outside')
+            os.link(root/'outside',source/'linked')
+            with self.assertRaises(m.Refused):m.scan(source)
+
+    @unittest.skipUnless(os.geteuid() == 0, 'root needed for immutable publisher custody fixture')
+    def test_sharing_preserves_abi_layout_and_refuses_drift_and_replay(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);a=root/'a';b=root/'b';a.mkdir();b.mkdir()
+            for source in [a,b]:(source/'shared').write_bytes(b'identical public bytes')
+            (a/'native.so').write_bytes(b'ABI-A');(b/'native.so').write_bytes(b'ABI-B')
+            (a/'alias').symlink_to('shared')
+            def fixture_store(path):path.mkdir(parents=True,exist_ok=True);path.chmod(0o755)
+            with patch.object(m,'trusted_directory',side_effect=fixture_store):
+                one=m.publish(m.scan(a),'abi-a',root/'store')
+                two=m.publish(m.scan(b),'abi-b',root/'store')
+                x=Path(one['tree']);y=Path(two['tree'])
+                self.assertEqual((x/'shared').stat().st_ino,(y/'shared').stat().st_ino)
+                self.assertNotEqual((x/'native.so').stat().st_ino,(y/'native.so').stat().st_ino)
+                self.assertEqual((x/'shared').stat().st_mode & 0o222,0)
+                self.assertEqual((x/'alias').read_bytes(),b'identical public bytes')
+                with self.assertRaises(m.Refused):m.publish(m.scan(a),'abi-a',root/'store')
+                plan=m.scan(a);(a/'shared').write_bytes(b'new source')
+                with self.assertRaises(m.Refused):m.publish(plan,'drift',root/'store')
+
+
+if __name__ == '__main__':unittest.main()
+#+END_SRC
