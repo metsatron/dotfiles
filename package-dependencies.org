@@ -1,0 +1,593 @@
+#+TITLE: Declared Dependency Placement
+#+DESCRIPTION: Shared immutable runtime generations and guarded Python installation
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent :comments no
+
+* Ownership and operation
+
+Guix remains the first choice for common packages. Its existing profiles share
+store items across agent identities. The existing speech services and tuned
+whisper.cpp fallback remain the first speech route. This module handles explicit
+Python exceptions and prevents the general user-site lane from accumulating
+heavyweight speech/GPU stacks.
+
+=loom deps:report= is local and read-only. An operator can inventory additional
+explicit local agent homes using =dotcortex-deps report --home PATH --json=.
+Permission failures make coverage incomplete and return a nonzero exit. This is
+user-site metadata coverage, not a complete container/virtualenv inventory or a
+physical-space saving estimate.
+
+=loom pip:plan= resolves the general pip manifest without installing packages.
+=loom pip:apply= uses the same complete preflight, rejects heavyweight transitive
+dependencies, then installs exactly the accepted HTTPS wheel hashes. Source/VCS
+builds need an explicitly managed recipe; they cannot silently enter this lane.
+Resolution can download package metadata or wheels to pip's cache. It never runs
+an installer until every planned dependency passes placement policy. Existing
+incompatible installations are reported, not automatically removed.
+
+Successful applies record interpreter identity under the private XDG state tree.
+An interpreter change or failed install stops the next apply for consumer
+reconciliation. Failed pip operations are not automatically replayed. No cleanup
+command deletes an old Python tree. The legacy direct =pip-apply= helper remains
+unchanged for now; use the guarded Loom entry point. This module does not intercept
+arbitrary installer commands invoked outside Loom.
+
+* Shared runtime exceptions
+
+Declare each compatible application closure in the policy below and tangle its
+complete pinned, SHA256-hashed wheel requirements from its owning Org source.
+Use =dotcortex-deps runtime-build NAME --store ABSOLUTE_LOCAL_STORE= to publish.
+A trusted publisher owns the store and build cache. Independent consumers only
+read published generations; credentials/configuration/state remain private.
+For cross-identity use, choose a neutral host-owned location, never the human's
+private home or a world-writable multi-user cache. Provision the publisher and
+consumer permissions through the existing agent capability lanes.
+
+Generation identity includes the exact interpreter, ABI, backend and lock hash.
+Matching declarations reuse an installed generation. uv links compatible wheels
+from a publisher-owned cache on the same filesystem. Old generations are retained;
+no garbage collection or container destruction is coupled to publication. A
+failed generation is labelled by the absence of its receipt and requires explicit
+inspection before retry. Venvs are built at their permanent path so console-script
+shebangs remain valid, then made read-only and published through an atomic pointer.
+
+A CPU declaration rejects CUDA/Triton before creating a generation. CPU PyTorch
+needs a dedicated CPU-wheel source recipe and is deliberately refused by this
+minimal publisher rather than selecting PyPI's default GPU closure. Existing
+NumPy/ABI conflicts, the HelmCortex conda fallback and local hot-path elevation
+remain separate compatibility requirements. Do not merge them into one mutable
+fleet environment. No live application is migrated merely by tangling this module.
+
+* Placement policy
+#+BEGIN_SRC toml :tangle all/.config/dotcortex/dependencies.toml
+schema = 1
+
+[user_site]
+# Speech/GPU stacks must use a declared compatible runtime or shared service.
+# This is checked against every transitive item in the resolver report.
+forbidden = ["torch", "triton", "cuda-*", "nvidia-*", "openai-whisper", "faster-whisper"]
+
+# Add application-specific closures through Org source, never at runtime.
+# [runtimes.example]
+# python = "python3.12"
+# backend = "cpu"
+# lock = "all/.config/dotcortex/runtime-locks/example.txt"
+[runtimes]
+#+END_SRC
+
+* Dependency manager
+#+BEGIN_SRC python :tangle all/.local/bin/dotcortex-deps :tangle-mode (identity #o755)
+#!/usr/bin/env python3
+"""Declared dependency placement, bounded inventory, and immutable runtime publication."""
+import argparse
+from contextlib import contextmanager
+import email
+import fnmatch
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+from urllib.parse import urlsplit
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def canonical(name):
+    return re.sub(r'[-_.]+', '-', name).lower()
+
+
+def read_policy(path):
+    import tomllib
+    data = tomllib.loads(path.read_text())
+    if data.get('schema') != 1:
+        raise Refused('Unsupported dependency policy schema')
+    if not isinstance(data.get('user_site', {}).get('forbidden'), list):
+        raise Refused('Missing user_site.forbidden policy')
+    return data
+
+
+def forbidden(name, policy):
+    return any(fnmatch.fnmatchcase(canonical(name), p) for p in policy['user_site']['forbidden'])
+
+
+def python_identity(python):
+    exe = shutil.which(python)
+    if not exe:
+        raise Refused('Declared interpreter is unavailable; provision through its package lane')
+    code = 'import json,sys,sysconfig;print(json.dumps(dict(executable=sys.executable,version=list(sys.version_info[:3]),abi=sysconfig.get_config_var("SOABI"),prefix=sys.prefix)))'
+    result = subprocess.run([exe, '-I', '-c', code], check=True, capture_output=True, text=True)
+    return json.loads(result.stdout)
+
+
+def atomic_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix='.receipt-')
+    try:
+        with os.fdopen(fd, 'w') as stream:
+            json.dump(value, stream, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+@contextmanager
+def locked(path):
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as stream:
+        fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+
+
+def local_home(home):
+    """Reject broad, symlinked, and remote roots before inspecting exact user-site paths."""
+    home = Path(os.path.abspath(home))
+    if home.parent == home or len(home.parts) < 3 or home.is_symlink():
+        raise Refused('Inventory requires an explicit local user home, not an ancestor or symlink')
+    if sys.platform.startswith('linux'):
+        mounts = []
+        for line in Path('/proc/self/mountinfo').read_text().splitlines():
+            left, right = line.split(' - ', 1)
+            mount = Path(left.split()[4].replace('\\040', ' '))
+            if home == mount or mount in home.parents:
+                mounts.append((len(mount.parts), right.split()[0]))
+        if mounts and max(mounts)[1] in {'autofs', 'nfs', 'nfs4', 'cifs', 'sshfs', 'fuse.sshfs'}:
+            raise Refused('Inventory roots must be local; inspect remote hosts through their owner')
+    return home
+
+
+def inventory(homes, policy):
+    rows, gaps = [], []
+    for raw in homes:
+        home = local_home(raw)
+        base = home / '.local/lib'
+        try:
+            # Only immediate python*/site-packages/*.dist-info metadata, never a home walk.
+            if not base.exists():
+                continue
+            if base.resolve() != base:
+                raise Refused('User-site root is redirected; declare its local owner explicitly')
+            for py in sorted(base.iterdir()):
+                if not re.fullmatch(r'python\d+\.\d+', py.name) or py.is_symlink():
+                    continue
+                site = py / 'site-packages'
+                if site.is_symlink() or not site.is_dir():
+                    continue
+                for dist in sorted(site.iterdir()):
+                    if not dist.name.endswith('.dist-info') or dist.is_symlink():
+                        continue
+                    meta = dist / 'METADATA'
+                    if meta.is_symlink():
+                        continue
+                    msg = email.message_from_string(meta.read_text(errors='replace'))
+                    name = canonical(msg.get('Name', ''))
+                    if not name or not msg.get('Version'):
+                        raise Refused('Incomplete installed package metadata: ' + str(dist))
+                    rows.append(dict(home=str(home), python=py.name, name=name,
+                                     version=msg['Version'], path=str(dist),
+                                     route='declared-runtime' if forbidden(name, policy) else 'review-guix-or-compatible-runtime'))
+        except (PermissionError, FileNotFoundError) as exc:
+            gaps.append(dict(home=str(home), reason=type(exc).__name__))
+    groups = {}
+    for row in rows:
+        groups.setdefault((row['name'], row['version']), []).append(row['path'])
+    repeated = [dict(name=k[0], version=k[1], installations=v) for k, v in sorted(groups.items()) if len(v) > 1]
+    return dict(schema=1, coverage='explicit local user-site metadata only', packages=rows,
+                repeated=repeated, gaps=gaps, complete=not gaps,
+                caveat='Matching names/versions are not byte identity or physical savings; virtualenvs, Guix, conda and containers are excluded.')
+
+
+def manifest_requirements(path, policy, installed=None):
+    installed = installed or {}
+    requirements = []
+    for line in path.read_text().splitlines():
+        parts = shlex.split(line, comments=True)
+        if not parts:
+            continue
+        if len(parts) != 3 or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', parts[0]):
+            raise Refused('Invalid three-column pip manifest row')
+        name, version, source = parts
+        if forbidden(name, policy):
+            raise Refused(name + ': belongs in a declared runtime, not a user-site install')
+        if any(c in version + source for c in '\r\n'):
+            raise Refused('Invalid manifest requirement')
+        if source:
+            current = installed.get(canonical(name))
+            if not current:
+                raise Refused(name + ': source/VCS installation needs a declared build recipe before resolution')
+            # Preserve the already-installed source tool; never execute VCS build hooks in preflight.
+            requirements.append(name + '==' + current)
+        else:
+            requirements.append(name + ('==' + version if version else ''))
+    if not requirements:
+        raise Refused('Empty pip manifest')
+    return requirements
+
+
+def locked_report(report, policy):
+    """Consume the complete resolver report; install precisely these wheel hashes."""
+    if report.get('version') != '1' or not isinstance(report.get('install'), list):
+        raise Refused('Unsupported pip resolver report')
+    lines = []
+    for item in report['install']:
+        name = item.get('metadata', {}).get('name', '')
+        if not name or forbidden(name, policy):
+            raise Refused((name or 'unnamed dependency') + ': dependency belongs in a declared runtime')
+        download = item.get('download_info', {})
+        url = download.get('url', '')
+        parsed = urlsplit(url)
+        digest = download.get('archive_info', {}).get('hashes', {}).get('sha256', '')
+        if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.query or parsed.fragment
+                or not parsed.path.endswith('.whl') or not re.fullmatch(r'[0-9a-fA-F]{64}', digest)):
+            raise Refused(name + ': requires an immutable hashed wheel; route source builds through a declared runtime')
+        lines.append(f'{canonical(name)} @ {url} --hash=sha256:{digest}')
+    return lines
+
+
+def pip_apply(args, policy, root):
+    python = python_identity(args.python)
+    manifest = args.manifest or root / 'all/.pip/manifest/packages.ssv'
+    installed_code = 'import importlib.metadata as m,json,re;print(json.dumps({re.sub(r"[-_.]+","-",d.metadata["Name"]).lower():d.version for d in m.distributions() if d.metadata["Name"]}))'
+    installed = json.loads(subprocess.run([python['executable'], '-c', installed_code],
+                           capture_output=True, text=True, check=True).stdout)
+    requirements = manifest_requirements(manifest, policy, installed)
+    state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'dotcortex/dependencies'
+    receipt = state / 'user-site.json'
+    with locked(state / 'user-site.lock'):
+        previous = json.loads(receipt.read_text()) if receipt.exists() else None
+        if previous and (previous.get('status') != 'complete' or previous.get('python') != python):
+            raise Refused('Previous install is incomplete or interpreter changed; reconcile consumers before adopting another user site')
+        with tempfile.TemporaryDirectory(prefix='dotcortex-deps-') as tmp:
+            tmp = Path(tmp)
+            req = tmp / 'requirements.txt'
+            req.write_text('\n'.join(requirements) + '\n')
+            report = tmp / 'resolver.json'
+            common = [python['executable'], '-m', 'pip', '--isolated', '--disable-pip-version-check']
+            # Complete resolution happens before any install. No shell or provider calls.
+            subprocess.run(common + ['install', '--dry-run', '--only-binary=:all:', '--user',
+                           '--break-system-packages', '--report', str(report), '-r', str(req)], check=True)
+            plan = json.loads(report.read_text())
+            lines = locked_report(plan, policy)
+            print(json.dumps(dict(python=python, new_wheels=len(lines), mode='apply' if args.apply else 'plan')))
+            if not args.apply:
+                return
+            if lines:
+                lock = tmp / 'locked.txt'
+                lock.write_text('\n'.join(lines) + '\n')
+                record = dict(schema=1, python=python, status='incomplete',
+                              requirements_sha256=hashlib.sha256('\n'.join(requirements).encode()).hexdigest())
+                atomic_json(receipt, record)
+                # No re-resolution between the gate and mutation; dependencies are all in the report.
+                subprocess.run(common + ['install', '--user', '--break-system-packages', '--no-deps',
+                               '--require-hashes', '--only-binary=:all:', '-r', str(lock)], check=True)
+                subprocess.run(common + ['check'], check=True)
+                record['status'] = 'complete'
+            else:
+                record = dict(schema=1, python=python, status='complete',
+                              requirements_sha256=hashlib.sha256('\n'.join(requirements).encode()).hexdigest())
+            atomic_json(receipt, record)
+
+
+def runtime_spec(policy, name, root):
+    spec = policy.get('runtimes', {}).get(name)
+    if not isinstance(spec, dict) or not re.fullmatch(r'[a-z][a-z0-9-]*', name):
+        raise Refused('Runtime must be declared in package-dependencies.org policy')
+    if spec.get('backend') not in {'cpu', 'cuda', 'rocm', 'vulkan', 'none'}:
+        raise Refused('Runtime needs an explicit backend')
+    rel = Path(spec.get('lock', ''))
+    if rel.is_absolute() or '..' in rel.parts or not rel.parts:
+        raise Refused('Runtime lock must be a repository-relative file')
+    lock = (root / rel).resolve(strict=True)
+    if not lock.is_relative_to(root.resolve()):
+        raise Refused('Runtime lock escapes the declared repository')
+    # Accept a simple, fully pinned transitive wheel lock. No nested files or index options.
+    lock_bytes = lock.read_bytes()
+    lines = lock_bytes.decode().replace('\\\n', ' ').splitlines()
+    names = []
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*==[^\s;]+(?:\s+--hash=sha256:[0-9a-fA-F]{64})+', line):
+            raise Refused('Runtime requires a pinned, hash-locked wheel closure without installer directives')
+        package = canonical(line.split('==', 1)[0])
+        names.append(package)
+        if spec['backend'] in {'cpu', 'none', 'vulkan'} and (package.startswith(('nvidia-', 'cuda-')) or package == 'triton'):
+            raise Refused('GPU dependency contradicts declared runtime backend: ' + package)
+    if not names:
+        raise Refused('Empty runtime closure')
+    if spec['backend'] == 'cpu' and 'torch' in names:
+        raise Refused('CPU torch requires an explicitly selected CPU wheel source; package it through Guix or a dedicated recipe')
+    return spec, lock_bytes
+
+
+def trusted_store(path):
+    if not path.is_absolute() or path.is_symlink():
+        raise Refused('Runtime store must be an absolute, trusted local directory')
+    for parent in [path, *path.parents]:
+        if parent.exists():
+            stat = parent.stat()
+            # /tmp is unsuitable for a published multi-user runtime store.
+            if stat.st_uid not in {0, os.geteuid()} or stat.st_mode & 0o022:
+                raise Refused('Runtime store ancestry is writable by another identity')
+    local_home(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def runtime_build(args, policy, root):
+    spec, lock_bytes = runtime_spec(policy, args.name, root)
+    if spec['backend'] == 'cuda' and not Path('/dev/nvidiactl').exists():
+        raise Refused('CUDA runtime requires an available NVIDIA device on this host')
+    if spec['backend'] == 'rocm' and not Path('/dev/kfd').exists():
+        raise Refused('ROCm runtime requires an available AMD compute device on this host')
+    python = python_identity(spec['python'])
+    identity = dict(python=python, backend=spec['backend'], lock_sha256=hashlib.sha256(lock_bytes).hexdigest())
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    store = args.store
+    trusted_store(store)
+    trusted_store(store / args.name)
+    trusted_store(store / '.build-cache')
+    target = store / args.name / digest
+    current = store / args.name / 'current'
+    with locked(store / (args.name + '.lock')):
+        if target.exists():
+            receipt = target / 'dotcortex-runtime.json'
+            if not receipt.exists() or json.loads(receipt.read_text()) != identity:
+                raise Refused('Unfinished or mismatched generation exists; inspect it before retrying')
+        else:
+            target.mkdir(parents=True, mode=0o700)
+            frozen_lock = target / 'requirements.lock'
+            frozen_lock.write_bytes(lock_bytes)
+            uv = shutil.which('uv')
+            if not uv:
+                raise Refused('uv is missing; provision through the existing package lane')
+            env = {k: v for k, v in os.environ.items() if not k.startswith(('UV_', 'PIP_'))}
+            env.update(UV_CACHE_DIR=str(store / '.build-cache'), UV_PYTHON_DOWNLOADS='never')
+            subprocess.run([uv, '--no-config', 'venv', '--python', python['executable'], str(target)], env=env, check=True)
+            subprocess.run([uv, '--no-config', 'pip', 'sync', '--python', str(target / 'bin/python'),
+                            '--require-hashes', '--only-binary=:all:', '--no-build', '--link-mode', 'hardlink',
+                            '--strict', str(frozen_lock)], env=env, check=True)
+            if python_identity(spec['python']) != python:
+                raise Refused('Interpreter changed during build; generation remains unpublished')
+            atomic_json(target / 'dotcortex-runtime.json', identity)
+            for parent, dirs, files in os.walk(target, followlinks=False):
+                for filename in files:
+                    file = Path(parent) / filename
+                    if not file.is_symlink():
+                        file.chmod(0o555 if file.stat().st_mode & 0o111 else 0o444)
+                Path(parent).chmod(0o555)
+        # venvs are built at their permanent path: console-script shebangs never move.
+        tmp = current.with_name('.current-' + str(os.getpid()))
+        tmp.symlink_to(target.name)
+        os.replace(tmp, current)
+        print(json.dumps(dict(runtime=args.name, generation=digest, path=str(current), backend=spec['backend'])))
+
+
+def main(argv=None):
+    root = Path(os.environ.get('DOTCORTEX_ROOT', str(Path.home() / 'DotCortex')))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--policy', type=Path, default=root / 'all/.config/dotcortex/dependencies.toml')
+    sub = parser.add_subparsers(dest='command', required=True)
+    report = sub.add_parser('report', help='Read exact local user-site metadata; never walks a home')
+    report.add_argument('--home', action='append', default=[])
+    report.add_argument('--json', action='store_true')
+    pip = sub.add_parser('pip-apply', help='Resolve and check the complete user-site dependency plan')
+    pip.add_argument('--manifest', type=Path)
+    pip.add_argument('--python', default='python3')
+    pip.add_argument('--apply', action='store_true')
+    runtime = sub.add_parser('runtime-build', help='Publish/reuse one declared immutable runtime generation')
+    runtime.add_argument('name')
+    runtime.add_argument('--store', type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        policy = read_policy(args.policy)
+        if args.command == 'report':
+            result = inventory(args.home or [str(Path.home())], policy)
+            if args.json:
+                print(json.dumps(result, indent=2))
+            else:
+                print(f"User-site distributions: {len(result['packages'])}; repeated name/version pairs: {len(result['repeated'])}")
+                for row in result['packages']:
+                    if row['route'] == 'declared-runtime':
+                        print(f"MOVE TO DECLARED RUNTIME: {row['name']} {row['version']} ({row['home']}/{row['python']})")
+                for gap in result['gaps']:
+                    print('INCOMPLETE: ' + json.dumps(gap))
+                print(result['caveat'])
+            return 0 if result['complete'] else 2
+        if args.command == 'pip-apply':
+            pip_apply(args, policy, root)
+        else:
+            runtime_build(args, policy, root)
+        return 0
+    except (Refused, OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print('Dependency operation stopped: ' + str(exc), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
+#+END_SRC
+
+* Offline contract tests
+
+Run =loom deps:test= or the generated test file. Fixtures verify the actual install
+gate, incomplete coverage, backend rejection, runtime reuse and stable shebangs.
+No package downloads or live inference are performed by this suite.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-dotcortex-dependencies.py
+import argparse
+import importlib.machinery
+import json
+from pathlib import Path
+import tempfile
+import unittest
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[5]
+loader = importlib.machinery.SourceFileLoader('deps', str(ROOT / 'all/.local/bin/dotcortex-deps'))
+d = loader.load_module()
+POLICY = {'schema': 1, 'user_site': {'forbidden': ['torch', 'triton', 'nvidia-*', 'cuda-*', 'openai-whisper', 'faster-whisper']}}
+
+
+class DependencyTests(unittest.TestCase):
+    def test_transitive_gpu_rejected_before_install(self):
+        for name in ['torch', 'NVIDIA_CUBLAS_CU13', 'cuda-toolkit', 'triton']:
+            with self.subTest(name=name), self.assertRaises(d.Refused):
+                d.locked_report({'version': '1', 'install': [{'metadata': {'name': name}}]}, POLICY)
+
+    def test_wheel_plan_pins_artifact_and_rejects_unlocked_sources(self):
+        item = {'metadata': {'name': 'Example_Pkg'}, 'download_info': {
+            'url': 'https://example.invalid/pkg.whl', 'archive_info': {'hashes': {'sha256': 'a' * 64}}}}
+        lock = d.locked_report({'version': '1', 'install': [item]}, POLICY)
+        self.assertEqual(lock, ['example-pkg @ https://example.invalid/pkg.whl --hash=sha256:' + 'a' * 64])
+        for url in ['https://example.invalid/pkg.tar.gz', 'https://user:secret@example.invalid/pkg.whl', 'file:///tmp/pkg.whl']:
+            item['download_info']['url'] = url
+            with self.assertRaises(d.Refused):
+                d.locked_report({'version': '1', 'install': [item]}, POLICY)
+
+    def test_inventory_is_bounded_and_reports_duplicates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'user';home.mkdir()
+            for version in ['3.12', '3.13']:
+                path = home / '.local/lib' / ('python' + version) / 'site-packages/example-1.dist-info'
+                path.mkdir(parents=True);(path / 'METADATA').write_text('Name: example\nVersion: 1\n')
+            # A link outside the home is never followed.
+            (home / '.local/lib/python3.14').symlink_to('/unreachable-fleet-path')
+            result = d.inventory([str(home)], POLICY)
+            self.assertEqual(len(result['packages']), 2)
+            self.assertEqual(len(result['repeated']), 1)
+            self.assertTrue(result['complete'])
+        with self.assertRaises(d.Refused):
+            d.local_home('/home')
+
+    def test_permission_gap_is_not_clean_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / 'user';(home / '.local/lib').mkdir(parents=True)
+            original = Path.iterdir
+            def denied(path):
+                if path == home / '.local/lib':raise PermissionError('fixture')
+                return original(path)
+            with patch.object(Path, 'iterdir', denied):
+                self.assertFalse(d.inventory([str(home)], POLICY)['complete'])
+
+    def test_changed_or_failed_interpreter_receipt_stops_before_resolver(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp);manifest=tmp/'manifest.ssv';manifest.write_text('example "" ""\n')
+            state = tmp / 'dotcortex/dependencies';state.mkdir(parents=True)
+            args = argparse.Namespace(python='python3',manifest=manifest,apply=True)
+            for status, identity in [('incomplete', {'version': [3,13,0]}), ('complete', {'version': [3,12,0]})]:
+                (state/'user-site.json').write_text(json.dumps({'status': status, 'python': identity}))
+                with patch.dict(d.os.environ, {'XDG_STATE_HOME':str(tmp)}), patch.object(d,'python_identity',return_value={'executable':'/usr/bin/python3','version':[3,13,0]}), patch.object(d.subprocess,'run',return_value=argparse.Namespace(stdout='{}')) as run:
+                    with self.assertRaises(d.Refused):d.pip_apply(args,POLICY,tmp)
+                    self.assertEqual(run.call_count,1)
+                    self.assertIn('-c',run.call_args.args[0])
+
+    def test_backend_conflict_rejected_before_runtime_creation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp=Path(tmp);(tmp/'lock.txt').write_text('nvidia-cublas-cu13==1 --hash=sha256:'+'a'*64+'\n')
+            policy={**POLICY,'runtimes':{'speech':{'python':'python3','backend':'cpu','lock':'lock.txt'}}}
+            with self.assertRaises(d.Refused):d.runtime_spec(policy,'speech',tmp)
+            policy['runtimes']['speech']['lock']='../escape.txt'
+            with self.assertRaises(d.Refused):d.runtime_spec(policy,'speech',tmp)
+
+    def test_runtime_build_reuses_generation_and_keeps_permanent_shebang(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);(root/'lock.txt').write_text('example==1 --hash=sha256:'+'a'*64+'\n')
+            policy={**POLICY,'runtimes':{'speech':{'python':'python3','backend':'none','lock':'lock.txt'}}}
+            args=argparse.Namespace(name='speech',store=root/'store')
+            def fake_run(argv, **kwargs):
+                if 'venv' in argv:
+                    target=Path(argv[-1]);(target/'bin').mkdir();(target/'bin/python').symlink_to('/usr/bin/python3')
+                    (target/'bin/example').write_text('#!'+str(target/'bin/python')+'\n')
+                return None
+            # Test directories sit under /tmp; production deliberately refuses world-writable ancestry.
+            def local_store(path):path.mkdir(parents=True,exist_ok=True)
+            with patch.object(d,'trusted_store',side_effect=local_store),patch.object(d,'python_identity',return_value={'executable':'/usr/bin/python3','version':[3,13,0]}),patch.object(d.shutil,'which',return_value='/usr/bin/uv'),patch.object(d.subprocess,'run',side_effect=fake_run) as run:
+                d.runtime_build(args,policy,root)
+                target=(args.store/'speech/current').resolve()
+                self.assertIn(str(target/'bin/python'),(target/'bin/example').read_text())
+                self.assertEqual(target.stat().st_mode & 0o222,0)
+                self.assertEqual(run.call_count,2)
+                d.runtime_build(args,policy,root)
+                self.assertEqual(run.call_count,2)
+                self.assertIn('--require-hashes',run.call_args_list[1].args[0])
+                self.assertIn('--strict',run.call_args_list[1].args[0])
+
+    def test_source_build_is_never_executed_during_preflight(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path=Path(tmp)/'manifest.ssv';path.write_text('example "" "git+https://example.invalid/repo"\n')
+            with self.assertRaises(d.Refused):d.manifest_requirements(path,POLICY)
+            self.assertEqual(d.manifest_requirements(path,POLICY,{'example':'1'}),['example==1'])
+
+    def test_full_pip_gate_installs_only_the_accepted_wheel_lock(self):
+        for package in ['example', 'nvidia-cublas-cu13']:
+            with self.subTest(package=package),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);manifest=root/'manifest.ssv';manifest.write_text('example "" ""\n')
+                args=argparse.Namespace(python='python3',manifest=manifest,apply=True)
+                commands=[]
+                def run(argv,**kwargs):
+                    commands.append(argv)
+                    if '--report' in argv:
+                        Path(argv[argv.index('--report')+1]).write_text(json.dumps({'version':'1','install':[{'metadata':{'name':package},'download_info':{'url':'https://example.invalid/example.whl','archive_info':{'hashes':{'sha256':'a'*64}}}}]}))
+                    if '--require-hashes' in argv:
+                        self.assertIn('--no-deps',argv)
+                        lock=Path(argv[-1]).read_text();self.assertIn('--hash=sha256:',lock)
+                    return argparse.Namespace(stdout='{}')
+                with patch.dict(d.os.environ,{'XDG_STATE_HOME':str(root)}),patch.object(d,'python_identity',return_value={'executable':'/usr/bin/python3','version':[3,13,0]}),patch.object(d.subprocess,'run',side_effect=run):
+                    if package.startswith('nvidia'):
+                        with self.assertRaises(d.Refused):d.pip_apply(args,POLICY,root)
+                        self.assertFalse(any('--require-hashes' in c for c in commands))
+                    else:
+                        d.pip_apply(args,POLICY,root)
+                        receipt=json.loads((root/'dotcortex/dependencies/user-site.json').read_text())
+                        self.assertEqual(receipt['status'],'complete')
+                        self.assertEqual(sum('--report' in c for c in commands),1)
+
+    def test_untrusted_shared_store_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(d.Refused):d.trusted_store(Path(tmp)/'shared')
+
+    def test_loom_canonical_apply_uses_guarded_lane(self):
+        source=(ROOT/'loom.org').read_text()
+        segment=source.split("(task 'pip:apply",1)[1].split("(task 'pip:health",1)[0]
+        self.assertIn('dotcortex-deps',segment)
+        self.assertIn('pip-apply --apply',segment)
+        for verb in ['deps:report','pip:plan','deps:test']:
+            self.assertIn("(task '"+verb,source)
+
+
+if __name__ == '__main__':unittest.main()
+#+END_SRC
