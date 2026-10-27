@@ -2509,7 +2509,7 @@ echo "$COUNT" > "$COUNTFILE"
 
 In a Telegram-bridged session the assistant's transcript text never reaches Mètsàtron — only a Telegram reply tool call does. This Stop hook lives in the SHARED baseline so it deploys to =~/.claude/settings.json= at USER scope: it therefore protects every warm bot (Fable/Auryn/Haiku/Opus) regardless of working directory, unlike the old HelmCortex-root-only wiring that most bots never loaded (Claude Code loads the cwd's own =.claude/settings.json= plus user scope, not ancestor project dirs).
 
-At turn end, if the LAST user prompt arrived from Telegram (carries a =<channel source="...telegram...">= tag) or starts with the stable =[mailcortex-wake]= marker and the turn produced spoken assistant text but made no Telegram delivery call (=reply=/=edit_message=), it blocks the stop and tells the model to deliver. A mail wake has no inbound channel tag: the reason names =MAILCORTEX_WAKE_REPLY_CHAT= from the launch environment, or states plainly that it is unset or still a placeholder. Provision the real value in the private seat launch configuration, never public source. A plain TUI prompt is never blocked (the terminal is what the user sees there). Gated to channel-bound sessions; fail-OPEN on any error (never wedge a session); never loops (honors =stop_hook_active=). The transcript read retries once to survive a flush race, and logs the distinct failure shapes (missing path / present-but-unreadable / no transcript_path) so a real fault is diagnosable rather than silent.
+At turn end, because the session is channel-bound (Gate 1 requires =CLAUDE_IDLE_CHANNEL=), the transcript is not the user's view: so if the turn produced spoken assistant text but made no Telegram delivery call (=reply=/=edit_message=), it blocks the stop and tells the model to deliver — regardless of what the last user record was. This is the 2026-10-27 fix: the guard used to bind only when the LAST user prompt still carried a =<channel ...telegram>= tag or the =[mailcortex-wake]= marker, but interrupts (=[Request interrupted by user for tool use]=) and background events (=<task-notification>=, slash-command output) arrive as text-carrying user records with no channel tag, and when one of those was the last user text the guard passed and let a reply leak to the console. Now such synthetic records are skipped when picking the binding prompt, and the channel-tag early-pass is gone. The remaining role of the (synthetic-skipped) last prompt is only to choose the reason: a mail wake (its =[mailcortex-wake]= marker) names =MAILCORTEX_WAKE_REPLY_CHAT= from the launch environment — or states plainly that it is unset or a placeholder (provision the real value in the private seat launch config, never public source) — while an ordinary channel turn names the inbound =<channel>= chat. A plain TUI session is still never blocked (Gate 1 exits first — the terminal is what the user sees there). Fail-OPEN on any error (never wedge a session); never loops (honors =stop_hook_active=). The transcript read retries once to survive a flush race, and logs the distinct failure shapes (missing path / present-but-unreadable / no transcript_path) so a real fault is diagnosable rather than silent.
 
 #+BEGIN_SRC bash :tangle all/.local/bin/claude-hook-telegram-delivery-guard :shebang "#!/usr/bin/env bash" :comments no
 # ~/DotCortex/all/.local/bin/claude-hook-telegram-delivery-guard
@@ -2579,8 +2579,15 @@ def texts(content):
                 if t: out.append(t)
     return out
 
-# Last REAL user prompt: type=user, role=user, carrying text.
-# (tool_result turns are role=user but carry only tool_result blocks -- not prompts.)
+# Last REAL user prompt: type=user, role=user, carrying text -- but skip
+# SYNTHETIC injected records when choosing the binding prompt. Interrupts
+# ("[Request interrupted by user for tool use]") and background events
+# ("<task-notification>", slash-command output) arrive as text-carrying user
+# records with NO channel tag; counting one as the binding prompt let a
+# spoke-without-delivery turn slip past the guard (2026-10-27). last_user stays
+# the scan cutoff (the assistant output of this turn); last_text is the real one.
+# (tool_result turns are role=user but carry only tool_result blocks.)
+SYNTHETIC = re.compile(r"^\s*(?:\[Request interrupted\b|<task-notification>|<local-command-)", re.I)
 last_user = -1
 last_text = ""
 for i, d in enumerate(recs):
@@ -2588,18 +2595,20 @@ for i, d in enumerate(recs):
     m = d.get("message") or {}
     if m.get("role") != "user": continue
     joined = "\n".join(texts(m.get("content"))).strip()
-    if joined:
-        last_user = i
+    if not joined: continue
+    last_user = i
+    if not SYNTHETIC.match(joined):
         last_text = joined
 
 if last_user < 0:
     print("pass"); sys.exit(0)
 
-# Mail wakes use a leading marker because they have no inbound channel tag.
-# A mention of the marker inside a plain TUI prompt must not bind that turn.
+# Gate 1 already proved this is a channel-bound (bridged) session: the transcript
+# is NOT what the user sees, so ANY turn that spoke assistant text without a Telegram
+# delivery is a lost message and must block -- regardless of whether the last user
+# record carried a <channel ...telegram> tag. last_text (synthetic records skipped)
+# only selects the reason: a mail wake (its marker) vs an ordinary channel turn.
 mail_wake = bool(re.match(r"^\[mailcortex-wake\](?:\s|$)", last_text))
-if not mail_wake and not re.search(r"<channel\b[^>]*telegram", last_text, re.I):
-    print("pass"); sys.exit(0)
 
 deliver = re.compile(r"telegram.*(reply|edit_message)", re.I)
 spoke = delivered = False
@@ -3160,7 +3169,7 @@ fi
 export DOTCORTEX_HOOK_INPUT="$HOOK_INPUT"
 
 python3 - <<'PYEOF'
-import json, os, re, ssl, subprocess, sys, urllib.parse, urllib.request
+import json, os, re, ssl, subprocess, sys, time, urllib.parse, urllib.request
 from shutil import which
 
 raw = os.environ.get('DOTCORTEX_HOOK_INPUT', '')
@@ -3210,24 +3219,38 @@ api = 'https://api.telegram.org'
 _ca = '/etc/ssl/certs/ca-certificates.crt'
 tls = ssl.create_default_context(cafile=_ca) if os.path.exists(_ca) else None
 safe_id = re.sub(r'[^A-Za-z0-9_-]', '_', file_id)[:64]
-try:
-    with urllib.request.urlopen(
-            '%s/bot%s/getFile?file_id=%s' % (api, token,
-                                             urllib.parse.quote(file_id)),
-            timeout=30, context=tls) as r:
-        remote = json.load(r)['result']['file_path']
-    ext = os.path.splitext(remote)[1] or '.oga'
-    audio = os.path.join(inbox, 'voice-%s%s' % (safe_id, ext))
-    if not os.path.exists(audio):
+# The download is the feature's single network step and single point of failure.
+# A transient getFile/file blip (seen as a bare URLError, 2026-10-27) used to lose
+# the note with a one-word reason. Retry once, and on final failure surface
+# str(e) -- the actual cause (DNS / timeout / route / TLS), token redacted -- so
+# a real fault is diagnosable instead of opaque.
+audio = None
+last_err = None
+for attempt in (1, 2):
+    try:
         with urllib.request.urlopen(
-                '%s/file/bot%s/%s' % (api, token, remote), timeout=120,
-                context=tls) as r, \
-                open(audio, 'wb') as f:
-            f.write(r.read())
-except Exception as e:
-    ctx('[voice-transcribe] download failed (%s) — attachment %s not '
-        'transcribed; use download_attachment + whisper-transcribe manually'
-        % (e.__class__.__name__, file_id))
+                '%s/bot%s/getFile?file_id=%s' % (api, token,
+                                                 urllib.parse.quote(file_id)),
+                timeout=30, context=tls) as r:
+            remote = json.load(r)['result']['file_path']
+        ext = os.path.splitext(remote)[1] or '.oga'
+        audio = os.path.join(inbox, 'voice-%s%s' % (safe_id, ext))
+        if not os.path.exists(audio):
+            with urllib.request.urlopen(
+                    '%s/file/bot%s/%s' % (api, token, remote), timeout=120,
+                    context=tls) as r, \
+                    open(audio, 'wb') as f:
+                f.write(r.read())
+        break
+    except Exception as e:
+        last_err, audio = e, None
+        if attempt == 1:
+            time.sleep(1.5)
+if audio is None:
+    reason = str(last_err).replace(token, '<token>') if token else str(last_err)
+    ctx('[voice-transcribe] download failed after 2 tries (%s: %s) — attachment '
+        '%s not transcribed; use download_attachment + whisper-transcribe manually'
+        % (last_err.__class__.__name__, reason, file_id))
 
 transcript_path = audio + '.transcript.md'
 if not os.path.exists(transcript_path):
