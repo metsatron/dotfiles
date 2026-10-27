@@ -733,7 +733,7 @@ def _floor_verb(lowered, coordinator=None):
             and lowered[4] in {'handling_completed', 'handling_deferred', 'handling_failed', 'handling_rejected'}
             and not any(ch in word for word in lowered for ch in '`$\\')):
         return False
-    if lowered and lowered[0] == 'mailcortex' and lowered[1:2] not in (['inbox'], ['read']) and not (lowered[-1:] in (['--help'], ['--version'], ['-h']) and len(lowered) <= 3) and coordinator not in {'coordinator_mail_send', 'coordinator_remote_mail_send', 'coordinator_mail_help'}:
+    if lowered and lowered[0] == 'mailcortex' and lowered[1:2] not in (['inbox'], ['read']) and not (lowered[-1:] in (['--help'], ['--version'], ['-h']) and len(lowered) <= 3) and coordinator not in {'coordinator_mail_send', 'coordinator_remote_mail_send', 'coordinator_mail_help', 'coordinator_mail_receipt'}:
         return True
     if lowered[:1] in (['eval'], ['source'], ['.'], ['xargs']):
         return True  # opaque execution cannot erase the floor
@@ -4874,10 +4874,10 @@ def _coordinator_candidate(command):
     return words[0] in {'codex', 'nohup', 'scp'} or words[:1] == ['mailcortex']
 
 
-def _coordinator_mail_filter(words):
-    """Only bounded head/tail counts or a literal cut character range on stdin.
+def _coordinator_mail_filter(words, *, print_selectors=False):
+    """Prove bounded stdin filters; print selectors are own-read opt-in only.
 
-    No filenames, follow modes, programs (AWK/sed), or general filter proof.
+    No filenames, follow modes, general sed programs, or executable language.
     """
     if not words:
         return False
@@ -4887,6 +4887,14 @@ def _coordinator_mail_filter(words):
         return (not args
                 or (len(args) == 1 and re.fullmatch(r'-(?:n)?' + count, args[0]) is not None)
                 or (len(args) == 2 and args[0] == '-n' and re.fullmatch(count, args[1]) is not None))
+    if print_selectors and len(words) == 3 and words[:2] == ['sed', '-n']:
+        # A positive grammar, not an e/w/r blacklist: one or two addresses
+        # followed only by p. No files, flags, substitutions, branches or code.
+        address = r'(?:[1-9][0-9]{0,5}|/[A-Za-z0-9_ :.^$-]{1,96}/)'
+        selectors = words[2].split(';')
+        return (1 <= len(selectors) <= 16 and all(
+            re.fullmatch(address + r'(?:,' + address + r')?p', item) is not None
+            for item in selectors))
     if words[0] == 'cut' and len(words) == 2:
         match = re.fullmatch(r'-c([1-9][0-9]{0,5})-([1-9][0-9]{0,5})', words[1])
         return match is not None and int(match[1]) <= int(match[2])
@@ -4922,7 +4930,7 @@ def _coordinator_mail_operators(command):
     return None if quote is not None else operators
 
 
-def _coordinator_mail_words(command):
+def _coordinator_mail_words(command, *, print_selectors=False):
     """Parse one approved mail argv after proving its shell syntax inert."""
     if (not isinstance(command, str) or _dynamic_shell(command)
             or any(ord(char) < 32 or ord(char) == 127 for char in command)):
@@ -4943,7 +4951,7 @@ def _coordinator_mail_words(command):
             filter_words = shlex.split(filter_command, posix=True)
         except ValueError:
             return None
-        if not _coordinator_mail_filter(filter_words):
+        if not _coordinator_mail_filter(filter_words, print_selectors=print_selectors):
             return None
     base = base.rstrip()
     operators = _coordinator_mail_operators(base)
@@ -4957,6 +4965,24 @@ def _coordinator_mail_words(command):
         return shlex.split(base, posix=True)
     except ValueError:
         return None
+
+
+def _coordinator_own_mail_read(words, config):
+    """Bind aliases to the policy-owned consort principal, never requested From.
+
+    Native address_maildir discards .helm domain provenance. It does not
+    discard the local principal or namespace. Sender authority remains exact.
+    """
+    if (not words or words[:2] not in (['mailcortex', 'inbox'], ['mailcortex', 'read'])
+            or len(words) != (3 if words[1] == 'inbox' else 4)):
+        return False
+    account = config.get('seat_account', '')
+    principal = account.split('@', 1)[0]
+    if (not re.fullmatch(r'[A-Za-z0-9_.-]+', principal)
+            or re.fullmatch(re.escape(principal) + r'@[A-Za-z0-9_.-]+\.helm', words[2]) is None):
+        return False
+    return (words[1] == 'inbox' or re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,255}', words[3]) is not None
+            and not _protected(words[3]))
 
 
 def _coordinator_mail_help(words):
@@ -5137,18 +5163,20 @@ def _coordinator_match(event, manifest):
     if words is None:
         return None
     flags = config['classes']
+    if (manifest['entries']['local_read']['enabled']
+            and _coordinator_own_mail_read(_coordinator_mail_words(command, print_selectors=True), config)):
+        return 'local_read'
     if words[:1] == ['mailcortex'] and flags['mail_send']:
         mail_words = _coordinator_mail_words(command)
         # Native receipt takes a seat component, not an address or filename.
         # Only this manifest's own seat and completion state are authorized;
-        # no shell redirects/pipelines or alternate lifecycle states here.
+        # descriptor/filter syntax was already proved stdin-only by the parser.
         seat = config['seat_account'].split('@', 1)[0]
         if (mail_words is not None and len(mail_words) == 5
                 and mail_words[:3] == ['mailcortex', 'receipt', seat]
                 and re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', seat)
                 and _coordinator_message_id(mail_words[3])
-                and mail_words[4] == 'handling_completed'
-                and _coordinator_mail_operators(command) == []):
+                and mail_words[4] == 'handling_completed'):
             return 'coordinator_mail_receipt'
     remote_grant = _peer_coordinator_match(command, words, config, manifest)
     if remote_grant is not None:
@@ -5510,6 +5538,43 @@ def _classify_scoped(event, manifest):
     return allow, reason
 
 
+def _terminal_exit_status(text):
+    """Prove echo's one literal label plus sole status expansion, never eval.
+
+    Keep shell quoting until the only permitted expansion is marked. Single
+    quoted dollars are data, not status; escapes/options/operators are absent.
+    """
+    if (not isinstance(text, str) or len(text) > 256 or '\\' in text
+            or any(ord(char) < 32 or ord(char) == 127 for char in text)):
+        return False
+    marked, quote, expansions, index = [], None, 0, 0
+    while index < len(text):
+        char = text[index]
+        if char in {'\'', '"'}:
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+        if char == '$' and quote != "'":
+            width = 2 if text.startswith('$?', index) else 4 if text.startswith('${?}', index) else 0
+            if not width:
+                return False
+            marked.append('\x00')
+            expansions += 1
+            index += width
+            continue
+        marked.append(char)
+        index += 1
+    if quote is not None or expansions != 1:
+        return False
+    try:
+        words = shlex.split(''.join(marked), posix=True)
+    except ValueError:
+        return False
+    return (len(words) == 2 and words[0] == 'echo'
+            and re.fullmatch(r'[A-Za-z][A-Za-z0-9_. :+=-]{0,63}\x00', words[1]) is not None)
+
+
 def _compound_approval(event, manifest, judge=None):
     """Preflight every segment's floor, then apply its standalone decision.
 
@@ -5535,8 +5600,9 @@ def _compound_approval(event, manifest, judge=None):
     variables = {}
     previous_result = None
     mail_status = (len(segments) == 2 and segments[0][1].startswith('mailcortex ')
-                   and segments[1] == (';', 'echo "exit=$?"')
-                   and command.endswith('; echo "exit=$?"'))
+                   and segments[1][0] == ';' and _terminal_exit_status(segments[1][1])
+                   and command.rstrip(' ').endswith(segments[1][1])
+                   and not any(ord(char) < 32 or ord(char) == 127 for char in command))
     for index, (separator, text) in enumerate(segments, 1):
         # The diagnostic proves and final-judges the original mail operation.
         # Rewriting even a literal '$HOME' changes data; rewriting "$HOME"
@@ -5552,11 +5618,9 @@ def _compound_approval(event, manifest, judge=None):
         stage = {**event, 'cwd': current, 'tool_input': {**payload, 'command': expanded_text}}
         # Only this terminal, literal readout of a proven mail operation is
         # special. Never evaluate $? or permit generic echo/body interpolation.
-        mail_words = (_coordinator_mail_words(segments[0][1]) or []) if mail_status else []
+        mail_words = (_coordinator_mail_words(segments[0][1], print_selectors=True) or []) if mail_status else []
         own_read = (previous_result == (True, 'local_read')
-                    and mail_words[:2] in (['mailcortex', 'inbox'], ['mailcortex', 'read'])
-                    and len(mail_words) == (3 if mail_words[1] == 'inbox' else 4)
-                    and mail_words[2] == manifest.get('coordinator_ops', {}).get('seat_account'))
+                    and _coordinator_own_mail_read(mail_words, manifest.get('coordinator_ops', {})))
         diagnostic = (mail_status and index == 2
                       and (previous_result in {(True, 'coordinator_mail_send'),
                                                (True, 'coordinator_mail_help'),
