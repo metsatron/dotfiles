@@ -296,6 +296,8 @@ def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None)
             or _protected(raw) or '.claude.json' in raw
             or _protected(normalized_raw) or '.claude.json' in normalized_raw):
         return True
+    if event.get('tool_name') in AGENTIFY_BROWSER_TOOLS:
+        return not _agentify_browser_capability(event, manifest)
     if isinstance(command, str):
         command_without_documents = _strip_heredoc_bodies(command)
         nested = _shell_substitutions(command_without_documents if command_without_documents is not None else command)
@@ -496,6 +498,8 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
     # compound or scratch redirect cannot reach the Decider.
     if isinstance(tool_input, dict) and _credential_content(tool_input):
         return True
+    if event.get('tool_name') in AGENTIFY_BROWSER_TOOLS:
+        return not _agentify_browser_capability(event, manifest)
     roots = _policy_roots(manifest) if manifest is not None and _inversion_enabled(manifest) else (tuple(manifest.get("roots") or ()) + tuple(manifest.get("scratch_roots") or ())) if manifest is not None else ()
     if coordinator is not None and manifest is not None:
         config = _coordinator_config(manifest)
@@ -1524,7 +1528,7 @@ def _load_manifest(data=None):
     version = data.get("manifest_version") if isinstance(data, dict) else None
     if version == "claude-approval-canary.kikin.v2":
         allowed_keys = allowed_keys | {"decider"}
-    if not isinstance(data, dict) or not allowed_keys <= set(data) or (set(data) - allowed_keys - {"unattended", "coordinator_ops", "gate_inversion", "notifications"}) or data.get("schema") != SCHEMA or version not in (VERSION, "claude-approval-canary.kikin.v2"):
+    if not isinstance(data, dict) or not allowed_keys <= set(data) or (set(data) - allowed_keys - {"unattended", "coordinator_ops", "gate_inversion", "notifications", "agentify_browser"}) or data.get("schema") != SCHEMA or version not in (VERSION, "claude-approval-canary.kikin.v2"):
         raise ValueError("invalid Kikin manifest")
     if not isinstance(data["hard_floor_ids"], list) or not isinstance(data["classes"], list) or not 4 <= len(data["classes"]) <= len(CLASS_NAMES):
         raise ValueError("invalid Kikin manifest classes")
@@ -5434,6 +5438,93 @@ def _mail_read_batch_proven(event, manifest):
     return not _admiral_floor(proof, manifest)
 
 
+AGENTIFY_BROWSER_TOOLS = {
+    'mcp__agentify__agentify_tab_create',
+    'mcp__agentify__agentify_ensure_ready',
+    'mcp__agentify__agentify_query',
+    'mcp__agentify__agentify_navigate',
+}
+
+
+def _agentify_browser_capability(event, manifest):
+    """Trusted private grant, never request-supplied browser/account authority.
+
+    Provision only after verifying a dedicated, nonprotected key in the existing
+    authenticated profile. No raw tab IDs, default/vendor tabs, uploads, context
+    packing, login or challenge automation are admitted by this capability.
+    """
+    if not isinstance(manifest, dict) or not isinstance(event, dict):
+        return False
+    grant = manifest.get('agentify_browser')
+    fields = {'enabled', 'seat_account', 'session_id', 'cwd', 'browser_authority',
+              'dedicated_key', 'model', 'tab_policy', 'prompts', 'navigation_urls'}
+    seat = manifest.get('coordinator_ops')
+    if (not isinstance(grant, dict) or set(grant) != fields
+            or grant.get('enabled') is not True or not isinstance(seat, dict)
+            or not isinstance(grant.get('seat_account'), str)
+            or not re.fullmatch(r'[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+\.helm', grant['seat_account'])
+            or grant['seat_account'] != seat.get('seat_account')
+            or grant.get('browser_authority') != 'existing_authenticated_profile'
+            or grant.get('tab_policy') != 'dedicated_nonprotected'):
+        return False
+    session, cwd, key = (grant.get(field) for field in ('session_id', 'cwd', 'dedicated_key'))
+    if (not isinstance(session, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', session)
+            or event.get('session_id') != session
+            or not isinstance(cwd, str) or not cwd.startswith('/') or cwd == '/'
+            or os.path.realpath(cwd) != cwd or event.get('cwd') != cwd
+            or _protected(cwd)
+            or not isinstance(key, str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_-]{1,127}', key)
+            or key.casefold() in {'default', 'protected', 'chatgpt', 'gemini', 'claude', 'perplexity'}
+            or not isinstance(grant.get('model'), str)
+            or grant['model'] not in {'gemini', 'chatgpt'}):
+        return False
+    prompts, urls = grant.get('prompts'), grant.get('navigation_urls')
+    if (not isinstance(prompts, list) or len(prompts) > 32
+            or not all(isinstance(text, str) and text.strip() and len(text) <= 8192
+                       and all(ord(char) >= 32 or char in '\n\t' for char in text)
+                       for text in prompts)
+            or not isinstance(urls, list) or len(urls) > 32
+            or not all(isinstance(url, str) for url in urls)):
+        return False
+    tool = event.get('tool_name')
+    if (event.get('hook_event_name') != 'PermissionRequest'
+            or not isinstance(tool, str) or tool not in AGENTIFY_BROWSER_TOOLS):
+        return False
+    payload = event.get('tool_input')
+    schemas = {
+        'mcp__agentify__agentify_tab_create': {'key', 'model', 'name', 'show'},
+        'mcp__agentify__agentify_ensure_ready': {'key', 'model', 'timeoutMs'},
+        'mcp__agentify__agentify_query': {'key', 'model', 'prompt', 'timeoutMs'},
+        'mcp__agentify__agentify_navigate': {'key', 'model', 'url'},
+    }
+    if (tool not in schemas or not isinstance(payload, dict)
+            or not {'key', 'model'} <= set(payload) or not set(payload) <= schemas[tool]
+            or payload['key'] != key or payload['model'] != grant['model']):
+        return False
+    if 'timeoutMs' in payload and (type(payload['timeoutMs']) is not int
+                                  or not 1 <= payload['timeoutMs'] <= 600000):
+        return False
+    if tool == 'mcp__agentify__agentify_query':
+        prompt = payload.get('prompt')
+        # Defence in depth, not a semantic safety classifier: the trusted grant
+        # must already contain only the user's reviewed, public prompt bytes.
+        auth = r'(?i)\b(?:auth\w*|oauth\w*|captcha|bypass|log[ -]?in|sign[ -]?in|password\w*|credential\w*|cookie\w*|token\w*|secret\w*|2fa|mfa)\b'
+        return (isinstance(prompt, str) and prompt in prompts
+                and not re.search(auth, prompt))
+    if tool == 'mcp__agentify__agentify_navigate':
+        url = payload.get('url')
+        pattern = (r'https://gemini\.google\.com/app/[0-9a-f]{16,64}' if grant['model'] == 'gemini'
+                   else r'https://chatgpt\.com/c/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}')
+        return isinstance(url, str) and url in urls and re.fullmatch(pattern, url) is not None
+    if tool == 'mcp__agentify__agentify_ensure_ready':
+        return True
+    if 'show' in payload and type(payload['show']) is not bool:
+        return False
+    name = payload.get('name', key)
+    return (isinstance(name, str) and 0 < len(name) <= 128
+            and all(ord(char) >= 32 and ord(char) != 127 for char in name))
+
+
 def _agentify_status_readonly(event):
     """Grant only the declared Agentify status query and its inert selectors."""
     if not isinstance(event, dict) or event.get('tool_name') != 'mcp__agentify__agentify_status':
@@ -5466,6 +5557,8 @@ def _classify_single(event, manifest):
     # scanned again on the FULL original request and still win.
     if floor and (coordinator is None or _true_floor(event, manifest, coordinator, readonly_proven=readonly_proven)):
         return False, "true_floor"
+    if _agentify_browser_capability(event, manifest):
+        return True, 'agentify_browser_capability'
     if _agentify_status_readonly(event):
         return True, 'agentify_status_readonly'
     # Installed MCP inputSchema is empty; GET /tabs copies in-memory rows.
