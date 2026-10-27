@@ -1729,8 +1729,9 @@ def _plain_observation_words(words, cwd, manifest, *, piped=False):
             arg in {'-p', '-e', '-t'} or (i > 0 and args[i - 1] == '-t' and not arg.startswith('-'))
             for i, arg in enumerate(args[1:], 1))
     if verb == 'mailcortex':
-        return bool(args) and args[0] in {'inbox', 'read'} and not any(arg in {'--help', '-h', '--version'} for arg in args) and not any(
-            any(ch in arg for ch in '><;&|`$\\') for arg in args)
+        # Mail reads require the complete own-seat coordinator proof, including
+        # the original pipeline. Generic observation filters cannot grant mail.
+        return False
     if verb in {'pgrep', 'ps'}:
         return bool(args) and not any(arg in {'-o', '--signal', '-signal'} for arg in args)
     if verb not in {'ls', 'stat', 'cat', 'grep', 'rg', 'find'}:
@@ -1976,9 +1977,9 @@ def _local_match(event, manifest, words=None):
     if verb in SYSTEM_READERS:
         return _system_read_match(verb, args)
     if verb == "mailcortex":
-        return (len(args) >= 1 and args[0] in {"inbox", "read"}
-                and not any(arg in {'--help', '-h', '--version'} for arg in args)) and all(
-            not any(char in arg for char in "><;&`$\\") for arg in args[1:])
+        # Never recover a refused own-seat/selector proof via the legacy
+        # generic read fallback. _coordinator_match owns the whole mail argv.
+        return False
     if verb == "tmux":
         if not args:
             return False
@@ -2458,7 +2459,9 @@ def _split_approval_compound(command):
             if char == '|' and (not ''.join(current).strip() or ''.join(current).rstrip().endswith('|')):
                 return None
             if char == '$':
-                expansion = re.match(r'\$\{[A-Za-z_][A-Za-z0-9_]*\}', command[index:])
+                # Tokenize only a complete simple parameter expansion; the
+                # diagnostic/operand proof still decides whether it is allowed.
+                expansion = re.match(r'\$\{(?:[A-Za-z_][A-Za-z0-9_]*|\?)\}', command[index:])
                 if expansion:
                     current.append(expansion.group()); index += expansion.end(); continue
             if char in {'&', '\\', '\r', '(', ')', '{', '}'}:
@@ -4887,6 +4890,10 @@ def _coordinator_mail_filter(words, *, print_selectors=False):
         return (not args
                 or (len(args) == 1 and re.fullmatch(r'-(?:n)?' + count, args[0]) is not None)
                 or (len(args) == 2 and args[0] == '-n' and re.fullmatch(count, args[1]) is not None))
+    if print_selectors and len(words) == 2 and words[0] == 'grep':
+        # Native inbox summaries select a literal, bounded line pattern only:
+        # no options, file operands, pattern files or executable preprocessors.
+        return re.fullmatch(r'[A-Za-z0-9_ :.^$-]{1,96}', words[1]) is not None and not words[1].startswith('-')
     if print_selectors and len(words) == 3 and words[:2] == ['sed', '-n']:
         # A positive grammar, not an e/w/r blacklist: one or two addresses
         # followed only by p. No files, flags, substitutions, branches or code.
@@ -4939,20 +4946,24 @@ def _coordinator_mail_words(command, *, print_selectors=False):
     if operators is None:
         return None
     pipes = [index for index in operators if command[index] == '|']
-    if len(pipes) > 1:
+    if len(pipes) > (2 if print_selectors else 1):
         return None
     base = command
     if pipes:
-        split = pipes[0]
-        base, filter_command = command[:split].rstrip(), command[split + 1:].strip()
-        if _coordinator_mail_operators(filter_command) != []:
-            return None
-        try:
-            filter_words = shlex.split(filter_command, posix=True)
-        except ValueError:
-            return None
-        if not _coordinator_mail_filter(filter_words, print_selectors=print_selectors):
-            return None
+        # Own reads retain the native grep | tail inbox summary, but every
+        # stage must independently prove stdin-only under the same grammar.
+        ends = pipes[1:] + [len(command)]
+        for start, end in zip(pipes, ends):
+            filter_command = command[start + 1:end].strip()
+            if _coordinator_mail_operators(filter_command) != []:
+                return None
+            try:
+                filter_words = shlex.split(filter_command, posix=True)
+            except ValueError:
+                return None
+            if not _coordinator_mail_filter(filter_words, print_selectors=print_selectors):
+                return None
+        base = command[:pipes[0]].rstrip()
     base = base.rstrip()
     operators = _coordinator_mail_operators(base)
     terminal = re.search(r'\s2>&1$', base)
