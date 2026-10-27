@@ -61,6 +61,49 @@ class MailCortexTests(unittest.TestCase):
             check=False,
         )
 
+    def test_shared_delivery_is_explicit_and_receiver_group_readable(self):
+        for leaf in ("tmp", "new"):
+            (self.maildir / leaf).chmod(0o3700)
+        sent = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
+                                "--subject", "shared", "--body", "literal body", "--shared-delivery")
+        self.assertEqual(sent.returncode, 0, sent.stderr)
+        path = self.maildir / "new" / sent.stdout.strip()
+        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(path.stat().st_gid, self.maildir.stat().st_gid)
+        msg = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+        self.assertEqual(msg.get_content().strip(), "literal body")
+        private = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
+                                   "--subject", "private", "--body", "unchanged")
+        self.assertEqual(private.returncode, 0, private.stderr)
+        self.assertEqual((self.maildir / "new" / private.stdout.strip()).stat().st_mode & 0o777, 0o600)
+
+    def test_shared_delivery_refuses_unprovisioned_directory_before_writing(self):
+        sent = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
+                                "--subject", "shared", "--body", "literal body", "--shared-delivery")
+        self.assertEqual(sent.returncode, 2)
+        self.assertIn("shared delivery requires", sent.stderr)
+        self.assertEqual(list((self.maildir / "new").iterdir()), [])
+        self.assertEqual(list((self.maildir / "tmp").iterdir()), [])
+
+    def test_shared_delivery_refuses_unsafe_leaves_without_partial_mail(self):
+        for mode in (0o2700, 0o1700, 0o3707):
+            with self.subTest(mode=oct(mode)):
+                for leaf in ("tmp", "new"):
+                    (self.maildir / leaf).chmod(mode)
+                sent = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
+                                        "--subject", "refuse", "--body", "body", "--shared-delivery")
+                self.assertEqual(sent.returncode, 2, sent.stderr)
+                self.assertEqual(list((self.maildir / "new").iterdir()), [])
+        (self.maildir / "tmp").rmdir()
+        outside = self.base / "outside"
+        outside.mkdir(mode=0o3700)
+        (self.maildir / "tmp").symlink_to(outside, target_is_directory=True)
+        (self.maildir / "new").chmod(0o3700)
+        sent = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
+                                "--subject", "refuse", "--body", "body", "--shared-delivery")
+        self.assertEqual(sent.returncode, 2, sent.stderr)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def post_alert(
         self,
         level: str,
