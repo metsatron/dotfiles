@@ -1588,6 +1588,53 @@ class UnattendedCoordinatorTests(unittest.TestCase):
                     self.assertEqual(e._decide_request(self.event(command), manifest), (True, reason))
             judge.assert_not_called()
 
+    def test_owned_mail_read_print_only_selectors(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        scripts = ['1,9p;/^Item:/p;/^Intent:/p;/^Tool:/p;/^Command:/,/approved this request/p',
+                   '/^Item:/p;/^Intent:/p;/^Tool:/p', '1,8p']
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+            for domain in ['fixture-host.helm', 'fixture-alias.helm']:
+                for script in scripts:
+                    base = f"mailcortex read your_seat@{domain} fixture-message 2>&1 | sed -n '{script}'"
+                    for suffix in ['', '; echo exit-status=$?']:
+                        with self.subTest(domain=domain, script=script, suffix=suffix):
+                            self.assertTrue(e._decide_request(self.event(base + suffix), manifest)[0])
+            for account in ['other_seat@fixture-alias.helm', 'seat+your_seat@fixture-alias.helm',
+                            'your_seat@example.invalid']:
+                bad = f"mailcortex read {account} fixture-message 2>&1 | sed -n '/^Item:/p;/^Tool:/p'"
+                self.assertFalse(e._decide_request(self.event(bad), manifest)[0])
+                self.assertFalse(e._decide_request(self.event(bad + '; echo exit-status=$?'), manifest)[0])
+            base = 'mailcortex read your_seat@fixture-host.helm fixture-message'
+            for script in ['1e fixture-command', '1w fixture-output', 'r fixture-input',
+                           's/x/y/e', '1p; e fixture-command', '/x/!p', '1p; q',
+                           '1p;w /tmp/fixture-output', '1p\n2p']:
+                self.assertFalse(e._decide_request(self.event(base + f" | sed -n '{script}'"), manifest)[0])
+            # Domain aliases never widen outbound sender authority.
+            sender = self.inline_mail('fixture status').replace('your_seat@fixture-host.helm',
+                                                               'your_seat@fixture-alias.helm')
+            self.assertFalse(e._decide_request(self.event(sender), manifest)[0])
+            self.assertFalse(e._decide_request(self.event(sender + '; echo exit-status=$?'), manifest)[0])
+            for suffix in [' | sed -n 1p fixture-input', ' | sed -nf fixture-input',
+                           ' | sed -i -n 1p', ' | sed -n 1p | sh']:
+                self.assertFalse(e._decide_request(self.event(base + suffix), manifest)[0])
+
+    def test_completion_receipt_inert_descriptor_and_filter(self):
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        receipt = "mailcortex receipt your_seat '<fixture-message@fixture-host.helm>' handling_completed"
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+            for suffix in [' 2>&1', ' 2>&1 | tail -2', ' 2>&1 | tail -1',
+                           ' | head -n 20', ' | cut -c1-1500']:
+                for status in ['', '; echo exit-status=$?']:
+                    request = self.event(receipt + suffix + status)
+                    with self.subTest(suffix=suffix, status=status):
+                        self.assertTrue(e.classify(request, manifest)[0])
+                        self.assertTrue(e._decide_request(request, manifest)[0])
+
     def test_mail_help_and_receipt_do_not_erase_effects_or_owner_proof(self):
         self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
         manifest = self.loaded()
@@ -1708,6 +1755,35 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         self.manifest['classes'][0]['enabled'] = False
         self.assertFalse(e._decide_request(self.event(command), self.loaded())[0])
 
+    def test_terminal_status_semantic_label_and_quoting(self):
+        self.manifest['classes'][0]['enabled'] = True
+        self.manifest['gate_inversion']['enabled'] = True
+        self.manifest['coordinator_ops']['seat_account'] = 'your_seat@fixture-host.helm'
+        manifest = self.loaded()
+        original = self.inline_mail('fixture status').removesuffix(' 2>&1 | tail -5')
+        suffixes = ['; echo exit-status=$?', '; echo "exit=$?"',
+                    '; echo exit=$?', '; echo "result: ${?}"',
+                    ';  echo "exit=$?"', '; echo  "exit=$?"',
+                    '; echo "exit=$?" ', '; echo \'exit-status=\'"$?"']
+        with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')), \
+                mock.patch.object(e.subprocess, 'run', side_effect=AssertionError('no execution')):
+            for suffix in suffixes:
+                with self.subTest(suffix=suffix):
+                    judged = []
+                    def judge_original(stage, stage_manifest):
+                        judged.append(stage['tool_input']['command'])
+                        return e.classify(stage, stage_manifest)
+                    request = self.event(original + suffix)
+                    self.assertTrue(e._decide_request(request, manifest)[0])
+                    self.assertTrue(e._compound_approval(request, manifest, judge=judge_original)[0])
+                    self.assertEqual(judged, [original])
+                    for bad_original in [original.replace('your_seat@', 'other_seat@'),
+                                         original.replace("'fixture status'", '"$HOME"'),
+                                         original + ' >/nonexistent-fixture']:
+                        self.assertFalse(e._decide_request(self.event(bad_original + suffix), manifest)[0])
+                    with mock.patch.object(e, '_classify_scoped', return_value=(False, 'fixture_veto')):
+                        self.assertFalse(e._compound_approval(request, manifest, judge=e._classify_scoped)[0])
+
     def test_own_seat_mail_exit_status_diagnostic_is_deterministic(self):
         self.manifest['classes'][0]['enabled'] = True
         self.manifest['gate_inversion']['enabled'] = True
@@ -1797,7 +1873,7 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         status = '; echo "exit=$?"'
         denied = ['echo "exit=$?"', 'true' + status, 'fixture-command' + status]
         denied += [base + suffix for suffix in [
-            '; echo "$?"', '; echo exit=$?', '; echo "exit=${?}"',
+            '; echo "$?"',
             '; echo "exit=$? $HOME"', '; echo "exit=$API_TOKEN"',
             '; echo "exit=$?$(fixture-command)"', '; echo "exit=$?`fixture-command`"',
             '; echo "exit=$?" extra', '; echo -n "exit=$?"',
@@ -1810,8 +1886,9 @@ class UnattendedCoordinatorTests(unittest.TestCase):
             '; echo "exit=$?" && fixture-command', '; echo "exit=$?" || fixture-command',
             '; echo "exit=$?" &', '; echo "exit=$?" # suffix',
             '; echo "exit=$?"; echo "exit=$?"',
-            ';  echo "exit=$?"', ';\techo "exit=$?"', '; echo  "exit=$?"',
-            '; echo "exit=$?" ', '; echo "exit=$?', '; echo "exit=$?\' ',
+            ';\techo "exit=$?"', '; echo "exit=$?', '; echo "exit=$?\' ',
+            '; echo "exit=$?$?"', '; echo "exit=${HOME}"',
+            '; echo "exit=\\$?"', '; echo "exit=\\\\$?"',
         ]]
         denied += [command + status for command in [
             base.replace('your_seat@', 'other_seat@'),
