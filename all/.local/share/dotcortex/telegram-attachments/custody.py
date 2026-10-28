@@ -37,11 +37,19 @@ def identity(pid):
 def owner():
     expected = Path.home() / '.npm-global/bin/claude'
     expected_stat = expected.stat()
+    # A Claude Code auto-update swaps the package dir under live seats: their
+    # exe becomes '<root>/.claude-code-XXXX/bin/claude.exe (deleted)' and no
+    # longer shares the new binary's inode. Match that exact npm layout too, or
+    # every seat older than the update silently loses its attachments.
+    package_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(expected))))
+    replaced = re.compile(re.escape(package_root) + r'/\.?claude-code(?:-[A-Za-z0-9]+)?/bin/claude\.exe(?: \(deleted\))?\Z')
     pid = os.getpid()
     for _ in range(64):
         item, parent = identity(pid)
         exe = os.stat('/proc/%s/exe' % pid)
         if (exe.st_dev, exe.st_ino) == (expected_stat.st_dev, expected_stat.st_ino):
+            return item
+        if replaced.fullmatch(os.readlink('/proc/%s/exe' % pid)):
             return item
         require(parent > 1 and parent != pid)
         pid = parent
