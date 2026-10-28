@@ -10,6 +10,10 @@ mkdir -p "$tmp/bin" "$tmp/home/.local/bin"
 touch "$tmp/home/.Xauthority"
 cat >"$tmp/home/.local/bin/sanctuary-cortex-xpra" <<'EOF'
 #!/usr/bin/env bash
+if { true >&9; } 2>/dev/null; then
+  printf '%s\n' 'Xpra inherited the Agentify startup lock' >&2
+  exit 1
+fi
 printf '%s\n' "$*" >"$FAKE_XPRA_START_MARKER"
 touch "$FAKE_XPRA_READY"
 EOF
