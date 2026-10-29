@@ -5687,7 +5687,8 @@ def _agentify_research_shell(event, manifest):
             or any(ord(char) < 32 or ord(char) == 127 for char in command)):
         return deny
     config = grant.get('export')
-    if (not isinstance(config, dict) or set(config) != {'executable', 'sha256', 'output_root', 'tabs'}
+    if (not isinstance(config, dict) or set(config) - {'output_gid'} != {'executable', 'sha256', 'output_root', 'tabs'}
+            or 'output_gid' in config and (type(config['output_gid']) is not int or config['output_gid'] < 0)
             or not isinstance(config.get('sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', config['sha256'])
             or not isinstance(config.get('tabs'), list) or not 1 <= len(config['tabs']) <= 32
             or not all(isinstance(tab, str) and re.fullmatch(
@@ -5703,7 +5704,9 @@ def _agentify_research_shell(event, manifest):
         info, parent = os.lstat(executable), os.stat(root)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_mode & 0o022
                 or not info.st_mode & 0o100 or info.st_nlink != 1
-                or not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid() or parent.st_mode & 0o022
+                or not stat.S_ISDIR(parent.st_mode) or parent.st_uid != os.getuid()
+                or parent.st_mode & 0o002
+                or parent.st_mode & 0o020 and config.get('output_gid') != parent.st_gid
                 or __import__('hashlib').sha256(Path(executable).read_bytes()).hexdigest() != config['sha256']):
             return deny
     except OSError:
