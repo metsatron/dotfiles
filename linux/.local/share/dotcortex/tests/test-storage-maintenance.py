@@ -76,6 +76,7 @@ class StorageMaintenanceTests(unittest.TestCase):
         env = os.environ.copy()
         env.update(
             {
+                "STORAGE_MAINTENANCE_PIP_CACHE_CONFIG": str(root / "absent-pip-config.json"),
                 "STORAGE_MAINTENANCE_HOME": str(root),
                 "STORAGE_MAINTENANCE_HOSTNAME": "kikin-kushi",
                 "STORAGE_MAINTENANCE_GUIX": str(fake_guix),
