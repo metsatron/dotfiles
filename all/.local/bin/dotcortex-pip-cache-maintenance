@@ -1,0 +1,242 @@
+#!/usr/bin/env python3
+"""Opt-in account pip download-cache maintenance; never removes installed packages."""
+import argparse
+from contextlib import contextmanager
+import fcntl
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+DEFAULT_CONFIG = Path('/etc/dotcortex/pip-cache-maintenance.json')
+
+
+class Refused(RuntimeError):
+    pass
+
+
+def local(path):
+    if not path.is_absolute() or len(path.parts) < 3 or '..' in path.parts:
+        raise Refused('unsafe or redirected root')
+    mounts = []
+    for line in Path('/proc/self/mountinfo').read_text().splitlines():
+        left, right = line.split(' - ', 1)
+        mount = Path(left.split()[4].replace('\\040', ' '))
+        if path == mount or mount in path.parents:
+            mounts.append((len(mount.parts), right.split()[0]))
+    if mounts and max(mounts)[1] in {'autofs', 'nfs', 'nfs4', 'cifs', 'sshfs', 'fuse.sshfs'}:
+        raise Refused('nonlocal root')
+    # Reject links in order before touching descendants or resolving a remote target.
+    for ancestor in [*reversed(path.parents), path]:
+        if ancestor.is_symlink():
+            raise Refused('unsafe or redirected root')
+
+
+def config_read(path):
+    if os.geteuid() != 0:
+        raise Refused('root is required for the explicit account allowlist')
+    local(path)
+    for parent in path.parents:
+        info = parent.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise Refused('configuration ancestry must have root custody')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    stream = os.fdopen(fd)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != 0 or info.st_mode & 0o022:
+            raise Refused('configuration must be root-owned and not group/world writable')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        config = json.load(stream)
+        if (not isinstance(config, dict) or set(config) - {'host', 'accounts', 'max_bytes', 'quiet_hours'}
+                or config.get('host') != socket.gethostname()):
+            raise Refused('invalid configuration or host mismatch')
+        accounts = config.get('accounts')
+        if (not isinstance(accounts, list) or not accounts or len(set(accounts)) != len(accounts)
+                or any(not isinstance(a, str) or not re.fullmatch(r'[a-z_][a-z0-9_-]*', a) for a in accounts)):
+            raise Refused('declare unique explicit account names')
+        for key, default in [('max_bytes', 1073741824), ('quiet_hours', 24)]:
+            config.setdefault(key, default)
+            if type(config[key]) is not int or config[key] <= 0:
+                raise Refused('limits must be positive integers')
+        return stream, config
+    except BaseException:
+        stream.close()
+        raise
+
+
+def owned_directory(path, uid):
+    info = path.lstat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+        raise Refused('unsafe directory ownership or permissions')
+
+
+def cache_root(account):
+    home = Path(account.pw_dir)
+    if account.pw_uid == 0 or home in {Path('/home'), Path('/root'), Path('/var'), Path('/tmp')}:
+        raise Refused('root or broad account home')
+    local(home)
+    owned_directory(home, account.pw_uid)
+    cache = home / '.cache/pip'
+    try:
+        owned_directory(home / '.cache', account.pw_uid)
+    except FileNotFoundError:
+        return home, None
+    local(cache)
+    if not cache.exists():
+        return home, None
+    owned_directory(cache, account.pw_uid)
+    return home, cache
+
+
+def active_installer(uid, proc=Path('/proc')):
+    for process in proc.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != uid:
+                continue
+            with (process / 'cmdline').open('rb') as stream:
+                argv = stream.read(65536).decode(errors='replace').split('\0')
+        except FileNotFoundError:
+            continue  # process exited
+        # Permission failures for a selected UID fail closed, rather than hiding activity.
+        pip = any(re.fullmatch(r'pip(?:3(?:\.\d+)?)?', Path(a).name) for a in argv[:4])
+        if pip and any(a in {'install', 'download', 'wheel'} for a in argv):
+            return True
+    return False
+
+
+def measure(cache, uid):
+    device = cache.stat().st_dev
+    total, newest = 0, cache.stat().st_mtime
+    def unreadable(error):
+        raise error
+    for parent, dirs, files in os.walk(cache, followlinks=False, onerror=unreadable):
+        for name in dirs + files:
+            info = (Path(parent) / name).lstat()
+            if (info.st_dev != device or info.st_uid != uid
+                    or not (stat.S_ISDIR(info.st_mode) or stat.S_ISREG(info.st_mode))):
+                raise Refused('foreign owner, symlink, special file or nested mount in pip cache')
+            newest = max(newest, info.st_mtime, info.st_ctime)
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+    return total, newest
+
+
+@contextmanager
+def installer_lock(home, uid, dry_run):
+    # Matches dotcortex-deps' default XDG state lock. No redirects/custom state roots.
+    parts = [home / '.local', home / '.local/state', home / '.local/state/dotcortex',
+             home / '.local/state/dotcortex/dependencies']
+    for directory in parts:
+        if not directory.exists() and not directory.is_symlink():
+            if dry_run:
+                yield
+                return
+            directory.mkdir(mode=0o700)
+        owned_directory(directory, uid)
+    lock = parts[-1] / 'user-site.lock'
+    if dry_run and not lock.exists():
+        yield
+        return
+    fd = os.open(lock, os.O_RDWR | os.O_NOFOLLOW | (0 if dry_run else os.O_CREAT), 0o600)
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != uid or info.st_mode & 0o022:
+            raise Refused('unsafe managed installer lock')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
+
+
+def pip_run(python, home, args):
+    env = dict(HOME=str(home), USER=pwd.getpwuid(os.geteuid()).pw_name,
+               LOGNAME=pwd.getpwuid(os.geteuid()).pw_name, PATH='/usr/local/bin:/usr/bin:/bin')
+    return subprocess.run([python, '-m', 'pip', '--disable-pip-version-check', *args],
+                          env=env, text=True, capture_output=True, timeout=120)
+
+
+def maintain(account, config, dry_run):
+    home, cache = cache_root(account)
+    if cache is None:
+        return 'skipped: no pip cache'
+    python = shutil.which('python3', path=str(home / '.guix-extra-profiles/core/core/bin') + ':/usr/local/bin:/usr/bin:/bin')
+    if not python:
+        return 'skipped: Python/pip unavailable'
+    with installer_lock(home, account.pw_uid, dry_run):
+        if active_installer(account.pw_uid):
+            return 'skipped: active pip installer'
+        result = pip_run(python, home, ['cache', 'dir'])
+        if result.returncode:
+            return 'skipped: pip unavailable'
+        if result.stdout.strip() != str(cache):
+            raise Refused('customized pip cache destination refused')
+        size, newest = measure(cache, account.pw_uid)
+        if size <= config['max_bytes']:
+            return f'skipped: below size cap bytes={size}'
+        if time.time() - newest < config['quiet_hours'] * 3600:
+            return f'skipped: pip cache is not quiet bytes={size}'
+        if active_installer(account.pw_uid):
+            return 'skipped: active pip installer'
+        if dry_run:
+            return f'would purge pip download cache bytes={size}'
+        # Recheck the exact root immediately before the native, account-owned mutation.
+        if cache_root(account) != (home, cache):
+            raise Refused('cache root changed')
+        result = pip_run(python, home, ['--cache-dir', str(cache), 'cache', 'purge'])
+        if result.returncode:
+            raise Refused('native pip cache purge failed')
+        return f'purged pip download cache prior_bytes={size}'
+
+
+def run_account(account, config, dry_run):
+    # Never execute account Python code with root credentials.
+    sys.stdout.flush()
+    child = os.fork()
+    if child == 0:
+        try:
+            os.initgroups(account.pw_name, account.pw_gid)
+            os.setgid(account.pw_gid)
+            os.setuid(account.pw_uid)
+            os.environ.clear()
+            os.environ.update(HOME=account.pw_dir, XDG_STATE_HOME=account.pw_dir + '/.local/state')
+            print('pip-cache account=' + account.pw_name + ' ' + maintain(account, config, dry_run), flush=True)
+            os._exit(0)
+        except (OSError, Refused, subprocess.TimeoutExpired):
+            print('pip-cache account=' + account.pw_name + ' refused: unsafe state, busy lock or failed cache operation', flush=True)
+            os._exit(2)
+    return os.waitstatus_to_exitcode(os.waitpid(child, 0)[1])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--config', type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument('--dry-run', action='store_true')
+    args = parser.parse_args()
+    try:
+        stream, config = config_read(args.config)
+        with stream:
+            # Resolve every account before changing any cache; root is never a target.
+            accounts = [pwd.getpwnam(name) for name in config['accounts']]
+            if any(a.pw_uid == 0 for a in accounts):
+                raise Refused('root account refused')
+            failed = False
+            for account in accounts:
+                failed = bool(run_account(account, config, args.dry_run)) or failed
+            return 2 if failed else 0
+    except (OSError, ValueError, KeyError, TypeError, Refused) as exc:
+        print('pip-cache maintenance refused: ' + str(exc), file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())
