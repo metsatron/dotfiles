@@ -28,9 +28,9 @@ incompatible installations are reported, not automatically removed.
 Successful applies record interpreter identity under the private XDG state tree.
 An interpreter change or failed install stops the next apply for consumer
 reconciliation. Failed pip operations are not automatically replayed. No cleanup
-command deletes an old Python tree. The legacy direct =pip-apply= helper remains
-unchanged for now; use the guarded Loom entry point. This module does not intercept
-arbitrary installer commands invoked outside Loom.
+command deletes an old Python tree. The legacy =pip-apply= helper and Make
+=pip-apply=/=pip-sync= targets use the same gate as Loom. This module does not
+intercept arbitrary installer commands invoked outside these managed entry points.
 
 * Shared runtime exceptions
 
@@ -65,6 +65,16 @@ A user-site alias to that module's canonical root-owned store remains visible in
 published tree. Guarded pip apply refuses such a site before resolution; upgrades
 must build a new generation rather than writing through the alias.
 
+=dotcortex-deps frozen-check --home PATH --json= checks adopted user-site aliases
+against the canonical store's existing publication receipts, including aliases
+that have been deleted or replaced with writable directories. It returns nonzero
+on drift and reports the acceptable published targets for operator reconciliation.
+All managed pip plans/applies run this check for the current home before resolution.
+Receipts describe published sources, so publishing a user site requires completing
+its reviewed alias cutover before the managed pip lane can resume. Old generations
+may remain; an alias may point to any valid publication for that exact source.
+This checks alias and store custody, not every package byte or unmanaged installer.
+
 * Placement policy
 #+BEGIN_SRC toml :tangle all/.config/dotcortex/dependencies.toml
 schema = 1
@@ -98,6 +108,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 from urllib.parse import urlsplit
@@ -174,6 +185,60 @@ def local_home(home):
         if mounts and max(mounts)[1] in {'autofs', 'nfs', 'nfs4', 'cifs', 'sshfs', 'fuse.sshfs'}:
             raise Refused('Inventory roots must be local; inspect remote hosts through their owner')
     return home
+
+
+CODE_COMMONS = Path('/var/lib/dotcortex/code-commons')
+
+
+def frozen_aliases(home):
+    """Discover expected aliases from trusted receipts, never from mutable home state."""
+    home = local_home(home)
+    store = CODE_COMMONS / 'generations'
+    if not CODE_COMMONS.exists() and not CODE_COMMONS.is_symlink():
+        return []
+    def custody(path, directory=False, readonly=False):
+        info = path.lstat()
+        kind = stat.S_ISDIR if directory else stat.S_ISREG
+        if (not kind(info.st_mode) or info.st_uid != 0
+                or info.st_mode & (0o222 if readonly else 0o022)):
+            raise Refused('Frozen runtime custody changed: ' + str(path))
+    for parent in [CODE_COMMONS, *CODE_COMMONS.parents]:
+        custody(parent, directory=True)
+    custody(store, directory=True)
+    expected = {}
+    for generation in sorted(store.iterdir()):
+        custody(generation, directory=True, readonly=True)
+        receipt = generation / 'receipt.json'
+        custody(receipt, readonly=True)
+        record = json.loads(receipt.read_text())
+        source = Path(record.get('source', ''))
+        if not source.is_relative_to(home):
+            continue
+        relative = source.relative_to(home)
+        if (len(relative.parts) != 4 or relative.parts[:2] != ('.local', 'lib')
+                or not re.fullmatch(r'python\d+\.\d+', relative.parts[2])
+                or relative.parts[3] != 'site-packages'):
+            continue
+        tree = generation / 'tree'
+        custody(tree, directory=True, readonly=True)
+        if record.get('schema') != 1 or record.get('tree') != str(tree):
+            raise Refused('Frozen runtime receipt does not bind published tree: ' + str(receipt))
+        expected.setdefault(source, []).append(str(tree))
+    rows = []
+    for source, targets in sorted(expected.items()):
+        # Inspect ancestor links before resolving the alias; never follow a redirected home tree.
+        ancestors = [home / '.local', home / '.local/lib', source.parent]
+        safe = all(p.is_dir() and not p.is_symlink() for p in ancestors)
+        actual = str(source.resolve()) if safe and source.is_symlink() else None
+        status = 'ok' if actual in targets else 'missing-or-replaced'
+        rows.append(dict(source=str(source), status=status, actual=actual, published_targets=targets))
+    return rows
+
+
+def require_frozen_aliases(home):
+    for row in frozen_aliases(home):
+        if row['status'] != 'ok':
+            raise Refused('Frozen runtime alias missing or replaced; reconcile before installation: ' + json.dumps(row))
 
 
 def inventory(homes, policy):
@@ -280,6 +345,7 @@ def locked_report(report, policy):
 
 
 def pip_apply(args, policy, root):
+    require_frozen_aliases(Path.home())
     python = python_identity(args.python)
     version = python.get('version', [])
     if len(version) >= 2:
@@ -294,6 +360,7 @@ def pip_apply(args, policy, root):
     state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'dotcortex/dependencies'
     receipt = state / 'user-site.json'
     with locked(state / 'user-site.lock'):
+        require_frozen_aliases(Path.home())
         previous = json.loads(receipt.read_text()) if receipt.exists() else None
         if previous and (previous.get('status') != 'complete' or previous.get('python') != python):
             raise Refused('Previous install is incomplete or interpreter changed; reconcile consumers before adopting another user site')
@@ -318,6 +385,9 @@ def pip_apply(args, policy, root):
                               requirements_sha256=hashlib.sha256('\n'.join(requirements).encode()).hexdigest())
                 atomic_json(receipt, record)
                 # No re-resolution between the gate and mutation; dependencies are all in the report.
+                require_frozen_aliases(Path.home())
+                if site.is_symlink():
+                    raise Refused('User site became a published runtime during preflight')
                 subprocess.run(common + ['install', '--user', '--break-system-packages', '--no-deps',
                                '--require-hashes', '--only-binary=:all:', '-r', str(lock)], check=True)
                 subprocess.run(common + ['check'], check=True)
@@ -431,6 +501,9 @@ def main(argv=None):
     report = sub.add_parser('report', help='Read exact local user-site metadata; never walks a home')
     report.add_argument('--home', action='append', default=[])
     report.add_argument('--json', action='store_true')
+    frozen = sub.add_parser('frozen-check', help='Check adopted user-site aliases against publication receipts')
+    frozen.add_argument('--home', type=Path, default=Path.home())
+    frozen.add_argument('--json', action='store_true')
     pip = sub.add_parser('pip-apply', help='Resolve and check the complete user-site dependency plan')
     pip.add_argument('--manifest', type=Path)
     pip.add_argument('--python', default='python3')
@@ -440,6 +513,14 @@ def main(argv=None):
     runtime.add_argument('--store', type=Path, required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == 'frozen-check':
+            rows = frozen_aliases(args.home)
+            if args.json:
+                print(json.dumps(dict(aliases=rows, complete=all(r['status'] == 'ok' for r in rows)), indent=2))
+            else:
+                for row in rows:
+                    print(json.dumps(row))
+            return 0 if all(r['status'] == 'ok' for r in rows) else 2
         policy = read_policy(args.policy)
         if args.command == 'report':
             result = inventory(args.home or [str(Path.home())], policy)
@@ -490,6 +571,69 @@ POLICY = {'schema': 1, 'user_site': {'forbidden': ['torch', 'triton', 'nvidia-*'
 
 
 class DependencyTests(unittest.TestCase):
+    def test_receipts_detect_missing_replaced_and_valid_aliases(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp);home=root/'user';home.mkdir()
+            store=root/'store';generation=store/'generations/fixture';tree=generation/'tree'
+            tree.mkdir(parents=True)
+            site=home/'.local/lib/python3.13/site-packages';site.parent.mkdir(parents=True)
+            receipt=generation/'receipt.json'
+            receipt.write_text(json.dumps(dict(schema=1,source=str(site),tree=str(tree))))
+            receipt.chmod(0o444);tree.chmod(0o555);generation.chmod(0o555)
+            original=Path.lstat
+            def root_owned(path, *args, **kwargs):
+                values=list(original(path,*args,**kwargs));values[4]=0
+                if path == Path("/tmp"): values[0] &= ~0o022
+                return os.stat_result(values)
+            with patch.object(d,'CODE_COMMONS',store),patch.object(Path,'lstat',root_owned):
+                for replacement in ['missing','directory','wrong-link','valid-link']:
+                    if site.is_symlink():site.unlink()
+                    elif site.exists():site.rmdir()
+                    if replacement=='directory':site.mkdir()
+                    elif replacement=='wrong-link':site.symlink_to(root/'wrong')
+                    elif replacement=='valid-link':site.symlink_to(tree)
+                    rows=d.frozen_aliases(home)
+                    self.assertEqual(rows[0]['published_targets'],[str(tree)])
+                    self.assertEqual(rows[0]['status']=='ok',replacement=='valid-link')
+                    if replacement!='valid-link':
+                        with self.assertRaises(d.Refused):d.require_frozen_aliases(home)
+                receipt.chmod(0o644)
+                with self.assertRaises(d.Refused):d.frozen_aliases(home)
+
+    def test_legacy_apply_refuses_transitive_gpu_and_frozen_site(self):
+        import os
+        import subprocess
+        import sys
+        for case in ['gpu','frozen']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
+                home=Path(tmp);bin=home/'bin';bin.mkdir()
+                manifest=home/'manifest';manifest.write_text('example "" ""\n')
+                policy=home/'all/.config/dotcortex/dependencies.toml';policy.parent.mkdir(parents=True)
+                policy.write_text('schema = 1\n[user_site]\nforbidden = ["torch", "nvidia-*"]\n')
+                if case=='frozen':
+                    site=home/'.local/lib/python3.13/site-packages';site.parent.mkdir(parents=True)
+                    site.symlink_to(home/'frozen')
+                marker=home/'install-ran'
+                shim=bin/'python3'
+                shim.write_text('#!'+sys.executable+'\n'+
+                    "import argparse,importlib.machinery,json,sys\nfrom pathlib import Path\n"+
+                    "d=importlib.machinery.SourceFileLoader('deps',sys.argv[1]).load_module()\n"+
+                    "d.CODE_COMMONS=Path("+repr(str(home/'absent-store'))+")\n"+
+                    "d.python_identity=lambda _:dict(executable='fixture',version=[3,13,0])\n"+
+                    "def run(argv,**kwargs):\n"+
+                    "    if '--report' in argv: Path(argv[argv.index('--report')+1]).write_text(json.dumps(dict(version='1',install=[dict(metadata=dict(name='torch'))])))\n"+
+                    "    if '--require-hashes' in argv: Path("+repr(str(marker))+").touch()\n"+
+                    "    return argparse.Namespace(stdout='{}')\n"+
+                    "d.subprocess.run=run\nraise SystemExit(d.main(sys.argv[2:]))\n")
+                shim.chmod(0o755)
+                env={**os.environ,'HOME':str(home),'DOTCORTEX_ROOT':str(home),
+                     'XDG_STATE_HOME':str(home/'state'),'PATH':str(bin)+':'+os.environ['PATH']}
+                result=subprocess.run(['bash',str(ROOT/'all/.local/bin/pip-apply'),'--manifest',str(manifest)],env=env,text=True,capture_output=True)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertIn('declared runtime' if case=='gpu' else 'published runtime',result.stderr)
+                self.assertFalse(marker.exists())
+
     def test_frozen_user_site_stops_before_resolver(self):
         with tempfile.TemporaryDirectory() as tmp:
             home=Path(tmp);site=home/'.local/lib/python3.13/site-packages'

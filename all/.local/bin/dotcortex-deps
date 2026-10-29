@@ -12,6 +12,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import stat
 import sys
 import tempfile
 from urllib.parse import urlsplit
@@ -88,6 +89,60 @@ def local_home(home):
         if mounts and max(mounts)[1] in {'autofs', 'nfs', 'nfs4', 'cifs', 'sshfs', 'fuse.sshfs'}:
             raise Refused('Inventory roots must be local; inspect remote hosts through their owner')
     return home
+
+
+CODE_COMMONS = Path('/var/lib/dotcortex/code-commons')
+
+
+def frozen_aliases(home):
+    """Discover expected aliases from trusted receipts, never from mutable home state."""
+    home = local_home(home)
+    store = CODE_COMMONS / 'generations'
+    if not CODE_COMMONS.exists() and not CODE_COMMONS.is_symlink():
+        return []
+    def custody(path, directory=False, readonly=False):
+        info = path.lstat()
+        kind = stat.S_ISDIR if directory else stat.S_ISREG
+        if (not kind(info.st_mode) or info.st_uid != 0
+                or info.st_mode & (0o222 if readonly else 0o022)):
+            raise Refused('Frozen runtime custody changed: ' + str(path))
+    for parent in [CODE_COMMONS, *CODE_COMMONS.parents]:
+        custody(parent, directory=True)
+    custody(store, directory=True)
+    expected = {}
+    for generation in sorted(store.iterdir()):
+        custody(generation, directory=True, readonly=True)
+        receipt = generation / 'receipt.json'
+        custody(receipt, readonly=True)
+        record = json.loads(receipt.read_text())
+        source = Path(record.get('source', ''))
+        if not source.is_relative_to(home):
+            continue
+        relative = source.relative_to(home)
+        if (len(relative.parts) != 4 or relative.parts[:2] != ('.local', 'lib')
+                or not re.fullmatch(r'python\d+\.\d+', relative.parts[2])
+                or relative.parts[3] != 'site-packages'):
+            continue
+        tree = generation / 'tree'
+        custody(tree, directory=True, readonly=True)
+        if record.get('schema') != 1 or record.get('tree') != str(tree):
+            raise Refused('Frozen runtime receipt does not bind published tree: ' + str(receipt))
+        expected.setdefault(source, []).append(str(tree))
+    rows = []
+    for source, targets in sorted(expected.items()):
+        # Inspect ancestor links before resolving the alias; never follow a redirected home tree.
+        ancestors = [home / '.local', home / '.local/lib', source.parent]
+        safe = all(p.is_dir() and not p.is_symlink() for p in ancestors)
+        actual = str(source.resolve()) if safe and source.is_symlink() else None
+        status = 'ok' if actual in targets else 'missing-or-replaced'
+        rows.append(dict(source=str(source), status=status, actual=actual, published_targets=targets))
+    return rows
+
+
+def require_frozen_aliases(home):
+    for row in frozen_aliases(home):
+        if row['status'] != 'ok':
+            raise Refused('Frozen runtime alias missing or replaced; reconcile before installation: ' + json.dumps(row))
 
 
 def inventory(homes, policy):
@@ -194,6 +249,7 @@ def locked_report(report, policy):
 
 
 def pip_apply(args, policy, root):
+    require_frozen_aliases(Path.home())
     python = python_identity(args.python)
     version = python.get('version', [])
     if len(version) >= 2:
@@ -208,6 +264,7 @@ def pip_apply(args, policy, root):
     state = Path(os.environ.get('XDG_STATE_HOME', str(Path.home() / '.local/state'))) / 'dotcortex/dependencies'
     receipt = state / 'user-site.json'
     with locked(state / 'user-site.lock'):
+        require_frozen_aliases(Path.home())
         previous = json.loads(receipt.read_text()) if receipt.exists() else None
         if previous and (previous.get('status') != 'complete' or previous.get('python') != python):
             raise Refused('Previous install is incomplete or interpreter changed; reconcile consumers before adopting another user site')
@@ -232,6 +289,9 @@ def pip_apply(args, policy, root):
                               requirements_sha256=hashlib.sha256('\n'.join(requirements).encode()).hexdigest())
                 atomic_json(receipt, record)
                 # No re-resolution between the gate and mutation; dependencies are all in the report.
+                require_frozen_aliases(Path.home())
+                if site.is_symlink():
+                    raise Refused('User site became a published runtime during preflight')
                 subprocess.run(common + ['install', '--user', '--break-system-packages', '--no-deps',
                                '--require-hashes', '--only-binary=:all:', '-r', str(lock)], check=True)
                 subprocess.run(common + ['check'], check=True)
@@ -345,6 +405,9 @@ def main(argv=None):
     report = sub.add_parser('report', help='Read exact local user-site metadata; never walks a home')
     report.add_argument('--home', action='append', default=[])
     report.add_argument('--json', action='store_true')
+    frozen = sub.add_parser('frozen-check', help='Check adopted user-site aliases against publication receipts')
+    frozen.add_argument('--home', type=Path, default=Path.home())
+    frozen.add_argument('--json', action='store_true')
     pip = sub.add_parser('pip-apply', help='Resolve and check the complete user-site dependency plan')
     pip.add_argument('--manifest', type=Path)
     pip.add_argument('--python', default='python3')
@@ -354,6 +417,14 @@ def main(argv=None):
     runtime.add_argument('--store', type=Path, required=True)
     args = parser.parse_args(argv)
     try:
+        if args.command == 'frozen-check':
+            rows = frozen_aliases(args.home)
+            if args.json:
+                print(json.dumps(dict(aliases=rows, complete=all(r['status'] == 'ok' for r in rows)), indent=2))
+            else:
+                for row in rows:
+                    print(json.dumps(row))
+            return 0 if all(r['status'] == 'ok' for r in rows) else 2
         policy = read_policy(args.policy)
         if args.command == 'report':
             result = inventory(args.home or [str(Path.home())], policy)

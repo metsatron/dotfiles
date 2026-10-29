@@ -13,6 +13,69 @@ POLICY = {'schema': 1, 'user_site': {'forbidden': ['torch', 'triton', 'nvidia-*'
 
 
 class DependencyTests(unittest.TestCase):
+    def test_receipts_detect_missing_replaced_and_valid_aliases(self):
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp);home=root/'user';home.mkdir()
+            store=root/'store';generation=store/'generations/fixture';tree=generation/'tree'
+            tree.mkdir(parents=True)
+            site=home/'.local/lib/python3.13/site-packages';site.parent.mkdir(parents=True)
+            receipt=generation/'receipt.json'
+            receipt.write_text(json.dumps(dict(schema=1,source=str(site),tree=str(tree))))
+            receipt.chmod(0o444);tree.chmod(0o555);generation.chmod(0o555)
+            original=Path.lstat
+            def root_owned(path, *args, **kwargs):
+                values=list(original(path,*args,**kwargs));values[4]=0
+                if path == Path("/tmp"): values[0] &= ~0o022
+                return os.stat_result(values)
+            with patch.object(d,'CODE_COMMONS',store),patch.object(Path,'lstat',root_owned):
+                for replacement in ['missing','directory','wrong-link','valid-link']:
+                    if site.is_symlink():site.unlink()
+                    elif site.exists():site.rmdir()
+                    if replacement=='directory':site.mkdir()
+                    elif replacement=='wrong-link':site.symlink_to(root/'wrong')
+                    elif replacement=='valid-link':site.symlink_to(tree)
+                    rows=d.frozen_aliases(home)
+                    self.assertEqual(rows[0]['published_targets'],[str(tree)])
+                    self.assertEqual(rows[0]['status']=='ok',replacement=='valid-link')
+                    if replacement!='valid-link':
+                        with self.assertRaises(d.Refused):d.require_frozen_aliases(home)
+                receipt.chmod(0o644)
+                with self.assertRaises(d.Refused):d.frozen_aliases(home)
+
+    def test_legacy_apply_refuses_transitive_gpu_and_frozen_site(self):
+        import os
+        import subprocess
+        import sys
+        for case in ['gpu','frozen']:
+            with self.subTest(case=case),tempfile.TemporaryDirectory() as tmp:
+                home=Path(tmp);bin=home/'bin';bin.mkdir()
+                manifest=home/'manifest';manifest.write_text('example "" ""\n')
+                policy=home/'all/.config/dotcortex/dependencies.toml';policy.parent.mkdir(parents=True)
+                policy.write_text('schema = 1\n[user_site]\nforbidden = ["torch", "nvidia-*"]\n')
+                if case=='frozen':
+                    site=home/'.local/lib/python3.13/site-packages';site.parent.mkdir(parents=True)
+                    site.symlink_to(home/'frozen')
+                marker=home/'install-ran'
+                shim=bin/'python3'
+                shim.write_text('#!'+sys.executable+'\n'+
+                    "import argparse,importlib.machinery,json,sys\nfrom pathlib import Path\n"+
+                    "d=importlib.machinery.SourceFileLoader('deps',sys.argv[1]).load_module()\n"+
+                    "d.CODE_COMMONS=Path("+repr(str(home/'absent-store'))+")\n"+
+                    "d.python_identity=lambda _:dict(executable='fixture',version=[3,13,0])\n"+
+                    "def run(argv,**kwargs):\n"+
+                    "    if '--report' in argv: Path(argv[argv.index('--report')+1]).write_text(json.dumps(dict(version='1',install=[dict(metadata=dict(name='torch'))])))\n"+
+                    "    if '--require-hashes' in argv: Path("+repr(str(marker))+").touch()\n"+
+                    "    return argparse.Namespace(stdout='{}')\n"+
+                    "d.subprocess.run=run\nraise SystemExit(d.main(sys.argv[2:]))\n")
+                shim.chmod(0o755)
+                env={**os.environ,'HOME':str(home),'DOTCORTEX_ROOT':str(home),
+                     'XDG_STATE_HOME':str(home/'state'),'PATH':str(bin)+':'+os.environ['PATH']}
+                result=subprocess.run(['bash',str(ROOT/'all/.local/bin/pip-apply'),'--manifest',str(manifest)],env=env,text=True,capture_output=True)
+                self.assertEqual(result.returncode,2,result.stdout+result.stderr)
+                self.assertIn('declared runtime' if case=='gpu' else 'published runtime',result.stderr)
+                self.assertFalse(marker.exists())
+
     def test_frozen_user_site_stops_before_resolver(self):
         with tempfile.TemporaryDirectory() as tmp:
             home=Path(tmp);site=home/'.local/lib/python3.13/site-packages'
