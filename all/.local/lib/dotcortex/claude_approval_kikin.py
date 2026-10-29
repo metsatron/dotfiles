@@ -5524,7 +5524,7 @@ def _agentify_research_browser(event, manifest):
     if tool.endswith('_navigate'):
         url = payload.get('url')
         patterns = {
-            'chatgpt': r'https://chatgpt\.com/(?:c/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|g/g-p-[A-Za-z0-9-]{1,160}/project)',
+            'chatgpt': r'https://chatgpt\.com/(?:c/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}|g/g-p-[A-Za-z0-9-]{1,160}/(?:project|c/[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))',
             'gemini': r'https://gemini\.google\.com/app/[0-9a-f]{16,64}',
             'perplexity': r'https://(?:www\.)?perplexity\.ai/(?:search|projects)/[A-Za-z0-9_-]{1,160}',
         }
@@ -5692,7 +5692,7 @@ def _agentify_research_shell(event, manifest):
             or not isinstance(config.get('sha256'), str) or not re.fullmatch(r'[a-f0-9]{64}', config['sha256'])
             or not isinstance(config.get('tabs'), list) or not 1 <= len(config['tabs']) <= 32
             or not all(isinstance(tab, str) and re.fullmatch(
-                r'(?:chatgpt\.com/c/[0-9a-f-]{36}|gemini\.google\.com/app/[0-9a-f]{16,64}|(?:www\.)?perplexity\.ai/search/[A-Za-z0-9_-]{1,160})', tab)
+                r'(?:chatgpt\.com/(?:g/g-p-[A-Za-z0-9-]{1,160}/)?c/[0-9a-f-]{36}|gemini\.google\.com/app/[0-9a-f]{16,64}|(?:www\.)?perplexity\.ai/search/[A-Za-z0-9_-]{1,160})', tab)
                 for tab in config['tabs'])):
         return deny
     executable, root = config.get('executable'), config.get('output_root')
