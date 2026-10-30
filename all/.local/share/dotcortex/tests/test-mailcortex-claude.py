@@ -1000,6 +1000,78 @@ class ClaudeWakeTests(unittest.TestCase):
         self.assertEqual(self.c.socket_request(control, request)["status"], "unavailable")
         self.assertIsNone(json.loads(path.read_text())["mailcortex_startup_idle_at"])
 
+    def test_real_pty_completed_compaction_establishes_mail_idle_boundary(self):
+        control, request, event, master, output, drain, path = self.start_pty()
+        before = json.loads(path.read_text())
+        self.assertTrue(event('session-activity')['ok'])
+        self.assertEqual(self.c.socket_request(control, request)['status'], 'busy')
+        self.assertTrue(event('post-compact')['ok'])
+        with Path(before['transcript_path']).open('a') as stream:
+            stream.write(json.dumps({'type': 'atis-latch'}) + '\n')
+        drain(0.1)
+        status = dict(request, command='mailcortex-status'); status.pop('text')
+        self.assertEqual(self.c.socket_request(control, status)['status'], 'idle')
+        after = json.loads(path.read_text())
+        self.assertEqual(after['last_normal_stop'], before['last_normal_stop'])
+        self.assertEqual(after['completed_turn_epoch'], before['completed_turn_epoch'])
+        self.assertGreater(after['mailcortex_post_compact_idle_at'], before['last_normal_stop'])
+        self.assertEqual(self.c.socket_request(control, request)['status'], 'accepted')
+        drain(0.2)
+        self.assertIn(b'RECEIVED:short wake', output)
+        self.assertEqual(self.c.socket_request(control, request)['status'], 'busy')
+
+    def test_real_pty_post_compact_activity_and_unsafe_screen_stay_busy(self):
+        for activity in ('user-prompt-submit', 'session-activity', 'typing',
+                         'partial-record', 'malformed-record', 'permission', 'unknown-screen'):
+            with self.subTest(activity=activity):
+                control, request, event, master, output, drain, path = self.start_pty()
+                self.assertTrue(event('post-compact')['ok'])
+                state = json.loads(path.read_text())
+                if activity in ('user-prompt-submit', 'session-activity'):
+                    self.assertTrue(event(activity)['ok'])
+                elif activity == 'typing':
+                    os.write(master, b'unfinished draft')
+                elif activity == 'permission':
+                    import signal
+                    os.kill(state['pid'], signal.SIGUSR1)
+                elif activity == 'unknown-screen':
+                    # The fixture renders this incomplete escape, not a real child.
+                    os.write(master, b'\x1b[')
+                else:
+                    with Path(state['transcript_path']).open('a') as stream:
+                        stream.write('{"type":' if activity == 'partial-record' else '{bad-json}\n')
+                drain(0.2)
+                status = dict(request, command='mailcortex-status'); status.pop('text')
+                self.assertEqual(self.c.socket_request(control, status)['status'], 'busy')
+                self.assertEqual(self.c.socket_request(control, request)['status'], 'busy')
+                self.assertNotIn(b'RECEIVED:short wake', output)
+
+    def test_post_compact_boundary_preserves_all_busy_guards(self):
+        owner = self.fake_owner()
+        owner.last_lifecycle_activity = 20
+        owner.mailcortex_post_compact_idle_at = 20
+        gates = (("status", "active"), ("screen_state", "blocked"),
+                 ("screen_state", "unknown"), ("compacting", True),
+                 ("lifecycle_health", "missing"), ("recovery_pending", True),
+                 ("recovery_awaiting", True), ("mailcortex_input_dirty", True),
+                 ("transcript_gate_blocked", True), ("transcript_partial", b'{'),
+                 ("transcript_quiescence_deadline", 30), ("last_local_input", 20),
+                 ("last_lifecycle_activity", 21))
+        with mock.patch.object(self.c, 'owner_matches', return_value=True), \
+             mock.patch.object(self.c, 'pending_terminal', return_value=False):
+            status = dict(self.request(), command='mailcortex-status'); status.pop('text')
+            self.assertEqual(self.c.owner_control(owner, status, self.fake_warm())['status'], 'idle')
+            for field, value in gates:
+                with self.subTest(field=field, value=value):
+                    previous = getattr(owner, field)
+                    setattr(owner, field, value)
+                    warm = self.fake_warm()
+                    self.assertEqual(self.c.owner_control(owner, self.request(), warm)['status'], 'busy')
+                    warm.write_all.assert_not_called()
+                    setattr(owner, field, previous)
+        with mock.patch.object(self.c, 'owner_matches', return_value=False):
+            self.assertEqual(self.c.owner_control(owner, self.request(), self.fake_warm())['status'], 'unavailable')
+
     def test_real_pty_captured_suggestion_admits_once(self):
         control, request, event, master, output, drain, path = self.start_pty(
             startup_screen=CAPTURED_SUGGESTION.decode())

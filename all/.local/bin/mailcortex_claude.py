@@ -604,6 +604,11 @@ def owner_control(owner, request, warm):
 
 
 def wake_idle_boundary(owner):
+    # PostCompact completes a native lifecycle without a normal-turn Stop.
+    # This mail-only boundary never changes the governor's turn/cache epoch.
+    compact = getattr(owner, "mailcortex_post_compact_idle_at", None)
+    if compact and (not owner.last_normal_stop or compact > owner.last_normal_stop):
+        return compact
     if owner.last_normal_stop:
         return owner.last_normal_stop
     if owner.completed_turn_epoch == 0:
@@ -763,12 +768,14 @@ def launch(argv):
             self.mailcortex_input_dirty = False
             self.mailcortex_startup_pending = False
             self.mailcortex_startup_idle_at = None
+            self.mailcortex_post_compact_idle_at = None
             super().__init__(*args, **kwargs)
 
         def state(self):
             value = super().state()
             value["supervisor_start_time"] = self.mailcortex_start_time
             value["mailcortex_startup_idle_at"] = self.mailcortex_startup_idle_at
+            value["mailcortex_post_compact_idle_at"] = self.mailcortex_post_compact_idle_at
             value["mailcortex_delivery"] = getattr(self, "mailcortex_delivery", None)
             return value
 
@@ -878,6 +885,10 @@ def launch(argv):
             # A normal Stop resets the governor's activity timestamp, but must
             # NEVER erase unfinished input typed while the preceding turn ran.
             if isinstance(response, dict) and response.get("ok") is True and not response.get("ignored"):
+                if message.get("event") == "post-compact":
+                    self.mailcortex_post_compact_idle_at = self.last_lifecycle_activity
+                elif message.get("event") in {"session-start", "session-end"}:
+                    self.mailcortex_post_compact_idle_at = None
                 self.mailcortex_startup_idle_at = None
                 self.mailcortex_startup_pending = (
                     message.get("event") == "session-start" and previous_session is None
