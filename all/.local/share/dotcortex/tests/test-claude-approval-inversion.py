@@ -524,7 +524,7 @@ class GateInversionTests(unittest.TestCase):
         self.assertEqual(result.stdout, '')
         self.assertFalse(self.queue.exists())
 
-    def test_wrapper_present_empty_engine_prompts_but_away_queues(self):
+    def test_wrapper_present_empty_engine_prompts_but_explicit_away_queues(self):
         wrapper = self.wrapper_module()
         self.manifest['gate_inversion'] = {'enabled': False, 'present_refusal': 'ask'}
         self.manifest['unattended']['enabled'] = True
@@ -536,8 +536,9 @@ class GateInversionTests(unittest.TestCase):
             with self.subTest(present=present):
                 if present:
                     self.stamp.touch()
-                elif self.stamp.exists():
-                    self.stamp.unlink()
+                else:
+                    self.stamp.unlink(missing_ok=True)
+                    self.flag.touch()
                 self.path.write_text(json.dumps(self.manifest))
                 result = subprocess.run(['/usr/bin/python3', str(REPO / 'all/.local/bin/claude-hook-approval-inverted')],
                                         input=json.dumps(self.event('for item in one; do printf %s "$item"; done\n')),
