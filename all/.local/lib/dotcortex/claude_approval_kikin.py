@@ -517,12 +517,14 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
         return True
     if manifest is not None and _for_loop_body_floor(floor_event, manifest):
         return True
-    split = _split_approval_compound(command)
+    # Parse the complete request, never a body-stripped incomplete << header.
+    # The stripped command above remains the effect/operand scan projection.
+    split = _split_approval_compound(tool_input['command'])
     if coordinator not in {'coordinator_codex_dispatch', 'coordinator_scratch_scp', 'coordinator_remote_mail_send', 'coordinator_ops_tool', 'coordinator_peer_fetch', 'coordinator_ops_redirect'}:
         if split is None:
-            if _unsafe_redirect(command):
+            if _unsafe_redirect(tool_input['command']):
                 return True
-        elif _unsafe_redirect(command, manifest, floor_event.get('cwd'), segmented=True):
+        elif _unsafe_redirect(tool_input['command'], manifest, floor_event.get('cwd'), segmented=True):
             return True
     # 2026-10-10 (replay finding): an unbalanced quote (a comment saying
     # "job's") makes the WHOLE command unparseable — the old early bail-out
@@ -558,7 +560,8 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
         if split is None:
             if _unreviewed_home_path(raw, roots):
                 return True
-        elif any(not _inert_environment_export(text) and _unreviewed_home_path(text, roots)
+        elif any(not _inert_environment_export(text)
+                  and _unreviewed_home_path(_strip_heredoc_bodies(text) or text, roots)
                   for _separator, text in split):
             return True
     # The floor sees every shell stage, including wrappers and redirects without
@@ -577,6 +580,9 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
             variables = {}
             expanded_parts = []
             for _separator, text in split:
+                text = _strip_heredoc_bodies(text)
+                if text is None:
+                    return True
                 if _inert_environment_export(text):
                     expanded_parts.append(text)
                     continue
@@ -1326,6 +1332,15 @@ def _literal_variable_expansion(text, cwd, manifest, variables=None):
     """
     if not isinstance(text, str) or not isinstance(cwd, str) or not isinstance(manifest, dict):
         return None
+    # Attached literal documents are data, including unmatched prose quotes and
+    # dollar/backtick bytes. Expand only the header, then retain payload bytes.
+    layout = _heredoc_layout(text)
+    documents = layout[1] if layout is not None else []
+    if documents:
+        segments = _split_approval_compound(text)
+        if segments is None or len(segments) != 1:
+            return None
+        text = layout[0]
     try:
         words = shlex.split(text, posix=True)
     except ValueError:
@@ -1351,7 +1366,10 @@ def _literal_variable_expansion(text, cwd, manifest, variables=None):
     # Keep shell substitutions, heredoc markers and quoting intact.  Rejoining
     # shlex words here would turn `$(read)` into a quoted literal and could
     # accidentally erase the very floor that must inspect it.
-    return pattern.sub(replace, text), state
+    rendered = pattern.sub(replace, text)
+    if documents:
+        rendered = rendered.rstrip('\n') + '\n' + ''.join(body for _offset, body in documents)
+    return rendered, state
 
 
 def _assignment_only(text, cwd, manifest, variables=None):
@@ -4666,14 +4684,14 @@ def _coordinator_path(raw, roots, *, regular=False, exists=True):
     return path
 
 
-def _coordinator_regular_input(raw, config, manifest, *, allow_policy=False):
+def _coordinator_regular_input(raw, config, manifest, *, allow_policy=False, allow_planned=False):
     if _coordinator_path(raw, config['scratch_roots'], regular=True):
         return True
     if allow_policy and _coordinator_path(raw, _policy_roots(manifest), regular=True):
         return True
-    # Only the internal compound walker supplies this proof. _load_manifest
-    # rejects the key in external policy files; request data cannot grant it.
-    planned = manifest.get('_compound_created_files', ())
+    # New prospective files are local mail-body inputs only, not grants for
+    # SCP, commit messages or dispatch. External policy cannot supply this key.
+    planned = manifest.get('_compound_created_files', ()) if allow_planned else ()
     path = _coordinator_path(raw, config['scratch_roots'], exists=False)
     return bool(path in planned and not os.path.lexists(raw) and os.path.isdir(os.path.dirname(raw)))
 
@@ -4690,7 +4708,10 @@ def _heredoc_scratch_output(event, manifest):
     raw = (words[2] if len(words) == 3 and words[:2] == ['cat', '>']
            else words[1] if len(words) == 2 and words[0] == 'tee' else None)
     raw = _lexical(raw, event['cwd']) if raw is not None else None
-    return _coordinator_path(raw, config['scratch_roots'], exists=False) if raw is not None else None
+    path = _coordinator_path(raw, config['scratch_roots'], exists=False) if raw is not None else None
+    # A creation fact needs a private existing parent, no symlink component,
+    # and an owned regular single-link leaf (or an absent new leaf).
+    return path if path is not None and _ops_redirect_target(raw, config) else None
 
 
 def _coordinator_git(repo, *args):
@@ -5184,14 +5205,14 @@ def _coordinator_match(event, manifest):
     if words[:1] == ['mailcortex'] and flags['mail_send']:
         mail_words = _coordinator_mail_words(command)
         # Native receipt takes a seat component, not an address or filename.
-        # Only this manifest's own seat and completion state are authorized;
+        # Only this manifest's own seat and completed/deferred states are authorized;
         # descriptor/filter syntax was already proved stdin-only by the parser.
         seat = config['seat_account'].split('@', 1)[0]
         if (mail_words is not None and len(mail_words) == 5
                 and mail_words[:3] == ['mailcortex', 'receipt', seat]
                 and re.fullmatch(r'[a-z0-9][a-z0-9._-]{0,63}', seat)
                 and _coordinator_message_id(mail_words[3])
-                and mail_words[4] == 'handling_completed'):
+                and mail_words[4] in {'handling_completed', 'handling_deferred'}):
             return 'coordinator_mail_receipt'
     remote_grant = _peer_coordinator_match(command, words, config, manifest)
     if remote_grant is not None:
@@ -5208,7 +5229,7 @@ def _coordinator_match(event, manifest):
         mail_words = _coordinator_mail_words(command)
         fields = _coordinator_mail_fields(mail_words, config) if mail_words is not None else None
         if (fields is not None and ('--body' in fields or _coordinator_regular_input(
-                fields['--body-file'], config, manifest, allow_policy=True))):
+                fields['--body-file'], config, manifest, allow_policy=True, allow_planned=True))):
             return 'coordinator_mail_send'
         return None
     dispatch = DISPATCH_RE.fullmatch(command)
@@ -5420,6 +5441,13 @@ def _mail_read_batch_proven(event, manifest):
     command = payload.get('command')
     if not isinstance(command, str) or len(command) > 8192:
         return False
+    if command.startswith('cd ~ && '):
+        # Cwd cannot affect these literal mailbox operands or stdin-only
+        # filters. This does not approve HOME as a tool or filesystem root.
+        command = command[len('cd ~ && '):]
+        if _coordinator_own_mail_read(_coordinator_mail_words(command, print_selectors=True), config):
+            proof = {**event, 'tool_input': {**payload, 'command': command}}
+            return not _admiral_floor(proof, manifest)
     match = re.fullmatch(
         r'(?:cd /tmp; )?for m in (?P<ids>[A-Za-z0-9_. -]+); '
         r'do echo "=========== \$m"; mailcortex read (?P<seat>[A-Za-z0-9_.@-]+) '
@@ -5995,7 +6023,12 @@ def _compound_approval(event, manifest, judge=None):
             current = target
         stages.append((index, expanded_text, stage, stage_manifest, cd, assignment, diagnostic))
         output = _heredoc_scratch_output(stage, stage_manifest)
-        if output is not None and os.path.isfile(output):
+        if (_heredoc_layout(expanded_text) or (None, []))[1] and any(
+                re.match(r'^mailcortex send(?:\s|$)', part) for _sep, part in segments) and output is None:
+            # A mail-body writer cannot inherit generic local-read/default
+            # authority over a symlink, hardlink, foreign or missing parent.
+            return False, _compound_segment_reason(index, expanded_text, 'true_floor') if judge else 'true_floor'
+        if output is not None:
             created.add(output)
         elif allow and reason == 'coordinator_scratch_scp':
             try:
