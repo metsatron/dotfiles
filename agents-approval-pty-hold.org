@@ -104,14 +104,39 @@ class HoldProfile(namedtuple("ProfileData", "name prompt_markers deny_keys marke
                 and all(marker in lowered for marker in self.required_markers))
 
     def identity(self, visible):
-        """Bind all visible request text and marker position, including context
-        above a generic confirmation question and choices below it."""
+        """Bind the request text and marker position, including context above a
+        generic confirmation question and choices below it.
+
+        Only the dialog counts (Admiral 9214/9610, 2026-10-31): Claude Code's
+        "N of M" queue counter and rotating "Tip:" line, and anything above the
+        dialog's header, are excluded. Each new queued request used to bump the
+        counter, change the hash and restart the 10-minute deadline, so a held
+        prompt with a growing queue behind it was never answered."""
         if not self.matches(visible):
             return None
         lowered = visible.lower()
+        question = min(lowered.index(marker) for marker in self.prompt_markers if marker in lowered)
+        request = _dialog_request(visible, question)
+        lowered = request.lower()
         position = min(lowered.index(marker) for marker in self.prompt_markers if marker in lowered)
-        digest = hashlib.sha256(visible.encode("utf-8", "replace")).hexdigest()
+        digest = hashlib.sha256(request.encode("utf-8", "replace")).hexdigest()
         return f"{digest}@{position}"
+
+
+# A permission dialog's first line names the tool ("Bash command", "Edit file",
+# an MCP tool, ...). Text above the LAST such header is the transcript, not the
+# request; a screen with no recognisable header is bound whole, as before.
+_DIALOG_HEADER = re.compile(
+    r"^[ \t]*(?:bash command|edit file|write file|create file|read file|update file|fetch|"
+    r"web search|tool use|notebook edit|[^\n]*\(mcp\))\b[^\n]*$", re.IGNORECASE | re.MULTILINE)
+_QUEUE_COUNTER = re.compile(r"\b\d+ of \d+\b")
+_TIP_LINE = re.compile(r"^[ \t]*tip:[^\n]*\n?", re.IGNORECASE | re.MULTILINE)
+
+
+def _dialog_request(visible, question):
+    headers = [match for match in _DIALOG_HEADER.finditer(visible) if match.start() < question]
+    request = visible[headers[-1].start():] if headers else visible
+    return _QUEUE_COUNTER.sub("# of #", _TIP_LINE.sub("", request))
 
 
 CLAUDE_CODE_PROFILE = HoldProfile(
@@ -700,6 +725,25 @@ class PtyHoldTests(unittest.TestCase):
         for old, new in [('rm OLD\n'+question, 'rm NEW\n'+question),
                          ('rm OLD\n'+question, 'rm OLD\n'+question.replace('1. Yes','1. Other'))]:
             self.assertNotEqual(profile.identity(old), profile.identity(new))
+
+    def test_queue_counter_tip_and_transcript_above_do_not_reset_the_deadline(self):
+        # Live 2026-10-31 (Admiral 9214/9535): "Bash command ... 11 of 12", then
+        # "183 of 184": every queued request bumped the counter and restarted the
+        # 10-minute timer, so the held prompt was never answered.
+        profile = self.hold.CLAUDE_CODE_PROFILE
+        def screen(above, counter, tip, command='cd /fixture && grep -n x y'):
+            return '\n'.join([above, ' Bash command · from the general-purpose agent   ' + counter,
+                ' Tip: ' + tip, '╌'*40, ' │ ' + command, '╌'*40, ' Do you want to proceed?',
+                ' ❯ 1. Yes', '   3. No', ' Esc to cancel'])
+        first = profile.identity(screen('transcript line one', '11 of 12', 'auto mode handles these'))
+        later = profile.identity(screen('transcript\nscrolled\nfurther', '183 of 184', 'use /rename'))
+        self.assertEqual(first, later)
+        timer = self.hold.PtyHoldTimer(600)
+        self.assertTrue(timer.record(screen('a', '11 of 12', 't'), profile, 0))
+        self.assertFalse(timer.record(screen('b\nc', '12 of 13', 'u'), profile, 300))
+        self.assertTrue(timer.expired(600))
+        # A different request in the same dialog position is still a new prompt.
+        self.assertNotEqual(first, profile.identity(screen('a', '11 of 12', 't', 'rm -rf /fixture')))
 
     def test_invalid_nonfinite_timeouts_are_bounded(self):
         for timeout in [True, False, 0, -1, float('nan'), float('inf')]:

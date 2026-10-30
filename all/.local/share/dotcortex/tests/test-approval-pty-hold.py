@@ -457,6 +457,25 @@ class PtyHoldTests(unittest.TestCase):
                          ('rm OLD\n'+question, 'rm OLD\n'+question.replace('1. Yes','1. Other'))]:
             self.assertNotEqual(profile.identity(old), profile.identity(new))
 
+    def test_queue_counter_tip_and_transcript_above_do_not_reset_the_deadline(self):
+        # Live 2026-10-31 (Admiral 9214/9535): "Bash command ... 11 of 12", then
+        # "183 of 184": every queued request bumped the counter and restarted the
+        # 10-minute timer, so the held prompt was never answered.
+        profile = self.hold.CLAUDE_CODE_PROFILE
+        def screen(above, counter, tip, command='cd /fixture && grep -n x y'):
+            return '\n'.join([above, ' Bash command · from the general-purpose agent   ' + counter,
+                ' Tip: ' + tip, '╌'*40, ' │ ' + command, '╌'*40, ' Do you want to proceed?',
+                ' ❯ 1. Yes', '   3. No', ' Esc to cancel'])
+        first = profile.identity(screen('transcript line one', '11 of 12', 'auto mode handles these'))
+        later = profile.identity(screen('transcript\nscrolled\nfurther', '183 of 184', 'use /rename'))
+        self.assertEqual(first, later)
+        timer = self.hold.PtyHoldTimer(600)
+        self.assertTrue(timer.record(screen('a', '11 of 12', 't'), profile, 0))
+        self.assertFalse(timer.record(screen('b\nc', '12 of 13', 'u'), profile, 300))
+        self.assertTrue(timer.expired(600))
+        # A different request in the same dialog position is still a new prompt.
+        self.assertNotEqual(first, profile.identity(screen('a', '11 of 12', 't', 'rm -rf /fixture')))
+
     def test_invalid_nonfinite_timeouts_are_bounded(self):
         for timeout in [True, False, 0, -1, float('nan'), float('inf')]:
             with self.subTest(timeout=timeout), self.assertRaises(ValueError):

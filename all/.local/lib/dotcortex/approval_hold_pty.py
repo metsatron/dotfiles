@@ -48,14 +48,39 @@ class HoldProfile(namedtuple("ProfileData", "name prompt_markers deny_keys marke
                 and all(marker in lowered for marker in self.required_markers))
 
     def identity(self, visible):
-        """Bind all visible request text and marker position, including context
-        above a generic confirmation question and choices below it."""
+        """Bind the request text and marker position, including context above a
+        generic confirmation question and choices below it.
+
+        Only the dialog counts (Admiral 9214/9610, 2026-10-31): Claude Code's
+        "N of M" queue counter and rotating "Tip:" line, and anything above the
+        dialog's header, are excluded. Each new queued request used to bump the
+        counter, change the hash and restart the 10-minute deadline, so a held
+        prompt with a growing queue behind it was never answered."""
         if not self.matches(visible):
             return None
         lowered = visible.lower()
+        question = min(lowered.index(marker) for marker in self.prompt_markers if marker in lowered)
+        request = _dialog_request(visible, question)
+        lowered = request.lower()
         position = min(lowered.index(marker) for marker in self.prompt_markers if marker in lowered)
-        digest = hashlib.sha256(visible.encode("utf-8", "replace")).hexdigest()
+        digest = hashlib.sha256(request.encode("utf-8", "replace")).hexdigest()
         return f"{digest}@{position}"
+
+
+# A permission dialog's first line names the tool ("Bash command", "Edit file",
+# an MCP tool, ...). Text above the LAST such header is the transcript, not the
+# request; a screen with no recognisable header is bound whole, as before.
+_DIALOG_HEADER = re.compile(
+    r"^[ \t]*(?:bash command|edit file|write file|create file|read file|update file|fetch|"
+    r"web search|tool use|notebook edit|[^\n]*\(mcp\))\b[^\n]*$", re.IGNORECASE | re.MULTILINE)
+_QUEUE_COUNTER = re.compile(r"\b\d+ of \d+\b")
+_TIP_LINE = re.compile(r"^[ \t]*tip:[^\n]*\n?", re.IGNORECASE | re.MULTILINE)
+
+
+def _dialog_request(visible, question):
+    headers = [match for match in _DIALOG_HEADER.finditer(visible) if match.start() < question]
+    request = visible[headers[-1].start():] if headers else visible
+    return _QUEUE_COUNTER.sub("# of #", _TIP_LINE.sub("", request))
 
 
 CLAUDE_CODE_PROFILE = HoldProfile(
