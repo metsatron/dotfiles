@@ -548,5 +548,141 @@ class RemotePresenceTests(unittest.TestCase):
 
 
 
+class WrapperAskProtocolTests(unittest.TestCase):
+    """Native blank ASK is successful, even without a fresh presence stamp."""
+    SPEC = importlib.util.spec_from_file_location('wrapper_inversion_fixture',
+        HERE / 'test-claude-approval-inversion.py')
+    inversion = importlib.util.module_from_spec(SPEC)
+    SPEC.loader.exec_module(inversion)
+    setUp = inversion.GateInversionTests.setUp
+    event = inversion.GateInversionTests.event
+    wrapper_module = inversion.GateInversionTests.wrapper_module
+
+    def presence(self, state):
+        self.flag.unlink(missing_ok=True)
+        self.stamp.unlink(missing_ok=True)
+        if state in ('fresh', 'stale', 'flag'):
+            self.stamp.touch()
+        if state == 'stale':
+            os.utime(self.stamp, (1, 1))
+        if state == 'flag':
+            self.flag.touch()
+
+    def wrapper_result(self, child):
+        wrapper = self.wrapper_module()
+        request = self.event('rm README.org')
+        out = io.StringIO()
+        def run(argv, **kwargs):
+            if argv[0] == '/usr/bin/python3':
+                if isinstance(child, Exception):
+                    raise child
+                return child
+            self.assertEqual(argv, ['/fixture/notifier'])
+            return subprocess.CompletedProcess(argv, 0)
+        self.manifest['notifications'] = {'argv': ['/fixture/notifier']}
+        with mock.patch.dict(os.environ, {}, clear=True), \
+                mock.patch.object(wrapper._runtime, '_runtime_manifest', side_effect=lambda: json.loads(json.dumps(self.manifest))), \
+                mock.patch.object(wrapper._runtime, '_queue_upsert', return_value='a' * 24) as queue, \
+                mock.patch.object(wrapper, '_research_unavailable_allow', return_value=False), \
+                mock.patch.object(wrapper, '_log_timeout_allow') as log_allow, \
+                mock.patch.object(wrapper, 'recall_prompt') as recall, \
+                mock.patch.object(wrapper.subprocess, 'run', side_effect=run) as process, \
+                mock.patch.object(wrapper.sys, 'stdin', io.StringIO(json.dumps(request))), \
+                contextlib.redirect_stdout(out):
+            self.assertEqual(wrapper.main(), 0)
+        output = out.getvalue()
+        behavior = json.loads(output)['hookSpecificOutput']['decision']['behavior'] if output else 'ask'
+        log_allow.assert_not_called()  # The real hard-floor request must never fail open.
+        return behavior, output, queue, process, recall
+
+    def test_native_blank_ask_fresh_stale_missing_and_explicit_away(self):
+        engine = self.inversion.e
+        for enabled in (True, False):
+            for mode in ('ask', 'deny', None, 'invalid'):
+                self.manifest['gate_inversion'] = {'enabled': enabled}
+                if mode is not None:
+                    self.manifest['gate_inversion']['present_refusal'] = mode
+                for state in ('fresh', 'stale', 'missing', 'flag'):
+                    with self.subTest(inversion=enabled, mode=mode, presence=state):
+                        self.presence(state)
+                        self.path.write_text(json.dumps(self.manifest))
+                        native = io.StringIO()
+                        env = {'SO_APPROVAL_KIKIN_MANIFEST': str(self.path)}
+                        with mock.patch.dict(os.environ, env, clear=True), \
+                                mock.patch.object(engine.sys, 'stdin', io.StringIO(json.dumps(self.event('rm README.org')))), \
+                                mock.patch.object(engine, '_desk_approval_consume', return_value=None), \
+                                mock.patch.object(engine, '_queue_upsert', return_value='b' * 24) as native_queue, \
+                                mock.patch.object(engine, '_notify_admiral', return_value='sent') as notify, \
+                                mock.patch.object(engine, '_log_decision'), contextlib.redirect_stdout(native):
+                            self.assertEqual(engine.main(), 0)
+                        expected = 'deny' if state == 'flag' or mode == 'deny' else 'ask'
+                        behavior, output, queue, process, recall = self.wrapper_result(
+                            subprocess.CompletedProcess([], 0, native.getvalue()))
+                        self.assertEqual(behavior, expected)
+                        queue.assert_not_called()  # No engine_unavailable reclassification.
+                        self.assertEqual(process.call_count, 1)  # Engine only; no duplicate notifier.
+                        self.assertEqual(native_queue.call_count, int(expected == 'deny'))
+                        self.assertEqual(notify.call_count, int(expected == 'deny'))
+                        if expected == 'ask':
+                            self.assertEqual(output, '')
+                            recall.assert_not_called()
+                        else:
+                            self.assertIs(json.loads(output)['hookSpecificOutput']['decision']['interrupt'], False)
+
+    def test_blank_child_respects_explicit_latch_and_presentation_switch(self):
+        for enabled in (True, False):
+            for mode in ('ask', 'deny'):
+                self.manifest['gate_inversion'] = {'enabled': enabled, 'present_refusal': mode}
+                for state in ('fresh', 'stale', 'missing', 'flag'):
+                    self.presence(state)
+                    for blank in ('', ' \n'):
+                        with self.subTest(inversion=enabled, mode=mode, presence=state, stdout=blank):
+                            behavior, output, queue, process, recall = self.wrapper_result(
+                                subprocess.CompletedProcess([], 0, blank))
+                            expected = 'ask' if state != 'flag' and mode == 'ask' else 'deny'
+                            self.assertEqual(behavior, expected)
+                            self.assertEqual(queue.call_count, int(expected == 'deny'))
+                            self.assertEqual(process.call_count, 1 + int(expected == 'deny'))
+
+    def test_bad_engine_results_keep_existing_fallback_and_floor(self):
+        malformed = ['{', '{}', 'null', '{"hookSpecificOutput":{"hookEventName":"Other","decision":{"behavior":"allow"}}}',
+                     '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"deny","interrupt":true}}}']
+        children = [subprocess.CompletedProcess([], 0, text) for text in malformed]
+        children += [subprocess.CompletedProcess([], 1, ''),
+                     subprocess.CompletedProcess([], 1, '{"hookSpecificOutput":{"hookEventName":"PermissionRequest","decision":{"behavior":"allow"}}}'),
+                     subprocess.TimeoutExpired('fixture engine', 6)]
+        for enabled in (True, False):
+            for mode in ('ask', 'deny'):
+                self.manifest['gate_inversion'] = {'enabled': enabled, 'present_refusal': mode}
+                for state in ('fresh', 'stale', 'missing', 'flag'):
+                    self.presence(state)
+                    for child in children:
+                        with self.subTest(inversion=enabled, mode=mode, presence=state, child=child):
+                            behavior, output, queue, process, recall = self.wrapper_result(child)
+                            expected = 'ask' if state == 'fresh' and mode == 'ask' else 'deny'
+                            self.assertEqual(behavior, expected)
+                            self.assertEqual(queue.call_count, int(expected == 'deny'))
+                            self.assertEqual(process.call_count, 1 + int(expected == 'deny'))
+                            if expected == 'deny':
+                                self.assertEqual(queue.call_args.args[1], 'engine_unavailable')
+                                self.assertIs(json.loads(output)['hookSpecificOutput']['decision']['interrupt'], False)
+
+    def test_structured_allow_and_deny_remain_authoritative(self):
+        for state in ('fresh', 'stale', 'missing', 'flag'):
+            self.presence(state)
+            for behavior in ('allow', 'deny'):
+                with self.subTest(presence=state, behavior=behavior):
+                    decision = {'behavior': behavior}
+                    if behavior == 'deny':
+                        decision.update(interrupt=False, message='native refusal')
+                    output = {'hookSpecificOutput': {'hookEventName': 'PermissionRequest', 'decision': decision}}
+                    result, text, queue, process, recall = self.wrapper_result(
+                        subprocess.CompletedProcess([], 0, json.dumps(output)))
+                    self.assertEqual(result, behavior)
+                    self.assertEqual(json.loads(text), output)
+                    queue.assert_not_called()
+                    self.assertEqual(process.call_count, 1)
+
+
 if __name__ == '__main__':
     unittest.main()
