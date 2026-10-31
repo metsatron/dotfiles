@@ -365,7 +365,7 @@ class LaneTests(unittest.TestCase):
         for needle in ("ssh kikin", "mailcortex inbox", "mailcortex read", "mailcortex send",
                        "mailcortex receipt", "handling_completed", "--in-reply-to", "[BRIEF]",
                        "Session Corpus Law", "doctrine-reference", "peer-agents", "meta-agents",
-                       "honey-skills-push", "session_id:", "rg -uu", "claude-code-md-pipeline"):
+                       "helmstow --to honey", "session_id:", "rg -uu", "claude-code-md-pipeline"):
             self.assertIn(needle, block)
         for text in texts.values():
             self.assertNotIn("Opus 5.5", text, "Opus 5.5 left the menu on 2026-10-19")
