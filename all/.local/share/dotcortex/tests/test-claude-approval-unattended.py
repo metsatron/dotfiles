@@ -657,7 +657,9 @@ class UnattendedCoordinatorTests(unittest.TestCase):
         manifest = self.loaded()
         base = self.inline_mail('fixture status').removesuffix(' | tail -5')
         status = '; echo "exit=$?"'
-        denied = ['echo "exit=$?"', 'true' + status, 'fixture-command' + status]
+        # A status tail after a non-mail command now follows that command's own
+        # verdict (test_terminal_exit_status_follows_the_command_it_reads).
+        denied = ['echo "exit=$?"']
         denied += [base + suffix for suffix in [
             '; echo "$?"',
             '; echo "exit=$? $HOME"', '; echo "exit=$API_TOKEN"',
@@ -708,6 +710,26 @@ class UnattendedCoordinatorTests(unittest.TestCase):
             manifest['coordinator_ops']['classes']['mail_send'] = False
             self.assertFalse(e.classify(self.event(base + status), manifest)[0])
             self.assertFalse(e._decide_request(self.event(base + status), manifest)[0])
+
+    def test_terminal_exit_status_follows_the_command_it_reads(self):
+        # Mètsàtron's word 2026-10-31 (Telegram 9888): a terminal literal
+        # `; echo "exit=$?"` adds no authority, so the compound gets exactly the
+        # verdict of what precedes it, never more.
+        status = '; echo "exit=$?"'
+        for inverted in [False, True]:
+            self.manifest['classes'][0]['enabled'] = inverted
+            self.manifest['gate_inversion']['enabled'] = inverted
+            manifest = self.loaded()
+            with mock.patch.object(e, '_decider_decide', side_effect=AssertionError('no model')):
+                for command in ['ls -la', 'git status --short', 'true', 'sudo fixture-command',
+                                'rm -rf /', 'cat .env', 'fixture-command', 'kill -9 1',
+                                'ls -la && git status --short', 'cat .env; ls -la']:
+                    with self.subTest(command=command, inverted=inverted):
+                        alone = e._decide_request(self.event(command), manifest)[0]
+                        self.assertEqual(e._decide_request(self.event(command + status), manifest)[0], alone)
+                self.assertTrue(e._decide_request(self.event('ls -la' + status), manifest)[0])
+                for command in ['sudo fixture-command', 'cat .env', 'rm -rf /']:
+                    self.assertFalse(e._decide_request(self.event(command + status), manifest)[0])
 
     def inline_mail(self, body='The fixture user asked for gate status. A read-only tabs call was deferred; notifier unconfigured. I have not retried. Please report when the gate and notifier are fixed.'):
         import shlex

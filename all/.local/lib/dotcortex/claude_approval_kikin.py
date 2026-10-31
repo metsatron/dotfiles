@@ -5965,10 +5965,16 @@ def _compound_approval(event, manifest, judge=None):
     stages = []
     variables = {}
     previous_result = None
-    mail_status = (len(segments) == 2 and segments[0][1].startswith('mailcortex ')
-                   and segments[1][0] == ';' and _terminal_exit_status(segments[1][1])
-                   and command.rstrip(' ').endswith(segments[1][1])
+    # A terminal `; echo "label=$?"` only reads back the previous exit status
+    # (Mètsàtron's word 2026-10-31, Telegram 9888): it adds no authority, so it
+    # is a diagnostic after any command, and every other segment is still
+    # judged on its own. _terminal_exit_status proves one literal label plus
+    # the sole $? expansion, with no redirect, option or trailing command.
+    status_tail = (len(segments) >= 2 and segments[-1][0] == ';'
+                   and _terminal_exit_status(segments[-1][1])
+                   and command.rstrip(' ').endswith(segments[-1][1])
                    and not any(ord(char) < 32 or ord(char) == 127 for char in command))
+    mail_status = status_tail and len(segments) == 2 and segments[0][1].startswith('mailcortex ')
     for index, (separator, text) in enumerate(segments, 1):
         # The diagnostic proves and final-judges the original mail operation.
         # Rewriting even a literal '$HOME' changes data; rewriting "$HOME"
@@ -5982,15 +5988,9 @@ def _compound_approval(event, manifest, judge=None):
             expanded_text, variables = expanded
         stage_manifest = {**manifest, '_compound_created_files': frozenset(created), '_compound_remote_created_files':frozenset(remote_created)}
         stage = {**event, 'cwd': current, 'tool_input': {**payload, 'command': expanded_text}}
-        # Only this terminal, literal readout of a proven mail operation is
-        # special. Never evaluate $? or permit generic echo/body interpolation.
-        mail_words = (_coordinator_mail_words(segments[0][1], print_selectors=True) or []) if mail_status else []
-        own_read = (previous_result == (True, 'local_read')
-                    and _coordinator_own_mail_read(mail_words, manifest.get('coordinator_ops', {})))
-        diagnostic = (mail_status and index == 2
-                      and (previous_result in {(True, 'coordinator_mail_send'),
-                                               (True, 'coordinator_mail_help'),
-                                               (True, 'coordinator_mail_receipt')} or own_read)
+        # Only the terminal, literal status readout is special. Never evaluate
+        # $? or permit generic echo/body interpolation anywhere else.
+        diagnostic = (status_tail and index == len(segments)
                       and not _admiral_floor(stage, stage_manifest))
         if text.startswith('echo ') and '$?' in text and _dynamic_shell(text) and not diagnostic:
             return False, _compound_segment_reason(index, text, 'true_floor') if judge else 'true_floor'
