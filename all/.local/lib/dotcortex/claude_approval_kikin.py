@@ -402,6 +402,12 @@ def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None)
                 return True
         if verb in {'kill', 'pkill', 'killall'}:
             return True
+        # Projection takeover is the Admiral's alone (ruling 2026-10-31): helmstow
+        # --adopt moves aside whatever stow does not own, and GNU stow's own
+        # --adopt/--override overwrite targets. No agent may run either unasked.
+        if (verb in {'helmstow', 'stow'} and any(word == '--adopt' or word.startswith(('--override', '--adopt='))
+                                                 for word in lowered[1:])):
+            return True
         if (verb in PACKAGE and any(word in {'install', 'add', 'upgrade', 'update', 'remove', 'uninstall', 'sync'}
                                    or word.startswith(('install=', 'add=')) for word in lowered[1:])):
             return True
