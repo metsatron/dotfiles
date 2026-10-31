@@ -111,11 +111,13 @@ honey_claude_launch() {
         export HONEY_VOICE="${!voice_var:-$voice}"
         [[ -n "${LIB_DIR:-}" ]] && export WHISPER_TRANSCRIBE="$LIB_DIR/../bin/honey-whisper-transcribe"
         # Mail wake (services-mailcortex-claude.org): seats listed in
-        # HONEY_CLAUDE_MAIL_WAKE_BOTS (default: opus, Bunta, the only seat with a
-        # Kikin wake registry entry) launch through mailcortex-claude-warm with the
-        # opt-in set; it execs claude-warm unchanged unless the wake is enabled.
+        # HONEY_CLAUDE_MAIL_WAKE_BOTS (default: all three; Bunta, Sasuke and
+        # Shoukichi each have a Kikin wake registry entry, applied by hand on Honey
+        # 2026-10-30 and encoded here 2026-10-31) launch through
+        # mailcortex-claude-warm with the opt-in set; it execs claude-warm
+        # unchanged unless the wake is enabled.
         local warm=claude-warm wake=0
-        case " ${HONEY_CLAUDE_MAIL_WAKE_BOTS-opus} " in *" $bot "*) warm=mailcortex-claude-warm wake=1 ;; esac
+        case " ${HONEY_CLAUDE_MAIL_WAKE_BOTS-opus sonnet haiku} " in *" $bot "*) warm=mailcortex-claude-warm wake=1 ;; esac
         local wake_reply_env="$HOME/.config/mailcortex/wake-reply-$bot.env"
         [[ ! -f "$wake_reply_env" ]] || source "$wake_reply_env"
         # acceptEdits (auto) mode: plan mode blocks unattended bot work (as on kikin).

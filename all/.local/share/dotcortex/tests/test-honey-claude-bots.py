@@ -103,9 +103,8 @@ class LauncherTests(unittest.TestCase):
                 self.assertEqual(rec["state"], str(box.home / f".claude/channels/telegram-{bot}"))
                 self.assertEqual(rec["agent"], f"honey-{bot}-bot")
                 self.assertEqual(rec["wake_reply_chat"], "YOUR_TELEGRAM_CHAT_ID")
-                # Only Bunta's seat (opus) launches through the mail-wake launcher, opted in.
-                self.assertEqual((rec["warm"], rec["wake"]),
-                                 ("mailcortex-claude-warm", "1") if bot == "opus" else ("claude-warm", "0"))
+                # All three seats launch through the mail-wake launcher, opted in.
+                self.assertEqual((rec["warm"], rec["wake"]), ("mailcortex-claude-warm", "1"))
                 self.assertIn(str(box.home / ".npm-global/bin"), rec["path"].split(":"))
                 self.assertIn(str(ROOT / "all/.local/bin"), rec["path"].split(":"), "fleet bin of the lane checkout")
                 self.assertTrue(rec["path"].startswith(str(box.bin)), "PATH must be appended to")
