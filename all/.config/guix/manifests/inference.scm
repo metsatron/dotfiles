@@ -39,6 +39,8 @@
 ;; (Xeon E3-1246 v3, Haswell — AVX2 + FMA). Deliberately *not* the X230: it is the fleet
 ;; fileserver, thermally degraded, and does no local inference (ruling 2026-07-25).
 
+;; *GPU build tools.* =shaderc= (for =glslc=) and =vulkan-headers= (for =vulkan.hpp=) are here as build-time inputs for Vulkan builds of llama.cpp bindings, first Kikin's =helmcortex-decider-vk= Lane 2 env (Mètsàtron's word 2026-10-31). The Guix llama.cpp's own Vulkan backend is no shortcut: under Guix's loader it sees no device on Kikin, so the bindings link the host's =libvulkan.so.1= instead.
+
 
 ;; [[file:../../../../package-guix.org::*Inference profile — CPU-tuned llama.cpp and whisper.cpp][Inference profile — CPU-tuned llama.cpp and whisper.cpp:1]]
 ;; ~/.config/guix/manifests/inference.scm
@@ -65,8 +67,13 @@
      (with-configure-flag . "ggml-for-whisper=-DGGML_CPU_ALL_VARIANTS=ON"))))
 
 (packages->manifest
- (cons llama-swap
-       (map (compose tune-ggml specification->package)
-            (list "llama-cpp"      ; Recall embeddings (Qwen3-Embedding) + local chat fallback
-                  "whisper-cpp")))) ; whisper-transcribe, whisper-hotkey dictation, telegram voice
+ (cons* llama-swap
+        ;; glslc and vulkan.hpp: build-time only, for Vulkan builds of llama.cpp bindings
+        ;; (Kikin's helmcortex-decider-vk env, Mètsàtron's word 2026-10-31). The build links
+        ;; the host's libvulkan.so.1, never a Guix loader (two glibcs in one process).
+        (specification->package "shaderc")
+        (specification->package "vulkan-headers")
+        (map (compose tune-ggml specification->package)
+             (list "llama-cpp"      ; Recall embeddings (Qwen3-Embedding) + local chat fallback
+                   "whisper-cpp")))) ; whisper-transcribe, whisper-hotkey dictation, telegram voice
 ;; Inference profile — CPU-tuned llama.cpp and whisper.cpp:1 ends here
