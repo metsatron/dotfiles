@@ -16,7 +16,7 @@ ROOT = Path(__file__).resolve().parents[5]
 SHARE = ROOT / "all/.local/share/dotcortex/honey-claude"
 BIN = SHARE / "bin"
 OPENRC = SHARE / "openrc"
-BOTS = {"opus": "claude-opus-4-8[1m]", "sonnet": "claude-sonnet-5-5[1m]", "haiku": "claude-haiku-4-5-20251001"}
+BOTS = {"opus": "claude-opus-4-8[1m]", "sonnet": "claude-sonnet-5-5[1m]", "haiku": "claude-haiku-5-5"}
 PERSONAS = {"opus": "Bunta", "sonnet": "Sasuke", "haiku": "Shoukichi"}
 
 
@@ -302,6 +302,28 @@ class ServiceTests(unittest.TestCase):
             real = subprocess.run([str(OPENRC / "honey-claude-install")], capture_output=True, text=True)
             self.assertNotEqual(real.returncode, 0)
 
+    def test_workdirs_dry_run_plans_each_identity_file_and_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for bot in BOTS:
+                (root / bot).mkdir()
+            (root / "opus/CLAUDE.md").write_text((SHARE / "CLAUDE.opus.md").read_text())
+            (root / "sonnet/CLAUDE.md").write_text("stale\n")
+            before = {p: p.read_text() for p in root.rglob("*") if p.is_file()}
+            env = {**os.environ, "HONEY_CLAUDE_WORK_ROOT": tmp}
+            result = subprocess.run([str(OPENRC / "honey-claude-install"), "--dry-run", "workdirs"],
+                                    capture_output=True, text=True, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"unchanged {tmp}/opus/CLAUDE.md", result.stdout)
+            for bot in ("sonnet", "haiku"):
+                self.assertRegex(result.stdout, rf"would: install -m 0644 -o root -g \S+ \S+/CLAUDE\.{bot}\.md {re.escape(tmp)}/{bot}/CLAUDE\.md")
+            self.assertRegex(result.stdout, rf"would: cp -p {re.escape(tmp)}/sonnet/CLAUDE\.md {re.escape(tmp)}/sonnet/CLAUDE\.md\.bak-")
+            self.assertEqual(before, {p: p.read_text() for p in root.rglob("*") if p.is_file()})
+            if os.getuid() != 0:
+                real = subprocess.run([str(OPENRC / "honey-claude-install"), "workdirs"],
+                                      capture_output=True, text=True, env=env)
+                self.assertNotEqual(real.returncode, 0)
+
 
 class LaneTests(unittest.TestCase):
     """The lane is a host service: never stowed, never on anyone's PATH."""
@@ -335,6 +357,21 @@ class LaneTests(unittest.TestCase):
                 self.assertNotIn("/dotcortex/honey-claude", dest, (host, rel))
                 self.assertNotIn(rel, (".local", ".local/share", ".local/share/dotcortex"),
                                  (host, "a folded parent would expose the lane", dest))
+
+    def test_context_block_is_shared_current_and_public_safe(self):
+        texts = {bot: (SHARE / f"CLAUDE.{bot}.md").read_text() for bot in BOTS}
+        blocks = {bot: text.split("# Reach and context", 1)[1] for bot, text in texts.items()}
+        self.assertEqual(len(set(blocks.values())), 1, "the three bots share one context block")
+        block = blocks["opus"]
+        for needle in ("ssh kikin", "mailcortex inbox", "mailcortex read", "mailcortex send",
+                       "mailcortex receipt", "handling_completed", "--in-reply-to", "[BRIEF]",
+                       "Session Corpus Law", "doctrine-reference", "peer-agents", "meta-agents",
+                       "honey-skills-push", "session_id:", "rg -uu", "claude-code-md-pipeline"):
+            self.assertIn(needle, block)
+        for text in texts.values():
+            self.assertNotIn("Opus 5.5", text, "Opus 5.5 left the menu on 2026-10-19")
+            self.assertIsNone(re.search(r"\b\d{6,}:[A-Za-z0-9_-]{30,}\b", text), "a bot token shape")
+            self.assertIsNone(re.search(r"(chat_id|user_id|api[_-]?key|password)\s*[:=]\s*\S", text, re.I))
 
     def test_boundary_law_names_the_vault_and_no_addresses(self):
         text = "".join((SHARE / f"CLAUDE.{bot}.md").read_text() for bot in BOTS)
