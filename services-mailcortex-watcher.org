@@ -1907,6 +1907,51 @@ def reconcile_replies(seat: str, record: dict, adapter: object, now: float) -> b
     return pending
 
 
+STALLED_WAKE_REASONS = frozenset({"busy", "rate_limited", "transport_unavailable"})
+REQUEUE_MAX_AGE_SECONDS = 12 * 60 * 60
+REQUEUE_MAX_ATTEMPTS = 8
+
+
+def requeue_stalled(seat: str, mailbox: Path, now: float) -> int:
+    """Re-offer queued wakes that were filed to `cur/` while the seat was busy.
+
+    A wake that cannot be admitted (busy, rate-limited, transport unavailable) is
+    written as a queued receipt and the message is filed to `cur/`, while the scan
+    only reads `new/` — so that mail was never offered again and sat unread
+    indefinitely. This moves such messages back for one more attempt, bounded by
+    age and attempt count so a chatty seat cannot cause an endless wake loop.
+    """
+    cur = mailbox / "cur"
+    target = mailbox / "new"
+    if not cur.is_dir():
+        return 0
+    moved = 0
+    for path in sorted(cur.iterdir(), key=lambda p: p.name):
+        if not path.is_file() or path.is_symlink() or path.name.startswith("."):
+            continue
+        mid = message_id(path)
+        receipt = safe_receipt(seat, mid)
+        if not receipt or receipt.get("wake_state") != "queued":
+            continue
+        if receipt.get("reason") not in STALLED_WAKE_REASONS:
+            continue
+        updated = receipt.get("wake_updated_at")
+        if not isinstance(updated, (int, float)) or now - updated > REQUEUE_MAX_AGE_SECONDS:
+            continue
+        attempts = receipt.get("wake_attempts")
+        attempts = attempts if isinstance(attempts, int) else 0
+        if attempts >= REQUEUE_MAX_ATTEMPTS:
+            continue
+        destination = target / path.name.split(":2,", 1)[0]
+        if destination.exists():
+            continue
+        path.rename(destination)
+        MAILCORTEX.write_wake_receipt(seat, mid, "queued",
+            reason=receipt.get("reason"), wake_attempts=attempts + 1, wake_updated_at=now)
+        moved += 1
+    return moved
+
+
 def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int:
     now = time.time() if now is None else now
     count = 0
@@ -1921,6 +1966,8 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
         if any(item.is_symlink() for item in components) or not all(item.is_dir() for item in components) or not (mailbox / "new").is_dir():
             raise WatcherError("canonical mailbox is absent or unsafe")
         transport_adapter = record_adapter(adapter, record)
+        if record["transport"] != "agent-peer-native":
+            requeue_stalled(seat, mailbox, now)
         if record["transport"] == "claude-ssh":
             count += claude_wake().scan_batch(globals(), seat, record, transport_adapter, now)
             continue
