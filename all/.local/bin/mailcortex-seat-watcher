@@ -12,6 +12,7 @@ import re
 import socket
 import shutil
 import subprocess
+import tempfile
 import sys
 import time
 import urllib.error
@@ -38,7 +39,8 @@ SPEC.loader.exec_module(MAILCORTEX)
 
 SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
-TRANSPORTS = {"agent-peer-native", "opencode", "herdr", "hermes", "nanobot", "ductor", "deepseek", "claude-ssh", "claude-local"}
+TRANSPORTS = {"agent-peer-native", "opencode", "herdr", "hermes", "nanobot", "ductor", "deepseek",
+              "claude-ssh", "claude-local", "gemma-pi"}
 
 
 class WatcherError(Exception):
@@ -62,6 +64,61 @@ def claude_wake():
         return mailcortex_claude
     except ImportError as error:
         raise WatcherError("Claude wake seam is not installed") from error
+
+
+class GemmaPiAdapter:
+    """Wake a Pi/antigravity harness by running exactly one bounded turn.
+
+    Every other transport injects into a process that is already alive. Gemma is
+    not: her Pi session belongs to her Telegram adapter, so a mail wake has to be
+    a turn of its own, launched through the same pinned contract and serialised
+    against her interactive turns by a file lock. The turn's output is her answer;
+    the seat watcher owns delivery and receipts, this owns exactly one turn.
+    """
+
+    TASK = Path(os.environ.get("GEMMA_TASK", "/home/metsatron/HelmCortex/FORGE/bin/gemma-task"))
+
+    def __init__(self, runner=subprocess.run):
+        self.runner = runner
+
+    @staticmethod
+    def validate_target(record: dict) -> None:
+        path = record.get("gemma_env_file")
+        if not isinstance(path, str) or not 1 <= len(path) <= 512:
+            raise WatcherError("invalid Gemma env file")
+        config = Path(path)
+        if config.is_symlink() or not config.is_file() or config.stat().st_mode & 0o077:
+            raise WatcherError("Gemma env file is not a private regular file")
+
+    def resolve_idle_pane(self, record: dict) -> str | None:
+        # There is no pane to own; the lock taken by the runner is the
+        # serialisation point, and a busy harness reports itself as busy.
+        return record["gemma_env_file"]
+
+    def deliver(self, record: dict, target: str, prompt: str) -> None:
+        with tempfile.NamedTemporaryFile("w", suffix=".prompt", delete=False,
+                                         encoding="utf-8") as stream:
+            stream.write(prompt)
+            brief = Path(stream.name)
+        try:
+            result = self.runner(
+                [str(self.TASK), "--env", record["gemma_env_file"],
+                 "--prompt-file", str(brief),
+                 "--timeout", str(record.get("gemma_turn_timeout_seconds", 900))],
+                capture_output=True, text=True, timeout=1200, check=False)
+        finally:
+            try:
+                brief.unlink()
+            except OSError:
+                pass
+        answers = Path("/home/metsatron/.local/state/mailcortex/gemma-answers")
+        answers.mkdir(parents=True, exist_ok=True)
+        (answers / (time.strftime("%Y%m%dT%H%M%S") + ".md")).write_text(
+            result.stdout or "", encoding="utf-8")
+        if result.returncode == 3:
+            raise PromptNotAdmittedError("busy")
+        if result.returncode != 0:
+            raise WatcherError("Gemma turn failed rc=%d" % result.returncode)
 
 
 class ClaudeLocalAdapter:
@@ -131,6 +188,7 @@ def load_registry(path: Path, host: str) -> dict:
             "opencode": {"opencode_url", "opencode_session", "opencode_directory"},
             "hermes": {"hermes_url", "hermes_api_key_file", "hermes_target"},
             "nanobot": {"nanobot_url", "nanobot_api_token_file", "nanobot_target"},
+            "gemma-pi": {"gemma_env_file"},
             "ductor": {"ductor_config"},
             "deepseek": {"deepseek_url", "deepseek_cookie_file", "deepseek_session"},
             "claude-ssh": {"ssh_target", "remote_user", "claude_target", "coalesce_seconds"},
@@ -142,7 +200,8 @@ def load_registry(path: Path, host: str) -> dict:
             record["host"] != host
             or record["mailbox"] not in {f"seats/{seat}", f"consorts/{seat}"}
             or not isinstance(record["harness"], str)
-            or record["harness"] not in {"opencode", "claude", "codex", "hermes", "nanobot", "ductor", "deepseek"}
+            or record["harness"] not in {"opencode", "claude", "codex", "hermes", "nanobot", "ductor",
+                                         "deepseek", "pi"}
         ):
             raise WatcherError("seat registry ownership or transport mismatch")
         if transport == "agent-peer-native":
@@ -194,6 +253,8 @@ def load_registry(path: Path, host: str) -> dict:
                     or not 1 <= len(target["chat_id"]) <= 256
                     or target.get("session_key") != f"telegram:{target['chat_id']}"):
                 raise WatcherError("invalid Nano target")
+        elif transport == "gemma-pi":
+            GemmaPiAdapter.validate_target(record)
         elif transport == "opencode":
             if record["harness"] != "opencode":
                 raise WatcherError("OpenCode transport requires OpenCode harness")
@@ -1079,6 +1140,7 @@ class TransportAdapters:
             "ductor": DuctorAdapter(),
             "deepseek": DeepSeekAdapter(),
             "claude-local": ClaudeLocalAdapter(),
+            "gemma-pi": GemmaPiAdapter(),
         }
 
     def for_record(self, record: dict) -> object:
@@ -1291,7 +1353,7 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             try:
                 pane_id = transport_adapter.resolve_idle_pane(record)
             except Exception as error:
-                if record["transport"] not in {"herdr", "deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local"}:
+                if record["transport"] not in {"herdr", "deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local", "gemma-pi"}:
                     raise
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
                                               wake_error=diagnostic(error), wake_updated_at=now)
@@ -1357,7 +1419,7 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
         try:
             count += scan_seats({"seats": {seat: record}}, adapter, now=now)
         except Exception as error:
-            if record.get("transport") not in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-ssh", "claude-local"}:
+            if record.get("transport") not in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-ssh", "claude-local", "gemma-pi"}:
                 raise
             report_error(seat, "scan", error)
     return count
