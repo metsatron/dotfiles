@@ -744,20 +744,67 @@ class OpenCodeAdapter:
             raise WatcherError("OpenCode activity response is invalid")
         return None if target in active else target
 
+    VERIFY_SECONDS = 45.0
+    VERIFY_INTERVAL = 3.0
+
+    def _message_ids(self, record: dict, target: str) -> list:
+        # A raw GET: the shared _request helper validates a dict under "data",
+        # while the message endpoint returns a LIST there.
+        self.validate_target(record)
+        request = urllib.request.Request(
+            loopback_url(record["opencode_url"], "OpenCode URL")
+            + f"/api/session/{target}/message", method="GET")
+        try:
+            with self.opener(request, timeout=15) as response:
+                if response.status != 200:
+                    raise WatcherError("OpenCode message list refused")
+                value = json.loads(response.read())
+        except WatcherError:
+            raise
+        except (OSError, ValueError, urllib.error.URLError) as error:
+            raise WatcherError("OpenCode message list unavailable") from error
+        rows = value.get("data") if isinstance(value, dict) else value
+        if not isinstance(rows, list):
+            raise WatcherError("OpenCode message list is invalid")
+        return [row.get("id") for row in rows if isinstance(row, dict) and row.get("id")]
+
+    def _post_async(self, record: dict, target: str, prompt: str) -> None:
+        self.validate_target(record)
+        query = urllib.parse.quote(record["opencode_directory"], safe="")
+        request = urllib.request.Request(
+            loopback_url(record["opencode_url"], "OpenCode URL")
+            + f"/session/{target}/prompt_async?directory={query}",
+            data=json.dumps({"parts": [{"type": "text", "text": prompt}],
+                             "agent": "build"}).encode("utf-8"),
+            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with self.opener(request, timeout=15) as response:
+                if response.status not in (200, 204):
+                    raise WatcherError("OpenCode turn admission refused")
+        except WatcherError:
+            raise
+        except (OSError, urllib.error.URLError) as error:
+            raise WatcherError("OpenCode API unavailable or admission outcome unknown") from error
+
     def deliver(self, record: dict, target: str, prompt: str) -> None:
         if target != record["opencode_session"]:
             raise PromptNotAdmittedError("unavailable")
-        # Rebind immediately before input; never create, resume another ID,
-        # steer, abort, or retry an ambiguous admission.
+        # The v2 queue endpoint (/api/session/{id}/prompt, delivery=queue) admits
+        # a message that only drains when the BOT sends its next prompt: an
+        # externally enqueued wake is accepted with a valid admittedSeq and then
+        # never runs — a seat "woken" by that route stays asleep. prompt_async is
+        # the endpoint that actually starts a turn, so wake uses it and then
+        # verifies the turn by reading the session back rather than trusting the
+        # HTTP status alone.
         self._bound_session(record)
-        request_id = "msg_" + uuid.uuid4().hex
-        value = self._request(record, "POST", f"/api/session/{target}/prompt", {
-            "id": request_id, "prompt": {"text": prompt},
-            "delivery": "queue", "resume": True})
-        if (value.get("id") != request_id or value.get("sessionID") != target
-                or value.get("delivery") != "queue"
-                or type(value.get("admittedSeq")) is not int or value["admittedSeq"] < 0):
-            raise WatcherError("OpenCode admission outcome is unknown")
+        before = self._message_ids(record, target)
+        self._post_async(record, target, prompt)
+        deadline = time.time() + self.VERIFY_SECONDS
+        while time.time() < deadline:
+            if self._message_ids(record, target) != before:
+                return
+            time.sleep(self.VERIFY_INTERVAL)
+        raise WatcherError("OpenCode wake was admitted but no turn appeared")
 
 
 class DuctorAdapter:
