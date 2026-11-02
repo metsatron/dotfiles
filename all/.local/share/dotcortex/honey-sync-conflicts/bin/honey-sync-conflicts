@@ -1,0 +1,353 @@
+#!/usr/bin/python3 -I
+# honey-sync-conflicts: deterministic Syncthing conflict handling for Gillean's folders.
+#
+#   run [--dry-run]            purge byte-identical conflict copies, write the report notes
+#   list                       print every open conflict with its id
+#   resolve ID keep-current    discard the conflict copy (moved to the trash, 30 days)
+#   resolve ID keep-conflict   the conflict copy becomes the file (old one moved to the trash)
+#
+# Never reads ~/Secret Vault. Never deletes a file unless another file with the very same
+# bytes survives in the same folder, checked by cmp immediately before the unlink.
+import difflib, hashlib, os, re, shutil, subprocess, sys, time, xml.etree.ElementTree as ET
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/state/sync-conflicts")
+LOG = os.path.join(STATE, "log")
+TRASH = os.path.join(STATE, "trash")
+KILL = os.path.join(HOME, ".config/sync-conflicts/DISABLED")
+ROOTS = [  # (name, path) -- Secret Vault is deliberately absent and refused below
+    ("obsidian-vault", "Obsidian Vault"), ("heea", "HEEA"), ("documents", "Documents"),
+    ("logseq-gill", "Logseq-Gill"), ("sync", "Sync"), ("pictures", "Pictures"),
+]
+REPORT_DIR = "Sync Conflicts"
+SKIP_DIRS = {".stfolder", ".stversions", ".git", "node_modules", REPORT_DIR}
+PAT = re.compile(r"^(.*)\.sync-conflict-(\d{8}-\d{6})-([A-Z0-9]{7})(\.[^.]*)?$")
+MIN_AGE = float(os.environ.get("HSC_MIN_AGE", "600"))  # a conflict copy must be this old (s)
+BASE_AGE = float(os.environ.get("HSC_BASE_AGE", "120"))
+MAX_PURGE = 200
+TEXT_EXT = {".md", ".txt", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml", ".org", ".py", ".sh", ".html", ".htm"}
+PANDOC_EXT = {".docx": "docx", ".odt": "odt", ".rtf": "rtf", ".epub": "epub"}
+MAX_BYTES = 8 * 1024 * 1024
+MAX_DIFF_LINES = 300
+MAX_NOTES = 300
+
+
+def log(msg):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+        os.replace(LOG, LOG + ".1")
+    with open(LOG, "a") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+
+def roots():
+    out = []
+    for name, rel in ROOTS:
+        p = os.path.join(HOME, rel)
+        if "Secret Vault" in p:
+            continue
+        if os.path.isdir(os.path.join(p, ".stfolder")):  # not a live Syncthing folder -> skip
+            out.append((name, p))
+    return out
+
+
+def devices():
+    for cfg in (".local/state/syncthing/config.xml", ".config/syncthing/config.xml"):
+        try:
+            return {d.get("id")[:7]: d.get("name") for d in ET.parse(os.path.join(HOME, cfg)).getroot().iter("device")}
+        except Exception:
+            continue
+    return {}
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def same_bytes(a, b):
+    try:
+        return os.path.getsize(a) == os.path.getsize(b) and subprocess.run(["cmp", "-s", a, b]).returncode == 0
+    except OSError:
+        return False
+
+
+def scan(root):
+    """Yield (dirpath, files) for every folder, skipping bookkeeping dirs and symlinks."""
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not os.path.islink(os.path.join(d, x))]
+        yield d, [f for f in files if not os.path.islink(os.path.join(d, f)) and not f.startswith(".syncthing.")]
+
+
+def cid(root_name, rel):
+    return hashlib.sha1(f"{root_name}\0{rel}".encode()).hexdigest()[:8]
+
+
+def purge_identical(root_name, root, dry):
+    """Delete conflict copies whose bytes survive in another file of the same folder."""
+    purged = []
+    now = time.time()
+    for d, files in scan(root):
+        conflicts = sorted(f for f in files if PAT.match(f))
+        if not conflicts:
+            continue
+        others = [f for f in files if not PAT.match(f)]
+        alive = set(files)
+        for c in conflicts:
+            cp = os.path.join(d, c)
+            if now - os.path.getmtime(cp) < MIN_AGE:
+                continue
+            m = PAT.match(c)
+            base = m.group(1) + (m.group(4) or "")
+            if base in alive and now - os.path.getmtime(os.path.join(d, base)) < BASE_AGE:
+                continue
+            # keepers: any ordinary file first, then an earlier-named conflict copy still alive
+            cands = [f for f in others if f in alive] + [f for f in conflicts if f < c and f in alive]
+            size = os.path.getsize(cp)
+            keeper = next((k for k in cands if os.path.getsize(os.path.join(d, k)) == size
+                           and same_bytes(os.path.join(d, k), cp)), None)
+            if not keeper:
+                continue
+            if len(purged) >= MAX_PURGE:
+                log(f"purge cap {MAX_PURGE} reached in {root_name}, rest next run")
+                return purged
+            rel = os.path.relpath(cp, root)
+            if dry:
+                purged.append((rel, keeper))
+                continue
+            if not same_bytes(os.path.join(d, keeper), cp):  # last look before the unlink
+                continue
+            digest = sha(cp)
+            os.unlink(cp)
+            alive.discard(c)
+            log(f"purged {root_name}:{rel} identical to {keeper} sha256={digest}")
+            purged.append((rel, keeper))
+    return purged
+
+
+def pairs(root_name, root):
+    """Open conflicts: dicts with id, rel, current path (or None), conflict path, device, stamp."""
+    devs = devices()
+    out = []
+    for d, files in scan(root):
+        for f in files:
+            m = PAT.match(f)
+            if not m:
+                continue
+            base = m.group(1) + (m.group(4) or "")
+            cp, bp = os.path.join(d, f), os.path.join(d, base)
+            stamp = datetime.strptime(m.group(2), "%Y%m%d-%H%M%S")
+            out.append(dict(id=cid(root_name, os.path.relpath(cp, root)), root=root_name, rootpath=root,
+                            rel=os.path.relpath(bp, root), conflict=cp, current=bp if os.path.exists(bp) else None,
+                            device=devs.get(m.group(3), m.group(3)), stamp=stamp))
+    out.sort(key=lambda p: (p["rel"], p["stamp"]))
+    return out
+
+
+def to_text(path):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if os.path.getsize(path) > MAX_BYTES:
+            return None
+        if ext in TEXT_EXT:
+            with open(path, "rb") as f:
+                raw = f.read()
+            return None if b"\0" in raw[:8192] else raw.decode("utf-8", "replace")
+        if ext in PANDOC_EXT:
+            r = subprocess.run(["pandoc", "-f", PANDOC_EXT[ext], "-t", "gfm", "--wrap=none", path],
+                               capture_output=True, text=True, timeout=45)
+            return r.stdout if r.returncode == 0 else None
+        if ext == ".pdf":
+            r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True, timeout=45)
+            return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def describe(p):
+    """Return (verdict, diff note body)."""
+    cp = p["conflict"]
+    if os.path.basename(p["rel"]).startswith("~$"):
+        return "Office lock file", "\n".join([f"# {os.path.basename(p['rel'])}", "",
+            f"Conflict id: `{p['id']}`. This is the temporary lock file Word or Excel leaves while a document is open, "
+            "not a document. It is safe to discard.", ""])
+    head = [f"# {os.path.basename(p['rel'])}", "", f"Folder: `{os.path.dirname(p['rel']) or '.'}`", "",
+            f"Conflict id: `{p['id']}`. The second version was made by **{p['device']}** at "
+            f"{p['stamp']:%Y-%m-%d %H:%M} and kept next to the file instead of overwriting it.", ""]
+    if not p["current"]:
+        size = os.path.getsize(cp)
+        return "only copy", "\n".join(head + [
+            "The original file is no longer there (renamed, moved or deleted on another device), so this "
+            f"conflict copy ({size} bytes, saved {fmt(os.path.getmtime(cp))}) is the only copy. Nothing to compare.", ""])
+    cur = p["current"]
+    head += ["| | Size | Last saved |", "|---|---|---|",
+             f"| Current file | {os.path.getsize(cur)} bytes | {fmt(os.path.getmtime(cur))} |",
+             f"| Conflict copy ({p['device']}) | {os.path.getsize(cp)} bytes | {fmt(os.path.getmtime(cp))} |", ""]
+    a, b = to_text(cur), to_text(cp)
+    if a is None or b is None:
+        return "binary", "\n".join(head + [
+            "This kind of file cannot be shown as text. Open both versions and keep the one you want.", ""])
+    if a == b:
+        return "same text", "\n".join(head + [
+            "The text is the same in both versions; only hidden file details differ (formatting, metadata or "
+            "timestamps). Safe to keep either one.", ""])
+    lines = list(difflib.unified_diff(a.splitlines(), b.splitlines(), "current", f"conflict ({p['device']})", lineterm="", n=2))
+    added = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+    body = lines[:MAX_DIFF_LINES]
+    if len(lines) > MAX_DIFF_LINES:
+        body.append(f"... {len(lines) - MAX_DIFF_LINES} more diff lines not shown")
+    return f"text differs (+{added}/-{removed})", "\n".join(head + [
+        "Lines starting with `-` are only in the current file; lines starting with `+` are only in the conflict copy.",
+        "", "```diff", *body, "```", ""])
+
+
+def write_if_changed(path, text):
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), f".syncthing.{os.path.basename(path)}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+    return True
+
+
+def report(root_name, root, plist):
+    rd = os.path.join(root, REPORT_DIR)
+    dd = os.path.join(rd, "diffs")
+    keep = set()
+    rows = []
+    for p in plist[:MAX_NOTES]:
+        verdict, body = describe(p)
+        note = f"{p['id']}.md"
+        keep.add(note)
+        write_if_changed(os.path.join(dd, note), "---\ntags:\n  - sync-conflicts\n---\n\n" + body)
+        rows.append((p, verdict, note))
+    if not plist and not os.path.isdir(rd):
+        return 0
+    if os.path.isdir(dd):
+        for f in os.listdir(dd):
+            if f not in keep:
+                os.unlink(os.path.join(dd, f))
+    order = {"text differs": 0, "same text": 1, "binary": 2, "only copy": 3, "Office lock file": 4}
+    rows.sort(key=lambda r: (order.get(r[1].split(" (")[0], 9), r[0]["rel"]))
+    out = ["---", "tags:", "  - sync-conflicts", *(["  - action-required"] if plist else []), "---", "", "# Sync conflicts", ""]
+    if not plist:
+        out.append("No open sync conflicts. Nothing needs doing.")
+    else:
+        out += [f"{len(plist)} file(s) have two versions because two devices saved the same file before they synced. "
+                "Nothing has been lost: both versions are kept. Files that were byte-for-byte identical have "
+                "already been tidied away automatically.", "",
+                "To settle one, ask Aura: *resolve sync conflict `ID`, keep the current file* (or *keep the conflict copy*). "
+                "The version you do not keep is held for 30 days before it is deleted.", "",
+                "| ID | File | What differs | Other version from | Made | Diff |", "|---|---|---|---|---|---|"]
+        for p, v, note in rows:
+            name = p["rel"].replace("|", "\\|")
+            out.append(f"| `{p['id']}` | {name} | {v} | {p['device']} | {p['stamp']:%Y-%m-%d %H:%M} | "
+                       f"[[{REPORT_DIR}/diffs/{note[:-3]}|diff]] |")
+        if len(plist) > MAX_NOTES:
+            out += ["", f"{len(plist) - MAX_NOTES} more not listed; run `honey-sync-conflicts list`."]
+    write_if_changed(os.path.join(rd, "Sync Conflicts.md"), "\n".join(out) + "\n")
+    return len(plist)
+
+
+def expire_trash():
+    cutoff = time.time() - 30 * 86400
+    if not os.path.isdir(TRASH):
+        return
+    for r in os.listdir(TRASH):
+        for stampdir in os.listdir(os.path.join(TRASH, r)):
+            p = os.path.join(TRASH, r, stampdir)
+            if os.path.getmtime(p) < cutoff:
+                shutil.rmtree(p)
+                log(f"trash expired {r}/{stampdir}")
+
+
+def trash(root_name, root, path):
+    dest = os.path.join(TRASH, root_name, datetime.now().strftime("%Y%m%d-%H%M%S"), os.path.relpath(path, root))
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    shutil.move(path, dest)
+    return dest
+
+
+def cmd_run(dry):
+    if os.path.exists(KILL):
+        print("disabled (kill switch)")
+        return 3
+    total_p = total_c = 0
+    for name, root in roots():
+        purged = purge_identical(name, root, dry)
+        plist = pairs(name, root)
+        if not dry:
+            report(name, root, plist)
+        total_p += len(purged)
+        total_c += len(plist)
+        print(f"{name}: purged {len(purged)} identical{' (dry run)' if dry else ''}, {len(plist)} open")
+    if not dry:
+        expire_trash()
+    print(f"total: purged {total_p}, open {total_c}")
+    return 0
+
+
+def cmd_list():
+    for name, root in roots():
+        for p in pairs(name, root):
+            print(f"{p['id']}  {p['root']}:{p['rel']}  <- {p['device']} {p['stamp']:%Y-%m-%d %H:%M}"
+                  f"{'' if p['current'] else '  (original missing)'}")
+    return 0
+
+
+def cmd_resolve(pid, choice, dry):
+    if choice not in ("keep-current", "keep-conflict"):
+        print("choice must be keep-current or keep-conflict")
+        return 2
+    for name, root in roots():
+        for p in pairs(name, root):
+            if p["id"] != pid:
+                continue
+            base = os.path.join(root, p["rel"])
+            if choice == "keep-current" and not p["current"]:
+                print("original is missing; use keep-conflict to restore the conflict copy")
+                return 2
+            if dry:
+                print(f"would {choice} {name}:{p['rel']}")
+                return 0
+            if choice == "keep-current":
+                dest = trash(name, root, p["conflict"])
+            else:
+                dest = trash(name, root, base) if p["current"] else "-"
+                os.replace(p["conflict"], base)
+            log(f"resolved {name}:{p['rel']} {choice} (discarded copy in trash: {dest})")
+            report(name, root, pairs(name, root))
+            print(f"done: {choice} {name}:{p['rel']}")
+            return 0
+    print(f"no open conflict with id {pid}")
+    return 1
+
+
+def main(argv):
+    if not argv or argv[0] == "run":
+        return cmd_run("--dry-run" in argv)
+    if argv[0] == "list":
+        return cmd_list()
+    if argv[0] == "resolve" and len(argv) >= 3:
+        return cmd_resolve(argv[1], argv[2], "--dry-run" in argv)
+    print(__doc__ or "usage: honey-sync-conflicts run|list|resolve")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
