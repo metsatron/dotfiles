@@ -12,7 +12,8 @@
 # bytes survives in the same folder, checked by cmp immediately before the unlink. A conflict copy
 # that is the only copy gets its clean name back (never over an existing file). Anything else
 # is a human decision, and the version not chosen is kept in the trash for 30 days.
-import difflib, hashlib, os, re, shutil, subprocess, sys, time, xml.etree.ElementTree as ET
+import difflib, hashlib, json, os, re, shutil, subprocess, sys, time, xml.etree.ElementTree as ET
+from collections import Counter
 from datetime import datetime
 
 HOME = os.path.expanduser("~")
@@ -413,16 +414,35 @@ def cmd_resolve(pid, choice, dry):
     return 1
 
 
-# ---- duplicate / name-variant families (read-only; never deletes, moves or renames anything) -------------
+# ---- duplicate / overlap finder (read-only; never deletes, moves or renames anything) ---------------------
+# Two independent signals are combined: (1) the file NAME with copy markers, version words and dates removed, and
+# (2) the file CONTENT, as a small sketch of 5-word shingles (no text is stored), so two files that overlap are found
+# even when they were saved under completely different names. Name look-alikes only count as the same document when
+# the content backs them up; content overlap needs no name match.
 NOISE = [  # stripped, in this order, from a lower-cased stem to find files that are variants of one document
-    r"\.sync-conflict-\d{8}-\d{6}-[a-z0-9]{7}", r"\bcopy( of)?\b", r"\(\d+\)", r"\b(final|draft|latest|new|old|backup|bak|signed|revised?)\b",
-    r"\bv(er(sion)?)?\.? ?\d+(\.\d+)*\b", r"\brev\.? ?\d+\b", r"\b\d{4}[-_. ]\d{1,2}[-_. ]\d{1,2}\b", r"\b\d{1,2}[-_. ]\d{1,2}[-_. ]\d{2,4}\b",
+    r"\.sync-conflict-\d{8}-\d{6}-[a-z0-9]{7}", r"\bcopy( of)?\b", r"\(\d+\)", r"\b(final|draft|latest|new|old|backup|bak|signed|revised?|updated?|edited?)\b",
+    r"\bv(er(sion)?)?\.? ?\d+(\.\d+)*\b", r"\brev\.? ?[a-z0-9]\b", r"\b\d{4}[-_. ]\d{1,2}[-_. ]\d{1,2}\b", r"\b\d{1,2}[-_. ]\d{1,2}[-_. ]\d{2,4}\b",
     r"\b(19|20)\d{2}[-_. ]\d{2}\b", r"\b\d{8}\b", r"\b\d{6}\b",
-    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.? ?(19|20)?\d{0,4}\b", r"\b(19|20)\d{2}\b",
+    r"\b\d{1,2} (jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]* (19|20)?\d{2,4}\b",
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.? ?(19|20)?\d{0,4}\b", r"\b(19|20)\d{2}\b", r"\s-?\s?\d{1,2}$",
 ]
 NOISE_RE = [re.compile(x) for x in NOISE]
-DUP_SKIP_DIRS = SKIP_DIRS | {".obsidian", ".trash", "__pycache__", "FileHistory"}
-GENERIC = 12  # a family bigger than this is a generic name (templates, indexes), listed as a count only
+DUP_SKIP_DIRS = SKIP_DIRS | {".obsidian", ".trash", "__pycache__", "FileHistory", "plugins", "themes", "snippets", "site-packages", "dist-packages"}
+# Never listed: generated exports, Mètsàtron's own niche, and the report folder itself.
+DUP_SKIP_PATHS = ("Cowork/", "Scripts/cowork-export/", "Metsatron - IT & Tech Notes/", REPORT_DIR + "/")
+TEXT_KINDS = {".docx", ".odt", ".pptx", ".xlsx", ".ods", ".odp", ".pdf", ".md", ".txt", ".rtf", ".csv"}   # content can be compared
+UNREADABLE_DOCS = {".doc", ".xls", ".ppt"}                                                                # documents, content cannot be read
+NOISE_EXT = {".css", ".svg", ".js", ".mjs", ".map", ".py", ".json", ".yml", ".yaml", ".conf", ".cfg", ".ini", ".dll", ".exe", ".tmp", ".asd",
+             ".wbk", ".download", ".bak", ".lock", ".db", ".edb", ".log", ".kdbx", ".ttf", ".woff", ".woff2", ".html", ".htm", ".url", ".lnk",
+             ".sqlite", ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp", ".mp3", ".mp4", ".mov", ".zip", ".sh", ".bat", ".ps1"}
+K = 400            # sketch size (bottom-K of the shingle hashes)
+SHINGLE = 5        # words per shingle
+MIN_WORDS = 40     # shorter documents are too small to judge by content
+J_RESAVE, J_OVERLAP, C_OVERLAP = 0.97, 0.55, 0.85
+J_NAME_BACKED, C_NAME_BACKED = 0.20, 0.50
+J_STRONG = 0.75   # content-only matches (different names) below this median overlap go to the weaker tier   # lower bar when the names also match: a heavily edited version of the same file
+GENERIC = 12       # a name family bigger than this is a generic name (templates, indexes)
+MAX_GROUP = 8      # a content cluster bigger than this is a set of forms built from one template, not versions of one document
 
 
 def family_key(name):
@@ -434,115 +454,309 @@ def family_key(name):
     return (t, ext.lower())
 
 
-def shingles(text):
-    w = text.lower().split()
-    return {hash(" ".join(w[i:i + 3])) for i in range(max(0, len(w) - 2))} or {hash(text[:200])}
+def _strip_xml(x):
+    import html
+    x = re.sub(r"</w:p>|<w:br[^>]*/>|<w:tab/>|</text:p>|</a:p>", " ", x)
+    return html.unescape(re.sub(r"<[^>]+>", " ", x))
 
 
-def duplicates(root_name, root, budget=240):
-    files = []
+def doc_text(path, ext):
+    """Plain text of a document for fingerprinting; never stored. None if it cannot be read."""
+    import zipfile
+    try:
+        if os.path.getsize(path) > MAX_BYTES:
+            return None
+        if ext in (".md", ".txt", ".csv"):
+            return open(path, encoding="utf-8", errors="replace").read(2_000_000)
+        if ext == ".pdf":
+            r = subprocess.run(["pdftotext", "-q", path, "-"], capture_output=True, text=True, timeout=40)
+            return r.stdout if r.returncode == 0 else None
+        if ext == ".rtf":
+            r = subprocess.run(["pandoc", "-f", "rtf", "-t", "plain", path], capture_output=True, text=True, timeout=40)
+            return r.stdout if r.returncode == 0 else None
+        with zipfile.ZipFile(path) as z:
+            names = z.namelist()
+            if ext == ".docx":
+                return _strip_xml(z.read("word/document.xml").decode("utf-8", "replace"))
+            if ext == ".pptx":
+                sl = sorted((n for n in names if re.match(r"ppt/slides/slide\d+\.xml$", n)), key=lambda n: int(re.search(r"(\d+)", n).group(1)))
+                return " ".join(" ".join(re.findall(r"<a:t>([^<]*)</a:t>", z.read(n).decode("utf-8", "replace"))) for n in sl)
+            if ext == ".xlsx":
+                return _strip_xml(z.read("xl/sharedStrings.xml").decode("utf-8", "replace")) if "xl/sharedStrings.xml" in names else ""
+            if ext in (".odt", ".ods", ".odp"):
+                return _strip_xml(z.read("content.xml").decode("utf-8", "replace"))
+    except Exception:
+        return None
+    return None
+
+
+def sketch_of(text):
+    import zlib
+    w = re.findall(r"[a-z0-9]+", text.lower())
+    if len(w) < MIN_WORDS:
+        return None
+    sh = {zlib.crc32(" ".join(w[i:i + SHINGLE]).encode()) for i in range(len(w) - SHINGLE + 1)}
+    return sorted(sh)[:K], len(sh)
+
+
+def load_cache(root_name):
+    try:
+        with open(os.path.join(STATE, f"dupcache-{root_name}.json")) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_cache(root_name, cache):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    tmp = os.path.join(STATE, f"dupcache-{root_name}.json.tmp")
+    with open(tmp, "w") as f:
+        json.dump(cache, f)
+    os.replace(tmp, os.path.join(STATE, f"dupcache-{root_name}.json"))
+
+
+def overlap(a, b, na, nb):
+    """(jaccard, containment) of two sketches; containment only when both sketches are the full shingle sets."""
+    A, B = set(a), set(b)
+    if na <= K and nb <= K:
+        inter = len(A & B)
+        return inter / max(1, len(A | B)), inter / max(1, min(len(A), len(B)))
+    union = sorted(A | B)[:K]
+    return sum(1 for v in union if v in A and v in B) / max(1, len(union)), None
+
+
+def duplicates(root_name, root, budget=1200):
+    files, filtered = [], Counter()
     for d, ds, fs in os.walk(root):
         ds[:] = [x for x in ds if x not in DUP_SKIP_DIRS and not os.path.islink(os.path.join(d, x))]
         for f in fs:
             fp = os.path.join(d, f)
-            if os.path.islink(fp) or f.startswith(".syncthing.") or f.startswith("~$"):
+            rel = os.path.relpath(fp, root)
+            ext = os.path.splitext(f)[1].lower()
+            if os.path.islink(fp) or f.startswith((".syncthing.", "~$", ".")) or f in ("desktop.ini", "Thumbs.db"):
+                filtered["temp/system files"] += 1
+                continue
+            if rel.startswith(DUP_SKIP_PATHS):
+                filtered["generated or not Gillean's (Cowork exports, Metsatron's notes)"] += 1
+                continue
+            if ext in NOISE_EXT or (ext not in TEXT_KINDS and ext not in UNREADABLE_DOCS):
+                filtered["other file types (images, plugin assets, scripts, databases...)"] += 1
                 continue
             try:
                 st = os.stat(fp)
             except OSError:
                 continue
-            files.append((os.path.relpath(fp, root), st.st_size, st.st_mtime))
-    # 1. same bytes, any name or folder
+            files.append((rel, ext, st.st_size, st.st_mtime))
+    meta = {rel: (ext, size, mt) for rel, ext, size, mt in files}
+    # same bytes, any name or folder (documents only)
     by_size = {}
-    for rel, size, mt in files:
+    for rel, ext, size, mt in files:
         if size > 0:
             by_size.setdefault(size, []).append(rel)
     by_hash = {}
     for size, rels in by_size.items():
-        if len(rels) > 1 and size < 400 * 1024 * 1024:
+        if len(rels) > 1:
             for rel in rels:
                 try:
                     by_hash.setdefault(sha(os.path.join(root, rel)), []).append(rel)
                 except OSError:
                     pass
-    exact = {h: sorted(r) for h, r in by_hash.items() if len(r) > 1}
-    # 2. name-variant families
-    meta = {rel: (size, mt) for rel, size, mt in files}
+    exact = [sorted(r) for r in by_hash.values() if len(r) > 1]
+    digest_of = {rel: h for h, rs in by_hash.items() for rel in rs}
+    # content sketches (cached by path, size and mtime; the cache holds hashes only, never text)
+    cache, deadline, fresh, skipped_budget = load_cache(root_name), time.time() + budget, 0, 0
+    sk = {}
+    for rel, ext, size, mt in files:
+        if ext not in TEXT_KINDS:
+            continue
+        c = cache.get(rel)
+        if c and c[0] == size and c[1] == mt:
+            if c[2]:
+                sk[rel] = (c[2], c[3])
+            continue
+        if time.time() > deadline:
+            skipped_budget += 1
+            continue
+        txt = doc_text(os.path.join(root, rel), ext)
+        got = sketch_of(txt) if txt else None
+        cache[rel] = [size, mt, got[0] if got else None, got[1] if got else 0]
+        fresh += 1
+        if got:
+            sk[rel] = got
+    save_cache(root_name, {k: v for k, v in cache.items() if k in meta})
+    # boilerplate: a shingle hash present in many documents is template text, not shared content
+    df = Counter(v for a, _ in sk.values() for v in a)
+    cap = max(5, int(0.003 * max(1, len(sk))))
+    boiler = {v for v, n in df.items() if n > cap}
+    clean = {rel: ([v for v in a if v not in boiler], n) for rel, (a, n) in sk.items()}
+    inv = {}
+    for rel, (a, n) in clean.items():
+        for v in a:
+            inv.setdefault(v, []).append(rel)
+    cand = Counter()
+    for v, rels in inv.items():
+        if 1 < len(rels) <= cap:
+            for i in range(len(rels)):
+                for j in range(i + 1, len(rels)):
+                    cand[(rels[i], rels[j])] += 1
     fam = {}
-    for rel, size, mt in files:
+    for rel, ext, size, mt in files:
         key = family_key(os.path.basename(rel))
         if key[0] and len(key[0]) >= 4:
             fam.setdefault(key, []).append(rel)
-    families = {k: sorted(v, key=lambda r: -meta[r][1]) for k, v in fam.items() if len(v) > 1}
-    generic = {k: v for k, v in families.items() if len(v) > GENERIC}
-    families = {k: v for k, v in families.items() if len(v) <= GENERIC}
-    deadline = time.time() + budget
-    out = []
-    for key, members in families.items():
-        digests = {rel: sha(os.path.join(root, rel)) if meta[rel][0] < 400 * 1024 * 1024 else None for rel in members}
-        texts = {}
-        if time.time() < deadline:
-            for rel in members:
-                texts[rel] = to_text(os.path.join(root, rel))
+    parent = {}
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]; x = parent[x]
+        return x
+    pair_stats = {}
+    for (x, y), shared in cand.items():
+        (ax, nx), (ay, ny) = clean[x], clean[y]
+        if shared < max(8, 0.2 * min(len(ax), len(ay))) or len(ax) < 8 or len(ay) < 8:
+            continue
+        j, c = overlap(ax, ay, nx, ny)
+        if j >= J_OVERLAP or (c is not None and c >= C_OVERLAP):
+            pair_stats[(x, y)] = (j, c)
+            parent[find(x)] = find(y)
+    # name AND content: the same name pattern needs only partial overlap (a heavily edited version of one file)
+    name_backed = set()
+    for key, mem in fam.items():
+        rd = [m for m in mem if m in clean and len(clean[m][0]) >= 8]
+        if 2 <= len(mem) <= MAX_GROUP and len(rd) >= 2:
+            for i in range(len(rd)):
+                for j2 in range(i + 1, len(rd)):
+                    x, y = rd[i], rd[j2]
+                    if (x, y) in pair_stats or (y, x) in pair_stats:
+                        continue
+                    j, c = overlap(clean[x][0], clean[y][0], clean[x][1], clean[y][1])
+                    if j >= J_NAME_BACKED or (c is not None and c >= C_NAME_BACKED):
+                        pair_stats[(x, y)] = (j, c)
+                        name_backed.add((x, y))
+                        parent[find(x)] = find(y)
+    groups = {}
+    for rel in {r for pr in pair_stats for r in pr}:
+        groups.setdefault(find(rel), []).append(rel)
+    content_groups, template_clusters = [], []
+    for members in groups.values():
+        if len(members) > MAX_GROUP:
+            template_clusters.append(len(members))
+            continue
+        members.sort(key=lambda r: -meta[r][2])
         newest = members[0]
-        sh_new = shingles(texts[newest]) if texts.get(newest) else None
         rows = []
         for rel in members:
-            if digests[rel] and digests[rel] == digests[newest] and rel != newest:
-                rel_note = "byte-identical to newest"
-            elif sh_new and texts.get(rel):
-                sh = shingles(texts[rel])
-                rel_note = f"{round(100 * len(sh & sh_new) / max(1, len(sh | sh_new)))}% text overlap with newest" if rel != newest else "newest"
+            if rel == newest:
+                rows.append((rel, meta[rel][1], meta[rel][2], "newest", None))
+                continue
+            key = (newest, rel) if (newest, rel) in pair_stats else (rel, newest)
+            if key in pair_stats:
+                j, c = pair_stats[key]
             else:
-                rel_note = "newest" if rel == newest else "differs (no text comparison for this file type)"
-            rows.append((rel, meta[rel][0], meta[rel][1], rel_note))
-        drift = any("identical" not in r[3] and r[3] != "newest" for r in rows)
-        out.append((drift, key, rows))
-    out.sort(key=lambda x: (not x[0], -x[2][0][2]))
-    return exact, out, len(generic), len(files)
+                j, c = overlap(*clean[newest][:1], *clean[rel][:1], clean[newest][1], clean[rel][1])
+            if digest_of.get(rel) and digest_of.get(rel) == digest_of.get(newest):
+                note = "byte-identical to newest"
+            else:
+                note = f"{round(100 * j)}% shared text" + (f", {round(100 * c)}% of the smaller is contained" if c is not None else "")
+            rows.append((rel, meta[rel][1], meta[rel][2], note, j))
+        js = [r[4] for r in rows if r[4] is not None]
+        kind = "re-save" if js and min(js) >= J_RESAVE else "revision"
+        found = "same name pattern and content" if len({family_key(os.path.basename(r[0])) for r in rows}) == 1 else "content only, different names: check these more carefully"
+        med = sorted(js)[len(js) // 2] if js else 0
+        if kind == "revision" and found.startswith("content only") and med < J_STRONG:
+            kind = "weak"
+        content_groups.append((kind, rows, found))
+    content_groups.sort(key=lambda g: ({"revision": 0, "re-save": 1, "weak": 2}[g[0]], g[2].startswith("content only"), -g[1][0][2]))
+    # name look-alikes: kept only if content backs them up, or content cannot be read
+    in_content = {r[0] for _, rows, _ in content_groups for r in rows}
+    name_only, lookalike_only, generic = [], 0, 0
+    for key, mem in fam.items():
+        if len(mem) < 2:
+            continue
+        if len(mem) > GENERIC:
+            generic += 1
+            continue
+        mem = sorted(mem, key=lambda r: -meta[r][2])
+        if all(m in in_content for m in mem):
+            continue
+        readable = [m for m in mem if m in sk]
+        if len(readable) == len(mem):
+            lookalike_only += 1      # content is readable and does NOT overlap: similar names, different documents
+        else:
+            name_only.append((key, mem))   # at least one member cannot be compared by content
+    stats = dict(scanned=len(files), fresh=fresh, deferred=skipped_budget, readable=len(sk), boilerplate=len(boiler), generic=generic,
+                 lookalike_only=lookalike_only, filtered=filtered, template_clusters=template_clusters)
+    return exact, content_groups, name_only, stats, meta, pair_stats
 
 
-def write_duplicates(root_name, root, exact, fams, n_generic, n_files):
-    L = ["---", "tags:", "  - sync-conflicts", "  - duplicates", "---", "", "# Duplicate candidates", "",
-         f"Read-only report. Nothing here has been changed, moved or deleted. {n_files} files scanned. A *candidate* is a guess from "
-         "file names and contents, so a human has to confirm. Names are matched after removing copy markers like `(2)` and `copy`, "
-         "version words (`v3`, `rev 2`, `final`, `draft`, `new`, `old`, `signed`), dates and times.", ""]
-    drift = [f for f in fams if f[0]]
-    same = [f for f in fams if not f[0]]
-    L += [f"- **Same document, different content:** {len(drift)} groups (these are the ones to look at first)",
-          f"- **Same document, same content under different names:** {len(same)} groups",
-          f"- **Exactly the same bytes, any name or folder:** {len(exact)} groups",
-          f"- Generic names left out because there are too many to be one document: {n_generic}", ""]
+def write_duplicates(root_name, root, exact, cgroups, name_only, stats, meta):
+    def esc(r):
+        return r.replace("|", "\\|")
     def table(rows):
         t = ["| File | Size | Last saved | Compared with the newest |", "|---|---|---|---|"]
-        for rel, size, mt, note in rows:
-            t.append(f"| {rel.replace('|', chr(92) + '|')} | {size} | {fmt(mt)} | {note} |")
+        for rel, size, mt, note, _ in rows:
+            t.append(f"| {esc(rel)} | {size} | {fmt(mt)} | {note} |")
         return t
-    L += ["## Same document, different content", ""]
-    for i, (_, key, rows) in enumerate(drift, 1):
-        L += [f"### {i}. {key[0]}{key[1]}", ""] + table(rows) + [""]
-    L += ["## Same document, same content under different names", ""]
-    for i, (_, key, rows) in enumerate(same, 1):
-        L += [f"### {i}. {key[0]}{key[1]}", ""] + table(rows) + [""]
+    rev = [g for g in cgroups if g[0] == "revision"]
+    res = [g for g in cgroups if g[0] == "re-save"]
+    weak = [g for g in cgroups if g[0] == "weak"]
+    doc_exact = [g for g in exact if len(g) > 1]
+    L = ["---", "tags:", "  - sync-conflicts", "  - duplicates", "---", "", "# Duplicate candidates", "",
+         f"Read-only report. Nothing has been changed, moved or deleted. {stats['scanned']} documents scanned; {stats['readable']} could be read "
+         "and compared by content. A *candidate* is a judgement from content and names, so a human confirms it. Files are matched by what they "
+         "say (so a document saved under a different name is still found) and by name (copy markers like `(2)`, version words like `v3` or "
+         "`final`, and dates are ignored). Template text that appears in many documents is ignored, so forms built from one template do not "
+         "match each other.", "",
+         f"- **Revisions: the same document with real differences:** {len(rev)} groups. Look at these first.",
+         f"- **Re-saves: the same text, saved again (different file bytes):** {len(res)} groups.",
+         f"- **Possible overlaps, weaker evidence** (different names, only {round(100 * J_OVERLAP)}-{round(100 * J_STRONG)}% shared text; often forms built from a template): {len(weak)} groups, listed last.",
+         f"- Of the revisions, {sum(1 for g in rev if g[2].startswith('content only'))} were found by content alone, under different names; the rest match on name and content.",
+         f"- **Exactly the same bytes under different names or folders:** {len(doc_exact)} groups.",
+         f"- **Name look-alikes whose content cannot be compared** (old `.doc`/`.xls`/`.ppt`, scans, very short files): {len(name_only)} groups.",
+         f"- Left out as noise: {stats['lookalike_only']} groups with similar names but clearly different content; {stats['generic']} generic names "
+         f"(too many to be one document); {len(stats['template_clusters'])} clusters of forms built from one template "
+         f"({sum(stats['template_clusters'])} files); " + "; ".join(f"{n} {k}" for k, n in stats['filtered'].items()) + ".", ""]
+    L += ["## Revisions: the same document with real differences", ""]
+    for i, (_, rows, found) in enumerate(rev, 1):
+        L += [f"### {i}. {os.path.basename(rows[0][0])}", "", f"Found by: {found}.", ""] + table(rows) + [""]
+    L += ["## Re-saves: the same text, saved again", ""]
+    for i, (_, rows, found) in enumerate(res, 1):
+        L += [f"### {i}. {os.path.basename(rows[0][0])}", "", f"Found by: {found}.", ""] + table(rows) + [""]
+    L += ["## Possible overlaps, weaker evidence", "", "Different file names and only partly shared text. Many will be separate documents written from the same template or form; some will be real versions. Check these last.", ""]
+    for i, (_, rows, found) in enumerate(weak, 1):
+        L += [f"### {i}. {os.path.basename(rows[0][0])}", ""] + table(rows) + [""]
     L += ["## Exactly the same bytes", ""]
-    for i, (h, rels) in enumerate(sorted(exact.items(), key=lambda kv: kv[1][0]), 1):
-        L += [f"{i}. " + "; ".join(r.replace('|', chr(92) + '|') for r in rels)]
-    path = os.path.join(root, REPORT_DIR, "Duplicate candidates.md")
-    write_if_changed(path, "\n".join(L) + "\n")
-    return len(drift), len(same), len(exact), n_generic
+    for i, rels in enumerate(sorted(doc_exact, key=lambda g: (-len(g), g[0])), 1):
+        L += [f"{i}. " + "; ".join(esc(r) for r in rels)]
+    L += ["", "## Look-alike names, content could not be compared", ""]
+    for i, (key, mem) in enumerate(sorted(name_only, key=lambda x: -meta[x[1][0]][2]), 1):
+        L += [f"{i}. " + "; ".join(f"{esc(r)} ({fmt(meta[r][2])})" for r in mem)]
+    write_if_changed(os.path.join(root, REPORT_DIR, "Duplicate candidates.md"), "\n".join(L) + "\n")
+    return len(rev), len(res), len(doc_exact), len(name_only)
 
 
 def cmd_duplicates(argv):
     only = argv[argv.index("--root") + 1] if "--root" in argv else None
     for name, root in roots():
-        if name == "pictures" and only != "pictures":
+        if (name == "pictures" and only != "pictures") or (only and name != only):
             continue
-        if only and name != only:
-            continue
-        exact, fams, n_generic, n_files = duplicates(name, root)
-        d, sm, ex, g = write_duplicates(name, root, exact, fams, n_generic, n_files)
-        print(f"{name}: scanned {n_files}; different-content groups {d}, same-content-other-name groups {sm}, "
-              f"identical-bytes groups {ex}, generic names skipped {g}")
+        exact, cgroups, name_only, stats, meta, pair_stats = duplicates(name, root)
+        rev, res, ex, no = write_duplicates(name, root, exact, cgroups, name_only, stats, meta)
+        # self-check: of the conflict pairs that still exist and are readable, how many did the content signal pair up?
+        truth = [p for p in pairs(name, root) if p["current"]]
+        got = tot = 0
+        in_groups = {}
+        for gi, (_, rows, _f) in enumerate(cgroups):
+            for r in rows:
+                in_groups[r[0]] = gi
+        for p in truth:
+            a, b = os.path.relpath(p["current"], root), os.path.relpath(p["conflict"], root)
+            if os.path.splitext(a)[1].lower() in TEXT_KINDS and a in meta and b in meta:
+                tot += 1
+                got += 1 if (a in in_groups and in_groups.get(a) == in_groups.get(b)) else 0
+        print(f"{name}: scanned {stats['scanned']} documents ({stats['readable']} readable, {stats['fresh']} newly read, {stats['deferred']} deferred); "
+              f"revisions {rev}, re-saves {res}, same-bytes {ex}, name-only {no}; noise left out: {stats['lookalike_only']} look-alikes, "
+              f"{stats['generic']} generic, {len(stats['template_clusters'])} template clusters, {sum(stats['filtered'].values())} other files; boilerplate hashes ignored {stats['boilerplate']}; "
+              f"self-check on conflict pairs: {got}/{tot} found by content")
     return 0
 
 
