@@ -18,10 +18,11 @@ Survey that shaped the design (read-only, names only, 2026-11-02): none of the 5
 |---|---|
 | Scope | The Syncthing folders =Obsidian Vault=, =HEEA=, =Documents=, =Logseq-Gill=, =Sync=, =Pictures=. A folder is skipped unless its =.stfolder= marker exists. =Secret Vault= is not in the list and is refused by name: this job never opens it. |
 | Purge | A conflict copy is deleted only when another file in the same folder has exactly the same bytes (an ordinary file first, otherwise an earlier-named conflict copy), the copy is at least 10 minutes old, the original at least 2 minutes old, and =cmp= confirms the match immediately before the unlink. So the content always survives. Every purge is logged with its sha256. At most 200 per run. |
-| Never purged | A conflict copy that differs from its original, and a conflict copy whose original is gone (the only copy). Symlinks are never followed. |
+| Clean names | A conflict copy whose original is gone is the only copy. It gets the clean name back (=NAME.ext=, no =sync-conflict= and no timestamp) by a rename that never overwrites an existing file; with several such copies the latest takes the name and the older ones stay listed as conflicts. Office =~$= lock files are skipped. Logged as =sanitised=. |
+| Never purged | A conflict copy that differs from its original. Symlinks are never followed. |
 | Diff | The differing pair is turned into text: markdown/text as-is, =.docx/.odt/.rtf/.epub= through =pandoc -t gfm=, =.pdf= through =pdftotext -layout=. Anything else (xlsx, ppt, edb, images) is reported as "binary" with sizes and times. A unified diff is written (300 lines max). Identical text with different bytes is reported "same text". Word/Excel =~$= lock files are reported as junk. |
 | Surface | Per folder: =Sync Conflicts/Sync Conflicts.md= (a table with an id, the file, what differs, which device made the other version, when, and a link) and =Sync Conflicts/diffs/ID.md=. Notes are rewritten only when their text changes, via a Syncthing temp name, so the job does not itself create sync churn. When there are no conflicts the note says so. |
-| Resolve | =honey-sync-conflicts resolve ID keep-current= moves the conflict copy to the trash; =keep-conflict= moves the current file to the trash and renames the conflict copy into place (it also restores an "only copy"). The trash is =~/.local/state/sync-conflicts/trash/=, outside every synced folder, kept 30 days. Gillean asks Aura; Aura or Mètsàtron runs the command. There is no automatic merge: without a common ancestor a three-way merge would only guess. |
+| Resolve | A conflict is two different versions of one file: the *main* file (the normal name) and the *other* version from another device. =honey-sync-conflicts resolve ID keep-main= keeps the main file and moves the other version to the trash; =keep-other= moves the main file to the trash and renames the other version to the normal name. Either way exactly one file is left, with the clean name. It is not a dedupe: identical copies are handled automatically and never need a decision. The trash is =~/.local/state/sync-conflicts/trash/=, outside every synced folder, kept 30 days. Gillean asks Aura; Aura or Mètsàtron runs the command. There is no automatic merge: without a common ancestor a three-way merge would only guess. |
 | Kill switch | =touch ~/.config/sync-conflicts/DISABLED= (the job exits 3 and does nothing). |
 
 * Boundaries
@@ -39,11 +40,13 @@ Survey that shaped the design (read-only, names only, 2026-11-02): none of the 5
 #
 #   run [--dry-run]            purge byte-identical conflict copies, write the report notes
 #   list                       print every open conflict with its id
-#   resolve ID keep-current    discard the conflict copy (moved to the trash, 30 days)
-#   resolve ID keep-conflict   the conflict copy becomes the file (old one moved to the trash)
+#   resolve ID keep-main       the file with the normal name stays; the other version goes to the trash
+#   resolve ID keep-other      the other version takes the normal name; the old one goes to the trash
 #
-# Never reads ~/Secret Vault. Never deletes a file unless another file with the very same
-# bytes survives in the same folder, checked by cmp immediately before the unlink.
+# Never reads ~/Secret Vault. Never deletes a file on its own unless another file with the very same
+# bytes survives in the same folder, checked by cmp immediately before the unlink. A conflict copy
+# that is the only copy gets its clean name back (never over an existing file). Anything else
+# is a human decision, and the version not chosen is kept in the trash for 30 days.
 import difflib, hashlib, os, re, shutil, subprocess, sys, time, xml.etree.ElementTree as ET
 from datetime import datetime
 
@@ -165,6 +168,35 @@ def purge_identical(root_name, root, dry):
     return purged
 
 
+def sanitise_orphans(root_name, root, dry):
+    """A conflict copy whose original is gone is the only copy: give it the clean name back."""
+    now = time.time()
+    done = []
+    for d, files in scan(root):
+        groups = {}
+        for f in files:
+            m = PAT.match(f)
+            if not m:
+                continue
+            base = m.group(1) + (m.group(4) or "")
+            if base in files or base.startswith("~$"):  # original exists, or an Office lock file
+                continue
+            if now - os.path.getmtime(os.path.join(d, f)) < MIN_AGE:
+                continue
+            groups.setdefault(base, []).append((m.group(2), f))
+        for base, items in groups.items():
+            stamp, newest = max(items)  # the latest version takes the name; older ones stay as conflicts
+            src, dst = os.path.join(d, newest), os.path.join(d, base)
+            if os.path.lexists(dst):
+                continue
+            rel = os.path.relpath(dst, root)
+            if not dry:
+                os.rename(src, dst)
+                log(f"sanitised {root_name}:{os.path.relpath(src, root)} -> {rel} (original was gone)")
+            done.append((os.path.relpath(src, root), rel))
+    return done
+
+
 def pairs(root_name, root):
     """Open conflicts: dicts with id, rel, current path (or None), conflict path, device, stamp."""
     devs = devices()
@@ -226,8 +258,8 @@ def describe(p):
             f"conflict copy ({size} bytes, saved {fmt(os.path.getmtime(cp))}) is the only copy. Nothing to compare.", ""])
     cur = p["current"]
     head += ["| | Size | Last saved |", "|---|---|---|",
-             f"| Current file | {os.path.getsize(cur)} bytes | {fmt(os.path.getmtime(cur))} |",
-             f"| Conflict copy ({p['device']}) | {os.path.getsize(cp)} bytes | {fmt(os.path.getmtime(cp))} |", ""]
+             f"| Main file (normal name) | {os.path.getsize(cur)} bytes | {fmt(os.path.getmtime(cur))} |",
+             f"| Other version ({p['device']}) | {os.path.getsize(cp)} bytes | {fmt(os.path.getmtime(cp))} |", ""]
     a, b = to_text(cur), to_text(cp)
     if a is None or b is None:
         return "binary", "\n".join(head + [
@@ -243,7 +275,7 @@ def describe(p):
     if len(lines) > MAX_DIFF_LINES:
         body.append(f"... {len(lines) - MAX_DIFF_LINES} more diff lines not shown")
     return f"text differs (+{added}/-{removed})", "\n".join(head + [
-        "Lines starting with `-` are only in the current file; lines starting with `+` are only in the conflict copy.",
+        "Lines starting with `-` are only in the main file; lines starting with `+` are only in the other version.",
         "", "```diff", *body, "```", ""])
 
 
@@ -287,8 +319,10 @@ def report(root_name, root, plist):
         out += [f"{len(plist)} file(s) have two versions because two devices saved the same file before they synced. "
                 "Nothing has been lost: both versions are kept. Files that were byte-for-byte identical have "
                 "already been tidied away automatically.", "",
-                "To settle one, ask Aura: *resolve sync conflict `ID`, keep the current file* (or *keep the conflict copy*). "
-                "The version you do not keep is held for 30 days before it is deleted.", "",
+                "Each one is two different versions of the same file: the one with the normal name (the *main* file) and the "
+                "*other* version saved by another device. To settle one, ask Aura: *resolve sync conflict `ID`, keep the "
+                "main file* (or *keep the other version*). Whichever you choose ends up with the normal name; the version "
+                "you do not choose is held for 30 days before it is deleted.", "",
                 "| ID | File | What differs | Other version from | Made | Diff |", "|---|---|---|---|---|---|"]
         for p, v, note in rows:
             name = p["rel"].replace("|", "\\|")
@@ -326,12 +360,14 @@ def cmd_run(dry):
     total_p = total_c = 0
     for name, root in roots():
         purged = purge_identical(name, root, dry)
+        renamed = sanitise_orphans(name, root, dry)
         plist = pairs(name, root)
         if not dry:
             report(name, root, plist)
         total_p += len(purged)
         total_c += len(plist)
-        print(f"{name}: purged {len(purged)} identical{' (dry run)' if dry else ''}, {len(plist)} open")
+        print(f"{name}: purged {len(purged)} identical, renamed {len(renamed)} to clean names, {len(plist)} open"
+              f"{' (dry run)' if dry else ''}")
     if not dry:
         expire_trash()
     print(f"total: purged {total_p}, open {total_c}")
@@ -347,21 +383,21 @@ def cmd_list():
 
 
 def cmd_resolve(pid, choice, dry):
-    if choice not in ("keep-current", "keep-conflict"):
-        print("choice must be keep-current or keep-conflict")
+    if choice not in ("keep-main", "keep-other"):
+        print("choice must be keep-main or keep-other")
         return 2
     for name, root in roots():
         for p in pairs(name, root):
             if p["id"] != pid:
                 continue
             base = os.path.join(root, p["rel"])
-            if choice == "keep-current" and not p["current"]:
-                print("original is missing; use keep-conflict to restore the conflict copy")
+            if choice == "keep-main" and not p["current"]:
+                print("the normal-named file is missing; use keep-other to give the other version its name")
                 return 2
             if dry:
                 print(f"would {choice} {name}:{p['rel']}")
                 return 0
-            if choice == "keep-current":
+            if choice == "keep-main":
                 dest = trash(name, root, p["conflict"])
             else:
                 dest = trash(name, root, base) if p["current"] else "-"
@@ -461,5 +497,5 @@ say "installed; the next scheduled run is at :17 past the hour"
 
 - =honey-sync-conflicts-install --dry-run= prints "unchanged" for the script and the crontab line once installed.
 - =honey-sync-conflicts run --dry-run= lists what would be purged per folder and changes nothing. =list= prints every open conflict with its id and the device name.
-- Tested on a throwaway tree (identical copy purged, renamed-sibling copy purged, a fresh copy left alone, text/docx/binary/only-copy/lock-file verdicts, both resolve choices, kill switch, a Secret Vault stand-in untouched) before it was pointed at the real folders.
+- Tested on a throwaway tree (identical copy purged, renamed-sibling copy purged, orphan given its clean name, newest of several orphans takes the name, lock file skipped, a fresh copy left alone, text/docx/binary/only-copy/lock-file verdicts, both resolve choices, kill switch, a Secret Vault stand-in untouched) before it was pointed at the real folders.
 - To pause: =touch ~/.config/sync-conflicts/DISABLED=. To remove: delete the =honey-sync-conflicts= line from =crontab -l=.
