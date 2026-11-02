@@ -2209,6 +2209,19 @@ def locked_scan(registry: dict, adapter: object, now: float | None = None) -> in
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def touch_heartbeat() -> None:
+    """Record that a scan actually completed.
+
+    Liveness is not progress: a watcher can hold both locks and never scan. The
+    boot owner reads this file to decide whether the holder is working or wedged.
+    """
+    try:
+        path = MAILCORTEX.runtime_root() / "seat-watcher.heartbeat"
+        path.write_text(json.dumps({"pid": os.getpid(), "at": time.time()}), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Wake owned idle MailCortex seats exactly once.")
     parser.add_argument("--registry", default=os.environ.get("MAILCORTEX_SEAT_REGISTRY", "~/.config/mailcortex/seats.json"))
@@ -2219,6 +2232,7 @@ def main() -> int:
         while True:
             registry = load_registry(Path(args.registry).expanduser(), os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
             locked_scan(registry, TransportAdapters())
+            touch_heartbeat()
             if args.once:
                 return 0
             time.sleep(max(args.interval, 0.1))
@@ -2418,6 +2432,20 @@ case "$mode" in
     require_ready
     umask 077
     mkdir -p -m 0700 "$state"
+    # Liveness is not progress. A watcher can hold both locks and stop scanning:
+    # that is exactly how the fleet sat frozen for forty minutes. If the recorded
+    # holder has not completed a scan in five minutes, take over instead of
+    # queueing behind it forever.
+    if [ -f "$state/seat-watcher.heartbeat" ] && [ -f "$pid_record" ]; then
+      age="$(python3 -c 'import json,sys,time; print(int(time.time()-json.load(open(sys.argv[1])).get("at",0)))' \
+             "$state/seat-watcher.heartbeat" 2>/dev/null || echo 0)"
+      holder="$(awk '{print $1}' "$pid_record" 2>/dev/null || true)"
+      if [ "${age:-0}" -gt 300 ] && [ -n "${holder:-}" ] && kill -0 "$holder" 2>/dev/null; then
+        kill "$holder" 2>/dev/null || true
+        sleep 3
+        echo "mailcortex-seat-watcher-service: took over a wedged watcher (pid $holder, ${age}s without a scan)" >&2
+      fi
+    fi
     exec 9>"$state/seat-watcher-service.lock"
     flock -n 9 || exit 0
     printf '%s %s\n' "$$" "$(awk '{print $22}' "/proc/$$/stat")" > "$pid_record"
