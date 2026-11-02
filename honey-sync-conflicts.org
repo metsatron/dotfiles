@@ -1,0 +1,465 @@
+#+TITLE: Honey sync conflicts lane: deterministic Syncthing conflict handling for Gillean
+#+DESCRIPTION: An hourly cron script on Honey purges conflict copies that are byte-identical to a surviving file, converts the differing ones to text and diffs them, and surfaces them to Gillean (or Aura) as Obsidian notes with a safe resolve command.
+#+AUTHOR: Honey Badger (Claude Sonnet 5.5), for Mètsàtron's DotCortex
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments no
+#+PROPERTY: header-args:python :comments no
+
+* Why
+
+Gillean's folders sync between Honey, her Windows PCs ("Gills", "ideacentre") and haggis. When two devices save the same file before they sync, Syncthing keeps both: the loser is renamed =NAME.sync-conflict-DATE-TIME-DEVICE.ext=. On 2026-11-02 there were 58 of them (21 in the Obsidian Vault, 37 in HEEA) and none of them is ever resolved, which overwhelms her. Mètsàtron asked (2026-11-02) for a deterministic cron job that purges byte-identical copies, diffs the rest as markdown, and surfaces them so Gillean or Aura can settle them.
+
+Survey that shaped the design (read-only, names only, 2026-11-02): none of the 58 was byte-identical to its original. 20 of the 21 in the Obsidian Vault come from the Cowork exporter (=Cowork/_NEEDS_LOGIN.md=, =Cowork Sessions.md=, =Scripts/cowork-export/export.log=), which is written by Windows Task Scheduler, not by Honey; the conflicts are from "Gills" and the winning copy from another device, so more than one PC appears to run that exporter. A handler cleans up after the symptom; stopping the second writer is the real fix and is flagged separately. Syncthing versioning is not enabled on any folder, so a deleted file cannot be recovered from Syncthing, which is why the purge rule below is strict.
+
+* What it does
+
+| Step | Rule |
+|---|---|
+| Scope | The Syncthing folders =Obsidian Vault=, =HEEA=, =Documents=, =Logseq-Gill=, =Sync=, =Pictures=. A folder is skipped unless its =.stfolder= marker exists. =Secret Vault= is not in the list and is refused by name: this job never opens it. |
+| Purge | A conflict copy is deleted only when another file in the same folder has exactly the same bytes (an ordinary file first, otherwise an earlier-named conflict copy), the copy is at least 10 minutes old, the original at least 2 minutes old, and =cmp= confirms the match immediately before the unlink. So the content always survives. Every purge is logged with its sha256. At most 200 per run. |
+| Never purged | A conflict copy that differs from its original, and a conflict copy whose original is gone (the only copy). Symlinks are never followed. |
+| Diff | The differing pair is turned into text: markdown/text as-is, =.docx/.odt/.rtf/.epub= through =pandoc -t gfm=, =.pdf= through =pdftotext -layout=. Anything else (xlsx, ppt, edb, images) is reported as "binary" with sizes and times. A unified diff is written (300 lines max). Identical text with different bytes is reported "same text". Word/Excel =~$= lock files are reported as junk. |
+| Surface | Per folder: =Sync Conflicts/Sync Conflicts.md= (a table with an id, the file, what differs, which device made the other version, when, and a link) and =Sync Conflicts/diffs/ID.md=. Notes are rewritten only when their text changes, via a Syncthing temp name, so the job does not itself create sync churn. When there are no conflicts the note says so. |
+| Resolve | =honey-sync-conflicts resolve ID keep-current= moves the conflict copy to the trash; =keep-conflict= moves the current file to the trash and renames the conflict copy into place (it also restores an "only copy"). The trash is =~/.local/state/sync-conflicts/trash/=, outside every synced folder, kept 30 days. Gillean asks Aura; Aura or Mètsàtron runs the command. There is no automatic merge: without a common ancestor a three-way merge would only guess. |
+| Kill switch | =touch ~/.config/sync-conflicts/DISABLED= (the job exits 3 and does nothing). |
+
+* Boundaries
+
+- No Secret Vault, ever. Aura has 4 conflict copies there; she handles them herself.
+- The diff notes contain text from Gillean's working documents. They are written inside the same Syncthing folder as the document, never copied across folders, so no content moves to a wider audience. HEEA's notes stay in HEEA.
+- Conflict copies are never deleted unless their bytes survive elsewhere. Anything else is a human or Aura decision, and the discarded side is kept for 30 days.
+- Files in the folders are Gillean's. The job writes only the =Sync Conflicts/= directory in each folder and removes only byte-identical conflict copies.
+
+* The script
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/honey-sync-conflicts/bin/honey-sync-conflicts :tangle-mode (identity #o755)
+#!/usr/bin/python3 -I
+# honey-sync-conflicts: deterministic Syncthing conflict handling for Gillean's folders.
+#
+#   run [--dry-run]            purge byte-identical conflict copies, write the report notes
+#   list                       print every open conflict with its id
+#   resolve ID keep-current    discard the conflict copy (moved to the trash, 30 days)
+#   resolve ID keep-conflict   the conflict copy becomes the file (old one moved to the trash)
+#
+# Never reads ~/Secret Vault. Never deletes a file unless another file with the very same
+# bytes survives in the same folder, checked by cmp immediately before the unlink.
+import difflib, hashlib, os, re, shutil, subprocess, sys, time, xml.etree.ElementTree as ET
+from datetime import datetime
+
+HOME = os.path.expanduser("~")
+STATE = os.path.join(HOME, ".local/state/sync-conflicts")
+LOG = os.path.join(STATE, "log")
+TRASH = os.path.join(STATE, "trash")
+KILL = os.path.join(HOME, ".config/sync-conflicts/DISABLED")
+ROOTS = [  # (name, path) -- Secret Vault is deliberately absent and refused below
+    ("obsidian-vault", "Obsidian Vault"), ("heea", "HEEA"), ("documents", "Documents"),
+    ("logseq-gill", "Logseq-Gill"), ("sync", "Sync"), ("pictures", "Pictures"),
+]
+REPORT_DIR = "Sync Conflicts"
+SKIP_DIRS = {".stfolder", ".stversions", ".git", "node_modules", REPORT_DIR}
+PAT = re.compile(r"^(.*)\.sync-conflict-(\d{8}-\d{6})-([A-Z0-9]{7})(\.[^.]*)?$")
+MIN_AGE = float(os.environ.get("HSC_MIN_AGE", "600"))  # a conflict copy must be this old (s)
+BASE_AGE = float(os.environ.get("HSC_BASE_AGE", "120"))
+MAX_PURGE = 200
+TEXT_EXT = {".md", ".txt", ".log", ".csv", ".tsv", ".json", ".yaml", ".yml", ".org", ".py", ".sh", ".html", ".htm"}
+PANDOC_EXT = {".docx": "docx", ".odt": "odt", ".rtf": "rtf", ".epub": "epub"}
+MAX_BYTES = 8 * 1024 * 1024
+MAX_DIFF_LINES = 300
+MAX_NOTES = 300
+
+
+def log(msg):
+    os.makedirs(STATE, mode=0o700, exist_ok=True)
+    if os.path.exists(LOG) and os.path.getsize(LOG) > 1_000_000:
+        os.replace(LOG, LOG + ".1")
+    with open(LOG, "a") as f:
+        f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S} {msg}\n")
+
+
+def roots():
+    out = []
+    for name, rel in ROOTS:
+        p = os.path.join(HOME, rel)
+        if "Secret Vault" in p:
+            continue
+        if os.path.isdir(os.path.join(p, ".stfolder")):  # not a live Syncthing folder -> skip
+            out.append((name, p))
+    return out
+
+
+def devices():
+    for cfg in (".local/state/syncthing/config.xml", ".config/syncthing/config.xml"):
+        try:
+            return {d.get("id")[:7]: d.get("name") for d in ET.parse(os.path.join(HOME, cfg)).getroot().iter("device")}
+        except Exception:
+            continue
+    return {}
+
+
+def sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for b in iter(lambda: f.read(1 << 20), b""):
+            h.update(b)
+    return h.hexdigest()
+
+
+def same_bytes(a, b):
+    try:
+        return os.path.getsize(a) == os.path.getsize(b) and subprocess.run(["cmp", "-s", a, b]).returncode == 0
+    except OSError:
+        return False
+
+
+def scan(root):
+    """Yield (dirpath, files) for every folder, skipping bookkeeping dirs and symlinks."""
+    for d, dirs, files in os.walk(root):
+        dirs[:] = [x for x in dirs if x not in SKIP_DIRS and not os.path.islink(os.path.join(d, x))]
+        yield d, [f for f in files if not os.path.islink(os.path.join(d, f)) and not f.startswith(".syncthing.")]
+
+
+def cid(root_name, rel):
+    return hashlib.sha1(f"{root_name}\0{rel}".encode()).hexdigest()[:8]
+
+
+def purge_identical(root_name, root, dry):
+    """Delete conflict copies whose bytes survive in another file of the same folder."""
+    purged = []
+    now = time.time()
+    for d, files in scan(root):
+        conflicts = sorted(f for f in files if PAT.match(f))
+        if not conflicts:
+            continue
+        others = [f for f in files if not PAT.match(f)]
+        alive = set(files)
+        for c in conflicts:
+            cp = os.path.join(d, c)
+            if now - os.path.getmtime(cp) < MIN_AGE:
+                continue
+            m = PAT.match(c)
+            base = m.group(1) + (m.group(4) or "")
+            if base in alive and now - os.path.getmtime(os.path.join(d, base)) < BASE_AGE:
+                continue
+            # keepers: any ordinary file first, then an earlier-named conflict copy still alive
+            cands = [f for f in others if f in alive] + [f for f in conflicts if f < c and f in alive]
+            size = os.path.getsize(cp)
+            keeper = next((k for k in cands if os.path.getsize(os.path.join(d, k)) == size
+                           and same_bytes(os.path.join(d, k), cp)), None)
+            if not keeper:
+                continue
+            if len(purged) >= MAX_PURGE:
+                log(f"purge cap {MAX_PURGE} reached in {root_name}, rest next run")
+                return purged
+            rel = os.path.relpath(cp, root)
+            if dry:
+                purged.append((rel, keeper))
+                continue
+            if not same_bytes(os.path.join(d, keeper), cp):  # last look before the unlink
+                continue
+            digest = sha(cp)
+            os.unlink(cp)
+            alive.discard(c)
+            log(f"purged {root_name}:{rel} identical to {keeper} sha256={digest}")
+            purged.append((rel, keeper))
+    return purged
+
+
+def pairs(root_name, root):
+    """Open conflicts: dicts with id, rel, current path (or None), conflict path, device, stamp."""
+    devs = devices()
+    out = []
+    for d, files in scan(root):
+        for f in files:
+            m = PAT.match(f)
+            if not m:
+                continue
+            base = m.group(1) + (m.group(4) or "")
+            cp, bp = os.path.join(d, f), os.path.join(d, base)
+            stamp = datetime.strptime(m.group(2), "%Y%m%d-%H%M%S")
+            out.append(dict(id=cid(root_name, os.path.relpath(cp, root)), root=root_name, rootpath=root,
+                            rel=os.path.relpath(bp, root), conflict=cp, current=bp if os.path.exists(bp) else None,
+                            device=devs.get(m.group(3), m.group(3)), stamp=stamp))
+    out.sort(key=lambda p: (p["rel"], p["stamp"]))
+    return out
+
+
+def to_text(path):
+    ext = os.path.splitext(path)[1].lower()
+    try:
+        if os.path.getsize(path) > MAX_BYTES:
+            return None
+        if ext in TEXT_EXT:
+            with open(path, "rb") as f:
+                raw = f.read()
+            return None if b"\0" in raw[:8192] else raw.decode("utf-8", "replace")
+        if ext in PANDOC_EXT:
+            r = subprocess.run(["pandoc", "-f", PANDOC_EXT[ext], "-t", "gfm", "--wrap=none", path],
+                               capture_output=True, text=True, timeout=45)
+            return r.stdout if r.returncode == 0 else None
+        if ext == ".pdf":
+            r = subprocess.run(["pdftotext", "-layout", path, "-"], capture_output=True, text=True, timeout=45)
+            return r.stdout if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return None
+
+
+def fmt(ts):
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+
+
+def describe(p):
+    """Return (verdict, diff note body)."""
+    cp = p["conflict"]
+    if os.path.basename(p["rel"]).startswith("~$"):
+        return "Office lock file", "\n".join([f"# {os.path.basename(p['rel'])}", "",
+            f"Conflict id: `{p['id']}`. This is the temporary lock file Word or Excel leaves while a document is open, "
+            "not a document. It is safe to discard.", ""])
+    head = [f"# {os.path.basename(p['rel'])}", "", f"Folder: `{os.path.dirname(p['rel']) or '.'}`", "",
+            f"Conflict id: `{p['id']}`. The second version was made by **{p['device']}** at "
+            f"{p['stamp']:%Y-%m-%d %H:%M} and kept next to the file instead of overwriting it.", ""]
+    if not p["current"]:
+        size = os.path.getsize(cp)
+        return "only copy", "\n".join(head + [
+            "The original file is no longer there (renamed, moved or deleted on another device), so this "
+            f"conflict copy ({size} bytes, saved {fmt(os.path.getmtime(cp))}) is the only copy. Nothing to compare.", ""])
+    cur = p["current"]
+    head += ["| | Size | Last saved |", "|---|---|---|",
+             f"| Current file | {os.path.getsize(cur)} bytes | {fmt(os.path.getmtime(cur))} |",
+             f"| Conflict copy ({p['device']}) | {os.path.getsize(cp)} bytes | {fmt(os.path.getmtime(cp))} |", ""]
+    a, b = to_text(cur), to_text(cp)
+    if a is None or b is None:
+        return "binary", "\n".join(head + [
+            "This kind of file cannot be shown as text. Open both versions and keep the one you want.", ""])
+    if a == b:
+        return "same text", "\n".join(head + [
+            "The text is the same in both versions; only hidden file details differ (formatting, metadata or "
+            "timestamps). Safe to keep either one.", ""])
+    lines = list(difflib.unified_diff(a.splitlines(), b.splitlines(), "current", f"conflict ({p['device']})", lineterm="", n=2))
+    added = sum(1 for l in lines if l.startswith("+") and not l.startswith("+++"))
+    removed = sum(1 for l in lines if l.startswith("-") and not l.startswith("---"))
+    body = lines[:MAX_DIFF_LINES]
+    if len(lines) > MAX_DIFF_LINES:
+        body.append(f"... {len(lines) - MAX_DIFF_LINES} more diff lines not shown")
+    return f"text differs (+{added}/-{removed})", "\n".join(head + [
+        "Lines starting with `-` are only in the current file; lines starting with `+` are only in the conflict copy.",
+        "", "```diff", *body, "```", ""])
+
+
+def write_if_changed(path, text):
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            if f.read() == text:
+                return False
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = os.path.join(os.path.dirname(path), f".syncthing.{os.path.basename(path)}.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o640)
+    os.replace(tmp, path)
+    return True
+
+
+def report(root_name, root, plist):
+    rd = os.path.join(root, REPORT_DIR)
+    dd = os.path.join(rd, "diffs")
+    keep = set()
+    rows = []
+    for p in plist[:MAX_NOTES]:
+        verdict, body = describe(p)
+        note = f"{p['id']}.md"
+        keep.add(note)
+        write_if_changed(os.path.join(dd, note), "---\ntags:\n  - sync-conflicts\n---\n\n" + body)
+        rows.append((p, verdict, note))
+    if not plist and not os.path.isdir(rd):
+        return 0
+    if os.path.isdir(dd):
+        for f in os.listdir(dd):
+            if f not in keep:
+                os.unlink(os.path.join(dd, f))
+    order = {"text differs": 0, "same text": 1, "binary": 2, "only copy": 3, "Office lock file": 4}
+    rows.sort(key=lambda r: (order.get(r[1].split(" (")[0], 9), r[0]["rel"]))
+    out = ["---", "tags:", "  - sync-conflicts", *(["  - action-required"] if plist else []), "---", "", "# Sync conflicts", ""]
+    if not plist:
+        out.append("No open sync conflicts. Nothing needs doing.")
+    else:
+        out += [f"{len(plist)} file(s) have two versions because two devices saved the same file before they synced. "
+                "Nothing has been lost: both versions are kept. Files that were byte-for-byte identical have "
+                "already been tidied away automatically.", "",
+                "To settle one, ask Aura: *resolve sync conflict `ID`, keep the current file* (or *keep the conflict copy*). "
+                "The version you do not keep is held for 30 days before it is deleted.", "",
+                "| ID | File | What differs | Other version from | Made | Diff |", "|---|---|---|---|---|---|"]
+        for p, v, note in rows:
+            name = p["rel"].replace("|", "\\|")
+            out.append(f"| `{p['id']}` | {name} | {v} | {p['device']} | {p['stamp']:%Y-%m-%d %H:%M} | "
+                       f"[[{REPORT_DIR}/diffs/{note[:-3]}|diff]] |")
+        if len(plist) > MAX_NOTES:
+            out += ["", f"{len(plist) - MAX_NOTES} more not listed; run `honey-sync-conflicts list`."]
+    write_if_changed(os.path.join(rd, "Sync Conflicts.md"), "\n".join(out) + "\n")
+    return len(plist)
+
+
+def expire_trash():
+    cutoff = time.time() - 30 * 86400
+    if not os.path.isdir(TRASH):
+        return
+    for r in os.listdir(TRASH):
+        for stampdir in os.listdir(os.path.join(TRASH, r)):
+            p = os.path.join(TRASH, r, stampdir)
+            if os.path.getmtime(p) < cutoff:
+                shutil.rmtree(p)
+                log(f"trash expired {r}/{stampdir}")
+
+
+def trash(root_name, root, path):
+    dest = os.path.join(TRASH, root_name, datetime.now().strftime("%Y%m%d-%H%M%S"), os.path.relpath(path, root))
+    os.makedirs(os.path.dirname(dest), mode=0o700, exist_ok=True)
+    shutil.move(path, dest)
+    return dest
+
+
+def cmd_run(dry):
+    if os.path.exists(KILL):
+        print("disabled (kill switch)")
+        return 3
+    total_p = total_c = 0
+    for name, root in roots():
+        purged = purge_identical(name, root, dry)
+        plist = pairs(name, root)
+        if not dry:
+            report(name, root, plist)
+        total_p += len(purged)
+        total_c += len(plist)
+        print(f"{name}: purged {len(purged)} identical{' (dry run)' if dry else ''}, {len(plist)} open")
+    if not dry:
+        expire_trash()
+    print(f"total: purged {total_p}, open {total_c}")
+    return 0
+
+
+def cmd_list():
+    for name, root in roots():
+        for p in pairs(name, root):
+            print(f"{p['id']}  {p['root']}:{p['rel']}  <- {p['device']} {p['stamp']:%Y-%m-%d %H:%M}"
+                  f"{'' if p['current'] else '  (original missing)'}")
+    return 0
+
+
+def cmd_resolve(pid, choice, dry):
+    if choice not in ("keep-current", "keep-conflict"):
+        print("choice must be keep-current or keep-conflict")
+        return 2
+    for name, root in roots():
+        for p in pairs(name, root):
+            if p["id"] != pid:
+                continue
+            base = os.path.join(root, p["rel"])
+            if choice == "keep-current" and not p["current"]:
+                print("original is missing; use keep-conflict to restore the conflict copy")
+                return 2
+            if dry:
+                print(f"would {choice} {name}:{p['rel']}")
+                return 0
+            if choice == "keep-current":
+                dest = trash(name, root, p["conflict"])
+            else:
+                dest = trash(name, root, base) if p["current"] else "-"
+                os.replace(p["conflict"], base)
+            log(f"resolved {name}:{p['rel']} {choice} (discarded copy in trash: {dest})")
+            report(name, root, pairs(name, root))
+            print(f"done: {choice} {name}:{p['rel']}")
+            return 0
+    print(f"no open conflict with id {pid}")
+    return 1
+
+
+def main(argv):
+    if not argv or argv[0] == "run":
+        return cmd_run("--dry-run" in argv)
+    if argv[0] == "list":
+        return cmd_list()
+    if argv[0] == "resolve" and len(argv) >= 3:
+        return cmd_resolve(argv[1], argv[2], "--dry-run" in argv)
+    print(__doc__ or "usage: honey-sync-conflicts run|list|resolve")
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+#+END_SRC
+
+* Installer
+
+Run as =gille= on Honey (no root needed). It installs the script into =~/bin= (backing up a differing file first) and ensures the hourly line (=:17=) in gille's crontab, then does a dry run. =--dry-run= changes nothing.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/honey-sync-conflicts/bin/honey-sync-conflicts-install :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# honey-sync-conflicts-install (generated by honey-sync-conflicts.org): install Honey's Syncthing conflict handler.
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: honey-sync-conflicts-install [--dry-run]
+Install honey-sync-conflicts into ~/bin and ensure the hourly crontab line.
+--dry-run prints what would change and touches nothing.
+USAGE
+}
+
+DRY=""
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) DRY=yes ;;
+    "") ;;
+    *) usage >&2; exit 64 ;;
+esac
+
+[ "$(id -u)" -ne 0 ] || { echo "honey-sync-conflicts-install: run as the owner (gille), not root" >&2; exit 1; }
+LANE=$(cd "$(dirname "$0")/.." && pwd)
+STAMP=$(date +%Y%m%d-%H%M%S)
+BIN=$HOME/bin
+CRON_COMMENT='# Sync conflicts (honey-sync-conflicts.org, Metsatron 2026-11-02): hourly, purge byte-identical conflict copies, write the Sync Conflicts notes. Pause: touch ~/.config/sync-conflicts/DISABLED'
+CRON_LINE='17 * * * * mkdir -p /home/gille/.local/state/sync-conflicts && flock -n /tmp/honey-sync-conflicts.lock timeout 600 /home/gille/bin/honey-sync-conflicts run > /home/gille/.local/state/sync-conflicts/last-run.txt 2>&1'
+
+say() { printf '%s\n' "$*"; }
+run() { if [ -n "$DRY" ]; then say "would: $*"; else "$@"; fi; }
+
+dest=$BIN/honey-sync-conflicts
+if [ -e "$dest" ] && cmp -s "$LANE/bin/honey-sync-conflicts" "$dest"; then
+    say "unchanged: $dest"
+else
+    [ -e "$dest" ] && run cp -p "$dest" "$dest.bak-honey-sync-conflicts-$STAMP"
+    run install -D -m 0755 "$LANE/bin/honey-sync-conflicts" "$dest"
+    say "installed: $dest"
+fi
+
+if crontab -l 2>/dev/null | grep -qF "$CRON_LINE"; then
+    say "unchanged: crontab line"
+else
+    if crontab -l 2>/dev/null | grep -q 'honey-sync-conflicts'; then
+        echo "honey-sync-conflicts-install: a different honey-sync-conflicts crontab line exists; fix by hand" >&2
+        exit 1
+    fi
+    if [ -n "$DRY" ]; then
+        say "would: append the hourly crontab line"
+    else
+        crontab -l > "$HOME/.local/state/crontab.pre-honey-sync-conflicts-$STAMP" 2>/dev/null || true
+        { crontab -l 2>/dev/null || true; printf '%s\n%s\n' "$CRON_COMMENT" "$CRON_LINE"; } | crontab -
+        say "installed: crontab line"
+    fi
+fi
+
+if [ -n "$DRY" ]; then
+    say "dry run: nothing changed"
+    exit 0
+fi
+"$dest" run --dry-run
+say "installed; the next scheduled run is at :17 past the hour"
+#+END_SRC
+
+* Verification
+
+- =honey-sync-conflicts-install --dry-run= prints "unchanged" for the script and the crontab line once installed.
+- =honey-sync-conflicts run --dry-run= lists what would be purged per folder and changes nothing. =list= prints every open conflict with its id and the device name.
+- Tested on a throwaway tree (identical copy purged, renamed-sibling copy purged, a fresh copy left alone, text/docx/binary/only-copy/lock-file verdicts, both resolve choices, kill switch, a Secret Vault stand-in untouched) before it was pointed at the real folders.
+- To pause: =touch ~/.config/sync-conflicts/DISABLED=. To remove: delete the =honey-sync-conflicts= line from =crontab -l=.
