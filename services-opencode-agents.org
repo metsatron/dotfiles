@@ -1,0 +1,191 @@
+#+TITLE: OpenCode agent servers
+#+FILETAGS: :dotcortex:services:opencode:
+#+PROPERTY: header-args:bash :tangle ~/DotCortex/all/.local/bin/opencode-agent-service :comments no
+
+* OpenCode agent servers
+
+Ecco and Orcinus Orca are long-lived `opencode serve` processes, each bound to its own
+worktree, port and config. Nothing restarted them: a reboot left them dead, and a crash
+left a seat that looked configured while its server was gone. This is their single
+lifecycle door, in the same shape as `telegram-agent-host` for the Telegram bots:
+`ensure` is idempotent and is the only verb cron calls.
+
+State is written per agent so the health readers (nurse-joy, pokedex) can see a server
+without probing a process name, and so an agent added later needs no code change.
+
+* Supervisor
+
+#+BEGIN_SRC bash
+#!/usr/bin/env bash
+# opencode-agent-service — one lifecycle door for the fleet's OpenCode servers.
+#
+#   ensure [agent]   start anything that is not healthy (cron-safe, idempotent)
+#   start  <agent>   start one agent, refusing if it is already healthy
+#   stop   <agent>   stop one agent and its server
+#   status [--json]  every registered agent with health evidence
+#
+# Health is not "a pid exists": it is an HTTP answer from the server's own /app plus a
+# matching model in /config. A process that is up and not answering is exactly the
+# failure this exists to remove.
+set -uo pipefail
+
+STATE="$HOME/.local/state/opencode-agents"
+REGISTRY="$HOME/.config/mailcortex/opencode-agents.json"
+mkdir -p "$STATE"
+
+usage() {
+  cat <<'EOF'
+Usage: opencode-agent-service {ensure [agent]|start <agent>|stop <agent>|status [--json]}
+EOF
+}
+
+# name|port|directory|config|uid
+agents() {
+  python3 - "$REGISTRY" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+if not p.exists():
+    sys.exit(0)
+for name, rec in (json.loads(p.read_text()).get("agents") or {}).items():
+    print("|".join([name, str(rec["port"]), rec["directory"], rec["config"], rec.get("run_as", "")]))
+PY
+}
+
+record_of() {
+  agents | awk -F'|' -v want="$1" '$1 == want {print; found=1} END {exit !found}'
+}
+
+health() {
+  # 0 when the server answers /config with the agent's declared model.
+  local port="$1" want="$2"
+  python3 - "$port" "$want" <<'PY'
+import json, sys, urllib.request
+port, want = sys.argv[1], sys.argv[2]
+try:
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/config", timeout=4) as r:
+        model = json.loads(r.read().decode()).get("model") or ""
+except Exception:
+    sys.exit(1)
+sys.exit(0 if model == want else 1)
+PY
+}
+
+start_agent() {
+  local name="$1" port="$2" dir="$3" cfg="$4" run_as="$5"
+  if health "$port" "$(declared_model "$name")"; then
+    echo "opencode-agent-service: $name already healthy on :$port"
+    return 0
+  fi
+  local bin_="$HOME/.npm-global/bin/opencode"
+  local prefix=()
+  if [ -n "${run_as:-}" ] && [ "$run_as" != "$(id -un)" ]; then
+    # The worktree belongs to the seat's uid; starting as the operator gives a
+    # process that cannot even cd into it.
+    bin_="/home/$run_as/.npm-global/bin/opencode"
+    prefix=(sudo -n -u "$run_as" env HOME="/home/$run_as")
+  fi
+  echo "opencode-agent-service: starting $name on :$port ($dir)"
+  mkdir -p "$STATE"
+  setsid "${prefix[@]}" env OPENCODE_CONFIG="$cfg" bash -c "cd '$dir' && exec '$bin_' serve --hostname 127.0.0.1 --port '$port'" \
+    >>"$STATE/$name.log" 2>&1 &
+  local pid=$!
+  echo "$pid" >"$STATE/$name.pid"
+  for _ in $(seq 1 40); do
+    if health "$port" "$(declared_model "$name")"; then
+      echo "opencode-agent-service: $name healthy on :$port (pid $pid)"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "opencode-agent-service: $name did not become healthy on :$port" >&2
+  return 1
+}
+
+declared_model() {
+  python3 - "$REGISTRY" "$1" <<'PY'
+import json, sys
+from pathlib import Path
+p = Path(sys.argv[1])
+rec = (json.loads(p.read_text()).get("agents") or {}).get(sys.argv[2]) or {}
+print(rec.get("model", ""))
+PY
+}
+
+stop_agent() {
+  local name="$1" port="$2"
+  local pidfile="$STATE/$name.pid"
+  if [ -f "$pidfile" ]; then
+    local pid; pid="$(cat "$pidfile")"
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null || true
+      for _ in $(seq 1 15); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    rm -f "$pidfile"
+  fi
+  # Anything still bound to the port is a stray from an older launch.
+  local holder; holder="$(ss -H -tlnp "( sport = :$port )" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+  if [ -n "${holder:-}" ]; then
+    echo "opencode-agent-service: stopping stray server on :$port (pid $holder)"
+    kill "$holder" 2>/dev/null || true
+  fi
+  echo "opencode-agent-service: $name stopped"
+}
+
+case "${1:-}" in
+  ensure)
+    target="${2:-}"
+    rc=0
+    while IFS='|' read -r name port dir cfg run_as; do
+      [ -n "${name:-}" ] || continue
+      [ -n "$target" ] && [ "$name" != "$target" ] && continue
+      start_agent "$name" "$port" "$dir" "$cfg" "$run_as" || rc=1
+    done < <(agents)
+    exit $rc
+    ;;
+  start)
+    [ $# -ge 2 ] || { usage >&2; exit 2; }
+    IFS='|' read -r name port dir cfg run_as <<<"$(record_of "$2")" || { echo "unknown agent: $2" >&2; exit 2; }
+    start_agent "$name" "$port" "$dir" "$cfg" "$run_as"
+    ;;
+  stop)
+    [ $# -ge 2 ] || { usage >&2; exit 2; }
+    IFS='|' read -r name port dir cfg run_as <<<"$(record_of "$2")" || { echo "unknown agent: $2" >&2; exit 2; }
+    stop_agent "$name" "$port"
+    ;;
+  status)
+    if [ "${2:-}" = "--json" ]; then
+      python3 - "$REGISTRY" "$STATE" <<'PY'
+import json, sys, urllib.request
+from pathlib import Path
+reg = json.loads(Path(sys.argv[1]).read_text())
+out = []
+for name, rec in (reg.get("agents") or {}).items():
+    port, want = rec["port"], rec.get("model", "")
+    entry = {"name": name, "port": port, "directory": rec["directory"], "model": want}
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/config", timeout=4) as r:
+            cfg = json.loads(r.read().decode())
+        entry["observed_model"] = cfg.get("model")
+        entry["verdict"] = "healthy" if cfg.get("model") == want else "model-mismatch"
+    except Exception as error:
+        entry["verdict"] = "down"
+        entry["error"] = type(error).__name__
+    out.append(entry)
+print(json.dumps({"schema": "helmcortex.opencode-agents.v1", "agents": out}, indent=1))
+PY
+    else
+      while IFS='|' read -r name port dir cfg run_as; do
+        [ -n "${name:-}" ] || continue
+        if health "$port" "$(declared_model "$name")"; then
+          echo "$name :$port healthy ($dir)"
+        else
+          echo "$name :$port DOWN ($dir)"
+        fi
+      done < <(agents)
+    fi
+    ;;
+  *) usage; exit 2 ;;
+esac
+#+END_SRC
