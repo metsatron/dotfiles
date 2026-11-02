@@ -3,6 +3,8 @@
 #
 #   run [--dry-run]            purge byte-identical conflict copies, write the report notes
 #   list                       print every open conflict with its id
+#   duplicates [--root NAME]   read-only: find duplicate and name-variant families (same bytes under other
+#                              names; "(2)", "v3", "final", date stamps) and write them to a note in each folder
 #   resolve ID keep-main       the file with the normal name stays; the other version goes to the trash
 #   resolve ID keep-other      the other version takes the normal name; the old one goes to the trash
 #
@@ -411,11 +413,146 @@ def cmd_resolve(pid, choice, dry):
     return 1
 
 
+# ---- duplicate / name-variant families (read-only; never deletes, moves or renames anything) -------------
+NOISE = [  # stripped, in this order, from a lower-cased stem to find files that are variants of one document
+    r"\.sync-conflict-\d{8}-\d{6}-[a-z0-9]{7}", r"\bcopy( of)?\b", r"\(\d+\)", r"\b(final|draft|latest|new|old|backup|bak|signed|revised?)\b",
+    r"\bv(er(sion)?)?\.? ?\d+(\.\d+)*\b", r"\brev\.? ?\d+\b", r"\b\d{4}[-_. ]\d{1,2}[-_. ]\d{1,2}\b", r"\b\d{1,2}[-_. ]\d{1,2}[-_. ]\d{2,4}\b",
+    r"\b(19|20)\d{2}[-_. ]\d{2}\b", r"\b\d{8}\b", r"\b\d{6}\b",
+    r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.? ?(19|20)?\d{0,4}\b", r"\b(19|20)\d{2}\b",
+]
+NOISE_RE = [re.compile(x) for x in NOISE]
+DUP_SKIP_DIRS = SKIP_DIRS | {".obsidian", ".trash", "__pycache__", "FileHistory"}
+GENERIC = 12  # a family bigger than this is a generic name (templates, indexes), listed as a count only
+
+
+def family_key(name):
+    stem, ext = os.path.splitext(name)
+    t = stem.lower()
+    for rx in NOISE_RE:
+        t = rx.sub(" ", t)
+    t = re.sub(r"[\W_]+", " ", t).strip()
+    return (t, ext.lower())
+
+
+def shingles(text):
+    w = text.lower().split()
+    return {hash(" ".join(w[i:i + 3])) for i in range(max(0, len(w) - 2))} or {hash(text[:200])}
+
+
+def duplicates(root_name, root, budget=240):
+    files = []
+    for d, ds, fs in os.walk(root):
+        ds[:] = [x for x in ds if x not in DUP_SKIP_DIRS and not os.path.islink(os.path.join(d, x))]
+        for f in fs:
+            fp = os.path.join(d, f)
+            if os.path.islink(fp) or f.startswith(".syncthing.") or f.startswith("~$"):
+                continue
+            try:
+                st = os.stat(fp)
+            except OSError:
+                continue
+            files.append((os.path.relpath(fp, root), st.st_size, st.st_mtime))
+    # 1. same bytes, any name or folder
+    by_size = {}
+    for rel, size, mt in files:
+        if size > 0:
+            by_size.setdefault(size, []).append(rel)
+    by_hash = {}
+    for size, rels in by_size.items():
+        if len(rels) > 1 and size < 400 * 1024 * 1024:
+            for rel in rels:
+                try:
+                    by_hash.setdefault(sha(os.path.join(root, rel)), []).append(rel)
+                except OSError:
+                    pass
+    exact = {h: sorted(r) for h, r in by_hash.items() if len(r) > 1}
+    # 2. name-variant families
+    meta = {rel: (size, mt) for rel, size, mt in files}
+    fam = {}
+    for rel, size, mt in files:
+        key = family_key(os.path.basename(rel))
+        if key[0] and len(key[0]) >= 4:
+            fam.setdefault(key, []).append(rel)
+    families = {k: sorted(v, key=lambda r: -meta[r][1]) for k, v in fam.items() if len(v) > 1}
+    generic = {k: v for k, v in families.items() if len(v) > GENERIC}
+    families = {k: v for k, v in families.items() if len(v) <= GENERIC}
+    deadline = time.time() + budget
+    out = []
+    for key, members in families.items():
+        digests = {rel: sha(os.path.join(root, rel)) if meta[rel][0] < 400 * 1024 * 1024 else None for rel in members}
+        texts = {}
+        if time.time() < deadline:
+            for rel in members:
+                texts[rel] = to_text(os.path.join(root, rel))
+        newest = members[0]
+        sh_new = shingles(texts[newest]) if texts.get(newest) else None
+        rows = []
+        for rel in members:
+            if digests[rel] and digests[rel] == digests[newest] and rel != newest:
+                rel_note = "byte-identical to newest"
+            elif sh_new and texts.get(rel):
+                sh = shingles(texts[rel])
+                rel_note = f"{round(100 * len(sh & sh_new) / max(1, len(sh | sh_new)))}% text overlap with newest" if rel != newest else "newest"
+            else:
+                rel_note = "newest" if rel == newest else "differs (no text comparison for this file type)"
+            rows.append((rel, meta[rel][0], meta[rel][1], rel_note))
+        drift = any("identical" not in r[3] and r[3] != "newest" for r in rows)
+        out.append((drift, key, rows))
+    out.sort(key=lambda x: (not x[0], -x[2][0][2]))
+    return exact, out, len(generic), len(files)
+
+
+def write_duplicates(root_name, root, exact, fams, n_generic, n_files):
+    L = ["---", "tags:", "  - sync-conflicts", "  - duplicates", "---", "", "# Duplicate candidates", "",
+         f"Read-only report. Nothing here has been changed, moved or deleted. {n_files} files scanned. A *candidate* is a guess from "
+         "file names and contents, so a human has to confirm. Names are matched after removing copy markers like `(2)` and `copy`, "
+         "version words (`v3`, `rev 2`, `final`, `draft`, `new`, `old`, `signed`), dates and times.", ""]
+    drift = [f for f in fams if f[0]]
+    same = [f for f in fams if not f[0]]
+    L += [f"- **Same document, different content:** {len(drift)} groups (these are the ones to look at first)",
+          f"- **Same document, same content under different names:** {len(same)} groups",
+          f"- **Exactly the same bytes, any name or folder:** {len(exact)} groups",
+          f"- Generic names left out because there are too many to be one document: {n_generic}", ""]
+    def table(rows):
+        t = ["| File | Size | Last saved | Compared with the newest |", "|---|---|---|---|"]
+        for rel, size, mt, note in rows:
+            t.append(f"| {rel.replace('|', chr(92) + '|')} | {size} | {fmt(mt)} | {note} |")
+        return t
+    L += ["## Same document, different content", ""]
+    for i, (_, key, rows) in enumerate(drift, 1):
+        L += [f"### {i}. {key[0]}{key[1]}", ""] + table(rows) + [""]
+    L += ["## Same document, same content under different names", ""]
+    for i, (_, key, rows) in enumerate(same, 1):
+        L += [f"### {i}. {key[0]}{key[1]}", ""] + table(rows) + [""]
+    L += ["## Exactly the same bytes", ""]
+    for i, (h, rels) in enumerate(sorted(exact.items(), key=lambda kv: kv[1][0]), 1):
+        L += [f"{i}. " + "; ".join(r.replace('|', chr(92) + '|') for r in rels)]
+    path = os.path.join(root, REPORT_DIR, "Duplicate candidates.md")
+    write_if_changed(path, "\n".join(L) + "\n")
+    return len(drift), len(same), len(exact), n_generic
+
+
+def cmd_duplicates(argv):
+    only = argv[argv.index("--root") + 1] if "--root" in argv else None
+    for name, root in roots():
+        if name == "pictures" and only != "pictures":
+            continue
+        if only and name != only:
+            continue
+        exact, fams, n_generic, n_files = duplicates(name, root)
+        d, sm, ex, g = write_duplicates(name, root, exact, fams, n_generic, n_files)
+        print(f"{name}: scanned {n_files}; different-content groups {d}, same-content-other-name groups {sm}, "
+              f"identical-bytes groups {ex}, generic names skipped {g}")
+    return 0
+
+
 def main(argv):
     if not argv or argv[0] == "run":
         return cmd_run("--dry-run" in argv)
     if argv[0] == "list":
         return cmd_list()
+    if argv[0] == "duplicates":
+        return cmd_duplicates(argv[1:])
     if argv[0] == "resolve" and len(argv) >= 3:
         return cmd_resolve(argv[1], argv[2], "--dry-run" in argv)
     print(__doc__ or "usage: honey-sync-conflicts run|list|resolve")
