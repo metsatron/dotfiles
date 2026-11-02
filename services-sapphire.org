@@ -1,0 +1,210 @@
+#+TITLE: Sapphire
+#+DESCRIPTION: Sapphire voice-assistant container — env-file secrets, docker/podman runtime detection, ensure/cron supervision, tailnet HTTPS publication
+#+AUTHOR: Mètsàtron — Sovereign Weaver
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent :comments no
+
+* Decision (Admiral, 2026-11-02)
+
+"Lets go with moving Sapphire." The service runs on Kikin today as a hand-started rootless
+podman container with no supervisor: =StartedAt= was four days after boot, so a reboot leaves
+it down until someone remembers. The ruling is to move it to X230 — the host with 304 G free
+and a running docker daemon, while Kikin sits at 18 G — and to make the launch **declared
+here** instead of typing a =docker run= by hand.
+
+The image is **not** rebuilt: =CORE/sapphire= has uncommitted modifications to
+=core/routes/content.py= and the TTS functions and last moved in March, so a rebuild would not
+be the thing that is running now. The exact image (=b6f4fe925ccc…=, 9.76 GB) is streamed to
+X230 and pinned by tag =sapphire-sarvam:9f949f1950ab=.
+
+* Wiring
+
+#+BEGIN_EXAMPLE
+  browser / tailnet
+        │  https://kikin-kushi.<tailnet>:8073   (URL unchanged — bookmarks and the Centre shelf keep working)
+        ▼
+  Kikin: tailscale serve --https=8073 → https+insecure://<x230-tailnet-ip>:8073
+        ▼
+  X230: docker container sapphire-sarvam — 127.0.0.1:8073 ONLY (loopback, not published)
+        ├── /app/user                 ← ~/.local/share/sapphire-sarvam/data
+        ├── /app/user_backups         ← ~/.local/share/sapphire-sarvam/backups
+        └── /home/sapphire/.config/sapphire ← ~/.config/sapphire-sarvam/credentials
+  secrets: ~/.config/sapphire-sarvam/runtime.env (0600, machine-local, never tangled)
+#+END_EXAMPLE
+
+Kikin keeps the HTTPS endpoint so no client URL changes; X230's own port is never exposed
+beyond loopback. The tailnet address is resolved at run time (=ssh x230 tailscale ip -4=), never
+written into this public repo.
+
+* Runtime
+
+- Image: =sapphire-sarvam:9f949f1950ab= (id =b6f4fe925ccc…=), =Config.Cmd= =[python main.py]=,
+  =Config.User= =1000:1000=, healthcheck supplied by the image.
+- Ports: =-p 127.0.0.1:8073:8073= — the container's own =WEB_UI_PORT= is 8073.
+- Hardening: =--security-opt no-new-privileges= and =--cap-drop ALL=, matching the audited
+  container's =CapDrop= set.
+- Supervision: user crontab, =@reboot= plus a two-minute =ensure=. =ensure= never recreates a
+  container that exists but is unhealthy — it leaves it for inspection, because a restart loop
+  hides the failure the supervisor exists to surface.
+- Host: X230 only. The cron-apply bakes =--expected-host ThinkPad-X230= so the same stowed
+  launcher is inert elsewhere.
+
+* Launcher
+
+#+BEGIN_SRC bash :tangle all/.local/bin/sapphire-service :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+CONTAINER="${SAPPHIRE_CONTAINER:-sapphire-sarvam}"
+IMAGE="${SAPPHIRE_IMAGE:-sapphire-sarvam:9f949f1950ab}"
+PORT="${SAPPHIRE_PORT:-8073}"
+ENV_FILE="${SAPPHIRE_ENV_FILE:-$HOME/.config/sapphire-sarvam/runtime.env}"
+DATA_DIR="${SAPPHIRE_DATA_DIR:-$HOME/.local/share/sapphire-sarvam/data}"
+BACKUP_DIR="${SAPPHIRE_BACKUP_DIR:-$HOME/.local/share/sapphire-sarvam/backups}"
+CRED_DIR="${SAPPHIRE_CRED_DIR:-$HOME/.config/sapphire-sarvam/credentials}"
+EXPECTED_HOST="${SAPPHIRE_EXPECTED_HOST:-}"
+TAG="sapphire-service"
+
+log() { printf '%s: %s\n' "$TAG" "$*" >&2; }
+
+runtime() {
+  if command -v docker >/dev/null 2>&1; then echo docker
+  elif command -v podman >/dev/null 2>&1; then echo podman
+  else log "no container runtime (docker|podman)"; exit 1; fi
+}
+
+preflight() {
+  [ -f "$ENV_FILE" ] || { log "missing env file: $ENV_FILE"; exit 1; }
+  local mode; mode=$(stat -Lc '%a' "$ENV_FILE")
+  case "$mode" in
+    600|400) ;;
+    *) log "refusing: $ENV_FILE is mode $mode, must be 0600"; exit 1 ;;
+  esac
+  grep -q '^SARVAM_API_KEY=.\+' "$ENV_FILE" \
+    || { log "refusing: SARVAM_API_KEY unset or placeholder in $ENV_FILE"; exit 1; }
+  for d in "$DATA_DIR" "$BACKUP_DIR" "$CRED_DIR"; do
+    [ -d "$d" ] || { log "missing state dir: $d"; exit 1; }
+  done
+}
+
+healthy() {
+  local rt="$1" st
+  st=$("$rt" inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' \
+        "$CONTAINER" 2>/dev/null) || return 1
+  [ "$st" = healthy ] || [ "$st" = running ]
+}
+
+exists() { "$(runtime)" container inspect "$CONTAINER" >/dev/null 2>&1; }
+
+do_run() {
+  local rt; rt=$(runtime); preflight
+  "$rt" run -d --name "$CONTAINER" \
+    --user 1000:1000 \
+    --env-file "$ENV_FILE" \
+    -p "127.0.0.1:${PORT}:8073" \
+    -v "$DATA_DIR:/app/user" \
+    -v "$BACKUP_DIR:/app/user_backups" \
+    -v "$CRED_DIR:/home/sapphire/.config/sapphire" \
+    --security-opt no-new-privileges \
+    --cap-drop ALL \
+    --restart unless-stopped \
+    "$IMAGE"
+}
+
+case "${1:-ensure}" in
+  ensure)
+    [ -n "$EXPECTED_HOST" ] && [ "$EXPECTED_HOST" != "$(hostname)" ] \
+      && { log "wrong host: $(hostname), expected $EXPECTED_HOST"; exit 0; }
+    if exists && healthy "$(runtime)"; then exit 0; fi
+    if exists; then "$(runtime)" start "$CONTAINER" >/dev/null 2>&1 || do_run
+    else do_run; fi
+    ;;
+  run)     do_run ;;
+  start)   preflight; "$(runtime)" start "$CONTAINER" ;;
+  stop)    "$(runtime)" stop "$CONTAINER" ;;
+  restart) "$(runtime)" restart "$CONTAINER" ;;
+  status)  exists && "$(runtime)" inspect -f \
+             '{{.Name}} {{.State.Status}} health={{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' \
+             "$CONTAINER" || { log "not created"; exit 1; } ;;
+  logs)    shift; "$(runtime)" logs --tail "${1:-100}" -f "$CONTAINER" ;;
+  *)       log "usage: sapphire-service [ensure|run|start|stop|restart|status|logs]"; exit 2 ;;
+esac
+#+END_SRC
+
+* Cron supervision
+
+#+BEGIN_SRC bash :tangle all/.local/bin/sapphire-cron-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="dotcortex-sapphire"
+BEGIN="# BEGIN ${TAG}"
+END="# END ${TAG}"
+BIN="$HOME/.local/bin/sapphire-service"
+HOST_NAME="$(hostname)"
+CRON_BIN="${SAPPHIRE_CRON_BIN:-crontab}"
+PATH_LINE="/usr/local/bin:/usr/bin:/bin:$HOME/.local/bin"
+REMOVE=0
+[ "${1:-}" = "--remove" ] && REMOVE=1
+
+current="$("$CRON_BIN" -l 2>/dev/null || true)"
+cleaned="$(printf '%s\n' "$current" | awk -v b="$BEGIN" -v e="$END" '
+  $0==b {skip=1; next}
+  $0==e {skip=0; next}
+  skip!=1 {print}')"
+cleaned="$(printf '%s' "$cleaned" | sed -e 's/[[:space:]]*$//' | awk 'NF||p{print} {p=NF}')"
+
+if [ "$REMOVE" = 1 ]; then
+  printf '%s\n' "$cleaned" | "$CRON_BIN" -
+  echo "$TAG: crontab block removed (host $HOST_NAME)"
+  exit 0
+fi
+
+[ -x "$BIN" ] || { echo "$TAG: $BIN missing or not executable — run loom stow first" >&2; exit 1; }
+
+block="${BEGIN}
+SHELL=/bin/sh
+PATH=${PATH_LINE}
+@reboot HOME=$HOME PATH=${PATH_LINE} $BIN ensure
+*/2 * * * * HOME=$HOME PATH=${PATH_LINE} $BIN ensure
+${END}"
+
+printf '%s\n%s\n' "$cleaned" "$block" | sed '/^$/d' | "$CRON_BIN" -
+echo "$TAG: installed user crontab block for $(basename "$BIN") on $HOST_NAME"
+"$CRON_BIN" -l | sed -n "/$BEGIN/,/$END/p"
+#+END_SRC
+
+The crontab block is delimited so =--remove= is exact and re-running replaces rather than
+accumulates. =ensure= is expected-host guarded, so a stowed launcher on any other machine
+exits 0 without touching containers.
+
+* Secrets
+
+=SARVAM_API_KEY= is the only secret. It lives in =~/.config/sapphire-sarvam/runtime.env=,
+mode 0600, machine-local, created by the operator from KeePass. It is **never** tangled into
+this repo and never passed on a command line (that would expose it to =ps=). The launcher
+refuses a loose mode or a placeholder value rather than starting a broken service.
+
+#+BEGIN_SRC text :tangle all/.config/sapphire-sarvam/runtime.env.example :tangle-mode (identity #o600)
+SARVAM_API_KEY=YOUR_SARVAM_API_KEY
+#+END_SRC
+
+* Rollback
+
+- Before cutover is accepted: =podman start sapphire-sarvam= on Kikin restores the service in
+  seconds; its binds, env and restart policy are untouched by this change.
+- After cutover: stop the X230 container, restart Kikin's, and point Kikin's
+  =tailscale serve= back at =127.0.0.1:8073=.
+- The DotCortex side rolls back by removing =services-sapphire.org= and running
+  =sapphire-cron-apply --remove=.
+
+* Tests
+
+Verification is live rather than unit-level for v1, because the contract is container health
+plus cron idempotence:
+
+1. =sapphire-service status= → =not created= + exit 1 on a host with no container.
+2. =sapphire-service run= → ={{.State.Health.Status}}= reaches =healthy= within the image's
+   start period (60 s).
+3. =ensure= on a healthy container leaves =.State.StartedAt= unchanged (no restart loop).
+4. =docker stop= then =ensure= brings it back.
+5. =ss -ltn= shows =127.0.0.1:8073= only — never 0.0.0.0.
+6. =tailscale serve status= on Kikin shows the 8073 proxy to X230.
