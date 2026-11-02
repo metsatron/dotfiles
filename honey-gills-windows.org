@@ -1,0 +1,158 @@
+#+TITLE: Honey to Gills: provisioning Gillean's Windows PC (windowless Cowork export, WSL health) from DotCortex
+#+DESCRIPTION: Gillean's HP Envy ("GILLS") runs a scheduled Cowork-to-Obsidian export. This lane replaces the batch file that flashed a console window with a windowless launcher, installs it idempotently over ssh from Honey, and adds a read-only WSL health probe. Everything here is tracked so it can be re-provisioned.
+#+AUTHOR: Honey Badger (Claude Sonnet 5.5), for Mètsàtron's DotCortex
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments no
+#+PROPERTY: header-args:python :comments no
+#+PROPERTY: header-args:powershell :comments no
+
+* Why
+
+Mètsàtron set up the Cowork export remotely, early on, as a Task Scheduler job (=CoworkExport=, every 4 hours and at logon) that runs =run-cowork-export.bat=. A batch file as the task action opens a console window every run, which flashed on Gillean's screen; an interactive-session task is also killed (exit code =0xC000013A=, shown in =export.log= as a bare =^C=) if that window is closed mid-run. 2026-11-02 additions to the picture:
+
+- *Why exports had stopped.* Claude Desktop holds an exclusive lock on its cookie store while it runs (the exporter's README says so). The exporter then falls back to its DPAPI cache, which only refreshes when a run finds Desktop closed. Desktop had been open since 2026-11-01 14:15, so the cache kept the cookie captured at 13:51 that day, which already returned 403. Quitting Desktop from the tray and re-running =seed_cache.py= (cookie names only, never values) gave a fresh =sessionKey= (expiry about 2026-11-30), and the next scheduled run exported normally (108 conversations found, 3 new). The log's other failure, "Cloudflare challenge ... set COWORK_UA", is separate: =COWORK_UA= is not set on the PC, and it needs Claude Desktop's exact User-Agent (devtools =navigator.userAgent=), which has not been read.
+- *Remedy for the window.* The task now runs =pythonw.exe= on a small launcher (=run-cowork-export.pyw=), so no console exists at all. It writes the same =export.log= in the same format and returns the exporter's own exit code. It also keeps any console program the exporter starts (it calls =icacls= when it refreshes the cache) hidden, which =pythonw= alone would not.
+- *WSL.* WSL has wedged before (2026-09-17 to 09-23: every =wsl.exe= call hung, about 16 stuck processes). The lane adds a read-only probe so a wedge is noticed. It does not repair anything.
+
+* Boundaries
+
+- Reached from Honey with the ordinary =ssh gillean= alias (key =id_ed25519_hermes=). This is NOT the restricted UPS key in =/etc/honey-ups=, whose forced command shuts the PC down; the two fingerprints were compared before first use. Never point this lane at the UPS key.
+- It writes only =%LOCALAPPDATA%\cowork-export\= (the launcher and task backups) and the =CoworkExport= task action. The exporter itself stays where it is, in the Obsidian Vault, unchanged; the batch file stays as a rollback.
+- It never reads cookie values or the DPAPI cache. =seed_cache.py= prints names only; this lane does not run it.
+- The WSL probe starts nothing: =wsl -l -q= only lists distributions.
+- No clinical material is touched. The vault is not opened.
+
+* The windowless launcher
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/honey-gills-windows/windows/run-cowork-export.pyw
+# run-cowork-export.pyw: windowless runner for the Cowork -> Obsidian export. It replaces run-cowork-export.bat as
+# the Task Scheduler action, so no console window opens. It writes the same export.log, in the same format, and
+# exits with the exporter's own exit code. Any console program the exporter starts (icacls) is also kept hidden.
+import datetime, os, runpy, subprocess, sys, traceback
+
+EXPORTER = os.environ.get("COWORK_EXPORT_DIR", r"C:\Users\gille\Obsidian Vault\Scripts\cowork-export")
+NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW
+
+_popen_init = subprocess.Popen.__init__
+
+
+def _quiet(self, *args, **kwargs):
+    kwargs["creationflags"] = kwargs.get("creationflags", 0) | NO_WINDOW
+    _popen_init(self, *args, **kwargs)
+
+
+subprocess.Popen.__init__ = _quiet
+os.environ["PYTHONIOENCODING"] = "utf-8"
+log = open(os.path.join(EXPORTER, "export.log"), "a", encoding="utf-8", buffering=1)
+sys.stdout = sys.stderr = log
+now = datetime.datetime.now()
+log.write("\n===== run %s %s.%02d =====\n" % (now.strftime("%a %d/%m/%Y"), now.strftime("%H:%M:%S"), now.microsecond // 10000))
+code = 0
+try:
+    script = os.path.join(EXPORTER, "cowork_to_md.py")
+    sys.path.insert(0, EXPORTER)
+    os.chdir(EXPORTER)
+    sys.argv = [script] + sys.argv[1:]
+    runpy.run_path(script, run_name="__main__")
+except SystemExit as e:
+    code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+except BaseException:
+    traceback.print_exc()
+    code = 1
+log.flush()
+sys.exit(code)
+#+END_SRC
+
+* The task installer (runs on the PC)
+
+Idempotent. =-WhatIf= changes nothing. Roll back by importing the saved XML: =Register-ScheduledTask -Xml (Get-Content BACKUP -Raw) -TaskName CoworkExport -Force=.
+
+#+BEGIN_SRC powershell :tangle all/.local/share/dotcortex/honey-gills-windows/windows/cowork-task-install.ps1
+# cowork-task-install.ps1: point the CoworkExport scheduled task at the windowless launcher. Idempotent.
+# Backs up the task definition first. -WhatIf prints the change and touches nothing. Roll back by importing the
+# backup: Register-ScheduledTask -Xml (Get-Content <backup> -Raw) -TaskName CoworkExport -Force
+param([switch]$WhatIf)
+$ErrorActionPreference = 'Stop'
+$task = 'CoworkExport'
+$pyw = 'C:\Python314\pythonw.exe'
+$dir = Join-Path $env:LOCALAPPDATA 'cowork-export'
+$launcher = Join-Path $dir 'run-cowork-export.pyw'
+if (-not (Test-Path $launcher)) { throw "launcher missing: $launcher" }
+if (-not (Test-Path $pyw)) { throw "pythonw missing: $pyw" }
+$t = Get-ScheduledTask -TaskName $task
+$a = $t.Actions[0]
+if ($a.Execute -eq $pyw -and $a.Arguments -like '*run-cowork-export.pyw*') { 'unchanged: task already runs the windowless launcher'; exit 0 }
+$bak = Join-Path $dir ('task-backup-{0}.xml' -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+if ($WhatIf) { "would: back up the task to $bak, then run $pyw `"$launcher`" instead of $($a.Execute)"; exit 0 }
+Export-ScheduledTask -TaskName $task | Out-File -Encoding utf8 $bak
+$new = New-ScheduledTaskAction -Execute $pyw -Argument ('"{0}"' -f $launcher) -WorkingDirectory $dir
+Set-ScheduledTask -TaskName $task -Action $new | Out-Null
+"installed: task now runs $pyw `"$launcher`" (previous definition saved to $bak)"
+#+END_SRC
+
+* The WSL health probe (runs on the PC, read-only)
+
+#+BEGIN_SRC powershell :tangle all/.local/share/dotcortex/honey-gills-windows/windows/wsl-health.ps1
+# wsl-health.ps1: read-only WSL health probe. Starts nothing; `wsl -l -q` only lists distributions.
+# A wsl.exe that does not answer within 15 s is reported as WEDGED (the failure seen on 2026-09-17/23).
+$ErrorActionPreference = 'SilentlyContinue'
+$svc = Get-Service WSLService
+"WSLService: $(if ($svc) { $svc.Status } else { 'not installed' })"
+$procs = Get-Process wsl, wslhost, wslservice, vmmemWSL
+foreach ($g in ($procs | Group-Object ProcessName)) { '{0}: {1} running' -f $g.Name, $g.Count }
+$old = $procs | Where-Object { $_.ProcessName -eq 'wsl' -and $_.StartTime -lt (Get-Date).AddHours(-1) }
+if ($old) { "STUCK: $(@($old).Count) wsl.exe process(es) older than 1 hour (oldest started $((($old | Sort-Object StartTime)[0]).StartTime.ToString('yyyy-MM-dd HH:mm')))" }
+$vm = Get-Process vmmemWSL
+if ($vm) { "vmmemWSL up since $($vm.StartTime.ToString('yyyy-MM-dd HH:mm')), $([math]::Round($vm.WorkingSet64 / 1MB)) MB" }
+$out = Join-Path $env:TEMP 'wsl-health-probe.txt'
+$p = Start-Process -FilePath wsl.exe -ArgumentList '-l', '-q' -NoNewWindow -PassThru -RedirectStandardOutput $out
+if ($p.WaitForExit(15000)) {
+    $d = @((Get-Content $out -Encoding Unicode) | Where-Object { $_.Trim() })
+    "wsl -l -q: answered in time; $($d.Count) distribution(s): $($d -join ', ')"
+    'VERDICT: WSL is responsive'
+} else {
+    Stop-Process -Id $p.Id -Force
+    'wsl -l -q: NO ANSWER within 15 s'
+    'VERDICT: WSL is WEDGED'
+}
+Remove-Item $out -Force
+#+END_SRC
+
+* The deploy script (runs on Honey)
+
+=gills-windows-install [--dry-run]= copies the launcher to the PC and points the task at it. =--wsl-health= runs only the probe. The ssh alias comes from =GILLS_SSH_ALIAS= (default =gillean=). It cleans up its temporary files on the PC.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/honey-gills-windows/bin/gills-windows-install :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# gills-windows-install (generated by honey-gills-windows.org): provision Gillean's Windows PC from Honey over ssh.
+#   gills-windows-install [--dry-run] [--wsl-health]
+# Copies the windowless Cowork launcher into %LOCALAPPDATA%\cowork-export on the PC and points the CoworkExport
+# scheduled task at it (the old definition is backed up first). --wsl-health only runs the read-only WSL probe.
+set -euo pipefail
+PCALIAS=${GILLS_SSH_ALIAS:-gillean}
+LANE=$(cd "$(dirname "$0")/.." && pwd)/windows
+TMPW='C:\Users\gille\AppData\Local\Temp'
+DRY=""; PROBE=""
+for a in "$@"; do case "$a" in --dry-run) DRY=1 ;; --wsl-health) PROBE=1 ;; *) echo "usage: $0 [--dry-run] [--wsl-health]" >&2; exit 64 ;; esac; done
+ssh_pc() { timeout 90 ssh -o BatchMode=yes -o ConnectTimeout=10 "$PCALIAS" "$@"; }
+push() { scp -q -o BatchMode=yes -o ConnectTimeout=10 "$LANE/$1" "$PCALIAS:C:/Users/gille/AppData/Local/Temp/$1"; }
+runps() { ssh_pc "powershell -NoProfile -ExecutionPolicy Bypass -File $TMPW\\$1 ${2:-}"; }
+if [ -n "$PROBE" ]; then push wsl-health.ps1; runps wsl-health.ps1; ssh_pc "del $TMPW\\wsl-health.ps1" >/dev/null; exit 0; fi
+push run-cowork-export.pyw; push cowork-task-install.ps1
+ssh_pc 'if not exist "%LOCALAPPDATA%\cowork-export" mkdir "%LOCALAPPDATA%\cowork-export"' >/dev/null
+ssh_pc "copy /Y $TMPW\\run-cowork-export.pyw \"%LOCALAPPDATA%\\cowork-export\\run-cowork-export.pyw\"" >/dev/null
+runps cowork-task-install.ps1 "${DRY:+-WhatIf}"
+ssh_pc "del $TMPW\\run-cowork-export.pyw $TMPW\\cowork-task-install.ps1" >/dev/null
+#+END_SRC
+
+* Verification (2026-11-02)
+
+- =gills-windows-install --wsl-health=: WSLService running, =wsl -l -q= answered in time, one distribution (Ubuntu), verdict responsive.
+- =gills-windows-install --dry-run= printed the intended change without touching the task.
+- =gills-windows-install=: task action replaced, previous definition saved; =schtasks /run /tn CoworkExport= then wrote a normal run block to =export.log= ("found 108 conversations", "processed: 0 skipped: 108") and the task's last result was 0.
+- Not yet verified by anyone: that no window appears on Gillean's screen (ask a person at the PC), and that WSL stays healthy over days.
+
+* Open
+
+Setting =COWORK_UA=; running the probe on a schedule and alerting; and the tmux-on-WSL setup Mètsàtron mentioned (what should always be running there, and who restarts it) are not decided.
