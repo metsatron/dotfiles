@@ -1203,6 +1203,65 @@ def diagnostic(error: Exception) -> str:
 
 def report_error(seat: str, subject: str, error: Exception) -> None:
     print(f"mailcortex-seat-watcher: seat={seat} item={subject}: {diagnostic(error)}", file=sys.stderr)
+    _FAILURE_MARKS[seat] = _FAILURE_MARKS.get(seat, 0) + 1
+    bump_failure(seat)
+
+
+_FAILURE_MARKS: dict[str, int] = {}
+
+
+def backoff_path() -> Path:
+    return MAILCORTEX.runtime_root() / "seat-backoff.json"
+
+
+def load_backoff() -> dict:
+    try:
+        value = json.loads(backoff_path().read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_backoff(value: dict) -> None:
+    try:
+        temporary = backoff_path().with_suffix(".tmp")
+        temporary.write_text(json.dumps(value), encoding="utf-8")
+        temporary.replace(backoff_path())
+    except OSError:
+        pass
+
+
+def bump_failure(seat: str, base: float = 120.0) -> None:
+    """Back a broken lane off exponentially instead of retrying it every scan.
+
+    A seat whose transport is genuinely unavailable (revoked key, wedged pane, 403)
+    cannot be fixed by waking it again; retrying only produces one log line and one
+    wake attempt per item, forever. The delay doubles per consecutive failure and
+    caps at an hour, and resets the moment a scan gets through.
+    """
+    state = load_backoff()
+    entry = dict(state.get(seat) or {})
+    entry["count"] = int(entry.get("count", 0)) + 1
+    delay = min(base * (2 ** (entry["count"] - 1)), 3600.0)
+    entry["until"] = time.time() + delay
+    entry["delay"] = delay
+    state[seat] = entry
+    save_backoff(state)
+
+
+def clear_failure(seat: str) -> None:
+    state = load_backoff()
+    if seat in state:
+        state.pop(seat, None)
+        save_backoff(state)
+
+
+def in_backoff(seat: str) -> bool:
+    entry = load_backoff().get(seat) or {}
+    try:
+        return float(entry.get("until", 0)) > time.time()
+    except (TypeError, ValueError):
+        return False
 
 
 def reconcile_reply(seat: str, record: dict, adapter: object, now: float, path: Path) -> bool:
@@ -1321,6 +1380,12 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
         if record.get("parked"):
             # Deliberate operator stop: keep the spool intact and stay silent.
             continue
+        if in_backoff(seat):
+            # This lane failed recently and the delay has not expired. Retrying a
+            # revoked key or a wedged pane every two seconds changes nothing except
+            # the log.
+            continue
+        _FAILURE_MARKS[seat] = 0
         mailbox_name = record.get("mailbox")
         if mailbox_name not in {f"seats/{seat}", f"consorts/{seat}"}:
             raise WatcherError("seat mailbox is not canonical")
@@ -1446,6 +1511,9 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             count += 1
             if extra.get("reply_context"):
                 pending_reply = True
+    for seat, failures in list(_FAILURE_MARKS.items()):
+        if failures == 0:
+            clear_failure(seat)
     return count
 
 
