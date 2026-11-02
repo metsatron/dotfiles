@@ -838,29 +838,59 @@ class OpenCodeAdapter:
             raise WatcherError("OpenCode activity response is invalid")
         return None if target in active else target
 
-    VERIFY_SECONDS = 45.0
+    # A turn must start before the wake counts, but on a slow provider the first
+    # persisted message can lag the admission by more than 45 s (DeepSeek on
+    # NeuralWatt measured ~60-80 s). Declaring delivery_unknown there is a lie in
+    # the safe direction that still costs a re-offer, so wait longer before saying
+    # we do not know.
+    VERIFY_SECONDS = 90.0
     VERIFY_INTERVAL = 3.0
 
     def _message_ids(self, record: dict, target: str) -> list:
-        # A raw GET: the shared _request helper validates a dict under "data",
-        # while the message endpoint returns a LIST there.
+        # Two shapes exist across builds: `/session/{id}/message` returns a bare list,
+        # and `/api/session/{id}/message` wraps it in {"data": [...], "cursor": ...}.
+        # On the OpenCode build the fleet runs, the /api form answers 200 with an
+        # EMPTY data list for a session that plainly has messages — so verifying a
+        # wake against it never sees a change and every delivered mail is recorded
+        # delivery_unknown. Read the bare form first and only fall back to /api.
         self.validate_target(record)
-        request = urllib.request.Request(
-            loopback_url(record["opencode_url"], "OpenCode URL")
-            + f"/api/session/{target}/message", method="GET")
-        try:
-            with self.opener(request, timeout=15) as response:
-                if response.status != 200:
-                    raise WatcherError("OpenCode message list refused")
-                value = json.loads(response.read())
-        except WatcherError:
-            raise
-        except (OSError, ValueError, urllib.error.URLError) as error:
-            raise WatcherError("OpenCode message list unavailable") from error
-        rows = value.get("data") if isinstance(value, dict) else value
-        if not isinstance(rows, list):
-            raise WatcherError("OpenCode message list is invalid")
-        return [row.get("id") for row in rows if isinstance(row, dict) and row.get("id")]
+        base = loopback_url(record["opencode_url"], "OpenCode URL")
+        last_error = None
+        for path in (f"/session/{target}/message", f"/api/session/{target}/message"):
+            request = urllib.request.Request(base + path, method="GET")
+            try:
+                with self.opener(request, timeout=15) as response:
+                    if response.status != 200:
+                        last_error = "OpenCode message list refused"
+                        continue
+                    value = json.loads(response.read())
+            except (OSError, ValueError, urllib.error.URLError) as error:
+                last_error = f"OpenCode message list unavailable ({type(error).__name__})"
+                continue
+            rows = value.get("data") if isinstance(value, dict) else value
+            if not isinstance(rows, list):
+                last_error = "OpenCode message list is invalid"
+                continue
+            if rows:
+                # This build wraps each row as {"info": {"id": ...}, "parts": [...]};
+                # reading only a top-level "id" yields an empty id list for every
+                # session, so a delivered wake could never be distinguished from an
+                # ignored one.
+                ids = []
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    ident = row.get("id") or (row.get("info") or {}).get("id")
+                    if ident:
+                        ids.append(ident)
+                if ids:
+                    return ids
+            # An empty list is a real answer only if the session is genuinely empty;
+            # try the other shape before believing it.
+            last_error = None if last_error is None else last_error
+        if last_error:
+            raise WatcherError(last_error)
+        return []
 
     def _post_async(self, record: dict, target: str, prompt: str) -> None:
         self.validate_target(record)
