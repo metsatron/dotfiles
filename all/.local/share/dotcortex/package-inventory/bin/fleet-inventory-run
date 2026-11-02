@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# fleet-inventory-run: collect this host's inventory, keep 14 days locally, and tell the hub.
+#   fleet-inventory-run [--dry]     --dry collects and prints the notice but copies and mails nothing
+# The mail is a short notice (host, date, digest, counts, coverage). The JSON itself is copied to a drop directory
+# on the hub, because a ~1 MB mail would land in an agent's context. Kill switch: ~/.config/fleet-inventory/DISABLED.
+set -u
+export PATH=/usr/local/bin:/usr/bin:/bin
+BIN=$(cd "$(dirname "$0")" && pwd)
+STATE=$HOME/.local/state/fleet-inventory
+LOG=$STATE/run.log
+HUB=${FLEET_INVENTORY_HUB:-kikin}
+DROP=${FLEET_INVENTORY_DROP:-/tmp/fleet-inventory-drop}
+TO=${FLEET_INVENTORY_TO:-hermes@kikin.helm}
+FROM=${FLEET_INVENTORY_FROM:-honey-badger@honey.helm}
+DRY=""; [ "${1:-}" = "--dry" ] && DRY=yes
+mkdir -p "$STATE"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+if [ -e "$HOME/.config/fleet-inventory/DISABLED" ]; then
+    echo "fleet-inventory: disabled (kill switch)"; exit 3
+fi
+host=$(hostname -s); day=$(date +%F)
+out=$STATE/$host-$day.json
+if ! timeout 120 "$BIN/fleet-inventory" --out "$out" 2>"$STATE/last-stderr.txt"; then
+    log "FAILED collecting ($(head -c 200 "$STATE/last-stderr.txt" | tr '\n' ' '))"
+    echo "fleet-inventory: collection failed"; exit 1
+fi
+ln -sf "$out" "$STATE/latest.json"
+find "$STATE" -name "$host-*.json" -mtime +14 -delete 2>/dev/null
+gz=$STATE/$host-$day.json.gz
+gzip -9nc "$out" >"$gz"
+notice=$(python3 - "$out" "$gz" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+c = d["coverage"]
+print(f"fleet-inventory notice: schema {d['schema']}")
+print(f"host: {d['host']}   collected_at: {d['collected_at']}   digest: {d['digest']}")
+print(f"os: {d['os'].get('pretty_name', '?')}   kernel: {d['os'].get('kernel', '?')}")
+print(f"items: {len(d['items'])}   listening sockets: {len(d['surfaces'])}")
+print("coverage:")
+for k, v in c.items():
+    print(f"  {k}: {v['status']} ({v['count']}) {v['note']}")
+PY
+)
+if [ -n "$DRY" ]; then printf '%s\n' "$notice"; echo "(dry: nothing copied or mailed; local copy $out)"; exit 0; fi
+
+if ! timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HUB" "mkdir -p '$DROP' && chmod 700 '$DROP'" 2>>"$LOG" \
+   || ! timeout 90 scp -q -o BatchMode=yes -o ConnectTimeout=10 "$gz" "$HUB:$DROP/" 2>>"$LOG"; then
+    log "FAILED copying to $HUB:$DROP"; echo "fleet-inventory: copy to hub failed"; exit 1
+fi
+body=$STATE/notice-$day.txt
+{ printf '%s\n' "$notice"; printf 'file: %s/%s-%s.json.gz  (gzip of the JSON; sha256 of the uncompressed JSON content is not the digest, the digest is inside)\n' "$DROP" "$host" "$day"
+  printf 'also kept on %s at %s (14 days)\n' "$host" "$gz"; } >"$body"
+scp -q -o BatchMode=yes -o ConnectTimeout=10 "$body" "$HUB:/tmp/fleet-inventory-notice-$host.txt" 2>>"$LOG" || { log "FAILED notice copy"; exit 1; }
+if timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HUB" "mailcortex send --from '$FROM' --to '$TO' --subject 'fleet-inventory $host $day' --body-file /tmp/fleet-inventory-notice-$host.txt >/dev/null" 2>>"$LOG"; then
+    log "OK digest=$(python3 -c "import json;print(json.load(open('$out'))['digest'][:16])") mailed $TO"
+    echo "fleet-inventory: OK, mailed $TO"
+else
+    log "FAILED mailing notice"; echo "fleet-inventory: mail failed"; exit 1
+fi

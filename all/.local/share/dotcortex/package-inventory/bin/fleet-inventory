@@ -1,0 +1,304 @@
+#!/usr/bin/env python3
+# fleet-inventory: a deterministic, read-only inventory of what is installed on this host and what it exposes.
+#
+#   fleet-inventory [--out FILE] [--summary]
+#
+# Writes one canonical JSON document (schema fleet-inventory.v1) to FILE or stdout. It makes no network calls,
+# runs no installed software except the package managers' own listing commands, reads package metadata files only
+# (never document contents), and never walks the vault directories. The "digest" covers everything except the
+# collection time, so an unchanged host gives the same digest on every run.
+import hashlib, json, os, re, shutil, socket, subprocess, sys, time
+from datetime import datetime, timezone
+
+SCHEMA = "fleet-inventory.v1"
+HOME = os.path.expanduser("~")
+WALK_ROOTS = [HOME, "/opt", "/usr/local"]
+WALK_DEPTH = 7
+# Never descended into: vaults and personal folders (clinical material lives there), caches, models, VCS.
+PRUNE = {"Secret Vault", "Obsidian Vault", "Documents", "HEEA", "Pictures", "Logseq-Gill", "Sync", "Downloads",
+         ".cache", ".git", ".stversions", ".stfolder", "models", ".ollama", ".Trash", "Trash", "proc", "sys", "dev"}
+TIMEOUT = 40
+
+
+def run(cmd, timeout=TIMEOUT):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def short(path):
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + "/") else path
+
+
+def os_info():
+    info = {}
+    try:
+        for line in open("/etc/os-release", encoding="utf-8", errors="replace"):
+            if "=" in line:
+                k, v = line.rstrip("\n").split("=", 1)
+                if k in ("ID", "ID_LIKE", "VERSION_ID", "VERSION_CODENAME", "PRETTY_NAME"):
+                    info[k.lower()] = v.strip('"')
+    except OSError:
+        pass
+    u = os.uname()
+    info.update(kernel=u.release, machine=u.machine)
+    return info
+
+
+# ---- collectors: each returns (items, status, note) -------------------------------------------------------
+def c_dpkg():
+    if not shutil.which("dpkg-query"):
+        return [], "skipped", "no dpkg"
+    rc, out = run(["dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${Architecture}\t${source:Package}\t${source:Version}\n"])
+    if rc != 0:
+        return [], "failed", out[:200]
+    items = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) == 6 and p[0].strip().startswith("ii"):
+            items.append(dict(eco="deb", name=p[1], version=p[2], arch=p[3], source=p[4] or p[1], source_version=p[5] or p[2]))
+    return items, "ok", ""
+
+
+def c_rpm():
+    if not shutil.which("rpm"):
+        return [], "skipped", "no rpm"
+    rc, out = run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\n"])
+    if rc != 0:
+        return [], "failed", out[:200]
+    return [dict(eco="rpm", name=p[0], version=p[1], arch=p[2], source=p[3]) for p in (l.split("\t") for l in out.splitlines()) if len(p) == 4], "ok", ""
+
+
+def walk_dirs():
+    """Yield (dirpath, dirnames, filenames) under WALK_ROOTS, pruned and depth-limited."""
+    seen = set()
+    for top in WALK_ROOTS:
+        if not os.path.isdir(top):
+            continue
+        base = top.rstrip("/").count("/")
+        for d, ds, fs in os.walk(top, followlinks=False):
+            real = os.path.realpath(d)
+            if real in seen:
+                ds[:] = []
+                continue
+            seen.add(real)
+            if d.count("/") - base >= WALK_DEPTH:
+                ds[:] = []
+            ds[:] = [x for x in ds if x not in PRUNE and not os.path.islink(os.path.join(d, x))]
+            yield d, ds, fs
+
+
+def read_head(path, n=60):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [next(f, "") for _ in range(n)]
+
+
+def py_dists(site):
+    out = []
+    try:
+        entries = os.listdir(site)
+    except OSError:
+        return out
+    for e in entries:
+        meta = None
+        if e.endswith(".dist-info"):
+            meta = os.path.join(site, e, "METADATA")
+        elif e.endswith(".egg-info"):
+            meta = os.path.join(site, e, "PKG-INFO") if os.path.isdir(os.path.join(site, e)) else os.path.join(site, e)
+        if not meta or not os.path.isfile(meta):
+            continue
+        name = ver = None
+        try:
+            for line in read_head(meta):
+                if line.startswith("Name:") and not name:
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("Version:") and not ver:
+                    ver = line.split(":", 1)[1].strip()
+        except OSError:
+            continue
+        if name and ver:
+            out.append((re.sub(r"[-_.]+", "-", name).lower(), ver))
+    return out
+
+
+def c_python(walked):
+    sites = set()
+    for pat in ("/usr/lib/python3/dist-packages", "/usr/local/lib/python3"):
+        if os.path.isdir(pat):
+            sites.add(pat)
+    for d, ds, fs in walked:
+        if "pyvenv.cfg" in fs:
+            for lib in ("lib", "lib64", "Lib"):
+                lp = os.path.join(d, lib)
+                if os.path.isdir(lp):
+                    for e in os.listdir(lp):
+                        if e.startswith("python") and os.path.isdir(os.path.join(lp, e, "site-packages")):
+                            sites.add(os.path.join(lp, e, "site-packages"))
+        if os.path.basename(d) in ("site-packages", "dist-packages"):
+            sites.add(d)
+    for base in list(sites):  # /usr/local/lib/python3.X/{site,dist}-packages
+        if base == "/usr/local/lib/python3":
+            sites.discard(base)
+            for e in os.listdir("/usr/local/lib"):
+                for sub in ("site-packages", "dist-packages"):
+                    p = os.path.join("/usr/local/lib", e, sub)
+                    if e.startswith("python") and os.path.isdir(p):
+                        sites.add(p)
+    items = []
+    for s in sorted(sites):
+        for name, ver in py_dists(s):
+            items.append(dict(eco="PyPI", name=name, version=ver, where=short(s)))
+    return items, "ok", f"{len(sites)} site-packages"
+
+
+def c_npm(walked):
+    items, roots = [], set()
+    for d, ds, fs in walked:
+        if os.path.basename(d) == "node_modules" and "node_modules" not in os.path.dirname(d):
+            roots.add(d)
+            ds[:] = []  # collected below, not by the pruned walk
+    for g in ("/usr/lib/node_modules", "/usr/local/lib/node_modules", os.path.join(HOME, ".local/lib/node_modules")):
+        if os.path.isdir(g):
+            roots.add(g)
+    for r in sorted(roots):
+        for d, ds, fs in os.walk(r, followlinks=False):
+            ds[:] = [x for x in ds if x not in (".cache", ".bin", ".git")]
+            if "package.json" in fs:
+                try:
+                    j = json.load(open(os.path.join(d, "package.json"), encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(j, dict) and j.get("name") and j.get("version") and "node_modules" in d:
+                    items.append(dict(eco="npm", name=str(j["name"]), version=str(j["version"]), where=short(r)))
+    return items, "ok", f"{len(roots)} node_modules roots"
+
+
+def c_cargo():
+    f = os.path.join(HOME, ".cargo/.crates2.json")
+    if not os.path.isfile(f):
+        return [], "skipped", "no installed crates file"
+    try:
+        inst = json.load(open(f)).get("installs", {})
+    except (OSError, ValueError):
+        return [], "failed", "unreadable"
+    items = []
+    for k in inst:
+        m = re.match(r"(\S+) (\S+) \(", k)
+        if m:
+            items.append(dict(eco="crates.io", name=m.group(1), version=m.group(2), where="~/.cargo"))
+    return items, "ok", ""
+
+
+def c_docker():
+    if not shutil.which("docker"):
+        return [], "skipped", "no docker"
+    rc, out = run(["docker", "images", "--digests", "--no-trunc", "--format", "{{.Repository}}\t{{.Tag}}\t{{.Digest}}"])
+    if rc != 0:
+        return [], "failed", "cannot list images (permission?)"
+    items = []
+    for l in out.splitlines():
+        p = l.split("\t")
+        if len(p) == 3 and p[0] != "<none>":
+            items.append(dict(eco="container", name=f"{p[0]}:{p[1]}", version=p[2] if p[2] != "<none>" else "no-digest"))
+    return items, "ok", "images listed; packages inside images are NOT scanned"
+
+
+def c_listing(name, cmd, parse):
+    if not shutil.which(cmd[0]):
+        return [], "skipped", f"no {cmd[0]}"
+    rc, out = run(cmd)
+    if rc != 0:
+        return [], "failed", out[:120]
+    return [i for i in (parse(l) for l in out.splitlines()) if i], "ok", ""
+
+
+def c_flatpak():
+    return c_listing("flatpak", ["flatpak", "list", "--columns=application,version"], lambda l: (
+        lambda p: dict(eco="flatpak", name=p[0], version=p[1] if len(p) > 1 and p[1] else "unknown") if p and p[0] else None)(l.split("\t")))
+
+
+def c_snap():
+    return c_listing("snap", ["snap", "list"], lambda l: (
+        lambda p: dict(eco="snap", name=p[0], version=p[1]) if len(p) > 2 and p[0] != "Name" else None)(l.split()))
+
+
+def c_guix():
+    return c_listing("guix", ["guix", "package", "-I"], lambda l: (
+        lambda p: dict(eco="guix", name=p[0], version=p[1]) if len(p) > 1 else None)(l.split("\t")))
+
+
+def surfaces():
+    """Listening sockets by scope; no addresses are recorded, only the class of bind."""
+    out = []
+    if not shutil.which("ss"):
+        return out, "skipped", "no ss"
+    rc, txt = run(["ss", "-H", "-ltnup"])
+    if rc != 0:
+        return out, "failed", txt[:120]
+    for l in txt.splitlines():
+        p = l.split()
+        if len(p) < 5:
+            continue
+        proto, local = p[0], p[4]
+        addr, _, port = local.rpartition(":")
+        addr = addr.strip("[]")
+        if addr in ("127.0.0.1", "::1") or addr.startswith("127."):
+            scope = "loopback"
+        elif addr in ("0.0.0.0", "::", "*", ""):
+            scope = "any"
+        elif addr.startswith("100."):
+            scope = "tailnet"
+        else:
+            scope = "specific-address"
+        m = re.search(r'users:\(\("([^"]+)"', l)
+        out.append(dict(proto=proto, port=int(port) if port.isdigit() else 0, scope=scope, process=m.group(1) if m else "not visible to this user"))
+    return out, "ok", "process names only for sockets this user can see"
+
+
+def collect():
+    cov, items = {}, []
+    walked = list(walk_dirs())
+    for name, fn in (("dpkg", c_dpkg), ("rpm", c_rpm), ("python", lambda: c_python(walked)), ("npm", lambda: c_npm(walked)),
+                     ("cargo", c_cargo), ("docker", c_docker), ("flatpak", c_flatpak), ("snap", c_snap), ("guix", c_guix)):
+        try:
+            got, status, note = fn()
+        except Exception as e:  # a collector must never stop the others
+            got, status, note = [], "failed", f"{type(e).__name__}: {e}"[:160]
+        cov[name] = dict(status=status, count=len(got), note=note)
+        items += got
+    osi = os_info()
+    items.append(dict(eco="kernel", name="linux", version=osi.get("kernel", "unknown")))
+    cov["kernel"] = dict(status="ok", count=1, note="vendor/custom kernels are not matchable by version alone")
+    surf, sstat, snote = surfaces()
+    cov["listening"] = dict(status=sstat, count=len(surf), note=snote)
+    uniq = {json.dumps(i, sort_keys=True): i for i in items}
+    items = [uniq[k] for k in sorted(uniq)]
+    surf.sort(key=lambda s: (s["proto"], s["port"], s["scope"], s["process"]))
+    body = dict(os=osi, items=items, surfaces=surf)
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return dict(schema=SCHEMA, host=socket.gethostname().split(".")[0], collected_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                digest=digest, coverage=cov, **body)
+
+
+def main(argv):
+    doc = collect()
+    text = json.dumps(doc, sort_keys=True, indent=1) + "\n"
+    if "--out" in argv:
+        out = argv[argv.index("--out") + 1]
+        tmp = out + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, out)
+    else:
+        sys.stdout.write(text)
+    if "--summary" in argv:
+        sys.stderr.write(f"host={doc['host']} items={len(doc['items'])} surfaces={len(doc['surfaces'])} digest={doc['digest'][:16]}\n")
+        for k, v in doc["coverage"].items():
+            sys.stderr.write(f"  {k:9} {v['status']:8} {v['count']:5}  {v['note']}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
