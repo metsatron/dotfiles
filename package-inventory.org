@@ -1,0 +1,495 @@
+#+TITLE: Fleet package inventory: a daily, deterministic, read-only host inventory for the vulnerability lane
+#+DESCRIPTION: Each host emits one canonical JSON per day (fleet-inventory.v1): OS and kernel, every installed package with its ecosystem and version (for deb, the source package that advisories key on), and its listening sockets. Hermes aggregates and matches; Athanor researches only the delta.
+#+AUTHOR: Honey Badger (Claude Sonnet 5.5), for Mètsàtron's DotCortex
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent
+#+PROPERTY: header-args:bash :comments no
+#+PROPERTY: header-args:python :comments no
+
+* Why and who owns what
+
+Mètsàtron asked (2026-11-02) for a daily report of every package and dependency on every machine, served to Athanor for package-by-package, version-by-version vulnerability research. Ruling the same night: *Hermes owns the hub side and drives Athanor herself.* This module is the host side only: it produces the inventory. It deliberately does no vulnerability lookup and makes no network call, so the same input always gives the same output and a host can run it anywhere, including offline.
+
+The hub side (Hermes, not this module) aggregates the per-host files, matches them deterministically (OSV.dev batch queries, CISA KEV, EPSS, with the fixed-in version as the "known good" answer), diffs against the previous day, and feeds Athanor only the delta as research targets (=ROOTS/ResearchTargets/target-index.json=, built by =FORGE/bin/research-target-indexer=). Athanor is the free-model lane in =FORGE/athanor=; it cannot research every package of every host daily, and free models invent CVE ids, so every claim it stages must carry an advisory id from the matcher.
+
+* Contract: fleet-inventory.v1
+
+One JSON object, keys sorted, UTF-8:
+
+| Key | Meaning |
+|---|---|
+| =schema= | =fleet-inventory.v1= |
+| =host= | short hostname |
+| =collected_at= | UTC time of collection. The only field that varies for an unchanged host. |
+| =digest= | sha256 over =os=, =items= and =surfaces= (everything except time and coverage). Equal digest means an unchanged host. |
+| =os= | =id=, =id_like=, =version_id=, =version_codename=, =pretty_name=, =kernel=, =machine= from =/etc/os-release= and =uname= |
+| =items= | sorted rows: =eco=, =name=, =version=, plus =arch=, =source=, =source_version= (deb), =where= (language packages: the site-packages or node_modules root, with =$HOME= shown as =~=) |
+| =surfaces= | listening sockets: =proto=, =port=, =scope= (=loopback=, =any=, =tailnet=, =specific-address=), =process= (name only, and only for sockets the collecting user can see) |
+| =coverage= | per collector: =status= (=ok=, =skipped=, =failed=), =count=, =note=. A =skipped= or =failed= collector means that attack surface is NOT covered on that host. |
+
+Ecosystem names follow OSV where one exists: =PyPI=, =npm=, =crates.io=. =deb= rows carry the source package and source version because Debian and Devuan advisories key on those; the matcher maps =os.id=, =os.id_like= and =os.version_id= to an OSV ecosystem (Devuan 6 is Debian 13 based). =container= rows are image names with their digest; the packages inside images are *not* scanned. =kernel= is a single row from =uname -r=; a vendor or custom kernel cannot be matched by version alone.
+
+** Not covered, by design, and reported rather than implied
+
+Custom kernels, Termux packages, AppImages, libraries vendored inside other projects, packages inside container images, the Windows PCs, firmware and BIOS, the router. A collector that finds its tool missing says =skipped=; it never pretends.
+
+* Boundaries
+
+- Read-only. It reads package metadata (dpkg database, =*.dist-info/METADATA=, =package.json=) and runs only the package managers' list commands and =ss=. It reads no document contents.
+- It never walks =Secret Vault=, =Obsidian Vault=, =Documents=, =HEEA=, =Pictures=, =Logseq-Gill=, =Sync= or =Downloads= (the =PRUNE= list), nor caches, models or VCS directories.
+- The output holds package names, versions, library paths under the home directory, and listening ports. No file contents, no process arguments, no addresses (only the class of bind), no secrets. It goes to the fleet hub only.
+- DotCortex is public: this module holds no hostnames, IPs or ports. Output lives in HelmCortex, which is private.
+
+* The collector
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/package-inventory/bin/fleet-inventory :tangle-mode (identity #o755)
+#!/usr/bin/env python3
+# fleet-inventory: a deterministic, read-only inventory of what is installed on this host and what it exposes.
+#
+#   fleet-inventory [--out FILE] [--summary]
+#
+# Writes one canonical JSON document (schema fleet-inventory.v1) to FILE or stdout. It makes no network calls,
+# runs no installed software except the package managers' own listing commands, reads package metadata files only
+# (never document contents), and never walks the vault directories. The "digest" covers everything except the
+# collection time, so an unchanged host gives the same digest on every run.
+import hashlib, json, os, re, shutil, socket, subprocess, sys, time
+from datetime import datetime, timezone
+
+SCHEMA = "fleet-inventory.v1"
+HOME = os.path.expanduser("~")
+WALK_ROOTS = [HOME, "/opt", "/usr/local"]
+WALK_DEPTH = 7
+# Never descended into: vaults and personal folders (clinical material lives there), caches, models, VCS.
+PRUNE = {"Secret Vault", "Obsidian Vault", "Documents", "HEEA", "Pictures", "Logseq-Gill", "Sync", "Downloads",
+         ".cache", ".git", ".stversions", ".stfolder", "models", ".ollama", ".Trash", "Trash", "proc", "sys", "dev"}
+TIMEOUT = 40
+
+
+def run(cmd, timeout=TIMEOUT):
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, str(e)
+
+
+def short(path):
+    return "~" + path[len(HOME):] if path == HOME or path.startswith(HOME + "/") else path
+
+
+def os_info():
+    info = {}
+    try:
+        for line in open("/etc/os-release", encoding="utf-8", errors="replace"):
+            if "=" in line:
+                k, v = line.rstrip("\n").split("=", 1)
+                if k in ("ID", "ID_LIKE", "VERSION_ID", "VERSION_CODENAME", "PRETTY_NAME"):
+                    info[k.lower()] = v.strip('"')
+    except OSError:
+        pass
+    u = os.uname()
+    info.update(kernel=u.release, machine=u.machine)
+    return info
+
+
+# ---- collectors: each returns (items, status, note) -------------------------------------------------------
+def c_dpkg():
+    if not shutil.which("dpkg-query"):
+        return [], "skipped", "no dpkg"
+    rc, out = run(["dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${Architecture}\t${source:Package}\t${source:Version}\n"])
+    if rc != 0:
+        return [], "failed", out[:200]
+    items = []
+    for line in out.splitlines():
+        p = line.split("\t")
+        if len(p) == 6 and p[0].strip().startswith("ii"):
+            items.append(dict(eco="deb", name=p[1], version=p[2], arch=p[3], source=p[4] or p[1], source_version=p[5] or p[2]))
+    return items, "ok", ""
+
+
+def c_rpm():
+    if not shutil.which("rpm"):
+        return [], "skipped", "no rpm"
+    rc, out = run(["rpm", "-qa", "--qf", "%{NAME}\t%{VERSION}-%{RELEASE}\t%{ARCH}\t%{SOURCERPM}\n"])
+    if rc != 0:
+        return [], "failed", out[:200]
+    return [dict(eco="rpm", name=p[0], version=p[1], arch=p[2], source=p[3]) for p in (l.split("\t") for l in out.splitlines()) if len(p) == 4], "ok", ""
+
+
+def walk_dirs():
+    """Yield (dirpath, dirnames, filenames) under WALK_ROOTS, pruned and depth-limited."""
+    seen = set()
+    for top in WALK_ROOTS:
+        if not os.path.isdir(top):
+            continue
+        base = top.rstrip("/").count("/")
+        for d, ds, fs in os.walk(top, followlinks=False):
+            real = os.path.realpath(d)
+            if real in seen:
+                ds[:] = []
+                continue
+            seen.add(real)
+            if d.count("/") - base >= WALK_DEPTH:
+                ds[:] = []
+            ds[:] = [x for x in ds if x not in PRUNE and not os.path.islink(os.path.join(d, x))]
+            yield d, ds, fs
+
+
+def read_head(path, n=60):
+    with open(path, encoding="utf-8", errors="replace") as f:
+        return [next(f, "") for _ in range(n)]
+
+
+def py_dists(site):
+    out = []
+    try:
+        entries = os.listdir(site)
+    except OSError:
+        return out
+    for e in entries:
+        meta = None
+        if e.endswith(".dist-info"):
+            meta = os.path.join(site, e, "METADATA")
+        elif e.endswith(".egg-info"):
+            meta = os.path.join(site, e, "PKG-INFO") if os.path.isdir(os.path.join(site, e)) else os.path.join(site, e)
+        if not meta or not os.path.isfile(meta):
+            continue
+        name = ver = None
+        try:
+            for line in read_head(meta):
+                if line.startswith("Name:") and not name:
+                    name = line.split(":", 1)[1].strip()
+                elif line.startswith("Version:") and not ver:
+                    ver = line.split(":", 1)[1].strip()
+        except OSError:
+            continue
+        if name and ver:
+            out.append((re.sub(r"[-_.]+", "-", name).lower(), ver))
+    return out
+
+
+def c_python(walked):
+    sites = set()
+    for pat in ("/usr/lib/python3/dist-packages", "/usr/local/lib/python3"):
+        if os.path.isdir(pat):
+            sites.add(pat)
+    for d, ds, fs in walked:
+        if "pyvenv.cfg" in fs:
+            for lib in ("lib", "lib64", "Lib"):
+                lp = os.path.join(d, lib)
+                if os.path.isdir(lp):
+                    for e in os.listdir(lp):
+                        if e.startswith("python") and os.path.isdir(os.path.join(lp, e, "site-packages")):
+                            sites.add(os.path.join(lp, e, "site-packages"))
+        if os.path.basename(d) in ("site-packages", "dist-packages"):
+            sites.add(d)
+    for base in list(sites):  # /usr/local/lib/python3.X/{site,dist}-packages
+        if base == "/usr/local/lib/python3":
+            sites.discard(base)
+            for e in os.listdir("/usr/local/lib"):
+                for sub in ("site-packages", "dist-packages"):
+                    p = os.path.join("/usr/local/lib", e, sub)
+                    if e.startswith("python") and os.path.isdir(p):
+                        sites.add(p)
+    items = []
+    for s in sorted(sites):
+        for name, ver in py_dists(s):
+            items.append(dict(eco="PyPI", name=name, version=ver, where=short(s)))
+    return items, "ok", f"{len(sites)} site-packages"
+
+
+def c_npm(walked):
+    items, roots = [], set()
+    for d, ds, fs in walked:
+        if os.path.basename(d) == "node_modules" and "node_modules" not in os.path.dirname(d):
+            roots.add(d)
+            ds[:] = []  # collected below, not by the pruned walk
+    for g in ("/usr/lib/node_modules", "/usr/local/lib/node_modules", os.path.join(HOME, ".local/lib/node_modules")):
+        if os.path.isdir(g):
+            roots.add(g)
+    for r in sorted(roots):
+        for d, ds, fs in os.walk(r, followlinks=False):
+            ds[:] = [x for x in ds if x not in (".cache", ".bin", ".git")]
+            if "package.json" in fs:
+                try:
+                    j = json.load(open(os.path.join(d, "package.json"), encoding="utf-8", errors="replace"))
+                except (OSError, ValueError):
+                    continue
+                if isinstance(j, dict) and j.get("name") and j.get("version") and "node_modules" in d:
+                    items.append(dict(eco="npm", name=str(j["name"]), version=str(j["version"]), where=short(r)))
+    return items, "ok", f"{len(roots)} node_modules roots"
+
+
+def c_cargo():
+    f = os.path.join(HOME, ".cargo/.crates2.json")
+    if not os.path.isfile(f):
+        return [], "skipped", "no installed crates file"
+    try:
+        inst = json.load(open(f)).get("installs", {})
+    except (OSError, ValueError):
+        return [], "failed", "unreadable"
+    items = []
+    for k in inst:
+        m = re.match(r"(\S+) (\S+) \(", k)
+        if m:
+            items.append(dict(eco="crates.io", name=m.group(1), version=m.group(2), where="~/.cargo"))
+    return items, "ok", ""
+
+
+def c_docker():
+    if not shutil.which("docker"):
+        return [], "skipped", "no docker"
+    rc, out = run(["docker", "images", "--digests", "--no-trunc", "--format", "{{.Repository}}\t{{.Tag}}\t{{.Digest}}"])
+    if rc != 0:
+        return [], "failed", "cannot list images (permission?)"
+    items = []
+    for l in out.splitlines():
+        p = l.split("\t")
+        if len(p) == 3 and p[0] != "<none>":
+            items.append(dict(eco="container", name=f"{p[0]}:{p[1]}", version=p[2] if p[2] != "<none>" else "no-digest"))
+    return items, "ok", "images listed; packages inside images are NOT scanned"
+
+
+def c_listing(name, cmd, parse):
+    if not shutil.which(cmd[0]):
+        return [], "skipped", f"no {cmd[0]}"
+    rc, out = run(cmd)
+    if rc != 0:
+        return [], "failed", out[:120]
+    return [i for i in (parse(l) for l in out.splitlines()) if i], "ok", ""
+
+
+def c_flatpak():
+    return c_listing("flatpak", ["flatpak", "list", "--columns=application,version"], lambda l: (
+        lambda p: dict(eco="flatpak", name=p[0], version=p[1] if len(p) > 1 and p[1] else "unknown") if p and p[0] else None)(l.split("\t")))
+
+
+def c_snap():
+    return c_listing("snap", ["snap", "list"], lambda l: (
+        lambda p: dict(eco="snap", name=p[0], version=p[1]) if len(p) > 2 and p[0] != "Name" else None)(l.split()))
+
+
+def c_guix():
+    return c_listing("guix", ["guix", "package", "-I"], lambda l: (
+        lambda p: dict(eco="guix", name=p[0], version=p[1]) if len(p) > 1 else None)(l.split("\t")))
+
+
+def surfaces():
+    """Listening sockets by scope; no addresses are recorded, only the class of bind."""
+    out = []
+    if not shutil.which("ss"):
+        return out, "skipped", "no ss"
+    rc, txt = run(["ss", "-H", "-ltnup"])
+    if rc != 0:
+        return out, "failed", txt[:120]
+    for l in txt.splitlines():
+        p = l.split()
+        if len(p) < 5:
+            continue
+        proto, local = p[0], p[4]
+        addr, _, port = local.rpartition(":")
+        addr = addr.strip("[]")
+        if addr in ("127.0.0.1", "::1") or addr.startswith("127."):
+            scope = "loopback"
+        elif addr in ("0.0.0.0", "::", "*", ""):
+            scope = "any"
+        elif addr.startswith("100."):
+            scope = "tailnet"
+        else:
+            scope = "specific-address"
+        m = re.search(r'users:\(\("([^"]+)"', l)
+        out.append(dict(proto=proto, port=int(port) if port.isdigit() else 0, scope=scope, process=m.group(1) if m else "not visible to this user"))
+    return out, "ok", "process names only for sockets this user can see"
+
+
+def collect():
+    cov, items = {}, []
+    walked = list(walk_dirs())
+    for name, fn in (("dpkg", c_dpkg), ("rpm", c_rpm), ("python", lambda: c_python(walked)), ("npm", lambda: c_npm(walked)),
+                     ("cargo", c_cargo), ("docker", c_docker), ("flatpak", c_flatpak), ("snap", c_snap), ("guix", c_guix)):
+        try:
+            got, status, note = fn()
+        except Exception as e:  # a collector must never stop the others
+            got, status, note = [], "failed", f"{type(e).__name__}: {e}"[:160]
+        cov[name] = dict(status=status, count=len(got), note=note)
+        items += got
+    osi = os_info()
+    items.append(dict(eco="kernel", name="linux", version=osi.get("kernel", "unknown")))
+    cov["kernel"] = dict(status="ok", count=1, note="vendor/custom kernels are not matchable by version alone")
+    surf, sstat, snote = surfaces()
+    cov["listening"] = dict(status=sstat, count=len(surf), note=snote)
+    uniq = {json.dumps(i, sort_keys=True): i for i in items}
+    items = [uniq[k] for k in sorted(uniq)]
+    surf.sort(key=lambda s: (s["proto"], s["port"], s["scope"], s["process"]))
+    body = dict(os=osi, items=items, surfaces=surf)
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return dict(schema=SCHEMA, host=socket.gethostname().split(".")[0], collected_at=datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                digest=digest, coverage=cov, **body)
+
+
+def main(argv):
+    doc = collect()
+    text = json.dumps(doc, sort_keys=True, indent=1) + "\n"
+    if "--out" in argv:
+        out = argv[argv.index("--out") + 1]
+        tmp = out + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.replace(tmp, out)
+    else:
+        sys.stdout.write(text)
+    if "--summary" in argv:
+        sys.stderr.write(f"host={doc['host']} items={len(doc['items'])} surfaces={len(doc['surfaces'])} digest={doc['digest'][:16]}\n")
+        for k, v in doc["coverage"].items():
+            sys.stderr.write(f"  {k:9} {v['status']:8} {v['count']:5}  {v['note']}\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
+#+END_SRC
+
+* The daily run
+
+Collects, keeps 14 days under =~/.local/state/fleet-inventory/=, copies the gzipped JSON to a drop directory on the hub (=FLEET_INVENTORY_DROP=, default =/tmp/fleet-inventory-drop=, which is temporary: the hub should ingest it the same morning, and the host keeps its own copy) and mails the hub agent a short notice (=FLEET_INVENTORY_TO=, default Hermes). The JSON is not mailed: about 1 MB would land in an agent's context. =--dry= prints the notice and copies nothing. Kill switch: =~/.config/fleet-inventory/DISABLED=.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/package-inventory/bin/fleet-inventory-run :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# fleet-inventory-run: collect this host's inventory, keep 14 days locally, and tell the hub.
+#   fleet-inventory-run [--dry]     --dry collects and prints the notice but copies and mails nothing
+# The mail is a short notice (host, date, digest, counts, coverage). The JSON itself is copied to a drop directory
+# on the hub, because a ~1 MB mail would land in an agent's context. Kill switch: ~/.config/fleet-inventory/DISABLED.
+set -u
+export PATH=/usr/local/bin:/usr/bin:/bin
+BIN=$(cd "$(dirname "$0")" && pwd)
+STATE=$HOME/.local/state/fleet-inventory
+LOG=$STATE/run.log
+HUB=${FLEET_INVENTORY_HUB:-kikin}
+DROP=${FLEET_INVENTORY_DROP:-/tmp/fleet-inventory-drop}
+TO=${FLEET_INVENTORY_TO:-hermes@kikin.helm}
+FROM=${FLEET_INVENTORY_FROM:-honey-badger@honey.helm}
+DRY=""; [ "${1:-}" = "--dry" ] && DRY=yes
+mkdir -p "$STATE"
+log() { printf '%s %s\n' "$(date '+%F %T')" "$*" >>"$LOG"; }
+
+if [ -e "$HOME/.config/fleet-inventory/DISABLED" ]; then
+    echo "fleet-inventory: disabled (kill switch)"; exit 3
+fi
+host=$(hostname -s); day=$(date +%F)
+out=$STATE/$host-$day.json
+if ! timeout 120 "$BIN/fleet-inventory" --out "$out" 2>"$STATE/last-stderr.txt"; then
+    log "FAILED collecting ($(head -c 200 "$STATE/last-stderr.txt" | tr '\n' ' '))"
+    echo "fleet-inventory: collection failed"; exit 1
+fi
+ln -sf "$out" "$STATE/latest.json"
+find "$STATE" -name "$host-*.json" -mtime +14 -delete 2>/dev/null
+gz=$STATE/$host-$day.json.gz
+gzip -9nc "$out" >"$gz"
+notice=$(python3 - "$out" "$gz" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1]))
+c = d["coverage"]
+print(f"fleet-inventory notice: schema {d['schema']}")
+print(f"host: {d['host']}   collected_at: {d['collected_at']}   digest: {d['digest']}")
+print(f"os: {d['os'].get('pretty_name', '?')}   kernel: {d['os'].get('kernel', '?')}")
+print(f"items: {len(d['items'])}   listening sockets: {len(d['surfaces'])}")
+print("coverage:")
+for k, v in c.items():
+    print(f"  {k}: {v['status']} ({v['count']}) {v['note']}")
+PY
+)
+if [ -n "$DRY" ]; then printf '%s\n' "$notice"; echo "(dry: nothing copied or mailed; local copy $out)"; exit 0; fi
+
+if ! timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HUB" "mkdir -p '$DROP' && chmod 700 '$DROP'" 2>>"$LOG" \
+   || ! timeout 90 scp -q -o BatchMode=yes -o ConnectTimeout=10 "$gz" "$HUB:$DROP/" 2>>"$LOG"; then
+    log "FAILED copying to $HUB:$DROP"; echo "fleet-inventory: copy to hub failed"; exit 1
+fi
+body=$STATE/notice-$day.txt
+{ printf '%s\n' "$notice"; printf 'file: %s/%s-%s.json.gz  (gzip of the JSON; sha256 of the uncompressed JSON content is not the digest, the digest is inside)\n' "$DROP" "$host" "$day"
+  printf 'also kept on %s at %s (14 days)\n' "$host" "$gz"; } >"$body"
+scp -q -o BatchMode=yes -o ConnectTimeout=10 "$body" "$HUB:/tmp/fleet-inventory-notice-$host.txt" 2>>"$LOG" || { log "FAILED notice copy"; exit 1; }
+if timeout 60 ssh -o BatchMode=yes -o ConnectTimeout=10 "$HUB" "mailcortex send --from '$FROM' --to '$TO' --subject 'fleet-inventory $host $day' --body-file /tmp/fleet-inventory-notice-$host.txt >/dev/null" 2>>"$LOG"; then
+    log "OK digest=$(python3 -c "import json;print(json.load(open('$out'))['digest'][:16])") mailed $TO"
+    echo "fleet-inventory: OK, mailed $TO"
+else
+    log "FAILED mailing notice"; echo "fleet-inventory: mail failed"; exit 1
+fi
+#+END_SRC
+
+* Installer
+
+Run as the owning user. Installs both scripts into =~/bin= (backing up a differing file first) and ensures the 05:30 crontab line, then does a dry run of the wrapper. =--dry-run= changes nothing. On other hosts the paths, the hub alias and the mail address come from =FLEET_INVENTORY_HUB=, =FLEET_INVENTORY_DROP=, =FLEET_INVENTORY_TO= and =FLEET_INVENTORY_FROM=; rolling it out across the fleet (stow, host layers) is the fleet owner's decision.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/package-inventory/bin/fleet-inventory-install :tangle-mode (identity #o755)
+#!/usr/bin/env bash
+# fleet-inventory-install (generated by package-inventory.org): install the daily fleet inventory on this host.
+set -euo pipefail
+
+usage() {
+    cat <<'USAGE'
+Usage: fleet-inventory-install [--dry-run]
+Install fleet-inventory and fleet-inventory-run into ~/bin and ensure the 05:30 crontab line.
+--dry-run prints what would change and touches nothing.
+USAGE
+}
+
+DRY=""
+case "${1:-}" in
+    -h|--help) usage; exit 0 ;;
+    --dry-run) DRY=yes ;;
+    "") ;;
+    *) usage >&2; exit 64 ;;
+esac
+
+[ "$(id -u)" -ne 0 ] || { echo "fleet-inventory-install: run as the owner, not root" >&2; exit 1; }
+LANE=$(cd "$(dirname "$0")/.." && pwd)
+STAMP=$(date +%Y%m%d-%H%M%S)
+BIN=$HOME/bin
+CRON_COMMENT='# Fleet inventory (package-inventory.org, Metsatron 2026-11-02): daily read-only package and listening-port inventory, notice mailed to Hermes. Pause: touch ~/.config/fleet-inventory/DISABLED'
+CRON_LINE='30 5 * * * mkdir -p $HOME/.local/state/fleet-inventory && flock -n /tmp/fleet-inventory.lock timeout 300 $HOME/bin/fleet-inventory-run >> $HOME/.local/state/fleet-inventory/cron.log 2>&1'
+
+say() { printf '%s\n' "$*"; }
+run() { if [ -n "$DRY" ]; then say "would: $*"; else "$@"; fi; }
+
+for s in fleet-inventory fleet-inventory-run; do
+    dest=$BIN/$s
+    if [ -e "$dest" ] && cmp -s "$LANE/bin/$s" "$dest"; then
+        say "unchanged: $dest"
+        continue
+    fi
+    [ -e "$dest" ] && run cp -p "$dest" "$dest.bak-fleet-inventory-$STAMP"
+    run install -D -m 0755 "$LANE/bin/$s" "$dest"
+    say "installed: $dest"
+done
+
+if crontab -l 2>/dev/null | grep -qF "$CRON_LINE"; then
+    say "unchanged: crontab line"
+else
+    if crontab -l 2>/dev/null | grep -q 'fleet-inventory-run'; then
+        echo "fleet-inventory-install: a different fleet-inventory-run crontab line exists; fix by hand" >&2
+        exit 1
+    fi
+    if [ -n "$DRY" ]; then
+        say "would: append the 05:30 crontab line"
+    else
+        mkdir -p "$HOME/.local/state"
+        crontab -l > "$HOME/.local/state/crontab.pre-fleet-inventory-$STAMP" 2>/dev/null || true
+        { crontab -l 2>/dev/null || true; printf '%s\n%s\n' "$CRON_COMMENT" "$CRON_LINE"; } | crontab -
+        say "installed: crontab line"
+    fi
+fi
+
+if [ -n "$DRY" ]; then
+    say "dry run: nothing changed"
+    exit 0
+fi
+"$BIN/fleet-inventory-run" --dry | sed -n '1,4p'
+say "installed; the next scheduled run is 05:30"
+#+END_SRC
+
+* Verification
+
+- =fleet-inventory --out FILE --summary= twice on an unchanged host gives the same =digest= (checked on Honey 2026-11-02: 7,038 items, 67 listening sockets, identical digest, about 7 s).
+- =fleet-inventory-install --dry-run= prints "unchanged" once installed.
+- =fleet-inventory-run --dry= prints the notice without copying or mailing.
+- To pause: =touch ~/.config/fleet-inventory/DISABLED=. To remove: delete the =fleet-inventory-run= line from =crontab -l=.
