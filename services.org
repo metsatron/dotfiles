@@ -1146,6 +1146,326 @@ journalctl --user -fu early-refresh.service
 systemctl --user disable --now early-refresh.timer
 #+END_EXAMPLE
 
+* Devuan swap-guardian — kikin-kushi (cron-driven / non-systemd)
+
+Non-systemd swap supervisor for Devuan agent hosts (e.g. kikin-kushi).
+Unlike the XFCE panel-focused x230 systemd timer, this guardian is designed
+for server workloads:
+1. Alert-first: detects high swap (>85%) or sustained thrash (si/so sustained >100/s)
+   and notifies the operator via the TimeArk herald lane.
+2. RAM-safety law: never swapoffs more than RAM can absorb (MemAvailable >= SwapUsed).
+3. Explicit service restarts: restarts are operator-directed via =--restart=.
+4. Devuan-native cron shape via =swap-guardian-cron-apply=.
+
+** swap-guardian
+#+NAME: swap-guardian
+#+BEGIN_SRC bash :tangle linux/.local/bin/swap-guardian :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="swap-guardian"
+SWAP_LIMIT="${SWAP_LIMIT:-85}"
+MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-2.0}"
+SI_SO_THRESHOLD="${SI_SO_THRESHOLD:-100}"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/swap-guardian"
+STATE_FILE="$STATE_DIR/state.json"
+DRY_RUN=0
+TEST_FIRE=0
+DO_HEAL=0
+RESTART_SERVICES=()
+
+usage() {
+  cat <<'EOF'
+Usage: swap-guardian [options]
+
+Devuan-native swap and thrash supervisor. Cron cadence: */5min.
+Alert-only by default. Enforces RAM-safety law before any swapoff.
+
+Options:
+  --swap-limit PCT       Swap usage percent threshold (default: 85)
+  --mem-floor-gib GIB    MemAvailable floor in GiB (default: 2.0)
+  --si-so-rate RATE      Thrash rate threshold in pages/sec (default: 100)
+  --heal                 Purge swap (swap-heal) if above threshold AND RAM-safe
+  --restart SERVICE      Named service to restart if thrashing/critical (may repeat)
+  --test-fire            Simulate high swap and thrash to verify alert path
+  --dry-run              Print observations and decisions without taking action
+  -h, --help             Show this help
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --swap-limit)
+      [ "$#" -ge 2 ] || { echo "$TAG: --swap-limit requires a percentage" >&2; exit 2; }
+      SWAP_LIMIT="$2"; shift ;;
+    --mem-floor-gib)
+      [ "$#" -ge 2 ] || { echo "$TAG: --mem-floor-gib requires a GiB value" >&2; exit 2; }
+      MEM_FLOOR_GIB="$2"; shift ;;
+    --si-so-rate)
+      [ "$#" -ge 2 ] || { echo "$TAG: --si-so-rate requires a number" >&2; exit 2; }
+      SI_SO_THRESHOLD="$2"; shift ;;
+    --heal)
+      DO_HEAL=1 ;;
+    --restart)
+      [ "$#" -ge 2 ] || { echo "$TAG: --restart requires a service name" >&2; exit 2; }
+      RESTART_SERVICES+=("$2"); shift ;;
+    --test-fire)
+      TEST_FIRE=1 ;;
+    --dry-run)
+      DRY_RUN=1 ;;
+    -h|--help|help)
+      usage; exit 0 ;;
+    *)
+      echo "$TAG: unknown argument: $1" >&2
+      usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+mkdir -p "$STATE_DIR"
+exec 8>"$STATE_DIR/guardian.lock"
+flock -n 8 || { echo "[$TAG] already running; exiting"; exit 0; }
+
+if [ "$TEST_FIRE" -eq 1 ]; then
+  # Simulated thrash state: 96.25% swap, 4 GiB avail RAM, si/so=150 pages/s
+  mem_total_kb=33554432
+  mem_available_kb=4194304
+  swap_total_kb=8388608
+  swap_used_kb=8053063
+  swap_pct=96
+  mem_avail_gib="4.0"
+  si_so_rate=150
+  thrash_sustained=1
+  thrash_samples=2
+  now_ts=$(date +%s)
+  pswpin=999999
+  pswpout=999999
+else
+  mem_total_kb=$(awk '/^MemTotal:/ {print $2}' /proc/meminfo)
+  mem_available_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+  swap_total_kb=$(awk '/^SwapTotal:/ {print $2}' /proc/meminfo)
+  swap_free_kb=$(awk '/^SwapFree:/  {print $2}' /proc/meminfo)
+  swap_used_kb=$(( swap_total_kb - swap_free_kb ))
+
+  if (( swap_total_kb > 0 )); then
+    swap_pct=$(( (swap_used_kb * 100 + swap_total_kb / 2) / swap_total_kb ))
+  else
+    swap_pct=0
+  fi
+
+  mem_avail_gib=$(awk -v k="$mem_available_kb" 'BEGIN { printf "%.1f", k / 1048576 }')
+
+  pswpin=$(awk '/^pswpin / {print $2}' /proc/vmstat 2>/dev/null || echo 0)
+  pswpout=$(awk '/^pswpout / {print $2}' /proc/vmstat 2>/dev/null || echo 0)
+  now_ts=$(date +%s)
+
+  prior_pswpin=0
+  prior_pswpout=0
+  prior_ts=0
+  prior_thrash_samples=0
+
+  if [ -f "$STATE_FILE" ]; then
+    eval "$(python3 -c '
+import json, sys
+try:
+    d = json.load(open("'"$STATE_FILE"'"))
+    print("prior_pswpin=%s" % d.get("pswpin", 0))
+    print("prior_pswpout=%s" % d.get("pswpout", 0))
+    print("prior_ts=%s" % d.get("ts", 0))
+    print("prior_thrash_samples=%s" % d.get("thrash_samples", 0))
+except Exception:
+    pass
+' 2>/dev/null || true)"
+  fi
+
+  si_so_rate=0
+  if [ "$prior_ts" -gt 0 ] && [ "$now_ts" -gt "$prior_ts" ]; then
+    elapsed=$(( now_ts - prior_ts ))
+    delta_in=$(( pswpin >= prior_pswpin ? pswpin - prior_pswpin : 0 ))
+    delta_out=$(( pswpout >= prior_pswpout ? pswpout - prior_pswpout : 0 ))
+    si_so_rate=$(( (delta_in + delta_out) / elapsed ))
+  fi
+
+  thrash_samples=0
+  if [ "$si_so_rate" -ge "$SI_SO_THRESHOLD" ]; then
+    thrash_samples=$(( prior_thrash_samples + 1 ))
+  fi
+  thrash_sustained=0
+  if [ "$thrash_samples" -ge 2 ]; then
+    thrash_sustained=1
+  fi
+fi
+
+# Persist state
+if [ "$DRY_RUN" -eq 0 ]; then
+  cat > "$STATE_FILE.tmp" <<EOF
+{"ts": $now_ts, "pswpin": $pswpin, "pswpout": $pswpout, "thrash_samples": $thrash_samples, "swap_pct": $swap_pct, "mem_avail_gib": $mem_avail_gib}
+EOF
+  mv -f "$STATE_FILE.tmp" "$STATE_FILE"
+fi
+
+is_critical=0
+is_warning=0
+reason=""
+
+mem_low=$(awk -v a="$mem_avail_gib" -v f="$MEM_FLOOR_GIB" 'BEGIN { print (a < f) ? 1 : 0 }')
+
+if [ "$swap_pct" -ge 95 ] || [ "$thrash_sustained" -eq 1 ] || [ "$mem_low" -eq 1 ]; then
+  is_critical=1
+  reason="CRITICAL: swap=${swap_pct}% (limit 95%), MemAvailable=${mem_avail_gib}GiB (floor ${MEM_FLOOR_GIB}GiB), thrash=${thrash_sustained} (si/so=${si_so_rate}/s)"
+elif [ "$swap_pct" -ge "$SWAP_LIMIT" ]; then
+  is_warning=1
+  reason="WARNING: swap=${swap_pct}% (limit ${SWAP_LIMIT}%), MemAvailable=${mem_avail_gib}GiB, si/so=${si_so_rate}/s"
+else
+  reason="NORMAL: swap=${swap_pct}% (limit ${SWAP_LIMIT}%), MemAvailable=${mem_avail_gib}GiB, si/so=${si_so_rate}/s"
+fi
+
+printf '[%s] %s\n' "$TAG" "$reason"
+
+# Alert via TimeArk lane
+if [ "$is_critical" -eq 1 ] || [ "$is_warning" -eq 1 ]; then
+  printf '[%s] Alert condition met. Notifying TimeArk herald dispatch…\n' "$TAG"
+  if [ "$DRY_RUN" -eq 0 ]; then
+    if [ -x "$HOME/HelmCortex/FORGE/bin/timeark-herald-dispatch" ]; then
+      "$HOME/HelmCortex/FORGE/bin/timeark-herald-dispatch" >/dev/null 2>&1 || true
+    fi
+  else
+    printf '[%s] [DRY RUN] Would invoke timeark-herald-dispatch.\n' "$TAG"
+  fi
+fi
+
+# RAM-safety law before any swap purge
+if [ "$DO_HEAL" -eq 1 ]; then
+  printf '[%s] Evaluating swap:heal request under RAM-safety law…\n' "$TAG"
+  if (( swap_used_kb == 0 )); then
+    printf '[%s] No swap in use; nothing to heal.\n' "$TAG"
+  elif (( mem_available_kb < swap_used_kb )) && [[ "${SWAP_HEAL_FORCE:-0}" != 1 ]]; then
+    printf '[%s] RAM-SAFETY VIOLATION: MemAvailable (%d KiB) < SwapUsed (%d KiB).\n' \
+      "$TAG" "$mem_available_kb" "$swap_used_kb"
+    printf '[%s] Refusing swapoff to prevent OOM panic (swap:heal RAM-safety law).\n' "$TAG"
+  else
+    printf '[%s] RAM-safety check passed (MemAvailable %d KiB >= SwapUsed %d KiB). Executing swap-heal…\n' \
+      "$TAG" "$mem_available_kb" "$swap_used_kb"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      if command -v swap-heal >/dev/null 2>&1; then
+        swap-heal
+      elif [ -x "$HOME/.local/bin/swap-heal" ]; then
+        "$HOME/.local/bin/swap-heal"
+      else
+        printf '[%s] swap-heal binary not found.\n' "$TAG"
+      fi
+    else
+      printf '[%s] [DRY RUN] Would execute swap-heal.\n' "$TAG"
+    fi
+  fi
+fi
+
+# Service restarts: operator-directed list
+if [ ${#RESTART_SERVICES[@]} -gt 0 ] && [ "$is_critical" -eq 1 ]; then
+  printf '[%s] Critical condition: processing explicit operator restart list: %s\n' \
+    "$TAG" "${RESTART_SERVICES[*]}"
+  for svc in "${RESTART_SERVICES[@]}"; do
+    printf '[%s] Restarting service: %s…\n' "$TAG" "$svc"
+    if [ "$DRY_RUN" -eq 0 ]; then
+      if command -v service >/dev/null 2>&1; then
+        sudo service "$svc" restart || printf '[%s] Failed to restart %s via service\n' "$TAG" "$svc"
+      elif [ -x "/etc/init.d/$svc" ]; then
+        sudo "/etc/init.d/$svc" restart || printf '[%s] Failed to restart %s via /etc/init.d\n' "$TAG" "$svc"
+      else
+        printf '[%s] Service manager not found for %s\n' "$TAG" "$svc"
+      fi
+    else
+      printf '[%s] [DRY RUN] Would restart %s\n' "$TAG" "$svc"
+    fi
+  done
+elif [ ${#RESTART_SERVICES[@]} -gt 0 ]; then
+  printf '[%s] Condition not critical; skipping service restarts.\n' "$TAG"
+fi
+#+END_SRC
+
+** swap-guardian-cron-apply
+#+NAME: swap-guardian-cron-apply
+#+BEGIN_SRC bash :tangle linux/.local/bin/swap-guardian-cron-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="swap-guardian-cron-apply"
+EXPECTED_HOST="kikin-kushi"
+DRY=0
+REMOVE=0
+HOSTNAME_BIN="${SWAP_GUARDIAN_CRON_HOSTNAME_BIN:-hostname}"
+CRON_BIN="${SWAP_GUARDIAN_CRON_BIN:-crontab}"
+BEGIN="# BEGIN dotcortex-swap-guardian (managed by $TAG)"
+END="# END dotcortex-swap-guardian (managed by $TAG)"
+
+usage() {
+  cat <<'EOF'
+Usage: swap-guardian-cron-apply [--host HOST] [--dry-run] [--remove]
+
+Install or remove the 5-minute swap-guardian user crontab entry.
+Idempotent: replaces only its own managed block.
+
+Options:
+  --host HOST   Expected hostname (default: kikin-kushi)
+  --dry-run     Print the crontab modifications without applying
+  --remove      Remove the managed block from crontab
+  -h, --help    Show this help
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --host) [ "$#" -ge 2 ] || { echo "$TAG: --host requires a value" >&2; exit 2; }; EXPECTED_HOST="$2"; shift ;;
+    --dry-run) DRY=1 ;;
+    --remove) REMOVE=1 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ "$REMOVE" = 0 ]; then
+  CURRENT_HOST="$($HOSTNAME_BIN -s 2>/dev/null || $HOSTNAME_BIN)"
+  if [ -n "$EXPECTED_HOST" ] && [ "$CURRENT_HOST" != "$EXPECTED_HOST" ]; then
+    echo "$TAG: warning: running on $CURRENT_HOST; expected $EXPECTED_HOST" >&2
+  fi
+fi
+
+GUARDIAN="$HOME/.local/bin/swap-guardian"
+[ "$DRY" = 1 ] || [ "$REMOVE" = 1 ] || [ -x "$GUARDIAN" ] || { echo "$TAG: missing $GUARDIAN; tangle and stow first" >&2; exit 1; }
+
+CRON_PATH="$HOME/.guix-extra-profiles/core/core/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+STATE_DIR="$HOME/.local/state/swap-guardian"
+
+existing="$("$CRON_BIN" -l 2>/dev/null || true)"
+stripped="$(printf '%s\n' "$existing" | awk -v begin="$BEGIN" -v end="$END" '
+  $0 == begin { skip = 1; next }
+  $0 == end { skip = 0; next }
+  !skip { print }
+')"
+
+if [ "$REMOVE" = 1 ]; then
+  if [ -z "$(printf '%s' "$stripped" | tr -d '[:space:]')" ]; then
+    if [ "$DRY" = 1 ]; then echo "remove crontab (empty)"; else "$CRON_BIN" -r; echo "$TAG: crontab removed (was only ours)"; fi
+  else
+    if [ "$DRY" = 1 ]; then printf '%s\n' "$stripped"; else printf '%s\n' "$stripped" | "$CRON_BIN" -; echo "$TAG: removed managed block"; fi
+  fi
+  exit 0
+fi
+
+desired="$(printf '%s\n' "$stripped" | cat -s)"
+[ -n "$desired" ] && desired="$desired
+"
+desired="${desired}${BEGIN}
+*/5 * * * * HOME=$HOME PATH=$CRON_PATH mkdir -p $STATE_DIR && $GUARDIAN >>$STATE_DIR/cron.log 2>&1
+${END}"
+
+if [ "$DRY" = 1 ]; then
+  printf '%s\n' "$desired"
+else
+  printf '%s\n' "$desired" | "$CRON_BIN" -
+  echo "$TAG: installed user crontab block ($GUARDIAN)"
+fi
+#+END_SRC
+
 * HelmCortex Borg systemd units — X230
 X230 is the only HelmCortex Borg writer. These user units supervise the existing
 =FORGE/bin/helmcortex-borg= entrypoint: the watcher handles debounced near-real-time
