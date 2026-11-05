@@ -186,6 +186,37 @@ class WatcherTests(unittest.TestCase):
                 else:
                     self.assertEqual(self.watcher.load_registry(path, "test-host"), self.registry)
 
+    def test_native_poll_seat_preserves_mail_and_other_seats_still_wake(self):
+        self.registry["seats"]["native"] = {
+            "host": "test-host", "mailbox": "consorts/native", "harness": "opencode",
+            "transport": "poll", "owner_unix_user": "native", "poll_hint": "Native inbox poll",
+            "rate_limit_seconds": 120,
+        }
+        path = self.base / "poll-registry.json"
+        path.write_text(json.dumps(self.registry)); path.chmod(0o600)
+        self.assertEqual(self.watcher.load_registry(path, "test-host"), self.registry)
+        self.mail("<poll-neighbor@node.helm>", "a")
+        adapter = FakeAdapter()
+        self.assertEqual(self.watcher.locked_scan(self.registry, adapter, now=10), 1)
+        self.assertEqual(len(adapter.deliveries), 1)
+        # No native mailbox exists: any attempt to touch/dispatch it would fail.
+        self.assertFalse((self.root / "consorts/native").exists())
+
+    def test_native_poll_seat_rejects_invalid_owner_and_hint(self):
+        self.registry["seats"]["builder"] = {
+            "host": "test-host", "mailbox": "seats/builder", "harness": "opencode",
+            "transport": "poll", "owner_unix_user": "native", "poll_hint": "Native poll",
+            "rate_limit_seconds": 120,
+        }
+        path = self.base / "invalid-poll-registry.json"
+        for change in ({"owner_unix_user": "../other"}, {"poll_hint": " "}, {"transport": "unknown"}):
+            with self.subTest(change=change):
+                value = json.loads(json.dumps(self.registry))
+                value["seats"]["builder"].update(change)
+                path.write_text(json.dumps(value)); path.chmod(0o600)
+                with self.assertRaises(self.watcher.WatcherError):
+                    self.watcher.load_registry(path, "test-host")
+
     def test_idle_injects_once_and_duplicate_filename_does_not_repeat(self):
         self.mail("<same@node.helm>", "a")
         self.mail("<same@node.helm>", "b")
