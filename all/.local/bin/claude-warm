@@ -123,6 +123,69 @@ TRANSCRIPT_INTERNAL_TYPES = frozenset(
     }
 )
 COMPACTION_FAILURE_MARKER = "not enough messages"
+USAGE_LIMIT_RE = re.compile(
+    r"hit your [\w -]*limit\b.*?resets\s+(?:([A-Za-z]{3,9})\s+(\d{1,2}),\s*)?"
+    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([\w/+-]+)\))?",
+    re.IGNORECASE | re.DOTALL,
+)
+USAGE_LIMIT_UNPARSED_HOLD_SECONDS = 60 * 60
+USAGE_LIMIT_MONTHS = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec")
+
+
+def is_usage_limit_text(text: object) -> bool:
+    """True for Claude's fixed "You've hit your ... limit" refusal."""
+    return isinstance(text, str) and bool(re.search(r"hit your [\w -]*limit\b", text, re.IGNORECASE))
+
+
+def parse_usage_limit_reset(text: object, *, at: float | None = None) -> float | None:
+    """The reset instant named by a usage-limit refusal, or None if unreadable.
+
+    Forms seen: "resets 10:10pm (Australia/Melbourne)" and "resets Nov 5, 6pm (...)".
+    A bare clock time means its next occurrence.
+    """
+    if not isinstance(text, str):
+        return None
+    match = USAGE_LIMIT_RE.search(text)
+    if match is None:
+        return None
+    month, day, hour, minute, meridiem, zone_name = match.groups()
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(zone_name) if zone_name else None
+    except Exception:
+        zone = None
+    reference = datetime.datetime.fromtimestamp(time.time() if at is None else at, zone)
+    hour_24 = int(hour) % 12 + (12 if meridiem.lower() == "pm" else 0)
+    try:
+        if month:
+            month_number = USAGE_LIMIT_MONTHS.index(month[:3].lower()) + 1
+            reset = reference.replace(month=month_number, day=int(day), hour=hour_24,
+                                      minute=int(minute or 0), second=0, microsecond=0)
+            if (reference - reset).days > 180:
+                reset = reset.replace(year=reset.year + 1)
+        else:
+            reset = reference.replace(hour=hour_24, minute=int(minute or 0), second=0, microsecond=0)
+            if reset <= reference:
+                reset += datetime.timedelta(days=1)
+    except ValueError:
+        return None
+    return reset.timestamp()
+
+
+def pressured_idle_seconds(idle_seconds: float, snapshot: object, threshold: float, pressured: float) -> float:
+    """Shorten the idle wait while a usage window is nearly spent.
+
+    /compact is refused once the limit is hit, and the context then has to be
+    re-read whole after the reset, so compact while there is still usage left.
+    """
+    if not isinstance(snapshot, dict):
+        return idle_seconds
+    for key in ("five_hour_used_pct", "seven_day_used_pct"):
+        used = snapshot.get(key)
+        if isinstance(used, (int, float)) and not isinstance(used, bool) and used >= threshold:
+            return min(idle_seconds, pressured)
+    return idle_seconds
+
 
 def env_int(name: str, default: int, minimum: int = 0) -> int:
     """Read a bounded integer configuration value from the environment."""
@@ -406,6 +469,8 @@ MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
 # logs transcript-gate-expired.
 TRANSCRIPT_GATE_MAX_SECONDS = env_int("CLAUDE_IDLE_TRANSCRIPT_GATE_MAX_SECONDS", 60 * 60, 60)
 COMPACT_RETRY_SECONDS = env_int("CLAUDE_IDLE_COMPACT_RETRY_SECONDS", 5 * 60, 1)
+USAGE_PRESSURE_PCT = env_float("CLAUDE_IDLE_COMPACT_USAGE_PRESSURE_PCT", 85.0, 0.0)
+USAGE_PRESSURE_IDLE_SECONDS = env_int("CLAUDE_IDLE_COMPACT_USAGE_PRESSURE_SECONDS", 3 * 60, 1)
 COMPACT_TIMEOUT_SECONDS = env_int("CLAUDE_IDLE_COMPACT_TIMEOUT_SECONDS", 15 * 60, 1)
 PTY_CHECK_ATTEMPTS = 3
 PTY_CHECK_RETRY_SECONDS = 0.05
@@ -1510,14 +1575,17 @@ def _hold_timeout_seconds():
 # and the Desk queue.  Unknown cue-footered dialogs are never keyed, only
 # recorded once as dialog_unknown so the next one can be added here.
 DIALOG_SETTLE_SECONDS = 5.0
-DIALOG_DISMISS_KEYS = (b"\r",)  # Enter confirms the dialog's highlighted default
+DOWN_KEY = b"\x1b[B"
+# Enter confirms the highlighted entry; Down moves it one row, and only a
+# fingerprint that pins the highlighted row may use it.
+DIALOG_DISMISS_KEYS = (b"\r", DOWN_KEY)
 
 
 class BlockingDialog:
     """One known non-permission blocking dialog: exact fingerprint, one key."""
-    __slots__ = ("dialog_id", "required_markers", "dismiss_key")
+    __slots__ = ("dialog_id", "required_markers", "dismiss_key", "allow_blocked")
 
-    def __init__(self, dialog_id, required_markers, dismiss_key):
+    def __init__(self, dialog_id, required_markers, dismiss_key, allow_blocked=False):
         if not isinstance(dialog_id, str) or not dialog_id:
             raise ValueError("dialog id")
         markers = tuple(required_markers)
@@ -1529,6 +1597,7 @@ class BlockingDialog:
         self.dialog_id = dialog_id
         self.required_markers = tuple(marker.strip().lower() for marker in markers)
         self.dismiss_key = dismiss_key
+        self.allow_blocked = bool(allow_blocked)
 
     def matches(self, visible):
         if not isinstance(visible, str) or not visible:
@@ -1560,6 +1629,37 @@ KNOWN_BLOCKING_DIALOGS = (
             "esc not now",
         ),
         b"\r",
+    ),
+    # The usage-limit picker (Telegram 10480) froze this seat for hours.  Its
+    # default "Stop and wait" strands the session, so walk to "Wait here, then
+    # continue automatically" in two verified steps, one key per exact screen:
+    # each marker pins the highlighted row, so nothing can reach "Add funds"
+    # or "Upgrade your plan", and a reworded picker falls to dialog_unknown.
+    BlockingDialog(
+        "usage-limit-select-wait",
+        (
+            "what do you want to do?",
+            "❯ 1. stop and wait for limit to reset",
+            "2. wait here, then continue automatically",
+            "add funds to continue with usage credits",
+            "enter to confirm",
+            "esc to cancel",
+        ),
+        DOWN_KEY,
+        allow_blocked=True,
+    ),
+    BlockingDialog(
+        "usage-limit-confirm-wait",
+        (
+            "what do you want to do?",
+            "1. stop and wait for limit to reset",
+            "❯ 2. wait here, then continue automatically",
+            "add funds to continue with usage credits",
+            "enter to confirm",
+            "esc to cancel",
+        ),
+        b"\r",
+        allow_blocked=True,
     ),
 )
 
@@ -2405,6 +2505,7 @@ class Supervisor:
             self.mailcortex_input_dirty = False
         self.hold_timer = None  # created on first permission-prompt sighting
         self.dialog_timer = None  # settle timer for known non-permission dialogs
+        self.usage_limit_until = None  # /compact is refused until this reset instant
         self.dialog_unknown_logged = False  # one dialog_unknown record per episode
         self.preservation_federation = PreservationFederationClient(self)
         self.lifecycle_health = "pending"
@@ -2695,6 +2796,7 @@ class Supervisor:
         self.cache_idle_seconds, self.cache_ttl_seconds, self.cache_policy = measured_cache_window(
             self.current_model if snapshot_error is None else None, self.cache_profile
         )
+        self._pressured_idle()
         self.timer_generation += 1
         self.timer_deadline = self.last_normal_stop + self.cache_idle_seconds
         self.timer_kind = "compact"
@@ -2738,6 +2840,7 @@ class Supervisor:
         self.cache_idle_seconds, self.cache_ttl_seconds, self.cache_policy = measured_cache_window(
             self.current_model if snapshot_error is None else None, self.cache_profile
         )
+        self._pressured_idle()
         anchor = self._idle_anchor()
         refreshed_deadline = (
             anchor + self.cache_idle_seconds if anchor is not None else None
@@ -3056,6 +3159,24 @@ class Supervisor:
             self.transcript_offset = 0
             self.transcript_partial = b""
 
+    def _hold_for_usage_limit(self, text: object) -> None:
+        """Stop injecting /compact until the limit Claude named has reset."""
+        reset = parse_usage_limit_reset(text, at=now())
+        self.usage_limit_until = reset if reset is not None else now() + USAGE_LIMIT_UNPARSED_HOLD_SECONDS
+        self._guard_log("usage-limit-hold", until=int(self.usage_limit_until), parsed=reset is not None)
+
+    def _pressured_idle(self) -> None:
+        """Apply the usage-pressure idle window after the measured cache window."""
+        try:
+            with self.snapshot_path.open(encoding="utf-8") as stream:
+                snapshot = json.load(stream)
+        except (OSError, ValueError):
+            return
+        idle = pressured_idle_seconds(self.cache_idle_seconds, snapshot, USAGE_PRESSURE_PCT, USAGE_PRESSURE_IDLE_SECONDS)
+        if idle != self.cache_idle_seconds:
+            self.cache_idle_seconds = idle
+            self._guard_log("usage-pressure-idle", delay=idle)
+
     def _compaction_failed(self, reason: str) -> None:
         """Clear an asynchronous compaction failure without making it dirty twice."""
         if not self.compacting:
@@ -3090,7 +3211,7 @@ class Supervisor:
         if not isinstance(content, str):
             return False
         lowered = content.lower()
-        if COMPACTION_FAILURE_MARKER not in lowered:
+        if COMPACTION_FAILURE_MARKER not in lowered and not is_usage_limit_text(content):
             return False
         entry_timestamp = transcript_entry_timestamp(entry)
         return not (
@@ -3244,7 +3365,10 @@ class Supervisor:
             # like a remote Telegram turn in the meantime.
             if self.compacting:
                 if self._is_failed_compaction_entry(entry):
-                    self._compaction_failed("transcript-rejected")
+                    limited = is_usage_limit_text(entry.get("content"))
+                    if limited:
+                        self._hold_for_usage_limit(entry.get("content"))
+                    self._compaction_failed("usage-limited" if limited else "transcript-rejected")
                 self._record_transcript_observation("compaction-transcript")
                 continue
             classification = transcript_entry_classification(entry)
@@ -3675,6 +3799,8 @@ class Supervisor:
         if purpose == "compact":
             if not self.dirty:
                 return "clean"
+            if self.usage_limit_until and now() < self.usage_limit_until:
+                return "usage-limited"
             if self.recovery_pending:
                 return "channel-recovery-pending"
             if (
@@ -4528,10 +4654,13 @@ class Supervisor:
         only while the seat is otherwise idle on it (never blocked/working)."""
         classifier = self.screen_classifier
         visible = classifier._visible_text()
-        if not classifier.screen.complete() or classifier._classify(visible) != "idle":
+        if not classifier.screen.complete():
+            return None, None
+        state = classifier._classify(visible)
+        if state not in {"idle", "blocked"}:
             return None, None
         dialog = match_known_dialog(visible)
-        if dialog is None:
+        if dialog is None or (state == "blocked" and not dialog.allow_blocked):
             return None, None
         return visible, dialog
 
