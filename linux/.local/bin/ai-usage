@@ -2021,27 +2021,110 @@ def deepinfra_token(timeout_seconds: float) -> tuple[str | None, str]:
 
 CLAUDE_USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
-CLAUDE_CREDENTIALS = os.path.expanduser("~/.claude/.credentials.json")
+CLAUDE_CREDENTIALS = os.environ.get(
+    "AI_USAGE_CLAUDE_CREDENTIALS", os.path.expanduser("~/.claude/.credentials.json")
+)
+# Claude Code stores its OAuth session per machine. A host that never signed in,
+# or whose copy was left hollow by a logout, can still have a live session next
+# door — and "signed in elsewhere" is not the same fact as "no usable token".
+# The local file is tried first, then these hosts over ssh, in order.
+CLAUDE_CREDENTIAL_HOSTS = [
+    host.strip()
+    for host in os.environ.get("AI_USAGE_CLAUDE_CREDENTIAL_HOSTS", "kikin").split(",")
+    if host.strip()
+]
+
+# Set during resolution so the caller can say *where* the token came from
+# instead of implying the local file was the only possibility.
+CLAUDE_TOKEN_ORIGIN: str | None = None
+CLAUDE_TOKEN_REASON: str | None = "absent"
+
+
+def _claude_oauth_fields(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    oauth = payload.get("claudeAiOauth")
+    return oauth if isinstance(oauth, dict) else None
+
+
+def _claude_token_from_oauth(oauth: dict[str, Any]) -> tuple[str | None, str]:
+    """Return (token, reason). The reason is a short machine-readable cause."""
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token.strip():
+        return None, "empty"
+    # expiresAt is epoch milliseconds. Refreshing is not our job — but an
+    # expired local copy is exactly when another host's live session matters.
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, (int, float)) and time.time() >= (float(expires_at) / 1000.0):
+        return None, "expired"
+    return token, "ok"
+
+
+def _claude_local_oauth() -> tuple[dict[str, Any] | None, str]:
+    try:
+        with open(CLAUDE_CREDENTIALS, encoding="utf-8") as handle:
+            oauth = _claude_oauth_fields(json.load(handle))
+    except OSError:
+        return None, "absent"
+    except ValueError:
+        return None, "unreadable"
+    return (oauth, "present") if oauth is not None else (None, "malformed")
+
+
+def _claude_remote_oauth(host: str) -> tuple[dict[str, Any] | None, str]:
+    """Read another machine's credentials over ssh.
+
+    The payload is consumed in-process and never logged, echoed or included in a
+    summary: only the reason string leaves this function.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", host,
+                "cat ~/.claude/.credentials.json",
+            ],
+            capture_output=True, text=True, timeout=20, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "unreachable"
+    if result.returncode != 0:
+        return None, "unreachable"
+    try:
+        oauth = _claude_oauth_fields(json.loads(result.stdout))
+    except ValueError:
+        return None, "unreadable"
+    return (oauth, "present") if oauth is not None else (None, "malformed")
 
 
 def claude_oauth_token() -> str | None:
-    try:
-        with open(CLAUDE_CREDENTIALS, encoding="utf-8") as handle:
-            oauth = json.load(handle).get("claudeAiOauth") or {}
-    except (OSError, ValueError):
-        return None
+    """Resolve a usable token: local credentials first, then the hosts above."""
+    global CLAUDE_TOKEN_ORIGIN, CLAUDE_TOKEN_REASON
+    notes: list[str] = []
 
-    token = oauth.get("accessToken")
-    if not isinstance(token, str) or not token:
-        return None
+    oauth, local_state = _claude_local_oauth()
+    if oauth is not None:
+        token, reason = _claude_token_from_oauth(oauth)
+        if token:
+            CLAUDE_TOKEN_ORIGIN, CLAUDE_TOKEN_REASON = "local", "ok"
+            return token
+        notes.append(f"local-{reason}")
+    else:
+        notes.append(f"local-{local_state}")
 
-    # expiresAt is epoch milliseconds. An expired token is not our job to
-    # refresh — say so and let the fuelcheck fallback try.
-    expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and time.time() >= (float(expires_at) / 1000.0):
-        return None
+    for host in CLAUDE_CREDENTIAL_HOSTS:
+        remote, state = _claude_remote_oauth(host)
+        if remote is None:
+            notes.append(f"{host}-{state}")
+            continue
+        token, reason = _claude_token_from_oauth(remote)
+        if token:
+            CLAUDE_TOKEN_ORIGIN, CLAUDE_TOKEN_REASON = host, "remote"
+            return token
+        notes.append(f"{host}-{reason}")
 
-    return token
+    CLAUDE_TOKEN_ORIGIN = None
+    CLAUDE_TOKEN_REASON = "+".join(notes) or "absent"
+    return None
 
 
 def _claude_quota(percent: Any, resets_at: Any, label: str, window_minutes: int | None = None) -> dict[str, Any]:
@@ -2103,7 +2186,16 @@ def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, 
             "label": spec.label,
             "state": "missing",
             "source": "oauth",
-            "summary": "No usable Claude OAuth token in ~/.claude/.credentials.json.",
+            "summary": (
+                "No usable Claude OAuth token in "
+                f"{CLAUDE_CREDENTIALS}"
+                + (
+                    f" or on {', '.join(CLAUDE_CREDENTIAL_HOSTS)}"
+                    if CLAUDE_CREDENTIAL_HOSTS
+                    else ""
+                )
+                + f" ({CLAUDE_TOKEN_REASON})."
+            ),
             "raw": None,
         }
 
@@ -2162,6 +2254,7 @@ def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, 
         "state": "ok",
         "source": "oauth",
         "summary": f"{spec.label} usage",
+        "credential_origin": CLAUDE_TOKEN_ORIGIN,
         "raw": {"usage": {"primary": primary, "secondary": secondary}, "scoped": scoped},
     }
 
