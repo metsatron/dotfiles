@@ -75,6 +75,27 @@ class NormalizerTests(unittest.TestCase):
         self.assertIn("codex_telegram", spoken)
         self.assertNotIn("\\", spoken)
         self.assertNotIn("*", spoken)
+        self.assertNotIn("/", spoken)
+
+    def test_paths_filter_slashes_to_spaces_and_large_numbers_are_omitted(self):
+        raw = (
+            "Read MailCortex delivery <179388615243.9498.7478661436905674088@kikin.helm>.\n"
+            "Checked /home/metsatron/foo/bar.py and ~/.ductor/config/config.json with NEXUS/stow/ and and/or.\n"
+            "Found 45 skills on port 8080 in year 2026, with 100,000 items and UUID 01a1a5f3-530f-7920-a7d1-3766bfd6a64b."
+        )
+        spoken = self.normalize(raw)
+        self.assertNotIn("/", spoken)
+        self.assertNotIn("179388615243", spoken)
+        self.assertNotIn("7478661436905674088", spoken)
+        self.assertNotIn("100,000", spoken)
+        self.assertNotIn("01a1a5f3", spoken)
+        self.assertIn("home metsatron foo bar.py", spoken)
+        self.assertIn(".ductor config config.json", spoken)
+        self.assertIn("NEXUS stow", spoken)
+        self.assertIn("and or", spoken)
+        self.assertIn("45", spoken)
+        self.assertIn("8080", spoken)
+        self.assertIn("2026", spoken)
 
 
 class ReplyPathTests(unittest.TestCase):
