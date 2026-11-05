@@ -116,6 +116,74 @@ class WatcherTests(unittest.TestCase):
 
         return record, self.watcher.OpenCodeAdapter(opener=opener), calls
 
+    def codex_fixture(self):
+        spool = self.base / "codex-wake"
+        spool.mkdir(mode=0o700)
+        spool.chmod(0o700)
+        record = {
+            "host": "test-host", "mailbox": "seats/builder", "harness": "codex",
+            "transport": "codex-telegram", "wake_spool": str(spool),
+            "rate_limit_seconds": 0,
+        }
+        self.registry["seats"]["builder"] = record
+        return record, spool
+
+    def test_codex_telegram_writes_only_the_atomic_wake_record(self):
+        record, spool = self.codex_fixture()
+        mid = "<codex-wake@node.helm>"
+        self.mail(mid, "codex-message")
+        self.assertEqual(
+            self.watcher.locked_scan(self.registry, self.watcher.TransportAdapters(), now=10), 1
+        )
+        records = list(spool.iterdir())
+        self.assertEqual(len(records), 1)
+        value = json.loads(records[0].read_text())
+        self.assertEqual(
+            set(value), {"sender", "subject", "message_id", "maildir_filename", "prompt"}
+        )
+        self.assertEqual(value["sender"], "sender@node.helm")
+        self.assertEqual(value["subject"], "wake")
+        self.assertEqual(value["message_id"], mid)
+        self.assertEqual(value["maildir_filename"], "codex-message")
+        self.assertEqual(
+            value["prompt"], self.watcher.wake_prompt(record, self.mailbox / "new/codex-message")
+        )
+        receipt = self.receipt(mid)
+        self.assertEqual(receipt["wake_state"], "injected")
+        self.assertNotIn("native_accepted", receipt)
+        self.assertFalse(any(path.name.startswith(".") for path in records))
+
+    def test_codex_telegram_spool_target_is_private_owned_absolute_directory(self):
+        record, spool = self.codex_fixture()
+        registry_path = self.base / "codex-registry.json"
+        registry_path.write_text(json.dumps(self.registry))
+        registry_path.chmod(0o600)
+        self.assertEqual(self.watcher.load_registry(registry_path, "test-host"), self.registry)
+        for changes in (
+            {"wake_spool": str(spool / "missing")},
+            {"wake_spool": "relative/spool"},
+        ):
+            with self.subTest(changes=changes):
+                value = json.loads(json.dumps(self.registry))
+                value["seats"]["builder"].update(changes)
+                registry_path.write_text(json.dumps(value))
+                with self.assertRaises(self.watcher.WatcherError):
+                    self.watcher.load_registry(registry_path, "test-host")
+        unsafe = self.base / "unsafe"
+        unsafe.mkdir(mode=0o755)
+        unsafe.chmod(0o755)
+        value = json.loads(json.dumps(self.registry))
+        value["seats"]["builder"]["wake_spool"] = str(unsafe)
+        registry_path.write_text(json.dumps(value))
+        with self.assertRaises(self.watcher.WatcherError):
+            self.watcher.load_registry(registry_path, "test-host")
+        link = self.base / "wake-link"
+        link.symlink_to(spool, target_is_directory=True)
+        value["seats"]["builder"]["wake_spool"] = str(link)
+        registry_path.write_text(json.dumps(value))
+        with self.assertRaises(self.watcher.WatcherError):
+            self.watcher.load_registry(registry_path, "test-host")
+
     def test_opencode_queued_input_has_exact_target_and_injects_once(self):
         record, adapter, calls = self.opencode_fixture()
         self.mail("<open@node.helm>", "open")
