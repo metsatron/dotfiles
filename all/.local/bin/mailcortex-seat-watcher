@@ -11,6 +11,7 @@ import os
 import re
 import socket
 import shutil
+import stat
 import subprocess
 import tempfile
 import sys
@@ -40,7 +41,7 @@ SPEC.loader.exec_module(MAILCORTEX)
 SAFE = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}\Z")
 PANE = re.compile(r"w[0-9A-Za-z]+:p[0-9A-Za-z]+\Z")
 TRANSPORTS = {"poll", "agent-peer-native", "opencode", "herdr", "hermes", "nanobot", "ductor", "deepseek",
-              "claude-ssh", "claude-local", "gemma-pi"}
+              "claude-ssh", "claude-local", "gemma-pi", "codex-telegram"}
 
 
 class WatcherError(Exception):
@@ -149,6 +150,86 @@ class GemmaPiAdapter:
             raise WatcherError("Gemma turn failed rc=%d" % result.returncode)
 
 
+class CodexTelegramAdapter:
+    """Write one plain-mail wake record for HelmAstra's local spool poll."""
+
+    RECORD_KEYS = frozenset(("sender", "subject", "message_id", "maildir_filename", "prompt"))
+
+    @staticmethod
+    def validate_target(record: dict) -> None:
+        value = record.get("wake_spool")
+        if not isinstance(value, str) or not value or len(value) > 512:
+            raise WatcherError("invalid Codex Telegram wake spool")
+        spool = Path(value)
+        try:
+            details = spool.lstat()
+        except OSError as error:
+            raise WatcherError("Codex Telegram wake spool is unavailable") from error
+        if (not spool.is_absolute() or stat.S_ISLNK(details.st_mode)
+                or not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != os.getuid()
+                or stat.S_IMODE(details.st_mode) != 0o700):
+            raise WatcherError(
+                "Codex Telegram wake spool must be an owned absolute mode-0700 directory"
+            )
+
+    def resolve_idle_pane(self, record: dict) -> str:
+        # This transport has no pane and performs no conditional model call.
+        self.validate_target(record)
+        return record["wake_spool"]
+
+    @classmethod
+    def _write_record(cls, spool: Path, value: dict) -> None:
+        filename = f"{time.time_ns():020d}-{uuid.uuid4().hex}.json"
+        destination = spool / filename
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=".mailcortex-wake-", suffix=".tmp", dir=spool
+        )
+        try:
+            os.fchmod(descriptor, 0o600)
+            with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+                descriptor = -1
+                json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+                stream.write("\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary_name, destination)
+            directory = os.open(spool, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            try:
+                Path(temporary_name).unlink()
+            except FileNotFoundError:
+                pass
+
+    def deliver(self, record: dict, target: str, prompt: str, path: Path | None = None) -> None:
+        self.validate_target(record)
+        if not isinstance(path, Path) or path.is_symlink() or not path.is_file():
+            raise WatcherError("Codex Telegram wake source is not a regular mail file")
+        try:
+            message = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
+        except (OSError, ValueError) as error:
+            raise WatcherError("malformed mail") from error
+        value = {
+            "sender": str(message.get("From", "")),
+            "subject": str(message.get("Subject", "")),
+            "message_id": str(message.get("Message-ID", "")).strip(),
+            "maildir_filename": path.name,
+            "prompt": prompt,
+        }
+        if (set(value) != self.RECORD_KEYS
+                or not value["message_id"]
+                or not isinstance(value["prompt"], str)
+                or not value["prompt"]):
+            raise WatcherError("Codex Telegram wake record is incomplete")
+        self._write_record(Path(target), value)
+
+
 class ClaudeLocalAdapter:
     """Use the guarded Claude supervisor control socket for a same-user warm seat."""
 
@@ -222,6 +303,7 @@ def load_registry(path: Path, host: str) -> dict:
             "deepseek": {"deepseek_url", "deepseek_cookie_file", "deepseek_session"},
             "claude-ssh": {"ssh_target", "remote_user", "claude_target", "coalesce_seconds"},
             "claude-local": {"claude_target"},
+            "codex-telegram": {"wake_spool"},
         }[transport]
         # A parked seat is a deliberate operator stop, not a broken seat. It keeps
         # its mailbox and receipts, is never woken, and says why in its own record —
@@ -296,6 +378,10 @@ def load_registry(path: Path, host: str) -> dict:
                 raise WatcherError("invalid Nano target")
         elif transport == "gemma-pi":
             GemmaPiAdapter.validate_target(record)
+        elif transport == "codex-telegram":
+            if record["harness"] != "codex":
+                raise WatcherError("Codex Telegram transport requires Codex harness")
+            CodexTelegramAdapter.validate_target(record)
         elif transport == "opencode":
             if record["harness"] != "opencode":
                 raise WatcherError("OpenCode transport requires OpenCode harness")
@@ -1212,6 +1298,7 @@ class TransportAdapters:
             "deepseek": DeepSeekAdapter(),
             "claude-local": ClaudeLocalAdapter(),
             "gemma-pi": GemmaPiAdapter(),
+            "codex-telegram": CodexTelegramAdapter(),
         }
 
     def for_record(self, record: dict) -> object:
@@ -1500,7 +1587,7 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             try:
                 pane_id = transport_adapter.resolve_idle_pane(record)
             except Exception as error:
-                if record["transport"] not in {"herdr", "deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local", "gemma-pi"}:
+                if record["transport"] not in {"herdr", "deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local", "gemma-pi", "codex-telegram"}:
                     raise
                 MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
                                               wake_error=diagnostic(error), wake_updated_at=now)
@@ -1530,7 +1617,9 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                                           pane_id=pane_id, wake_updated_at=now,
                                           **attempt, **extra)
             try:
-                if extra:
+                if record["transport"] == "codex-telegram":
+                    transport_adapter.deliver(record, pane_id, prompt, path)
+                elif extra:
                     transport_adapter.deliver(record, pane_id, prompt,
                                               request_id=request_id)
                 else:
@@ -1546,7 +1635,7 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                     seat, mid, "delivery_unknown", filename=path.name,
                     pane_id=pane_id, reason="delivery_error", wake_updated_at=now,
                 )
-                if record["transport"] in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local"}:
+                if record["transport"] in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local", "codex-telegram"}:
                     report_error(seat, path.name, error)
                     continue
                 if isinstance(error, WatcherError):
@@ -1569,7 +1658,7 @@ def scan_once(registry: dict, adapter: object, now: float | None = None) -> int:
         try:
             count += scan_seats({"seats": {seat: record}}, adapter, now=now)
         except Exception as error:
-            if record.get("transport") not in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-ssh", "claude-local", "gemma-pi"}:
+            if record.get("transport") not in {"deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-ssh", "claude-local", "gemma-pi", "codex-telegram"}:
                 raise
             report_error(seat, "scan", error)
     return count
