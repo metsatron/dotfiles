@@ -272,6 +272,17 @@ def _floor_home_roots(manifest, coordinator=None):
     return roots + (os.path.realpath(os.path.expanduser('~')),)
 
 
+def _ssh_fleet_host(lowered, manifest):
+    """True when an ssh stage targets a host the private manifest names as the seat's own."""
+    hosts = (manifest or {}).get('coordinator_ops', {}).get('fleet_ssh_hosts') if isinstance(manifest, dict) else None
+    if not isinstance(hosts, list):
+        return False
+    index = 1
+    while index < len(lowered) and lowered[index].startswith('-'):
+        index += 2 if lowered[index] in {'-o', '-i', '-p', '-l', '-f', '-j', '-c'} and len(lowered[index]) == 2 else 1
+    return index < len(lowered) and lowered[index] in hosts
+
+
 def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None):
     """The Admiral's non-overridable floor; uncertainty belongs to the judge.
 
@@ -387,7 +398,14 @@ def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None)
         lowered = [word if word in {'-C', '-F'} else word.casefold() for word in words]
         verb = lowered[0].rsplit('/', 1)[-1]
         if verb == 'xargs':
-            return True
+            # xargs runs its argument command, so judge that command, not the word.
+            rest, index = words[1:], 0
+            while index < len(rest) and rest[index].startswith('-'):
+                index += 2 if rest[index] in {'-I', '-n', '-P', '-L', '-d', '-s', '-E', '-a'} else 1
+            nested_event = {**event, 'tool_input': {**payload, 'command': shlex.join(rest[index:]) or 'true'}}
+            if _admiral_floor(nested_event, manifest, coordinator, readonly_proven):
+                return True
+            continue
         if verb in {'eval', 'bash', 'sh', 'zsh'} and '-c' in lowered[1:]:
             script = words[lowered.index('-c') + 1] if '-c' in lowered[1:] else shlex.join(words[1:])
             nested_event = {**event, 'tool_input': {**payload, 'command': script}}
@@ -400,7 +418,8 @@ def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None)
             piece_event = {**event, 'tool_input': {**payload, 'command': piece}}
             if not (verb == 'crontab' and _plain_observation_compound(piece_event, manifest or {})):
                 return True
-        if verb in {'kill', 'pkill', 'killall'}:
+        # `kill -0` only asks whether a process exists; it signals nothing.
+        if verb in {'kill', 'pkill', 'killall'} and not (verb == 'kill' and lowered[1:2] == ['-0']):
             return True
         # Projection takeover is the Admiral's alone (ruling 2026-10-31): helmstow
         # --adopt moves aside whatever stow does not own, and GNU stow's own
@@ -418,7 +437,8 @@ def _admiral_floor(event, manifest=None, coordinator=None, readonly_proven=None)
         piece_event = {**event, 'tool_input': {**payload, 'command': piece}}
         if verb == 'ssh' and not (readonly_proven or _ssh_readonly_candidate(piece_event, manifest or {})):
             piece_coordinator = coordinator or _coordinator_match(piece_event, manifest or {})
-            if piece_coordinator is None:
+            # The seat's own fleet hosts go to the judge; only unlisted hosts floor.
+            if piece_coordinator is None and not _ssh_fleet_host(lowered, manifest):
                 return True
         if verb in {'curl', 'wget', 'nc', 'socat', 'telnet', 'rsync', 'scp'}:
             if not (verb == 'ssh' and readonly_proven):
@@ -6277,8 +6297,7 @@ def _decide_request(event, manifest):
     if (event.get('tool_name') == 'Bash' and isinstance(command, str)
             and _split_approval_compound(command) is None
             and (stripped_command is None or _shell_substitutions(stripped_command) is None)):
-        extras.update(decision_path='ambiguous', judge_verdict='not_consulted')
-        return False, 'ambiguous_shell'
+        return _judge_whole_command(event, manifest, 'ambiguous_shell', extras)
     if event.get('tool_name') == 'Bash' and isinstance(command, str) and _for_loop_candidate(event) is not None:
         if _for_loop_body_floor(event, manifest):
             extras.update(decision_path='floor', judge_verdict='not_consulted')
@@ -6286,8 +6305,7 @@ def _decide_request(event, manifest):
         if _for_readonly(event, manifest):
             extras.update(decision_path='deterministic', judge_verdict='not_needed')
             return True, 'local_read'
-        extras.update(decision_path='ambiguous', judge_verdict='not_consulted')
-        return False, 'ambiguous_shell'
+        return _judge_whole_command(event, manifest, 'ambiguous_shell', extras)
     if event.get('tool_name') == 'Bash' and isinstance(command, str):
         compound = _compound_approval(event, manifest, judge=_decide_request)
         if compound is not None:
@@ -6295,10 +6313,10 @@ def _decide_request(event, manifest):
             if allow:
                 extras.update(decision_path='deterministic', judge_verdict='not_needed')
             elif reason.startswith('compound_refused:'):
-                if 'decider_' in reason or 'no_match_decider' in reason:
+                if 'decider_risky' in reason:
                     extras.update(decision_path='judge', judge_verdict=extras.get('verdict', 'ask'))
                 else:
-                    extras.update(decision_path='deterministic', judge_verdict='not_consulted')
+                    return _judge_whole_command(event, manifest, reason, extras)
             return allow, reason
     if event.get('tool_name') == 'Bash' and isinstance(command, str):
         nested = _substitutions_approval(event, manifest, _decide_request)
@@ -6307,6 +6325,8 @@ def _decide_request(event, manifest):
                 current_extras = getattr(_log_decision, 'extras', {})
                 if not isinstance(current_extras, dict):
                     current_extras = _log_decision.extras = {}
+                if 'decider_risky' not in nested[1]:
+                    return _judge_whole_command(event, manifest, nested[1], current_extras)
                 current_extras.update(decision_path='judge',
                                       judge_verdict=current_extras.get('verdict', 'ask'))
             return nested
@@ -6332,6 +6352,15 @@ def _decide_request(event, manifest):
     if reason == 'not_permission_request':
         extras.update(decision_path='floor', judge_verdict='not_consulted')
         return allow, reason
+    return _judge_whole_command(event, manifest, reason, extras)
+
+
+def _judge_whole_command(event, manifest, reason, extras):
+    """Ask the Decider about the complete request; only its explicit allow allows.
+
+    Shell shape is not a floor (the Admiral, Telegram 10565, 10567): a heredoc,
+    a substitution or a segment the rules could not prove is a question for the
+    judge, so an agent never has to reshape a harmless command."""
     config = _decider_config(manifest)
     if config is None:
         extras.update(decision_path='judge', judge_verdict='unavailable', decider_status='disabled')
