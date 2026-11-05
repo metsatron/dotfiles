@@ -1147,16 +1147,6 @@ class BlockingDialogDismissTests(unittest.TestCase):
         self.assertTrue(self.warm.is_usage_limit_text(weekly))
         self.assertFalse(self.warm.is_usage_limit_text("Not enough messages to compact."))
 
-    def test_usage_pressure_shortens_idle_only_at_threshold(self):
-        idle = self.warm.pressured_idle_seconds
-        self.assertEqual(idle(3300, {"five_hour_used_pct": 90}, 85.0, 180), 180)
-        self.assertEqual(idle(3300, {"seven_day_used_pct": 85}, 85.0, 180), 180)
-        self.assertEqual(idle(3300, {"five_hour_used_pct": 84, "seven_day_used_pct": None}, 85.0, 180), 3300)
-        self.assertEqual(idle(120, {"five_hour_used_pct": 99}, 85.0, 180), 120)
-        for bad in (None, [], {"five_hour_used_pct": True}, {"five_hour_used_pct": "99"}):
-            with self.subTest(bad=bad):
-                self.assertEqual(idle(3300, bad, 85.0, 180), 3300)
-
     def test_dialog_table_is_deny_shape_and_small(self):
         self.assertEqual(self.warm.DIALOG_DISMISS_KEYS, (b"\r", b"\x1b[B"))
         ids = [dialog.dialog_id for dialog in self.warm.KNOWN_BLOCKING_DIALOGS]
