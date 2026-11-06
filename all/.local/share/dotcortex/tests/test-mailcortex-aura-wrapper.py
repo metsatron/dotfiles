@@ -46,6 +46,8 @@ def load(tmp):
     loader.exec_module(mod)
     mod.LAST = os.path.join(tmp, "last.json")
     mod.LOG = os.path.join(tmp, "lane.log")
+    mod.REPLIED = os.path.join(tmp, "replied.json")
+    mod.FENCE_LOCK = os.path.join(tmp, "replied.lock")
     return mod
 
 
@@ -74,7 +76,6 @@ class WrapperTests(unittest.TestCase):
         self.assertIn(["read", "aura@honey.helm", "222.2_b.kikin-kushi"], fake.calls)
         meta = json.load(open(self.mod.LAST))
         self.assertEqual(meta["message-id"], "<222.2.99@kikin.helm>")
-        self.assertFalse(meta["replied"])
 
     def test_mistyped_name_is_refused_with_the_short_form(self):
         code, err = run(self.mod, Fake(), "read 2222.2_b")
@@ -102,13 +103,39 @@ class WrapperTests(unittest.TestCase):
         self.assertIn("already replied", err)
         self.assertEqual(len([c for c in fake.calls if c[0] == "send"]), 1)
 
-    def test_failed_send_records_no_receipt_and_allows_a_retry(self):
+    def test_uncertain_send_keeps_the_fence_and_records_no_receipt(self):
         fake = Fake(send_rc=1)
         run(self.mod, fake, "read next")
-        code, _ = run(self.mod, fake, "reply", b"x\n")
-        self.assertEqual(code, 1)
+        self.assertEqual(run(self.mod, fake, "reply", b"first\n")[0], 1)
+        code, err = run(self.mod, fake, "reply", b"second\n")
+        self.assertEqual(code, 2)
+        self.assertIn("may have been delivered", err)
+        self.assertEqual(len([c for c in fake.calls if c[0] == "send"]), 1)
         self.assertFalse([c for c in fake.calls if c[0] == "receipt"])
-        self.assertFalse(json.load(open(self.mod.LAST))["replied"])
+
+    def test_rereading_the_same_message_cannot_reply_twice(self):
+        fake = Fake()
+        run(self.mod, fake, "read next")
+        run(self.mod, fake, "reply", b"first\n")
+        run(self.mod, fake, "read 2")
+        code, _ = run(self.mod, fake, "reply", b"second\n")
+        self.assertEqual(code, 2)
+        self.assertEqual(len([c for c in fake.calls if c[0] == "send"]), 1)
+
+    def test_a_concurrent_dispatch_in_flight_blocks_a_second_reply(self):
+        fake = Fake()
+        run(self.mod, fake, "read next")
+        json.dump({"<222.2.99@kikin.helm>": {"state": "dispatching"}}, open(self.mod.REPLIED, "w"))
+        code, _ = run(self.mod, fake, "reply", b"x\n")
+        self.assertEqual(code, 2)
+        self.assertFalse([c for c in fake.calls if c[0] == "send"])
+
+    def test_validation_failures_stay_retryable(self):
+        fake = Fake()
+        run(self.mod, fake, "read next")
+        self.assertEqual(run(self.mod, fake, "reply", b"   \n")[0], 2)
+        self.assertEqual(run(self.mod, fake, "reply", b"real\n")[0], 0)
+        self.assertEqual(len([c for c in fake.calls if c[0] == "send"]), 1)
 
     def test_reply_without_a_read_or_with_arguments_is_refused(self):
         self.assertEqual(run(self.mod, Fake(), "reply", b"x\n")[0], 2)
@@ -117,7 +144,7 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(run(self.mod, fake, "reply --to someone@kikin.helm", b"x\n")[0], 2)
 
     def test_reply_never_answers_her_own_mail(self):
-        json.dump({"from": "aura@honey.helm", "message-id": "<1.2@kikin.helm>", "subject": "s", "replied": False},
+        json.dump({"from": "aura@honey.helm", "message-id": "<1.2@kikin.helm>", "subject": "s"},
                   open(self.mod.LAST, "w"))
         self.assertEqual(run(self.mod, Fake(), "reply", b"x\n")[0], 2)
 
