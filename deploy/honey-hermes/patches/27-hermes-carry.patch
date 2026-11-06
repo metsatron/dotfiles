@@ -1,0 +1,268 @@
+diff --git a/agent/auxiliary_client.py b/agent/auxiliary_client.py
+index a171afac..1c813e8c 100644
+--- a/agent/auxiliary_client.py
++++ b/agent/auxiliary_client.py
+@@ -6160,7 +6160,7 @@ _DEFAULT_AUX_TIMEOUT = 30.0
+ # stream to time out and the compressor to fall back to the deterministic context marker (#54915). A floor
+ # is harmless for fast compression models (they finish before the deadline) and is a minimum, so a higher
+ # config value is kept unchanged.
+-_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
++_COMPRESSION_TIMEOUT_FLOOR_SECONDS = 600.0
+ 
+ 
+ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
+@@ -6286,6 +6286,18 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
+     return default
+ 
+ 
++def _get_task_max_tokens(task: str) -> Optional[int]:
++    """Read a positive output-token ceiling from ``auxiliary.<task>``."""
++    if not task:
++        return None
++    raw = _get_auxiliary_task_config(task).get("max_tokens")
++    try:
++        value = int(raw)
++    except (TypeError, ValueError):
++        return None
++    return value if value > 0 else None
++
++
+ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
+     """Explicit ``timeout`` wins, else config; compression gets a floor so a reasoning model
+     summarising a large context isn't cut off."""
+@@ -6527,6 +6539,9 @@ def _forwards_max_tokens(provider: str, provider_norm: str, model: str, effectiv
+         or provider_norm == "openrouter"
+         or base_url_host_matches(effective_base, "openrouter.ai")
+         or _is_managed_local_endpoint(effective_base)
++        # Honey local patch: compression carries an explicit configured output ceiling (auxiliary.compression.max_tokens)
++        # on every route, including the unmanaged loopback Aura endpoint, so a runaway summary cannot decode unbounded.
++        or str(task) == "compression"
+     )
+ 
+ 
+diff --git a/agent/context_compressor.py b/agent/context_compressor.py
+index 53bad5bd..1cf98475 100644
+--- a/agent/context_compressor.py
++++ b/agent/context_compressor.py
+@@ -25,6 +25,7 @@ from agent.auxiliary_client import (
+     CODEX_STREAM_STALL_MARKER,
+     AuxiliaryExplicitCancellation,
+     _coerce_llm_message,
++    _get_task_max_tokens,
+     _is_connection_error,
+     _message_field,
+     aux_interrupt_protection,
+@@ -843,13 +844,13 @@ def _next_timeout_cooldown(compressor: Any, counter: str = "_consecutive_timeout
+ _MIN_SUMMARY_TOKENS = 2000
+ _SUMMARY_RATIO = 0.20
+ # Summaries above ~10K tokens are themselves a context-pressure source.
+-_SUMMARY_TOKENS_CEILING = 10_000
++_SUMMARY_TOKENS_CEILING = 32_768
+ 
+ # After this many failures at one cursor, skip the exchange to avoid busy-looping.
+ _MICRO_COMPACT_MAX_CONSECUTIVE_FAILURES = 3
+ 
+ # Prompt-side char cap on the serialized turn block (~40K tokens; head+tail kept,
+-# see _bound_summary_input). NEVER add a max_tokens wire cap on the summary call.
++# see _bound_summary_input). The wire ceiling is separately bounded below.
+ _SUMMARY_INPUT_MAX_CHARS = 160_000
+ 
+ _PRUNED_TOOL_PLACEHOLDER = "[Old tool output cleared to save context space]"
+@@ -3779,8 +3780,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
+                 "api_mode": self.api_mode,
+             },
+             "messages": [{"role": "user", "content": prompt}], "route_info": _aux_route,
+-            # NO max_tokens: Anthropic/NIM wires forward it and a hard cap truncates summaries
+-            # (thinking models burn it on reasoning). Timeout comes from call_llm config.
++            "max_tokens": min(_get_task_max_tokens("compression") or _SUMMARY_TOKENS_CEILING,
++                               _SUMMARY_TOKENS_CEILING),
+         }
+         if self.summary_model:
+             call_kwargs["model"] = self.summary_model
+diff --git a/gateway/run.py b/gateway/run.py
+index 620fe26b..ce681792 100644
+--- a/gateway/run.py
++++ b/gateway/run.py
+@@ -689,6 +689,25 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
+     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
+ 
+ 
++_VOICE_NOTE_MARKER_RE = re.compile(
++    r"\[Sent (?:voice message|audio attachment|image attachment|"
++    r"video attachment|document attachment|\d+ media attachments?)\]",
++    re.IGNORECASE,
++)
++
++
++def _strip_voice_note_markers(text: str) -> str:
++    """Remove assistant-visible media mirror markers without touching real prose."""
++    if not text:
++        return text
++    stripped, count = _VOICE_NOTE_MARKER_RE.subn("", text)
++    if not count:
++        return text
++    stripped = re.sub(r"[ \t]+\n", "\n", stripped)
++    stripped = re.sub(r"\n{3,}", "\n\n", stripped).strip()
++    return stripped if stripped else text
++
++
+ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+     """Sanitize final gateway replies for chat surfaces: concise, secret-redacted provider failure
+     categories instead of raw HTTP bodies, request IDs, leaked credentials, or policy text."""
+@@ -723,7 +742,7 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
+     redacted = _redact_gateway_user_facing_secrets(str(text))
+     if _looks_like_gateway_provider_error(redacted):
+         return _gateway_provider_error_reply(redacted)
+-    return redacted
++    return _strip_voice_note_markers(redacted)
+ 
+ 
+ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str) -> Optional[str]:
+diff --git a/hermes_cli/config_defaults.py b/hermes_cli/config_defaults.py
+index 1196da72..50ed5b08 100644
+--- a/hermes_cli/config_defaults.py
++++ b/hermes_cli/config_defaults.py
+@@ -764,7 +764,7 @@ DEFAULT_CONFIG = {
+         # (Codex/Responses streams only): seconds without a substantive event before the stream
+         # fails fast; None = built-in 60s default. Independent of "timeout" (the overall request
+         # budget) — raising "timeout" alone does not widen this window. See #108104.
+-        "compression": _aux(120, no_progress_timeout=None),
++        "compression": _aux(600, max_tokens=32768, no_progress_timeout=None),
+         "skills_hub": _aux(30),
+         "approval": _aux(30),   # classifier — a fast/cheap model is recommended
+         # /review reviewer: a full subagent on the async delegation rail, credentials resolved like
+diff --git a/tests/agent/test_auxiliary_client.py b/tests/agent/test_auxiliary_client.py
+index 9e2960ca..6821ea47 100644
+--- a/tests/agent/test_auxiliary_client.py
++++ b/tests/agent/test_auxiliary_client.py
+@@ -468,6 +468,30 @@ class TestNousTagsScoping:
+ 
+         assert "extra_body" not in kwargs
+ 
++    def test_compression_task_sends_explicit_cap_to_openai_compatible_endpoint(self):
++        """Compression's configured ceiling must reach local OpenAI wires."""
++        kwargs = _build_call_kwargs(
++            provider="custom",
++            model="Aura",
++            messages=[{"role": "user", "content": "hi"}],
++            max_tokens=32_768,
++            base_url="http://127.0.0.1:8090/v1",
++            task="compression",
++        )
++        assert kwargs["max_tokens"] == 32_768
++
++    def test_compression_timeout_floor_is_600_seconds(self, monkeypatch):
++        """Configured compression calls get the doubled minimum deadline."""
++        from agent.auxiliary_client import _effective_aux_timeout
++
++        monkeypatch.setattr(
++            "agent.auxiliary_client._get_task_timeout",
++            lambda task: 120.0,
++        )
++        assert _effective_aux_timeout("compression", None) == 600.0
++        # Explicit caller deadlines remain authoritative.
++        assert _effective_aux_timeout("compression", 17.0) == 17.0
++
+ 
+ class TestNormalizeAuxProvider:
+     def test_main_provider_opencode_resolves_an_aux_client(self, monkeypatch):
+diff --git a/tests/agent/test_compression_attempt_telemetry.py b/tests/agent/test_compression_attempt_telemetry.py
+index 6319ded3..795a6bce 100644
+--- a/tests/agent/test_compression_attempt_telemetry.py
++++ b/tests/agent/test_compression_attempt_telemetry.py
+@@ -143,10 +143,7 @@ def test_aux_call_telemetry_records_durations_without_content(caplog):
+ 
+     payload = _extract_telemetry(caplog)
+     assert payload["aux_prompt_tokens"] is not None
+-    # Current main intentionally omits max_tokens from the aux summary call
+-    # (the summary budget is prompt-level guidance only), so no output
+-    # reservation is recorded.
+-    assert payload["aux_output_reservation"] is None
++    assert payload["aux_output_reservation"] == 32_768
+     assert isinstance(payload["aux_call_duration_ms"], int)
+     assert payload["aux_provider"]
+     assert payload["aux_model"]
+diff --git a/tests/agent/test_compression_small_ctx_threshold_floor.py b/tests/agent/test_compression_small_ctx_threshold_floor.py
+index 33bc6634..be2ef70c 100644
+--- a/tests/agent/test_compression_small_ctx_threshold_floor.py
++++ b/tests/agent/test_compression_small_ctx_threshold_floor.py
+@@ -7,7 +7,8 @@ Covers the July 2026 compression tuning pass:
+    blocks) must never reach the summarizer prompt, and traces emitted BY the
+    summarizer model must never be stored in the summary.
+ 2. Head/tail protection budgets stay proportionate (tail = 20% of threshold).
+-3. Summary token budget is bounded to the 1K-10K envelope.
++3. Summary token budget is bounded to the 1K-32K envelope and the request
++   carries a matching hard output ceiling.
+ 4. Models with context windows below 512K get their compression threshold
+    floored at 75% (raise-only — a higher configured value always wins).
+ """
+@@ -85,16 +86,9 @@ class TestReasoningExcludedFromSummarizer:
+ 
+ 
+ class TestSummaryBudgetEnvelope:
+-    def test_no_max_tokens_wire_cap_on_summary_call(self):
+-        """The summary budget is PROMPT GUIDANCE only ("Target ~N tokens").
+-
+-        A wire-level max_tokens cap truncates summaries mid-section on the
+-        Anthropic Messages / NVIDIA NIM paths (which forward the param), and
+-        thinking models burn the cap on reasoning before emitting the summary
+-        body — producing truncated or thinking-only summaries and compaction
+-        loops. The call must NOT carry max_tokens.
+-        """
+-        comp = _make(128_000)
++    def test_summary_call_carries_configured_output_cap(self):
++        """The prompt target and wire-level output ceiling are separate."""
++        comp = _make(1_000_000)
+         captured = {}
+ 
+         class FakeMsg:
+@@ -110,10 +104,11 @@ class TestSummaryBudgetEnvelope:
+             captured.update(kw)
+             return FakeResp()
+ 
+-        with patch.object(cc, "call_llm", side_effect=fake_call_llm):
++        with patch.object(cc, "_get_task_max_tokens", return_value=40_000), \
++             patch.object(cc, "call_llm", side_effect=fake_call_llm):
+             out = comp._generate_summary([{"role": "user", "content": "hi"}])
+         assert out is not None
+-        assert "max_tokens" not in captured
++        assert captured["max_tokens"] == 32_768
+ 
+ 
+ 
+diff --git a/tests/agent/test_unsupported_temperature_retry.py b/tests/agent/test_unsupported_temperature_retry.py
+index 28babcdc..d8c044b3 100644
+--- a/tests/agent/test_unsupported_temperature_retry.py
++++ b/tests/agent/test_unsupported_temperature_retry.py
+@@ -164,7 +164,7 @@ class TestCallLlmUnsupportedTemperatureRetry:
+                   side_effect=lambda resp, _task, **_kw: resp),
+         ):
+             result = call_llm(
+-                task="compression",
++                task="session_search",
+                 messages=[{"role": "user", "content": "remember this"}],
+                 temperature=0.3,
+                 max_tokens=500,
+@@ -176,6 +176,7 @@ class TestCallLlmUnsupportedTemperatureRetry:
+         retry_kwargs = client.chat.completions.create.call_args_list[1].kwargs
+         assert first_kwargs["temperature"] == 0.3
+         assert "temperature" not in retry_kwargs
++        # (Honey: moved off task=compression, which now carries an explicit ceiling.)
+         # max_tokens is intentionally omitted on OpenAI-compatible endpoints
+         # (#34530) — auxiliary calls let the model max out its own output — so
+         # it must be absent in BOTH the first and retry kwargs. Use a kwarg that
+diff --git a/tools/send_message_tool.py b/tools/send_message_tool.py
+index a8d5ba66..5a913158 100644
+--- a/tools/send_message_tool.py
++++ b/tools/send_message_tool.py
+@@ -443,6 +443,10 @@ def _weixin_env_pconfig():
+ 
+ def _describe_media_for_mirror(media_files):
+     """Return a human-readable mirror summary when a message only contains media."""
++    # Do not place a synthetic delivery marker into Aura's own assistant history:
++    # the marker is transport metadata and can be copied into later replies.
++    # The actual media delivery remains unchanged.
++    return ""
+     if not media_files:
+         return ""
+     if len(media_files) != 1:
