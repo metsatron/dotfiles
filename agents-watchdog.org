@@ -41,6 +41,27 @@ The successor resumes the committed candidate while still holding admission and 
 
 Readiness and acknowledgement timeouts keep the request and report an actionable, deduplicated pending state. A late valid receipt may complete the same transaction. A precommit request is consumed only with the adapter's matching failure acknowledgement and unchanged original pin. No timeout forces a bounce, rolls back a committed pin or discards accepted tasks. This source describes the implemented protocol; production injection persistence, wrapper readiness and permission checks still require a scoped runtime canary after authorized integration.
 
+** Hermes recovery transaction
+
+Hermes requests additionally bind the native gateway PID and kernel start ticks
+from the selected home. The owner receives that exact fence with =restart hermes=,
+so a replacement between observation and owner admission cannot authorize another
+bounce. Candidate preflight runs before stop. A directory-synced per-request
+=revivals/hermes.<request-id>.json= journal precedes effects; a failed or interrupted
+attempt remains for inspection and cannot replay automatically. The generic healer
+stands down while that queue entry owns the target. Success requires a different
+verified generation and targeted RUNNING readback, not just exit zero or PID reuse.
+
+There is no automatic credential/configuration rollback: without a reviewed prior
+artifact, such a rollback would be destructive. Failure records a recovery-required
+blocker and retains its request. Inspect the owner and journal before explicitly
+clearing/replacing that request. A failed preflight preserves the old generation
+and records a terminal blocked journal; repairing configuration permits a new request.
+Healthy Nurse Joy revives use =recover= (no bounce); only an explicit self-request
+uses =restart=. DEGRADED Hermes is recoverable through its owner; BLOCKED, STARTING
+and UNKNOWN are not automatic restart triggers. Other agents keep their existing
+classification and lifecycle behavior.
+
 ** Watchdog
 
 #+BEGIN_SRC python :tangle all/.local/bin/telegram-agent-watchdog :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755) :comments no
@@ -186,6 +207,9 @@ def run_manager(manager: str, args: list[str], timeout: int) -> subprocess.Compl
 
 def classify(agent: str, status_text: str) -> str:
     """Return up, down, or unknown from the agent's own status line."""
+    if agent == "hermes":
+        states = re.findall(r"(?m)^\s*hermes gateway run: ([A-Z]+)(?:\s|$)", status_text)
+        return {"RUNNING": "up", "STOPPED": "down", "DEGRADED": "down"}.get(states[0], "unknown") if len(states) == 1 else "unknown"
     pattern = STATUS_LABELS.get(agent)
     if pattern is None:
         return "unknown"
@@ -399,6 +423,24 @@ def boot_owns_lock(path: Path) -> bool:
 
 def generation_of(agent: str, pid_dir: Path) -> str | None:
     """Identity of the agent's supervisor: pid plus kernel start-time, or None when unfenced."""
+    if agent == "hermes":
+        home = Path(os.environ.get("HERMES_HOME") or Path.home() / ".hermes")
+        override = os.environ.get("HERMES_GATEWAY_PID_FILE")
+        paths = [Path(override)] if override else [home / "gateway_state.json", home / "gateway.pid"]
+        for path in paths:
+            try:
+                record = json.loads(path.read_text())
+                pid = record["pid"]
+                if record.get("kind") != "hermes-gateway" or type(pid) is not int or pid <= 1:
+                    continue
+                if record.get("hermes_home") and Path(record["hermes_home"]).resolve() != home.resolve():
+                    continue
+                generation = proc_generation(pid)
+                if generation == f"{pid}:{record['start_time']}":
+                    return generation
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return "absent"
     name = PID_FILES.get(agent)
     if name is None:
         return None
@@ -1022,6 +1064,131 @@ def request_main(argv: list[str]) -> int:
     return 0
 
 
+# Journal phases whose outcome is resolved: the request was consumed (or the
+# recovery completed), so nothing is left owning the next lifecycle decision.
+RESOLVED_REVIVAL_PHASES = {"ready", "blocked", "stale"}
+
+
+def hermes_unresolved_journal(state_dir: Path, identity: object = None) -> Path | None:
+    """Path of a retained Hermes revival journal whose outcome is unresolved.
+
+    An unresolved journal owns the recovery: the generation drift it left
+    behind is expected residue of an uncertain restart, so the request must be
+    retained for explicit reconciliation and the generic healer must stand down
+    even when the request file is absent. An unreadable retained journal fails
+    closed; a resolved phase never fences anything.
+    """
+    revivals = Path(state_dir) / "revivals"
+    if identity is not None:
+        if not re.fullmatch(r"[a-f0-9]{32}", str(identity)):
+            return None
+        candidates = [revivals / ("hermes.%s.json" % identity)]
+        if not candidates[0].exists():
+            return None
+    else:
+        # Only owner-issued 32-hex journal names claim lifecycle ownership.
+        # Unreadable/unknown content at that namespace requires explicit
+        # reconciliation (inspect then resolve/archive); no age-based expiry.
+        # Other malformed or unrelated filenames never acquire this fence.
+        candidates = sorted(p for p in revivals.glob("hermes.*.json")
+                            if re.fullmatch(r"hermes\.[a-f0-9]{32}\.json", p.name))
+    for path in candidates:
+        try:
+            journal = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return path
+        if not isinstance(journal, dict) or journal.get("phase") not in RESOLVED_REVIVAL_PHASES:
+            return path
+    return None
+
+
+def hermes_reconcile_notice(args, journal_path: Path, request: dict, host: str, when: dt.datetime) -> list[dict]:
+    """One critical notice per unresolved journal, then silent retention.
+
+    Mirrors the renewal journal's last_notice dedupe: the operator is alerted
+    once that explicit reconciliation is required; no automatic replay follows.
+    """
+    writable = True
+    try:
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        journal = {}
+        writable = False
+    if not isinstance(journal, dict):
+        journal = {}
+        writable = False
+    key = hashlib.sha256(("revive_reconcile:%s:%s" % (journal.get("phase"), journal.get("reason"))).encode()).hexdigest()
+    if journal.get("last_notice") == key:
+        return []
+    # Never overwrite undecodable evidence merely to deduplicate a notice.
+    if not args.dry_run and writable:
+        journal["last_notice"] = key
+        renew_journal_write(journal_path, journal)
+    return [make_event(host, "hermes", "revive_reconcile", "critical",
+                       "Hermes recovery needs explicit reconciliation",
+                       "A retained revival journal is unresolved and the recorded generation fence drifted; "
+                       "the request is retained and no automatic recovery was attempted",
+                       {"request": request.get("id"), "recovery": str(journal_path),
+                        "reason": str(journal.get("reason") or "inspect the retained journal and generation; no automatic replay")},
+                       when)]
+
+
+def process_hermes_request(args, request, path, host, when, now):
+    """One owner-mediated attempt; uncertain effects never replay on next cron.
+
+    No config or credential rollback: without a reviewed prior artifact there is
+    no safe automatic rollback. Retain failure for inspection, not another bounce.
+    """
+    identity = request.get("id")
+    if not re.fullmatch(r"[a-f0-9]{32}", str(identity)):
+        return [make_event(host, "hermes", "revive_rejected", "critical",
+                           "Hermes revive refused", "Invalid request identity; no lifecycle effects", {}, when)]
+    journal_path = Path(args.state_dir) / "revivals" / ("hermes." + identity + ".json")
+    def save(phase, reason):
+        renew_journal_write(journal_path, {"request": identity, "phase": phase,
+                    "generation": request.get("generation"), "reason": reason, "updated_at": now})
+    def event(kind, reason):
+        return [make_event(host, "hermes", kind, "notice" if kind == "revive_done" else "critical",
+                          "Hermes recovery " + kind, reason,
+                          {"request": identity, "recovery": str(journal_path), "reason": reason}, when)]
+    if hermes_unresolved_journal(args.state_dir) is not None or journal_path.exists():
+        # A crash after intent may have stopped or started a generation. Observe
+        # only; never repeat an effect whose completion is not known.
+        return []
+    if args.dry_run:
+        return []
+    try:
+        preflight = run_manager(args.manager, ["preflight", "hermes"], 30)
+        if preflight.returncode:
+            reason = "Candidate preflight refused; running generation preserved; repair configuration before a new request"
+            save("blocked", reason)
+            path.unlink(missing_ok=True)
+            return event("revive_rejected", reason)
+        before = generation_of("hermes", Path(args.pid_dir))
+        if before == "absent" or request.get("generation") != before:
+            reason = "Missing or changed Hermes generation fence; no restart attempted"
+            save("stale", reason)
+            path.unlink(missing_ok=True)
+            return event("revive_stale", reason)
+        save("restart-intent", "Owner restart pending; interrupted outcomes require inspection, no automatic replay")
+        started = run_manager(args.manager, ["restart", "hermes", before], args.start_timeout)
+        after = generation_of("hermes", Path(args.pid_dir))
+        probe = run_manager(args.manager, ["status", "hermes"], 60)
+        ok = (started.returncode == 0 and probe.returncode == 0 and classify("hermes", probe.stdout) == "up"
+              and after not in {"absent", before})
+        if ok:
+            save("ready", "Replacement generation and structural/transport readiness verified; reply delivery not exercised")
+            path.unlink(missing_ok=True)
+            return event("revive_done", "Replacement generation ready; no inference canary was issued")
+        reason = "Owner restart failed or replacement readiness unverified; inspect retained journal and generation; no automatic rollback or second restart"
+        save("recovery-required", reason)
+        return event("revive_failed", reason)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        reason = "Recovery outcome unknown; inspect owner and retained journal; no automatic replay or rollback"
+        save("recovery-required", reason)
+        return event("revive_failed", reason)
+
+
 def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.datetime, now: float) -> list[dict]:
     """Execute pending self-revive requests from outside the requesting process group."""
     events: list[dict] = []
@@ -1039,6 +1206,14 @@ def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.
             events.append(make_event(host, "*", "revive_rejected", "warning", "Malformed revive request dropped",
                                      "A revive request in the watchdog queue was unreadable and was dropped", {}, when))
             continue
+        if agent == "hermes":
+            # Global ownership precedes even request expiry/renewal handling.
+            # A different pending request cannot replay uncertain old effects.
+            journal = hermes_unresolved_journal(args.state_dir)
+            if journal is not None:
+                if journal.name == "hermes.%s.json" % request.get("id") and request.get("generation") != generation_of("hermes", Path(args.pid_dir)):
+                    events.extend(hermes_reconcile_notice(args, journal, request, host, when))
+                continue
         if request.get("mode") == "renew":
             # Requester-shell exit does not prove handler or delivery cleanup.
             events.extend(process_renewal(args, request, path, host, state, when, now))
@@ -1066,6 +1241,16 @@ def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.
             current_generation, _ = warm_resume_identity(warm_name, current_member)
         else:
             current_generation = generation_of(agent, Path(args.pid_dir))
+        if agent == "hermes":
+            # Resolve unresolved journal ownership FIRST: an uncertain
+            # restart leaves a retained journal whose generation drift is
+            # expected residue, not staleness. Retain the request for
+            # explicit reconciliation; never delete it or replay recovery.
+            journal = hermes_unresolved_journal(args.state_dir, request.get("id"))
+            if journal is not None:
+                if request.get("generation") != current_generation:
+                    events.extend(hermes_reconcile_notice(args, journal, request, host, when))
+                continue
         fence = request.get("generation")
         if warm_target and not isinstance(fence, str):
             path.unlink(missing_ok=True)
@@ -1084,6 +1269,12 @@ def process_requests(args: argparse.Namespace, host: str, state: dict, when: dt.
             events.append(make_event(host, agent, "revive_rejected", "warning", "%s revive is cooling down" % agent,
                                      "%s was self-revived less than %ss ago; request refused" % (agent, args.revive_cooldown),
                                      {"request": request.get("id")}, when))
+            continue
+        if agent == "hermes":
+            result = process_hermes_request(args, request, path, host, when, now)
+            events.extend(result)
+            if any(e["kind"] in {"revive_done", "revive_failed"} for e in result) and not args.dry_run:
+                revive[agent] = int(now)
             continue
         if warm_target:
             # Live-session guard before anything is killed: a warm revive whose
@@ -1203,13 +1394,23 @@ def main(argv: list[str]) -> int:
     status_text = status_run.stdout if status_run is not None else ""
 
     # Telegram agents relaunch through the host manager; warm Claude sessions through nurse-joy.
-    targets = [(agent, classify(agent, status_text), [args.manager, "start", agent]) for agent in enabled]
+    targets = [(agent, classify(agent, status_text),
+                [args.manager, "recover" if agent == "hermes" else "start", agent]) for agent in enabled]
     warm = read_warm_sessions(Path(args.warm_file))
     warm_status = warm_verdicts(args.nurse, warm, 60, args.tmux)
     targets += [("warm-" + name.lower(), warm_status[name], [args.nurse, "revive", "--no-visit", name.lower()]) for name in warm]
     supervised = {agent for agent, _, _ in targets}
 
     for agent, verdict, start_cmd in targets:
+        if agent == "hermes":
+            if (state_dir / "requests/hermes.json").exists():
+                outcomes[agent] = "revive-pending"
+                continue
+            if hermes_unresolved_journal(state_dir) is not None:
+                # A retained journal owns an unresolved recovery even with no
+                # request file; the generic healer must not call recover behind it.
+                outcomes[agent] = "recovery-unresolved"
+                continue
         if agent == "codex":
             # The durable renewal state machine exclusively owns stop/start
             # while pending. Generic liveness repair must not race its pause,
@@ -1270,6 +1471,9 @@ def main(argv: list[str]) -> int:
         try:
             started = run_manager(start_cmd[0], start_cmd[1:], args.start_timeout)
             outcomes[agent] = "relaunched" if started.returncode == 0 else "relaunch-failed"
+            if agent == "hermes" and started.returncode == 0:
+                probe = run_manager(args.manager, ["status", "hermes"], 60)
+                outcomes[agent] = "owner-ready" if probe.returncode == 0 and classify(agent, probe.stdout) == "up" else "relaunch-failed"
             entry["last_result"] = started.returncode
         except (OSError, subprocess.SubprocessError) as exc:
             outcomes[agent] = "relaunch-failed"
@@ -1922,6 +2126,11 @@ The tests drive the real watchdog against a fake =telegram-agent-host=. They ass
 from __future__ import annotations
 
 import json
+import importlib.util
+from importlib.machinery import SourceFileLoader
+from types import SimpleNamespace
+from unittest.mock import patch
+import datetime as dt
 import os
 from pathlib import Path
 import socket
@@ -1941,6 +2150,8 @@ case "$1" in
   status) cat "$root/status"; [ ! -f "$root/status_fail" ] || exit 1 ;;
   start) echo "$2" >> "$root/starts"; echo "start:$2" >> "$root/calls"; if [ -f "$root/start_fail" ]; then exit 1; fi
          [ ! -f "$root/status_after_start" ] || cp "$root/status_after_start" "$root/status" ;;
+  preflight) echo "preflight:$2" >> "$root/calls"; [ ! -f "$root/preflight_fail" ] || exit 78 ;;
+  recover) echo "recover:$2" >> "$root/calls"; [ ! -f "$root/start_fail" ] || exit 1 ;;
   stop) echo "stop:$2" >> "$root/calls"; [ ! -f "$root/stop_fail" ] || exit 1 ;;
   *) exit 2 ;;
 esac
@@ -1963,6 +2174,84 @@ if [ -f "$FAKE_ROOT/tmux_dead" ]; then echo "no server running on /tmp/tmux-1000
 if [ -f "$FAKE_ROOT/tmux_broken" ]; then echo "some other failure" >&2; exit 1; fi
 echo "Fable: 1 windows"
 """
+
+
+class HermesRecoveryJournalTests(unittest.TestCase):
+    def setUp(self):
+        spec = importlib.util.spec_from_loader("watchdog_recovery", SourceFileLoader("watchdog_recovery", str(WATCHDOG)))
+        self.w = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(self.w)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.args = SimpleNamespace(state_dir=str(self.root), pid_dir=str(self.root),
+                                    manager="fixture-manager", dry_run=False, start_timeout=1)
+        self.request = {"id": "a" * 32, "generation": "123:456"}
+        self.path = self.root / "request.json"
+        self.path.write_text(json.dumps(self.request))
+        self.when = dt.datetime.now(dt.timezone.utc)
+
+    def invoke(self, generations, probe="RUNNING", restart_code=0):
+        calls = []
+        def manager(command, args, timeout):
+            calls.append(args)
+            return SimpleNamespace(returncode=restart_code if args[0] == "restart" else 0,
+                                   stdout=f"  hermes gateway run: {probe}\n")
+        with patch.object(self.w, "run_manager", side_effect=manager), \
+             patch.object(self.w, "generation_of", side_effect=generations):
+            events = self.w.process_hermes_request(self.args, self.request, self.path,
+                                                 "fixture", self.when, 1000)
+        return events, calls
+
+    def test_only_owned_journal_names_fence_and_resolved_phases_release(self):
+        directory = self.root / "revivals"
+        directory.mkdir()
+        (directory / "hermes.stale-not-an-issued-id.json").write_text("broken")
+        self.assertIsNone(self.w.hermes_unresolved_journal(self.root))
+        owned = directory / ("hermes." + "b" * 32 + ".json")
+        for phase in ("ready", "blocked", "stale"):
+            owned.write_text(json.dumps({"phase": phase}))
+            self.assertIsNone(self.w.hermes_unresolved_journal(self.root))
+        with patch.object(Path, "read_text", side_effect=PermissionError("fixture")):
+            self.assertEqual(self.w.hermes_unresolved_journal(self.root), owned)
+
+    def test_reconciliation_notice_preserves_unreadable_journal_evidence(self):
+        journal = self.root / "retained.json"
+        journal.write_text("partial-journal-evidence")
+        self.w.hermes_reconcile_notice(self.args, journal, self.request, "fixture", self.when)
+        self.assertEqual(journal.read_text(), "partial-journal-evidence")
+
+    def test_status_reason_cannot_masquerade_as_readiness(self):
+        self.assertEqual(self.w.classify("hermes", "  hermes gateway run: UNKNOWN (previous RUNNING)\n"), "unknown")
+
+    def test_new_generation_and_ready_transport_required_for_success(self):
+        events, calls = self.invoke(["123:456", "234:567"])
+        self.assertEqual(events[0]["kind"], "revive_done")
+        self.assertEqual(calls, [["preflight", "hermes"], ["restart", "hermes", "123:456"], ["status", "hermes"]])
+        self.assertFalse(self.path.exists())
+
+    def test_pid_only_success_is_failed_and_never_replayed(self):
+        events, calls = self.invoke(["123:456", "123:456"])
+        self.assertEqual(events[0]["kind"], "revive_failed")
+        self.assertTrue(self.path.exists())
+        again, calls = self.invoke([])
+        self.assertEqual(calls, [])
+        journal = json.loads((self.root / "revivals" / ("hermes." + "a" * 32 + ".json")).read_text())
+        self.assertEqual(journal["phase"], "recovery-required")
+
+    def test_replacement_degraded_never_reports_up(self):
+        events, _ = self.invoke(["123:456", "234:567"], probe="DEGRADED")
+        self.assertEqual(events[0]["kind"], "revive_failed")
+        self.assertTrue(self.path.exists())
+
+    def test_changed_fence_never_restarts(self):
+        events, calls = self.invoke(["234:567"])
+        self.assertEqual(events[0]["kind"], "revive_stale")
+        self.assertEqual(calls, [["preflight", "hermes"]])
+
+    def test_owner_refusal_is_not_success_even_with_ready_snapshot(self):
+        events, _ = self.invoke(["123:456", "234:567"], restart_code=75)
+        self.assertEqual(events[0]["kind"], "revive_failed")
 
 
 class WatchdogTests(unittest.TestCase):
@@ -2188,6 +2477,40 @@ class WatchdogTests(unittest.TestCase):
         self.run_watchdog()
         self.assertFalse((self.root / "intent/codex").exists())
         self.assertIn("revive_failed", [e["kind"] for e in self.events()])
+
+    def test_hermes_request_preflight_refusal_never_stops_gateway(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: BLOCKED (missing reply route)\n")
+        (self.root / "preflight_fail").touch()
+        self.request("hermes", self.dead_pid())
+        self.run_watchdog()
+        self.assertNotIn("stop:hermes", self.calls())
+        self.assertNotIn("start:hermes", self.calls())
+        self.assertIn("revive_rejected", [e["kind"] for e in self.events()])
+
+    def test_old_unresolved_journal_fences_new_request_entrypoint(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: DEGRADED (fixture)\n")
+        self.assertEqual(self.request("hermes", self.dead_pid()).returncode, 0)
+        request = self.root / "state/requests/hermes.json"
+        original = request.read_bytes()
+        journals = self.root / "state/revivals"
+        journals.mkdir()
+        journal = journals / ("hermes." + "b" * 32 + ".json")
+        for content in (json.dumps({"phase": "restart-intent", "reason": "uncertain"}), "unreadable-json", json.dumps({"phase": "future-phase"})):
+            with self.subTest(content=content):
+                journal.write_text(content)
+                result = self.run_watchdog()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(request.read_bytes(), original)
+                self.assertEqual(journal.read_text(), content)
+
+    def test_hermes_degraded_routes_recovery_to_owner_not_blind_start(self):
+        (self.root / "enabled").write_text("hermes\n")
+        (self.root / "status").write_text("  hermes gateway run: DEGRADED (transport failed)\n")
+        self.run_watchdog()
+        self.assertEqual(self.calls(), ["recover:hermes"])
 
     def test_request_is_self_targeted_by_default(self) -> None:
         refused = self.request("ductor", self.dead_pid(), env={"TELEGRAM_AGENT_SELF": "codex"})
