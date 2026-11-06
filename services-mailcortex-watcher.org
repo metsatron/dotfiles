@@ -739,6 +739,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import fcntl
+import hashlib
 import ipaddress
 import json
 import os
@@ -2455,6 +2456,148 @@ def locked_scan(registry: dict, adapter: object, now: float | None = None) -> in
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+STALE_AFTER_SECONDS = 6 * 3600
+STALE_CHECK_SECONDS = 300
+STALE_REALERT_SECONDS = 24 * 3600
+HERALD = Path.home() / "HelmCortex/FORGE/bin/timeark-herald-dispatch"
+
+
+def stale_mail(seat: str, record: dict, now: float) -> list[tuple[float, str]]:
+    """Mail no transport delivered and nobody handled, older than STALE_AFTER_SECONDS.
+
+    A wake that was injected carried the mail into the agent, so only mail with
+    no injection and no terminal handling receipt counts. This is exactly what
+    a seat registered with the wrong transport leaves behind: Orca's seat stayed
+    on session-start polling after he moved to DSH, and 21 mails sat unseen for
+    34 hours (2026-11-07).
+    """
+    found = []
+    new = MAILCORTEX.mail_root() / record["mailbox"] / "new"
+    try:
+        paths = list(new.iterdir())
+    except OSError:
+        return found
+    for path in paths:
+        if not path.is_file() or path.is_symlink() or path.name.startswith("."):
+            continue
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        if now - mtime < STALE_AFTER_SECONDS:
+            continue
+        try:
+            mid = message_id(path)
+            old = safe_receipt(seat, mid)
+        except (OSError, WatcherError):
+            # Mail the watcher cannot read stops the whole seat, so it is the
+            # first thing to surface (Orca, 2026-11-07: 36 files without the
+            # watcher's ACL entry held his lane in failure backoff).
+            found.append((mtime, "unreadable:" + path.name[:80]))
+            continue
+        if old and (old.get("handling_state") in {"handling_completed", "handling_rejected"}
+                    or old.get("wake_state") == "injected"):
+            continue
+        found.append((mtime, mid))
+    return sorted(found)
+
+
+def stale_lane_event(seat: str, record: dict, stale: list[tuple[float, str]], revision: int,
+                     now: float) -> dict:
+    """One trusted timeark.fleet-incident.v1 record for the Herald (kind mail_lane_stale)."""
+    observed = datetime.fromtimestamp(now, timezone.utc).isoformat()
+    oldest_hours = int((now - stale[0][0]) // 3600)
+    condition = hashlib.sha256(json.dumps([seat, stale[0][1], len(stale)]).encode()).hexdigest()
+    incident = "mail-lane-" + hashlib.sha256(seat.encode()).hexdigest()[:32]
+    return {
+        "schema": "timeark.fleet-incident.v1",
+        "event_id": f"{incident}-{revision}",
+        "kind": "mail_lane_stale",
+        "occurred_at": observed,
+        "observed_at": observed,
+        "identity": {"host": record["host"], "owner": "metsatron", "agent": seat, "account": "mailcortex",
+                     "provider": record["harness"], "endpoint": "mailcortex:" + record["mailbox"],
+                     "model": "not-applicable", "auth_scope": "seat"},
+        "incident_id": incident,
+        "state_revision": revision,
+        "evidence": {"basis": "mailbox_receipts", "source_ref": "mailcortex:seat-watcher", "sha256": condition},
+        "summary": (f"{len(stale)} mail(s) waiting with no wake and no handling receipt; the oldest is "
+                    f"{oldest_hours} hours old; transport {record['transport']}")[:180],
+        "severity": "warning",
+    }
+
+
+def herald_notify(event: dict) -> bool:
+    """Queue and send one incident through the existing TimeArk Herald; True only on rc 0."""
+    if not HERALD.is_file():
+        return False
+    try:
+        MAILCORTEX.runtime_root().mkdir(parents=True, exist_ok=True)
+        fd, name = tempfile.mkstemp(prefix="stale-lane-", suffix=".json", dir=MAILCORTEX.runtime_root())
+    except OSError:
+        return False
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(event, handle)
+        result = subprocess.run([str(HERALD), "--incident-file", name], capture_output=True,
+                                text=True, timeout=180, check=False)
+        return result.returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        try:
+            os.unlink(name)
+        except OSError:
+            pass
+
+
+def check_stale_lanes(registry: dict, now: float, notify=herald_notify) -> list[str]:
+    """Alert once per stale episode per seat; re-alert daily or when the oldest mail changes.
+
+    Runs at most every STALE_CHECK_SECONDS. A failed notification is not
+    recorded, so the next check retries it. Returns the seats alerted.
+    """
+    path = MAILCORTEX.runtime_root() / "stale-lanes.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(state, dict) or not isinstance(state.get("seats"), dict):
+            state = {"seats": {}}
+    except (OSError, ValueError):
+        state = {"seats": {}}
+    if now - float(state.get("checked_at", 0) or 0) < STALE_CHECK_SECONDS:
+        return []
+    alerted = []
+    seats = {}
+    for seat, record in registry["seats"].items():
+        if record.get("parked"):
+            continue
+        stale = stale_mail(seat, record, now)
+        if not stale:
+            continue
+        prior = state["seats"].get(seat) if isinstance(state["seats"].get(seat), dict) else {}
+        entry = dict(prior)
+        due = (prior.get("oldest") != stale[0][1]
+               or now - float(prior.get("alerted_at", 0) or 0) >= STALE_REALERT_SECONDS)
+        if due:
+            revision = int(prior.get("revision", 0) or 0) + 1
+            if notify(stale_lane_event(seat, record, stale, revision, now)):
+                entry = {"oldest": stale[0][1], "revision": revision, "alerted_at": now}
+                alerted.append(seat)
+            else:
+                print(f"mailcortex-seat-watcher: seat={seat}: stale-lane alert not delivered; will retry",
+                      file=sys.stderr)
+        seats[seat] = entry
+    state = {"checked_at": now, "seats": seats}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(state), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+    return alerted
+
+
 def touch_heartbeat() -> None:
     """Record that a scan actually completed.
 
@@ -2478,6 +2621,10 @@ def main() -> int:
         while True:
             registry = load_registry(Path(args.registry).expanduser(), os.environ.get("MAILCORTEX_HOSTNAME", socket.gethostname()))
             locked_scan(registry, TransportAdapters())
+            try:
+                check_stale_lanes(registry, time.time())
+            except Exception as error:  # an alarm must never stop the wake loop
+                print(f"mailcortex-seat-watcher: stale-lane check failed: {diagnostic(error)}", file=sys.stderr)
             touch_heartbeat()
             if args.once:
                 return 0
