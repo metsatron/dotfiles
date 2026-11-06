@@ -7,6 +7,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -15,6 +16,7 @@ from unittest import mock
 
 HERE = Path(__file__).resolve()
 MANAGER = HERE.parents[3] / "bin" / "telegram-agent-host"
+REDACTOR = HERE.parents[3] / "bin" / "dsh-session-log"
 HOST = subprocess.check_output(["hostname"], text=True).strip().lower()
 
 
@@ -1558,13 +1560,57 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         manager_text = MANAGER.read_text(encoding="utf-8")
         detached = manager_text.index('exec nohup setsid env -u TELEGRAM_BOT_TOKEN')
         detached_shell = manager_text.index("bash -c '", detached)
-        redactor = manager_text.index("sed -u -E", detached_shell)
         launch = manager_text.index('exec dsh --profile "$DSH_TELEGRAM_PROFILE"', detached_shell)
+        redactor = manager_text.index("dsh-session-log", launch)
         pid_publish = manager_text.index('printf \'%s\\n\' "$launched_pid" > "$DSH_TELEGRAM_PID_FILE"', launch)
+        launch_block = manager_text[launch:pid_publish]
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
-        self.assertIn('NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE"', manager_text)
+        # The redactor is the only consumer of the detached harness stdout, so no
+        # unredacted line can reach the log. It is the managed script, not an
+        # inline sed pipeline: the launch URL must survive into a private file.
+        self.assertIn('"$DSH_TELEGRAM_LOG_FILE" "$DSH_WEB_URL_FILE"', launch_block)
+        self.assertNotIn("sed -u -E", launch_block)
+        self.assertNotIn("/usr/local/bin/dsh-session-log", manager_text)
+        self.assertIn('DSH_WEB_URL_FILE="$DSH_WEB_URL_FILE"', manager_text)
+        self.assertIn('NEURALWATT_API_KEY_FILE="${NEURALWATT_API_KEY_FILE:-}"', manager_text)
+
+    def test_deepseek_harness_redactor_scrubs_the_log_and_keeps_a_private_url(self) -> None:
+        self.assertTrue(REDACTOR.is_file(), f"managed log redactor missing: {REDACTOR}")
+        directory = self.root / "redactor"
+        directory.mkdir()
+        log = directory / "dsh.log"
+        url = directory / "dsh-web-url"
+        token = "SECRETTOKEN0123456789abcdef"
+        bot = "bot123456789:" + "A" * 30
+        payload = (
+            f"dsh web: http://127.0.0.1:3939/?token={token}\n"
+            f"{bot}\n"
+            "chatId=-10012345 bar-sync(-42) done\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(REDACTOR), str(log), str(url)],
+            input=payload,
+            text=True,
+            capture_output=True,
+            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        streamed = log.read_text(encoding="utf-8")
+        # Nothing secret survives into the log...
+        self.assertNotIn(token, streamed)
+        self.assertNotIn("A" * 30, streamed)
+        self.assertNotIn("10012345", streamed)
+        self.assertNotIn("-42", streamed)
+        self.assertIn("?token=[REDACTED]", streamed)
+        self.assertIn("bot[REDACTED]", streamed)
+        self.assertIn("chatId=[REDACTED]", streamed)
+        self.assertIn("bar-sync([REDACTED])", streamed)
+        # ...while the operator still gets the launch URL it needs, privately.
+        self.assertIn(f"http://127.0.0.1:3939/?token={token}", url.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(url.stat().st_mode), 0o600)
 
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
