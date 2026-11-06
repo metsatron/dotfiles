@@ -83,8 +83,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "start_ticks": start_ticks if start_ticks is not None else self.read_start_ticks(pid),
             "profile": profile,
             "generation": generation,
-            "provider": "helmcortex-opencode-go",
-            "model": "deepseek-v4.1-flash",
+            "provider": "neuralwatt",
+            "model": "deepseek-v4.1-flash-flex",
             "telegram_bot_identity_validated": True,
             "long_polling_owned": True,
             "ready_at": "2026-09-17T00:00:00Z",
@@ -532,8 +532,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
                 {
                     "security": {"allowedChatIds": allowed_chat_ids},
                     "model": {
-                        "provider": "helmcortex-opencode-go",
-                        "model": "deepseek-v4.1-flash",
+                        "provider": "neuralwatt",
+                        "model": "deepseek-v4.1-flash-flex",
                     },
                 }
             ),
@@ -551,13 +551,13 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             [
                 "llm-pi-ai:",
                 "  providers:",
-                "    helmcortex-opencode-go:",
-                "      displayName: HelmCortex OpenCode Go",
-                "      apiKeyEnv: OPENCODE_GO_API_KEY",
+                "    neuralwatt:",
+                "      displayName: NeuralWatt",
+                "      apiKeyEnv: NEURALWATT_API_KEY",
                 "      api: openai-completions",
-                "      baseURL: https://opencode.ai/zen/go/v1",
+                "      baseURL: https://api.neuralwatt.com/v1",
                 "      models:",
-                "        - id: deepseek-v4.1-flash",
+                "        - id: deepseek-v4.1-flash-flex",
                 "          contextWindow: 1048576",
                 "          compat:",
                 "            thinkingFormat: deepseek",
@@ -574,8 +574,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             [
                 "- id: agent-default-model",
                 "  config:",
-                "    provider: helmcortex-opencode-go",
-                "    model: deepseek-v4.1-flash",
+                "    provider: neuralwatt",
+                "    model: deepseek-v4.1-flash-flex",
                 "",
                 "- id: llm-deepseek",
                 "  disabled: true",
@@ -599,14 +599,14 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "\n".join(
                 [
                     f"TELEGRAM_BOT_TOKEN_FILE={token}",
-                    f"OPENCODE_GO_API_KEY_FILE={key}",
+                    f"NEURALWATT_API_KEY_FILE={key}",
                     f"DSH_HOME={self.home / '.local/share/deepseek-harness-telegram/dsh-home'}",
                     "DSH_TELEGRAM_PROFILE=helmcortex-telegram",
                     f"DSH_TELEGRAM_WORKSPACE={workspace}",
                     f"DSH_TELEGRAM_PLUGIN_ROOT={plugin}",
-                    "DSH_TELEGRAM_MODEL_PROVIDER=helmcortex-opencode-go",
-                    "DSH_TELEGRAM_MODEL=deepseek-v4.1-flash",
-                    "DSH_TELEGRAM_PROVIDER_BASE_URL=https://opencode.ai/zen/go/v1",
+                    "DSH_TELEGRAM_MODEL_PROVIDER=neuralwatt",
+                    "DSH_TELEGRAM_MODEL=deepseek-v4.1-flash-flex",
+                    "DSH_TELEGRAM_PROVIDER_BASE_URL=https://api.neuralwatt.com/v1",
                     "",
                 ]
             ),
@@ -764,7 +764,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
             "python3 - \"$DSH_TELEGRAM_READY_MARKER\" \"$pid\" \"$ticks\" <<'PY'\n"
             "import json, sys\n"
             "from pathlib import Path\n"
-            "Path(sys.argv[1]).write_text(json.dumps({'schema': 1, 'component': 'dsh-telegram', 'pid': int(sys.argv[2]), 'start_ticks': sys.argv[3], 'profile': 'helmcortex-telegram', 'provider': 'helmcortex-opencode-go', 'model': 'deepseek-v4.1-flash', 'telegram_bot_identity_validated': True, 'long_polling_owned': True}), encoding='utf-8')\n"
+            "Path(sys.argv[1]).write_text(json.dumps({'schema': 1, 'component': 'dsh-telegram', 'pid': int(sys.argv[2]), 'start_ticks': sys.argv[3], 'profile': 'helmcortex-telegram', 'provider': 'neuralwatt', 'model': 'deepseek-v4.1-flash-flex', 'telegram_bot_identity_validated': True, 'long_polling_owned': True}), encoding='utf-8')\n"
             "PY\n"
             "exit 0\n",
         )
@@ -903,7 +903,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.prepare_deepseek_harness([123])
         config = self.home / ".local/share/deepseek-harness-telegram/workspace/.pi/telegram.json"
         data = json.loads(config.read_text(encoding="utf-8"))
-        data["model"] = {"provider": "helmcortex-opencode-go", "model": "deepseek-v4-flash"}
+        data["model"] = {"provider": "neuralwatt", "model": "deepseek-v4-flash"}
         config.write_text(json.dumps(data), encoding="utf-8")
         result = self.run_manager("start", "deepseek-harness", timeout=2)
         self.assertEqual(result.returncode, 1)
@@ -919,8 +919,8 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         profile_patch.write_text(
             "- id: agent-default-model\n"
             "  config:\n"
-            "    provider: helmcortex-opencode-go\n"
-            "    model: deepseek-v4.1-flash\n",
+            "    provider: neuralwatt\n"
+            "    model: deepseek-v4.1-flash-flex\n",
             encoding="utf-8",
         )
         result = self.run_manager("start", "deepseek-harness", timeout=2)
@@ -933,8 +933,162 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertGreaterEqual(manager_text.count(provider_scrub), 2)
         self.assertIn("env -u TELEGRAM_BOT_TOKEN " + provider_scrub, manager_text)
         self.assertNotIn('DEEPSEEK_API_KEY="$DEEPSEEK_API_KEY"', manager_text)
+        self.assertNotIn('NEURALWATT_API_KEY="$NEURALWATT_API_KEY"', manager_text)
         self.assertNotIn('OPENCODE_GO_API_KEY="$OPENCODE_GO_API_KEY"', manager_text)
         self.assertNotIn('TELEGRAM_BOT_TOKEN="$TELEGRAM_BOT_TOKEN"', manager_text)
+
+    def test_deepseek_harness_pins_neuralwatt_flex_defaults(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        self.assertIn('DSH_TELEGRAM_MODEL_PROVIDER:-neuralwatt', manager_text)
+        self.assertIn('DSH_TELEGRAM_MODEL:-deepseek-v4.1-flash-flex', manager_text)
+        self.assertIn('DSH_TELEGRAM_PROVIDER_BASE_URL:-https://api.neuralwatt.com/v1', manager_text)
+        self.assertIn('neuralwatt/deepseek-v4.1-flash-flex/https://api.neuralwatt.com/v1', manager_text)
+        self.assertIn('helmcortex-opencode-go/deepseek-v4.1-flash/https://opencode.ai/zen/go/v1', manager_text)
+        self.assertIn('IFS= read -r NEURALWATT_API_KEY < "$NEURALWATT_API_KEY_FILE"', manager_text)
+        self.assertIn('export NEURALWATT_API_KEY', manager_text)
+
+    def test_deepseek_harness_manual_go_route_and_cross_route_refusal(self) -> None:
+        manager_text = MANAGER.read_text(encoding="utf-8")
+        route = manager_text.split("deepseek_harness_validate_route() {", 1)[1].split("\n}\n", 1)[0]
+        function = "deepseek_harness_validate_route() {" + route + "\n}\n"
+        routes = [
+            ("neuralwatt", "deepseek-v4.1-flash-flex", "https://api.neuralwatt.com/v1", 0),
+            ("helmcortex-opencode-go", "deepseek-v4.1-flash", "https://opencode.ai/zen/go/v1", 0),
+            ("neuralwatt", "deepseek-v4.1-flash", "https://api.neuralwatt.com/v1", 1),
+            ("helmcortex-opencode-go", "deepseek-v4.1-flash-flex", "https://opencode.ai/zen/go/v1", 1),
+            ("neuralwatt", "deepseek-v4.1-flash-flex", "https://opencode.ai/zen/go/v1", 1),
+            ("helmcortex-opencode-go", "deepseek-v4.1-flash", "https://api.neuralwatt.com/v1", 1),
+            ("deepseek", "deepseek-v4.1-flash", "https://opencode.ai/zen/go/v1", 1),
+        ]
+        for provider, model, url, expected in routes:
+            with self.subTest(provider=provider, model=model, url=url):
+                result = subprocess.run(["bash", "-c", function + 'DSH_TELEGRAM_MODEL_PROVIDER="$1"; DSH_TELEGRAM_MODEL="$2"; DSH_TELEGRAM_PROVIDER_BASE_URL="$3"; deepseek_harness_validate_route', "test", provider, model, url], capture_output=True, text=True)
+                self.assertEqual(result.returncode, expected, result.stderr)
+        self.assertIn('IFS= read -r OPENCODE_GO_API_KEY < "$OPENCODE_GO_API_KEY_FILE"', manager_text)
+        self.assertIn('export OPENCODE_GO_API_KEY', manager_text)
+
+    def test_deepseek_harness_catalogs_retain_manual_go_and_flex_default(self) -> None:
+        templates = MANAGER.parents[2] / ".bots/templates"
+        settings = (templates / "deepseek-harness-settings.yaml").read_text()
+        patch = (templates / "deepseek-harness-cordis.patch.yml").read_text()
+        for catalog in (settings, patch):
+            neural, go = catalog.split("    helmcortex-opencode-go:", 1)
+            self.assertIn("apiKeyEnv: NEURALWATT_API_KEY", neural)
+            self.assertNotIn("x-opencode-session", neural)
+            self.assertIn("apiKeyEnv: OPENCODE_GO_API_KEY", go)
+            self.assertIn("x-opencode-session: helmcortex-deepseek-harness", go)
+        self.assertIn("    provider: neuralwatt\n    model: deepseek-v4.1-flash-flex", patch)
+        config = json.loads((templates / "deepseek-harness-telegram.json").read_text())
+        self.assertEqual(config["model"], {"provider": "neuralwatt", "model": "deepseek-v4.1-flash-flex"})
+        env = (templates / "deepseek-harness-telegram.env").read_text()
+        self.assertIn("DSH_TELEGRAM_MODEL_PROVIDER=neuralwatt", env)
+        self.assertIn("OPENCODE_GO_API_KEY_FILE=YOUR_HELMCORTEX_OPENCODE_GO_KEY_FILE", env)
+
+    def durability_python(self, function: str) -> str:
+        text = MANAGER.read_text().split(function + "() {", 1)[1]
+        return text.split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+
+    def test_deepseek_harness_durability_native_credentials(self) -> None:
+        import sys
+        home = self.root.resolve() / "synthetic-dsh-home"
+        home.mkdir(mode=0o700)
+        store = home / ".credentials.yaml"
+        synthetic = "SYNTHETIC-FIXTURE-NOT-A-REAL-KEY"
+        baseline = "refs:\n  NEURALWATT_API_KEY: " + synthetic + "\n  OTHER_REF: SYNTHETIC-OTHER\n"
+        store.write_text(baseline)
+        store.chmod(0o600)
+        code = self.durability_python("deepseek_harness_provider_check")
+        env = dict(os.environ, DSH_HOME=str(home), DSH_TELEGRAM_MODEL_PROVIDER="neuralwatt",
+                   DSH_TELEGRAM_MODEL="deepseek-v4.1-flash-flex",
+                   DSH_TELEGRAM_PROVIDER_BASE_URL="https://api.neuralwatt.com/v1",
+                   NEURALWATT_API_KEY_FILE="")
+        # Real preflight code, mocked transport only; no network or live provider.
+        mock = ("import io,sys,urllib.request\n"
+                "def mocked(request, **kwargs):\n"
+                "    assert request.get_header('Authorization') == 'Bearer SYNTHETIC-FIXTURE-NOT-A-REAL-KEY'\n"
+                "    return io.StringIO('{\"data\":[{\"id\":\"deepseek-v4.1-flash-flex\"}]}')\n"
+                "urllib.request.urlopen = mocked\n")
+        def run(expected: int, prefix: str = "", mode: str = "validate") -> None:
+            result = subprocess.run([sys.executable, "-c", prefix + code, mode], env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertNotIn(synthetic, result.stdout + result.stderr)
+            self.assertNotIn("SYNTHETIC-OTHER", result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        run(0)
+        run(0, mock, "preflight")
+        self.assertEqual(store.read_text(), baseline)
+        store.chmod(0o640)
+        run(1)
+        store.chmod(0o600)
+        run(1, "import os\nos.geteuid = lambda: -1\n")
+        wrong_file_owner = ("import os\n_real_fstat = os.fstat\n"
+                            "def wrong_owner(fd):\n"
+                            "    fields = list(_real_fstat(fd)); fields[4] = -1\n"
+                            "    return os.stat_result(fields)\n"
+                            "os.fstat = wrong_owner\n")
+        run(1, wrong_file_owner)
+        store.write_text("refs: {}\n")
+        run(1)
+        store.write_text("refs: [malformed: [\n" + synthetic)
+        run(1)
+        store.write_text(baseline)
+        other = home / "synthetic-store"
+        store.rename(other)
+        store.symlink_to(other)
+        run(1)
+        store.unlink()
+        other.rename(store)
+        key = self.root / "synthetic-key-file"
+        key.write_text(synthetic + "\n")
+        key.chmod(0o600)
+        env["NEURALWATT_API_KEY_FILE"] = str(key)
+        run(0)
+        run(0, mock, "preflight")
+        run(1, wrong_file_owner)
+        key.chmod(0o644)
+        run(1)  # Do not hide an invalid explicit file behind a valid native ref.
+        key.unlink()
+        run(1)
+        env["NEURALWATT_API_KEY_FILE"] = ""
+        store.unlink()
+        run(1)
+
+    def test_deepseek_harness_durability_settings_semantics(self) -> None:
+        import copy
+        import sys
+        import yaml
+        template = MANAGER.parents[2] / ".bots/templates/deepseek-harness-settings.yaml"
+        approved = yaml.safe_load(template.read_text())
+        actual = self.root / "synthetic-settings.yaml"
+        code = self.durability_python("deepseek_harness_validate_private_config")
+        def run(data: dict, expected: int) -> None:
+            actual.write_text(yaml.safe_dump(data, sort_keys=True))
+            result = subprocess.run([sys.executable, "-c", code, str(actual), str(template)], text=True, capture_output=True)
+            self.assertEqual(result.returncode, expected, result.stderr)
+            self.assertNotIn("SYNTHETIC-INLINE-SECRET", result.stdout + result.stderr)
+            self.assertNotIn("Traceback", result.stderr)
+        run(approved, 0)
+        for provider, model in [("neuralwatt", "deepseek-v4.1-flash-flex"), ("helmcortex-opencode-go", "deepseek-v4.1-flash")]:
+            data = copy.deepcopy(approved)
+            data["agent-default-model"] = {"provider": provider, "model": model}
+            run(data, 0)
+        for field, value in [("baseURL", "https://unapproved.invalid"), ("apiKeyEnv", "OTHER_KEY"),
+                             ("apiKey", "SYNTHETIC-INLINE-SECRET"), ("headers", {"Authorization": "SYNTHETIC-INLINE-SECRET"}),
+                             ("models", [{"id": "unapproved"}])]:
+            data = copy.deepcopy(approved)
+            data["llm-pi-ai"]["providers"]["neuralwatt"][field] = value
+            run(data, 1)
+        data = copy.deepcopy(approved)
+        data["llm-pi-ai"]["providers"]["foreign"] = {}
+        run(data, 1)
+        data = copy.deepcopy(approved)
+        data["foreign-setting"] = {}
+        run(data, 1)
+        for selection in [None, {"provider": "neuralwatt", "model": "deepseek-v4.1-flash"},
+                          {"provider": "neuralwatt", "model": "deepseek-v4.1-flash-flex", "apiKey": "SYNTHETIC-INLINE-SECRET"}]:
+            data = copy.deepcopy(approved)
+            data["agent-default-model"] = selection
+            run(data, 1)
 
     def test_deepseek_harness_log_redactor_lives_in_detached_session(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
@@ -946,7 +1100,7 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
-        self.assertIn('OPENCODE_GO_API_KEY_FILE="$OPENCODE_GO_API_KEY_FILE"', manager_text)
+        self.assertIn('NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE"', manager_text)
 
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
