@@ -1922,6 +1922,7 @@ class ClaudeWarmTests(unittest.TestCase):
             "dev-mods",
             "cost-state",
             "tools-used",
+            "session-owner",
         ):
             entry = {"type": record_type, "sessionId": "fixture-session"}
             self.assertEqual(
@@ -1929,6 +1930,12 @@ class ClaudeWarmTests(unittest.TestCase):
                 "internal-" + record_type,
                 record_type,
             )
+        self.assertEqual(
+            module.transcript_entry_classification(
+                {"type": "system", "subtype": "informational", "isMeta": True}
+            ),
+            "internal-system",
+        )
         # A genuinely unrecognised record still fails closed.
         self.assertEqual(
             module.transcript_entry_classification({"type": "not-a-real-record"}),
