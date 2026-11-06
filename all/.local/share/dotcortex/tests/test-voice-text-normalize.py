@@ -82,7 +82,8 @@ class NormalizerTests(unittest.TestCase):
         raw = (
             "Read MailCortex delivery <179388615243.9498.7478661436905674088@kikin.helm>.\n"
             "Checked /home/metsatron/foo/bar.py and ~/.ductor/config/config.json with NEXUS/stow/ and and/or.\n"
-            "Found 45 skills on port 8080 in year 2026, with 100,000 items and UUID 01a1a5f3-530f-7920-a7d1-3766bfd6a64b."
+            "Found 45 skills on port 8080 in year 2026, with 100,000 items and UUID 01a1a5f3-530f-7920-a7d1-3766bfd6a64b.\n"
+            "Commit b9c3ad5a0573968a53bc8b8b1d91e854668c9204 and short 45a01e0 and key .863_b993d18854654cf880744a28fb62c853."
         )
         spoken = self.normalize(raw)
         self.assertNotIn("/", spoken)
@@ -90,6 +91,10 @@ class NormalizerTests(unittest.TestCase):
         self.assertNotIn("7478661436905674088", spoken)
         self.assertNotIn("100,000", spoken)
         self.assertNotIn("01a1a5f3", spoken)
+        self.assertNotIn("b9c3ad5a0573968a53bc8b8b1d91e854668c9204", spoken)
+        self.assertNotIn("0573968", spoken)
+        self.assertNotIn("45a01e0", spoken)
+        self.assertNotIn("b993d18854654cf", spoken)
         self.assertIn("home metsatron foo bar.py", spoken)
         self.assertIn(".ductor config config.json", spoken)
         self.assertIn("NEXUS stow", spoken)
