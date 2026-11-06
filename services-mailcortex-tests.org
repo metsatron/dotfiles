@@ -1619,6 +1619,83 @@ class WatcherTests(unittest.TestCase):
             with self.assertRaises(self.watcher.WatcherError):
                 load(seats)
 
+    def stale_fixture(self, *, age_hours=7, receipt=None):
+        self.mail("<stale-1@test-host.helm>", "stale-1")
+        path = self.mailbox / "new" / "stale-1"
+        old = 1_800_000_000 - age_hours * 3600
+        os.utime(path, (old, old))
+        if receipt:
+            self.watcher.MAILCORTEX.write_wake_receipt("builder", "<stale-1@test-host.helm>", receipt,
+                                                       wake_updated_at=old)
+        sent = []
+        return sent, (lambda event: sent.append(event) or True)
+
+    def test_stale_lane_alerts_once_for_undelivered_unhandled_mail(self):
+        sent, notify = self.stale_fixture()
+        now = 1_800_000_000
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now, notify), ["builder"])
+        event = sent[0]
+        self.assertEqual(event["kind"], "mail_lane_stale")
+        self.assertEqual(event["identity"]["agent"], "builder")
+        self.assertEqual(event["evidence"]["basis"], "mailbox_receipts")
+        self.assertIn("7 hours old", event["summary"])
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now + 400, notify), [])
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now + 25 * 3600, notify), ["builder"])
+        self.assertEqual(sent[-1]["state_revision"], 2)
+
+    def test_stale_lane_ignores_young_injected_handled_and_parked_mail(self):
+        now = 1_800_000_000
+        for kwargs in ({"age_hours": 2}, {"receipt": "injected"}):
+            sent, notify = self.stale_fixture(**kwargs)
+            self.assertEqual(self.watcher.check_stale_lanes(self.registry, now, notify), [], kwargs)
+            (self.runtime / "stale-lanes.json").unlink(missing_ok=True)
+            for leaf in ("new", "cur"):
+                for item in (self.mailbox / leaf).iterdir():
+                    item.unlink()
+        sent, notify = self.stale_fixture()
+        self.watcher.MAILCORTEX.write_handling_receipt("builder", "<stale-1@test-host.helm>", "handling_completed")
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now, notify), [])
+        self.registry["seats"]["builder"]["parked"] = True
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now + 400, notify), [])
+
+    def test_stale_lane_counts_mail_the_watcher_cannot_read(self):
+        path = self.mailbox / "new" / "broken"
+        path.write_bytes(b"From: a@test-host.helm\r\n\r\nno message id\r\n")
+        old = 1_800_000_000 - 7 * 3600
+        os.utime(path, (old, old))
+        sent = []
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, 1_800_000_000,
+                                                        lambda e: sent.append(e) or True), ["builder"])
+        self.assertEqual(self.watcher.stale_mail("builder", self.registry["seats"]["builder"], 1_800_000_000),
+                         [(old, "unreadable:broken")])
+
+    def test_stale_lane_retries_when_the_herald_fails(self):
+        sent, _ = self.stale_fixture()
+        now = 1_800_000_000
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now, lambda event: False), [])
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now + 400, lambda e: sent.append(e) or True),
+                         ["builder"])
+        self.assertEqual(sent[0]["state_revision"], 1)
+
+    def test_stale_lane_event_passes_the_herald_schema(self):
+        import sys as _sys
+        timeark = Path.home() / "HelmCortex/CORE/TimeArk"
+        if not (timeark / "modules/notifications/incidents.py").is_file():
+            self.skipTest("TimeArk is not on this host")
+        _sys.path.insert(0, str(timeark))
+        try:
+            from modules.notifications import incidents
+        except ImportError as error:  # TimeArk runs in its conda env; system Python may lack its deps
+            self.skipTest(f"TimeArk is not importable here: {error}")
+        if "mail_lane_stale" not in incidents.KINDS:
+            self.skipTest("this TimeArk predates mail_lane_stale")
+        from datetime import datetime, timezone
+        sent, notify = self.stale_fixture()
+        now = 1_800_000_000
+        self.watcher.check_stale_lanes(self.registry, now, notify)
+        incidents.validate(sent[0], datetime.fromtimestamp(now, timezone.utc))
+
     def deep_fixture(self):
         record = {"host": "test-host", "mailbox": "seats/builder", "harness": "deepseek",
                   "transport": "deepseek", "deepseek_url": "http://localhost:YOUR_PORT",
