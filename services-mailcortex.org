@@ -1534,3 +1534,209 @@ mailcortex inbox "$seat" 2>/dev/null |
     awk -F'\t' '$1=="new"{printf "%s\t%s\t%s\n", $2, $4, $5}' |
     sort -t$'\t' -k2
 #+END_SRC
+
+* Aura's MailCortex lane: the forced-command wrapper
+
+Aura reaches her mailbox (=aura@honey.helm=, =consorts/aura=) from Honey through one ssh key whose =authorized_keys= entry forces this script on kikin. It serves four verbs for that one mailbox, the sender is always her, and no shell is involved. Until 2026-11-07 it lived only as a hand-made file in =~/.local/bin=. It is now tracked here.
+
+The short forms exist because her model mis-copies long opaque names. The lane log shows five different wrong spellings of one Maildir filename in two minutes (2026-11-07 01:44, Admiral 11199). The forms are:
+- =read next=: the oldest unread message.
+- =read N=: the Nth inbox row, counted from 1.
+- =last=: the message the lane most recently read. It works with =receipt=, =send --to= and =send --in-reply-to=.
+
+So she never has to retype a filename, a Message-ID or a sender. Every resolved value is still validated against the same patterns as before.
+
+#+BEGIN_SRC python :tangle all/.local/bin/mailcortex-aura-wrapper :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Forced-command wrapper for Aura's MailCortex lane (runs on kikin as metsatron).
+
+Reached only through Aura's dedicated ssh key (authorized_keys: restrict + command=this script).
+It serves exactly four verbs for ONE mailbox, aura@honey.helm (consorts/aura), and nothing else:
+
+  inbox
+  read FILENAME | read next | read N        (next = oldest unread; N = Nth row of inbox, from 1)
+  send --to ADDRESS|last --subject SUBJECT [--in-reply-to '<Message-ID>'|last]   (body on stdin, max 8000 bytes)
+  receipt '<Message-ID>'|last handling_completed|handling_deferred|handling_failed|handling_rejected
+
+"last" always means the message this lane most recently read: its sender for --to, its Message-ID for
+--in-reply-to and receipt. Aura's model mis-copies the long Maildir filenames and Message-IDs (lane log,
+2026-11-07 01:44), so she never has to retype one (Admiral 11199).
+
+The sender is always aura@honey.helm and the seat/mailbox is always aura: neither can be chosen by the caller.
+No shell is ever involved: arguments are validated and passed as an argument list. Every call is logged
+(verb and metadata only, never message bodies) to ~/.local/state/mailcortex/aura-lane.log.
+"""
+import os
+import re
+import shlex
+import subprocess
+import sys
+import json
+import tempfile
+import time
+
+ME = "aura@honey.helm"
+SEAT = "aura"
+MAILCORTEX = "/home/metsatron/.local/bin/mailcortex"
+LOG = os.path.expanduser("~/.local/state/mailcortex/aura-lane.log")
+MAX_BODY = 8000
+ADDR = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}@[a-z0-9][a-z0-9.-]{0,63}\.helm$")
+FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:,=+-]{0,200}$")
+MSGID = re.compile(r"^<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,200}@[A-Za-z0-9.-]{1,100}>$")
+STATES = {"handling_completed", "handling_deferred", "handling_failed", "handling_rejected"}
+LAST = os.path.expanduser("~/.local/state/mailcortex/aura-lane-last.json")
+ENV = {"PATH": "/home/metsatron/.local/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/home/metsatron"}
+
+
+def inbox_rows():
+    out = subprocess.run([MAILCORTEX, "inbox", ME], env=ENV, capture_output=True, text=True)
+    if out.returncode != 0:
+        refuse("inbox unavailable")
+    return [line.split("\t") for line in out.stdout.splitlines() if line.count("\t") >= 1]
+
+
+def resolve_filename(token):
+    rows = inbox_rows()
+    if token == "next":
+        unread = [r[1] for r in rows if r[0] == "new" and len(r) > 1]
+        if not unread:
+            refuse("no unread mail")
+        return unread[0]
+    if token.isdigit():
+        n = int(token)
+        if not 1 <= n <= len(rows) or len(rows[n - 1]) < 2:
+            refuse(f"no row {n}; inbox has {len(rows)}")
+        return rows[n - 1][1]
+    return token
+
+
+def remember(stdout):
+    meta = {}
+    for line in stdout.splitlines():
+        if not line.strip():
+            break
+        key, _, value = line.partition(":")
+        if key.lower() in ("from", "message-id", "subject"):
+            meta[key.lower()] = value.strip()
+    if MSGID.match(meta.get("message-id", "")):
+        try:
+            with open(LAST, "w") as fh:
+                json.dump(meta, fh)
+        except OSError:
+            pass
+
+
+def last(field):
+    try:
+        with open(LAST) as fh:
+            value = json.load(fh).get(field, "")
+    except (OSError, ValueError):
+        refuse("no message read yet; run read next first")
+    if field == "from":
+        value = value.split("<")[-1].rstrip(">").strip() if "<" in value else value
+    return value
+
+
+def log(verb, detail=""):
+    try:
+        os.makedirs(os.path.dirname(LOG), exist_ok=True)
+        with open(LOG, "a") as fh:
+            fh.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} {verb} {detail}\n")
+    except OSError:
+        pass
+
+
+def refuse(why):
+    log("REFUSED", why)
+    print(f"mailcortex-aura: refused: {why}", file=sys.stderr)
+    sys.exit(2)
+
+
+def run(args):
+    env = {"PATH": "/home/metsatron/.local/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/home/metsatron"}
+    sys.exit(subprocess.run([MAILCORTEX, *args], env=env).returncode)
+
+
+def main():
+    raw = os.environ.get("SSH_ORIGINAL_COMMAND", "")
+    try:
+        argv = shlex.split(raw)
+    except ValueError:
+        refuse("unparseable command")
+    if not argv:
+        refuse("no command; verbs are inbox, read, send, receipt")
+    verb, rest = argv[0], argv[1:]
+
+    if verb == "inbox":
+        if rest:
+            refuse("inbox takes no arguments")
+        log("inbox")
+        run(["inbox", ME])
+
+    if verb == "read":
+        if len(rest) != 1 or not FILENAME.match(rest[0]):
+            refuse("usage: read FILENAME | read next | read N (no paths)")
+        name = resolve_filename(rest[0])
+        if not FILENAME.match(name):
+            refuse("bad file name")
+        log("read", name)
+        out = subprocess.run([MAILCORTEX, "read", ME, name], env=ENV, capture_output=True, text=True)
+        sys.stdout.write(out.stdout)
+        sys.stderr.write(out.stderr)
+        if out.returncode == 0:
+            remember(out.stdout)
+        sys.exit(out.returncode)
+
+    if verb == "receipt":
+        if len(rest) == 2 and rest[0] == "last":
+            rest = [last("message-id"), rest[1]]
+        if len(rest) != 2 or not MSGID.match(rest[0]) or rest[1] not in STATES:
+            refuse("usage: receipt '<Message-ID>' " + "|".join(sorted(STATES)))
+        log("receipt", f"{rest[0]} {rest[1]}")
+        run(["receipt", SEAT, rest[0], rest[1]])
+
+    if verb == "send":
+        opts, i = {}, 0
+        while i < len(rest):
+            key = rest[i]
+            if key not in ("--to", "--subject", "--in-reply-to") or i + 1 >= len(rest) or key in opts:
+                refuse("usage: send --to ADDRESS --subject SUBJECT [--in-reply-to '<Message-ID>'] (body on stdin)")
+            opts[key] = rest[i + 1]
+            i += 2
+        if opts.get("--to") == "last":
+            opts["--to"] = last("from")
+        if opts.get("--in-reply-to") == "last":
+            opts["--in-reply-to"] = last("message-id")
+        to, subject = opts.get("--to", ""), opts.get("--subject", "")
+        if not ADDR.match(to):
+            refuse("recipient must be a fleet address like name@host.helm")
+        if not subject or len(subject) > 200 or "\n" in subject or "\r" in subject:
+            refuse("subject must be 1-200 characters on one line")
+        reply = opts.get("--in-reply-to")
+        if reply is not None and not MSGID.match(reply):
+            refuse("in-reply-to must be a '<Message-ID>'")
+        body = sys.stdin.buffer.read(MAX_BODY + 1)
+        if not body.strip():
+            refuse("empty body")
+        if len(body) > MAX_BODY:
+            refuse(f"body over {MAX_BODY} bytes")
+        try:
+            body.decode("utf-8")
+        except UnicodeDecodeError:
+            refuse("body must be UTF-8 text")
+        log("send", f"to={to} subject_len={len(subject)} body_bytes={len(body)} reply={'yes' if reply else 'no'}")
+        with tempfile.TemporaryDirectory(prefix="aura-lane-", dir="/tmp") as tmp:
+            path = os.path.join(tmp, "body.txt")
+            with open(path, "wb") as fh:
+                fh.write(body)
+            args = ["send", "--from", ME, "--to", to, "--subject", subject, "--body-file", path, "--print-id"]
+            if reply:
+                args += ["--in-reply-to", reply]
+            env = {"PATH": "/home/metsatron/.local/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/home/metsatron"}
+            sys.exit(subprocess.run([MAILCORTEX, *args], env=env).returncode)
+
+    refuse("unknown verb; verbs are inbox, read, send, receipt")
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
