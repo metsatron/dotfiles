@@ -783,6 +783,12 @@ class WatcherError(Exception):
     pass
 
 
+class ReplyHistoryExceeded(WatcherError):
+    """The mail-back turn is older than the bounded session history the adapter reads."""
+
+REPLY_SETTLE_AFTER_SECONDS = 24 * 3600
+
+
 class PromptNotAdmittedError(WatcherError):
     """An exact negative ACK proving that a conditional prompt did not run."""
 
@@ -2019,7 +2025,7 @@ class DeepSeekAdapter:
                 if not page["records"] or min(item["event"]["seq"] for item in page["records"]) >= before:
                     raise WatcherError("DeepSeek mail-back history made no progress")
                 records.extend(page["records"])
-            raise WatcherError("DeepSeek mail-back exceeded its bounded history window")
+            raise ReplyHistoryExceeded("DeepSeek mail-back exceeded its bounded history window")
         except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, TypeError) as error:
             raise WatcherError("DeepSeek mail-back history is unavailable or malformed") from error
 
@@ -2184,7 +2190,20 @@ def reconcile_reply(seat: str, record: dict, adapter: object, now: float, path: 
     if state in {"delivered", "failed"}:
         return False
     if state == "pending":
-        state, body = adapter.reply(record, context["request_id"])
+        try:
+            state, body = adapter.reply(record, context["request_id"])
+        except ReplyHistoryExceeded:
+            # A reply that has scrolled out of the readable history can never be
+            # reconciled. Retrying it forever held Orca's whole lane in backoff
+            # and queued every new mail behind it (2026-11-07). After a day it is
+            # settled as failed, with the reason kept on the receipt.
+            injected_at = float(receipt.get("wake_updated_at") or now)
+            if now - injected_at < REPLY_SETTLE_AFTER_SECONDS:
+                raise
+            receipt.update(reply_state="failed", reply_ready_at=now,
+                           reply_reason="reply_history_window_exceeded")
+            MAILCORTEX.atomic_json(path, receipt)
+            return False
         if state == "pending":
             return True
         receipt.update(reply_state=state, reply_ready_at=now)
