@@ -130,6 +130,26 @@ class WrapperTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertFalse([c for c in fake.calls if c[0] == "send"])
 
+    def test_a_damaged_fence_refuses_without_sending_or_overwriting(self):
+        for content in ("{", "[]", "null", '"x"'):
+            fake = Fake()
+            run(self.mod, fake, "read next")
+            with open(self.mod.REPLIED, "w") as fh:
+                fh.write(content)
+            code, err = run(self.mod, fake, "reply", b"x\n")
+            self.assertEqual(code, 2, content)
+            self.assertIn("ledger", err)
+            self.assertFalse([c for c in fake.calls if c[0] == "send"], content)
+            self.assertEqual(open(self.mod.REPLIED).read(), content)
+
+    def test_a_falsey_entry_for_this_message_still_fences(self):
+        for value in ({}, None, "", 0):
+            fake = Fake()
+            run(self.mod, fake, "read next")
+            json.dump({"<222.2.99@kikin.helm>": value}, open(self.mod.REPLIED, "w"))
+            self.assertEqual(run(self.mod, fake, "reply", b"x\n")[0], 2, repr(value))
+            self.assertFalse([c for c in fake.calls if c[0] == "send"], repr(value))
+
     def test_validation_failures_stay_retryable(self):
         fake = Fake()
         run(self.mod, fake, "read next")
