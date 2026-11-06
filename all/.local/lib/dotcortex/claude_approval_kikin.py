@@ -6208,7 +6208,7 @@ def _telegram_attachment_policy(event, manifest, bind=False):
     return False, 'true_floor'
 
 
-TELEGRAM_CUSTODY_SHA256 = '82cdb590aeecb98c3b8b9100486164235388c2edcdeb3571db170b9c41252fa2'
+TELEGRAM_CUSTODY_SHA256 = 'caec26adfc90c26a73ce37e31475d54e9d1a1aa1bb90d815fa9bdbdeb88481e3'
 
 
 def classify(event, manifest):
