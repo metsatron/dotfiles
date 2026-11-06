@@ -3470,6 +3470,7 @@ import re
 import signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -3478,6 +3479,7 @@ from unittest import mock
 
 HERE = Path(__file__).resolve()
 MANAGER = HERE.parents[3] / "bin" / "telegram-agent-host"
+REDACTOR = HERE.parents[3] / "bin" / "dsh-session-log"
 HOST = subprocess.check_output(["hostname"], text=True).strip().lower()
 
 
@@ -5021,13 +5023,57 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         manager_text = MANAGER.read_text(encoding="utf-8")
         detached = manager_text.index('exec nohup setsid env -u TELEGRAM_BOT_TOKEN')
         detached_shell = manager_text.index("bash -c '", detached)
-        redactor = manager_text.index("sed -u -E", detached_shell)
         launch = manager_text.index('exec dsh --profile "$DSH_TELEGRAM_PROFILE"', detached_shell)
+        redactor = manager_text.index("dsh-session-log", launch)
         pid_publish = manager_text.index('printf \'%s\\n\' "$launched_pid" > "$DSH_TELEGRAM_PID_FILE"', launch)
+        launch_block = manager_text[launch:pid_publish]
         self.assertLess(detached_shell, launch)
         self.assertLess(launch, redactor)
         self.assertLess(redactor, pid_publish)
-        self.assertIn('NEURALWATT_API_KEY_FILE="$NEURALWATT_API_KEY_FILE"', manager_text)
+        # The redactor is the only consumer of the detached harness stdout, so no
+        # unredacted line can reach the log. It is the managed script, not an
+        # inline sed pipeline: the launch URL must survive into a private file.
+        self.assertIn('"$DSH_TELEGRAM_LOG_FILE" "$DSH_WEB_URL_FILE"', launch_block)
+        self.assertNotIn("sed -u -E", launch_block)
+        self.assertNotIn("/usr/local/bin/dsh-session-log", manager_text)
+        self.assertIn('DSH_WEB_URL_FILE="$DSH_WEB_URL_FILE"', manager_text)
+        self.assertIn('NEURALWATT_API_KEY_FILE="${NEURALWATT_API_KEY_FILE:-}"', manager_text)
+
+    def test_deepseek_harness_redactor_scrubs_the_log_and_keeps_a_private_url(self) -> None:
+        self.assertTrue(REDACTOR.is_file(), f"managed log redactor missing: {REDACTOR}")
+        directory = self.root / "redactor"
+        directory.mkdir()
+        log = directory / "dsh.log"
+        url = directory / "dsh-web-url"
+        token = "SECRETTOKEN0123456789abcdef"
+        bot = "bot123456789:" + "A" * 30
+        payload = (
+            f"dsh web: http://127.0.0.1:3939/?token={token}\n"
+            f"{bot}\n"
+            "chatId=-10012345 bar-sync(-42) done\n"
+        )
+        result = subprocess.run(
+            [sys.executable, str(REDACTOR), str(log), str(url)],
+            input=payload,
+            text=True,
+            capture_output=True,
+            env={"HOME": str(self.home), "PATH": os.environ.get("PATH", "/usr/bin:/bin")},
+            timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        streamed = log.read_text(encoding="utf-8")
+        # Nothing secret survives into the log...
+        self.assertNotIn(token, streamed)
+        self.assertNotIn("A" * 30, streamed)
+        self.assertNotIn("10012345", streamed)
+        self.assertNotIn("-42", streamed)
+        self.assertIn("?token=[REDACTED]", streamed)
+        self.assertIn("bot[REDACTED]", streamed)
+        self.assertIn("chatId=[REDACTED]", streamed)
+        self.assertIn("bar-sync([REDACTED])", streamed)
+        # ...while the operator still gets the launch URL it needs, privately.
+        self.assertIn(f"http://127.0.0.1:3939/?token={token}", url.read_text(encoding="utf-8"))
+        self.assertEqual(stat.S_IMODE(url.stat().st_mode), 0o600)
 
     def test_deepseek_harness_readiness_marker_contract_excludes_secrets_and_ids(self) -> None:
         manager_text = MANAGER.read_text(encoding="utf-8")
@@ -7161,6 +7207,13 @@ deepseek_harness_validate_install() {
         echo "DeepSeek Harness CLI not found in PATH; run loom npm:apply after tangling" >&2
         return 1
     fi
+    # The log redactor is the only consumer of the detached harness stdout. If it
+    # is missing, dsh would write into a dead pipe: the log loses the stream and
+    # the launch URL (and any secret it carries) is never split out. Refuse instead.
+    if ! env PATH="$AGENT_RUNTIME_PATH" bash -c 'command -v dsh-session-log >/dev/null 2>&1'; then
+        echo "dsh-session-log redactor not found in PATH; refusing an unredacted harness log" >&2
+        return 1
+    fi
     if [ ! -d "$DSH_TELEGRAM_PLUGIN_ROOT" ]; then
         echo "dsh-telegram checkout missing: $DSH_TELEGRAM_PLUGIN_ROOT" >&2
         return 1
@@ -7976,7 +8029,7 @@ start_agent() {
                             export OPENCODE_GO_API_KEY
                         fi
                         exec dsh --profile "$DSH_TELEGRAM_PROFILE" > >(
-                            /usr/local/bin/dsh-session-log \
+                            dsh-session-log \
                                 "$DSH_TELEGRAM_LOG_FILE" "$DSH_WEB_URL_FILE"
                         ) 2>&1 </dev/null
                     '
@@ -8315,6 +8368,99 @@ esac
 # Agent Control Script:1 ends here
 
 #+END_SRC
+
+* DSH Session Log Redactor
+
+The managed redactor that =telegram-agent-host= pipes the detached harness
+stdout through.
+
+#+BEGIN_SRC python :tangle all/.local/bin/dsh-session-log :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
+"""Redact a DeepSeek Harness log stream, and keep its one-time web URL.
+
+The harness prints `dsh web: http://host:port/?token=...` exactly once per start, and that
+token is the only way a browser can obtain its `dsh-auth-*` cookie. The log must not carry
+the token; the operator still needs the URL. So the stream is split here: redacted lines go
+to the log, the launch URL goes to a private file owned by the operator.
+
+    dsh --profile <p> | dsh-session-log <log-file> <url-file>
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+
+REDACTIONS = (
+    (re.compile(r"bot[0-9]{8,}:[A-Za-z0-9_-]{30,}"), "bot[REDACTED]"),
+    (re.compile(r"chatId=-?[0-9]+"), "chatId=[REDACTED]"),
+    (re.compile(r"bar-sync\(-?[0-9]+\)"), "bar-sync([REDACTED])"),
+    (re.compile(r"([?&]token=)[A-Za-z0-9_-]+"), r"\1[REDACTED]"),
+)
+URL = re.compile(r"https?://[^\s]*?[?&]token=[A-Za-z0-9_-]+")
+
+
+def _open_url_file(url_path: str) -> str:
+    """Create the URL file private, wherever the seat can actually write.
+
+    The launcher's state directory belongs to the operator while the harness runs as its own
+    uid, so a write there raises EACCES and the URL would be lost. Fall back to the seat's
+    own state directory; the operator reads it with privilege when they need it.
+    """
+    candidates = [url_path]
+    home = os.environ.get("HOME")
+    if home:
+        candidates.append(os.path.join(home, ".local", "state", "dsh-web-url"))
+    last: Exception | None = None
+    for path in candidates:
+        if not path:
+            continue
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            os.close(fd)
+            return path
+        except OSError as error:
+            last = error
+    raise SystemExit(f"dsh-session-log: no writable url file ({last})")
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 3:
+        print("usage: dsh-session-log <log-file> <url-file>", file=sys.stderr)
+        return 2
+    log_path = argv[1]
+    url_path = _open_url_file(argv[2])
+
+    with open(log_path, "a", encoding="utf-8", errors="replace") as log:
+        for raw in sys.stdin:
+            match = URL.search(raw)
+            if match:
+                with open(url_path, "w", encoding="utf-8") as handle:
+                    handle.write(match.group(0) + "\n")
+            line = raw
+            for pattern, replacement in REDACTIONS:
+                line = pattern.sub(replacement, line)
+            log.write(line)
+            log.flush()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
+#+END_SRC
+
+The harness prints its launch URL — and with it the process token that mints the
+=dsh-auth-= cookie — exactly once per start.  The redactor is therefore the only
+consumer of the detached harness stdout: the log gets redacted lines only, while
+the launch URL is written to a private (=0600=) file the operator reads.  Keeping
+the script in DotCortex versions the redaction contract and makes it testable;
+=telegram-agent-host= resolves it from =AGENT_RUNTIME_PATH=, which puts
+=~/.local/bin= ahead of any host-installed copy, and refuses to launch the
+harness when no redactor is resolvable.
 
 * Remote Start Helper
 
