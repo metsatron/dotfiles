@@ -2,6 +2,7 @@
 """Offline fixtures for fleet-wide spoken-reply text normalisation."""
 
 import io
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -227,6 +228,52 @@ class ReplyPathTests(unittest.TestCase):
         self.assertEqual(observed, ["Mail uses snake_case and a link."])
         self.assertNotIn("*", observed[0])
         self.assertNotIn("\\", observed[0])
+
+
+class ProviderWatcherTests(unittest.TestCase):
+    def test_codex_owner_routing_start_offset_and_duplicate_guard(self):
+        watcher_path = ROOT / "all/.local/share/dotcortex/honey-voice/bin/provider-rollout-watcher.py"
+        spec = importlib.util.spec_from_file_location("voice_watcher_fixture", watcher_path)
+        watcher = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(watcher)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            ductor = root / "ductor"
+            rollout_dir = home / ".codex/sessions/fixture"
+            rollout_dir.mkdir(parents=True)
+            (ductor / "config").mkdir(parents=True)
+            with (ductor / "config/config.json").open("w") as config:
+                json.dump({"allowed_user_ids": [424242]}, config)
+            session_id = "fixture-codex-session"
+            rollout = rollout_dir / ("rollout-" + session_id + ".jsonl")
+            old = {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "old"}}
+            rollout.write_text(json.dumps(old) + "\n")
+            watcher.DUCTOR = str(ductor)
+            watcher.ROLLOUT_HOME = str(home)
+            watcher.SESSIONS_GLOB = str(home / ".codex/sessions/**/rollout-*%s.jsonl")
+            watcher.STATE = str(root / "state")
+            watcher.OFFSETS = str(root / "state/offsets.json")
+            watcher.DELIVERIES = str(root / "state/deliveries.json")
+            watcher._threads_cache = {"mtime": None, "out": {}}
+            sessions = {
+                "telegram": {"transport": "tg", "chat_id": 424242,
+                              "provider_sessions": {"claude": {"session_id": "other"},
+                                                     "codex": {"session_id": session_id}}},
+                "background": {"transport": "internal", "chat_id": 424242,
+                                "provider_sessions": {"codex": {"session_id": "background"}}},
+            }
+            with (ductor / "sessions.json").open("w") as session_file:
+                json.dump(sessions, session_file)
+            calls = []
+            watcher.queue_voice = lambda text, chat: calls.append((text, chat))
+            with patch("sys.argv", [str(watcher_path), "--once"]):
+                watcher.main()
+                rollout.write_text(json.dumps(old) + "\n" + json.dumps(
+                    {"type": "event_msg", "payload": {"type": "task_complete", "last_agent_message": "new"}}) + "\n")
+                watcher.main()
+                watcher.main()
+            self.assertEqual(calls, [("new", 424242)])
 
 
 if __name__ == "__main__":
