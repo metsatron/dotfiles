@@ -1220,6 +1220,26 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(self.watcher.stale_mail("builder", self.registry["seats"]["builder"], 1_800_000_000),
                          [(old, "unreadable:broken")])
 
+    def test_unreachable_old_reply_settles_failed_after_a_day_not_forever(self):
+        mid = "<old-reply@test-host.helm>"
+        record = {"deepseek_session": "telegram-S"}
+        injected = 1_800_000_000
+        self.watcher.MAILCORTEX.write_wake_receipt(
+            "builder", mid, "injected", wake_updated_at=injected, reply_state="pending",
+            reply_context={"session": "telegram-S", "request_id": "r1"})
+        path = self.watcher.MAILCORTEX.receipt_path("builder", mid)
+        class Adapter:
+            def reply(self, record, request_id):
+                raise self_watcher.ReplyHistoryExceeded("window")
+        self_watcher = self.watcher
+        with self.assertRaises(self.watcher.ReplyHistoryExceeded):
+            self.watcher.reconcile_reply("builder", record, Adapter(), injected + 3600, path)
+        self.assertEqual(self.watcher.MAILCORTEX.load_receipt("builder", mid)["reply_state"], "pending")
+        self.assertFalse(self.watcher.reconcile_reply("builder", record, Adapter(), injected + 25 * 3600, path))
+        receipt = self.watcher.MAILCORTEX.load_receipt("builder", mid)
+        self.assertEqual(receipt["reply_state"], "failed")
+        self.assertEqual(receipt["reply_reason"], "reply_history_window_exceeded")
+
     def test_stale_lane_retries_when_the_herald_fails(self):
         sent, _ = self.stale_fixture()
         now = 1_800_000_000
