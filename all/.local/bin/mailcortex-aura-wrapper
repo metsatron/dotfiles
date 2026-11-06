@@ -24,6 +24,7 @@ import re
 import shlex
 import subprocess
 import sys
+import fcntl
 import json
 import tempfile
 import time
@@ -38,6 +39,8 @@ FILENAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:,=+-]{0,200}$")
 MSGID = re.compile(r"^<[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,200}@[A-Za-z0-9.-]{1,100}>$")
 STATES = {"handling_completed", "handling_deferred", "handling_failed", "handling_rejected"}
 LAST = os.path.expanduser("~/.local/state/mailcortex/aura-lane-last.json")
+REPLIED = os.path.expanduser("~/.local/state/mailcortex/aura-lane-replied.json")
+FENCE_LOCK = os.path.expanduser("~/.local/state/mailcortex/aura-lane-replied.lock")
 ENV = {"PATH": "/home/metsatron/.local/bin:/usr/local/bin:/usr/bin:/bin", "HOME": "/home/metsatron"}
 
 
@@ -64,7 +67,7 @@ def resolve_filename(token):
 
 
 def remember(stdout, name=""):
-    meta = {"filename": name, "replied": False}
+    meta = {"filename": name}
     for line in stdout.splitlines():
         if not line.strip():
             break
@@ -77,6 +80,23 @@ def remember(stdout, name=""):
                 json.dump(meta, fh)
         except OSError:
             pass
+
+
+def _fence_load():
+    try:
+        with open(REPLIED) as fh:
+            value = json.load(fh)
+        return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _fence_store(fence):
+    os.makedirs(os.path.dirname(REPLIED), exist_ok=True)
+    tmp = REPLIED + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(fence, fh)
+    os.replace(tmp, REPLIED)
 
 
 def last(field):
@@ -202,8 +222,6 @@ def main():
                 meta = json.load(fh)
         except (OSError, ValueError):
             refuse("no message read yet; run `mailcortex-aura read next` first")
-        if meta.get("replied"):
-            refuse("already replied to the message last read; run `mailcortex-aura read next` for the next one")
         raw_from, mid = meta.get("from", ""), meta.get("message-id", "")
         to = raw_from.split("<")[-1].rstrip(">").strip() if "<" in raw_from else raw_from.strip()
         if not ADDR.match(to) or to == ME:
@@ -223,10 +241,23 @@ def main():
             body.decode("utf-8")
         except UnicodeDecodeError:
             refuse("body must be UTF-8 text")
-        # Mark first, so a crash or a retry can never send twice; unmark only on a failed send.
-        meta["replied"] = True
-        with open(LAST, "w") as fh:
-            json.dump(meta, fh)
+        # The fence is keyed by Message-ID and held under a lock across check and mark, so a
+        # re-read of the same message or two concurrent calls can never dispatch twice. Once a
+        # send has been invoked the entry stays, whatever the outcome: a non-zero return does
+        # not prove nothing was submitted. Only the validation above is safely retryable.
+        os.makedirs(os.path.dirname(FENCE_LOCK), exist_ok=True)
+        with open(FENCE_LOCK, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fence = _fence_load()
+            prior = fence.get(mid)
+            if prior:
+                state = prior.get("state")
+                if state == "sent":
+                    refuse("you already replied to this message; run `mailcortex-aura read next` for the next one")
+                refuse("a reply to this message was already attempted and may have been delivered; "
+                       "do not resend, tell Mètsàtron instead")
+            fence[mid] = {"state": "dispatching", "to": to, "at": time.strftime("%Y-%m-%dT%H:%M:%S%z")}
+            _fence_store(fence)
         log("reply", f"to={to} reply_to={mid} body_bytes={len(body)}")
         with tempfile.TemporaryDirectory(prefix="aura-lane-", dir="/tmp") as tmp:
             path = os.path.join(tmp, "body.txt")
@@ -234,16 +265,25 @@ def main():
                 fh.write(body)
             sent = subprocess.run([MAILCORTEX, "send", "--from", ME, "--to", to, "--subject", subject,
                                    "--body-file", path, "--in-reply-to", mid, "--print-id"], env=ENV)
+        with open(FENCE_LOCK, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            fence = _fence_load()
+            fence[mid] = {**fence.get(mid, {}), "state": "sent" if sent.returncode == 0 else "uncertain",
+                          "send_rc": sent.returncode}
+            _fence_store(fence)
         if sent.returncode != 0:
-            meta["replied"] = False
-            with open(LAST, "w") as fh:
-                json.dump(meta, fh)
-            log("reply-failed", f"rc={sent.returncode}")
+            log("reply-uncertain", f"{mid} rc={sent.returncode}")
+            print("mailcortex-aura: the send did not confirm. It may or may not have gone out, so it will not "
+                  "be retried; tell Mètsàtron.", file=sys.stderr)
             sys.exit(sent.returncode)
         done = subprocess.run([MAILCORTEX, "receipt", SEAT, mid, "handling_completed"], env=ENV)
         log("reply-receipt", f"{mid} rc={done.returncode}")
+        if done.returncode != 0:
+            print("mailcortex-aura: reply sent, but the handling receipt failed; the reply stands, do not resend.",
+                  file=sys.stderr)
+            sys.exit(done.returncode)
         print(f"replied to {to} and recorded handling_completed for the message you last read")
-        sys.exit(done.returncode)
+        sys.exit(0)
 
     refuse("unknown verb; verbs are inbox, read, reply, send, receipt")
 
