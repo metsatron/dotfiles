@@ -1,7 +1,10 @@
-# Shared by phaseB-backup.sh / go-live.sh / rollback.sh. Paths are overridable ONLY for the /tmp rehearsal.
+# Shared by the deploy scripts. Paths are overridable ONLY for the /tmp rehearsal.
 : "${HH:=/home/gille/.hermes}"            # hermes home
 : "${WS:=/home/gille/src}"                # webui parent
 : "${BK:=/var/lib/hermes-upgrade/backups}"
+: "${LB:=/home/gille/.local/bin}"         # launcher directory
+: "${INITD:=/etc/init.d}"
+: "${OWNER:=gille}"
 : "${RC:=rc-service}"
 : "${SKIP_PROC_CHECK:=0}"
 die(){ echo "ABORT: $*" >&2; exit 1; }
