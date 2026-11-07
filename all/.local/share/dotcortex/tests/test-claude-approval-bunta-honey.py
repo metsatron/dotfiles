@@ -304,10 +304,17 @@ class BuntaReplayTests(unittest.TestCase):
                         "ssh kikin bunta-ops git dotcortex log --output=x",
                         "ssh kikin bunta-ops git helmcortex branch --show-current",
                         "ssh kikin bunta-ops git dc-wt/x diff --stat",
-                        "ssh kikin bunta-ops status"):
+                        "ssh kikin bunta-ops status",
+                        # 2026-11-07: Bunta's whole mail loop, so it never waits on the Admiral.
+                        "ssh kikin bunta-ops mail-new",
+                        "ssh kikin bunta-ops mail-receipt 179398882462.12618.11296359807829242148@honey.helm completed",
+                        "ssh kikin bunta-ops mail-send hermes@kikin.helm bunta-reply.md 1794.1@kikin.helm"):
             with self.subTest(command=command):
                 self.assertEqual(grant(command), "coordinator_ops_tool")
         for command in ("ssh kikin bunta-ops mail-read -x",
+                        "ssh kikin bunta-ops mail-receipt '<1794.1@kikin.helm>' completed",
+                        "ssh kikin bunta-ops mail-receipt 1794.1@kikin.helm completed;id",
+                        "ssh kikin bunta-ops mail-delete 1794.1@kikin.helm",
                         "ssh kikin bunta-ops status -v",
                         "ssh kikin bunta-ops logs -v",
                         "ssh kikin bunta-ops git -5 log",

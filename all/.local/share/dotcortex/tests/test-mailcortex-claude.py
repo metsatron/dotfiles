@@ -425,6 +425,104 @@ class ClaudeWakeTests(unittest.TestCase):
         self.assertEqual(result["status"], "accepted")
         self.assertEqual([call.args[1] for call in w.write_all.call_args_list], [text.encode("ascii"), b"\r"])
 
+    def hold_owner(self, clock):
+        # The overnight shape: a turn whose tool call was hold-denied. Claude
+        # fired no Stop, so the owner is still "active" from that turn.
+        o = self.fake_owner()
+        o.status = "active"; o.last_normal_stop = 5; o.last_lifecycle_activity = 10
+        o.mailcortex_hold_notice = None; o.mailcortex_hold_idle_at = None
+        o.mailcortex_post_compact_idle_at = None; o.mailcortex_startup_idle_at = None
+        w = self.fake_warm(); w.now = lambda: clock[0]
+        return o, w
+
+    def hold_factory(self, owner, text):
+        return dict(self.request(), text=text)
+
+    def test_hold_notice_text_is_bounded_ascii_and_names_only_a_queue_id(self):
+        for queue_id, label in (("8cff4170a00bcf12e8fff170", "8cff4170a00bcf12e8fff170"), (None, "unrecorded"),
+                                ("x; rm -rf /", "unrecorded"), ("A" * 24, "unrecorded"), ("f" * 65, "unrecorded")):
+            with self.subTest(queue_id=queue_id):
+                text = self.c.hold_notice_text(queue_id)
+                self.assertIn("as " + label + ".", text)
+                self.assertNotIn("rm -rf", text)
+                self.assertLessEqual(len(text), 400)
+                self.assertTrue(all(32 <= ord(ch) <= 126 for ch in text))
+                self.assertIn("not Metsatron", text)
+                self.assertIn("Do not retry it", text)
+
+    def test_hold_denied_turn_ends_and_the_notice_is_admitted_exactly_once(self):
+        clock = [100.0]; o, w = self.hold_owner(clock)
+        self.c.hold_notice_record(o, "8cff4170a00bcf12e8fff170", w)
+        text = self.c.hold_notice_text("8cff4170a00bcf12e8fff170")
+        with mock.patch.object(self.c, "owner_matches", return_value=True), \
+             mock.patch.object(self.c, "pending_terminal", return_value=False):
+            # The settle window lets the interrupted turn finish redrawing.
+            self.assertIsNone(self.c.hold_notice_tick(o, w, self.hold_factory))
+            self.assertEqual(o.status, "active")
+            w.write_all.assert_not_called()
+            clock[0] = 104.0
+            self.assertEqual(self.c.hold_notice_tick(o, w, self.hold_factory), "accepted")
+            self.assertEqual(o.mailcortex_hold_idle_at, 104.0)
+            self.assertEqual([call.args[1] for call in w.write_all.call_args_list], [text.encode("ascii"), b"\r"])
+            self.assertIsNone(o.mailcortex_hold_notice)
+            clock[0] = 200.0
+            self.assertIsNone(self.c.hold_notice_tick(o, w, self.hold_factory))
+        self.assertEqual(len(w.write_all.call_args_list), 2)
+        o._guard_log.assert_any_call("hold-denied-turn-ended")
+        o._guard_log.assert_any_call("hold-notice-delivered", status="accepted")
+
+    def test_hold_boundary_admits_mail_and_a_later_stop_supersedes_it(self):
+        clock = [100.0]; o, w = self.hold_owner(clock)
+        o.status = "idle"; o.mailcortex_hold_idle_at = 104.0
+        self.assertEqual(self.c.wake_idle_boundary(o), 104.0)
+        with mock.patch.object(self.c, "owner_matches", return_value=True), \
+             mock.patch.object(self.c, "pending_terminal", return_value=False):
+            self.assertEqual(self.c.owner_control(o, self.request(), w)["status"], "accepted")
+        o.last_normal_stop = 150.0
+        self.assertEqual(self.c.wake_idle_boundary(o), 150.0)
+        o.mailcortex_post_compact_idle_at = 160.0
+        self.assertEqual(self.c.wake_idle_boundary(o), 160.0)
+
+    def test_hold_notice_never_ends_a_turn_that_moved_on_or_speaks_over_a_human(self):
+        cases = (("lifecycle-after-deny", "busy", "active"), ("permission-screen", None, "active"),
+                 ("pending-terminal", None, "active"), ("compacting", "busy", "active"),
+                 ("human-typed", "human-present", "active"), ("input-dirty", "human-present", "active"),
+                 ("expired", "expired", "active"))
+        for case, expected, status in cases:
+            with self.subTest(case=case):
+                clock = [100.0]; o, w = self.hold_owner(clock)
+                self.c.hold_notice_record(o, "8cff4170a00bcf12e8fff170", w)
+                clock[0] = 104.0
+                pending = False
+                if case == "lifecycle-after-deny": o.last_lifecycle_activity = 101.0
+                elif case == "permission-screen": o.screen_state = "blocked"
+                elif case == "pending-terminal": pending = True
+                elif case == "compacting": o.compacting = True
+                elif case == "human-typed": o.last_local_input = 101.0
+                elif case == "input-dirty": o.mailcortex_input_dirty = True
+                elif case == "expired": clock[0] = 100.0 + self.c.HOLD_NOTICE_WINDOW_SECONDS + 1
+                with mock.patch.object(self.c, "owner_matches", return_value=True), \
+                     mock.patch.object(self.c, "pending_terminal", return_value=pending):
+                    self.assertEqual(self.c.hold_notice_tick(o, w, self.hold_factory), expected)
+                self.assertEqual(o.status, status)
+                self.assertIsNone(o.mailcortex_hold_idle_at)
+                w.write_all.assert_not_called()
+                if expected in {"human-present", "expired"}:
+                    self.assertIsNone(o.mailcortex_hold_notice)
+                else:
+                    self.assertIsNotNone(o.mailcortex_hold_notice)
+
+    def test_hold_notice_without_owner_identity_is_dropped_not_guessed(self):
+        clock = [100.0]; o, w = self.hold_owner(clock)
+        self.c.hold_notice_record(o, None, w)
+        clock[0] = 104.0
+        def no_identity(owner, text):
+            raise OSError("no controlling terminal")
+        with mock.patch.object(self.c, "pending_terminal", return_value=False):
+            self.assertEqual(self.c.hold_notice_tick(o, w, no_identity), "no-owner-identity")
+        w.write_all.assert_not_called()
+        self.assertIsNone(o.mailcortex_hold_notice)
+
     def test_captured_uncleared_box_is_unknown_without_retyping(self):
         o = self.fake_owner(); w = self.fake_warm()
         o.screen_classifier = load("unsent_screen", BIN / "claude-warm").ClaudeScreenClassifier()

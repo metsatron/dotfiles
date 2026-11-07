@@ -382,8 +382,9 @@ class SparseTests(unittest.TestCase):
     """The sparse system checkout carries everything the lane runs from DotCortex."""
 
     # all/.local/bin names that occur here only as English, or (mailcortex) as
-    # claude-warm's injection-purpose label, never as a command it runs
-    PROSE_WORDS = {"agent", "launch", "mailcortex"}
+    # claude-warm's injection-purpose label, never as a command it runs;
+    # bunta-ops is Bunta's Kikin tool, only ever reached as `ssh kikin bunta-ops`
+    PROSE_WORDS = {"agent", "launch", "mailcortex", "bunta-ops"}
 
     def patterns(self):
         return [l.strip() for l in (SHARE / "SPARSE").read_text().splitlines() if l.strip()]

@@ -695,6 +695,34 @@ class PtyHoldTests(unittest.TestCase):
         self.assertEqual(len(ledger.read_text().splitlines()),3)
         self.assertEqual(json.loads(ledger.read_text().splitlines()[-1])['queue_id'],records[-1]['id'])
 
+    def test_landed_deny_tells_the_owner_with_its_queue_id_even_when_recording_fails(self):
+        # 2026-11-07: the agent saw only Claude's generic refusal. The owner
+        # must learn the deny landed, with the Desk id, or with None if the
+        # queue write itself failed; a notice failure never undoes the deny.
+        warm=load('review_queue_notice',BIN/'claude-warm')
+        manifest=self.base/'manifest.json'
+        manifest.write_text(json.dumps({'coordinator_ops':{'seat_account':'YOUR_SEAT@YOUR_HOST.helm'}}))
+        env={'HOME':str(self.base),'SO_APPROVAL_KIKIN_MANIFEST':str(manifest),
+             'SO_APPROVAL_MORNING_QUEUE':str(self.base/'queue.jsonl')}
+        told=[]
+        supervisor=types.SimpleNamespace(session_id='fixture-session',screen_classifier=warm.ClaudeScreenClassifier(),
+            _guard_log=mock.Mock(),_hold_denied=told.append)
+        supervisor.screen_classifier.feed(b'\x1b[2J\x1b[Hrm OLD\nDo you want to proceed?\nEsc to cancel')
+        identity=self.hold.CLAUDE_CODE_PROFILE.identity(supervisor.screen_classifier._visible_text())
+        with mock.patch.dict(os.environ,env):
+            warm._hold_queue_write(supervisor,self.hold.CLAUDE_CODE_PROFILE,identity)
+            runtime=__import__('sys').modules['claude_approval_runtime']
+            with (self.base/'queue.jsonl').open() as handle:records=runtime._queue_read(handle)
+        self.assertEqual(told,[records[0]['id']])
+        broken=types.SimpleNamespace(session_id='fixture-session',_guard_log=mock.Mock(),_hold_denied=told.append)
+        warm._hold_queue_write(broken,self.hold.CLAUDE_CODE_PROFILE,identity)
+        self.assertEqual(told[-1],None)
+        broken._guard_log.assert_any_call('pty-hold-record-failed')
+        failing=types.SimpleNamespace(session_id='fixture-session',_guard_log=mock.Mock(),
+            _hold_denied=mock.Mock(side_effect=RuntimeError('notice')))
+        warm._hold_queue_write(failing,self.hold.CLAUDE_CODE_PROFILE,identity)
+        failing._guard_log.assert_any_call('pty-hold-notice-failed')
+
     def test_boxed_permission_hold_queues_the_real_request_identity(self):
         # A boxed Claude Code dialog carries the real request: the warm hold
         # must queue tool, command and intent so a later successful run of the
