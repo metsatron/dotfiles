@@ -4626,7 +4626,8 @@ OPTIONAL_COORDINATOR_CLASSES = ('ops_tool',)
 # The vetted Kikin tool's fixed verb set (bunta-ops; agents-bunta-ops.org).
 # Every argument must be shell-inert: the remote shell re-parses the argv.
 OPS_TOOL = 'bunta-ops'
-OPS_VERBS = frozenset({'mail-inbox', 'mail-read', 'mail-send', 'status', 'logs', 'git', 'x230-fetch', 'x230-push'})
+OPS_VERBS = frozenset({'mail-inbox', 'mail-new', 'mail-read', 'mail-receipt', 'mail-send',
+                       'status', 'logs', 'git', 'x230-fetch', 'x230-push'})
 OPS_ARG = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_./:@=+,-]*$')
 # A leading '-' only after 'git <repo> <read sub>' (Bunta's review, 2026-10-16):
 # bunta-ops checks each flag against its own allowlist; the gate keeps the

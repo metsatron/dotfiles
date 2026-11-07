@@ -47,6 +47,28 @@ class BuntaOpsTests(unittest.TestCase):
         self.assertIn('Hello Fable', argv)
         self.assertEqual(argv[-2:], ['--in-reply-to', '<1792.1@kikin.helm>'])
 
+    def test_mail_receipt_takes_only_a_bare_id_and_two_states(self):
+        self.refused('mail-receipt', '<1792.1@kikin.helm>', 'completed')
+        self.refused('mail-receipt', '1792.1@kikin.helm', 'failed')
+        self.refused('mail-receipt', '1792.1@kikin.helm')
+        self.refused('mail-receipt', "x';rm -rf /;'@kikin.helm", 'completed')
+        self.assertEqual(self.calls, [])
+        self.assertEqual(ops.main(['bunta-ops', 'mail-receipt', '1792.1@kikin.helm', 'completed']), 0)
+        self.assertEqual(self.calls[-1], ['mailcortex', 'receipt', 'bunta', '<1792.1@kikin.helm>', 'handling_completed'])
+        self.assertEqual(ops.main(['bunta-ops', 'mail-receipt', 'ab12@honey.helm', 'deferred']), 0)
+        self.assertEqual(self.calls[-1][-1], 'handling_deferred')
+
+    def test_mail_new_lists_every_new_row_and_takes_no_arguments(self):
+        self.refused('mail-new', 'extra')
+        rows = ''.join(f'new\tf{n}\tdate\tsender\tsubject {n}\n' for n in range(40)) + 'cur\told\tdate\tsender\tseen\n'
+        done = __import__('subprocess').CompletedProcess([], 0, rows, '')
+        import io, unittest.mock as mock
+        with mock.patch.object(ops.subprocess, 'run', return_value=done), mock.patch('sys.stdout', new=io.StringIO()) as out:
+            self.assertEqual(ops.main(['bunta-ops', 'mail-new']), 0)
+        lines = out.getvalue().splitlines()
+        self.assertEqual(len(lines), 40)
+        self.assertTrue(all(line.startswith('new\t') for line in lines))
+
     def test_symlinked_body_refused(self):
         (self.dir / 'bunta-link.md').symlink_to('/etc/hostname')
         self.refused('mail-send', 'fable@kikin.helm', 'bunta-link.md')

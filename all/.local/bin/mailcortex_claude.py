@@ -10,6 +10,7 @@ import json
 import math
 import os
 import re
+import secrets
 import select
 import signal
 import socket
@@ -603,10 +604,108 @@ def owner_control(owner, request, warm):
         return dict(ack, status="accepted")
 
 
+# Hold-timeout notice (2026-11-07, Bunta's overnight stall). When nobody
+# answers a permission prompt, the PTY hold denies it with a keystroke.
+# Claude reports that to the agent as a plain user refusal ending in "STOP ...
+# wait for the user", and the interrupted turn fires no Stop hook, so the seat
+# also stayed busy to every mail wake. One fixed ASCII notice, admitted
+# through the same guarded owner_control path as a mail wake, tells the agent
+# what really happened. The only variable part is the Desk queue id.
+HOLD_NOTICE_SETTLE_SECONDS = 3.0
+HOLD_NOTICE_RETRY_SECONDS = 5.0
+HOLD_NOTICE_WINDOW_SECONDS = 1800.0
+HOLD_QUEUE_ID = re.compile(r"[0-9a-f]{8,64}\Z")
+HOLD_NOTICE = ("[approval-hold] That refusal was not Metsatron. Your tool call waited for his "
+               "approval, nobody answered, and the hold timed out and denied it. It is queued "
+               "on the Desk as {queue}. Do not retry it; his answer will be relayed to you. "
+               "Carry on with work that needs no approval.")
+
+
+def hold_notice_text(queue_id):
+    label = queue_id if isinstance(queue_id, str) and HOLD_QUEUE_ID.fullmatch(queue_id) else "unrecorded"
+    return HOLD_NOTICE.format(queue=label)
+
+
+def self_admission_request(owner, text):
+    """A request naming this very owner. Every owner_control guard still runs;
+    the target is shape-only there and is never dereferenced."""
+    expected = {"channel": owner.channel, "session_id": owner.session_id,
+                "supervisor_pid": os.getpid(), "supervisor_start_time": owner.mailcortex_start_time,
+                "epoch": owner.completed_turn_epoch, "pane_id": os.environ.get("TMUX_PANE"),
+                "pane_tty": os.ttyname(sys.stdin.fileno())}
+    return {"kind": "control", "channel": owner.channel, "protocol": PROTOCOL,
+            "request_id": secrets.token_hex(16), "owner": expected,
+            "target": {"tmux_socket": "/proc/self", "tmux_session": "hold-notice", "runtime_dir": "/proc/self"},
+            "command": "mailcortex-admit", "text": text}
+
+
+def hold_notice_record(owner, queue_id, warm):
+    with owner.mailcortex_admission_lock:
+        current = warm.now()
+        owner.mailcortex_hold_notice = hold_notice_text(queue_id)
+        owner.mailcortex_hold_denied_at = current
+        owner.mailcortex_hold_notice_next = current + HOLD_NOTICE_SETTLE_SECONDS
+        owner._guard_log("hold-notice-pending", queued=owner.mailcortex_hold_notice.find("unrecorded") < 0)
+        owner._write_state()
+
+
+def hold_notice_drop(owner, reason):
+    owner.mailcortex_hold_notice = None
+    owner._guard_log("hold-notice-dropped", reason=reason)
+    owner._write_state()
+    return reason
+
+
+def hold_notice_tick(owner, warm, request_factory=self_admission_request):
+    """Deliver a pending hold notice once the denied turn has settled.
+
+    Returns None while waiting, "busy" when admission refused for now, or the
+    final outcome. The denied turn counts as ended only when nothing has
+    happened since the deny: no hook event, no human input, idle screen."""
+    if not getattr(owner, "mailcortex_hold_notice", None):
+        return None
+    with owner.mailcortex_admission_lock:
+        current = warm.now()
+        if current < owner.mailcortex_hold_notice_next:
+            return None
+        owner.mailcortex_hold_notice_next = current + HOLD_NOTICE_RETRY_SECONDS
+        denied = owner.mailcortex_hold_denied_at
+        if current - denied > HOLD_NOTICE_WINDOW_SECONDS:
+            return hold_notice_drop(owner, "expired")
+        if owner.mailcortex_input_dirty or (owner.last_local_input is not None and owner.last_local_input >= denied):
+            # Someone is at this terminal; they speak for themselves.
+            return hold_notice_drop(owner, "human-present")
+        if owner.screen_state != "idle" or pending_terminal(owner):
+            return None
+        if (owner.status == "active" and not owner.compacting and not owner.recovery_pending
+                and not owner.recovery_awaiting
+                and (owner.last_lifecycle_activity is None or owner.last_lifecycle_activity <= denied)):
+            owner.status = "idle"
+            owner.mailcortex_hold_idle_at = current
+            owner.last_state_transition = "hold-denied-turn-ended"
+            owner._guard_log("hold-denied-turn-ended")
+        try:
+            request = request_factory(owner, owner.mailcortex_hold_notice)
+        except (OSError, ValueError, AttributeError, TypeError):
+            return hold_notice_drop(owner, "no-owner-identity")
+        status = owner_control(owner, request, warm).get("status")
+        if status == "busy":
+            return status
+        owner.mailcortex_hold_notice = None
+        owner._guard_log("hold-notice-delivered" if status == "accepted" else "hold-notice-failed", status=status)
+        owner._write_state()
+        return status
+
+
 def wake_idle_boundary(owner):
     # PostCompact completes a native lifecycle without a normal-turn Stop.
     # This mail-only boundary never changes the governor's turn/cache epoch.
     compact = getattr(owner, "mailcortex_post_compact_idle_at", None)
+    # A hold-timeout deny ends its turn as an interrupt, also without a Stop.
+    held = getattr(owner, "mailcortex_hold_idle_at", None)
+    if (held and (not owner.last_normal_stop or held > owner.last_normal_stop)
+            and (not compact or held > compact)):
+        return held
     if compact and (not owner.last_normal_stop or compact > owner.last_normal_stop):
         return compact
     if owner.last_normal_stop:
@@ -769,6 +868,10 @@ def launch(argv):
             self.mailcortex_startup_pending = False
             self.mailcortex_startup_idle_at = None
             self.mailcortex_post_compact_idle_at = None
+            self.mailcortex_hold_idle_at = None
+            self.mailcortex_hold_notice = None
+            self.mailcortex_hold_denied_at = None
+            self.mailcortex_hold_notice_next = 0.0
             super().__init__(*args, **kwargs)
 
         def state(self):
@@ -776,6 +879,8 @@ def launch(argv):
             value["supervisor_start_time"] = self.mailcortex_start_time
             value["mailcortex_startup_idle_at"] = self.mailcortex_startup_idle_at
             value["mailcortex_post_compact_idle_at"] = self.mailcortex_post_compact_idle_at
+            value["mailcortex_hold_idle_at"] = self.mailcortex_hold_idle_at
+            value["mailcortex_hold_notice_pending"] = self.mailcortex_hold_notice is not None
             value["mailcortex_delivery"] = getattr(self, "mailcortex_delivery", None)
             return value
 
@@ -786,6 +891,18 @@ def launch(argv):
 
         def _mailcortex_barrier(self):
             return paused_child(self)
+
+        def _hold_denied(self, queue_id):
+            hold_notice_record(self, queue_id, types.SimpleNamespace(now=warm.now, write_all=write_wake))
+
+        def _hold_notice_tick(self):
+            if self.mailcortex_hold_notice is None:
+                return None
+            try:
+                return hold_notice_tick(self, types.SimpleNamespace(now=warm.now, write_all=write_wake))
+            except (OSError, ValueError, AttributeError, RuntimeError, TypeError):
+                with self.mailcortex_admission_lock:
+                    return hold_notice_drop(self, "tick-failed")
 
         def _mailcortex_refresh_screen(self):
             # Drain under the same lock, without the base's development-channel
@@ -889,6 +1006,8 @@ def launch(argv):
                     self.mailcortex_post_compact_idle_at = self.last_lifecycle_activity
                 elif message.get("event") in {"session-start", "session-end"}:
                     self.mailcortex_post_compact_idle_at = None
+                    self.mailcortex_hold_idle_at = None
+                    self.mailcortex_hold_notice = None
                 self.mailcortex_startup_idle_at = None
                 self.mailcortex_startup_pending = (
                     message.get("event") == "session-start" and previous_session is None
