@@ -1412,3 +1412,145 @@ class SafeCommit(unittest.TestCase):
 if __name__ == "__main__":
     unittest.main()
 #+END_SRC
+
+* Web shot — rendered pixels and DOM for a seat without a browser lane
+:PROPERTIES:
+:CUSTOM_ID: web-shot
+:END:
+
+An agent that cannot open a real browser cannot check layout, art, or a
+responsive break. Reasoning about CSS from the source is not a visual check, and
+a DOM assertion is not a rendered frame: both pass happily while a sprite row
+wraps, a panel covers the board, or every ball renders identical. Seats that
+build UI therefore need one command that produces real pixels at a stated
+viewport width, plus the DOM the browser actually built.
+
+=web-shot= is that command: a headless Chromium at an explicit window size, one
+PNG per requested width, and a DOM dump beside them. It fails closed — no PNG,
+a zero-byte PNG, or a Chromium error page is an error, never a pass — because a
+silent blank capture is worse than no capture. The profile lives in a throwaway
+directory under the caller's own =TMPDIR=, so nothing is retained between runs
+and two seats never share browser state.
+
+It does not click, and it does not replace an interactive harness for a flow
+that needs input. It answers the question a builder actually has after an edit:
+"what does this look like at 390 and at 900, and what did the DOM end up as?"
+
+#+BEGIN_SRC bash :tangle all/.local/bin/web-shot :shebang "#!/usr/bin/env bash" :comments no :tangle-mode (identity #o755)
+set -euo pipefail
+
+usage(){
+  cat >&2 <<'USAGE'
+web-shot URL [options]
+
+  --width N[,N...]   viewport width(s) in pixels; one PNG each (default 390,900)
+  --height N         viewport height (default 844)
+  --outdir DIR       where PNGs and the DOM go (default: a new mktemp -d)
+  --wait MS          virtual time budget for scripts to run (default 6000)
+  --insecure         ignore certificate errors (self-signed/tailnet faces)
+  --keep-profile     reuse a per-user profile instead of a throwaway one
+  -h, --help
+
+Exit: 0 captured, 2 usage/bad arguments, 3 no Chromium, 4 Chromium error page
+      or no usable PNG.
+USAGE
+}
+
+url=""
+widths="390,900"
+height=844
+outdir=""
+wait_ms=6000
+insecure=0
+keep_profile=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --width) [ "$#" -ge 2 ] || { usage; exit 2; }; widths="$2"; shift 2;;
+    --height) [ "$#" -ge 2 ] || { usage; exit 2; }; height="$2"; shift 2;;
+    --outdir) [ "$#" -ge 2 ] || { usage; exit 2; }; outdir="$2"; shift 2;;
+    --wait) [ "$#" -ge 2 ] || { usage; exit 2; }; wait_ms="$2"; shift 2;;
+    --insecure) insecure=1; shift;;
+    --keep-profile) keep_profile=1; shift;;
+    -h|--help) usage; exit 0;;
+    -*) echo "web-shot: unknown option $1" >&2; usage; exit 2;;
+    *) if [ -n "$url" ]; then echo "web-shot: one URL only" >&2; exit 2; fi; url="$1"; shift;;
+  esac
+done
+
+[ -n "$url" ] || { usage; exit 2; }
+
+find_chromium(){
+  for candidate in "${WEB_SHOT_CHROMIUM:-}" \
+                   "$(command -v chromium 2>/dev/null || true)" \
+                   "$(command -v chromium-browser 2>/dev/null || true)" \
+                   "$(command -v google-chrome 2>/dev/null || true)" \
+                   "$(command -v brave-browser 2>/dev/null || true)" \
+                   "$HOME"/.guix-extra-profiles/*/*/bin/chromium \
+                   /usr/bin/chromium /usr/bin/chromium-browser
+  do
+    [ -n "$candidate" ] && [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  return 1
+}
+
+chromium="$(find_chromium)" || { echo "web-shot: no Chromium found; set WEB_SHOT_CHROMIUM" >&2; exit 3; }
+
+if [ -z "$outdir" ]; then outdir="$(mktemp -d "${TMPDIR:-/tmp}/web-shot-XXXXXX")"; fi
+mkdir -p "$outdir"
+outdir="$(cd "$outdir" && pwd)"
+
+if [ "$keep_profile" = 1 ]; then
+  profile="${XDG_CACHE_HOME:-$HOME/.cache}/web-shot/profile"
+  mkdir -p "$profile"; chmod 700 "$profile"
+  cleanup(){ :; }
+else
+  profile="$(mktemp -d "${TMPDIR:-/tmp}/web-shot-profile-XXXXXX")"
+  cleanup(){ rm -rf "$profile"; }
+fi
+trap cleanup EXIT
+
+slug="$(printf '%s' "$url" | sed -e 's#^[a-zA-Z]*://##' -e 's#[^A-Za-z0-9._-]#-#g' | cut -c1-80)"
+status=0
+
+old_ifs="$IFS"; IFS=','
+for width in $widths; do
+  IFS="$old_ifs"
+  case "$width" in (''|*[!0-9]*) echo "web-shot: bad width '$width'" >&2; exit 2;; esac
+  png="$outdir/$slug-${width}x${height}.png"
+  dom="$outdir/$slug-${width}x${height}.dom.html"
+  args=(--headless=new --disable-gpu --no-sandbox --hide-scrollbars
+        --user-data-dir="$profile"
+        --window-size="${width},${height}"
+        --virtual-time-budget="$wait_ms"
+        --run-all-compositor-stages-before-draw
+        --screenshot="$png")
+  [ "$insecure" = 1 ] && args+=(--ignore-certificate-errors)
+  rm -f "$png"
+  if ! "$chromium" "${args[@]}" "$url" >"$outdir/$slug-${width}x${height}.chrome.log" 2>&1; then
+    echo "web-shot: chromium failed at ${width}x${height}; see $outdir/$slug-${width}x${height}.chrome.log" >&2
+    status=4
+  fi
+  if ! "$chromium" "${args[@]}" --dump-dom "$url" >"$dom" 2>>"$outdir/$slug-${width}x${height}.chrome.log"; then
+    echo "web-shot: DOM dump failed at ${width}x${height}" >&2
+    status=4
+  fi
+  if grep -qiE 'ERR_CERT|ERR_CONNECTION|ERR_NAME_NOT_RESOLVED|This site can.t be reached' "$dom" 2>/dev/null; then
+    echo "web-shot: browser error page at ${width}x${height} (retry with --insecure if the face is self-signed)" >&2
+    status=4
+  fi
+  if [ ! -s "$png" ]; then
+    echo "web-shot: no PNG written at ${width}x${height}" >&2
+    status=4
+    continue
+  fi
+  printf 'OK url=%s width=%s height=%s png=%s sha256=%s bytes=%s dom=%s\n' \
+    "$url" "$width" "$height" "$png" \
+    "$(sha256sum "$png" | cut -d' ' -f1)" "$(stat -c %s "$png")" "$dom"
+  IFS=','
+done
+IFS="$old_ifs"
+
+printf 'web-shot: output directory %s\n' "$outdir"
+exit "$status"
+#+END_SRC
