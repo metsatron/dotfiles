@@ -113,6 +113,8 @@ refused before delivery. Total raw attachments are capped at 25 MiB. Types are
 guessed from filenames, falling back to =application/octet-stream=. Without
 =--attach= the original single-part wire format is unchanged.
 
+Repeatable =send --cc ADDRESS= (also accepted by =forward=) adds further recipients, each receiving its own full atomic copy in its own Maildir with the same =To=/=Cc= headers; every recipient across =--to= and =--cc= is deduplicated and preflighted for a provisioned Maildir and a registered transport (or an explicit =--recipient-local-only= override) before any message is written, so a bad or unregistered Cc address can never cause a half-delivered send, and fanout is capped at ten total recipients. A single recipient keeps the exact legacy output (bare filename, or filename and Message-ID with =--print-id=); fanout to more than one recipient prefixes each line with the address it reached. =forward ADDRESS MESSAGE= locates the source message with the same safe lookup as =read= (exact filename, Message-ID, or unique prefix), defaults =Subject= to =Fwd: <original subject>= unless already so prefixed or overridden with =--subject=, carries an optional =--body=/=--body-file= commentary (empty by default), and always attaches the original message whole as a =message/rfc822= part so no header or structure is lost to quoting; it shares =--cc=, =--recipient-local-only=, =--shared-delivery=, =--print-id= and =--permission-auth= with =send=.
+
 ** Explicit cross-UID delivery
 
 =send --shared-delivery= is an opt-in for an operator-provisioned receiver Maildir.
@@ -900,29 +902,110 @@ def recipient_has_transport(address: str) -> bool:
     mailbox without a watcher seat is a dead drop: the mail lands, nothing ever
     reads it, and the sender sees success. A probe to honey-badger@honey.helm did
     exactly that while the real Honey Badger seat is honey-badger on kikin.
+
+    The registry keys bare seat names, never the consort/seat/machine/sanctuary
+    prefix (see the watcher registry's own "mailbox": "seats/NAME" convention), so
+    this must match on the parsed name, not the raw local part: a bare rsplit on
+    "@" left every prefixed address (seat+NAME@, machine+NAME@, sanctuary+NAME@)
+    permanently unmatchable even when NAME was genuinely registered.
     """
-    return address.rsplit("@", 1)[0] in registered_seats()
+    match = ADDRESS_RE.fullmatch(address.lower())
+    local = match.group(2) if match else address.rsplit("@", 1)[0]
+    return local in registered_seats()
+
+
+MAX_FANOUT = 10
+
+
+def resolve_recipients(to: str, cc: list[str], recipient_local_only: bool) -> list[str]:
+    """Preflight every To/Cc recipient's maildir and transport before any write lands.
+
+    Deduplicates To against Cc, preserving first-seen order so To stays primary, caps
+    total fanout at MAX_FANOUT, and refuses the whole send on the first unprovisioned
+    or unregistered recipient — never a partial fanout discovered late.
+    """
+    recipients: list[str] = []
+    for address in (to, *cc):
+        if address not in recipients:
+            recipients.append(address)
+    if len(recipients) > MAX_FANOUT:
+        raise MailCortexError(f"fanout exceeds {MAX_FANOUT} recipients: {len(recipients)}")
+    for address in recipients:
+        require_maildir(address)
+    if not recipient_local_only:
+        unregistered = [address for address in recipients if not recipient_has_transport(address)]
+        if unregistered:
+            # Name the seats that DO have a transport: the sender can pick the right
+            # address instead of discovering the dead drop hours later.
+            raise MailCortexError(
+                f"recipients with no registered seat; mail would never be read: "
+                f"{', '.join(unregistered)}. Seats with a transport: "
+                f"{', '.join(sorted(registered_seats()))}. Override only if the "
+                "mailbox is read by hand (--recipient-local-only)."
+            )
+    return recipients
+
+
+def deliver_fanout(message: EmailMessage, recipients: list[str], *, shared_delivery: bool, print_id: bool) -> int:
+    """Write one already-built message into every recipient's own Maildir.
+
+    Each recipient's write is atomic (tmp + rename); the loop across recipients is
+    not, so a failure partway through is reported with exactly how many already
+    landed and then raised immediately — never retried, since a retry here could
+    hand an already-delivered recipient a second silent copy. A single recipient
+    keeps the original tab-free (or print-id tab-pair) output exactly; fanout to
+    more than one recipient prefixes each line with the address it went to.
+    """
+    fanning_out = len(recipients) > 1
+    for index, address in enumerate(recipients):
+        target = address_maildir(address)
+        if shared_delivery:
+            owner = target.lstat()
+            for leaf in ("tmp", "new"):
+                entry = (target / leaf).lstat()
+                if (not stat.S_ISDIR(entry.st_mode)
+                        or entry.st_mode & 0o3000 != 0o3000
+                        or entry.st_uid != owner.st_uid or entry.st_gid != owner.st_gid
+                        or entry.st_mode & 0o007):
+                    raise MailCortexError("shared delivery requires owner-matched sticky setgid tmp/new directories with no other access")
+        name = safe_name()
+        temporary = target / "tmp" / name
+        delivered = target / "new" / name
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as stream:
+                stream.write(message.as_bytes())
+                stream.flush()
+                if shared_delivery:
+                    os.fchmod(stream.fileno(), 0o640)
+                os.fsync(stream.fileno())
+            os.replace(temporary, delivered)
+            _grant_mailbox_read(delivered, target)
+            fsync_directory(target / "new")
+        except Exception:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+            if index:
+                print(f"partial fanout: {index}/{len(recipients)} recipients delivered "
+                      f"before failure on {address}; not retried", file=sys.stderr)
+            raise
+        if fanning_out:
+            if print_id:
+                print(f"{address}\t{name}\t{message['Message-ID']}")
+            else:
+                print(f"{address}\t{name}")
+        elif print_id:
+            print(f"{name}\t{message['Message-ID']}")
+        else:
+            print(name)
+    return 0
 
 
 def deliver(args: argparse.Namespace) -> int:
-    target = require_maildir(args.to)
-    if (not args.recipient_local_only and not recipient_has_transport(args.to)):
-        # Name the seats that DO have a transport: the sender can pick the right
-        # address instead of discovering the dead drop hours later.
-        raise MailCortexError(
-            f"recipient {args.to} has no registered seat; mail would never be "
-            f"read. Seats with a transport: {', '.join(sorted(registered_seats()))}. "
-            "Override only if the mailbox is read by hand (--recipient-local-only)."
-        )
-    if args.shared_delivery:
-        owner = target.lstat()
-        for leaf in ("tmp", "new"):
-            entry = (target / leaf).lstat()
-            if (not stat.S_ISDIR(entry.st_mode)
-                    or entry.st_mode & 0o3000 != 0o3000
-                    or entry.st_uid != owner.st_uid or entry.st_gid != owner.st_gid
-                    or entry.st_mode & 0o007):
-                raise MailCortexError("shared delivery requires owner-matched sticky setgid tmp/new directories with no other access")
+    recipients = resolve_recipients(args.to, args.cc, args.recipient_local_only)
+    cc_header = [address for address in recipients if address != args.to]
     if args.body is not None:
         body = args.body
     else:
@@ -932,6 +1015,8 @@ def deliver(args: argparse.Namespace) -> int:
     message["Date"] = format_datetime(datetime.now().astimezone())
     message["From"] = args.sender
     message["To"] = args.to
+    if cc_header:
+        message["Cc"] = ", ".join(cc_header)
     message["Subject"] = args.subject
     message["Message-ID"] = make_msgid(domain=args.sender.rsplit("@", 1)[-1])
     if args.in_reply_to:
@@ -944,31 +1029,7 @@ def deliver(args: argparse.Namespace) -> int:
         major, minor = mime.split("/", 1)
         message.add_attachment(data, maintype=major, subtype=minor, filename=filename)
 
-    name = safe_name()
-    temporary = target / "tmp" / name
-    delivered = target / "new" / name
-    try:
-        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "wb") as stream:
-            stream.write(message.as_bytes())
-            stream.flush()
-            if args.shared_delivery:
-                os.fchmod(stream.fileno(), 0o640)
-            os.fsync(stream.fileno())
-        os.replace(temporary, delivered)
-        _grant_mailbox_read(delivered, target)
-        fsync_directory(target / "new")
-    except Exception:
-        try:
-            temporary.unlink()
-        except FileNotFoundError:
-            pass
-        raise
-    if args.print_id:
-        print(f"{name}\t{message['Message-ID']}")
-    else:
-        print(name)
-    return 0
+    return deliver_fanout(message, recipients, shared_delivery=args.shared_delivery, print_id=args.print_id)
 
 
 def _grant_mailbox_read(delivered: Path, mailbox: Path) -> None:
@@ -1093,13 +1154,59 @@ def read_message(args: argparse.Namespace) -> int:
     # state and its own wake ledger — never the fact that a human-shaped reader took it.
     close_read_receipt(args.address, message)
 
-    for header in ("Date", "From", "To", "Subject", "Message-ID", "In-Reply-To", "References",
+    for header in ("Date", "From", "To", "Cc", "Subject", "Message-ID", "In-Reply-To", "References",
                    "X-MailCortex-Permission"):
         print(f"{header}: {message.get(header, '')}")
     print()
     body = message.get_body(preferencelist=("plain",))
     print(body.get_content() if body is not None else "", end="")
     return 0
+
+
+def forward_message(args: argparse.Namespace) -> int:
+    """Forward an existing message, preserving it losslessly as an RFC822 attachment.
+
+    The source is located with the same safe lookup `read` uses (exact filename,
+    Message-ID, or unique prefix), so a forward can never be pointed at a message
+    that was never really in that mailbox. The original is attached whole rather
+    than quoted, so none of its headers or structure are lost in translation.
+    """
+    recipients = resolve_recipients(args.to, args.cc, args.recipient_local_only)
+    cc_header = [address for address in recipients if address != args.to]
+    source_maildir = require_maildir(args.source_address)
+    _state, source_path = locate_message(source_maildir, args.source_message)
+    original = parse_message(source_path)
+    original_subject = str(original.get("Subject", ""))
+    subject = args.subject
+    if subject is None:
+        subject = original_subject if original_subject.lower().startswith("fwd:") else f"Fwd: {original_subject}"
+    if args.body is not None:
+        body = args.body
+    elif args.body_file is not None:
+        body = Path(args.body_file).read_text(encoding="utf-8")
+    else:
+        body = ""
+
+    message = EmailMessage(policy=policy.SMTP)
+    message["Date"] = format_datetime(datetime.now().astimezone())
+    message["From"] = args.sender
+    message["To"] = args.to
+    if cc_header:
+        message["Cc"] = ", ".join(cc_header)
+    message["Subject"] = subject
+    message["Message-ID"] = make_msgid(domain=args.sender.rsplit("@", 1)[-1])
+    if args.permission_auth:
+        message["X-MailCortex-Permission"] = args.permission_auth
+    message.set_content(body)
+    # Attach the parsed Message object, not its raw bytes: the content manager then
+    # emits Content-Transfer-Encoding: 8bit with the original inlined verbatim, which
+    # is what RFC 2046 requires for message/rfc822 and what a mail reader expects to
+    # parse as a real nested message. Passing raw bytes with an explicit
+    # maintype="message" instead gets base64-encoded like any other binary blob —
+    # spec-invalid for this subtype, and unreadable as a message by any MUA.
+    message.add_attachment(original, filename="forwarded-message.eml")
+
+    return deliver_fanout(message, recipients, shared_delivery=args.shared_delivery, print_id=args.print_id)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1116,6 +1223,9 @@ def build_parser() -> argparse.ArgumentParser:
     send = subparsers.add_parser("send", help="atomically deliver one message")
     send.add_argument("--from", dest="sender", required=True, type=validate_address)
     send.add_argument("--to", required=True, type=validate_address)
+    send.add_argument("--cc", action="append", default=[], type=validate_address,
+                      help="additional recipient (repeatable); each gets a full copy, "
+                           f"up to {MAX_FANOUT} total with --to")
     send.add_argument("--subject", required=True)
     send.add_argument("--in-reply-to", type=validate_message_id,
                       help="parent Message-ID; writes In-Reply-To and References")
@@ -1133,6 +1243,31 @@ def build_parser() -> argparse.ArgumentParser:
     send.add_argument("--attach", action="append", default=[], metavar="PATH",
                       help="attach a regular file (repeatable; total <= 25 MiB)")
     send.set_defaults(function=deliver)
+
+    forward = subparsers.add_parser(
+        "forward", help="forward an existing message, preserving it as an RFC822 attachment")
+    forward.add_argument("--from", dest="sender", required=True, type=validate_address)
+    forward.add_argument("--to", required=True, type=validate_address)
+    forward.add_argument("--cc", action="append", default=[], type=validate_address,
+                         help="additional recipient (repeatable); each gets a full copy, "
+                              f"up to {MAX_FANOUT} total with --to")
+    forward.add_argument("source_address", type=validate_address,
+                         help="mailbox that holds the message to forward")
+    forward.add_argument("source_message",
+                         help="exact filename, Message-ID, or unique filename prefix")
+    forward.add_argument("--subject", help="override the default 'Fwd: <original subject>'")
+    forward_body = forward.add_mutually_exclusive_group()
+    forward_body.add_argument("--body")
+    forward_body.add_argument("--body-file")
+    forward.add_argument("--shared-delivery", action="store_true",
+                         help="opt-in receiver-group read for an operator-provisioned sticky setgid Maildir")
+    forward.add_argument("--recipient-local-only", action="store_true",
+                         help="allow delivery to a mailbox with no registered seat (read by hand)")
+    forward.add_argument("--print-id", action="store_true",
+                         help="print filename and Message-ID separated by a tab")
+    forward.add_argument("--permission-auth", type=validate_permission_auth,
+                         help="validated MailCortex permission authentication header")
+    forward.set_defaults(function=forward_message)
 
     inbox = subparsers.add_parser("inbox", help="list new and seen messages")
     inbox.add_argument("address", type=validate_address)
@@ -1450,6 +1585,9 @@ WantedBy=default.target
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-mailcortex-core.py :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 """Threading and opt-in Message-ID output fixtures for mailcortex."""
 
+import email
+import email.policy
+import json
 import os
 import subprocess
 import tempfile
@@ -1460,15 +1598,24 @@ from pathlib import Path
 MAILCORTEX = os.environ.get("MAILCORTEX", "mailcortex")
 OWNER = "owner@test.helm"
 FACE = "seat+xmpp-bridge@test.helm"
+ALICE = "seat+alice@test.helm"
+BOB = "seat+bob@test.helm"
+UNREGISTERED = "seat+ghost@test.helm"
 
 
 class MailCortexCoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        registry = self.tmp / "seats.json"
+        registry.write_text(json.dumps({
+            "schema": "mailcortex.seats.v1", "host": "test",
+            "seats": {"xmpp-bridge": {}, "alice": {}, "bob": {}},
+        }))
         self.env = dict(os.environ,
                         MAILCORTEX_ROOT=str(self.tmp / "Mail"),
-                        MAILCORTEX_RUNTIME=str(self.tmp / "state"))
-        self.mc(["provision", OWNER, FACE])
+                        MAILCORTEX_RUNTIME=str(self.tmp / "state"),
+                        MAILCORTEX_SEAT_REGISTRY=str(registry))
+        self.mc(["provision", OWNER, FACE, ALICE, BOB, UNREGISTERED])
 
     def mc(self, args, check=True):
         return subprocess.run([MAILCORTEX, *args], env=self.env, text=True,
@@ -1508,6 +1655,79 @@ class MailCortexCoreTest(unittest.TestCase):
                            "--permission-auth", "forged"], check=False)
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("invalid permission authentication", invalid.stderr)
+
+    def test_cc_fanout_delivers_full_copy_with_headers_to_each_recipient(self):
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE, "--cc", ALICE,
+                        "--cc", BOB, "--subject", "squadron", "--body", "status"])
+        lines = sorted(sent.stdout.strip().splitlines())
+        recipients = [line.split("\t", 1)[0] for line in lines]
+        self.assertEqual(recipients, sorted([FACE, ALICE, BOB]))
+        for address in (FACE, ALICE, BOB):
+            inbox = self.mc(["inbox", address]).stdout
+            self.assertIn("squadron", inbox)
+            name = inbox.strip().splitlines()[0].split("\t")[1]
+            rendered = self.mc(["read", address, name]).stdout
+            self.assertIn(f"To: {FACE}", rendered)
+            self.assertIn(f"Cc: {ALICE}, {BOB}", rendered)
+
+    def test_cc_dedup_against_to_delivers_once_with_no_cc_header(self):
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE, "--cc", FACE,
+                        "--subject", "solo", "--body", "hi"])
+        self.assertNotIn("\t", sent.stdout.strip())
+        rendered = self.mc(["read", FACE, sent.stdout.strip()]).stdout
+        self.assertIn("Cc: \n", rendered)
+
+    def test_cc_preflight_refuses_whole_send_before_any_write(self):
+        refused = self.mc(["send", "--from", OWNER, "--to", FACE, "--cc", UNREGISTERED,
+                           "--subject", "blocked", "--body", "no"], check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("no registered seat", refused.stderr)
+        self.assertNotIn("blocked", self.mc(["inbox", FACE]).stdout)
+
+    def test_fanout_bound_rejects_excess_recipients(self):
+        # None of these ten Cc addresses need to be provisioned: the bound is
+        # checked before any Maildir lookup, on syntactically valid addresses alone.
+        cc_args = []
+        for index in range(10):
+            cc_args += ["--cc", f"seat+flood{index}@test.helm"]
+        result = self.mc(["send", "--from", OWNER, "--to", FACE, *cc_args,
+                          "--subject", "flood", "--body", "no"], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fanout exceeds 10 recipients: 11", result.stderr)
+
+    def test_forward_preserves_original_as_rfc822_attachment_with_default_subject(self):
+        original = self.mc(["send", "--from", OWNER, "--to", FACE,
+                            "--subject", "quarterly numbers", "--body", "see attached",
+                            "--print-id"])
+        filename, _message_id = original.stdout.strip().split("\t")
+        forwarded = self.mc(["forward", "--from", FACE, "--to", ALICE,
+                             FACE, filename, "--body", "fyi"])
+        name = forwarded.stdout.strip()
+        rendered = self.mc(["read", ALICE, name]).stdout
+        self.assertIn("Subject: Fwd: quarterly numbers", rendered)
+        self.assertIn("fyi", rendered)
+        raw = next((self.tmp / "Mail" / "seats" / "alice" / "cur").glob("*")).read_bytes()
+        self.assertIn(b"Content-Type: message/rfc822", raw)
+        delivered = email.message_from_bytes(raw, policy=email.policy.default)
+        attached = next(part for part in delivered.walk() if part.get_content_type() == "message/rfc822")
+        original = attached.get_payload(0)
+        self.assertEqual(str(original["Subject"]), "quarterly numbers")
+
+    def test_forward_respects_explicit_subject_and_defaults_empty_body(self):
+        original = self.mc(["send", "--from", OWNER, "--to", FACE,
+                            "--subject", "raw status", "--body", "x", "--print-id"])
+        filename, _message_id = original.stdout.strip().split("\t")
+        forwarded = self.mc(["forward", "--from", FACE, "--to", BOB,
+                             "--subject", "custom subject", FACE, filename])
+        name = forwarded.stdout.strip()
+        rendered = self.mc(["read", BOB, name]).stdout
+        self.assertIn("Subject: custom subject", rendered)
+
+    def test_forward_source_lookup_rejects_unknown_message(self):
+        result = self.mc(["forward", "--from", FACE, "--to", ALICE,
+                          FACE, "not-a-real-filename", "--body", "x"], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("message not found", result.stderr)
 
 
 if __name__ == "__main__":
