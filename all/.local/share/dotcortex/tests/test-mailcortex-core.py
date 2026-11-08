@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Threading and opt-in Message-ID output fixtures for mailcortex."""
 
+import email
+import email.policy
+import json
 import os
 import subprocess
 import tempfile
@@ -11,15 +14,25 @@ from pathlib import Path
 MAILCORTEX = os.environ.get("MAILCORTEX", "mailcortex")
 OWNER = "owner@test.helm"
 FACE = "seat+xmpp-bridge@test.helm"
+ALICE = "seat+alice@test.helm"
+BOB = "seat+bob@test.helm"
+UNREGISTERED = "seat+ghost@test.helm"
 
 
 class MailCortexCoreTest(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
+        registry = self.tmp / "seats.json"
+        registry.write_text(json.dumps({
+            "schema": "mailcortex.seats.v1", "host": "test",
+            "seats": {"xmpp-bridge": {}, "alice": {}, "bob": {}},
+        }))
         self.env = dict(os.environ,
                         MAILCORTEX_ROOT=str(self.tmp / "Mail"),
-                        MAILCORTEX_RUNTIME=str(self.tmp / "state"))
-        self.mc(["provision", OWNER, FACE])
+                        MAILCORTEX_RUNTIME=str(self.tmp / "state"),
+                        MAILCORTEX_MANUAL_RECIPIENTS=str(self.tmp / "manual.json"),
+                        MAILCORTEX_SEAT_REGISTRY=str(registry))
+        self.mc(["provision", OWNER, FACE, ALICE, BOB, UNREGISTERED])
 
     def mc(self, args, check=True):
         return subprocess.run([MAILCORTEX, *args], env=self.env, text=True,
@@ -59,6 +72,219 @@ class MailCortexCoreTest(unittest.TestCase):
                            "--permission-auth", "forged"], check=False)
         self.assertNotEqual(invalid.returncode, 0)
         self.assertIn("invalid permission authentication", invalid.stderr)
+
+    def test_cc_fanout_delivers_full_copy_with_headers_to_each_recipient(self):
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE, "--cc", ALICE,
+                        "--cc", BOB, "--subject", "squadron", "--body", "status"])
+        lines = sorted(sent.stdout.strip().splitlines())
+        recipients = [line.split("\t", 1)[0] for line in lines]
+        self.assertEqual(recipients, sorted([FACE, ALICE, BOB]))
+        for address in (FACE, ALICE, BOB):
+            inbox = self.mc(["inbox", address]).stdout
+            self.assertIn("squadron", inbox)
+            name = inbox.strip().splitlines()[0].split("\t")[1]
+            rendered = self.mc(["read", address, name]).stdout
+            self.assertIn(f"To: {FACE}", rendered)
+            self.assertIn(f"Cc: {ALICE}, {BOB}", rendered)
+
+    def test_cc_dedup_against_to_delivers_once_with_no_cc_header(self):
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE, "--cc", FACE,
+                        "--subject", "solo", "--body", "hi"])
+        self.assertNotIn("\t", sent.stdout.strip())
+        rendered = self.mc(["read", FACE, sent.stdout.strip()]).stdout
+        self.assertIn("Cc: \n", rendered)
+
+    def test_cc_preflight_refuses_whole_send_before_any_write(self):
+        refused = self.mc(["send", "--from", OWNER, "--to", FACE, "--cc", UNREGISTERED,
+                           "--subject", "blocked", "--body", "no"], check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("no registered seat", refused.stderr)
+        self.assertNotIn("blocked", self.mc(["inbox", FACE]).stdout)
+
+    def test_fanout_bound_rejects_excess_recipients(self):
+        # None of these ten Cc addresses need to be provisioned: the bound is
+        # checked before any Maildir lookup, on syntactically valid addresses alone.
+        cc_args = []
+        for index in range(10):
+            cc_args += ["--cc", f"seat+flood{index}@test.helm"]
+        result = self.mc(["send", "--from", OWNER, "--to", FACE, *cc_args,
+                          "--subject", "flood", "--body", "no"], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("fanout exceeds 10 recipients: 11", result.stderr)
+
+    def test_forward_preserves_original_as_rfc822_attachment_with_default_subject(self):
+        original = self.mc(["send", "--from", OWNER, "--to", FACE,
+                            "--subject", "quarterly numbers", "--body", "see attached",
+                            "--print-id"])
+        filename, _message_id = original.stdout.strip().split("\t")
+        forwarded = self.mc(["forward", "--from", FACE, "--to", ALICE,
+                             FACE, filename, "--body", "fyi"])
+        name = forwarded.stdout.strip()
+        rendered = self.mc(["read", ALICE, name]).stdout
+        self.assertIn("Subject: Fwd: quarterly numbers", rendered)
+        self.assertIn("fyi", rendered)
+        raw = next((self.tmp / "Mail" / "seats" / "alice" / "cur").glob("*")).read_bytes()
+        self.assertIn(b"Content-Type: message/rfc822", raw)
+        delivered = email.message_from_bytes(raw, policy=email.policy.default)
+        attached = next(part for part in delivered.walk() if part.get_content_type() == "message/rfc822")
+        original = attached.get_payload(0)
+        self.assertEqual(str(original["Subject"]), "quarterly numbers")
+
+    def test_forward_respects_explicit_subject_and_defaults_empty_body(self):
+        original = self.mc(["send", "--from", OWNER, "--to", FACE,
+                            "--subject", "raw status", "--body", "x", "--print-id"])
+        filename, _message_id = original.stdout.strip().split("\t")
+        forwarded = self.mc(["forward", "--from", FACE, "--to", BOB,
+                             "--subject", "custom subject", FACE, filename])
+        name = forwarded.stdout.strip()
+        rendered = self.mc(["read", BOB, name]).stdout
+        self.assertIn("Subject: custom subject", rendered)
+
+    def test_forward_source_lookup_rejects_unknown_message(self):
+        result = self.mc(["forward", "--from", FACE, "--to", ALICE,
+                          FACE, "not-a-real-filename", "--body", "x"], check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("message not found", result.stderr)
+
+
+    def test_export_empty_and_ordered_seen_messages_leaves_handling_state(self):
+        import mailbox
+        output = self.tmp / "empty.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(output)])
+        self.assertEqual(output.read_bytes(), b"")
+        root = self.tmp / "Mail/seats/xmpp-bridge"
+        for state, name, subject, stamp in (("cur", "seen:2,S", "first", 1),
+                                             ("new", "unseen", "second", 2)):
+            path = root / state / name
+            path.write_bytes(("From: a@test.helm\nTo: b@test.helm\nSubject: "
+                              + subject + "\n\nbody\n").encode())
+            os.utime(path, ns=(stamp, stamp))
+        runtime = self.tmp / "state"
+        runtime.mkdir()
+        receipt = runtime / "handling.json"
+        receipt.write_text('{"handling_completed":true}')
+        before = receipt.stat()
+        ordered = self.tmp / "ordered.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(ordered)])
+        after = receipt.stat()
+        self.assertEqual((before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns),
+                         (after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns))
+        self.assertEqual(receipt.read_text(), '{"handling_completed":true}')
+        box = mailbox.mbox(ordered)
+        try:
+            self.assertEqual([m["Subject"] for m in box], ["first", "second"])
+        finally:
+            box.close()
+        self.assertTrue((root / "cur/seen:2,S").exists())
+        self.assertTrue((root / "new/unseen").exists())
+
+    def manual_registry(self, **changes):
+        path = self.tmp / "manual.json"
+        value = {"schema": "mailcortex.manual-recipients.v1", "recipients": [OWNER]}
+        value.update(changes)
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+        self.env["MAILCORTEX_MANUAL_RECIPIENTS"] = str(path)
+        return path
+
+    def test_human_recipient_send_cc_and_invalid_registry_refusal(self):
+        path = self.manual_registry()
+        sent = self.mc(["send", "--from", FACE, "--to", OWNER, "--cc", ALICE,
+                        "--subject", "human", "--body", "reply"])
+        self.assertEqual(len(sent.stdout.splitlines()), 2)
+        owner_new = self.tmp / "Mail/consorts/owner/new"
+        count = len(list(owner_new.iterdir()))
+        bad = self.mc(["send", "--from", FACE, "--to", OWNER, "--cc", UNREGISTERED,
+                       "--subject", "bad", "--body", "bad"], check=False)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertEqual(len(list(owner_new.iterdir())), count)
+        for mode in (0o644, 0o660):
+            path.chmod(mode)
+            self.assertNotEqual(self.mc(["send", "--from", FACE, "--to", OWNER,
+                "--subject", "bad", "--body", "bad"], check=False).returncode, 0)
+        path.chmod(0o600)
+        self.manual_registry(recipients=["invalid"])
+        self.assertNotEqual(self.mc(["send", "--from", FACE, "--to", OWNER,
+            "--subject", "bad", "--body", "bad"], check=False).returncode, 0)
+        self.manual_registry()
+        alias = self.tmp / "alias.json"
+        alias.symlink_to(path)
+        self.env["MAILCORTEX_MANUAL_RECIPIENTS"] = str(alias)
+        self.assertNotEqual(self.mc(["send", "--from", FACE, "--to", OWNER,
+            "--subject", "bad", "--body", "bad"], check=False).returncode, 0)
+
+    def test_forward_digest_binds_consumed_source(self):
+        import hashlib
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE,
+                        "--subject", "guard", "--body", "source"])
+        path = self.tmp / "Mail/seats/xmpp-bridge/new" / sent.stdout.strip()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        argv = ["forward", "--from", FACE, "--to", ALICE, FACE, path.name,
+                "--expect-sha256", digest]
+        self.mc(argv)
+        path.write_bytes(path.read_bytes().replace(b"source", b"changed"))
+        bad = self.mc(argv, check=False)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("SHA-256 mismatch", bad.stderr)
+        self.assertEqual(len(list((self.tmp / "Mail/seats/alice/new").iterdir())), 1)
+
+    def test_export_snapshot_mime_metadata_and_refusal(self):
+        import hashlib
+        import mailbox
+        import stat
+        attachment = self.tmp / "binary.dat"
+        attachment.write_bytes(bytes(range(256)))
+        self.mc(["send", "--from", OWNER, "--to", FACE, "--subject", "mbox MIME",
+                 "--body", "From dangerous envelope\nbody", "--attach", str(attachment)])
+        root = self.tmp / "Mail"
+        # Warm only the fixture observer's atime, then snapshot before exporter.
+        files = list(root.rglob("*"))
+        expected = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in files if p.is_file()}
+        paths = [root, *files]
+        def snapshot():
+            return {str(p): (p.stat().st_mode, p.stat().st_ino, p.stat().st_size,
+                    p.stat().st_atime_ns, p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+                    for p in paths}
+        before = snapshot()
+        output = self.tmp / "snapshot.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(output)])
+        self.assertEqual(before, snapshot())
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        self.assertIn(b"\n>From dangerous envelope", output.read_bytes())
+        box = mailbox.mbox(output)
+        try:
+            messages = list(box)
+            self.assertEqual(len(messages), 1)
+            message = messages[0]
+            self.assertEqual(message["Subject"], "mbox MIME")
+            self.assertEqual(message.get_payload()[1].get_payload(decode=True), bytes(range(256)))
+        finally:
+            box.close()
+        self.assertEqual(expected, {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                                   for p in files if p.is_file()})
+        second = self.tmp / "again.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(second)])
+        self.assertEqual(output.read_bytes(), second.read_bytes())
+        for dest in (output, root / "snapshot.mbox", self.tmp / "missing/out"):
+            self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(dest)], check=False).returncode, 0)
+        alias = self.tmp / "alias"
+        alias.symlink_to(output)
+        self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(alias)], check=False).returncode, 0)
+        fifo = self.tmp / "fifo"
+        os.mkfifo(fifo)
+        self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(fifo)], check=False).returncode, 0)
+        source = self.tmp / "Mail/seats/xmpp-bridge/new/unsafe"
+        source.symlink_to(attachment)
+        failed = self.tmp / "failed.mbox"
+        self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(failed)], check=False).returncode, 0)
+        self.assertFalse(failed.exists())
+        self.assertEqual(list(self.tmp.glob(".mailcortex-mbox-*")), [])
+        # Read installed legacy mailx with only this synthetic snapshot.
+        mailx = subprocess.run(["/usr/bin/mailx", "-H", "-f", str(output)],
+                              capture_output=True, text=True, env=self.env)
+        self.assertEqual(mailx.returncode, 0, mailx.stderr)
+        self.assertIn("mbox MIME", mailx.stdout)
 
 
 if __name__ == "__main__":
