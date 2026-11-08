@@ -25,7 +25,7 @@ class MailCortexTests(unittest.TestCase):
         self.registry = self.base / "seats.json"
         seats = {
             name: {"host": "fixture-host", "mailbox": f"seats/{name}"}
-            for name in ("leader", "coordinator", "quota-monitor", "outsider")
+            for name in ("leader", "coordinator", "quota-monitor", "outsider", "reader")
         }
         self.registry.write_text(json.dumps({
             "schema": "mailcortex.seats.v1",
@@ -41,6 +41,7 @@ class MailCortexTests(unittest.TestCase):
         self.usage_cache = self.base / "codex-v2.json"
         self.env = os.environ | {
             "MAILCORTEX_ROOT": str(self.root),
+            "MAILCORTEX_MANUAL_RECIPIENTS": str(self.base / "manual.json"),
             "MAILCORTEX_SEAT_REGISTRY": str(self.registry),
             "MAILCORTEX_CODEX_USAGE_CACHE": str(self.usage_cache),
         }
@@ -61,6 +62,19 @@ class MailCortexTests(unittest.TestCase):
             check=False,
         )
 
+    def assert_delivery_access(self, path: Path, expected: int) -> None:
+        # A named-user ACL stores its mask in st_mode's group bits. Verify the
+        # owning-group ACL rather than mistaking the mask for a group grant.
+        mode = path.stat().st_mode & 0o777
+        if mode == expected:
+            return
+        self.assertEqual(mode, expected | 0o060)
+        acl = subprocess.run(["getfacl", "-cp", str(path)], text=True,
+                             capture_output=True, check=True).stdout.splitlines()
+        self.assertIn("group::r--" if expected & 0o040 else "group::---", acl)
+        self.assertIn("mask::rw-", acl)
+        self.assertIn("other::---", acl)
+
     def test_shared_delivery_is_explicit_and_receiver_group_readable(self):
         for leaf in ("tmp", "new"):
             (self.maildir / leaf).chmod(0o3700)
@@ -68,14 +82,14 @@ class MailCortexTests(unittest.TestCase):
                                 "--subject", "shared", "--body", "literal body", "--shared-delivery")
         self.assertEqual(sent.returncode, 0, sent.stderr)
         path = self.maildir / "new" / sent.stdout.strip()
-        self.assertEqual(path.stat().st_mode & 0o777, 0o640)
+        self.assert_delivery_access(path, 0o640)
         self.assertEqual(path.stat().st_gid, self.maildir.stat().st_gid)
         msg = BytesParser(policy=policy.default).parsebytes(path.read_bytes())
         self.assertEqual(msg.get_content().strip(), "literal body")
         private = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
                                    "--subject", "private", "--body", "unchanged")
         self.assertEqual(private.returncode, 0, private.stderr)
-        self.assertEqual((self.maildir / "new" / private.stdout.strip()).stat().st_mode & 0o777, 0o600)
+        self.assert_delivery_access(self.maildir / "new" / private.stdout.strip(), 0o600)
 
     def test_shared_delivery_refuses_unprovisioned_directory_before_writing(self):
         sent = self.run_command("send", "--from", "writer@node-a.helm", "--to", self.address,
@@ -209,7 +223,7 @@ class MailCortexTests(unittest.TestCase):
         delivered = list((self.maildir / "new").iterdir())
         self.assertEqual(len(delivered), 1)
         self.assertEqual(delivered[0].name, result.stdout.strip())
-        self.assertEqual(delivered[0].stat().st_mode & 0o777, 0o600)
+        self.assert_delivery_access(delivered[0], 0o600)
         message = BytesParser(policy=policy.default).parsebytes(delivered[0].read_bytes())
         self.assertEqual(message["From"], "sender@node-a.helm")
         self.assertEqual(message["To"], self.address)
@@ -242,7 +256,7 @@ class MailCortexTests(unittest.TestCase):
         self.assertEqual(parts[0].get_payload(decode=True), audio.read_bytes())
         self.assertEqual(parts[1].get_payload(decode=True), unknown.read_bytes())
         self.assertEqual(parts[1].get_content_type(), "application/octet-stream")
-        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assert_delivery_access(path, 0o600)
         self.assertEqual(list((self.maildir / "tmp").iterdir()), [])
         read = self.run_command("read", self.address, path.name)
         self.assertIn("\n\ntranscript\n", read.stdout)

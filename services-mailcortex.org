@@ -185,6 +185,8 @@ import argparse
 import hashlib
 import json
 import mimetypes
+import mailbox
+import tempfile
 import os
 import re
 import socket
@@ -895,6 +897,35 @@ def registered_seats() -> set[str]:
         return set()
 
 
+def manual_recipients() -> set[str]:
+    """Explicit human readers, independent of the agent wake/transport registry."""
+    path = Path(os.environ.get(
+        "MAILCORTEX_MANUAL_RECIPIENTS", "~/.config/mailcortex/manual-recipients.json"
+    )).expanduser()
+    if not path.is_absolute() or path != path.resolve():
+        raise MailCortexError("manual recipient registry must use a canonical absolute path")
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return set()
+    with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or stat.S_IMODE(info.st_mode) != 0o600 or info.st_nlink != 1):
+            raise MailCortexError("manual recipient registry must be owner-owned private mode 0600")
+        value = json.load(stream)
+    if (not isinstance(value, dict) or set(value) != {"schema", "recipients"}
+            or value["schema"] != "mailcortex.manual-recipients.v1"
+            or not isinstance(value["recipients"], list)):
+        raise MailCortexError("invalid manual recipient registry shape")
+    recipients = value["recipients"]
+    if any(not isinstance(a, str) or not ADDRESS_RE.fullmatch(a) for a in recipients):
+        raise MailCortexError("manual recipient registry contains invalid address")
+    if len(set(recipients)) != len(recipients):
+        raise MailCortexError("manual recipient registry contains duplicate address")
+    return set(recipients)
+
+
 def recipient_has_transport(address: str) -> bool:
     """True when the recipient has a registered seat, else delivery is silent loss.
 
@@ -933,7 +964,7 @@ def resolve_recipients(to: str, cc: list[str], recipient_local_only: bool) -> li
     for address in recipients:
         require_maildir(address)
     if not recipient_local_only:
-        unregistered = [address for address in recipients if not recipient_has_transport(address)]
+        unregistered = [address for address in recipients if not recipient_has_transport(address) and address not in manual_recipients()]
         if unregistered:
             # Name the seats that DO have a transport: the sender can pick the right
             # address instead of discovering the dead drop hours later.
@@ -1175,7 +1206,10 @@ def forward_message(args: argparse.Namespace) -> int:
     cc_header = [address for address in recipients if address != args.to]
     source_maildir = require_maildir(args.source_address)
     _state, source_path = locate_message(source_maildir, args.source_message)
-    original = parse_message(source_path)
+    original_bytes = read_unchanged_source(source_path)
+    if args.expect_sha256 and hashlib.sha256(original_bytes).hexdigest() != args.expect_sha256:
+        raise MailCortexError("forward source SHA-256 mismatch; select the message again")
+    original = BytesParser(policy=policy.default).parsebytes(original_bytes)
     original_subject = str(original.get("Subject", ""))
     subject = args.subject
     if subject is None:
@@ -1207,6 +1241,83 @@ def forward_message(args: argparse.Namespace) -> int:
     message.add_attachment(original, filename="forwarded-message.eml")
 
     return deliver_fanout(message, recipients, shared_delivery=args.shared_delivery, print_id=args.print_id)
+
+
+def read_unchanged_source(path: Path, *, preserve_metadata: bool = False) -> bytes:
+    # O_NOATIME preserves source metadata instead of restoring timestamps (which
+    # would itself change ctime). Refuse when the platform/ownership cannot do so.
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    if preserve_metadata:
+        if not hasattr(os, "O_NOATIME"):
+            raise MailCortexError("read-only export requires O_NOATIME support")
+        flags |= os.O_NOATIME
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode):
+            raise MailCortexError("message source must be a regular file")
+        data = stream.read()
+        after = os.fstat(stream.fileno())
+        if (before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+                after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise MailCortexError("message source changed while reading")
+    return data
+
+
+def export_mbox(args: argparse.Namespace) -> int:
+    source = require_maildir(args.address).absolute()
+    output = Path(args.output).expanduser()
+    if not output.is_absolute() or output != output.resolve():
+        raise MailCortexError("mbox output must use a canonical absolute path without symlinks")
+    for protected in (mail_root().resolve(), runtime_root().resolve()):
+        if output.is_relative_to(protected):
+            raise MailCortexError("mbox output must be outside Maildir and runtime state")
+    parent = output.parent
+    info = parent.stat()
+    if (not parent.is_dir() or info.st_uid != os.geteuid()
+            or stat.S_IMODE(info.st_mode) & 0o022):
+        raise MailCortexError("mbox output directory must be owner-owned and not group/world writable")
+    if output.exists() or output.is_symlink():
+        raise MailCortexError("mbox output already exists; choose a new snapshot path")
+    if source != source.resolve():
+        raise MailCortexError("refusing symlink in source Maildir path")
+    rows = []
+    for state in ("new", "cur"):
+        directory = source / state
+        descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NOATIME)
+        try:
+            for name in os.listdir(descriptor):
+                if name.startswith("."):
+                    continue
+                path = directory / name
+                entry = path.lstat()
+                if not stat.S_ISREG(entry.st_mode):
+                    raise MailCortexError("refusing non-regular Maildir entry")
+                rows.append((entry.st_mtime_ns, name, state, path))
+        finally:
+            os.close(descriptor)
+    descriptor, temporary = tempfile.mkstemp(prefix=".mailcortex-mbox-", dir=parent)
+    os.close(descriptor)
+    try:
+        box = mailbox.mbox(temporary, create=False)
+        try:
+            for _mtime, _name, _state, path in sorted(rows):
+                # Bytes input preserves original headers/MIME and mailbox supplies
+                # standard From_ escaping, line endings, separators and envelope.
+                raw = read_unchanged_source(path, preserve_metadata=True).replace(b"\r\n", b"\n")
+                box.add(b"From MAILER-DAEMON Thu Jan  1 00:00:00 1970\n" + raw)
+            box.flush()
+        finally:
+            box.close()
+        with open(temporary, "rb") as stream:
+            os.fsync(stream.fileno())
+        # Hard-link publishes the completed inode atomically, refusing a raced
+        # destination rather than replacing anything the operator already owns.
+        os.link(temporary, output, follow_symlinks=False)
+        fsync_directory(parent)
+    finally:
+        os.unlink(temporary)
+    print(output)
+    return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1267,7 +1378,14 @@ def build_parser() -> argparse.ArgumentParser:
                          help="print filename and Message-ID separated by a tab")
     forward.add_argument("--permission-auth", type=validate_permission_auth,
                          help="validated MailCortex permission authentication header")
+    forward.add_argument("--expect-sha256", type=validate_sha256,
+                         help="refuse if selected source bytes changed")
     forward.set_defaults(function=forward_message)
+
+    export = subparsers.add_parser("export-mbox", help="publish a read-only private mbox snapshot")
+    export.add_argument("address", type=validate_address)
+    export.add_argument("--output", required=True)
+    export.set_defaults(function=export_mbox)
 
     inbox = subparsers.add_parser("inbox", help="list new and seen messages")
     inbox.add_argument("address", type=validate_address)
@@ -1353,6 +1471,12 @@ def validate_permission_auth(value: str) -> str:
 def validate_address(value: str) -> str:
     address_maildir(value)
     return value.lower()
+
+
+def validate_sha256(value: str) -> str:
+    if not re.fullmatch(r"[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("SHA-256 must be 64 lowercase hexadecimal characters")
+    return value
 
 
 def main() -> int:
@@ -1614,6 +1738,7 @@ class MailCortexCoreTest(unittest.TestCase):
         self.env = dict(os.environ,
                         MAILCORTEX_ROOT=str(self.tmp / "Mail"),
                         MAILCORTEX_RUNTIME=str(self.tmp / "state"),
+                        MAILCORTEX_MANUAL_RECIPIENTS=str(self.tmp / "manual.json"),
                         MAILCORTEX_SEAT_REGISTRY=str(registry))
         self.mc(["provision", OWNER, FACE, ALICE, BOB, UNREGISTERED])
 
@@ -1728,6 +1853,146 @@ class MailCortexCoreTest(unittest.TestCase):
                           FACE, "not-a-real-filename", "--body", "x"], check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("message not found", result.stderr)
+
+
+    def test_export_empty_and_ordered_seen_messages_leaves_handling_state(self):
+        import mailbox
+        output = self.tmp / "empty.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(output)])
+        self.assertEqual(output.read_bytes(), b"")
+        root = self.tmp / "Mail/seats/xmpp-bridge"
+        for state, name, subject, stamp in (("cur", "seen:2,S", "first", 1),
+                                             ("new", "unseen", "second", 2)):
+            path = root / state / name
+            path.write_bytes(("From: a@test.helm\nTo: b@test.helm\nSubject: "
+                              + subject + "\n\nbody\n").encode())
+            os.utime(path, ns=(stamp, stamp))
+        runtime = self.tmp / "state"
+        runtime.mkdir()
+        receipt = runtime / "handling.json"
+        receipt.write_text('{"handling_completed":true}')
+        before = receipt.stat()
+        ordered = self.tmp / "ordered.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(ordered)])
+        after = receipt.stat()
+        self.assertEqual((before.st_atime_ns, before.st_mtime_ns, before.st_ctime_ns),
+                         (after.st_atime_ns, after.st_mtime_ns, after.st_ctime_ns))
+        self.assertEqual(receipt.read_text(), '{"handling_completed":true}')
+        box = mailbox.mbox(ordered)
+        try:
+            self.assertEqual([m["Subject"] for m in box], ["first", "second"])
+        finally:
+            box.close()
+        self.assertTrue((root / "cur/seen:2,S").exists())
+        self.assertTrue((root / "new/unseen").exists())
+
+    def manual_registry(self, **changes):
+        path = self.tmp / "manual.json"
+        value = {"schema": "mailcortex.manual-recipients.v1", "recipients": [OWNER]}
+        value.update(changes)
+        path.write_text(json.dumps(value))
+        path.chmod(0o600)
+        self.env["MAILCORTEX_MANUAL_RECIPIENTS"] = str(path)
+        return path
+
+    def test_human_recipient_send_cc_and_invalid_registry_refusal(self):
+        path = self.manual_registry()
+        sent = self.mc(["send", "--from", FACE, "--to", OWNER, "--cc", ALICE,
+                        "--subject", "human", "--body", "reply"])
+        self.assertEqual(len(sent.stdout.splitlines()), 2)
+        owner_new = self.tmp / "Mail/consorts/owner/new"
+        count = len(list(owner_new.iterdir()))
+        bad = self.mc(["send", "--from", FACE, "--to", OWNER, "--cc", UNREGISTERED,
+                       "--subject", "bad", "--body", "bad"], check=False)
+        self.assertNotEqual(bad.returncode, 0)
+        self.assertEqual(len(list(owner_new.iterdir())), count)
+        for mode in (0o644, 0o660):
+            path.chmod(mode)
+            self.assertNotEqual(self.mc(["send", "--from", FACE, "--to", OWNER,
+                "--subject", "bad", "--body", "bad"], check=False).returncode, 0)
+        path.chmod(0o600)
+        self.manual_registry(recipients=["invalid"])
+        self.assertNotEqual(self.mc(["send", "--from", FACE, "--to", OWNER,
+            "--subject", "bad", "--body", "bad"], check=False).returncode, 0)
+        self.manual_registry()
+        alias = self.tmp / "alias.json"
+        alias.symlink_to(path)
+        self.env["MAILCORTEX_MANUAL_RECIPIENTS"] = str(alias)
+        self.assertNotEqual(self.mc(["send", "--from", FACE, "--to", OWNER,
+            "--subject", "bad", "--body", "bad"], check=False).returncode, 0)
+
+    def test_forward_digest_binds_consumed_source(self):
+        import hashlib
+        sent = self.mc(["send", "--from", OWNER, "--to", FACE,
+                        "--subject", "guard", "--body", "source"])
+        path = self.tmp / "Mail/seats/xmpp-bridge/new" / sent.stdout.strip()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        argv = ["forward", "--from", FACE, "--to", ALICE, FACE, path.name,
+                "--expect-sha256", digest]
+        self.mc(argv)
+        path.write_bytes(path.read_bytes().replace(b"source", b"changed"))
+        bad = self.mc(argv, check=False)
+        self.assertEqual(bad.returncode, 2)
+        self.assertIn("SHA-256 mismatch", bad.stderr)
+        self.assertEqual(len(list((self.tmp / "Mail/seats/alice/new").iterdir())), 1)
+
+    def test_export_snapshot_mime_metadata_and_refusal(self):
+        import hashlib
+        import mailbox
+        import stat
+        attachment = self.tmp / "binary.dat"
+        attachment.write_bytes(bytes(range(256)))
+        self.mc(["send", "--from", OWNER, "--to", FACE, "--subject", "mbox MIME",
+                 "--body", "From dangerous envelope\nbody", "--attach", str(attachment)])
+        root = self.tmp / "Mail"
+        # Warm only the fixture observer's atime, then snapshot before exporter.
+        files = list(root.rglob("*"))
+        expected = {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                    for p in files if p.is_file()}
+        paths = [root, *files]
+        def snapshot():
+            return {str(p): (p.stat().st_mode, p.stat().st_ino, p.stat().st_size,
+                    p.stat().st_atime_ns, p.stat().st_mtime_ns, p.stat().st_ctime_ns)
+                    for p in paths}
+        before = snapshot()
+        output = self.tmp / "snapshot.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(output)])
+        self.assertEqual(before, snapshot())
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o600)
+        self.assertIn(b"\n>From dangerous envelope", output.read_bytes())
+        box = mailbox.mbox(output)
+        try:
+            messages = list(box)
+            self.assertEqual(len(messages), 1)
+            message = messages[0]
+            self.assertEqual(message["Subject"], "mbox MIME")
+            self.assertEqual(message.get_payload()[1].get_payload(decode=True), bytes(range(256)))
+        finally:
+            box.close()
+        self.assertEqual(expected, {str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                                   for p in files if p.is_file()})
+        second = self.tmp / "again.mbox"
+        self.mc(["export-mbox", FACE, "--output", str(second)])
+        self.assertEqual(output.read_bytes(), second.read_bytes())
+        for dest in (output, root / "snapshot.mbox", self.tmp / "missing/out"):
+            self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(dest)], check=False).returncode, 0)
+        alias = self.tmp / "alias"
+        alias.symlink_to(output)
+        self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(alias)], check=False).returncode, 0)
+        fifo = self.tmp / "fifo"
+        os.mkfifo(fifo)
+        self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(fifo)], check=False).returncode, 0)
+        source = self.tmp / "Mail/seats/xmpp-bridge/new/unsafe"
+        source.symlink_to(attachment)
+        failed = self.tmp / "failed.mbox"
+        self.assertNotEqual(self.mc(["export-mbox", FACE, "--output", str(failed)], check=False).returncode, 0)
+        self.assertFalse(failed.exists())
+        self.assertEqual(list(self.tmp.glob(".mailcortex-mbox-*")), [])
+        # Read installed legacy mailx with only this synthetic snapshot.
+        mailx = subprocess.run(["/usr/bin/mailx", "-H", "-f", str(output)],
+                              capture_output=True, text=True, env=self.env)
+        self.assertEqual(mailx.returncode, 0, mailx.stderr)
+        self.assertIn("mbox MIME", mailx.stdout)
 
 
 if __name__ == "__main__":
