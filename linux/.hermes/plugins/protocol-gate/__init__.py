@@ -84,10 +84,18 @@ def _worktrees(hole):
 
 def _sources(hole):
     refs = hole.get("planning_refs") or []
-    if not isinstance(refs, list) or not refs:
-        raise ProtocolError("hole has no canonical MetaCortex planning_refs; link it using native sync")
+    if not isinstance(refs, list):
+        raise ProtocolError("invalid planning_refs list")
+    local_refs = []
+    for ref in refs:
+        if not isinstance(ref, dict) or not isinstance(ref.get("url"), str):
+            raise ProtocolError("invalid native planning ref; expected platform/url/title/date object")
+        if ref.get("platform") == "local":
+            local_refs.append(ref["url"])
+    if not local_refs:
+        raise ProtocolError("hole has no local MetaCortex planning ref; link it with prompt-golf ref")
     evidence = []
-    for rel in dict.fromkeys([*SOURCES, *refs]):
+    for rel in dict.fromkeys([*SOURCES, *local_refs]):
         if not isinstance(rel, str):
             raise ProtocolError("invalid planning ref")
         path = (REPO / rel).resolve()
