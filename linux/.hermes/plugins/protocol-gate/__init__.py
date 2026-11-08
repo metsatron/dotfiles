@@ -7,8 +7,10 @@ import hashlib
 import json
 import pathlib
 import shlex
+import subprocess
 
 REPO = pathlib.Path("/home/metsatron/HelmCortex").resolve()
+REPOSITORIES = {"HelmCortex": REPO, "DotCortex": pathlib.Path.home() / "DotCortex"}
 COURSES = REPO / "ROOTS/PromptGolf/courses"
 SPEAKER = "hermes-agent"
 READ_TOOLS = {"read_file", "search_files", "skill_view", "skills_list", "tool_describe",
@@ -64,20 +66,43 @@ def _claim(session_id):
     return matches[0]
 
 
+def _git_worktrees(repo):
+    result = subprocess.run(["git", "-C", str(repo), "worktree", "list", "--porcelain", "-z"],
+                            capture_output=True, text=True, check=True, timeout=15)
+    records = []
+    for block in result.stdout.split("\0\0"):
+        fields = dict(field.split(" ", 1) for field in block.split("\0") if " " in field)
+        if fields.get("worktree"):
+            records.append(fields)
+    return records
+
+
 def _worktrees(hole):
     registry = _json(REPO / "ROOTS/PromptGolf/registry/worktree-map.json")
-    entries = registry.get("worktrees")
+    entries = registry.get("entries")
     if not isinstance(entries, list):
-        raise ProtocolError("invalid worktree registry")
-    paths = []
+        raise ProtocolError("invalid native worktree map; expected entries[] of repo/branch/hole")
+    paths, seen = [], set()
     for row in entries:
         if not isinstance(row, dict):
             raise ProtocolError("invalid worktree registry row")
-        if (row.get("hole") == hole["id"] and row.get("course") == hole.get("course")
-                and row.get("state") == "commissioned"):
-            path = pathlib.Path(row["worktree"]).expanduser().resolve()
-            if not path.is_dir() or path == REPO.resolve():
-                raise ProtocolError("missing/unsafe registered worktree: %s" % path)
+        if row.get("hole") != hole["id"]:
+            continue
+        key = (row.get("repo"), row.get("branch"))
+        if key in seen:
+            raise ProtocolError("duplicate native worktree binding: %s" % (key,))
+        seen.add(key)
+        repo = REPOSITORIES.get(row.get("repo"))
+        if repo is None:
+            continue  # No invented host path for a repository this installation does not know.
+        for actual in _git_worktrees(repo):
+            if actual.get("branch") != "refs/heads/" + str(row.get("branch")):
+                continue
+            path = pathlib.Path(actual["worktree"]).expanduser().resolve()
+            if not path.is_dir():
+                raise ProtocolError("registered worktree is not locally accessible: %s" % path)
+            if path == pathlib.Path(repo).resolve():
+                raise ProtocolError("native binding points to the shared main tree")
             paths.append(path)
     return paths
 
