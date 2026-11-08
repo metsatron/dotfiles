@@ -32,21 +32,28 @@ class Admission(unittest.TestCase):
         self.save()
         self.registry = self.root / "ROOTS/PromptGolf/registry/worktree-map.json"
         self.registry.parent.mkdir(parents=True)
-        self.registry.write_text(json.dumps({"worktrees": [{"course": "HelmCortex",
-            "hole": "test-hole", "worktree": str(self.wt), "branch": "wt/test",
-            "state": "commissioned"}]}))
+        self.registry.write_text(json.dumps({"entries": [{"repo": "HelmCortex",
+            "hole": "test-hole", "branch": "wt/test"}]}))
+        # Exercise actual Git's porcelain/branch resolution, not an invented path-bearing map.
+        import subprocess
+        for argv in (["git", "init", "--quiet", str(self.root)],
+                     ["git", "-C", str(self.root), "-c", "core.hooksPath=/dev/null",
+                      "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                      "commit", "--quiet", "--allow-empty", "-m", "fixture"],
+                     ["git", "-C", str(self.root), "worktree", "add", "--quiet", "-b", "wt/test", str(self.wt)]):
+            subprocess.run(argv, check=True, capture_output=True)
         for rel in ("LOGS/TODO/HelmCortex.md", "ROOTS/Athanor/models.json", "project.md",
                     "FORGE/harness/userspace/PEER-AGENTS.md"):
             p = self.root / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text('{"models": []}' if p.suffix == '.json' else "# evidence\n- [ ] Operator priority unresolved\n")
-        self.oldrepo, self.oldcourses = m.REPO, m.COURSES
-        m.REPO, m.COURSES = self.root, self.courses
+        self.oldrepo, self.oldcourses, self.oldrepositories = m.REPO, m.COURSES, m.REPOSITORIES
+        m.REPO, m.COURSES, m.REPOSITORIES = self.root, self.courses, {"HelmCortex": self.root}
         self.addCleanup(self.restore)
         self.called = 0
 
     def restore(self):
-        m.REPO, m.COURSES = self.oldrepo, self.oldcourses
+        m.REPO, m.COURSES, m.REPOSITORIES = self.oldrepo, self.oldcourses, self.oldrepositories
 
     def save(self):
         self.holepath.write_text(json.dumps(self.hole))
