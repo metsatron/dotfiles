@@ -26,7 +26,7 @@ class Admission(unittest.TestCase):
         self.holepath = self.courses / "HelmCortex/holes/active/test-hole.json"
         self.holepath.parent.mkdir(parents=True)
         self.hole = {"id": "test-hole", "course": "HelmCortex", "status": "in-progress",
-                     "assigned_speaker": "hermes-agent", "planning_refs": ["project.md"],
+                     "assigned_speaker": "hermes-agent", "planning_refs": [{"platform": "local", "url": "project.md", "title": "fixture", "date": "2026-11-08"}],
                      "swings": [{"speaker": "hermes-agent", "session_id": "s1", "lie": None,
                                   "landed": None}]}
         self.save()
@@ -130,6 +130,26 @@ class Admission(unittest.TestCase):
 
     def test_missing_planning_ref_fails_closed(self):
         (self.root / "project.md").unlink()
+        self.refused()
+
+    def test_external_reference_is_not_local_project_admission(self):
+        self.hole["planning_refs"] = [{"platform": "chatgpt", "url": "https://example.invalid/thread"}]
+        self.save()
+        self.refused()
+
+    def test_external_reference_does_not_get_fetched(self):
+        self.hole["planning_refs"].append({"platform": "chatgpt", "url": "https://example.invalid/thread"})
+        self.save()
+        self.assertTrue(self.invoke().get("ran"))
+
+    def test_string_planning_ref_is_not_native_schema(self):
+        self.hole["planning_refs"] = ["project.md"]
+        self.save()
+        self.refused()
+
+    def test_planning_ref_escape_refused(self):
+        self.hole["planning_refs"][0]["url"] = "../outside.md"
+        self.save()
         self.refused()
 
     def test_pre_llm_contains_canonical_evidence(self):
