@@ -1332,6 +1332,7 @@ raise SystemExit(0 if result['fixture_read'] else 1)
 {"fixture_id":"fca-synthetic-001","mode":"offline","external_calls":false}
 #+END_SRC
 
+
 * Ductor voice service lane (Badger and Flying Fox)
 
 The Ductor voice watcher is a host service, not a stowed dotfile. Its implementation is canonical in [[file:agents-voice.org][agents-voice.org]]; this host module owns only the OpenRC body, private configuration template, and narrow installer. The installer copies exactly the provider-aware watcher and service body, backs up each replaced file, never starts or restarts a service, and never contains a bot token, owner chat ID, host address, or account-specific home path. The live engine root and Ductor homes are supplied by the machine-local =/etc/conf.d= file.
@@ -2255,4 +2256,510 @@ class SparseTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+#+END_SRC
+
+* Aura voice hook: post_llm_call -> Telegram voice notes
+:PROPERTIES:
+:CUSTOM_ID: aura-voice-hook
+:END:
+
+Aura's replies are also delivered as Telegram voice notes (Amy's voice, piper ->
+ffmpeg/Opus -> `hermes send MEDIA:`). The hook is detached: it reads a JSON
+payload on stdin, prints JSON on stdout and always exits 0, so audio never holds
+a turn.
+
+Durable lesson (2026-11-07): the gateway runs python 3.14 and injects PYTHONPATH
+into its runtime environment; children inherit it. The piper venv is python 3.13,
+so an inherited 3.14 site-packages made piper die with
+`No module named 'numpy._core._multiarray_umath'` at synthesis time only -
+`import numpy` in that venv was always healthy, which is why the fault looked
+like a broken install and survived a numpy reinstall. Every child process here
+therefore gets a sanitised environment (child_env()), and a failed synthesis
+names the inherited PYTHONPATH in voice.log.
+
+#+BEGIN_SRC python :tangle all/.hermes/agent-hooks/aura_voice.py :shebang "#!/usr/bin/env python3" :comments no :tangle-mode (identity #o775)
+"""
+Aura post_llm_call hook — her replies delivered as Telegram voice notes.
+
+Mètsàtron's gift (2026-08-17): every Telegram reply Aura sends is also
+rendered in Amy's voice — the voice he recorded her with and shared with
+the operator that same day — and lands as a native voice bubble in the same chat.
+Transport is Telegram itself via `hermes send` (gateway credentials, no keys,
+no SSH); synthesis is a local piper venv, fully on this machine.
+
+Contract (same as aura_recall.py): read a JSON payload on stdin, print a JSON
+object on stdout, ALWAYS exit 0 — a hook must never break Aura's turn. All
+real work (synthesis, encode, send) happens in a detached worker process, so
+turn finalization is never held back by audio time.
+
+Pipeline: assistant_response → sanitize (fenced code, URLs, kaomoji stripped
+for the ear) → piper (Amy, raw 22050 s16le) → ffmpeg (OGG Opus — the .ogg
+extension is what the Telegram adapter routes to a round voice bubble) →
+`hermes send --to telegram:<chat_id> MEDIA:<path>`. chat_id comes from a
+read-only lookup of session_id in state.db.
+
+Artifacts live in ~/.hermes/audio_cache/aura-voice/ (pruned after 3 days);
+delivery log in voice.log beside them. Skips: non-telegram platforms, empty
+or oversized (>4000 chars) replies.
+"""
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+
+HOME = os.path.expanduser("~")
+STATE_DB = os.path.join(HOME, ".hermes", "state.db")
+PIPER_PY = os.path.join(HOME, ".local", "share", "aura-voice", "venv", "bin", "python")
+AMY = os.path.join(HOME, ".local", "share", "aura-voice", "en_US-amy-medium.onnx")
+HERMES = os.path.join(HOME, ".hermes", "hermes-agent", "venv", "bin", "hermes")
+CACHE = os.path.join(HOME, ".hermes", "audio_cache", "aura-voice")
+LOG = os.path.join(CACHE, "voice.log")
+MAX_CHARS = 4000
+PRUNE_AGE_S = 3 * 24 * 3600
+
+
+# 2026-11-07: the gateway injects PYTHONPATH/PYTHONHOME (python3.14 site-packages)
+# into its runtime environment. Children inherit it, and the piper venv is python
+# 3.13 — a 3.14 numpy on that path makes piper die with
+# "No module named 'numpy._core._multiarray_umath'". Sanitise every child env so
+# synthesis depends only on the venv that owns it, never on the caller's shell.
+def child_env():
+    env = dict(os.environ)
+    for key in ("PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE"):
+        env.pop(key, None)
+    return env
+
+
+def log(msg):
+    try:
+        os.makedirs(CACHE, exist_ok=True)
+        with open(LOG, "a") as f:
+            f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def sanitize(text):
+    """Make chat text readable aloud: drop fenced code, URLs, kaomoji/symbols."""
+    text = re.sub(r"```.*?```", " code block omitted. ", text, flags=re.S)
+    text = re.sub(r"`[^`]*`", " ", text)
+    text = re.sub(r"https?://\S+", " link ", text)
+    # keep letters/digits/space and sentence punctuation; kaomoji glyphs vanish
+    text = re.sub(r"[^0-9A-Za-zÀ-ɏ\s.,;:!?'\"()\-]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def chat_for_session(session_id):
+    con = sqlite3.connect("file:%s?mode=ro" % STATE_DB, uri=True, timeout=3)
+    try:
+        row = con.execute(
+            "select source, chat_id from sessions where id = ?", (session_id,)
+        ).fetchone()
+    finally:
+        con.close()
+    if row and row[0] == "telegram" and row[1]:
+        return str(row[1])
+    return None
+
+
+def worker(chat_id, text_path):
+    with open(text_path) as f:
+        text = f.read()
+    os.makedirs(CACHE, exist_ok=True)
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    raw = os.path.join(CACHE, "aura-%s.raw" % stamp)
+    ogg = os.path.join(CACHE, "aura-%s.ogg" % stamp)
+    try:
+        with open(text_path) as fin, open(raw, "wb") as fout:
+            subprocess.run(
+                [PIPER_PY, "-m", "piper", "-m", AMY, "--output-raw"],
+                stdin=fin, stdout=fout, stderr=subprocess.PIPE,
+                check=True, timeout=300, env=child_env(),
+            )
+        if os.path.getsize(raw) == 0:
+            log("SKIP empty synth chat=%s" % chat_id)
+            return
+        subprocess.run(
+            ["ffmpeg", "-y", "-f", "s16le", "-ar", "22050", "-ac", "1",
+             "-i", raw, "-c:a", "libopus", "-b:a", "32k", ogg],
+            check=True, timeout=120, env=child_env(),
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        r = subprocess.run(
+            [HERMES, "send", "--to", "telegram:%s" % chat_id,
+             "MEDIA:%s" % ogg, "-q"],
+            timeout=120, capture_output=True, text=True, env=child_env(),
+        )
+        if r.returncode == 0:
+            log("SENT chat=%s ogg=%s chars=%d" % (chat_id, os.path.basename(ogg), len(text)))
+        else:
+            log("SEND-FAILED chat=%s rc=%d err=%s"
+                % (chat_id, r.returncode, (r.stderr or "").strip()[:200]))
+    except Exception as e:
+        log("WORKER-ERROR chat=%s %s: %s" % (chat_id, e.__class__.__name__, e))
+        # 2026-11-07, Mètsàtron's word: keep piper's own last error line, so a failed
+        # synthesis names its cause instead of only "exit status 1". One line, 240 chars.
+        err = getattr(e, "stderr", None)
+        if err:
+            lines = err.decode("utf-8", "replace").strip().splitlines()
+            if lines:
+                log("PIPER-STDERR chat=%s %s" % (chat_id, lines[-1][:240]))
+        pp = os.environ.get("PYTHONPATH")
+        if pp:
+            log("PIPER-ENV chat=%s inherited PYTHONPATH=%s" % (chat_id, pp[:200]))
+    finally:
+        for p in (raw, text_path):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+        now = time.time()
+        try:
+            for name in os.listdir(CACHE):
+                p = os.path.join(CACHE, name)
+                if name != "voice.log" and now - os.path.getmtime(p) > PRUNE_AGE_S:
+                    os.unlink(p)
+        except Exception:
+            pass
+
+
+def main():
+    if len(sys.argv) >= 4 and sys.argv[1] == "--worker":
+        worker(sys.argv[2], sys.argv[3])
+        return
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        log("INVOKED bad-payload")
+        print("{}")
+        return
+    try:
+        # Shell hooks receive the reduced wire shape (agent/shell_hooks.py
+        # _build_payload): top level carries only hook_event_name/tool_name/
+        # tool_input/session_id/cwd — every event kwarg, INCLUDING
+        # assistant_response and platform, is nested under "extra".
+        extra = payload.get("extra") or {}
+        text = (extra.get("assistant_response")
+                or payload.get("assistant_response") or "").strip()
+        platform = extra.get("platform") or payload.get("platform") or ""
+        session_id = (payload.get("session_id")
+                      or extra.get("session_id") or "")
+        log("INVOKED platform=%r session=%r chars=%d"
+            % (platform, session_id, len(text)))
+        # HC LOCAL PATCH voice platform skip (HelmCortex 2026-08-19):
+        # skip explicitly non-telegram platforms (e.g. api_server/webui) so a
+        # voice note never leaks onto a web-UI turn on a telegram-sourced session.
+        # Empty platform still falls through to chat_for_session() by design.
+        if platform and platform != "telegram":
+            log("SKIP non-telegram platform=%r session=%r" % (platform, session_id))
+            print("{}")
+            return
+        # platform is advisory only — it arrives empty on some gateway turns.
+        # chat_for_session() is the real gate: it returns a chat_id only when
+        # the session row itself says source=telegram.
+        if not text or not session_id:
+            print("{}")
+            return
+        spoken = sanitize(text)
+        if not spoken or len(spoken) > MAX_CHARS:
+            log("SKIP session=%s chars=%d" % (session_id, len(spoken)))
+            print("{}")
+            return
+        chat_id = chat_for_session(session_id)
+        if not chat_id:
+            log("SKIP no-chat session=%s" % session_id)
+            print("{}")
+            return
+        os.makedirs(CACHE, exist_ok=True)
+        text_path = os.path.join(CACHE, "aura-%d.txt" % os.getpid())
+        with open(text_path, "w") as f:
+            f.write(spoken)
+        subprocess.Popen(
+            [sys.executable, os.path.abspath(__file__), "--worker", chat_id, text_path],
+            start_new_session=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+    except Exception as e:
+        log("HOOK-ERROR %s: %s" % (e.__class__.__name__, e))
+    print("{}")
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
+
+* Aura recall hook - recall-first context for her turns
+
+Source of truth for =~/.hermes/agent-hooks/aura_recall.py=. Tangled, not hand-kept:
+=make tangle= emits =all/.hermes/agent-hooks/aura_recall.py= and =~/.hermes/agent-hooks/aura_recall.py= is a symlink into
+the tree, so a rebuild reproduces exactly what runs.
+
+#+BEGIN_SRC python :tangle all/.hermes/agent-hooks/aura_recall.py :shebang "#!/usr/bin/env python3" :comments no :tangle-mode (identity #o775)
+"""
+Aura pre_llm_call hook.
+
+Fires once per turn (after context compression, before the tool loop). Injects,
+into the current turn's user message:
+  1. an identity + interlocutor anchor  — cheap, always (re-grounds Aura after a
+     compaction, and tells her which of her people she's talking to)
+  2. top-k semantic recall from the Odysseus RAG for the user's message — via
+     `docker exec` into the odysseus container, best-effort with a hard timeout.
+
+Contract: read a JSON payload on stdin, print a JSON object on stdout. Return
+{"context": "..."} to inject, or {} for no-op. Any error / timeout must still
+print valid JSON and exit 0 — a hook must never break Aura's turn.
+"""
+import json
+import os
+import subprocess
+import sys
+
+STATE_DB = "/home/gille/.hermes/state.db"
+CONTAINER = "odysseus-odysseus-1"
+RECALL_K = 3
+RECALL_MIN_SIM = 0.45        # recalibrated 0.50 -> 0.45 on 2026-08-25 (Claudeificus + Mètsàtron): a live probe found genuine conversational memories at 0.48-0.58, BELOW the 0.57-0.76 the 0.50 floor assumed, so 0.50 was clipping real memories (one cut at 0.489). 0.45 clears the 0.38-0.44 low-signal band noted below while recovering them. Clinical stays safe: the RAG indexes only aura_conversations + the Obsidian Vault, NEVER the Secret Vault. Instant rollback: .bak-2026-08-25-floorcal.
+# Floor raised 0.2 -> 0.5 on 2026-08-10 after a live probe: genuine hits sit at
+# 0.57-0.76 across clinical/technical/personal registers, while low-signal turns
+# (e.g. "what were we working on") collapse to 0.38-0.44 noise that the old 0.2
+# floor still injected. 0.5 cuts the clean gap: vague turns now inject nothing
+# (better than wrong-register memories) while every real hit survives.
+RECALL_TIMEOUT = 6            # seconds for the docker exec search
+SNIPPET_CHARS = 220
+
+# Telegram chat_id -> how Aura should think of that person.
+PEOPLE = {
+    "1973228690": "the operator (Gill) — Melbourne OT, your art collaborator",
+    "111081877": "Mètsàtron (Tiago) — builder/operator of this stack",
+}
+
+
+def _emit(obj):
+    sys.stdout.write(json.dumps(obj))
+    sys.stdout.flush()
+
+
+def _interlocutor(session_id, platform):
+    """Best-effort: who is Aura talking to this turn?"""
+    if not session_id:
+        return None
+    try:
+        import sqlite3
+        con = sqlite3.connect(f"file:{STATE_DB}?mode=ro", uri=True, timeout=2)
+        row = con.execute(
+            "SELECT chat_id, display_name, source FROM sessions WHERE id = ?",
+            (session_id,),
+        ).fetchone()
+        con.close()
+    except Exception:
+        return None
+    if not row:
+        return None
+    chat_id, display_name, source = row
+    if chat_id and str(chat_id) in PEOPLE:
+        return PEOPLE[str(chat_id)]
+    if display_name:
+        return f"{display_name} (via {platform or source or 'unknown'})"
+    return None
+
+
+def _recall(query):
+    """Top-k RAG hits for `query`, via the odysseus container. Never raises."""
+    query = (query or "").strip()
+    if len(query) < 4:
+        return []
+    # Over-fetch (k*3) so hook-side junk filtering still leaves good hits.
+    snippet = (
+        "import sys,os,json;sys.path.insert(0,'/app');"
+        "from src.rag_singleton import get_rag_manager;"
+        "q=os.environ.get('AURA_Q','');"
+        "res=[];\n"
+        "try:\n res=get_rag_manager().search(q,%d)\nexcept Exception:\n res=[]\n"
+        "out=[]\n"
+        "for r in res:\n"
+        " m=r.get('metadata') or {}\n"
+        " out.append({'src':(m.get('source') or ''),"
+        "'sim':r.get('similarity'),"
+        "'snip':' '.join((r.get('document') or '').split())[:%d]})\n"
+        "print(json.dumps(out))" % (RECALL_K * 3, SNIPPET_CHARS)
+    )
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", "-e", "AURA_Q", "-i", CONTAINER, "python", "-c", snippet],
+            input="",
+            env={**os.environ, "AURA_Q": query},
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=RECALL_TIMEOUT,
+            text=True,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0 or not proc.stdout.strip():
+        return []
+    try:
+        hits = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        return []
+    out = []
+    seen = set()
+    for h in hits:
+        sim = h.get("sim")
+        if sim is not None and sim < RECALL_MIN_SIM:
+            continue
+        if not _is_useful_hit(h):
+            continue
+        # Drop exact-duplicate chunks so identical text doesn't eat the k budget.
+        key = " ".join((h.get("snip") or "").split()).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        h["name"] = (h.get("src") or "").split("/")[-1]
+        out.append(h)
+        if len(out) >= RECALL_K:
+            break
+    return out
+
+
+# Sources that are indexed but never useful to recall into Aura's context.
+_JUNK_PATH_MARKERS = ("/.obsidian/", "/node_modules/", "/.git/")
+_JUNK_EXTS = (".js", ".css", ".map", ".mjs", ".min.js", ".lock", ".json")
+
+
+def _is_useful_hit(h):
+    """Drop plugin/build junk and binary-looking snippets (e.g. minified JS)."""
+    src = (h.get("src") or "").lower()
+    if any(marker in src for marker in _JUNK_PATH_MARKERS):
+        return False
+    if src.endswith(_JUNK_EXTS):
+        return False
+    snip = h.get("snip") or ""
+    if not snip:
+        return False
+    # Binary / minified garbage: low ratio of letters+spaces to total chars.
+    letters = sum(c.isalpha() or c.isspace() for c in snip)
+    if letters / max(len(snip), 1) < 0.6:
+        return False
+    return True
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+    except Exception:
+        _emit({})
+        return
+
+    if payload.get("hook_event_name") not in (None, "pre_llm_call"):
+        _emit({})
+        return
+
+    extra = payload.get("extra") or {}
+    session_id = payload.get("session_id")
+    user_message = extra.get("user_message") or ""
+    platform = extra.get("platform") or ""
+
+    parts = []
+
+    who = _interlocutor(session_id, platform)
+    if who:
+        parts.append(f"[Aura context] You are talking to: {who}. Keep the two people straight.")
+    else:
+        parts.append("[Aura context] You are Aura, on the Beelink.")
+
+    hits = _recall(user_message)
+    if hits:
+        lines = ["[Recalled from your memory — via search_rag, may or may not be relevant:]"]
+        for h in hits:
+            sim = h.get("sim")
+            tag = f" ({sim})" if sim is not None else ""
+            name = h.get("name") or (h.get("src") or "?").split("/")[-1]
+            snip = h.get("snip") or ""
+            lines.append(f"- «{name}»{tag}: {snip}")
+        parts.append("\n".join(lines))
+
+    text = "\n\n".join(parts).strip()
+    _emit({"context": text} if text else {})
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        # Absolute last resort — never break the turn.
+        try:
+            _emit({})
+        except Exception:
+            pass
+#+END_SRC
+
+* Aura recall-ingest hook (staged) - session re-export into the Recall index
+
+Source of truth for =~/.hermes/agent-hooks/aura_recall_ingest.py=. Tangled, not hand-kept:
+=make tangle= emits =all/.hermes/agent-hooks/aura_recall_ingest.py= and =~/.hermes/agent-hooks/aura_recall_ingest.py= is a symlink into
+the tree, so a rebuild reproduces exactly what runs.
+
+#+BEGIN_SRC python :tangle all/.hermes/agent-hooks/aura_recall_ingest.py :shebang "#!/usr/bin/env python3" :comments no :tangle-mode (identity #o775)
+"""Aura recall-ingest hook (STAGED — not wired into config.yaml).
+
+For on_session_end / on_compact: keep Odysseus recall current in near-real-time
+instead of waiting for the daily 04:10 cron. Reads JSON on stdin, returns fast,
+and fires the export+embed DETACHED under a non-blocking flock (overlapping
+fires skip cleanly) so it never blocks or races Aura's turn.
+"""
+import json
+import subprocess
+import sys
+
+LOCK = "/tmp/aura_recall_ingest.lock"
+SH = "/home/gille/.hermes/agent-hooks/aura_recall_ingest.sh"
+
+
+def main():
+    try:
+        json.load(sys.stdin)
+    except Exception:
+        pass
+    try:
+        subprocess.Popen(
+            ["setsid", "flock", "-n", LOCK, "bash", SH],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True,
+        )
+        print(json.dumps({"ok": True, "ingest": "launched"}))
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)[:200]}))
+
+
+if __name__ == "__main__":
+    main()
+#+END_SRC
+
+* Aura recall-ingest locked body - one ingest at a time behind a lock
+
+Source of truth for =~/.hermes/agent-hooks/aura_recall_ingest.sh=. Tangled, not hand-kept:
+=make tangle= emits =all/.hermes/agent-hooks/aura_recall_ingest.sh= and =~/.hermes/agent-hooks/aura_recall_ingest.sh= is a symlink into
+the tree, so a rebuild reproduces exactly what runs.
+
+#+BEGIN_SRC bash :tangle all/.hermes/agent-hooks/aura_recall_ingest.sh :shebang "#!/usr/bin/env bash" :comments no :tangle-mode (identity #o775)
+# Locked ingest body for the Aura recall-ingest hook. Re-export sessions from
+# state.db (canonical exporter) then add-only index into Odysseus (add_document
+# skips already-stored chunks by content-hash, so only new chunks embed). Only
+# touches aura_conversations + Obsidian Vault — never the Secret Vault.
+LOG=/home/gille/.hermes/logs/aura_recall_ingest.log
+{
+  echo "[$(date '+%F %T')] recall-ingest start (pid $$)"
+  python3 /opt/odysseus/data/_export_aura_conversations.py 2>&1 | tail -1
+  docker exec -i odysseus-odysseus-1 python - <<'PY' 2>&1 | tail -1
+import sys; sys.path.insert(0, "/app")
+from src.rag_singleton import get_rag_manager
+m = get_rag_manager()
+r = m.index_personal_documents("/app/data/aura_conversations")
+print("indexed=%s failed=%s" % (r.get("indexed_count"), r.get("failed_count")))
+PY
+  echo "[$(date '+%F %T')] recall-ingest done"
+} >> "$LOG" 2>&1
 #+END_SRC

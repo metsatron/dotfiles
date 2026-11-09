@@ -11,16 +11,20 @@ set -euo pipefail
 TARGET_VERSION="0.20.1"
 CHECK_ONLY=0
 SITE_OVERRIDE=""
+ONLY=""
 
 usage() {
     cat <<'EOF'
-Usage: ductor-seam-apply [--check] [--site DIR] [-h|--help]
+Usage: ductor-seam-apply [--check] [--only switch_capsule] [--site DIR] [-h|--help]
 
 Apply DotCortex's fleet-wide ductor_bot seams to the installed package.
 
   (no args)     Apply missing seams idempotently, then byte-compile-verify.
   --check       Report applied/missing per seam; change nothing. Exit 1 if any
                 seam is missing.
+  --only switch_capsule
+                Handle just that seam and leave every other one untouched
+                (--check works the same way). Its hook is independent of the rest.
   --site DIR    Operate on the site-packages root DIR instead of the one the
                 `ductor` launcher's interpreter uses.
   -h, --help    Show this help and exit (no side effects).
@@ -30,6 +34,8 @@ Seams:
                 (Claude 55/60 min, Codex 25/30 min; config.json "idle_compaction")
   busy_state    authenticated loopback GET /busy for the default main session
   idle_prompt   encrypted idle-only prompt admission holding API and bus locks
+  switch_capsule  first message after a Claude<->Codex switch carries the
+                  workspace SWITCH_CAPSULE.md head (fail-open)
 
 Seam files:  <dotcortex>/all/.local/share/dotcortex/ductor-seams/
              (override with DOTCORTEX_DUCTOR_SEAMS)
@@ -41,6 +47,7 @@ while [ $# -gt 0 ]; do
     case "$1" in
         -h|--help) usage; exit 0 ;;
         --check)   CHECK_ONLY=1; shift ;;
+        --only)    ONLY="${2:-}"; [ "$ONLY" = switch_capsule ] || { usage >&2; exit 2; }; shift 2 ;;
         --site)    SITE_OVERRIDE="${2:-}"; [ -n "$SITE_OVERRIDE" ] || { usage >&2; exit 2; }; shift 2 ;;
         *) echo "ductor-seam-apply: unknown argument: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -83,6 +90,32 @@ fi
 missing=0
 changed=0
 
+if [ "$ONLY" = switch_capsule ]; then
+    # Independent of the other seams: stage-check on a disposable core.py, then touch only this seam.
+    only_src="$SEAMS_DIR/switch_capsule.py"
+    only_dst="$PKG/orchestrator/switch_capsule.py"
+    only_patch="$SEAMS_DIR/switch_capsule_core.patch"
+    [ -f "$only_src" ] && [ -f "$only_patch" ] || fail "switch_capsule seam files missing in $SEAMS_DIR"
+    if [ -f "$only_dst" ] && cmp -s "$only_src" "$only_dst"; then only_module=applied; else only_module=missing; fi
+    only_hook="$(patch -d "$SITE" -p1 --fuzz=0 --dry-run --reverse --force -s <"$only_patch" >/dev/null 2>&1 && echo applied \
+        || { patch -d "$SITE" -p1 --fuzz=0 --dry-run --forward --force -s <"$only_patch" >/dev/null 2>&1 && echo missing || echo drifted; })"
+    [ "$only_hook" != drifted ] || fail "switch_capsule: orchestrator/core.py drifted from the seam; regenerate it"
+    echo "switch_capsule: module=$only_module hook=$only_hook"
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        [ "$only_module" = applied ] && [ "$only_hook" = applied ]
+        exit $?
+    fi
+    [ "$only_module" = missing ] && install -m 0644 "$only_src" "$only_dst"
+    [ "$only_hook" = missing ] && patch -d "$SITE" -p1 --fuzz=0 --forward -s <"$only_patch"
+    (cd /tmp && "$PYTHON_BIN" -m py_compile "$only_dst" "$PKG/orchestrator/core.py") || fail "py_compile failed after applying switch_capsule"
+    if [ "$only_module" = missing ] || [ "$only_hook" = missing ]; then
+        echo "ductor-seam-apply: switch_capsule applied to $SITE"
+    else
+        echo "ductor-seam-apply: switch_capsule already applied"
+    fi
+    exit 0
+fi
+
 seam_file_state() {  # $1 = seam source, $2 = installed path
     if [ -f "$2" ] && cmp -s "$1" "$2"; then echo applied; else echo missing; fi
 }
@@ -118,6 +151,12 @@ mirror_patch="$SEAMS_DIR/idle_prompt_telegram.patch"
 [ -f "$prompt_src" ] && [ -f "$prompt_patch" ] && [ -f "$mirror_patch" ] \
     || fail "idle_prompt seam files missing in $SEAMS_DIR"
 prompt_module_state="$(seam_file_state "$prompt_src" "$prompt_dst")"
+
+capsule_src="$SEAMS_DIR/switch_capsule.py"
+capsule_dst="$PKG/orchestrator/switch_capsule.py"
+capsule_patch="$SEAMS_DIR/switch_capsule_core.patch"
+[ -f "$capsule_src" ] && [ -f "$capsule_patch" ] || fail "switch_capsule seam files missing in $SEAMS_DIR"
+capsule_module_state="$(seam_file_state "$capsule_src" "$capsule_dst")"
 
 # Validate the complete ordered series on a disposable staged copy first.
 # Later patches overlap earlier context. Peel an applied admission hook off
@@ -156,6 +195,14 @@ mirror_hook_state="$(seam_patch_state "$mirror_patch" "$preflight")"
 if [ "$mirror_hook_state" = missing ]; then
     patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$mirror_patch" || fail "Telegram bus preflight failed"
 fi
+# switch_capsule hooks core.py far from the other series; classify it last, on the fully staged copy.
+install -m 0644 "$capsule_src" "$preflight/ductor_bot/orchestrator/switch_capsule.py"
+capsule_hook_state="$(seam_patch_state "$capsule_patch" "$preflight")"
+[ "$capsule_hook_state" != drifted ] || fail "switch_capsule: orchestrator/core.py drifted from the seam; regenerate it"
+echo "switch_capsule: module=$capsule_module_state hook=$capsule_hook_state"
+if [ "$capsule_hook_state" = missing ]; then
+    patch -d "$preflight" -p1 --fuzz=0 --forward -s <"$capsule_patch" || fail "switch_capsule preflight failed"
+fi
 "$PYTHON_BIN" -m compileall -q "$preflight/ductor_bot" || fail "complete series preflight compile failed"
 
 if [ "$CHECK_ONLY" -eq 1 ]; then
@@ -163,6 +210,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     [ "$busy_module_state" = applied ] && [ "$busy_hook_state" = applied ] || missing=1
     [ "$prompt_module_state" = applied ] && [ "$prompt_hook_state" = applied ] \
         && [ "$mirror_hook_state" = applied ] || missing=1
+    [ "$capsule_module_state" = applied ] && [ "$capsule_hook_state" = applied ] || missing=1
     exit "$missing"
 fi
 
@@ -197,6 +245,15 @@ if [ "$mirror_hook_state" = missing ]; then
     changed=1
 fi
 
-(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$busy_dst" "$prompt_dst" "$PKG/api/server.py" "$PKG/orchestrator/lifecycle.py" "$PKG/orchestrator/core.py") \
+if [ "$capsule_module_state" = missing ]; then
+    install -m 0644 "$capsule_src" "$capsule_dst"
+    changed=1
+fi
+if [ "$capsule_hook_state" = missing ]; then
+    patch -d "$SITE" -p1 --fuzz=0 --forward -s <"$capsule_patch"
+    changed=1
+fi
+
+(cd /tmp && "$PYTHON_BIN" -m py_compile "$module_dst" "$busy_dst" "$prompt_dst" "$capsule_dst" "$PKG/api/server.py" "$PKG/orchestrator/lifecycle.py" "$PKG/orchestrator/core.py") \
     || fail "py_compile failed after applying seams"
 [ "$changed" -eq 1 ] && echo "ductor-seam-apply: seams applied to $SITE" || echo "ductor-seam-apply: already applied"
