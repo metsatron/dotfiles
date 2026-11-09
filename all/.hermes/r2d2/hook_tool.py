@@ -396,7 +396,11 @@ def vault_block(tool: str, args: dict):
     if tool in ("terminal", "execute_code"):
         text = args.get("command") or args.get("code") or ""
     elif tool in ("read_file", "write_file", "patch", "search_files", "list_directory", "send_message",
-                  "vision_analyze", "text_to_speech"):
+                  "vision_analyze", "text_to_speech") or tool.startswith("mcp_"):
+        # mcp__<server>__<tool>: Hermes names every MCP tool this way (checked in agent.log 2026-11-10; the
+        # single-underscore prefix test also matches). An MCP server reads files as the
+        # gateway process, so a vault path in its arguments is the same breach as read_file (2026-11-10,
+        # before GenOffice was wired in: the fixed list above let mcp_* calls through unchecked).
         text = json.dumps(args, ensure_ascii=False)
     else:
         return
