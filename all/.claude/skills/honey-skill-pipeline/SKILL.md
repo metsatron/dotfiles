@@ -35,14 +35,20 @@ Use this when asked to add, change, deploy or explain a skill on Honey, or wheth
 - `ssh kikin 'helmcortex-compile --scope <scope> --type skills --dry-run'` prints every target
   path and body and writes nothing. Name files; a broad `grep -r` over `~/HelmCortex` hangs on NFS.
 - `helmcortex-compile` is routed as class `hub`; `local-apply` is the caller-local mode.
-- Do NOT run a real `canonical` compile or `helmstow` from Honey without Mètsàtron's word. They
-  write hub output and his home, and `helmstow --adopt` is his alone.
+- Do NOT run a real `canonical` compile, `helmstow` or `helmstow --to honey` from Honey without
+  Mètsàtron's word. They write hub output, his home, or the bots' skills, and `--adopt` is his alone.
 
 ## What Honey does not have (checked 2026-11-10)
 
-No `hx-router`, no fleet-router registry, no `x230-helmcortex-git` alias, no skills mirror, no
-cron line, no `helmcortex-skills-sync` on PATH; `~/HelmCortex` is a stub with only `ROOTS/`.
-So skills do not arrive from HelmCortex on this account today. Installing the mirror needs a
-read-only git key from Mètsàtron. Say so rather than claiming a skill is compiled from HelmCortex.
+This account (`gille`) has no `hx-router`, no fleet-router registry, no `x230-helmcortex-git`
+alias, no skills mirror, no cron line, no `helmcortex-skills-sync` on PATH; `~/HelmCortex` is a
+stub with only `ROOTS/`. So skills do not arrive from HelmCortex on this account today.
+**The Honey bots' account (`agent-claude`) does get them**: the hub runs `helmstow --to honey`
+(allowlist `FORGE/scripts/helmstow_remote/profiles/honey.toml`, root-owned copy in
+`/usr/local/share/helmcortex/stow`, stowed as the bot). Nothing projects automatically.
+Read-only checks from here: `ssh kikin 'helmstow --to honey --verify'` and `--dry-run`. On
+2026-11-10 `--verify` showed 5 of 18 skills drifted from the hub; the sync itself is
+Mètsàtron's call. Getting this account a profile of its own needs his word. Say so rather than
+claiming a skill is compiled from HelmCortex.
 Existing skills: `honey-host` is a hand-placed file, `llm-benchmark` comes from the
 `llm-report-bench` repo, `inbox` is a copy of a DotCortex skill.
