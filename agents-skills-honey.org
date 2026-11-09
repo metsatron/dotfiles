@@ -1,0 +1,140 @@
+#+TITLE: DotCortex Skill Schema — Honey host skills
+#+DESCRIPTION: Skills for working on Honey (the operator's machine): trialling candidate models next to Aura through llama-swap, with the reference notes and the Nemotron Bolt trial record
+#+AUTHOR: Honey Badger (Claude Sonnet 5.5), for Mètsàtron's DotCortex
+#+LANGUAGE: en
+#+PROPERTY: header-args :mkdirp yes :results silent :comments both :noweb yes
+
+Skill bodies follow the =skill-NAME-body= + per-harness emission pattern; the schema note and emission-mode table live in =agents-skills.org=. This file also carries the long-form reference a skill points at, so the skill stays short and the reasoning stays written down.
+
+Provenance: =honey-host= (=~/.codex/skills/honey-host=) is a hand-placed file with no source in DotCortex or HelmCortex, and =llm-benchmark= lives in the =~/src/llm-report-bench= repository. Neither is compiled from HelmCortex: the HelmCortex skill mirror (=helmcortex-skills-mirror.org=) is not installed on Honey as of 2026-11-10 (no =helmcortex-skills-sync= on PATH, no mirror directory, no cron). This module is the DotCortex-authored lane for Honey-specific skills until that changes.
+
+* Reference: trialling a candidate model on Honey
+
+** Why this is a procedure and not a one-off
+
+Honey runs the operator's production Aura model and one shared memory pool. A candidate model cannot be tried next to her; it has to take her place for a window. Doing that carelessly stops her chats and the Tiago mail-wake lane. The procedure keeps everything that can be done without touching Aura (pre-flight, build, download) separate from the one step that does (loading the candidate), so the second needs an explicit go-ahead and a window.
+
+** Facts that shape every trial (verified 2026-11-10)
+
+- Aura's =llama-server= (=ornith-35b-Q6_K=, 524288 context, =-np 2=, q8_0 KV) is started by =gille-llama-swap= (=:8000=, config =~/src/llama-swap/config.yaml=, =ttl: 0=, no config watch). It uses about 40.5 of the 54 GiB GTT (=/sys/class/drm/card0/device/mem_info_gtt_used=). About 8 GiB of system RAM was free.
+- Every chat model (=Brae=, =BraeSpec=, =Gem=, =Aura=, =GemAura=) sits in one =chat= group with =swap: true= and =exclusive: true=. A request for one unloads the others; a request for Aura while a candidate is loaded unloads the candidate mid-run.
+- =BraeSpec= already points at a separate, newer runtime (=~/src/llm-report-bench-runtime/<commit>/build/bin/llama-server=). A candidate that needs newer llama.cpp follows the same pattern; Aura's live build (=~/src/llama.cpp-vulkan=, =74976e1ae=, July 2026) is never rebuilt for a trial.
+- Adding a model entry means restarting llama-swap, which drops Aura's model; she cold-reloads about 27 GB on her next request. The restart command is =sudo -n rc-service gille-llama-swap restart=; its stale-pidfile behaviour has not been exercised (the gateway's pidfile was stale once, see =~/CLAUDE.md=), so check the process is really gone before starting it again.
+- Benchmark data must be synthetic. Nothing in this procedure reads Secret Vault or clinical material.
+
+** Pre-flight, none of which touches Aura
+
+1. *Find the right repo.* A model link is often the training release (BF16, 150 GB). Quantised and GGUF variants are usually separate repos named on the card.
+2. *Get hashes from the Hugging Face API*, =GET /api/models/<repo>?blobs=true=, field =siblings[].lfs.sha256=. Pull with =curl -C -=, rename only on a matching hash. The pull script for the Bolt trial is =~/models/pull-nemotron-bolt.sh=.
+3. *Read the GGUF header over HTTP before downloading the weights.* A range request of the first 32 MB holds the metadata and tensor table. =truncate -s <full size>= makes the file sparse-extend to its real length (no disk used), and =gguf-py='s =GGUFReader= then lists the keys and tensor shapes. Use a Python with numpy (=~/.hermes/aura-tools/bin/python= has it). This found that Bolt has a different expert count in every layer (240 to 496) before any 22 GB was fetched.
+4. *Check the loader supports the architecture.* Grep =src/models/<arch>.cpp= and =llama-hparams.h= in a fresh checkout for the features the header needs (here: per-layer =n_expert_used_arr= and =n_ff_exp_arr=, and the =draft-dflash= speculative type). Comparing against a stale =origin/master= is a trap: =git fetch --dry-run= does not update refs.
+5. *Do the memory arithmetic from the header, not the card.* KV bytes per token = attention layers × KV heads × (key length + value length) × bytes per element. The attention layers are the non-zero entries of =head_count_kv=. State, weights and compute buffers come on top; read the real buffer sizes from the load log before trusting the estimate.
+6. *Size the recipe to Honey, not to the card's target hardware.* A vendor's "28 GB recipe" is sized for a 32 GB card. Honey has about 54 GiB of GTT once Aura is out, so a recipe is chosen by arithmetic against that. (2026-11-10: a first proposal copied the 28 GB recipe's 65,536 context; the KV maths showed the full 262,144 fits easily, and the 32 GB recipe was chosen.)
+
+** Build a separate runtime
+
+#+BEGIN_SRC bash :tangle no
+git clone --no-checkout ~/src/llama.cpp-vulkan ~/src/llama.cpp-vulkan-<name>
+cd ~/src/llama.cpp-vulkan-<name> && git checkout <commit>
+nohup nice -n 19 ionice -c3 bash -c 'cmake -B build -DGGML_VULKAN=ON -DGGML_NATIVE=ON \
+  -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF \
+  && cmake --build build -j8 --target llama-server llama-cli llama-bench' >build.log 2>&1 &
+#+END_SRC
+
+Build and download run at low priority so Aura is not slowed. Verify =llama-server --list-devices= shows =Vulkan0= and =--help= lists the flags the recipe needs.
+
+** The load step (needs a go-ahead and a window)
+
+1. Say what stops: Aura's chats, the operator's web UI, the mail-wake lane. Get a window from Tiago; the operator is the machine's owner.
+2. Back up =~/src/llama-swap/config.yaml= (pattern: =config.yaml.bak-<date>-<reason>=).
+3. Add a candidate entry in the =chat= group: its own runtime path, =RADV_PERFTEST=nogttspill= as Aura's entry has, =ttl: 0=, the recipe. Restart llama-swap. Aura stays the default.
+4. Load the candidate alone and read the load log (buffer sizes, which layers are offloaded). Then a smoke test, drafter on and off, thinking on and off where the model has it.
+5. Measure the same synthetic tasks on the candidate and on Aura, cold and warm (a warm number can be a replay of an identical response; read min/median/max). Record time to first token, tokens per second and total time per task. The harness is =~/src/llm-report-bench= with data in =~/bench-data= (see the =llm-benchmark= skill).
+6. Restore: request =Aura=, confirm the =:5800= server is back with her arguments, confirm a real reply through the =:8090= front, and confirm GTT use is back near 40 GiB. A failed load means Aura goes straight back up and the failure is reported.
+
+* Trial record: NVIDIA Nemotron 3.5 Bolt 74B-A9B (24GB, IQ2_XXS)
+
+Requested by Tiago 2026-11-10: test it in the new DSH against Aura on report writing. He expects it to be much faster than Qwen3.8 (earlier best, =BraeSpec=, 19.4 tok/s on 2026-10-26) and perhaps slower than Ornith 1.0.
+
+** What it is
+
+- The linked =…-BF16= repo is the 150 GB training release. The 2-bit build is =nvidia/NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-GGUF=: 22.0 GB main (=IQ2_XXS= experts, =NVFP4= Mamba layers, =Q8_0= embeddings), 1.73 GB =mmproj=, plus the drafter =…-24GB-LiLiCorr-GGUF= (1.0 GB, DFlash). Licence OpenMDW-1.1.
+- 74B total, 9B active, Mamba-2 and attention hybrid LatentMoE, 88 layers, top-9 routing, native context 262144. About 11 of the 88 layers are attention (2 KV heads of 128), so KV is about 11 KB per token at f16 (about 3 GiB for the full context).
+- The card gives no BF16 Bolt row to compare the quantised model against, so "little to no degradation" is NVIDIA's claim about the parent model.
+
+** State, 2026-11-10
+
+- Build: =~/src/llama.cpp-vulkan-bolt= at =a4d4f2fd4= (9 Nov 2026), build 12230. Sees =Vulkan0 (RADV GFX1150)=; has =draft-dflash=, =--spec-draft-model=, =--mmproj=.
+- Files: =~/models/nemotron-bolt/=, three GGUFs, sha256 verified against the Hugging Face API.
+- *Not loaded yet.* NVFP4 layers and the DFlash path on this GPU are unproven. Aura is untouched.
+
+** Recipe (NVIDIA's 32 GB recipe, chosen by the KV arithmetic above)
+
+#+BEGIN_SRC text :tangle no
+--model NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf --mmproj mmproj-NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB.gguf
+--ctx-size 262144 --parallel 1 -ngl 999 --batch-size 4096 --ubatch-size 2048 --flash-attn on --jinja
+--temp 1.0 --top-p 0.95
+--spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-model NVIDIA-Nemotron-3.5-Bolt-74B-A9B-24GB-LiLiCorr.gguf --spec-draft-ngl 999
+#+END_SRC
+
+=-ctk q8_0 -ctv q8_0= is the headroom option. Thinking is on by default in the chat template (=enable_thinking=); test both.
+
+** Open
+
+- Which DSH report tasks form the benchmark set (the earlier Qwen3.8 numbers came from =~/bench-data/llm-report-bench*=; reuse it if DSH can run it).
+- The window and Tiago's go-ahead for the llama-swap edit and restart.
+- Results table (to be filled in): model, drafter, thinking, cold/warm, TTFT, tok/s, total time.
+
+* Skills
+
+** honey-model-trial
+#+NAME: skill-honey-model-trial-body
+#+BEGIN_SRC markdown :tangle no
+# Honey model trial
+
+Use this when someone wants a candidate model (a new GGUF, quant, drafter or llama.cpp build)
+tried on Honey, usually against Aura on DSH report writing. The long-form reasoning is in
+`~/DotCortex/agents-skills-honey.org` ("Reference: trialling a candidate model on Honey").
+Read `honey-host` and `llm-benchmark` first; this skill adds only the sequencing.
+
+## The rule
+
+Aura is the operator's production model on one shared memory pool (about 40.5 of 54 GiB GTT).
+A candidate cannot sit beside her. Everything before the load is safe and should just be done;
+the load takes Aura out, so it needs Tiago's go-ahead and a stated window. Never stop or
+restart `gille-llama-swap` or Aura's `llama-server` on your own say-so.
+
+## Do without asking (does not touch Aura)
+
+1. Find the real repo (the linked one is often the BF16 training release) and get sha256 from
+   the Hugging Face API; download with `curl -C -`, rename only on a hash match, `nice`/`ionice`.
+2. Read the GGUF header by a 32 MB range request, `truncate -s <size>`, parse with gguf-py
+   (a Python with numpy). Check architecture, per-layer arrays, tensor types.
+3. Check support in a fresh llama.cpp checkout, not a stale `origin/master` (`git fetch` for real).
+4. Build in a separate clone, Vulkan, low priority. Never rebuild `~/src/llama.cpp-vulkan`.
+5. Do the memory arithmetic from the header (KV per token from the non-zero `head_count_kv`
+   layers) and size the recipe to Honey, not to the vendor card's target hardware.
+
+## Ask first
+
+6. Window and go-ahead. Say what stops: Aura chats, web UI, the mail-wake lane.
+7. Back up `~/src/llama-swap/config.yaml`, add a candidate entry to the exclusive `chat` group
+   with its own runtime path, restart llama-swap, load the candidate alone, read the load log.
+8. Measure candidate and Aura on the same synthetic tasks, cold and warm, TTFT, tok/s, total.
+9. Restore: Aura back, answering through `:8090`, GTT near 40 GiB. A failed load means Aura
+   goes straight back up, then report.
+
+## Never
+
+Read Secret Vault or clinical material for a benchmark. Use real client data. Edit the live
+Aura entry's arguments as part of a trial. Treat a warm replay as a headline number.
+#+END_SRC
+
+#+BEGIN_SRC markdown :tangle all/.claude/skills/honey-model-trial/SKILL.md :comments no
+---
+name: honey-model-trial
+description: Try a candidate model (GGUF, quant, drafter, newer llama.cpp) on Honey against Aura via llama-swap. Safe pre-flight, build and download without touching Aura, then a gated load window, measurement and restore. Use when asked whether a model can run on Honey or to compare one with Aura on DSH.
+---
+
+<<skill-honey-model-trial-body>>
+#+END_SRC
