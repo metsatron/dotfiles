@@ -32,10 +32,15 @@ restart `gille-llama-swap` or Aura's `llama-server` on your own say-so.
 
 6. Window and go-ahead. Say what stops: Aura chats, web UI, the mail-wake lane.
 7. Back up `~/src/llama-swap/config.yaml`, add a candidate entry to the exclusive `chat` group
-   with its own runtime path, restart llama-swap, load the candidate alone, read the load log.
+   with its own runtime path, `rc-service gille-llama-swap stop`, confirm it and Aura's
+   `llama-server` are gone, `start`. The stop cascades: also `start` `gille-llama-swap-bridge`
+   and `identity-proxy` (it `need`s llama-swap) or `:8090` stays down. Then load the candidate
+   alone by requesting it on `:8000`.
 8. Measure candidate and Aura on the same synthetic tasks, cold and warm, TTFT, tok/s, total.
-9. Restore: Aura back, answering through `:8090`, GTT near 40 GiB. A failed load means Aura
-   goes straight back up, then report.
+9. Restore: request `Aura` on `:8000` (cold load about 35 s), confirm her `llama-server` is on
+   `:5800` with her original arguments, a real reply through `:8090` (give it room: her
+   reasoning eats an 8-token limit), `hermes-webui` healthy, GTT near 40 GiB. A failed load
+   means Aura goes straight back up, then report.
 
 ## Never
 
