@@ -75,6 +75,11 @@ class Admission(unittest.TestCase):
     def test_claimed_structured_write(self):
         self.assertTrue(self.invoke().get("ran"))
 
+    def test_refusal_is_serialized_string(self):
+        result = self.invoke(session="wrong")
+        self.assertIsInstance(result, str)
+        self.assertIn("PROTOCOL GATE REFUSED", result)
+
     def test_foreign_session_cannot_unlock(self):
         self.refused(session="someone-else")
 

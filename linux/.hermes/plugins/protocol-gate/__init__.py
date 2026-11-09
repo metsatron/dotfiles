@@ -207,9 +207,9 @@ def _dispatch_check(command):
 
 
 def _refusal(tool, reason):
-    return {"error": "PROTOCOL GATE REFUSED %s: %s" % (tool, reason),
-            "protocol": "promptgolf", "speaker": SPEAKER,
-            "next": "read the canonical sources; open/assign the relevant hole and record this session's swing"}
+    return json.dumps({"error": "PROTOCOL GATE REFUSED %s: %s" % (tool, reason),
+                       "protocol": "promptgolf", "speaker": SPEAKER,
+                       "next": "read the canonical sources; open/assign the relevant hole and record this session's swing"})
 
 
 def gate(tool_name, args, next_call, **ctx):
