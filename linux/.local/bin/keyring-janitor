@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# keyring-janitor
+# #+NAME: keyring-janitor
+
+# [[file:../../../services.org::keyring-janitor][keyring-janitor]]
+set -euo pipefail
+
+TAG="keyring-janitor"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/keyring-janitor"
+STATE_FILE="$STATE_DIR/last-run.json"
+ALERT_THRESHOLD="${KEYRING_JANITOR_ALERT_THRESHOLD:-150}"
+MAX_CLEAR="${KEYRING_JANITOR_MAX_CLEAR:-2000}"
+DRY_RUN=0
+QUIET=0
+HERALD="${KEYRING_JANITOR_HERALD:-$HOME/HelmCortex/FORGE/bin/timeark-herald-dispatch}"
+
+usage() {
+  cat <<'EOF'
+Usage: keyring-janitor [options]
+
+Reap orphaned, empty session keyrings owned by the invoking user. Rootless
+containers leak these; they count against kernel.keys.maxkeys and eventually
+stop every container from starting with "Disk quota exceeded".
+
+Safe by construction: only empty `_ses:` keyrings that no live process of this
+uid references, and never the uid/user-session keyrings or container-named ones.
+
+Options:
+  --threshold N   Alert (via the TimeArk herald) when the remaining key count
+                  is above N (default: 150, or $KEYRING_JANITOR_ALERT_THRESHOLD)
+  --max-clear N   Hard cap on keyrings cleared in one run (default: 2000)
+  --dry-run       Report what would be cleared; change nothing
+  --quiet         Print only the final summary line
+  -h, --help      Show this help
+
+Exit status: 0 clean or nothing to do; 1 cleared some and reported;
+             2 usage error; 3 the kernel key facility is unreadable.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --threshold) [ "$#" -ge 2 ] || { echo "$TAG: --threshold requires a value" >&2; exit 2; }; ALERT_THRESHOLD="$2"; shift ;;
+    --max-clear) [ "$#" -ge 2 ] || { echo "$TAG: --max-clear requires a value" >&2; exit 2; }; MAX_CLEAR="$2"; shift ;;
+    --dry-run)   DRY_RUN=1 ;;
+    --quiet)     QUIET=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "$TAG: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say() { [ "$QUIET" -eq 1 ] || printf '[%s] %s\n' "$TAG" "$*"; }
+
+[ -r /proc/keys ] || { echo "$TAG: /proc/keys unreadable; nothing can be proven, changing nothing" >&2; exit 3; }
+command -v keyctl >/dev/null 2>&1 || { echo "$TAG: keyctl not on PATH" >&2; exit 3; }
+
+uid=$(id -u)
+
+read_maxkeys() { cat /proc/sys/kernel/keys/maxkeys 2>/dev/null || echo "?"; }
+before=$(wc -l < /proc/keys)
+
+# Keyrings any live process of ours is still using. Never touch these.
+live=$( {
+  for p in $(pgrep -u "$uid" 2>/dev/null || true); do
+    awk '/^(Session|Thread|Process)Keyring:/{print $2}' "/proc/$p/status" 2>/dev/null || true
+  done
+} | sort -u )
+
+is_live() {
+  local id="$1"
+  case "
+$live
+" in *"
+$id
+"*) return 0 ;; esac
+  return 1
+}
+
+# Candidates: our uid, type keyring, description exactly "_ses:".
+candidates=$(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 == "_ses:" { print $1 }' /proc/keys 2>/dev/null || true)
+
+cleared=0
+skipped_live=0
+skipped_nonempty=0
+skipped_named=0
+for id in $candidates; do
+  [ "$cleared" -lt "$MAX_CLEAR" ] || break
+
+  if is_live "$id"; then
+    skipped_live=$((skipped_live + 1))
+    continue
+  fi
+
+  # Emptiness: keyctl show prints a header line plus one line per nested key.
+  entries=$( { keyctl show "$id" 2>/dev/null || true; } | wc -l )
+  entries=$(printf '%s' "$entries" | tr -cd '0-9')
+  [ -n "$entries" ] || entries=0
+  if [ "$entries" -gt 1 ]; then
+    skipped_nonempty=$((skipped_nonempty + 1))
+    continue
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "would clear id=$id (empty, unreferenced)"
+    cleared=$((cleared + 1))
+    continue
+  fi
+
+  if keyctl clear "$id" 2>/dev/null; then
+    cleared=$((cleared + 1))
+  fi
+done
+
+# Named keyrings we deliberately never touch are counted, not cleared.
+named=$(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 ~ /^[0-9a-f]{64}:/ { c++ } END { print c + 0 }' /proc/keys 2>/dev/null || echo 0)
+skipped_named=$named
+
+after=$(wc -l < /proc/keys)
+maxkeys=$(read_maxkeys)
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+cat > "$STATE_FILE.tmp" <<JSON 2>/dev/null || true
+{"ts":"$(date -Is)","before":${before},"after":${after},"cleared":${cleared},"live":${skipped_live},"nonempty":${skipped_nonempty},"named":${skipped_named},"maxkeys":"${maxkeys}","dry_run":${DRY_RUN}}
+JSON
+mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null || true
+
+printf '[%s] keys %s -> %s; %s %s; left (live %s, non-empty %s, container-named %s); maxkeys %s\n' \
+  "$TAG" "$before" "$after" \
+  "$([ "$DRY_RUN" -eq 1 ] && echo 'would clear' || echo 'cleared')" "$cleared" \
+  "$skipped_live" "$skipped_nonempty" "$skipped_named" "$maxkeys"
+
+# Alert only when the residue is still above threshold — i.e. the leak is live.
+if [ "$after" -gt "$ALERT_THRESHOLD" ] && [ "$DRY_RUN" -eq 0 ]; then
+  printf '[%s] residue %s exceeds threshold %s: the leak is still producing orphans\n' "$TAG" "$after" "$ALERT_THRESHOLD" >&2
+  if [ -x "$HERALD" ]; then
+    "$HERALD" >/dev/null 2>&1 || true
+  fi
+fi
+
+[ "$cleared" -gt 0 ] && exit 1
+exit 0
+# keyring-janitor ends here

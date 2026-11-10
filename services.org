@@ -2390,3 +2390,267 @@ echo "=== T480s lid-switch fix applied ==="
 echo "Test by physically closing the lid — this is the only real verification."
 echo "Expect: screen off within ~1s, everything (audio, background agents) keeps running, screen back on when reopened."
 #+END_SRC
+
+* Keyring janitor — session-keyring leak reaper (cron-driven)
+
+Rootless containers leak kernel keyrings. Every =crun=/podman run asks the
+kernel for a session keyring to hang the container's identity on, and on exit
+the empty keyring is frequently never reaped: it survives as an orphan owned by
+the invoking uid, counting against =kernel.keys.maxkeys=.
+
+Measured on kikin-kushi, 2026-11-10: uid 1000 held **377** keys against a
+default ceiling of 200. 372 of them were empty =keyring _ses:= entries with no
+live owner, two were keyrings named by the 64-hex id of a running container, and
+about five were real. Rootless podman then failed with
+=crun: create keyring: Disk quota exceeded=, which reads like a quota problem
+and is in fact a leak — the ceiling was never the issue.
+
+The wrong fix, taken once at 22:24 on 2026-11-10, was
+=sysctl -w kernel.keys.maxkeys=2000=.  It unblocked the build, it did not
+persist, and it hid the leak rather than closing it. This janitor is the durable
+fix: reap the orphans, leave the real keys alone, and stay on the default
+ceiling.
+
+** Safety law
+
+The janitor only ever clears a keyring when all six hold:
+
+1. it belongs to the invoking uid;
+2. its type is =keyring=;
+3. its description is exactly =_ses:= — the kernel's name for an anonymous
+   session keyring;
+4. it is **empty** (=keyctl show <id>= returns only the header);
+5. no live process of that uid names it as Session, Thread or Process keyring;
+6. it is not =_uid.<uid>=, =_uid_ses.<uid>=, and its description is not a
+   64-hex container id.
+
+Anything it cannot prove safe, it leaves. It never raises a quota, never uses
+sudo, and never needs root: a user may clear their own keyrings.
+
+** keyring-janitor
+#+NAME: keyring-janitor
+#+BEGIN_SRC bash :tangle linux/.local/bin/keyring-janitor :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="keyring-janitor"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/keyring-janitor"
+STATE_FILE="$STATE_DIR/last-run.json"
+ALERT_THRESHOLD="${KEYRING_JANITOR_ALERT_THRESHOLD:-150}"
+MAX_CLEAR="${KEYRING_JANITOR_MAX_CLEAR:-2000}"
+DRY_RUN=0
+QUIET=0
+HERALD="${KEYRING_JANITOR_HERALD:-$HOME/HelmCortex/FORGE/bin/timeark-herald-dispatch}"
+
+usage() {
+  cat <<'EOF'
+Usage: keyring-janitor [options]
+
+Reap orphaned, empty session keyrings owned by the invoking user. Rootless
+containers leak these; they count against kernel.keys.maxkeys and eventually
+stop every container from starting with "Disk quota exceeded".
+
+Safe by construction: only empty `_ses:` keyrings that no live process of this
+uid references, and never the uid/user-session keyrings or container-named ones.
+
+Options:
+  --threshold N   Alert (via the TimeArk herald) when the remaining key count
+                  is above N (default: 150, or $KEYRING_JANITOR_ALERT_THRESHOLD)
+  --max-clear N   Hard cap on keyrings cleared in one run (default: 2000)
+  --dry-run       Report what would be cleared; change nothing
+  --quiet         Print only the final summary line
+  -h, --help      Show this help
+
+Exit status: 0 clean or nothing to do; 1 cleared some and reported;
+             2 usage error; 3 the kernel key facility is unreadable.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --threshold) [ "$#" -ge 2 ] || { echo "$TAG: --threshold requires a value" >&2; exit 2; }; ALERT_THRESHOLD="$2"; shift ;;
+    --max-clear) [ "$#" -ge 2 ] || { echo "$TAG: --max-clear requires a value" >&2; exit 2; }; MAX_CLEAR="$2"; shift ;;
+    --dry-run)   DRY_RUN=1 ;;
+    --quiet)     QUIET=1 ;;
+    -h|--help)   usage; exit 0 ;;
+    *) echo "$TAG: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+say() { [ "$QUIET" -eq 1 ] || printf '[%s] %s\n' "$TAG" "$*"; }
+
+[ -r /proc/keys ] || { echo "$TAG: /proc/keys unreadable; nothing can be proven, changing nothing" >&2; exit 3; }
+command -v keyctl >/dev/null 2>&1 || { echo "$TAG: keyctl not on PATH" >&2; exit 3; }
+
+uid=$(id -u)
+
+read_maxkeys() { cat /proc/sys/kernel/keys/maxkeys 2>/dev/null || echo "?"; }
+before=$(wc -l < /proc/keys)
+
+# Keyrings any live process of ours is still using. Never touch these.
+live=$( {
+  for p in $(pgrep -u "$uid" 2>/dev/null || true); do
+    awk '/^(Session|Thread|Process)Keyring:/{print $2}' "/proc/$p/status" 2>/dev/null || true
+  done
+} | sort -u )
+
+is_live() {
+  local id="$1"
+  case "
+$live
+" in *"
+$id
+"*) return 0 ;; esac
+  return 1
+}
+
+# Candidates: our uid, type keyring, description exactly "_ses:".
+candidates=$(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 == "_ses:" { print $1 }' /proc/keys 2>/dev/null || true)
+
+cleared=0
+skipped_live=0
+skipped_nonempty=0
+skipped_named=0
+for id in $candidates; do
+  [ "$cleared" -lt "$MAX_CLEAR" ] || break
+
+  if is_live "$id"; then
+    skipped_live=$((skipped_live + 1))
+    continue
+  fi
+
+  # Emptiness: keyctl show prints a header line plus one line per nested key.
+  entries=$( { keyctl show "$id" 2>/dev/null || true; } | wc -l )
+  entries=$(printf '%s' "$entries" | tr -cd '0-9')
+  [ -n "$entries" ] || entries=0
+  if [ "$entries" -gt 1 ]; then
+    skipped_nonempty=$((skipped_nonempty + 1))
+    continue
+  fi
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say "would clear id=$id (empty, unreferenced)"
+    cleared=$((cleared + 1))
+    continue
+  fi
+
+  if keyctl clear "$id" 2>/dev/null; then
+    cleared=$((cleared + 1))
+  fi
+done
+
+# Named keyrings we deliberately never touch are counted, not cleared.
+named=$(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 ~ /^[0-9a-f]{64}:/ { c++ } END { print c + 0 }' /proc/keys 2>/dev/null || echo 0)
+skipped_named=$named
+
+after=$(wc -l < /proc/keys)
+maxkeys=$(read_maxkeys)
+
+mkdir -p "$STATE_DIR" 2>/dev/null || true
+cat > "$STATE_FILE.tmp" <<JSON 2>/dev/null || true
+{"ts":"$(date -Is)","before":${before},"after":${after},"cleared":${cleared},"live":${skipped_live},"nonempty":${skipped_nonempty},"named":${skipped_named},"maxkeys":"${maxkeys}","dry_run":${DRY_RUN}}
+JSON
+mv -f "$STATE_FILE.tmp" "$STATE_FILE" 2>/dev/null || true
+
+printf '[%s] keys %s -> %s; %s %s; left (live %s, non-empty %s, container-named %s); maxkeys %s\n' \
+  "$TAG" "$before" "$after" \
+  "$([ "$DRY_RUN" -eq 1 ] && echo 'would clear' || echo 'cleared')" "$cleared" \
+  "$skipped_live" "$skipped_nonempty" "$skipped_named" "$maxkeys"
+
+# Alert only when the residue is still above threshold — i.e. the leak is live.
+if [ "$after" -gt "$ALERT_THRESHOLD" ] && [ "$DRY_RUN" -eq 0 ]; then
+  printf '[%s] residue %s exceeds threshold %s: the leak is still producing orphans\n' "$TAG" "$after" "$ALERT_THRESHOLD" >&2
+  if [ -x "$HERALD" ]; then
+    "$HERALD" >/dev/null 2>&1 || true
+  fi
+fi
+
+[ "$cleared" -gt 0 ] && exit 1
+exit 0
+#+END_SRC
+
+** keyring-janitor-cron-apply
+#+NAME: keyring-janitor-cron-apply
+#+BEGIN_SRC bash :tangle linux/.local/bin/keyring-janitor-cron-apply :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755)
+set -euo pipefail
+
+TAG="keyring-janitor-cron-apply"
+DRY=0
+REMOVE=0
+CRON_BIN="${KEYRING_JANITOR_CRON_BIN:-crontab}"
+BEGIN="# BEGIN dotcortex-keyring-janitor (managed by $TAG)"
+END="# END dotcortex-keyring-janitor (managed by $TAG)"
+
+usage() {
+  cat <<'EOF'
+Usage: keyring-janitor-cron-apply [--dry-run] [--remove]
+
+Install or remove the hourly keyring-janitor user crontab entry.
+Idempotent: replaces only its own managed block, leaves everything else alone.
+
+Options:
+  --dry-run    Print the crontab modifications without applying
+  --remove     Remove the managed block from crontab
+  -h, --help   Show this help
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --remove)  REMOVE=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "$TAG: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+current=$("$CRON_BIN" -l 2>/dev/null || true)
+stripped=$(printf '%s\n' "$current" | awk -v b="$BEGIN" -v e="$END" '
+  $0 == b { skip = 1; next }
+  $0 == e { skip = 0; next }
+  !skip   { print }
+')
+
+if [ "$REMOVE" -eq 1 ]; then
+  proposed=$(printf '%s\n' "$stripped" | sed -e '/^$/d')
+  if [ "$DRY" -eq 1 ]; then
+    printf '%s\n' "$proposed"
+    exit 0
+  fi
+  printf '%s\n' "$proposed" | "$CRON_BIN" -
+  echo "$TAG: removed the managed keyring-janitor block"
+  exit 0
+fi
+
+block="$BEGIN
+# Hourly: reap orphaned empty session keyrings leaked by rootless containers.
+17 * * * * \"\$HOME/.local/bin/keyring-janitor\" --quiet >/dev/null 2>&1
+$END"
+
+proposed=$(printf '%s\n%s\n' "$stripped" "$block" | sed -e '/^$/d')
+
+if [ "$DRY" -eq 1 ]; then
+  printf '%s\n' "$proposed"
+  exit 0
+fi
+
+printf '%s\n' "$proposed" | "$CRON_BIN" -
+echo "$TAG: installed the hourly keyring-janitor block"
+#+END_SRC
+
+** Applying it
+
+On a Devuan / non-systemd host (kikin-kushi, T480s, T1700):
+
+#+BEGIN_SRC bash :tangle no
+keyring-janitor --dry-run     # prove the safety law holds before it acts
+keyring-janitor               # one manual reap
+keyring-janitor-cron-apply    # hourly thereafter
+#+END_SRC
+
+Verification is the count, not the exit status: =wc -l < /proc/keys= should fall
+by the number the janitor reports cleared, and =cat /proc/sys/kernel/keys/maxkeys=
+should still read the default. If the residue climbs again above the threshold,
+the leak is live and the alert fires — which is the signal to file it against
+crun, not to raise the ceiling.
