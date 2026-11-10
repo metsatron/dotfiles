@@ -2756,7 +2756,7 @@ while [ "$#" -gt 0 ]; do
     --dry-run)    APPLY=0 ;;
     --apply)      APPLY=1 ;;
     --report-containers) REPORT_CONTAINERS=1 ;;
-    --only)       [ "$#" -ge 2 ] || { echo "$TAG: --only needs a value (e.g. --only class3,class4); valid: $VALID_CLASSES" >&2; exit 2; }; ONLY="$2"; ONLY_SET=1; shift ;;
+    --only)       case "${2:-}" in ""|-*) echo "$TAG: --only needs a value (e.g. --only class3,class4); valid: $VALID_CLASSES" >&2; exit 2 ;; esac; ONLY="$2"; ONLY_SET=1; shift ;;
     --min-age-min) [ "$#" -ge 2 ] || { echo "$TAG: --min-age-min needs a value" >&2; exit 2; }; MIN_AGE_MIN="$2"; shift ;;
     --max-deletions) [ "$#" -ge 2 ] || { echo "$TAG: --max-deletions needs a value" >&2; exit 2; }; MAX_DELETIONS="$2"; shift ;;
     -h|--help)    usage; exit 0 ;;
@@ -2908,34 +2908,87 @@ check_logs() {
 }
 
 # ---------------------------------------------------------------- class 4 ---
+# Reports, and refuses. It does not act, because on this host it cannot.
+#
+# Measured 2026-11-11 on kikin-kushi, 372 `_ses:` keyrings owned by uid 1000:
+#   368 revoked      -> keyctl clear: "Key has been revoked"
+#     4 not revoked  -> keyctl clear: "Permission denied" (not possessed)
+# and no unprivileged keyctl mutation succeeds at all: a key can be created but
+# not linked, read or cleared. So the honest class 4 is a reporter. A reaper that
+# cannot act should say so rather than plan.
+#
+# Three defects this replaces, all found by Hermes running the apply:
+#   1. fail-open: `keyctl clear ... 2>/dev/null` with no else and no PROBLEM=1,
+#      so the one class that could not report its own failure was the one that
+#      silently did nothing and exited 0.
+#   2. an unachievable predicate: "empty _ses:, no live reference" selected
+#      revoked keyrings, which no verb can touch.
+#   3. a dead live-reference guard: /proc/keys prints the id in HEX and
+#      /proc/PID/status prints it in DECIMAL, so the comparison never matched.
 check_keyrings() {
   command -v keyctl >/dev/null 2>&1 || { echo "  [class 4 ] skipped: keyctl not on PATH"; return; }
   [ -r /proc/keys ] || { echo "  [class 4 ] skipped: /proc/keys unreadable"; PROBLEM=1; return; }
   uid=$(id -u)
+  # Decimal ids of every keyring a live process actually holds. /proc/keys is
+  # hex, so convert before comparing - the old code compared hex to decimal and
+  # the guard could never fire.
   live=$( { for p in $(pgrep -u "$uid" 2>/dev/null || true); do
               awk '/^(Session|Thread|Process)Keyring:/{print $2}' "/proc/$p/status" 2>/dev/null || true
             done; } | sort -u )
-  found=0; acted=0
-  for id in $(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 == "_ses:" { print $1 }' /proc/keys 2>/dev/null); do
-    printf '%s\n' "$live" | grep -qx "$id" && { echo "  [class 4 ] KEEP key $id (live process reference)"; continue; }
-    entries=$( { keyctl show "$id" 2>/dev/null || true; } | wc -l )
-    entries=$(printf '%s' "$entries" | tr -cd '0-9'); [ -n "$entries" ] || entries=0
-    if [ "$entries" -gt 1 ]; then echo "  [class 4 ] KEEP key $id (not empty: $entries entries)"; continue; fi
+  found=0; acted=0; revoked=0; unpossessed=0; notempty=0; failed=0
+  for hexid in $(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 == "_ses:" { print $1 }' /proc/keys 2>/dev/null); do
+    decid=$(printf '%d' "0x$hexid" 2>/dev/null || echo "")
+    [ -n "$decid" ] || { refuse "class 4" "key 0x$hexid" "cannot convert id to decimal; refusing rather than guessing"; continue; }
+    printf '%s\n' "$live" | grep -qx "$decid" && { echo "  [class 4 ] KEEP key 0x$hexid (live process reference)"; continue; }
     found=$((found+1))
+
+    # The discriminator. `keyctl describe` succeeds on a keyring this process
+    # holds and could act on; it fails with the reason on everything else.
+    desc_err=$(keyctl describe "0x$hexid" 2>&1 >/dev/null)
+    if [ -n "$desc_err" ]; then
+      case "$desc_err" in
+        *revoked*)
+          refuse "class 4" "key 0x$hexid" "revoked: cannot be cleared, described or read; only unlinked, and it is linked into no keyring this process holds"
+          revoked=$((revoked+1)) ;;
+        *"Permission denied"*)
+          refuse "class 4" "key 0x$hexid" "not possessed by this process: clear would be denied; nothing this uid can do unprivileged"
+          unpossessed=$((unpossessed+1)) ;;
+        *)
+          refuse "class 4" "key 0x$hexid" "describe failed: $desc_err"
+          unpossessed=$((unpossessed+1)) ;;
+      esac
+      continue
+    fi
+
+    entries=$( { keyctl show "0x$hexid" 2>/dev/null || true; } | wc -l )
+    entries=$(printf '%s' "$entries" | tr -cd '0-9'); [ -n "$entries" ] || entries=0
+    if [ "$entries" -gt 1 ]; then echo "  [class 4 ] KEEP key 0x$hexid (not empty: $entries entries)"; notempty=$((notempty+1)); continue; fi
+
     if [ "$acted" -ge "$MAX_DELETIONS" ]; then
-      refuse "class 4" "key $id" "per-run cap of $MAX_DELETIONS reached"
+      refuse "class 4" "key 0x$hexid" "per-run cap of $MAX_DELETIONS reached"
       continue
     fi
     if [ "$APPLY" -eq 1 ]; then
-      if keyctl clear "$id" 2>/dev/null; then record "class 4" REMOVED "key $id" "empty _ses: keyring, uid $uid, no live reference"; acted=$((acted+1)); fi
+      # No 2>/dev/null on a mutation. A clear that fails must be visible, must
+      # name the key and the errno text, and must make the run exit non-zero.
+      clear_err=$(keyctl clear "0x$hexid" 2>&1 >/dev/null)
+      if [ -z "$clear_err" ]; then
+        record "class 4" REMOVED "key 0x$hexid" "empty _ses: keyring, uid $uid, no live reference"
+        acted=$((acted+1))
+      else
+        record "class 4" FAILED "key 0x$hexid" "clear failed: $clear_err"
+        failed=$((failed+1))
+        PROBLEM=1
+      fi
     else
-      record "class 4" WOULD "key $id" "empty _ses: keyring, uid $uid, no live reference"; acted=$((acted+1))
+      record "class 4" WOULD "key 0x$hexid" "empty _ses: keyring, uid $uid, no live reference"
+      acted=$((acted+1))
     fi
   done
   if [ "$found" -eq 0 ]; then
     echo "  [class 4 ] nothing: no empty _ses: keyrings belong to uid $uid"
   else
-    echo "  [class 4 ] $([ "$APPLY" -eq 1 ] && echo cleared || echo would clear) $acted of $found candidate keyring(s)"
+    echo "  [class 4 ] $([ "$APPLY" -eq 1 ] && echo cleared || echo would clear) $acted of $found candidate keyring(s); refused: $revoked revoked, $unpossessed unpossessed, $notempty non-empty; failed: $failed"
   fi
 }
 
