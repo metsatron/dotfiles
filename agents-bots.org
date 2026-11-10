@@ -4161,6 +4161,170 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         (home / "gateway_state.json").write_text(json.dumps(state))
         return gateway
 
+    # -- cold-start clearance: a stopped gateway whose last verified generation is unchanged ------------------
+
+    def cold_hermes(self, last_start_offset=3600.0):
+        """A stopped gateway whose last running generation is on disk: a source repo, its snapshot and install facts."""
+        home = self.home / ".hermes"
+        home.mkdir(exist_ok=True)
+        source = self.root / "hermes-agent"
+        (source / "hermes_cli").mkdir(parents=True)
+        (source / "hermes_cli/main.py").write_text("print('gateway')\n")
+        for argv in (["init", "-q"], ["add", "-A"],
+                     ["-c", "user.name=fixture", "-c", "user.email=f@example.invalid", "commit", "-q", "-m", "fixture"]):
+            subprocess.run(["git", "-C", str(source), *argv], check=True, capture_output=True)
+        sha = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True,
+                             text=True).stdout.strip()
+        self.cold_config = {
+            "model": {"provider": "openai-codex", "default": "fixture-model"},
+            "platforms": {"telegram": {"enabled": True, "token": "fixture-token",
+                                       "extra": {"drop_pending_on_cold_boot": False}}},
+            "stt": {"enabled": True, "provider": "local"}, "tts": {"provider": "edge"},
+            "voice": {"auto_tts": True}, "hooks": {"post_llm_call": [{"command": "hook"}]},
+        }
+        self.hermes_config(self.cold_config)
+        (home / "gateway_state.json").write_text(json.dumps({
+            "pid": 424242, "argv": [str(source / "hermes_cli/main.py"), "gateway", "run"], "code_sha": sha,
+            "gateway_state": "running", "hermes_home": str(home)}))
+        (home / "gateway-starts.log").write_text("%f\n" % (time.time() + last_start_offset))
+        facts = home / "installs/gen1/facts.json"
+        facts.parent.mkdir(parents=True)
+        facts.write_text('{"stamp": "a"}')
+        return source
+
+    def receipt_path(self):
+        return self.state / "telegram-agents/hermes-cold-start.json"
+
+    def bootstrap(self):
+        return self.run_manager("hermes-baseline", "bootstrap")
+
+    def test_hermes_cold_start_without_a_recorded_generation_is_held(self):
+        self.cold_hermes()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("no recorded generation", result.stdout)
+
+    def test_hermes_bootstrap_then_cold_start_preflight_is_ready(self):
+        self.cold_hermes()
+        boot = self.bootstrap()
+        self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+        self.assertEqual("operator-bootstrap", json.loads(self.receipt_path().read_text())["basis"])
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("READY", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_code_change(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (source / "new.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", str(source), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.name=f", "-c", "user.email=f@example.invalid",
+                        "commit", "-q", "-m", "change"], check=True, capture_output=True)
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("code identity changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_an_uncommitted_change(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (source / "hermes_cli/main.py").write_text("print('edited')\n")
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("uncommitted source changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_an_untracked_file(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (source / "stray.py").write_text("x = 1\n")
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("uncommitted source changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_dependency_generation_change(self):
+        self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (self.home / ".hermes/installs/gen2").mkdir()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("dependency generation changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_capability_change(self):
+        self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        self.cold_config["stt"]["provider"] = "other"
+        self.hermes_config(self.cold_config)
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("capability set changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_hook_file_change(self):
+        self.cold_hermes()
+        hooks = self.home / ".hermes/agent-hooks"
+        hooks.mkdir()
+        (hooks / "voice.py").write_text("print('a')\n")
+        self.assertEqual(0, self.bootstrap().returncode)
+        (hooks / "voice.py").write_text("print('b')\n")
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("capability set changed", result.stdout)
+
+    def test_hermes_live_predecessor_is_held_even_with_a_matching_baseline(self):
+        self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        gateway = self.start_gateway_stand_in()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertNotIn("READY", result.stdout)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_bootstrap_is_refused_when_the_code_differs_from_the_last_running_generation(self):
+        self.cold_hermes()
+        path = self.home / ".hermes/gateway_state.json"
+        state = json.loads(path.read_text())
+        state["code_sha"] = "0" * 40
+        path.write_text(json.dumps(state))
+        result = self.bootstrap()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("code identity differs", result.stdout)
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_hermes_bootstrap_is_refused_when_source_is_newer_than_the_last_start(self):
+        source = self.cold_hermes(last_start_offset=-3600.0)
+        (source / "late.py").write_text("x = 1\n")
+        result = self.bootstrap()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("changed after the last start", result.stdout)
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_hermes_baseline_record_needs_a_running_generation(self):
+        self.cold_hermes()
+        result = self.run_manager("hermes-baseline", "record")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_hermes_cold_start_start_reports_a_started_unverified_gateway_and_records_the_baseline(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        self.write_executable("hermes", (
+            "#!/usr/bin/env python3\n"
+            "import json, os, subprocess, sys\n"
+            "if sys.argv[1:3] != ['gateway', 'run']:\n"
+            "    sys.exit(2)\n"
+            "home = os.path.join(os.environ['HOME'], '.hermes')\n"
+            "child = subprocess.Popen(['sleep', '20'], start_new_session=True)\n"
+            "ticks = open('/proc/%d/stat' % child.pid).read().rsplit(')', 1)[1].split()[19]\n"
+            f"argv = [{str(source / 'hermes_cli/main.py')!r}, 'gateway', 'run']\n"
+            "base = {'pid': child.pid, 'kind': 'hermes-gateway', 'argv': argv, 'start_time': ticks}\n"
+            "json.dump(base, open(os.path.join(home, 'gateway.pid'), 'w'))\n"
+            "json.dump(dict(base, gateway_state='running', active_agents=0, platforms={'telegram': {'state': 'connected',\n"
+            "    'writer_pid': child.pid, 'writer_start_time': ticks}}), open(os.path.join(home, 'gateway_state.json'), 'w'))\n"
+        ))
+        result = self.run_manager("start", "hermes", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reply credential usability NOT-VERIFIED", result.stdout)
+        self.assertNotIn("RUNNING", result.stdout)
+        self.assertEqual("verified-running", json.loads(self.receipt_path().read_text())["basis"])
+
     def test_hermes_missing_telegram_preflight_preserves_generation(self):
         gateway = self.ready_hermes()
         self.hermes_config({"model": {"provider": "openai-codex", "default": "fixture-model"}})
@@ -5877,6 +6041,8 @@ Commands:
   list              List all known agents
   status            Show which agents are running
   preflight hermes  Check candidate configuration without runtime effects
+  hermes-baseline record|bootstrap|show
+                    Record the last verified Hermes generation a cold start is compared with
   recover hermes    Recover an unhealthy idle gateway through its owner
   restart hermes    Explicit fenced idle restart (self-request owner only)
   enabled           Print enabled agents for this host
@@ -6220,17 +6386,85 @@ PYCODE
 # the runtime (which may refresh credentials/install dependencies), calls an LLM,
 # or opens a second Telegram consumer. Diagnostics are fixed labels, not config.
 hermes_inspect() {
-    python3 - "${1:-status}" "${HERMES_HOME:-$HOME/.hermes}" "$(hermes_gateway_pid)" <<'PY'
+    python3 - "${1:-status}" "${HERMES_HOME:-$HOME/.hermes}" "$(hermes_gateway_pid)" "${STATE_DIR:-}" <<'PY'
+import hashlib
 import json
 import os
 from pathlib import Path
+import subprocess
 import sys
+import time
 
-mode, root, pid = sys.argv[1:]
+mode, root, pid = sys.argv[1:4]
+state_dir = Path(sys.argv[4]) if len(sys.argv) > 4 and sys.argv[4] else None
 home = Path(root).expanduser().resolve()
+RECEIPT = state_dir / "hermes-cold-start.json" if state_dir else None
 def finish(state, reason, code):
     print(f"  hermes gateway run: {state} ({reason})")
     raise SystemExit(code)
+
+def _git(source, *argv):
+    return subprocess.run(["git", "-C", str(source), *argv], capture_output=True, timeout=30).stdout
+
+def _dirty_files(source):
+    names = _git(source, "diff", "HEAD", "--name-only", "-z").split(b"\0") + \
+        _git(source, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+    return sorted({n.decode() for n in names if n})
+
+def _generation(source, config, telegram, token_present):
+    """What a cold start would run: code identity including uncommitted work, every dependency generation, and the
+    capability set (STT/TTS/voice/hooks/retention/access) a candidate must keep. Values only where they are not secret."""
+    sha = hashlib.sha256
+    code = _git(source, "rev-parse", "HEAD").decode().strip()
+    dirty = sha(_git(source, "diff", "HEAD", "--binary"))
+    for name in _dirty_files(source):
+        dirty.update(b"\0" + name.encode() + b"\0")
+        try:
+            dirty.update((source / name).read_bytes()[: 4 << 20])
+        except OSError:
+            dirty.update(b"unreadable")
+    installs = sha()
+    for gen in sorted(p for p in (home / "installs").glob("*") if p.is_dir()):
+        facts = gen / "facts.json"
+        installs.update(gen.name.encode() + b"\0" + (sha(facts.read_bytes()).digest() if facts.is_file() else b"absent"))
+    stt, tts, voice = (config.get(k) or {} for k in ("stt", "tts", "voice"))
+    hooks = config.get("hooks") or {}
+    capability = {"stt": [stt.get("enabled"), stt.get("provider")], "tts": tts.get("provider"),
+                  "auto_tts": voice.get("auto_tts"), "hooks": sorted(k for k in hooks if hooks.get(k)),
+                  "retention": (telegram.get("extra") or {}).get("drop_pending_on_cold_boot"), "token": bool(token_present)}
+    cap = sha(json.dumps(capability, sort_keys=True).encode())
+    for hook in sorted((home / "agent-hooks").glob("*.py")):
+        cap.update(hook.name.encode() + b"\0" + sha(hook.read_bytes()).digest())
+    pairing = home / "pairing"
+    if pairing.is_dir():
+        for entry in sorted(pairing.iterdir()):
+            cap.update(entry.name.encode() + b"\0" + str(entry.stat().st_size).encode())
+    return {"schema": 1, "source_dir": str(source), "code_sha": code, "dirty_sha256": dirty.hexdigest(),
+            "installs_sha256": installs.hexdigest(), "capability_sha256": cap.hexdigest()}
+
+def _cold_start_problem(config, telegram, token_present):
+    """None when a cold start has nothing to adopt; otherwise a fixed label naming what is unverified."""
+    try:
+        receipt = json.loads(RECEIPT.read_text())
+    except (OSError, ValueError, AttributeError):
+        return "no recorded generation"
+    try:
+        now = _generation(Path(receipt["source_dir"]), config, telegram, token_present)
+    except (OSError, KeyError, TypeError, subprocess.SubprocessError):
+        return "recorded generation unreadable"
+    for key, label in (("code_sha", "code identity changed"), ("dirty_sha256", "uncommitted source changed"),
+                       ("installs_sha256", "dependency generation changed"),
+                       ("capability_sha256", "capability set changed")):
+        if receipt.get(key) != now[key]:
+            return label
+    return None
+
+def _write_receipt(receipt, basis):
+    receipt = dict(receipt, basis=basis, recorded_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"))
+    RECEIPT.parent.mkdir(parents=True, exist_ok=True)
+    tmp = RECEIPT.with_suffix(".tmp")
+    tmp.write_text(json.dumps(receipt, indent=1) + "\n")
+    os.replace(tmp, RECEIPT)
 try:
     import yaml
     config = yaml.safe_load((home / "config.yaml").read_text())
@@ -6276,10 +6510,51 @@ try:
             # Native create_adapter may ensure_import -> sync_venv -> adopt a
             # dependency generation. A structural YAML check cannot authorize
             # that mutation or prove the candidate kept access/STT/TTS hooks.
-            # Hold BEFORE stopping the predecessor, until the canonical native
-            # install/preflight lane owns these gates. Never disable PM blindly.
-            finish("UNKNOWN", "native startup dependencies and capability continuity NOT-VERIFIED", 69)
+            # Hold BEFORE stopping a live predecessor, always. A COLD start
+            # (nothing running, nothing to stop) clears only when the code
+            # (including uncommitted work), every dependency generation and the
+            # capability set equal the last generation this host recorded as
+            # verified, so adoption has nothing to change. Never disable PM blindly.
+            held = "native startup dependencies and capability continuity NOT-VERIFIED"
+            if pid:
+                finish("UNKNOWN", held, 69)
+            problem = _cold_start_problem(config, telegram, token_present)
+            if problem:
+                finish("UNKNOWN", f"{held}; {problem}", 69)
+            finish("READY", "cold start of the last verified generation; adoption has nothing to change", 0)
         finish("READY", "structural preflight only; credentials and delivery not exercised", 0)
+    if mode in ("baseline-record", "baseline-bootstrap"):
+        if cron_only or RECEIPT is None:
+            finish("BLOCKED", "no cold-start baseline applies", 78)
+        state = json.loads((home / "gateway_state.json").read_text())
+        source = Path(state["argv"][0]).resolve().parents[1]
+        generation = _generation(source, config, telegram, token_present)
+        if mode == "baseline-record":
+            if not pid:
+                finish("BLOCKED", "no running generation to record", 1)
+            ticks = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
+            platform = (state.get("platforms") or {}).get("telegram") or {}
+            if (state.get("pid") != int(pid) or str(state.get("start_time")) != ticks
+                    or state.get("gateway_state") != "running" or platform.get("state") != "connected"
+                    or platform.get("writer_pid") != int(pid)):
+                finish("BLOCKED", "running generation not verified connected; baseline not recorded", 1)
+            _write_receipt(generation, "verified-running")
+            finish("RECORDED", "baseline from a verified running generation", 0)
+        # Operator bootstrap: no verified-running record exists yet. Prove from evidence that nothing changed since the
+        # last start: code identity equals the last snapshot, and no uncommitted source or dependency fact is newer
+        # than that start. The capability set is recorded as it stands now; that part is the operator's acceptance.
+        if pid:
+            finish("BLOCKED", "a gateway is running; record from it instead", 1)
+        if state.get("code_sha") != generation["code_sha"]:
+            finish("BLOCKED", "code identity differs from the last running generation", 1)
+        starts = [float(x) for x in (home / "gateway-starts.log").read_text().split()]
+        last_start = max(starts)
+        newer = [n for n in _dirty_files(source) if (source / n).stat().st_mtime > last_start]
+        newer += [str(g) for g in (home / "installs").glob("*/facts.json") if g.stat().st_mtime > last_start]
+        if newer:
+            finish("BLOCKED", "source or dependency facts changed after the last start", 1)
+        _write_receipt(generation, "operator-bootstrap")
+        finish("RECORDED", "baseline bootstrapped from evidence; capability set accepted as it stands", 0)
     if not pid:
         finish("STOPPED", "no verified gateway generation", 1)
     fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
@@ -6321,11 +6596,20 @@ hermes_preflight() { hermes_inspect preflight; }
 hermes_wait_ready() {
     local timeout="${HERMES_READY_TIMEOUT:-90}" i rc
     case "$timeout" in ''|*[!0-9]*) echo 'Invalid HERMES_READY_TIMEOUT' >&2; return 1 ;; esac
+    local out=""
     for ((i=0; i<=timeout; i++)); do
         rc=0
-        hermes_inspect status && return 0 || rc=$?
+        out=$(hermes_inspect status) || rc=$?
+        if [ "$rc" -eq 0 ]; then printf '%s\n' "$out"; return 0; fi
+        case "$out" in
+            *"Telegram connected; reply credential usability NOT-VERIFIED"*)
+                # The transport is up and the reply path is unverifiable by design
+                # (no inference canary). That is a started gateway, reported as
+                # exactly what it is; it is never reported as RUNNING.
+                printf '%s\n' "$out"; return 0 ;;
+        esac
         case "$rc" in
-            78) return "$rc" ;;
+            78) printf '%s\n' "$out"; return "$rc" ;;
             69)
                 # UNKNOWN is not always fatal: a new gateway.pid can precede
                 # its gateway_state.json snapshot while the old snapshot
@@ -6337,11 +6621,13 @@ hermes_wait_ready() {
                     [ "$i" -eq "$timeout" ] || sleep 1
                     continue
                 fi
+                printf '%s\n' "$out"
                 return "$rc"
                 ;;
         esac
         [ "$i" -eq "$timeout" ] || sleep 1
     done
+    printf '%s\n' "$out"
     return 1
 }
 
@@ -6438,7 +6724,11 @@ hermes_start_unlocked() {
         echo "No user service manager available; starting Hermes gateway detached..."
         nohup setsid hermes gateway run > "$STATE_DIR/hermes.log" 2>&1 </dev/null &
     fi
-    hermes_wait_ready
+    local ready_rc=0
+    hermes_wait_ready || ready_rc=$?
+    # A verified-connected generation becomes the baseline a later cold start is compared with.
+    [ "$ready_rc" -ne 0 ] || hermes_inspect baseline-record >/dev/null 2>&1 || true
+    return "$ready_rc"
 }
 
 # Lock-owning boundary for every external Hermes start. The unlocked start
@@ -8341,6 +8631,14 @@ case "$COMMAND" in
     list) list_agents ;;
     status) status_cmd "${1:-}" ;;
     preflight) [ "${1:-}" = hermes ] || exit 2; hermes_preflight ;;
+    hermes-baseline)
+        case "${1:-}" in
+            record) hermes_inspect baseline-record ;;
+            bootstrap) hermes_inspect baseline-bootstrap ;;
+            show) cat "$STATE_DIR/hermes-cold-start.json" ;;
+            *) exit 2 ;;
+        esac
+        ;;
     recover) [ "${1:-}" = hermes ] || exit 2; recover_hermes ;;
     restart) [ "${1:-}" = hermes ] || exit 2; recover_hermes restart "${2:-}" ;;
     enable) enable_agent "${1:-}" ;;

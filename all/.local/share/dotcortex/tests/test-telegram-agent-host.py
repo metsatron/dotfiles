@@ -690,6 +690,170 @@ class TelegramAgentHostColdStartTest(unittest.TestCase):
         (home / "gateway_state.json").write_text(json.dumps(state))
         return gateway
 
+    # -- cold-start clearance: a stopped gateway whose last verified generation is unchanged ------------------
+
+    def cold_hermes(self, last_start_offset=3600.0):
+        """A stopped gateway whose last running generation is on disk: a source repo, its snapshot and install facts."""
+        home = self.home / ".hermes"
+        home.mkdir(exist_ok=True)
+        source = self.root / "hermes-agent"
+        (source / "hermes_cli").mkdir(parents=True)
+        (source / "hermes_cli/main.py").write_text("print('gateway')\n")
+        for argv in (["init", "-q"], ["add", "-A"],
+                     ["-c", "user.name=fixture", "-c", "user.email=f@example.invalid", "commit", "-q", "-m", "fixture"]):
+            subprocess.run(["git", "-C", str(source), *argv], check=True, capture_output=True)
+        sha = subprocess.run(["git", "-C", str(source), "rev-parse", "HEAD"], check=True, capture_output=True,
+                             text=True).stdout.strip()
+        self.cold_config = {
+            "model": {"provider": "openai-codex", "default": "fixture-model"},
+            "platforms": {"telegram": {"enabled": True, "token": "fixture-token",
+                                       "extra": {"drop_pending_on_cold_boot": False}}},
+            "stt": {"enabled": True, "provider": "local"}, "tts": {"provider": "edge"},
+            "voice": {"auto_tts": True}, "hooks": {"post_llm_call": [{"command": "hook"}]},
+        }
+        self.hermes_config(self.cold_config)
+        (home / "gateway_state.json").write_text(json.dumps({
+            "pid": 424242, "argv": [str(source / "hermes_cli/main.py"), "gateway", "run"], "code_sha": sha,
+            "gateway_state": "running", "hermes_home": str(home)}))
+        (home / "gateway-starts.log").write_text("%f\n" % (time.time() + last_start_offset))
+        facts = home / "installs/gen1/facts.json"
+        facts.parent.mkdir(parents=True)
+        facts.write_text('{"stamp": "a"}')
+        return source
+
+    def receipt_path(self):
+        return self.state / "telegram-agents/hermes-cold-start.json"
+
+    def bootstrap(self):
+        return self.run_manager("hermes-baseline", "bootstrap")
+
+    def test_hermes_cold_start_without_a_recorded_generation_is_held(self):
+        self.cold_hermes()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("no recorded generation", result.stdout)
+
+    def test_hermes_bootstrap_then_cold_start_preflight_is_ready(self):
+        self.cold_hermes()
+        boot = self.bootstrap()
+        self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+        self.assertEqual("operator-bootstrap", json.loads(self.receipt_path().read_text())["basis"])
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("READY", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_code_change(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (source / "new.py").write_text("x = 1\n")
+        subprocess.run(["git", "-C", str(source), "add", "-A"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(source), "-c", "user.name=f", "-c", "user.email=f@example.invalid",
+                        "commit", "-q", "-m", "change"], check=True, capture_output=True)
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("code identity changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_an_uncommitted_change(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (source / "hermes_cli/main.py").write_text("print('edited')\n")
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("uncommitted source changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_an_untracked_file(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (source / "stray.py").write_text("x = 1\n")
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("uncommitted source changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_dependency_generation_change(self):
+        self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        (self.home / ".hermes/installs/gen2").mkdir()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("dependency generation changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_capability_change(self):
+        self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        self.cold_config["stt"]["provider"] = "other"
+        self.hermes_config(self.cold_config)
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("capability set changed", result.stdout)
+
+    def test_hermes_cold_start_is_refused_after_a_hook_file_change(self):
+        self.cold_hermes()
+        hooks = self.home / ".hermes/agent-hooks"
+        hooks.mkdir()
+        (hooks / "voice.py").write_text("print('a')\n")
+        self.assertEqual(0, self.bootstrap().returncode)
+        (hooks / "voice.py").write_text("print('b')\n")
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertIn("capability set changed", result.stdout)
+
+    def test_hermes_live_predecessor_is_held_even_with_a_matching_baseline(self):
+        self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        gateway = self.start_gateway_stand_in()
+        result = self.run_manager("preflight", "hermes")
+        self.assertEqual(result.returncode, 69, result.stdout + result.stderr)
+        self.assertNotIn("READY", result.stdout)
+        self.assertIsNone(gateway.poll())
+
+    def test_hermes_bootstrap_is_refused_when_the_code_differs_from_the_last_running_generation(self):
+        self.cold_hermes()
+        path = self.home / ".hermes/gateway_state.json"
+        state = json.loads(path.read_text())
+        state["code_sha"] = "0" * 40
+        path.write_text(json.dumps(state))
+        result = self.bootstrap()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("code identity differs", result.stdout)
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_hermes_bootstrap_is_refused_when_source_is_newer_than_the_last_start(self):
+        source = self.cold_hermes(last_start_offset=-3600.0)
+        (source / "late.py").write_text("x = 1\n")
+        result = self.bootstrap()
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("changed after the last start", result.stdout)
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_hermes_baseline_record_needs_a_running_generation(self):
+        self.cold_hermes()
+        result = self.run_manager("hermes-baseline", "record")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertFalse(self.receipt_path().exists())
+
+    def test_hermes_cold_start_start_reports_a_started_unverified_gateway_and_records_the_baseline(self):
+        source = self.cold_hermes()
+        self.assertEqual(0, self.bootstrap().returncode)
+        self.write_executable("hermes", (
+            "#!/usr/bin/env python3\n"
+            "import json, os, subprocess, sys\n"
+            "if sys.argv[1:3] != ['gateway', 'run']:\n"
+            "    sys.exit(2)\n"
+            "home = os.path.join(os.environ['HOME'], '.hermes')\n"
+            "child = subprocess.Popen(['sleep', '20'], start_new_session=True)\n"
+            "ticks = open('/proc/%d/stat' % child.pid).read().rsplit(')', 1)[1].split()[19]\n"
+            f"argv = [{str(source / 'hermes_cli/main.py')!r}, 'gateway', 'run']\n"
+            "base = {'pid': child.pid, 'kind': 'hermes-gateway', 'argv': argv, 'start_time': ticks}\n"
+            "json.dump(base, open(os.path.join(home, 'gateway.pid'), 'w'))\n"
+            "json.dump(dict(base, gateway_state='running', active_agents=0, platforms={'telegram': {'state': 'connected',\n"
+            "    'writer_pid': child.pid, 'writer_start_time': ticks}}), open(os.path.join(home, 'gateway_state.json'), 'w'))\n"
+        ))
+        result = self.run_manager("start", "hermes", timeout=30)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reply credential usability NOT-VERIFIED", result.stdout)
+        self.assertNotIn("RUNNING", result.stdout)
+        self.assertEqual("verified-running", json.loads(self.receipt_path().read_text())["basis"])
+
     def test_hermes_missing_telegram_preflight_preserves_generation(self):
         gateway = self.ready_hermes()
         self.hermes_config({"model": {"provider": "openai-codex", "default": "fixture-model"}})
