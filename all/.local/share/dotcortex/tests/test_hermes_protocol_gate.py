@@ -49,11 +49,23 @@ class Admission(unittest.TestCase):
             p.write_text('{"models": []}' if p.suffix == '.json' else "# evidence\n- [ ] Operator priority unresolved\n")
         self.oldrepo, self.oldcourses, self.oldrepositories = m.REPO, m.COURSES, m.REPOSITORIES
         m.REPO, m.COURSES, m.REPOSITORIES = self.root, self.courses, {"HelmCortex": self.root}
+        self.oldstate = m.STATE_DB
+        m.STATE_DB = Path(self.tmp.name) / "state.db"
         self.addCleanup(self.restore)
         self.called = 0
 
     def restore(self):
         m.REPO, m.COURSES, m.REPOSITORIES = self.oldrepo, self.oldcourses, self.oldrepositories
+        m.STATE_DB = self.oldstate
+
+    def sessions(self, rows):
+        """Hermes's own session store: (id, parent_session_id, source) rows."""
+        import sqlite3
+        con = sqlite3.connect(str(m.STATE_DB))
+        con.execute("CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, source TEXT)")
+        con.executemany("INSERT OR REPLACE INTO sessions VALUES (?, ?, ?)", rows)
+        con.commit()
+        con.close()
 
     def save(self):
         self.holepath.write_text(json.dumps(self.hole))
@@ -238,6 +250,69 @@ class Admission(unittest.TestCase):
         command = (str(m.REPO / "FORGE/bin/prompt-golf") + " record-swing --hole test-hole "
                    "--speaker hermes-agent --session-id s2 --aimed repair")
         self.assertTrue(self.invoke(tool="terminal", args={"command": command}, session="s2").get("ran"))
+
+    def test_delegated_child_is_admitted_under_the_parent_hole(self):
+        self.sessions([("c1", "s1", "subagent")])
+        self.assertTrue(self.invoke(session="c1").get("ran"))
+
+    def test_grandchild_is_admitted(self):
+        self.sessions([("g1", "c1", "subagent"), ("c1", "s1", "subagent")])
+        self.assertTrue(self.invoke(session="g1").get("ran"))
+
+    def test_child_write_outside_the_worktree_is_refused(self):
+        self.sessions([("c1", "s1", "subagent")])
+        self.refused(args={"path": str(self.root / "project.md")}, session="c1")
+
+    def test_session_row_that_is_not_a_subagent_is_not_a_child(self):
+        self.sessions([("c1", "s1", "telegram")])
+        self.refused(session="c1")
+
+    def test_child_of_an_unclaimed_parent_is_refused(self):
+        self.sessions([("c1", "nobody", "subagent")])
+        self.refused(session="c1")
+
+    def test_child_is_refused_once_the_parent_swing_is_closed(self):
+        self.sessions([("c1", "s1", "subagent")])
+        self.hole["swings"][0]["lie"] = "fairway"
+        self.save()
+        self.refused(session="c1")
+
+    def test_lineage_depth_is_capped(self):
+        rows = [("n%d" % i, "n%d" % (i + 1), "subagent") for i in range(1, 6)] + [("n6", "s1", "subagent")]
+        self.sessions(rows)
+        self.refused(session="n1")
+
+    def test_missing_session_store_refuses_a_child(self):
+        self.refused(session="c1")
+
+    def test_parent_cannot_be_declared_by_the_caller(self):
+        self.sessions([("other", "nobody", "subagent")])
+        result = m.gate("write_file", {"path": str(self.wt / "x")}, self.next, session_id="forger",
+                        parent_session_id="s1", turn_id="t1")
+        self.assertEqual(0, self.called, result)
+        self.assertIn("error", result)
+
+    def test_child_cannot_assign_or_open_holes(self):
+        self.sessions([("c1", "s1", "subagent")])
+        for verb in ("assign --hole test-hole --course HelmCortex --speaker hermes-agent",
+                     "tee-off HelmCortex stolen-hole",
+                     "record-swing --hole test-hole --speaker hermes-agent --session-id c1 --aimed x"):
+            self.called = 0
+            self.refused(tool="terminal", args={"command": str(m.REPO / "FORGE/bin/prompt-golf") + " " + verb}, session="c1")
+
+    def test_child_can_read_hole_status(self):
+        self.sessions([("c1", "s1", "subagent")])
+        command = str(m.REPO / "FORGE/bin/prompt-golf") + " status HelmCortex"
+        self.assertTrue(self.invoke(tool="terminal", args={"command": command}, session="c1").get("ran"))
+
+    def test_child_cannot_send_outbound_mail(self):
+        self.sessions([("c1", "s1", "subagent")])
+        self.refused(tool="terminal", args={"command": "mailcortex send --from hermes@kikin.helm --to orca@kikin.helm --subject x --body y"}, session="c1")
+
+    def test_pre_llm_marks_a_delegated_child(self):
+        self.sessions([("c1", "s1", "subagent")])
+        text = m.inject_state(session_id="c1")["context"]
+        self.assertIn("CLAIMED via parent lineage", text)
 
     def test_middleware_chain_refuses_without_next(self):
         self.chain(session="wrong")
