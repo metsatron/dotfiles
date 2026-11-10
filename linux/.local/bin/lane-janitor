@@ -1,0 +1,243 @@
+#!/usr/bin/env bash
+# lane-janitor
+# #+NAME: lane-janitor
+
+# [[file:../../../services.org::lane-janitor][lane-janitor]]
+set -uo pipefail
+
+TAG="lane-janitor"
+ROOT="/tmp/dxbuild"
+HOLDER="/home/metsatron/.cache/wasm-build.lock.holder"
+LOCKFILE="/home/metsatron/.cache/wasm-build.lock"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/lane-janitor/actions.log"
+KEEP_LOG_BYTES=${LANE_JANITOR_KEEP_LOG_BYTES:-262144}
+MIN_AGE_MIN=${LANE_JANITOR_MIN_AGE_MIN:-120}
+MAX_DELETIONS=${LANE_JANITOR_MAX_DELETIONS:-50}
+APPLY=0
+REPORT_CONTAINERS=0
+PROBLEM=0
+
+usage() {
+  cat <<'EOF'
+Usage: lane-janitor [--root DIR] [--dry-run|--apply] [--report-containers]
+                    [--min-age-min N] [--max-deletions N] [--help]
+
+One-shot reaper for the build lane's litter. Dry-run is the default and is what
+the schedule runs; --apply is a deliberate hand invocation.
+
+It names every candidate by path and every refusal by reason. A run that finds
+nothing says so in words, so silence can never be mistaken for a clean tree.
+
+Classes: stale lock holder, stray link-*.log in the lane root, empty `_ses:`
+keyrings owned by this uid, its own log by rotation. Containers are reported,
+never killed. It never uses sudo and has no privileged verb.
+
+Exit: 0 clean, acted or nothing to do; 2 usage; 3 a prerequisite is unreadable.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --root)       [ "$#" -ge 2 ] || { echo "$TAG: --root needs a value" >&2; exit 2; }; ROOT="$2"; shift ;;
+    --dry-run)    APPLY=0 ;;
+    --apply)      APPLY=1 ;;
+    --report-containers) REPORT_CONTAINERS=1 ;;
+    --min-age-min) [ "$#" -ge 2 ] || { echo "$TAG: --min-age-min needs a value" >&2; exit 2; }; MIN_AGE_MIN="$2"; shift ;;
+    --max-deletions) [ "$#" -ge 2 ] || { echo "$TAG: --max-deletions needs a value" >&2; exit 2; }; MAX_DELETIONS="$2"; shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *) echo "$TAG: unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+mkdir -p "${LOG%/*}" 2>/dev/null || true
+
+# Protected prefixes. The janitor will not operate inside a repo or a knowledge
+# store even if someone points --root at one: the litter it exists to reap is
+# build scratch, and a reaper that can wander into HelmCortex is a reaper that can
+# delete a lane's work. Refused loudly, not silently skipped.
+protected_root() {
+  local resolved
+  resolved=$(readlink -f -- "$ROOT" 2>/dev/null || printf '%s' "$ROOT")
+  # Match the path as given AND as resolved. /home/metsatron/HelmCortex is a
+  # symlink into /home/metsatron/mnt/x230/HelmCortex, so a pattern anchored on the
+  # familiar name alone lets the real path through — which it did, first test.
+  case "$ROOT" in
+    /home/metsatron/HelmCortex*|/home/metsatron/DotCortex*) return 0 ;;
+  esac
+  case "$resolved" in
+    */HelmCortex|*/HelmCortex/*|*/DotCortex|*/DotCortex/*) return 0 ;;
+    */ROOTS|*/ROOTS/*|*/LOGS|*/LOGS/*|*/NEXUS|*/NEXUS/*|*/.git|*/.git/*) return 0 ;;
+  esac
+  return 1
+}
+
+if protected_root; then
+  echo "$TAG: REFUSING to run with --root $ROOT — it resolves inside a protected tree" >&2
+  echo "$TAG: protected: HelmCortex, DotCortex, ROOTS, LOGS, NEXUS, any .git path" >&2
+  echo "$TAG: build scratch belongs outside them; nothing was inspected and nothing changed" >&2
+  printf '%s\trefuse\tREFUSED\t%s\troot resolves inside a protected tree\n' "$(date -Is)" "$ROOT" >> "$LOG" 2>/dev/null || true
+  exit 2
+fi
+
+# Append-only action log. One line per decision, action or refusal.
+record() { # record <class> <decision> <what> <reason>
+  printf '%s\t%s\t%s\t%s\t%s\n' "$(date -Is)" "$1" "$2" "$3" "$4" >> "$LOG" 2>/dev/null || true
+  printf '  [%s] %-6s %s  -- %s\n' "$1" "$2" "$2" >/dev/null 2>&1 || true
+  printf '  [%-8s] %-6s %s\n              why: %s\n' "$1" "$2" "$3" "$4"
+}
+
+# Refuse and log. Never silent.
+refuse() { # refuse <class> <what> <reason>
+  record "$1" REFUSE "$2" "$3"
+}
+
+now=$(date +%s)
+
+# ---------------------------------------------------------------- class 2 ---
+check_holder() {
+  [ -e "$HOLDER" ] || { echo "  [class 2 ] nothing: no holder file at $HOLDER"; return; }
+  read -r rec_lane rec_pid _rest < "$HOLDER" 2>/dev/null || true
+  if [ -z "${rec_pid:-}" ]; then
+    refuse "class 2" "$HOLDER" "holder file present but carries no pid; refusing rather than guessing"
+    return
+  fi
+  if kill -0 "$rec_pid" 2>/dev/null; then
+    echo "  [class 2 ] KEEP $HOLDER (pid $rec_pid alive)"
+    return
+  fi
+  # pid is dead; now prove no live flock holder, in that order.
+  if [ -e "$LOCKFILE" ]; then
+    if command -v flock >/dev/null 2>&1 && ! flock -n "$LOCKFILE" true 2>/dev/null; then
+      echo "  [class 2 ] KEEP $HOLDER (pid $rec_pid dead, but flock $LOCKFILE is HELD)"
+      return
+    fi
+  fi
+  if [ "$APPLY" -eq 1 ]; then
+    if rm -f -- "$HOLDER"; then record "class 2" REMOVED "$HOLDER" "pid $rec_pid dead and flock unheld"; else PROBLEM=1; fi
+  else
+    record "class 2" WOULD "$HOLDER" "pid $rec_pid dead and flock unheld"
+  fi
+}
+
+# ---------------------------------------------------------------- class 3 ---
+# Only names matching this literal pattern, directly in ROOT. No recursion,
+# no glob the shell expands, no path the caller supplied.
+LOG_PATTERN='^link-[A-Za-z0-9._-]+\.log$'
+
+check_logs() {
+  [ -d "$ROOT" ] || { echo "  [class 3 ] nothing: lane root $ROOT absent"; return; }
+  deleted=0
+  # newest preserved artefact = newest finite timestamp under ROOT/.preserved if present
+  newest_keep=0
+  if [ -f "$ROOT/.preserved" ]; then newest_keep=$(cat "$ROOT/.preserved" 2>/dev/null || echo 0); fi
+  for path in "$ROOT"/link-*.log; do
+    [ -e "$path" ] || continue
+    name=${path##*/}
+    if ! printf '%s' "$name" | grep -Eq "$LOG_PATTERN"; then
+      refuse "class 3" "$path" "name does not match $LOG_PATTERN"
+      continue
+    fi
+    owner=$(stat -c %u -- "$path" 2>/dev/null || echo -1)
+    if [ "$owner" != "$(id -u)" ]; then
+      refuse "class 3" "$path" "owned by uid $owner, not $(id -u)"
+      continue
+    fi
+    mtime=$(stat -c %Y -- "$path" 2>/dev/null || echo "$now")
+    age_min=$(( (now - mtime) / 60 ))
+    if [ "$age_min" -lt "$MIN_AGE_MIN" ]; then
+      echo "  [class 3 ] KEEP $path (age ${age_min}m < ${MIN_AGE_MIN}m)"
+      continue
+    fi
+    if [ "$mtime" -gt "$newest_keep" ] 2>/dev/null && [ "$newest_keep" -gt 0 ]; then
+      echo "  [class 3 ] KEEP $path (newer than preserved artefact marker)"
+      continue
+    fi
+    if [ "$deleted" -ge "$MAX_DELETIONS" ]; then
+      refuse "class 3" "$path" "per-run cap of $MAX_DELETIONS reached; deferred to the next run"
+      continue
+    fi
+    if [ "$APPLY" -eq 1 ]; then
+      if rm -f -- "$path"; then record "class 3" REMOVED "$path" "stale link log, age ${age_min}m, older than preserved artefact"; deleted=$((deleted+1)); else PROBLEM=1; fi
+    else
+      record "class 3" WOULD "$path" "stale link log, age ${age_min}m, older than preserved artefact"; deleted=$((deleted+1))
+    fi
+  done
+  [ "$deleted" -eq 0 ] && echo "  [class 3 ] nothing: no stale link-*.log in $ROOT older than ${MIN_AGE_MIN}m"
+}
+
+# ---------------------------------------------------------------- class 4 ---
+check_keyrings() {
+  command -v keyctl >/dev/null 2>&1 || { echo "  [class 4 ] skipped: keyctl not on PATH"; return; }
+  [ -r /proc/keys ] || { echo "  [class 4 ] skipped: /proc/keys unreadable"; PROBLEM=1; return; }
+  uid=$(id -u)
+  live=$( { for p in $(pgrep -u "$uid" 2>/dev/null || true); do
+              awk '/^(Session|Thread|Process)Keyring:/{print $2}' "/proc/$p/status" 2>/dev/null || true
+            done; } | sort -u )
+  found=0; acted=0
+  for id in $(awk -v u="$uid" '$6 == u && $8 == "keyring" && $9 == "_ses:" { print $1 }' /proc/keys 2>/dev/null); do
+    printf '%s\n' "$live" | grep -qx "$id" && { echo "  [class 4 ] KEEP key $id (live process reference)"; continue; }
+    entries=$( { keyctl show "$id" 2>/dev/null || true; } | wc -l )
+    entries=$(printf '%s' "$entries" | tr -cd '0-9'); [ -n "$entries" ] || entries=0
+    if [ "$entries" -gt 1 ]; then echo "  [class 4 ] KEEP key $id (not empty: $entries entries)"; continue; fi
+    found=$((found+1))
+    if [ "$acted" -ge "$MAX_DELETIONS" ]; then
+      refuse "class 4" "key $id" "per-run cap of $MAX_DELETIONS reached"
+      continue
+    fi
+    if [ "$APPLY" -eq 1 ]; then
+      if keyctl clear "$id" 2>/dev/null; then record "class 4" REMOVED "key $id" "empty _ses: keyring, uid $uid, no live reference"; acted=$((acted+1)); fi
+    else
+      record "class 4" WOULD "key $id" "empty _ses: keyring, uid $uid, no live reference"; acted=$((acted+1))
+    fi
+  done
+  if [ "$found" -eq 0 ]; then
+    echo "  [class 4 ] nothing: no empty _ses: keyrings belong to uid $uid"
+  else
+    echo "  [class 4 ] $([ "$APPLY" -eq 1 ] && echo cleared || echo would clear) $acted of $found candidate keyring(s)"
+  fi
+}
+
+# ---------------------------------------------------------------- class 5 ---
+check_own_log() {
+  [ -f "$LOG" ] || { echo "  [class 5 ] nothing: no log yet at $LOG"; return; }
+  size=$(stat -c %s -- "$LOG" 2>/dev/null || echo 0)
+  if [ "$size" -le "$KEEP_LOG_BYTES" ]; then echo "  [class 5 ] KEEP $LOG (${size}B <= ${KEEP_LOG_BYTES}B)"; return; fi
+  if [ "$APPLY" -eq 1 ]; then
+    tail -c "$KEEP_LOG_BYTES" -- "$LOG" > "$LOG.tmp" 2>/dev/null && mv -f "$LOG.tmp" "$LOG"
+    printf '%s\tclass 5\tROTATED\t%s\tkept last %s bytes of %s\n' "$(date -Is)" "$LOG" "$KEEP_LOG_BYTES" "$size" >> "$LOG" 2>/dev/null || true
+    echo "  [class 5 ] ROTATED $LOG (was ${size}B, kept ${KEEP_LOG_BYTES}B)"
+  else
+    record "class 5" WOULD "$LOG" "own log ${size}B exceeds ${KEEP_LOG_BYTES}B"
+  fi
+}
+
+# ---------------------------------------------------------------- class 1 ---
+report_containers() {
+  command -v podman >/dev/null 2>&1 || { echo "  [class 1 ] skipped: podman not on PATH"; return; }
+  CONTAINERS_CONF="${CONTAINERS_CONF:-$HOME/.local/state/laneA-wasm/containers.conf}" \
+    timeout 30 podman ps -a --format '{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}' > /tmp/.lj.ps 2>/dev/null || true
+  if [ ! -s /tmp/.lj.ps ]; then echo "  [class 1 ] nothing: podman reported no containers"; rm -f /tmp/.lj.ps; return; fi
+  while IFS=$'\t' read -r cid cname cimage cstatus; do
+    case "$cimage" in
+      *emsdk*|*dosbox*|*wasm*)
+        printf '  [class 1 ] REPORT %s (%s) image=%s status=%s -- never killed by this janitor\n' "$cid" "$cname" "$cimage" "$cstatus"
+        record "class 1" REPORT "container $cid ($cname)" "lane-owned image; reported only, kill requires a lane label" ;;
+      *)
+        printf '  [class 1 ] foreign %s (%s) -- not ours, untouched\n' "$cid" "$cname" ;;
+    esac
+  done < /tmp/.lj.ps
+  rm -f /tmp/.lj.ps
+}
+
+echo "$TAG: root=$ROOT apply=$APPLY min_age_min=$MIN_AGE_MIN max_deletions=$MAX_DELETIONS"
+echo "$TAG: log=$LOG"
+check_holder
+check_logs
+check_keyrings
+check_own_log
+[ "$REPORT_CONTAINERS" -eq 1 ] && report_containers
+echo "$TAG: done ($([ "$APPLY" -eq 1 ] && echo apply || echo dry-run))"
+[ "$PROBLEM" -eq 0 ] || exit 3
+exit 0
+# lane-janitor ends here
