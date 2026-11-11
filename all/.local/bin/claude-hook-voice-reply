@@ -101,6 +101,14 @@ esac
 # streaming latency for that robustness; replies are Telegram-sized.
 PLAY_HOST="${PVOX_REPLY_HOST:-s24}"
 FALLBACK_HOST="${PVOX_REPLY_FALLBACK_HOST:-t480s}"
+# Voice-note fallback (2026-11-11). The helpers live beside the hook, so they
+# are found the same way the normaliser is — never through PATH, which hook
+# environments do not reliably carry. TG_* are exported because the delivery
+# worker is a detached `setsid bash -c`, which only sees the environment.
+PVOX_REPLY_BINDIR="$(dirname "$(readlink -f "$0")")"
+PVOX_REPLY_TG_ENV="${PVOX_REPLY_TG_ENV:-$HOME/.hermes/.env}"
+PVOX_REPLY_TG_CHAT="${PVOX_REPLY_TG_CHAT:-111081877}"
+export PVOX_REPLY_BINDIR PVOX_REPLY_TG_ENV PVOX_REPLY_TG_CHAT
 # Host-agnostic remote play: Termux has sox (+pulse on demand), Guix fleet
 # machines have aplay; flock serializes so rapid replies queue, never stack.
 # The lock is a FIXED per-host path ($HOME/.pvox-reply-play.lock), NOT under
@@ -152,8 +160,26 @@ setsid bash -c '
     # lock (doze cannot truncate; exit code means text delivered + spawn
     # ok). Fleet render+ship stays the lane for non-kitten seats, other
     # hosts, and a dead enclave. Kill switch: PVOX_REPLY_NO_ONDEVICE=1.
+    # Can he hear the phone at all? One round trip, off the reply path. Zero
+    # on the media stream means muted, so playback is pointless — but the render
+    # lane still runs, because the note needs the audio either way.
+    MUTED=0
+    PROBE="${PVOX_REPLY_BINDIR:-$HOME/.local/bin}/pvox-reply-media-muted"
+    # PVOX_REPLY_MUTE_FORCE=1 asks for note-only delivery without touching the
+    # phone: the probe cannot be exercised otherwise on a device that is not
+    # muted, and a meeting or a sleeping house is a real reason to want it.
+    if [ -n "${PVOX_REPLY_MUTE_FORCE:-}" ]; then
+        MUTED=1
+        printf "%s voice=%s host=%s MUTED forced note-only\n" "$(date "+%F %T")" "$VOICE" "$PLAY_HOST" >> "$LOG" 2>/dev/null || true
+    elif [ -x "$PROBE" ] && [ -z "${PVOX_REPLY_NO_MUTE_PROBE:-}" ]; then
+        if "$PROBE" "$PLAY_HOST" 2>/dev/null | grep -qx muted; then
+            MUTED=1
+            printf "%s voice=%s host=%s MUTED media-volume=0 -> telegram note\n" "$(date "+%F %T")" "$VOICE" "$PLAY_HOST" >> "$LOG" 2>/dev/null || true
+        fi
+    fi
+
     SPEC="$("$PVOX" voicespec "$VOICE" 2>/dev/null || true)"
-    if [ -n "$SPEC" ] && [ -z "${PVOX_REPLY_NO_ONDEVICE:-}" ]; then
+    if [ "$MUTED" = "0" ] && [ -n "$SPEC" ] && [ -z "${PVOX_REPLY_NO_ONDEVICE:-}" ]; then
         read -r ENGINE KV KS <<EOF2
 $(printf "%s" "$SPEC" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d[\"engine\"], d[\"voice\"], d[\"speed\"])" 2>/dev/null)
 EOF2
@@ -181,16 +207,33 @@ EOF2
         printf "%s voice=%s chars=%s RENDER-FAIL\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" >> "$LOG" 2>/dev/null || true
         exit 0
     fi
-    for H in "$PLAY_HOST" "$FALLBACK_HOST"; do
-        if ssh $SSHOPTS "$H" "if [ -n \"$HUD_AGENT\" ] && command -v pvox-phone-play >/dev/null 2>&1; then pvox-phone-play \"$HUD_AGENT\" \"$PLAYBACK_ID\"; else
+    DELIVERED=""
+    if [ "$MUTED" = "1" ]; then
+        : # muted: nothing to play anywhere; the note carries the reply
+    else
+        for H in "$PLAY_HOST" "$FALLBACK_HOST"; do
+            if ssh $SSHOPTS "$H" "if [ -n \"$HUD_AGENT\" ] && command -v pvox-phone-play >/dev/null 2>&1; then pvox-phone-play \"$HUD_AGENT\" \"$PLAYBACK_ID\"; else
 export PVOX_SPEAKER_ID=\"$HUD_AGENT\" PVOX_PLAYBACK_ID=\"$PLAYBACK_ID\"
 $REMOTE_PLAY
 fi" < "$W" >/dev/null 2>&1; then
-            printf "%s voice=%s chars=%s bytes=%s delivered=%s\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" "$(wc -c < "$W")" "$H" >> "$LOG" 2>/dev/null || true
-            exit 0
+                DELIVERED="$H"
+                printf "%s voice=%s chars=%s bytes=%s delivered=%s\n" "$(date "+%F %T")" "$VOICE" "${#TEXT}" "$(wc -c < "$W")" "$H" >> "$LOG" 2>/dev/null || true
+                break
+            fi
+            printf "%s voice=%s host=%s DELIVER-FAIL\n" "$(date "+%F %T")" "$VOICE" "$H" >> "$LOG" 2>/dev/null || true
+        done
+    fi
+
+    # Append the note whenever he could not hear it on the phone: muted,
+    # delivered to the fallback host, or nowhere at all. An audible phone
+    # delivery is the only case that goes without one.
+    if [ -n "${PVOX_REPLY_TG_FORCE:-}" ] || [ "$MUTED" = "1" ] || [ -z "$DELIVERED" ] || [ "$DELIVERED" != "$PLAY_HOST" ]; then
+        NOTE="${PVOX_REPLY_BINDIR:-$HOME/.local/bin}/pvox-reply-telegram-note"
+        if [ -x "$NOTE" ]; then
+            printf "%s voice=%s chars=%s " "$(date "+%F %T")" "$VOICE" "${#TEXT}" >> "$LOG" 2>/dev/null || true
+            "$NOTE" "$W" "$VOICE" >> "$LOG" 2>&1 || true
         fi
-        printf "%s voice=%s host=%s DELIVER-FAIL\n" "$(date "+%F %T")" "$VOICE" "$H" >> "$LOG" 2>/dev/null || true
-    done
+    fi
 ' _ "$VOICE" "$TEXT" "$PLAY_HOST" "$FALLBACK_HOST" "$REMOTE_PLAY" "$HUD_AGENT" >/dev/null 2>&1 &
 
 exit 0
