@@ -84,7 +84,7 @@ is not uid 2012, and a relay directory that is not root-owned and read-only, the
 every start recreates the directory; running it again changes nothing and corrects a loosened mode). OpenRC drops to `fca-egress` itself
 (`command_user`, via start-stop-daemon); the relay is never run as root. `start_post` fails the start if `relay.sock` does not appear within 10 s, so a
 start is never half-alive. The relay needs no tailnet: it listens on a Unix socket only and REFUSES tailnet addresses as destinations; the unit depends on
-`net`/`dns` and a network fault shows per connection as `dns`/`connect`. `stop_post` removes the socket only, never the code or the directory.
+`net`/`dns` and a network fault shows per connection as `dns`/`connect`. The unit defines its own `stop`: it signals by pidfile and the `fca-egress` uid ONLY and never passes `--exec`, because the default OpenRC stop does, `command` is `/usr/bin/python3`, and with no pidfile `start-stop-daemon` then signals every OpenRC-started python3 process on the host. `stop_post` removes the socket only, never the code or the directory.
 `openrc/honey-fca-egress-install` places ONLY the relay and the unit, and only when the relay's sha256 equals the `--expect-relay-sha256` you
 pass (the hash recorded in the review). It starts nothing. `enable` links `/etc/rc2.d/S04honey-fca-egress`: this host boots sysvinit, so the
 symlink is the evidence of boot durability, not `rc-update`. Order, each a separate human-released step: the `useradd` above, `install`,

@@ -327,6 +327,80 @@ class RealOpenRC(unittest.TestCase):
         self.assertEqual(self.dir_state(), (['group::---', 'mask::--x', 'other::---', 'user::rwx', 'user:agent-deepseek:--x'], 'fca-egress:fca-egress'))
 
 
+STOP_HARNESS = r'''
+ebegin() { :; }
+eend() { return "${1:-0}"; }
+eerror() { echo "E: $*" >&2; }
+. "$BODY"
+pidfile="$T_PID"
+stop
+echo "rc=$?"
+'''
+
+
+class StopSafety(unittest.TestCase):
+    """The unit's own stop(). OpenRC's default stop passes --exec /usr/bin/python3, which with no pidfile SIGTERMs every OpenRC-started python3
+    process on the host (reproduced 2026-11-12). These tests run stop() in a stubbed shell: no real start-stop-daemon, no real signal."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fca-stop-')
+        self.log = os.path.join(self.tmp, 'calls.log')
+        self.pid = os.path.join(self.tmp, 'unit.pid')
+        open(self.log, 'w').close()
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.makedirs(self.bin)
+        stub = os.path.join(self.bin, 'start-stop-daemon')   # a hyphenated name cannot be a shell function in dash: a stub on PATH
+        with open(stub, 'w') as f:
+            f.write('#!/bin/sh\necho "ssd $*" >> "$LOG"\n')
+        os.chmod(stub, 0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_stop(self):
+        r = sh(STOP_HARNESS, env=dict(os.environ, LOG=self.log, BODY=BODY, T_PID=self.pid, PATH=self.bin + ':' + os.environ['PATH']))
+        self.assertIn('rc=0', r.stdout, r.stdout + r.stderr)
+        return read(self.log).splitlines()
+
+    def test_the_unit_never_passes_exec_to_start_stop_daemon(self):
+        code = '\n'.join(l for l in read(BODY).splitlines() if not l.lstrip().startswith('#'))
+        self.assertNotIn('--exec', code)
+        self.assertRegex(code, r'(?m)^stop\(\) \{')
+
+    def test_no_pidfile_means_nothing_is_signalled(self):
+        self.assertEqual(self.run_stop(), [])
+
+    def test_an_empty_pidfile_means_nothing_is_signalled(self):
+        open(self.pid, 'w').close()
+        self.assertEqual(self.run_stop(), [])
+
+    def test_a_pidfile_of_a_dead_process_is_cleared_and_nothing_is_signalled(self):
+        p = subprocess.Popen(['true'])
+        p.wait()
+        with open(self.pid, 'w') as f:
+            f.write('%d\n' % p.pid)
+        self.assertEqual(self.run_stop(), [])
+        self.assertFalse(os.path.exists(self.pid))
+
+    def test_a_live_pid_is_stopped_by_pidfile_and_user_only(self):
+        p = subprocess.Popen(['sleep', '30'])
+        try:
+            with open(self.pid, 'w') as f:
+                f.write('%d\n' % p.pid)
+            calls = self.run_stop()
+        finally:
+            p.kill()
+            p.wait()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0], 'ssd --stop --quiet --retry TERM/5/KILL/3 --user fca-egress --pidfile %s' % self.pid)
+
+    def test_a_failed_start_stops_through_the_same_safe_stop(self):
+        text = '\n'.join(l for l in read(BODY).splitlines() if not l.lstrip().startswith('#'))
+        post = text[text.index('start_post()'):text.index('stop() {')]
+        self.assertRegex(post, r'(?m)^    stop >/dev/null 2>&1$')
+        self.assertNotIn('start-stop-daemon', post)
+
+
 class RehearsalGate(unittest.TestCase):
     """The gate in front of the RealOpenRC tests, tested as pure logic: none of these runs openrc-run."""
     VAR = {DISPOSABLE_VAR: DISPOSABLE_VALUE}
