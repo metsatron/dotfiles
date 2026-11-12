@@ -1,23 +1,31 @@
 #!/usr/bin/env bash
 # Mutation proof for the relay's OpenRC unit and installer: each sabotaged copy MUST fail the suite, by a NAMED unittest failure.
-# A pass, a stall or a skipped run is an error, not a kill. Disposable space only; the candidate is not modified.
+# A pass, a stall, a skip or a REFUSAL is never a kill. A mutant only a RealOpenRC test can kill is reported UNPROVEN (exit 3) unless those tests
+# ran on a declared-disposable OpenRC host; it is never counted as killed. Exit 0 = every mutant killed, 1 = a survivor or an error, 3 = unproven only.
+# Disposable space only; the candidate is not modified. Do NOT set HONEY_DISPOSABLE_OPENRC_HOST on a host that carries services.
 set -uo pipefail
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 LANE="$(dirname "$HERE")"
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-fail=0
+fail=0; killed=0; unproven=0
 mutate() { # name file sed-expression
   local name="$1" file="$2" expr="$3" d="$TMP/$1" out rc names
   mkdir -p "$d"; cp -r "$LANE/egress" "$LANE/openrc" "$d"/
   sed -i "$expr" "$d/openrc/$file"
   if cmp -s "$HERE/$file" "$d/openrc/$file"; then echo "MUTATION NOT APPLIED: $name"; fail=1; return; fi
   out="$(timeout 300 python3 "$d/openrc/test_honey_fca_egress.py" 2>&1)"; rc=$?
-  if [ "$rc" = 0 ]; then echo "SURVIVED (tests too weak, or the run skipped): $name [$file]"; fail=1
-  elif [ "$rc" = 124 ]; then echo "TIMEOUT (infrastructure, NOT a kill): $name [$file]"; fail=1
-  elif printf '%s\n' "$out" | grep -qE '^FAILED \('; then
-    names="$(printf '%s\n' "$out" | grep -E '^(FAIL|ERROR):' | sed 's/^[A-Z]*: //; s/ (.*//' | head -3 | tr '\n' ' ')"
-    echo "killed: $name [$file] by: $names"
-  else echo "INFRASTRUCTURE ERROR (not a kill): $name [$file]"; printf '%s\n' "$out" | tail -8 | sed 's/^/    | /'; fail=1; fi
+  if [ "$rc" = 124 ]; then echo "TIMEOUT (infrastructure, NOT a kill): $name [$file]"; fail=1; return; fi
+  if ! printf '%s\n' "$out" | grep -qE '^(FAILED \(|OK)'; then
+    echo "INFRASTRUCTURE ERROR (not a kill): $name [$file]"; printf '%s\n' "$out" | tail -8 | sed 's/^/    | /'; fail=1; return; fi
+  # Evidence of a kill = a named failure OTHER than the RealOpenRC tests when those REFUSED (they refuse on any host that has not been declared
+  # disposable, and a refusal fails every mutant alike, so it proves nothing). A skip proves nothing either.
+  names="$(printf '%s\n' "$out" | grep -E '^(FAIL|ERROR):' )"
+  if printf '%s\n' "$out" | grep -q 'REFUSED:'; then names="$(printf '%s\n' "$names" | grep -v 'RealOpenRC')"; fi
+  names="$(printf '%s\n' "$names" | sed 's/^[A-Z]*: //; s/ (.*//' | sed '/^$/d' | head -3 | tr '\n' ' ')"
+  if [ -n "$names" ]; then killed=$((killed+1)); echo "killed: $name [$file] by: $names"
+  elif [ "$rc" != 0 ] || printf '%s\n' "$out" | grep -qE 'skipped=|REFUSED:'; then
+    unproven=$((unproven+1)); echo "UNPROVEN (only a RealOpenRC test could kill it, and those did not run here; needs a disposable OpenRC host): $name [$file]"
+  else echo "SURVIVED (tests too weak): $name [$file]"; fail=1; fi
 }
 B=honey-fca-egress I=honey-fca-egress-install
 mutate runs-as-root              $B "s/^command_user=.*/command_user=\"root:root\"/"
@@ -34,4 +42,13 @@ mutate hash-optional             $I "s/^        \"\") problems+=(.*/        \"\"
 mutate installer-starts-service  $I "s/^    echo \"not started and not enabled.*/&\n    run rc-service honey-fca-egress start/"
 mutate enable-links-wrong-unit   $I "s|ln -sfn ../init.d/honey-fca-egress|ln -sfn ../init.d/something-else|"
 mutate no-backup-of-drifted-file $I "s/\[ -e \"\$d\" \] \&\& run cp -p \"\$d\" \"\$d.bak-\$ts\"/true/"
-exit $fail
+mutate start-post-never-fails        $B "/start-stop-daemon --stop/{n;s/return 1/return 0/}"
+mutate start-post-leaves-relay-up    $B "/start-stop-daemon --stop/d"
+mutate start-post-skips-socket-wait  $B "s/\[ -S \"\${run_dir}\/relay.sock\" \] \&\& return 0/true \&\& return 0/"
+mutate stop-post-removes-run-dir     $B "s|rm -f \"\${run_dir}/relay.sock\"|rm -rf \"\${run_dir}\"|"
+mutate no-acl-for-worker             $B "/setfacl -m/d"
+mutate log-world-readable            $B "s/checkpath -f -m 0640/checkpath -f -m 0644/"
+echo "mutants: $killed killed, $unproven UNPROVEN, survivors/errors counted in the exit status"
+[ "$fail" = 0 ] || exit 1
+[ "$unproven" = 0 ] || exit 3
+exit 0
