@@ -14,6 +14,8 @@ The engine only checks the *shape*. This tool owns the *meaning*: every verb val
 | =mail-inbox= | — | =mailcortex inbox bunta@kikin-kushi.helm= (last 30 rows) |
 | =mail-new= | — | every =new= row of Bunta's inbox (not a tail, so an overnight backlog is complete) |
 | =mail-read= | =<file-id>= | =mailcortex read= of one of Bunta's own messages |
+| =mail-read= | =<file-id> attachments= | lists the message's attachments (number, name, type, size); changes nothing, marks nothing seen |
+| =mail-read= | =<file-id> attachment <n>= | saves attachment n (at most 4 MiB, name sanitised, mode 0600) as =/tmp/bunta/in/<stamp>-<n>-<name>= and prints its path and sha256; =mailcortex read= prints the body only, so this is how a seat opens an attachment. Refuses cleanly when the message or attachment does not exist; never executes anything; marks nothing seen |
 | =mail-receipt= | =<message-id> <completed\|deferred>= | =mailcortex receipt bunta <id> handling_completed= or =handling_deferred=; the id is given without angle brackets |
 | =mail-send= | =<to> <body-file> [in-reply-to]= | sends as =bunta@kikin.helm=; the body file must be a regular =/tmp/bunta/bunta-*.md= whose first line is =Subject: …=; the in-reply-to id is given without angle brackets |
 | =status= | — | live/dead for each =/tmp/bunta/*.pid=, the newest 20 entries of =/tmp/bunta=, running codex/vibe processes |
@@ -46,6 +48,9 @@ MAIL_ID = re.compile(r'^[0-9]+\.[0-9]+_[0-9a-f]+\.[A-Za-z0-9-]+(?::2,[A-Z]*)?$')
 MSG_ID = re.compile(r'^[A-Za-z0-9._-]+@[A-Za-z0-9._-]+$')
 ADDRESS = re.compile(r'^[A-Za-z0-9_.+-]+@[A-Za-z0-9_.-]+\.helm$')
 GIT_ARG = re.compile(r'^[A-Za-z0-9._/~^@:-]+$')
+MAILDIR = HOME / 'Mail/consorts/bunta'  # this seat's own Maildir; nothing else is ever opened
+MAX_ATTACHMENT = 4 * 1024 * 1024
+ATTACHMENT_NAME = re.compile(r'[^A-Za-z0-9._-]')
 GIT_OPTIONS = {'--oneline', '--stat', '--short', '--porcelain', '--name-only', '--name-status', '-n', '--graph',
                '--decorate', '--cached', '--format=%h %ad %an %s', '--date=short', '--date=iso', '-a', '-v', '--show-current'}
 REPOS = {'helmcortex': HOME / 'HelmCortex', 'dotcortex': HOME / 'DotCortex'}
@@ -91,10 +96,65 @@ def verb_mail_inbox(args):
     return result.returncode
 
 
+def message_attachments(file_id):
+    """The attachments of one of Bunta's own messages, by exact Maildir filename. Opens nothing outside MAILDIR."""
+    import email.policy
+    from email.parser import BytesParser
+    path = next((MAILDIR / state / file_id for state in ('new', 'cur') if (MAILDIR / state / file_id).is_file()
+                 and not (MAILDIR / state / file_id).is_symlink()), None)
+    if path is None:
+        raise Refused('no such message')
+    with path.open('rb') as handle:
+        message = BytesParser(policy=email.policy.default).parse(handle)
+    return [part for part in message.iter_attachments()]
+
+
+def attachment_name(part, number):
+    raw = (part.get_filename() or '').replace('\\', '/').rsplit('/', 1)[-1]
+    name = ATTACHMENT_NAME.sub('_', raw).lstrip('.')[:80]
+    return name or f'attachment-{number}'
+
+
 def verb_mail_read(args):
-    if len(args) != 1 or not MAIL_ID.fullmatch(args[0]):
-        raise Refused('mail-read <file-id>')
-    return run(['mailcortex', 'read', SEAT_INBOX, args[0]])
+    if not args or not MAIL_ID.fullmatch(args[0]):
+        raise Refused('mail-read <file-id> [attachments | attachment <n>]')
+    if len(args) == 1:
+        return run(['mailcortex', 'read', SEAT_INBOX, args[0]])
+    if args[1] == 'attachments' and len(args) == 2:
+        parts = message_attachments(args[0])
+        if not parts:
+            print('(no attachments)')
+        for number, part in enumerate(parts, 1):
+            size = len(part.get_payload(decode=True) or b'')  # the bytes `attachment <n>` would save, so the two always agree
+            print(f'{number}\t{attachment_name(part, number)}\t{part.get_content_type()}\t{size}')
+        return 0
+    if args[1] == 'attachment' and len(args) == 3 and re.fullmatch(r'[1-9][0-9]?', args[2]):
+        number = int(args[2])
+        parts = message_attachments(args[0])
+        if number > len(parts):
+            raise Refused(f'no attachment {number} (the message has {len(parts)})')
+        part = parts[number - 1]
+        data = part.get_payload(decode=True)
+        if data is None:
+            raise Refused('attachment has no decodable body')
+        if len(data) > MAX_ATTACHMENT:
+            raise Refused(f'attachment is {len(data)} bytes, over the {MAX_ATTACHMENT} limit')
+        folder = SCRATCH / 'in'
+        if folder.is_symlink():
+            raise Refused('scratch in/ is a link')
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+        target = folder / f"{args[0].split(':', 1)[0]}-{number}-{attachment_name(part, number)}"
+        if target.is_symlink() or target.is_dir():
+            raise Refused('target is a link or directory')
+        scratch = target.with_name(target.name + '.part')
+        descriptor = os.open(scratch, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(data)
+        os.replace(scratch, target)
+        import hashlib
+        print(f'{target}\t{len(data)} bytes\tsha256 {hashlib.sha256(data).hexdigest()}')
+        return 0
+    raise Refused('mail-read <file-id> [attachments | attachment <n>]')
 
 
 def verb_mail_new(args):
@@ -329,6 +389,170 @@ class BuntaOpsTests(unittest.TestCase):
         self.assertIn('unknown verb', (self.dir / 'audit.jsonl').read_text())
 
 
+class AttachmentTests(unittest.TestCase):
+    """mail-read <file-id> attachments | attachment <n>: a seat's mail tool prints bodies only, so this opens attachments."""
+    FID = '1794509312.23826_5d2c4c0669d8474db906981748571734.kikin-kushi:2,S'
+
+    def setUp(self):
+        import email.message
+        self.dir = Path(tempfile.mkdtemp(prefix='bunta-ops-att-'))
+        ops.SCRATCH = self.dir / 'scratch'; ops.SCRATCH.mkdir()
+        ops.AUDIT = self.dir / 'audit.jsonl'
+        ops.MAILDIR = self.dir / 'Maildir'
+        ops.MAX_ATTACHMENT = 4 * 1024 * 1024
+        for state in ('new', 'cur', 'tmp'): (ops.MAILDIR / state).mkdir(parents=True)
+        self.calls = []
+        ops.run = lambda argv, timeout=60: self.calls.append(argv) or 0
+        msg = email.message.EmailMessage(); msg['From'] = 'honey-badger@honey.helm'; msg['To'] = 'bunta@honey.helm'; msg['Subject'] = 'pack'
+        msg.set_content('body text')
+        msg.add_attachment('first attachment\n' * 3, subtype='plain', filename='00-READ-FIRST.md')
+        msg.add_attachment(b'\x00\x01binary', maintype='application', subtype='octet-stream', filename='../../etc/passwd')
+        msg.add_attachment('no name', subtype='plain')
+        (ops.MAILDIR / 'cur' / self.FID).write_bytes(bytes(msg))
+        plain = email.message.EmailMessage(); plain['Subject'] = 'plain'; plain.set_content('no attachments here')
+        self.PLAIN = '1794509999.1_aa.kikin-kushi:2,S'
+        (ops.MAILDIR / 'new' / self.PLAIN).write_bytes(bytes(plain))
+
+    def run_(self, *args):
+        import io, unittest.mock as mock
+        with mock.patch('sys.stdout', new=io.StringIO()) as out, mock.patch('sys.stderr', new=io.StringIO()) as err:
+            code = ops.main(['bunta-ops', 'mail-read', *args])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_listing_shows_number_sanitised_name_type_and_size_and_writes_nothing(self):
+        code, out, _ = self.run_(self.FID, 'attachments')
+        rows = [line.split('\t') for line in out.splitlines()]
+        self.assertEqual(code, 0); self.assertEqual([r[0] for r in rows], ['1', '2', '3'])
+        self.assertEqual(rows[0][1:], ['00-READ-FIRST.md', 'text/plain', str(len('first attachment\n' * 3))])
+        self.assertEqual(rows[1][1], 'passwd'); self.assertEqual(rows[1][2], 'application/octet-stream'); self.assertEqual(rows[2][1], 'attachment-3')
+        self.assertFalse((ops.SCRATCH / 'in').exists())
+        self.assertEqual(self.calls, [])
+
+    def test_extract_saves_the_bytes_privately_under_scratch_in_and_prints_path_and_sha256(self):
+        import hashlib
+        code, out, _ = self.run_(self.FID, 'attachment', '1')
+        path, size, digest = out.strip().split('\t')
+        saved = Path(path)
+        self.assertEqual(code, 0); self.assertEqual(saved.parent, ops.SCRATCH / 'in')
+        self.assertEqual(saved.read_bytes(), ('first attachment\n' * 3).encode())
+        self.assertEqual(saved.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(digest, 'sha256 ' + hashlib.sha256(saved.read_bytes()).hexdigest())
+        self.assertEqual(saved.name, '1794509312.23826_5d2c4c0669d8474db906981748571734.kikin-kushi-1-00-READ-FIRST.md')
+        self.assertEqual(list((ops.SCRATCH / 'in').glob('*.part')), [])
+
+    def test_the_listed_size_is_the_size_of_the_saved_file(self):
+        listed = [line.split('\t') for line in self.run_(self.FID, 'attachments')[1].splitlines()]
+        for number, row in enumerate(listed, 1):
+            saved = Path(self.run_(self.FID, 'attachment', str(number))[1].split('\t')[0])
+            self.assertEqual(int(row[3]), saved.stat().st_size, row)
+
+    def test_a_hostile_filename_cannot_leave_the_in_directory(self):
+        code, out, _ = self.run_(self.FID, 'attachment', '2')
+        saved = Path(out.split('\t')[0]); self.assertEqual(code, 0)
+        self.assertEqual(saved.parent, ops.SCRATCH / 'in'); self.assertTrue(saved.name.endswith('-2-passwd'))
+        self.assertEqual(saved.read_bytes(), b'\x00\x01binary')
+
+    def test_odd_characters_in_a_filename_are_replaced_and_a_leading_dot_dropped(self):
+        import email.message
+        msg = email.message.EmailMessage(); msg['Subject'] = 'odd'; msg.set_content('x')
+        msg.add_attachment('t', subtype='plain', filename='.a b;c$(d).txt')
+        name = '1794510001.3_cc.kikin-kushi'
+        (ops.MAILDIR / 'new' / name).write_bytes(bytes(msg))
+        row = self.run_(name, 'attachments')[1].split('\t')
+        self.assertEqual(row[1], 'a_b_c__d_.txt')
+
+    def test_a_missing_attachment_or_message_is_a_clean_refusal_not_an_empty_file(self):
+        for args in ((self.FID, 'attachment', '4'), (self.PLAIN, 'attachment', '1'), ('1.1_zz.kikin-kushi', 'attachments')):
+            with self.subTest(args=args):
+                code, _, err = self.run_(*args)
+                self.assertEqual(code, 2); self.assertIn('refused', err)
+        self.assertFalse((ops.SCRATCH / 'in').exists() and any((ops.SCRATCH / 'in').iterdir()))
+
+    def test_a_message_without_attachments_lists_cleanly(self):
+        code, out, _ = self.run_(self.PLAIN, 'attachments'); self.assertEqual((code, out.strip()), (0, '(no attachments)'))
+
+    def test_bad_shapes_are_refused(self):
+        for args in ((self.FID, 'attachment'), (self.FID, 'attachment', '0'), (self.FID, 'attachment', '100'), (self.FID, 'attachment', '1', 'x'),
+                     (self.FID, 'attachment', '-1'), (self.FID, 'attachments', 'x'), (self.FID, 'everything'), ('../' + self.FID, 'attachments')):
+            with self.subTest(args=args):
+                self.assertEqual(self.run_(*args)[0], 2)
+
+    def test_an_oversize_attachment_is_refused(self):
+        ops.MAX_ATTACHMENT = 5
+        code, _, err = self.run_(self.FID, 'attachment', '1'); self.assertEqual(code, 2); self.assertIn('limit', err)
+        self.assertFalse(list((ops.SCRATCH / 'in').glob('*')) if (ops.SCRATCH / 'in').exists() else False)
+
+    def test_a_planted_link_at_the_target_is_refused(self):
+        (ops.SCRATCH / 'in').mkdir()
+        (ops.SCRATCH / 'in' / (self.FID.split(':')[0] + '-1-00-READ-FIRST.md')).symlink_to('/etc/hostname')
+        self.assertEqual(self.run_(self.FID, 'attachment', '1')[0], 2)
+        self.assertEqual(Path('/etc/hostname').read_text(), Path('/etc/hostname').read_text())
+
+    def test_it_never_runs_mailcortex_and_never_moves_or_marks_the_message(self):
+        before = sorted(p.name for p in ops.MAILDIR.rglob('*'))
+        self.run_(self.FID, 'attachments'); self.run_(self.PLAIN, 'attachments'); self.run_(self.PLAIN, 'attachment', '1'); self.run_(self.FID, 'attachment', '1')
+        self.assertEqual(self.calls, []); self.assertEqual(sorted(p.name for p in ops.MAILDIR.rglob('*')), before)
+
+    def test_plain_mail_read_is_unchanged(self):
+        self.assertEqual(self.run_(self.FID)[0], 0)
+        self.assertEqual(self.calls, [['mailcortex', 'read', ops.SEAT_INBOX, self.FID]])
+
+    def test_every_argument_passes_the_approval_gate_shape_so_no_engine_change_is_needed(self):
+        gate = __import__('re').compile(r'^[A-Za-z0-9_][A-Za-z0-9_./:@=+,-]*$')  # OPS_ARG in agents-approval-engine-remote.org
+        for argument in (self.FID, 'attachments', 'attachment', '12'):
+            self.assertRegex(argument, gate)
+
+    def test_a_symlinked_maildir_message_is_not_opened(self):
+        (ops.MAILDIR / 'new' / '1794510000.2_bb.kikin-kushi').symlink_to(ops.MAILDIR / 'cur' / self.FID)
+        self.assertEqual(self.run_('1794510000.2_bb.kikin-kushi', 'attachments')[0], 2)
+
+
 if __name__ == '__main__':
     unittest.main()
+#+END_SRC
+
+** Mail attachments (=mail-read <file-id> attachments= and =attachment <n>=)
+
+=mailcortex read= prints a message body only, so a seat whose only mail tool is =bunta-ops= could not open an attachment (2026-11-13: Bunta could not read the five files of a decision pack). The two forms above fix that without a new verb, so the approval engine's =OPS_VERBS= is unchanged, and every argument is a plain word the gate's =OPS_ARG= shape accepts (no leading =-=; a test pins that). The listing opens nothing but the seat's own Maildir (=~/Mail/consorts/bunta=, exact filename, never a link) and writes nothing; =attachment <n>= saves that one part under =/tmp/bunta/in/= with mode 0600, a sanitised name (path parts dropped, anything outside =A-Za-z0-9._-= replaced, no leading dot), at most 4 MiB, refusing a planted link at the target, and prints its path and sha256. It never runs =mailcortex=, never marks the message seen, and a message or attachment that does not exist is a clean refusal, not an empty file. Plain =mail-read <file-id>= is unchanged. The mutation script sabotages the tool 13 ways; each must fail a named test.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/tests/mutation-check-bunta-ops-attach.sh :shebang "#!/usr/bin/env bash" :comments no :tangle-mode (identity #o755)
+# Mutation proof for bunta-ops mail-read attachments (generated by agents-bunta-ops.org): each sabotaged copy of the tool MUST fail test-bunta-ops.py by a NAMED failure.
+set -uo pipefail
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+TOOL="$HERE/../../../bin/bunta-ops"
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+fail=0; killed=0
+mutate() {
+  local name="$1" expr="$2" d="$TMP/$1"
+  mkdir -p "$d/bin" "$d/share/dotcortex/tests"; cp "$TOOL" "$d/bin/bunta-ops"; sed -i "$expr" "$d/bin/bunta-ops"
+  cp "$HERE/test-bunta-ops.py" "$d/share/dotcortex/tests/"
+  if cmp -s "$TOOL" "$d/bin/bunta-ops"; then echo "MUTATION NOT APPLIED: $name"; fail=1; return; fi
+  mkdir -p "$d/x/y/z"; ln -s "$d/bin" "$d/x/bin" 2>/dev/null
+  out="$(python3 - "$d" <<'PY' 2>&1
+import sys, unittest, importlib.util, pathlib
+d = pathlib.Path(sys.argv[1]); src = (d / 'share/dotcortex/tests/test-bunta-ops.py').read_text().replace("Path(__file__).resolve().parents[3] / 'bin/bunta-ops'", "Path(%r)" % str(d / 'bin/bunta-ops'))
+ns = {'__name__': 't', '__file__': str(d / 'share/dotcortex/tests/t.py')}; exec(compile(src.split("if __name__")[0], 't', 'exec'), ns)
+suite = unittest.defaultTestLoader.loadTestsFromTestCase(ns['AttachmentTests']); suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(ns['BuntaOpsTests']))
+r = unittest.TextTestRunner(stream=open('/dev/null', 'w')).run(suite)
+print('FAILED' if (r.failures or r.errors) else 'OK'); [print('FAIL:', str(t[0]).split()[0]) for t in r.failures + r.errors]
+PY
+)"
+  names="$(printf '%s\n' "$out" | grep '^FAIL:' | head -3 | sed 's/FAIL: //' | tr '\n' ' ')"
+  if [ -n "$names" ]; then killed=$((killed+1)); echo "killed: $name by: $names"; else echo "SURVIVED: $name"; fail=1; fi
+}
+mutate no-name-sanitising      "s/    name = ATTACHMENT_NAME.sub('_', raw).lstrip('.')\[:80\]/    name = raw/"
+mutate size-cap-removed        "s/        if len(data) > MAX_ATTACHMENT:/        if False:/"
+mutate file-mode-world         "s/os.O_NOFOLLOW, 0o600)/os.O_NOFOLLOW, 0o644)/"
+mutate index-off-by-one        "s/        part = parts\[number - 1\]/        part = parts[number]/"
+mutate missing-part-not-refused "s/        if number > len(parts):/        if False:/"
+mutate link-target-allowed     "s/        if target.is_symlink() or target.is_dir():/        if False:/"
+mutate message-link-followed   "s/                 and not (MAILDIR \/ state \/ file_id).is_symlink()), None)/                 ), None)/"
+mutate default-read-broken     "s/    if len(args) == 1:/    if len(args) == 99:/"
+mutate runs-mailcortex         "s/        parts = message_attachments(args\[0\])\n        if not parts:/&/;s/            print('(no attachments)')/            run(['mailcortex', 'read', SEAT_INBOX, args[0]]); print('(no attachments)')/"
+mutate any-index-shape         "s/re.fullmatch(r'\[1-9\]\[0-9\]?', args\[2\])/args[2].lstrip('-').isdigit()/"
+mutate listing-size-wrong      "s/            size = len(part.get_payload(decode=True) or b'')/            size = 0/"
+mutate saves-outside-in        "s|        folder = SCRATCH / 'in'|        folder = SCRATCH|"
+mutate shape-refusal-dropped   "s/    raise Refused('mail-read <file-id> \[attachments | attachment <n>\]')\$/    return 0/"
+echo "mutants: $killed killed"
+[ "$fail" = 0 ] || exit 1
 #+END_SRC
