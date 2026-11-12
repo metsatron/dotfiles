@@ -75,8 +75,17 @@ second connection waits for the lock for at most the connect deadline (5 s) and 
     install -d -o fca-egress -g fca-egress -m 0700 /run/fca-dsh-egress
     setfacl -m u:2012:--x /run/fca-dsh-egress                                               # traverse only
     # the relay itself creates relay.sock (umask 0177) and runs: setfacl -m u:2012:rw- relay.sock   (u:2012 only)
-OpenRC: `command=/usr/bin/python3`, `command_args="-I /opt/honey-fca-dsh/egress/fca_egress_relay.py"`, `command_user=fca-egress:fca-egress`,
-`start_pre` does the `checkpath`/`setfacl` above. The relay refuses to start as root, uid 1000/2000/2012, or with ANY supplementary group.
+The relay refuses to start as root, uid 1000/2000/2012, or with ANY supplementary group.
+
+## Service unit (`../openrc/`; human-released, not installed by this candidate)
+`openrc/honey-fca-egress` is the OpenRC body: `command=/usr/bin/python3`, `command_args="-I /opt/honey-fca-dsh/egress/fca_egress_relay.py"`,
+`command_user=fca-egress:fca-egress`, no other argument. `start_pre` refuses a missing or uid 0 identity, any supplementary group, a worker that
+is not uid 2012, and a relay directory that is not root-owned and read-only, then runs the `checkpath`/`setfacl` above (`/run` is tmpfs, so
+every start recreates the directory). `stop_post` removes the socket.
+`openrc/honey-fca-egress-install` places ONLY the relay and the unit, and only when the relay's sha256 equals the `--expect-relay-sha256` you
+pass (the hash recorded in the review). It starts nothing. `enable` links `/etc/rc2.d/S04honey-fca-egress`: this host boots sysvinit, so the
+symlink is the evidence of boot durability, not `rc-update`. Order, each a separate human-released step: the `useradd` above, `install`,
+`rc-service honey-fca-egress start`, `enable`.
 
 ## Sandbox fragment for the later model-enabled overlay (offline probe/dsh-config launcher modes are unchanged)
 Add to the bwrap argv only for that separately reviewed mode:
