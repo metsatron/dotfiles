@@ -464,6 +464,23 @@ class StopProofGate(unittest.TestCase):
         self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
         self.assertNotIn('GATE:', p.stdout)
 
+    def test_guest_mode_refuses_when_it_is_not_pid_1_and_touches_nothing(self):
+        before = os.stat('/etc/rc.conf').st_mtime_ns if os.path.exists('/etc/rc.conf') else None
+        p = subprocess.run(['bash', PROOF, '--in-guest', tempfile.gettempdir(), os.devnull], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr); self.assertIn('not pid 1', p.stdout); self.assertNotIn('GATE:', p.stdout)
+        self.assertEqual(os.stat('/etc/rc.conf').st_mtime_ns if os.path.exists('/etc/rc.conf') else None, before)
+
+    def test_guest_mode_writes_its_one_config_change_only_after_every_refusal(self):
+        text = rd(PROOF); guest = text[text.index("# GUEST mode: this script is the entrypoint") if "# GUEST mode" in text else text.index('GUEST mode: this script'):]
+        guest = guest[:guest.index('  fi\n')]
+        write = guest.index('rc_controller_cgroups')
+        for gate in ('not pid 1', 'pid 1 here is not this script', 'not a tmpfs', 'not empty', 'no /etc/os-release'):
+            self.assertLess(guest.index(gate), write, gate)
+
+    def test_guest_mode_mounts_nothing(self):
+        text = rd(PROOF); guest = text[text.index('GUEST mode: this script'):]; guest = guest[:guest.index('  fi\n')]
+        self.assertNotIn('mount ', '\n'.join(l for l in guest.splitlines() if not l.strip().startswith('#')))
+
     def test_the_gate_precedes_every_mount_and_every_start_in_the_source(self):
         text = rd(PROOF)
         inside = text[text.index('if [ "${1:-}" = --inside ]'):]

@@ -5619,6 +5619,23 @@ class StopProofGate(unittest.TestCase):
         self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
         self.assertNotIn('GATE:', p.stdout)
 
+    def test_guest_mode_refuses_when_it_is_not_pid_1_and_touches_nothing(self):
+        before = os.stat('/etc/rc.conf').st_mtime_ns if os.path.exists('/etc/rc.conf') else None
+        p = subprocess.run(['bash', PROOF, '--in-guest', tempfile.gettempdir(), os.devnull], capture_output=True, text=True, timeout=60)
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr); self.assertIn('not pid 1', p.stdout); self.assertNotIn('GATE:', p.stdout)
+        self.assertEqual(os.stat('/etc/rc.conf').st_mtime_ns if os.path.exists('/etc/rc.conf') else None, before)
+
+    def test_guest_mode_writes_its_one_config_change_only_after_every_refusal(self):
+        text = rd(PROOF); guest = text[text.index("# GUEST mode: this script is the entrypoint") if "# GUEST mode" in text else text.index('GUEST mode: this script'):]
+        guest = guest[:guest.index('  fi\n')]
+        write = guest.index('rc_controller_cgroups')
+        for gate in ('not pid 1', 'pid 1 here is not this script', 'not a tmpfs', 'not empty', 'no /etc/os-release'):
+            self.assertLess(guest.index(gate), write, gate)
+
+    def test_guest_mode_mounts_nothing(self):
+        text = rd(PROOF); guest = text[text.index('GUEST mode: this script'):]; guest = guest[:guest.index('  fi\n')]
+        self.assertNotIn('mount ', '\n'.join(l for l in guest.splitlines() if not l.strip().startswith('#')))
+
     def test_the_gate_precedes_every_mount_and_every_start_in_the_source(self):
         text = rd(PROOF)
         inside = text[text.index('if [ "${1:-}" = --inside ]'):]
@@ -5740,6 +5757,8 @@ exit 0
 # A CONTROL runs first: the same unit shape WITHOUT a stop() of its own. If the control does not reproduce the mass-kill the proof is vacuous and
 # the script exits 3, never 0.
 #
+# GUEST MODE (--in-guest WORK UNIT): the same proof as the entrypoint of a container started for it alone (docker run --tmpfs /run ... bash initd-stop-proof
+# --in-guest WORK UNIT). Nothing is mounted: the engine supplies the PID namespace and /run; the gate asserts pid 1 is this script and /run is an empty tmpfs.
 # Usage: initd-stop-proof [--unit PATH_TO_UNIT_WITH_stop()]   (default: ../honey-fca-dsh/openrc/honey-fca-egress, next to this script's lane)
 # Needs: passwordless sudo, unshare, /sbin/openrc-run. Without them it says SKIP and exits 4. Exit: 0 proven, 1 a check failed, 3 control vacuous,
 # 4 skipped, 5 the gate refused.
@@ -5748,20 +5767,33 @@ SELF="$(readlink -f "$0")"; HERE="$(dirname "$SELF")"
 UNIT="${HERE}/../honey-fca-dsh/openrc/honey-fca-egress"
 OPENRC=/sbin/openrc-run
 
-if [ "${1:-}" = --inside ]; then
+if [ "${1:-}" = --inside ] || [ "${1:-}" = --in-guest ]; then
   # ---------------------------------------------------------------- inside the namespaces
-  HOSTNS="$2"; WORK="$3"; UNIT="$4"
+  MODE="$1"
+  if [ "$MODE" = --inside ]; then HOSTNS="$2"; WORK="$3"; UNIT="$4"; else HOSTNS=""; WORK="$2"; UNIT="$3"; fi
   say() { printf '%s\n' "$*"; }
   refuse() { say "GATE REFUSED: $*"; exit 5; }
   # --- gate: all three conditions, before anything is started ---
-  [ "$(readlink /proc/self/ns/pid)" != "$HOSTNS" ] || refuse "this is the host PID namespace"
-  [ "$$" -lt 100 ] || refuse "pid $$ is not a fresh namespace's early pid"
-  tr '\0' ' ' < /proc/1/cmdline | grep -q -- '--inside' || refuse "pid 1 here is not this script: the PID namespace is not private"
-  mount -t tmpfs tmpfs /run || refuse "cannot mount a private /run"
-  [ "$(stat -f -c %T /run)" = tmpfs ] || refuse "/run is not a fresh tmpfs"
-  [ -z "$(ls -A /run)" ] || refuse "/run is not empty: it is not private"   # checked first: mount(8) itself writes /run/mount afterwards
-  mount -t tmpfs tmpfs /sys/fs/cgroup 2>/dev/null || refuse "cannot hide /sys/fs/cgroup"
-  [ -z "$(ls -A /sys/fs/cgroup)" ] || refuse "/sys/fs/cgroup still shows the host's cgroups"
+  if [ "$MODE" = --inside ]; then
+    [ "$(readlink /proc/self/ns/pid)" != "$HOSTNS" ] || refuse "this is the host PID namespace"
+    [ "$$" -lt 100 ] || refuse "pid $$ is not a fresh namespace's early pid"
+    tr '\0' ' ' < /proc/1/cmdline | grep -q -- '--inside' || refuse "pid 1 here is not this script: the PID namespace is not private"
+    mount -t tmpfs tmpfs /run || refuse "cannot mount a private /run"
+    [ "$(stat -f -c %T /run)" = tmpfs ] || refuse "/run is not a fresh tmpfs"
+    [ -z "$(ls -A /run)" ] || refuse "/run is not empty: it is not private"   # checked first: mount(8) itself writes /run/mount afterwards
+    mount -t tmpfs tmpfs /sys/fs/cgroup 2>/dev/null || refuse "cannot hide /sys/fs/cgroup"
+    [ -z "$(ls -A /sys/fs/cgroup)" ] || refuse "/sys/fs/cgroup still shows the host's cgroups"
+  else
+    # GUEST mode: this script is the entrypoint (pid 1) of a container or VM that was started for it alone, with a fresh tmpfs /run supplied by the
+    # engine (docker run --tmpfs /run). Nothing is mounted here: the engine already separated the three things the host mode has to build.
+    [ "$$" = 1 ] || refuse "not pid 1: --in-guest must be the guest's entrypoint, never run in a host or a shared namespace"
+    tr '\0' ' ' < /proc/1/cmdline | grep -q -- '--in-guest' || refuse "pid 1 here is not this script"
+    [ "$(stat -f -c %T /run)" = tmpfs ] || refuse "/run is not a tmpfs (start the guest with --tmpfs /run)"
+    [ -z "$(ls -A /run)" ] || refuse "/run is not empty: it is not private"
+    [ -r /etc/os-release ] || refuse "no /etc/os-release: not a distribution guest"
+    # OpenRC must not create cgroups in the guest's (read-only or shared) cgroup tree
+    mkdir -p /etc && { grep -q '^rc_controller_cgroups=' /etc/rc.conf 2>/dev/null && sed -i 's/^rc_controller_cgroups=.*/rc_controller_cgroups="NO"/' /etc/rc.conf || echo 'rc_controller_cgroups="NO"' >> /etc/rc.conf; }
+  fi
   nproc_seen="$(ls /proc | grep -c '^[0-9]\+$')"
   [ "$nproc_seen" -le 15 ] || refuse "$nproc_seen processes visible: not a private PID namespace"
   for p in /proc/[0-9]*; do
@@ -5770,8 +5802,11 @@ if [ "${1:-}" = --inside ]; then
       refuse "production-looking process visible: ${p#/proc/} $c";; esac
   done
   [ -z "$(ls /run/*.pid 2>/dev/null)" ] || refuse "a pidfile exists in /run"
-  say "GATE: own PID namespace ($nproc_seen processes, none production), fresh tmpfs /run (empty), /sys/fs/cgroup hidden"
+  if [ "$MODE" = --inside ]; then say "GATE: own PID namespace ($nproc_seen processes, none production), fresh tmpfs /run (empty), /sys/fs/cgroup hidden"
+  else say "GATE (guest): this script is pid 1, fresh tmpfs /run (empty), $nproc_seen processes, none production, openrc cgroups disabled in the guest"; fi
+  say "GUEST VERSIONS: $(. /etc/os-release; echo "$PRETTY_NAME") | $(openrc --version 2>&1 | head -1) | $(/lib/rc/sbin/start-stop-daemon --version 2>&1 | head -1) | $(/sbin/start-stop-daemon --version 2>&1 | head -1)"
   mkdir -p /run/openrc/{started,starting,stopping,inactive,hotplugged,failed,scheduled,exclusive,daemons,options} /run/lock
+  mkdir -p "$WORK"
   touch /run/openrc/softlevel   # OpenRC refuses to run a service on a system it did not boot; this /run is private, so the marker is too
 
   # --- the bystander: a python3 that LOGS every signal it is sent (and who sent it) instead of dying ---
@@ -5886,6 +5921,95 @@ pidfiles_after="$(ls -l --time-style=+%s /run/*.pid 2>/dev/null | awk '{print $6
 echo "HOST AFTER: openrc cgroups before=$cgbefore after=$cgafter; production pidfile listing $( [ "$pidfiles_before" = "$pidfiles_after" ] && echo unchanged || echo CHANGED)"
 [ "$cgbefore" = "$cgafter" ] && [ "$pidfiles_before" = "$pidfiles_after" ] || { echo "HOST CHANGED DURING THE PROOF: treat it as a failure"; [ "$rc" = 0 ] && rc=1; }
 exit "$rc"
+#+END_SRC
+
+** A disposable guest that matches Honey (W5)
+
+The namespace proof above runs on Honey itself with Honey's own binaries; what it lacks is a host that is disposable by construction. =devuan-guest-proof= builds one. It is a Virtual Habitat /sanctuary/-class guest (a container on the host kernel; =guests.org=, =sanctuary-distrobox.org=): Honey has docker, not podman or distrobox, so it uses docker, and installs nothing on Honey. No Devuan 6 / OpenRC guest is registered in =guests.org= today; this script is not a registration, it is the evidence that one can match.
+
+It pulls the Devuan 6 =excalibur= image, installs the =openrc= package at EXACTLY Honey's version in a throwaway container, and runs the lint there on a copy of Honey's =/etc/init.d=: the output must equal the lint's output on Honey, byte for byte apart from the path prefix (the copy is discarded with that container, so the committed image holds only tools). It then starts a fresh container with =--network none=, a fresh tmpfs =/run=, memory and pid limits, whose entrypoint is =initd-stop-proof --in-guest=: the container's own PID namespace and =/run= are the first two of the proof's three conditions, and the gate asserts them (pid 1 is the script, =/run= is an empty tmpfs, no production-looking process) before anything starts, mounting nothing. It prints Honey's and the guest's version strings side by side (Devuan release, openrc package and =--version=, OpenRC's =start-stop-daemon=, Debian's =start-stop-daemon=, dpkg) and exits 0 only if every one matches, the lint output is identical, and the proof says PROVEN. The image is removed afterwards unless =--keep=. Two honest differences: OpenRC tags its version with =[DOCKER]= in a container (stripped before comparing), and the guest's =/etc/debian_version= is newer than Honey's (printed, informational: it is a base-files string, not an init package).
+
+The label on the proof is unchanged: it shows that this stop function signals only its own pid, not that the default stop is safe on Honey.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/honey-initd-lint/devuan-guest-proof :tangle-mode (identity #o755) :comments no :shebang "#!/usr/bin/env bash"
+# devuan-guest-proof (generated by agents-bots-honey.org): a DISPOSABLE guest that matches Honey's init, running the init-script lint and one
+# stop-safety proof, with Honey's version strings printed beside the guest's.
+#
+# The guest is a Virtual Habitat "sanctuary"-class guest (a container on the host kernel: guests.org, sanctuary-distrobox.org). Honey has docker, not
+# podman/distrobox, so this uses docker; nothing is installed on Honey. It is built from the Devuan 6 "excalibur" image with the SAME openrc package version
+# as Honey, run with no network and no mounts for the proof itself, and removed afterwards (the image too, unless --keep).
+#   prepare : a throwaway container with network installs openrc=<Honey's version>, python3, procps, then runs the LINT on a copy of Honey's /etc/init.d
+#             inside it and compares the output with the lint run on Honey (they must be identical apart from the path prefix). The copy is discarded with
+#             that container: the committed image holds only the tools.
+#   prove   : a fresh container, --network none, --tmpfs /run, memory and pid limits, whose ENTRYPOINT is initd-stop-proof --in-guest: the guest's own
+#             PID namespace and private /run are the three conditions the host mode has to build (see that script's gate). /tmp is mounted exec because
+#             docker's tmpfs mounts are noexec by default.
+# Exit: 0 only if the guest's Devuan release, openrc package, OpenRC start-stop-daemon and Debian start-stop-daemon versions all equal Honey's, the lint
+# output equals Honey's, and the proof says PROVEN. 1 = mismatch or failure, 4 = skipped (no docker or no network), 5 = the proof's gate refused.
+# Usage: devuan-guest-proof [--keep] [--image IMAGE]
+set -uo pipefail
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+IMAGE="devuan/devuan:excalibur"; KEEP=0
+while [ $# -gt 0 ]; do case "$1" in --keep) KEEP=1;; --image) IMAGE="$2"; shift;; *) echo "unknown option $1" >&2; exit 64;; esac; shift; done
+pick() { for c in "$@"; do [ -f "$c" ] && { echo "$c"; return; }; done; }
+LINT="${HONEY_INITD_LINT:-$(pick "$HERE/../../../bin/honey-initd-lint" "$HERE/honey-initd-lint")}"
+PROOF="${INITD_STOP_PROOF:-$(pick "$HERE/initd-stop-proof")}"
+UNIT="${PROOF_UNIT:-$(pick "$HERE/../honey-fca-dsh/openrc/honey-fca-egress" "$HERE/honey-fca-egress")}"
+[ -f "$LINT" ] && [ -f "$PROOF" ] && [ -f "$UNIT" ] || { echo "SKIPPED: lint, proof or unit not found"; exit 4; }
+command -v docker >/dev/null && docker info >/dev/null 2>&1 || { echo "SKIPPED: no usable docker"; exit 4; }
+TAG="hb-devuan-guest-proof:$$"; PREP="hb-devuan-prep-$$"
+cleanup() { docker rm -f "$PREP" >/dev/null 2>&1; docker rmi -f "$TAG" >/dev/null 2>&1; [ "$KEEP" = 1 ] || docker rmi "$IMAGE" >/dev/null 2>&1; }
+trap cleanup EXIT
+bad=0
+# ---- Honey's side
+H_OS="$(. /etc/os-release; echo "$VERSION_ID ($VERSION_CODENAME)")"; H_DEB="$(cat /etc/debian_version)"
+H_PKG="$(dpkg-query -W -f='${Version}' openrc)"; H_DPKG="$(dpkg-query -W -f='${Version}' dpkg)"
+H_RC="$(openrc --version 2>&1 | head -1)"; H_SSD_RC="$(/lib/rc/sbin/start-stop-daemon --version 2>&1 | head -1)"; H_SSD_DEB="$(/sbin/start-stop-daemon --version 2>&1 | head -1)"
+H_LINT="$(python3 -I "$LINT" --dir /etc/init.d --confd /etc/conf.d | sed 's|/etc/init.d/|/g/init.d/|g')"
+# ---- prepare
+docker pull -q "$IMAGE" >/dev/null 2>&1 || { echo "SKIPPED: cannot pull $IMAGE (no network?)"; exit 4; }
+IMG_ID="$(docker image inspect "$IMAGE" --format '{{.Id}}' | cut -c1-19)"
+docker run -d --name "$PREP" --memory 768m --pids-limit 512 --cpus 2 "$IMAGE" sleep 600 >/dev/null || { echo "cannot start the preparation container"; exit 1; }
+docker exec "$PREP" sh -c "apt-get update -qq >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends openrc='$H_PKG' python3 procps >/dev/null 2>&1" \
+  || { echo "FAIL: could not install openrc=$H_PKG in the guest (the repository no longer serves Honey's version?)"; docker exec "$PREP" apt-cache policy openrc | head -5; exit 1; }
+docker exec "$PREP" mkdir -p /opt/hb /g
+docker cp "$LINT" "$PREP:/opt/hb/honey-initd-lint"; docker cp "$PROOF" "$PREP:/opt/hb/initd-stop-proof"; docker cp "$UNIT" "$PREP:/opt/hb/honey-fca-egress"
+docker cp /etc/init.d "$PREP:/g/init.d" 2>/dev/null; docker cp /etc/conf.d "$PREP:/g/conf.d" 2>/dev/null
+G_LINT="$(docker exec "$PREP" python3 -I /opt/hb/honey-initd-lint --dir /g/init.d --confd /g/conf.d)"
+docker exec "$PREP" rm -rf /g
+G_OS="$(docker exec "$PREP" sh -c '. /etc/os-release; echo "$VERSION_ID ($VERSION_CODENAME)"')"; G_DEB="$(docker exec "$PREP" cat /etc/debian_version)"
+G_PKG="$(docker exec "$PREP" dpkg-query -W -f='${Version}' openrc)"; G_DPKG="$(docker exec "$PREP" dpkg-query -W -f='${Version}' dpkg)"
+G_RC="$(docker exec "$PREP" openrc --version 2>&1 | head -1)"
+G_SSD_RC="$(docker exec "$PREP" sh -c '$(dpkg -L openrc | grep -E "/rc/sbin/start-stop-daemon$" | head -1) --version 2>&1 | head -1')"
+G_SSD_DEB="$(docker exec "$PREP" /sbin/start-stop-daemon --version 2>&1 | head -1)"
+G_PRETTY="$(docker exec "$PREP" sh -c '. /etc/os-release; echo "$PRETTY_NAME"')"
+docker commit "$PREP" "$TAG" >/dev/null; docker rm -f "$PREP" >/dev/null
+# ---- versions side by side
+# OpenRC prints a container tag in its version string ("OpenRC [DOCKER]") when it detects one; the tag is not a version, so it is stripped before comparing.
+norm() { printf '%s' "$1" | sed 's/ \[[A-Z-]*\]//'; }
+row() { local ok=DIFFERENT; [ "$(norm "$2")" = "$(norm "$3")" ] && ok=match; printf '%-26s | %-34s | %-34s | %s\n' "$1" "$2" "$3" "$ok"; [ "$ok" = match ] || bad=$((bad+1)); }
+info() { printf '%-26s | %-34s | %-34s | %s\n' "$1" "$2" "$3" "informational (base-files string, not an init package)"; }
+echo "image: $IMAGE ($IMG_ID)"; printf '%-26s | %-34s | %-34s | %s\n' "" "HONEY" "GUEST" ""
+row "Devuan VERSION_ID"        "$H_OS"     "$G_OS"
+info "Debian base"             "$H_DEB"    "$G_DEB"
+row "openrc package"           "$H_PKG"    "$G_PKG"
+row "openrc --version"         "$H_RC"     "$G_RC"
+row "start-stop-daemon (OpenRC)" "$H_SSD_RC" "$G_SSD_RC"
+row "start-stop-daemon (Debian)" "$H_SSD_DEB" "$G_SSD_DEB"
+row "dpkg package"             "$H_DPKG"   "$G_DPKG"
+echo "guest PRETTY_NAME: $G_PRETTY   (Honey's is a Devuan 6 derivative; the base release and the init packages are what must match)"
+# ---- lint on the guest, against Honey's own init scripts
+if [ "$H_LINT" = "$G_LINT" ]; then echo "LINT in the guest on a copy of Honey's /etc/init.d: output identical to Honey's ($(printf '%s\n' "$G_LINT" | grep '^SUMMARY' | cut -c1-110))"
+else echo "LINT DIFFERS between Honey and the guest:"; diff <(printf '%s\n' "$H_LINT") <(printf '%s\n' "$G_LINT") | head -10; bad=$((bad+1)); fi
+# ---- the proof, as the guest's entrypoint
+echo "== stop-safety proof inside the guest (entrypoint pid 1, --network none, --tmpfs /run, memory and pid limits; docker tmpfs mounts are noexec by default, so /tmp is mounted exec)"
+PROOF_OUT="$(docker run --rm --network none --tmpfs /run:exec,mode=755,size=16m --tmpfs /tmp:exec,mode=1777,size=64m --memory 256m --pids-limit 256 "$TAG" bash /opt/hb/initd-stop-proof --in-guest /tmp/w /opt/hb/honey-fca-egress 2>&1)"; prc=$?
+printf '%s\n' "$PROOF_OUT" | cut -c1-200
+if [ "$prc" = 5 ]; then echo "GATE REFUSED inside the guest"; exit 5; fi
+[ "$prc" = 0 ] || { echo "proof exit $prc"; bad=$((bad+1)); }
+echo
+if [ "$bad" = 0 ]; then echo "RESULT: guest matches Honey on every version string, the lint output is identical, and the stop-safety proof ran inside it (exit 0)."; exit 0; fi
+echo "RESULT: $bad mismatch(es) or failure(s)"; exit 1
 #+END_SRC
 
 * Service heartbeat and liveness check (W4 SOURCE candidate; wired to nothing)
