@@ -25,7 +25,7 @@ PY
 }
 mutate no-name-sanitising      "s/    name = ATTACHMENT_NAME.sub('_', raw).lstrip('.')\[:80\]/    name = raw/"
 mutate size-cap-removed        "s/        if len(data) > MAX_ATTACHMENT:/        if False:/"
-mutate file-mode-world         "s/os.O_NOFOLLOW, 0o600)/os.O_NOFOLLOW, 0o644)/"
+mutate file-mode-world         "s/os.fchmod(descriptor, 0o600)/os.fchmod(descriptor, 0o644)/"
 mutate index-off-by-one        "s/        part = parts\[number - 1\]/        part = parts[number]/"
 mutate missing-part-not-refused "s/        if number > len(parts):/        if False:/"
 mutate link-target-allowed     "s/        if target.is_symlink() or target.is_dir():/        if False:/"
