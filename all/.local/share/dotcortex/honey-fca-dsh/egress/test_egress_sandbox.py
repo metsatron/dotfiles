@@ -64,6 +64,16 @@ def sudo_as(uid, *argv, groups=None):
     return ['sudo', '-n', 'setpriv', '--reuid=%d' % uid, '--regid=%d' % uid] + g + list(argv)
 
 
+def host_tailnet_address():
+    """The host's own tailnet IPv4 address, read at run time with `tailscale ip -4`. Never written into the repo or printed."""
+    try:
+        out = subprocess.run(['tailscale', 'ip', '-4'], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = out.stdout.split()
+    return lines[0] if out.returncode == 0 and lines else None
+
+
 def run(argv, **kw):
     kw.setdefault('capture_output', True)
     kw.setdefault('text', True)
@@ -205,14 +215,34 @@ class Sandbox(unittest.TestCase):
         s = socket.socket(socket.AF_UNIX)
         s.connect('\0fca-egress-canary-%d' % os.getpid())
         s.close()
-        out = run(bwrap(SOCKDIR, ['/usr/bin/python3', '-I', '/opt/test/sandbox_client.py', 'isolation'],
-                        env={'CANARY_PORT': str(CANARY.getsockname()[1]), 'ABSTRACT_NAME': 'fca-egress-canary-%d' % os.getpid()}))
+        env = {'CANARY_PORT': str(CANARY.getsockname()[1]), 'ABSTRACT_NAME': 'fca-egress-canary-%d' % os.getpid()}
+        tailnet = host_tailnet_address()  # read at run time; the address is never committed or printed
+        tail_canary = None
+        if tailnet:
+            tail_canary = socket.socket()
+            tail_canary.bind((tailnet, 0))
+            tail_canary.listen(4)
+            socket.create_connection(tail_canary.getsockname(), 2).close()  # control: the host really listens on its tailnet address
+            env['TAILNET_IP'] = tailnet
+            env['TAILNET_CANARY_PORT'] = str(tail_canary.getsockname()[1])
+        try:
+            out = run(bwrap(SOCKDIR, ['/usr/bin/python3', '-I', '/opt/test/sandbox_client.py', 'isolation'], env=env))
+        finally:
+            if tail_canary:
+                tail_canary.close()
         self.assertEqual(out.returncode, 0, out.stderr)
         res = json.loads(out.stdout)
-        for k in ('host_loopback_canary', 'tailnet_22', 'tailnet_3003', 'lan_gateway_80', 'public_v4_443', 'public_v6_443', 'dns_udp_resolver',
+        for k in ('host_loopback_canary', 'lan_gateway_80', 'public_v4_443', 'public_v6_443', 'dns_udp_resolver',
                   'host_abstract_socket', 'other_unix_path'):
             self.assertNotEqual(res[k], 'connected', (k, res))
             print('  blocked %-22s %s' % (k, res[k]))
+        for k in ('tailnet_canary', 'tailnet_22', 'tailnet_3003'):
+            with self.subTest(k):
+                if not tailnet:
+                    self.assertEqual(res[k], 'unset')
+                    self.skipTest('SKIPPED %s: this host has no tailnet address (nothing to probe)' % k)
+                self.assertNotIn(res[k], ('connected', 'unset'), (k, res))
+                print('  blocked %-22s %s' % (k, res[k]))
         self.assertEqual(res['resolve_example_com'], 'gaierror')
         self.assertEqual(res['resolve_provider'], ['127.0.0.1'])  # hosts file only: the name never leaves the namespace
         self.assertEqual(res['resolve_provider_alt'], 'gaierror')

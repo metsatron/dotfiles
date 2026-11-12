@@ -40,12 +40,17 @@ def tls_fetch(sni, ca='/opt/test/ca.pem', host='127.0.0.1'):
         out += d
     return out.decode().partition('\r\n\r\n')[2]
 
+def probe_tailnet(port):
+    ip = os.environ.get('TAILNET_IP')  # the host's own tailnet address, passed by the runner at run time
+    return attempt(lambda: tcp(ip, port)) if ip and port else 'unset'
+
 mode = sys.argv[1]
 if mode == 'isolation':
     r = {
         'host_loopback_canary': attempt(lambda: tcp('127.0.0.1', int(os.environ['CANARY_PORT']))),
-        'tailnet_22': attempt(lambda: tcp('100.64.0.1', 22)),
-        'tailnet_3003': attempt(lambda: tcp('100.64.0.1', 3003)),
+        'tailnet_canary': probe_tailnet(int(os.environ.get('TAILNET_CANARY_PORT', '0'))),
+        'tailnet_22': probe_tailnet(22),
+        'tailnet_3003': probe_tailnet(3003),
         'lan_gateway_80': attempt(lambda: tcp('192.168.1.1', 80)),
         'public_v4_443': attempt(lambda: tcp('104.18.6.80', 443)),
         'public_v6_443': attempt(lambda: tcp('2606:4700:20::681a:650', 443, socket.AF_INET6)),
