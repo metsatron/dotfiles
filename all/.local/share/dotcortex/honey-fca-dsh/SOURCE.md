@@ -11,5 +11,7 @@ future_private_env: $HOME/.config/deepseek-fca-dsh/private/fca-synthetic.env
 network: none
 inherited_environment: cleared
 config: disable model, web, shell, filesystem, jobs, workflow, tools, and subagents
+telemetry: disabled twice (overlay row session-telemetry-otel and DSH_TELEMETRY_DISABLED in the launcher environment)
+boot: honey-fca-dsh boot-check boots the composed profile (offline) and exits; dsh-config alone proves row composition only
 telegram: forbidden
 clinical_or_aura_paths: forbidden
