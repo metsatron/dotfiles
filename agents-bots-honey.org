@@ -4526,6 +4526,1368 @@ echo "mutants: $killed killed, $unproven UNPROVEN, survivors/errors counted in t
 exit 0
 #+END_SRC
 
+* Init-script lint: a shared interpreter needs a stop of its own (rev15 SOURCE candidate; nothing here changes a production script)
+
+OpenRC's default =stop= runs =start-stop-daemon --stop --exec $command --pidfile $pidfile=. With the pidfile gone it signals every process whose =argv[0]= is the string in =command=. A script with =command=/usr/bin/python3= and no =stop()= of its own therefore takes down every python3 service started that way. That is what killed seven Honey services on 2026-11-12 (the relay unit's =start_post= stopped its own daemon, the pidfile went, and the default stop that followed signalled its neighbours). The reviewer rejected a package-level patch to OpenRC (a locally patched init system is a larger standing risk than the defect, and a patch that works around behaviour nobody can fully explain is not one to carry) and asked for a deterministic lint instead, so that the next script written by anyone is caught without a fork.
+
+*What was measured, not assumed (2026-11-12, private PID namespace):* =start-stop-daemon --exec= matches a process by the =argv[0]= string, not by the binary behind it. A decoy started as =/usr/bin/python3= was signalled; a decoy started as =python3=, and one started through a symlink to the same binary, was not. That is the whole reason the earlier non-OpenRC decoy survived the same call: it had been started as =python3=. It also means any process launched by absolute path, including a script whose shebang is =#!/usr/bin/python3=, is inside the blast radius. This section lints for the name in =command=; it does not claim to know what else on a host carries that =argv[0]=.
+
+** What the lint fails on
+
+=honey-initd-lint= reads every file in =/etc/init.d= (never runs or sources one) and exits 1 only for a PROVEN fault in an active script:
+
+| Rule           | Fails when                                                                                                                  |
+|----------------+-----------------------------------------------------------------------------------------------------------------------------|
+| =no-own-stop=  | =command= (or =procname=) is a shared interpreter (python, python3, python3.N, perl, bash, sh, dash, zsh, ksh, node, nodejs, ruby, php, lua) and the script has no =stop()= |
+| =stop-exec=    | a =stop=, =stop_pre= or =stop_post= passes =--exec= (or =-x=) to =start-stop-daemon= and the executable is a shared interpreter: worse than no stop, because it looks like a fix |
+| =stop-by-name= | a stop signals by name or pattern: =start-stop-daemon --name=, =pkill=, =killall=, =kill $(pgrep ...)=, =pgrep \| xargs kill=, with no uid restriction, or a bare interpreter name, or on a shared-interpreter daemon |
+
+It follows =${x:-default}= and =: "${x:=default}"= forms, reads =/etc/conf.d/NAME= first (openrc-run sources it before the script body), joins continuation lines, ignores comments and heredoc bodies, and looks inside =sh -c '...'= and command substitutions. A uid-scoped pattern signal on a specific daemon is only a NOTE. For an LSB (sysv) script, which has no default stop, it checks only the =start-stop-daemon --stop= calls and =pkill= and accepts =--exec=/=--name= next to a =--pidfile= (that narrows the match).
+
+*What it never does:* fail on a script it cannot parse. Those are reported =UNPARSED= with the line that stopped it (an unterminated quote, an unbalanced function, a computed =command=, a =supervisor=supervise-daemon= on a shared interpreter, a file with no shebang) and never change the exit status. A bug inside the lint is itself reported UNPARSED for that file, never a pass and never a fault. Backup copies (=*.bak-*=, =*.orig=, =*.disabled=, =*.retired-*=, =*~=) are scanned and reported on their own line but never change the exit status; dotfiles (=.depend.*=) are insserv caches, not scripts.
+
+** The shape it accepts
+
+The reference =stop()=, which this section's namespace proof runs verbatim. It signals the pid in the pidfile and only if that pid is alive, and never passes =--exec=:
+
+#+BEGIN_SRC bash
+stop() {
+    # Own stop (honey-initd-lint). OpenRC's default stop passes --exec ${command}; with the pidfile gone that signals every process whose argv[0] is
+    # the same string (for command=/usr/bin/python3: every python3 service on the host). This one signals the pid in the pidfile, and only if it is alive.
+    local pid
+    pid="$(cat "${pidfile}" 2>/dev/null)"
+    [ -n "${pid}" ] || return 0
+    if [ ! -d "/proc/${pid}" ]; then rm -f "${pidfile}"; return 0; fi
+    ebegin "Stopping ${name:-${RC_SVCNAME}}"
+    start-stop-daemon --stop --quiet --retry "${retry:-TERM/30/KILL/5}" --pidfile "${pidfile}"
+    eend $? "Failed to stop ${name:-${RC_SVCNAME}}"
+}
+#+END_SRC
+
+** Running it, on a schedule and when a script changes
+
+=honey-initd-lint-watch= hashes =/etc/init.d=, =/etc/conf.d= and the lint itself (content, not mtime) and runs the lint when anything moved or when the last run is a day old; unchanged, it exits at the hash. It writes only =~/.local/state/honey-initd-lint/= (=status= is one line, =last.txt=, =last.json=, =history.log=). Alerting is opt-in and off: set =HONEY_INITD_LINT_ALERT= to a command that takes one message and it is called when the SET of faulting scripts changes, never on a repeat. Cron, every five minutes, as the account that owns the checkout:
+
+#+BEGIN_SRC text
+*/5 * * * * flock -n /tmp/honey-initd-lint.lock nice -n 10 $HOME/.local/bin/honey-initd-lint-watch
+#+END_SRC
+
+** Proof that a stop signals only its own pid
+
+=initd-stop-proof= runs a unit's own =stop()= under the real =openrc-run= with the pidfile deleted, inside a private PID namespace, and asserts three conditions BEFORE it starts anything (otherwise it exits 5 having done nothing): its own =/proc= (pid 1 is the script; a handful of processes), a fresh tmpfs over =/run= and over =/sys/fs/cgroup= (so OpenRC creates no cgroup on the host), and no production process or pidfile visible. A CONTROL runs first, the same unit shape without a =stop()=; if it does not reproduce the mass-kill the script exits 3 and never says PROVEN. It also checks the host afterwards (OpenRC cgroup count and production pidfile listing unchanged).
+
+*It proves one thing: this stop function signals only its own pid.* It does NOT prove that OpenRC's default stop no longer mass-kills on the real host, and says nothing about any init script it was not run on.
+
+** Tests and mutation proof
+
+=test_initd_lint.py= is pure Python (no root, no OpenRC): the three rules and every UNPARSED path, conf.d and default expansion, sysv, the directory run and its exit statuses, the watcher (change detection, daily rerun, opt-in alert on a changed fault set), and the namespace proof's gate (without root, in the host namespace: it must refuse before it mounts or starts anything). =mutation-check-initd-lint.sh= sabotages the lint and the watcher 36 ways; each mutant must fail a NAMED test.
+
+#+BEGIN_SRC python :tangle all/.local/bin/honey-initd-lint :tangle-mode (identity #o755) :comments no :shebang "#!/usr/bin/python3 -I"
+"""honey-initd-lint (generated by agents-bots-honey.org): fail on an init script whose daemon is a SHARED INTERPRETER and that has no stop of its own.
+
+Why: OpenRC's default stop runs `start-stop-daemon --stop --exec $command --pidfile $pidfile`. When the pidfile is gone it falls back to matching the
+executable alone, so a script with command=/usr/bin/python3 takes down EVERY OpenRC-started python3 process on the host (Honey, 2026-11-12: seven services).
+
+A script is a FAULT (exit 1) only when the fault is PROVEN from what the script says:
+  no-own-stop   the daemon (command=, or a procname=) is a shared interpreter and the script defines no stop()
+  stop-exec     a stop/stop_pre/stop_post passes --exec (or -x) to start-stop-daemon and the executable is a shared interpreter
+  stop-by-name  a stop/stop_pre/stop_post signals by name or pattern (start-stop-daemon --name, pkill, killall, kill $(pgrep ...), pgrep | xargs kill)
+                with no uid restriction, or with a bare shared-interpreter name, or on a shared-interpreter daemon.
+Anything the lint cannot decide is UNPARSED: it prints the line that stopped it and does NOT fail the run. A pattern signal that is uid-scoped and names
+something specific is a NOTE. Backup copies (*.bak-*, *.orig, *.disabled, *.retired-*, *~) are reported separately and never change the exit status.
+Shared interpreters, by NAME: python, python3, python3.N, perl, bash, sh, dash, zsh, ksh, node, nodejs, ruby, php, lua. (start-stop-daemon --exec matches argv[0]
+by string, so the name in command= is what decides; symlinks and `env X` are not followed.)
+Sysv/LSB scripts have no default stop; only their start-stop-daemon --stop calls and pkill/killall are examined, and an --exec/--name next to a
+--pidfile is accepted there (it narrows the match rather than widening it).
+
+Exit: 0 no proven fault in an active script, 1 at least one, 2 the directory could not be read.
+Usage: honey-initd-lint [--dir /etc/init.d] [--confd /etc/conf.d] [--json] [-q] [FILE...]
+Read-only. It never runs, sources or evaluates any script: it only reads text."""
+import json, os, re, shlex, sys
+
+SHARED_RE = re.compile(r'^(python([0-9]+(\.[0-9]+)*)?|perl[0-9.]*|bash|sh|dash|zsh|ksh|node(js)?|ruby[0-9.]*|php[0-9.]*|lua[0-9.]*)$')
+INACTIVE_RE = re.compile(r'(\.(bak|orig|old|save|disabled|retired|dpkg-[a-z]+)([-.].*)?|~)$')
+STOP_FUNCS = ('stop', 'stop_pre', 'stop_post')
+ASSIGN_RE = re.compile(r'^\s*(?:export\s+|local\s+|readonly\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$')
+FUNC_RE = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_.:-]*)\s*\(\s*\)\s*(.*)$')
+HEREDOC_RE = re.compile(r'(?<!<)<<(?!<)-?\s*(?:\'([^\']+)\'|"([^"]+)"|\\?([A-Za-z_][A-Za-z0-9_]*))')
+LEAD = {'if', 'then', 'else', 'elif', 'do', 'while', 'until', '!', '{', 'time', 'sudo', 'nohup', 'nice', 'exec', 'command', '-n', 'env'}
+
+
+class Unparsed(Exception):
+    def __init__(self, line, why):
+        super().__init__(why)
+        self.line, self.why = line, why
+
+
+def is_shared(path_or_name):
+    return bool(SHARED_RE.match(os.path.basename(str(path_or_name))))
+
+
+def shared_reason(value):
+    """The interpreter's name when VALUE (a path or bare name) is a shared interpreter, judged by its NAME only; else None.
+    Why not through symlinks or `env X`: OpenRC's start-stop-daemon --exec matches a process by its argv[0] STRING (measured 2026-11-12: a decoy started
+    as /usr/bin/python3 was signalled, one started as `python3`, or via a symlink to the same binary, was not), so what matters is the string in command=."""
+    if value and is_shared(value):
+        return os.path.basename(value)
+    return None
+
+
+# ---- preprocessing: logical lines with their first original line number --------------------------------------------
+def logical_lines(text):
+    """[(lineno, text)] with continuations joined, comments and heredoc bodies removed. Raises Unparsed on an unterminated quote or heredoc."""
+    out, raw = [], text.split('\n')
+    i, n = 0, len(raw)
+    while i < n:
+        start, cur = i + 1, raw[i]
+        i += 1
+        while cur.endswith('\\') and not cur.endswith('\\\\') and i < n:
+            cur = cur[:-1] + raw[i]
+            i += 1
+        buf, q, k = [], None, 0
+        while True:
+            while k < len(cur):
+                c = cur[k]
+                if q is None:
+                    if c == '\\' and k + 1 < len(cur):
+                        buf.append(cur[k:k + 2]); k += 2; continue
+                    if c == '#' and (k == 0 or cur[k - 1] in ' \t;&|('):
+                        break
+                    if c in '\'"':
+                        q = c
+                elif c == q:
+                    q = None
+                elif c == '\\' and q == '"' and k + 1 < len(cur):
+                    buf.append(cur[k:k + 2]); k += 2; continue
+                buf.append(c); k += 1
+            if q is None:
+                break
+            if i >= n:
+                raise Unparsed(start, 'unterminated %s quote' % ('single' if q == "'" else 'double'))
+            buf.append(' '); cur = raw[i]; i += 1; k = 0
+        line = ''.join(buf)
+        out.append((start, line))
+        m = HEREDOC_RE.search(line)
+        if m:
+            tag = m.group(1) or m.group(2) or m.group(3)
+            while i < n and raw[i].strip() != tag:
+                i += 1
+            if i >= n:
+                raise Unparsed(start, 'heredoc %s is never closed' % tag)
+            i += 1
+    return out
+
+
+def brace_delta(line):
+    """Net { minus } outside quotes, so ${x} cancels and quoted braces vanish."""
+    d, q, k = 0, None, 0
+    while k < len(line):
+        c = line[k]
+        if c == '\\' and q != "'":
+            k += 2; continue
+        if q is None:
+            if c in '\'"':
+                q = c
+            elif c == '{':
+                d += 1
+            elif c == '}':
+                d -= 1
+        elif c == q:
+            q = None
+        k += 1
+    return d
+
+
+def split_script(lines):
+    """-> (top-level [(n, line)], functions {name: (start_n, [(n, line)])})."""
+    top, funcs, i = [], {}, 0
+    while i < len(lines):
+        n, line = lines[i]
+        m = FUNC_RE.match(line)
+        if not m:
+            top.append((n, line)); i += 1; continue
+        name, rest = m.group(1), m.group(2).strip()
+        if rest.startswith('('):
+            raise Unparsed(n, 'function %s has a subshell body' % name)
+        cur_n, cur = n, line
+        if not rest.startswith('{'):  # the brace may sit on the next line
+            if i + 1 >= len(lines) or not lines[i + 1][1].strip().startswith('{'):
+                raise Unparsed(n, 'function %s has no { body' % name)
+            i += 1
+            cur_n, cur = lines[i]
+        body, depth = [], 0
+        while True:
+            depth += brace_delta(cur)
+            body.append((cur_n, cur))
+            if depth <= 0:
+                break
+            i += 1
+            if i >= len(lines):
+                raise Unparsed(n, 'function %s is never closed (unbalanced braces)' % name)
+            cur_n, cur = lines[i]
+        funcs[name] = (n, body)
+        i += 1
+    return top, funcs
+
+
+# ---- words and expansion ----------------------------------------------------------------------------------------------
+def substitutions(line):
+    """(outer, [inner command strings]) for $(...) and `...` (nesting by paren depth; single-quoted text is literal)."""
+    inner, out, q, k = [], [], None, 0
+    while k < len(line):
+        c = line[k]
+        if q == "'":
+            out.append(c)
+            if c == "'": q = None
+            k += 1; continue
+        if c == "'":
+            q = "'"; out.append(c); k += 1; continue
+        if c == '\\' and k + 1 < len(line):
+            out.append(line[k:k + 2]); k += 2; continue
+        if line.startswith('$(', k) and not line.startswith('$((', k):
+            depth, j = 1, k + 2
+            while j < len(line) and depth:
+                depth += (line[j] == '(') - (line[j] == ')'); j += 1
+            inner.append(line[k + 2:j - 1]); out.append('SUBST'); k = j; continue
+        if c == '`':
+            j = line.find('`', k + 1)
+            if j < 0: j = len(line)
+            inner.append(line[k + 1:j]); out.append('SUBST'); k = j + 1; continue
+        if c == '"':
+            q = None if q == '"' else '"'
+        out.append(c); k += 1
+    return ''.join(out), inner
+
+
+def split_commands(line):
+    """Quote-aware split of one logical line into simple commands (; & | && || ( ) newline), each as a shlex word list."""
+    segs, cur, q, k = [], [], None, 0
+    while k < len(line):
+        c = line[k]
+        if q:
+            cur.append(c)
+            if c == '\\' and q == '"' and k + 1 < len(line):
+                cur.append(line[k + 1]); k += 1
+            elif c == q:
+                q = None
+        elif c == '\\' and k + 1 < len(line):
+            cur.append(line[k:k + 2]); k += 1
+        elif c in '\'"':
+            q = c; cur.append(c)
+        elif c in ';&|()\n':
+            segs.append(''.join(cur)); cur = []
+        else:
+            cur.append(c)
+        k += 1
+    segs.append(''.join(cur))
+    out = []
+    for s in segs:
+        s = re.sub(r'\d*[<>]+&?\S*', ' ', s) if False else s  # redirections stay as words; they never match a command name
+        s = s.strip()
+        if not s:
+            continue
+        try:
+            out.append(shlex.split(s, posix=True))
+        except ValueError:
+            out.append(s.split())
+    return out
+
+
+def strip_redirections(words):
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False; continue
+        m = re.match(r'^\d*(?:&>>?|>>?|<<?<?|>&|<&)(.*)$', w)
+        if m:
+            skip = (m.group(1) == '')  # `> file`: the target is the next word
+            continue
+        out.append(w)
+    return out
+
+
+def commands(line, depth=0):
+    """All simple commands on a logical line, including command substitutions and `sh -c '...'` strings, leading keywords removed."""
+    outer, inner = substitutions(line)
+    res = []
+    for words in split_commands(outer):
+        while words and (words[0] in LEAD or re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[0])):
+            if words[0] == '-n' and len(words) > 1:  # `sudo -n cmd`
+                words = words[1:]; continue
+            words = words[1:]
+        words = strip_redirections(words)
+        if not words:
+            continue
+        res.append(words)
+        if depth < 3 and os.path.basename(words[0]) in ('su', 'sh', 'bash', 'dash') and '-c' in words[:-1]:
+            res += commands(words[words.index('-c') + 1], depth + 1)
+    for s in inner:
+        if depth < 3:
+            res += commands(s, depth + 1)
+    return res
+
+
+VAR_RE = re.compile(r'\$\{([A-Za-z_][A-Za-z0-9_]*)(?:(:?[-=+])([^{}]*))?\}|\$([A-Za-z_][A-Za-z0-9_]*)')
+
+
+def expand(s, env, depth=0):
+    """Expand $v ${v} ${v:-d} ${v:=d} ${v:+a} against ENV; None when anything cannot be decided (undefined variable, $(...), other operators)."""
+    if s is None or depth > 8 or '$(' in s or '`' in s or re.search(r'\$\{(?![A-Za-z_][A-Za-z0-9_]*(?:\}|:?[-=+]))', s):
+        return None
+    bad = []
+
+    def sub(m):
+        name, op, arg = m.group(1) or m.group(4), m.group(2), m.group(3)
+        val = env.get(name)
+        unset = val is None or (val == '' and op is not None and op.startswith(':'))
+        if op in (':-', '-', ':=', '='):
+            if unset:
+                r = expand(arg, env, depth + 1)
+                if r is None: bad.append(1); return ''
+                return r
+            return val
+        if op in (':+', '+'):
+            if unset: return ''
+            r = expand(arg, env, depth + 1)
+            if r is None: bad.append(1); return ''
+            return r
+        if val is None: bad.append(1); return ''
+        return val
+    out = VAR_RE.sub(sub, s)
+    return None if bad else out
+
+
+def one_word(value):
+    value = value.strip()
+    try:
+        w = shlex.split(value, posix=True)
+    except ValueError:
+        return value
+    return ' '.join(w)
+
+
+def assign(env, key, raw, rawvals=None):
+    if rawvals is not None:
+        rawvals[key] = one_word(raw)
+    if '$(' in raw or '`' in raw:
+        env.pop(key, None); return  # computed at run time
+    v = one_word(raw)
+    val = expand(v, env) if '$' in v else v
+    if val is None:
+        env.pop(key, None)
+    else:
+        env[key] = val
+
+
+def parse_env(top, name, confd, rawvals=None):
+    """Variables as openrc-run sees them: /etc/conf.d/NAME is sourced FIRST (openrc-run.sh), then the script's own top-level lines, so a plain
+    assignment in the script overrides conf.d, and conf.d feeds the ${x:-default} and : "${x:=default}" forms."""
+    env = {'RC_SVCNAME': name}
+    if confd and os.path.isfile(os.path.join(confd, name)):
+        try:
+            with open(os.path.join(confd, name), errors='replace') as fh:
+                for _, line in logical_lines(fh.read()):
+                    m = ASSIGN_RE.match(line)
+                    if m:
+                        assign(env, m.group(1), m.group(2), rawvals)
+        except (OSError, Unparsed):
+            pass
+    for _, line in top:
+        m = ASSIGN_RE.match(line)
+        if m:
+            assign(env, m.group(1), m.group(2), rawvals)
+        else:
+            m = re.match(r'^\s*:\s+"?\$\{([A-Za-z_][A-Za-z0-9_]*):?=([^}]*)\}"?\s*$', line)  # : "${x:=default}"
+            if m and m.group(1) not in env:
+                assign(env, m.group(1), m.group(2), rawvals)
+    return env
+
+
+# ---- analysis ----------------------------------------------------------------------------------------------------------
+def opt_value(words, short, long_):
+    """Value of -x VAL / --exec VAL / --exec=VAL / -xVAL; None when absent."""
+    for i, w in enumerate(words):
+        if w == '--':
+            break
+        if w in short or w in long_:
+            return words[i + 1] if i + 1 < len(words) else ''
+        for l in long_:
+            if w.startswith(l + '='):
+                return w[len(l) + 1:]
+        for s in short:
+            if w.startswith(s) and len(w) > 2 and not w.startswith('--'):
+                return w[2:]
+    return None
+
+
+def has_opt(words, short, long_):
+    return any(w in short or w in long_ or any(w.startswith(l + '=') for l in long_) for w in words)
+
+
+def stop_findings(fname, body, env, daemon_shared, kind):
+    """(faults, notes, unparsed) of one stop-family function body, or (sysv) of the whole script."""
+    faults, notes, unp = [], [], []
+    for n, line in body:
+        cmds = commands(line)
+        kills = any(os.path.basename(w[0]) in ('kill', 'xargs') for w in cmds)
+        for words in cmds:
+            cmd = os.path.basename(words[0])
+            args = words[1:]
+            if cmd == 'start-stop-daemon' and has_opt(args, ('-K',), ('--stop',)):
+                pid = opt_value(args, ('-p',), ('--pidfile',))
+                ex = opt_value(args, ('-x',), ('--exec',))
+                nm = opt_value(args, ('-n',), ('--name',))
+                narrowed = kind == 'sysv' and pid is not None
+                if ex and not narrowed:
+                    ev = expand(ex, env)
+                    if ev is None and daemon_shared:
+                        faults.append((n, 'stop-exec', '%s passes --exec %s to start-stop-daemon and the daemon is a shared interpreter (the value cannot be resolved)' % (fname, ex)))
+                    elif ev is None:
+                        unp.append((n, '--exec %s cannot be resolved' % ex))
+                    elif shared_reason(ev):
+                        faults.append((n, 'stop-exec', '%s passes --exec %s to start-stop-daemon: it can signal processes this script never started' % (fname, ev)))
+                if nm and not narrowed:
+                    nv = expand(nm, env)
+                    if (nv is None and daemon_shared) or (nv is not None and shared_reason(nv)):
+                        faults.append((n, 'stop-by-name', '%s signals by --name %s' % (fname, nv or nm)))
+                    elif nv is None:
+                        unp.append((n, '--name %s cannot be resolved' % nm))
+                    else:
+                        notes.append((n, 'start-stop-daemon --name %s (a specific name)' % nv))
+            elif cmd in ('pkill', 'killall') or (cmd == 'pgrep' and kills):
+                uid = has_opt(args, ('-u', '-U'), ('--euid', '--uid', '--user'))
+                parent = has_opt(args, ('-P',), ('--parent',))
+                skip = {i + 1 for i, a in enumerate(args) if a in ('-u', '-U', '-g', '-G', '-P', '-s', '-t', '-n', '-o', '-c', '--signal', '--euid', '--uid', '--user', '--parent', '--session')}
+                pat = [a for i, a in enumerate(args) if not a.startswith('-') and i not in skip]
+                shown = '%s %s' % (cmd, ' '.join(shlex.quote(a) for a in args))
+                if parent and not pat:
+                    notes.append((n, '%s by parent pid only' % shown)); continue
+                pv = expand(pat[-1], env) if pat else None
+                bare = bool(pv and pv.split() and is_shared(pv.split()[0]))
+                if daemon_shared or bare:
+                    faults.append((n, 'stop-by-name', '%s signals by name or pattern (%s)' % (fname, shown)))
+                elif not uid:
+                    faults.append((n, 'stop-by-name', '%s signals by name or pattern with no uid restriction (%s)' % (fname, shown)))
+                elif pat and pv is None:
+                    unp.append((n, 'pattern %s cannot be resolved (uid-scoped %s)' % (pat[-1], cmd)))
+                else:
+                    notes.append((n, '%s: pattern %r, uid-scoped' % (cmd, pv)))
+    return faults, notes, unp
+
+
+def analyse_text(name, text, confd=None):
+    res = {'status': 'OK', 'faults': [], 'notes': [], 'why': '', 'line': 0, 'daemon': ''}
+    first = text.split('\n', 1)[0]
+    if not first.startswith('#!'):
+        return dict(res, status='UNPARSED', line=1, why='no #! line: not a script the lint understands')
+    try:
+        lines = logical_lines(text)
+        top, funcs = split_script(lines)
+    except Unparsed as e:
+        return dict(res, status='UNPARSED', line=e.line, why=str(e))
+    rawvals = {}
+    env = parse_env(top, name, confd, rawvals)
+    unp = []
+
+    if 'openrc-run' not in first:  # sysv/LSB: no default stop to fall back on
+        f, nt, u = stop_findings('script', lines, env, False, 'sysv')
+        res['faults'], res['notes'] = f, nt
+        if f: res['status'] = 'FAULT'
+        elif u: res.update(status='UNPARSED', line=u[0][0], why=u[0][1])
+        else: res['status'] = 'NA'
+        return res
+
+    cmd = env.get('command')
+    cmd_line = next((n for n, l in reversed(top) if re.match(r'\s*command=', l)), 0)
+    why_shared = shared_reason(cmd) if cmd else None
+    cmd_known = cmd is not None
+    if cmd is None and rawvals.get('command'):  # computed prefix, literal last component (${user_home}/.local/bin/ductor): the name still decides
+        tail = rawvals['command'].rsplit('/', 1)
+        if len(tail) == 2 and tail[1] and '$' not in tail[1]:
+            cmd_known = True
+            why_shared = shared_reason(tail[1])
+    pn = env.get('procname')
+    if not why_shared and pn and is_shared(pn):
+        why_shared = 'procname=' + pn
+    res['daemon'] = cmd or ''
+    daemon_shared = bool(why_shared)
+    has_stop = 'stop' in funcs
+    sup = env.get('supervisor')
+    if sup and 'supervise' in sup:  # supervise-daemon stops its own supervisor; only matters if the daemon is shared
+        if daemon_shared:
+            return dict(res, status='UNPARSED', line=0, why='supervisor=%s on a shared-interpreter daemon: its stop semantics are not modelled' % sup)
+        return dict(res, status='NA')
+    if not has_stop:
+        if not cmd_known and cmd_line:
+            return dict(res, status='UNPARSED', line=cmd_line, why='command= is computed at run time or uses an undefined variable: cannot tell whether the daemon is a shared interpreter')
+        if daemon_shared:
+            res['faults'].append((cmd_line, 'no-own-stop', 'daemon is a shared interpreter (%s) and the script defines no stop(): the default stop passes --exec %s and, with the pidfile gone, signals every process whose argv[0] is that string' % (why_shared, cmd or pn)))
+    for fn in STOP_FUNCS:
+        if fn in funcs:
+            f, nt, u = stop_findings(fn + '()', funcs[fn][1], env, daemon_shared, 'openrc')
+            res['faults'] += f; res['notes'] += nt; unp += u
+    if res['faults']:
+        res['status'] = 'FAULT'
+    elif unp:
+        res.update(status='UNPARSED', line=unp[0][0], why=unp[0][1])
+    elif daemon_shared or has_stop:
+        res['status'] = 'OK'
+    else:
+        res['status'] = 'NA'
+    return res
+
+
+def analyse_file(path, confd):
+    name = os.path.basename(path)
+    base = {'status': 'UNPARSED', 'faults': [], 'notes': [], 'line': 0, 'why': '', 'daemon': ''}
+    try:
+        with open(path, 'rb') as fh:
+            raw = fh.read()
+    except OSError as e:
+        return dict(base, why='cannot read: %s' % e.strerror)
+    if b'\0' in raw[:4096]:
+        return dict(base, line=1, why='binary file')
+    try:
+        return analyse_text(name, raw.decode('utf-8', 'replace'), confd)
+    except Exception as e:  # a bug in the lint must surface as UNPARSED for that file: never a pass, never a fault
+        return dict(base, why='lint error: %s: %s' % (type(e).__name__, e))
+
+
+def main(argv):
+    d, confd, as_json, quiet, files = '/etc/init.d', '/etc/conf.d', False, False, []
+    a = list(argv)
+    while a:
+        x = a.pop(0)
+        if x == '--dir' and a: d = a.pop(0)
+        elif x == '--confd' and a: confd = a.pop(0)
+        elif x == '--json': as_json = True
+        elif x in ('-q', '--quiet'): quiet = True
+        elif x in ('-h', '--help'): print(__doc__); return 0
+        elif x.startswith('-'): print('honey-initd-lint: unknown or incomplete option %s' % x, file=sys.stderr); return 2
+        else: files.append(x)
+    if not files:
+        try:
+            files = [os.path.join(d, f) for f in sorted(os.listdir(d))]
+        except OSError as e:
+            print('honey-initd-lint: cannot read %s: %s' % (d, e.strerror), file=sys.stderr)
+            return 2
+    rows, skipped = [], 0
+    for p in files:
+        if os.path.isdir(p) or os.path.basename(p).startswith('.'):  # dotfiles in /etc/init.d are insserv caches (.depend.*), not scripts
+            skipped += 1; continue
+        r = analyse_file(p, confd)
+        r['path'], r['inactive'] = p, bool(INACTIVE_RE.search(os.path.basename(p)))
+        rows.append(r)
+    act = [r for r in rows if not r['inactive']]
+    ina = [r for r in rows if r['inactive']]
+    cnt = lambda rs, k: sum(1 for r in rs if r['status'] == k)
+    s = {'scanned': len(rows), 'active': len(act), 'ok': cnt(act, 'OK'), 'not_applicable': cnt(act, 'NA'), 'fault': cnt(act, 'FAULT'),
+         'unparsed': cnt(act, 'UNPARSED'), 'inactive_copies': len(ina), 'inactive_copies_with_fault': cnt(ina, 'FAULT'),
+         'inactive_copies_unparsed': cnt(ina, 'UNPARSED')}
+    rc = 1 if s['fault'] else 0
+    if as_json:
+        print(json.dumps({'summary': s, 'exit': rc, 'directories_skipped': skipped, 'results': rows}, indent=1))
+        return rc
+    for r in rows:
+        tag = ' (inactive copy)' if r['inactive'] else ''
+        if r['status'] == 'FAULT':
+            for ln, rule, msg in r['faults']:
+                print('FAULT%s %s:%s [%s] %s' % (tag, r['path'], ln or '-', rule, msg))
+        elif r['status'] == 'UNPARSED':
+            print('UNPARSED%s %s:%s %s' % (tag, r['path'], r['line'] or '-', r['why']))
+        if not quiet:
+            for ln, msg in r['notes']:
+                print('NOTE%s %s:%s %s' % (tag, r['path'], ln, msg))
+    print('SUMMARY scanned=%(scanned)d active=%(active)d ok=%(ok)d not_applicable=%(not_applicable)d fault=%(fault)d unparsed=%(unparsed)d '
+          'inactive_copies=%(inactive_copies)d inactive_copies_with_fault=%(inactive_copies_with_fault)d inactive_copies_unparsed=%(inactive_copies_unparsed)d' % s)
+    print('RESULT ' + ('FAIL: %d active script(s) with a proven fault' % s['fault'] if rc else
+                       'PASS: no proven fault in an active script (%d UNPARSED are not a verdict)' % s['unparsed']))
+    return rc
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))
+#+END_SRC
+
+
+#+BEGIN_SRC bash :tangle all/.local/bin/honey-initd-lint-watch :tangle-mode (identity #o755) :comments no :shebang "#!/usr/bin/env bash"
+# honey-initd-lint-watch (generated by agents-bots-honey.org): run honey-initd-lint when an init script or its conf.d changed, when the lint itself changed,
+# and at least once a day. Cheap enough to run from cron every few minutes: it hashes /etc/init.d and /etc/conf.d (a few hundred small files) and stops
+# there when nothing moved. Read-only on the system: it writes only under its own state directory.
+#   state: ${HONEY_INITD_LINT_STATE:-~/.local/state/honey-initd-lint}/{status,last.txt,last.json,history.log,sig}
+#   status is ONE line: "<iso time> rc=<0|1|2> fault=<n> unparsed=<n> scanned=<n> faulting=<names>"; rc=1 means a proven fault, nothing else does.
+# Alerting is opt-in and OFF: set HONEY_INITD_LINT_ALERT to a command that takes one message argument and it is called when the SET of faulting
+# scripts changes (a new fault, or one cleared), never on a repeat run.
+# Usage: honey-initd-lint-watch [--force] [--max-age SECONDS]    (exit status = the last lint run's: 0 clean, 1 proven fault, 2 could not run)
+set -uo pipefail
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+LINT="${HONEY_INITD_LINT:-$HERE/honey-initd-lint}"
+DIR="${HONEY_INITD_DIR:-/etc/init.d}"; CONFD="${HONEY_INITD_CONFD:-/etc/conf.d}"
+STATE="${HONEY_INITD_LINT_STATE:-$HOME/.local/state/honey-initd-lint}"
+MAX_AGE=86400; FORCE=0
+while [ $# -gt 0 ]; do case "$1" in
+  --force) FORCE=1;; --max-age) MAX_AGE="$2"; shift;; -h|--help) sed -n '2,12p' "$0"; exit 0;;
+  *) echo "honey-initd-lint-watch: unknown option $1" >&2; exit 2;; esac; shift; done
+[ -f "$LINT" ] || { echo "honey-initd-lint-watch: lint not found: $LINT" >&2; exit 2; }
+mkdir -p "$STATE" || exit 2
+exec 9>"$STATE/lock"; flock -n 9 || exit 0   # a run is already in progress
+sig="$( { find "$DIR" "$CONFD" -maxdepth 1 -type f -print0 2>/dev/null | sort -z | xargs -0 -r sha256sum; sha256sum "$LINT"; } | sha256sum | cut -d' ' -f1)"
+last_sig="$(cat "$STATE/sig" 2>/dev/null || true)"
+now="$(date +%s)"; last_run="$(stat -c %Y "$STATE/status" 2>/dev/null || echo 0)"
+if [ "$FORCE" = 0 ] && [ "$sig" = "$last_sig" ] && [ $((now - last_run)) -lt "$MAX_AGE" ]; then
+  rc="$(sed -n 's/^[^ ]* rc=\([0-9]\).*/\1/p' "$STATE/status" 2>/dev/null | head -1)"; exit "${rc:-0}"
+fi
+prev_faulting="$(sed -n 's/.* faulting=//p' "$STATE/status" 2>/dev/null | head -1)"
+python3 -I "$LINT" --dir "$DIR" --confd "$CONFD" > "$STATE/last.txt.new" 2>&1; rc=$?
+python3 -I "$LINT" --dir "$DIR" --confd "$CONFD" --json > "$STATE/last.json.new" 2>/dev/null
+mv -f "$STATE/last.txt.new" "$STATE/last.txt"; mv -f "$STATE/last.json.new" "$STATE/last.json"
+summary="$(grep '^SUMMARY ' "$STATE/last.txt" | tail -1)"
+num() { printf '%s\n' "$summary" | tr ' ' '\n' | sed -n "s/^$1=//p" | head -1; }
+faulting="$(grep '^FAULT ' "$STATE/last.txt" | grep -v '^FAULT (inactive copy)' | sed 's|^FAULT [^ ]*/\([^/:]*\):.*|\1|' | sort -u | paste -sd, -)"
+line="$(date -Is) rc=$rc fault=$(num fault) unparsed=$(num unparsed) scanned=$(num scanned) faulting=${faulting:-none}"
+echo "$line" > "$STATE/status"; echo "$line" >> "$STATE/history.log"; echo "$sig" > "$STATE/sig"
+if [ -n "${HONEY_INITD_LINT_ALERT:-}" ] && [ "${faulting:-none}" != "${prev_faulting:-none}" ]; then
+  "$HONEY_INITD_LINT_ALERT" "honey-initd-lint: faulting init scripts changed: ${prev_faulting:-none} -> ${faulting:-none}" >/dev/null 2>&1 || true
+fi
+exit "$rc"
+#+END_SRC
+
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/honey-initd-lint/test_initd_lint.py :tangle-mode (identity #o755) :comments no :shebang "#!/usr/bin/python3"
+"""Tests for honey-initd-lint (generated by agents-bots-honey.org). Pure Python: no root, no OpenRC, no network, reads only its own fixtures.
+HONEY_INITD_LINT=/path overrides the lint under test (the mutation proof uses it)."""
+import importlib.machinery, importlib.util, json, os, subprocess, sys, tempfile, unittest
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CANDIDATES = [os.environ.get('HONEY_INITD_LINT', ''), os.path.join(HERE, '..', '..', '..', 'bin', 'honey-initd-lint'), os.path.join(HERE, 'honey-initd-lint')]
+LINT = next(os.path.abspath(c) for c in CANDIDATES if c and os.path.isfile(c))
+WATCH = next((c for c in (os.environ.get('HONEY_INITD_LINT_WATCH', ''), os.path.join(HERE, '..', '..', '..', 'bin', 'honey-initd-lint-watch'), os.path.join(HERE, 'honey-initd-lint-watch')) if c and os.path.isfile(c)), None)
+PROOF = next((os.path.join(HERE, n) for n in ('initd-stop-proof',) if os.path.isfile(os.path.join(HERE, n))), None)
+_spec = importlib.util.spec_from_loader('initd_lint', importlib.machinery.SourceFileLoader('initd_lint', LINT))
+lint = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(lint)
+
+OPENRC = '#!/sbin/openrc-run\n'
+SAFE_STOP = '''
+stop() {
+    local pid
+    pid="$(cat "${pidfile}" 2>/dev/null)"
+    [ -n "${pid}" ] || return 0
+    ebegin "Stopping ${RC_SVCNAME}"
+    start-stop-daemon --stop --quiet --retry TERM/5/KILL/3 --pidfile "${pidfile}"
+    eend $?
+}
+'''
+PY = OPENRC + 'command="/usr/bin/python3"\ncommand_args="-I /opt/x/relay.py"\ncommand_background=true\npidfile="/run/${RC_SVCNAME}.pid"\n'
+
+
+def wr(path, text):
+    with open(path, 'w') as fh:
+        fh.write(text)
+
+
+def rd(path):
+    with open(path) as fh:
+        return fh.read()
+
+
+def run(text, name='svc', confd=None):
+    return lint.analyse_text(name, text, confd)
+
+
+def rules(res):
+    return sorted(r for _, r, _ in res['faults'])
+
+
+class Rule1NoOwnStop(unittest.TestCase):
+    def test_python3_without_stop_is_the_fault_that_killed_seven_services(self):
+        r = run(PY)
+        self.assertEqual(r['status'], 'FAULT'); self.assertEqual(rules(r), ['no-own-stop'])
+
+    def test_the_fault_names_the_line_of_command(self):
+        r = run(PY)
+        self.assertEqual(r['faults'][0][0], 2)
+
+    def test_every_shared_interpreter_name_is_caught(self):
+        for exe in ('/usr/bin/python3', '/usr/bin/python', '/usr/bin/python3.13', '/usr/bin/perl', '/bin/bash', '/bin/sh', '/usr/bin/node', '/usr/bin/ruby', '/venv/bin/python3'):
+            with self.subTest(exe=exe):
+                self.assertEqual(run(OPENRC + 'command="%s"\npidfile=/run/x.pid\n' % exe)['status'], 'FAULT')
+
+    def test_a_specific_daemon_is_not_applicable(self):
+        r = run(OPENRC + 'command="/usr/bin/syncthing"\npidfile=/run/x.pid\n')
+        self.assertEqual(r['status'], 'NA'); self.assertEqual(r['faults'], [])
+
+    def test_a_script_that_merely_runs_under_python_is_not_shared(self):
+        self.assertEqual(run(OPENRC + 'command="/home/u/bin/llama-swap-bridge-relay.py"\n')['status'], 'NA')
+
+    def test_default_expansion_resolves_to_the_interpreter(self):
+        r = run(OPENRC + 'command="${py:-/usr/bin/python3}"\n')
+        self.assertEqual(r['status'], 'FAULT')
+
+    def test_conf_d_is_sourced_first_so_it_feeds_defaults_but_a_plain_assignment_in_the_script_wins(self):
+        with tempfile.TemporaryDirectory() as d:
+            wr(os.path.join(d, 'svc'), 'py=/opt/app/bin/app-server\n')
+            self.assertEqual(run(OPENRC + 'command="${py:-/usr/bin/python3}"\n', confd=d)['status'], 'NA')
+            wr(os.path.join(d, 'svc'), 'py=/usr/bin/python3\n')
+            self.assertEqual(run(OPENRC + 'command="${py:-/opt/app/bin/app-server}"\n', confd=d)['status'], 'FAULT')
+            wr(os.path.join(d, 'svc'), 'command=/usr/bin/python3\n')  # a plain assignment in the script is sourced later and wins
+            self.assertEqual(run(OPENRC + 'command=/opt/app/bin/app-server\n', confd=d)['status'], 'NA')
+
+    def test_a_variable_set_earlier_in_the_script_is_followed(self):
+        self.assertEqual(run(OPENRC + 'interp=/usr/bin/python3\ncommand="${interp}"\n')['status'], 'FAULT')
+
+    def test_procname_naming_an_interpreter_is_shared(self):
+        self.assertEqual(run(OPENRC + 'command="/opt/x/server"\nprocname=python3\n')['status'], 'FAULT')
+
+    def test_an_own_stop_clears_it(self):
+        r = run(PY + SAFE_STOP)
+        self.assertEqual((r['status'], r['faults']), ('OK', []))
+
+    def test_conf_d_default_assignment_form_is_followed(self):
+        self.assertEqual(run(OPENRC + ': "${command:=/usr/bin/python3}"\n')['status'], 'FAULT')
+
+
+class Rule2StopPassesExec(unittest.TestCase):
+    def stop_with(self, line):
+        return run(PY + 'stop() {\n    %s\n}\n' % line)
+
+    def test_exec_python3_in_stop_is_a_fault_that_looks_like_a_fix(self):
+        r = self.stop_with('start-stop-daemon --stop --exec /usr/bin/python3 --pidfile "${pidfile}"')
+        self.assertEqual(rules(r), ['stop-exec'])
+
+    def test_exec_through_the_command_variable_is_a_fault(self):
+        self.assertEqual(rules(self.stop_with('start-stop-daemon --stop --exec "${command}" --pidfile "${pidfile}"')), ['stop-exec'])
+
+    def test_short_and_equals_forms_are_caught(self):
+        for form in ('-x /usr/bin/python3', '--exec=/usr/bin/python3', '-x/usr/bin/python3'):
+            with self.subTest(form=form):
+                self.assertEqual(rules(self.stop_with('start-stop-daemon -K %s -p "${pidfile}"' % form)), ['stop-exec'])
+
+    def test_exec_of_a_specific_binary_is_not_a_fault(self):
+        r = run(OPENRC + 'command="/opt/x/relay-server"\n' + 'stop() {\n    start-stop-daemon --stop --exec /opt/x/relay-server --pidfile "${pidfile}"\n}\n')
+        self.assertEqual(r['status'], 'OK')
+
+    def test_unresolvable_exec_on_a_shared_daemon_is_a_fault_but_on_others_unparsed(self):
+        self.assertEqual(rules(self.stop_with('start-stop-daemon --stop --exec "${mystery}" --pidfile "${pidfile}"')), ['stop-exec'])
+        r = run(OPENRC + 'command="/opt/x/server"\nstop() {\n    start-stop-daemon --stop --exec "${mystery}" --pidfile "${pidfile}"\n}\n')
+        self.assertEqual(r['status'], 'UNPARSED'); self.assertEqual(r['line'], 4)
+
+    def test_exec_in_stop_pre_and_stop_post_counts(self):
+        for fn in ('stop_pre', 'stop_post'):
+            with self.subTest(fn=fn):
+                r = run(PY + SAFE_STOP + '%s() {\n    start-stop-daemon --stop --exec /usr/bin/python3\n}\n' % fn)
+                self.assertEqual(rules(r), ['stop-exec'])
+
+    def test_exec_in_a_comment_or_a_string_is_not_a_call(self):
+        r = run(PY + 'stop() {\n    # never pass --exec /usr/bin/python3 here\n    einfo "no --exec /usr/bin/python3 --stop"\n    start-stop-daemon --stop --pidfile "${pidfile}"\n}\n')
+        self.assertEqual(r['status'], 'OK')
+
+    def test_the_landed_egress_unit_passes(self):
+        unit = os.path.join(HERE, '..', 'honey-fca-dsh', 'openrc', 'honey-fca-egress')
+        if not os.path.isfile(unit):
+            self.skipTest('SKIPPED: the relay unit is not beside this lane')
+        r = lint.analyse_file(unit, None)
+        self.assertEqual((r['status'], r['faults']), ('OK', []))
+
+
+class Rule3SignalsByNameOrPattern(unittest.TestCase):
+    def stop_with(self, body, head=PY):
+        return run(head + 'stop() {\n%s\n}\n' % body)
+
+    def test_pkill_python3_is_a_fault(self):
+        self.assertEqual(rules(self.stop_with('    pkill python3')), ['stop-by-name'])
+
+    def test_pkill_pattern_on_a_shared_daemon_is_a_fault_even_with_a_uid(self):
+        self.assertEqual(rules(self.stop_with('    pkill -u svc -f relay.py')), ['stop-by-name'])
+
+    def test_unscoped_pattern_signal_is_a_fault_even_on_a_specific_daemon(self):
+        r = self.stop_with('    pkill -f my-daemon', head=OPENRC + 'command="/opt/x/my-daemon"\n')
+        self.assertEqual(rules(r), ['stop-by-name'])
+
+    def test_uid_scoped_specific_pattern_on_a_specific_daemon_is_only_a_note(self):
+        r = self.stop_with('    pkill -TERM -u "${warm_user}" -f "/home/u/.local/bin/warm" 2>/dev/null', head=OPENRC + 'command="/opt/x/my-daemon"\nwarm_user=svc\n')
+        self.assertEqual((r['status'], r['faults']), ('OK', [])); self.assertEqual(len(r['notes']), 1)
+
+    def test_bare_interpreter_pattern_is_a_fault_even_when_uid_scoped(self):
+        r = self.stop_with('    pkill -u svc -f python3', head=OPENRC + 'command="/opt/x/my-daemon"\n')
+        self.assertEqual(rules(r), ['stop-by-name'])
+
+    def test_killall_is_caught(self):
+        self.assertEqual(rules(self.stop_with('    killall -TERM relay', head=OPENRC + 'command="/opt/x/relay"\n')), ['stop-by-name'])
+
+    def test_kill_of_a_pgrep_substitution_is_caught(self):
+        self.assertEqual(rules(self.stop_with('    kill -TERM $(pgrep -f relay.py)', head=OPENRC + 'command="/opt/x/relay"\n')), ['stop-by-name'])
+
+    def test_pgrep_piped_to_xargs_kill_is_caught(self):
+        self.assertEqual(rules(self.stop_with('    pgrep -f relay.py | xargs kill', head=OPENRC + 'command="/opt/x/relay"\n')), ['stop-by-name'])
+
+    def test_pgrep_alone_is_not_a_signal(self):
+        r = self.stop_with('    while pgrep -f relay.py >/dev/null 2>&1; do sleep 1; done', head=OPENRC + 'command="/opt/x/relay"\n')
+        self.assertEqual((r['status'], r['faults'], r['notes']), ('OK', [], []))
+
+    def test_start_stop_daemon_name_python3_is_a_fault(self):
+        self.assertEqual(rules(self.stop_with('    start-stop-daemon --stop --name python3 --pidfile "${pidfile}"')), ['stop-by-name'])
+
+    def test_a_specific_ssd_name_is_a_note(self):
+        r = self.stop_with('    start-stop-daemon --stop --name udevd', head=OPENRC + 'command="/opt/x/relay"\n')
+        self.assertEqual(r['faults'], []); self.assertEqual(len(r['notes']), 1)
+
+    def test_signal_by_pidfile_or_by_pid_is_fine(self):
+        r = self.stop_with('    local pid; pid="$(cat "${pidfile}")"\n    kill -TERM "${pid}"\n    kill -0 "${pid}" && kill -KILL "${pid}"')
+        self.assertEqual((r['status'], r['faults']), ('OK', []))
+
+    def test_signal_by_ssd_uid_and_pidfile_is_fine(self):
+        r = self.stop_with('    start-stop-daemon --stop --user svc --pidfile "${pidfile}"')
+        self.assertEqual((r['status'], r['faults']), ('OK', []))
+
+    def test_pkill_inside_sh_c_and_su_c_is_still_seen(self):
+        for wrap in ('su -l svc -c "pkill python3"', "sh -c 'pkill python3'"):
+            with self.subTest(wrap=wrap):
+                self.assertEqual(rules(self.stop_with('    ' + wrap)), ['stop-by-name'])
+
+    def test_a_function_that_is_not_stop_family_is_not_examined(self):
+        r = run(PY + SAFE_STOP + 'start_pre() {\n    pkill -f stale-thing\n}\n')
+        self.assertEqual(r['status'], 'OK')
+
+    def test_a_comment_with_an_apostrophe_or_a_brace_does_not_break_parsing(self):
+        r = run(PY + "stop() {\n    # it's a { odd comment\n    start-stop-daemon --stop --pidfile \"${pidfile}\"  # not --exec\n}\n")
+        self.assertEqual((r['status'], r['faults']), ('OK', []))
+
+    def test_pkill_in_a_comment_or_heredoc_is_not_a_call(self):
+        r = run(PY + SAFE_STOP + "stop_post() {\n    # pkill python3\n    cat <<'EOF'\npkill python3\nstop() {\nEOF\n    rm -f /run/x.sock\n}\n")
+        self.assertEqual(r['status'], 'OK')
+
+
+class UnparsedIsNeverAVerdict(unittest.TestCase):
+    def test_unterminated_quote_reports_the_line(self):
+        r = run(OPENRC + 'command="/usr/bin/python3"\necho "oops\n')
+        self.assertEqual(r['status'], 'UNPARSED'); self.assertEqual(r['line'], 3); self.assertIn('quote', r['why'])
+
+    def test_unbalanced_function_reports_the_line_where_it_opened(self):
+        r = run(OPENRC + 'command="/opt/x/y"\nstop() {\n    echo hi\n')
+        self.assertEqual((r['status'], r['line']), ('UNPARSED', 3))
+
+    def test_computed_command_without_a_stop_is_unparsed_with_its_line(self):
+        r = run(OPENRC + 'user_home="$(getent passwd u | cut -d: -f6)"\ncommand="${user_home}"\n')
+        self.assertEqual((r['status'], r['line']), ('UNPARSED', 3))
+
+    def test_computed_prefix_with_a_literal_specific_tail_is_decidable(self):
+        r = run(OPENRC + 'user_home="$(getent passwd u | cut -d: -f6)"\ncommand="${user_home}/.local/bin/ductor"\n')
+        self.assertEqual(r['status'], 'NA')
+
+    def test_computed_prefix_with_a_literal_interpreter_tail_is_a_fault(self):
+        r = run(OPENRC + 'user_home="$(getent passwd u | cut -d: -f6)"\ncommand="${user_home}/venv/bin/python3"\n')
+        self.assertEqual(r['status'], 'FAULT')
+
+    def test_no_shebang_is_unparsed(self):
+        r = run('some text\n')
+        self.assertEqual((r['status'], r['line']), ('UNPARSED', 1))
+
+    def test_supervise_daemon_on_a_shared_interpreter_is_unparsed_not_a_fault(self):
+        self.assertEqual(run(PY + 'supervisor=supervise-daemon\n')['status'], 'UNPARSED')
+
+    def test_supervise_daemon_on_a_specific_daemon_is_not_applicable(self):
+        self.assertEqual(run(OPENRC + 'supervisor=supervise-daemon\ncommand=/sbin/agetty\n')['status'], 'NA')
+
+    def test_a_subshell_function_body_is_unparsed(self):
+        self.assertEqual(run(PY + 'stop() ( pkill python3 )\n')['status'], 'UNPARSED')
+
+    def test_exit_status_ignores_unparsed(self):
+        with tempfile.TemporaryDirectory() as d:
+            wr(os.path.join(d, 'a'), 'no shebang\n')
+            wr(os.path.join(d, 'b'), OPENRC + 'command="/opt/x/y"\necho "oops\n')
+            p = subprocess.run([sys.executable, '-I', LINT, '--dir', d, '--confd', d + '/none'], capture_output=True, text=True)
+            self.assertEqual(p.returncode, 0, p.stdout)
+            self.assertIn('unparsed=2', p.stdout); self.assertIn('UNPARSED %s/b:3' % d, p.stdout)
+
+    def test_a_bug_in_the_lint_is_unparsed_for_that_file_never_a_pass_or_a_fault(self):
+        saved = lint.analyse_text
+        try:
+            lint.analyse_text = lambda *a, **k: 1 / 0
+            with tempfile.TemporaryDirectory() as d:
+                p = os.path.join(d, 'x'); wr(p, OPENRC)
+                r = lint.analyse_file(p, None)
+                self.assertEqual(r['status'], 'UNPARSED'); self.assertIn('ZeroDivisionError', r['why'])
+        finally:
+            lint.analyse_text = saved
+
+
+class SysvScripts(unittest.TestCase):
+    HEAD = '#!/bin/sh\nDAEMON=/usr/bin/python3\nPIDFILE=/var/run/x.pid\ncase "$1" in\n  start) start-stop-daemon --start --pidfile $PIDFILE --exec $DAEMON -- /opt/x.py ;;\n'
+
+    def test_stop_by_pidfile_only_is_fine(self):
+        r = run(self.HEAD + '  stop) start-stop-daemon --stop --pidfile $PIDFILE ;;\nesac\n')
+        self.assertEqual((r['status'], r['faults']), ('NA', []))
+
+    def test_stop_by_exec_alone_on_an_interpreter_is_a_fault(self):
+        r = run(self.HEAD + '  stop) start-stop-daemon --stop --exec $DAEMON ;;\nesac\n')
+        self.assertEqual(rules(r), ['stop-exec'])
+
+    def test_exec_next_to_a_pidfile_narrows_the_match_and_is_accepted(self):
+        r = run(self.HEAD + '  stop) start-stop-daemon --stop --exec $DAEMON --pidfile $PIDFILE ;;\nesac\n')
+        self.assertEqual(r['faults'], [])
+
+    def test_pkill_python3_in_a_sysv_script_is_a_fault(self):
+        r = run(self.HEAD + '  stop) pkill python3 ;;\nesac\n')
+        self.assertEqual(rules(r), ['stop-by-name'])
+
+    def test_continuation_lines_are_joined(self):
+        r = run(self.HEAD + '  stop) start-stop-daemon --stop \\\n      --exec /usr/bin/python3 ;;\nesac\n')
+        self.assertEqual(rules(r), ['stop-exec'])
+
+
+class DirectoryRun(unittest.TestCase):
+    def tree(self, files):
+        d = tempfile.mkdtemp(); self.addCleanup(lambda: __import__('shutil').rmtree(d, ignore_errors=True))
+        for n, t in files.items():
+            os.makedirs(os.path.dirname(os.path.join(d, n)), exist_ok=True)
+            if t is None: os.mkdir(os.path.join(d, n))
+            else: wr(os.path.join(d, n), t)
+        return d
+
+    def cli(self, d, *extra):
+        return subprocess.run([sys.executable, '-I', LINT, '--dir', d, '--confd', d + '/none', *extra], capture_output=True, text=True)
+
+    def test_exit_1_on_a_proven_fault_and_the_summary_counts_add_up(self):
+        d = self.tree({'bad': PY, 'good': PY + SAFE_STOP, 'other': OPENRC + 'command=/usr/bin/syncthing\n', 'junk': 'x\n'})
+        p = self.cli(d)
+        self.assertEqual(p.returncode, 1, p.stdout)
+        self.assertIn('scanned=4 active=4 ok=1 not_applicable=1 fault=1 unparsed=1', p.stdout)
+        self.assertIn('RESULT FAIL', p.stdout)
+
+    def test_exit_0_and_a_pass_line_when_no_active_script_is_faulty(self):
+        p = self.cli(self.tree({'good': PY + SAFE_STOP}))
+        self.assertEqual(p.returncode, 0); self.assertIn('RESULT PASS', p.stdout)
+
+    def test_backup_copies_are_reported_but_never_change_the_exit(self):
+        d = self.tree({'svc': PY + SAFE_STOP, 'svc.bak-2026-10-01': PY, 'svc.orig': PY, 'old.disabled': PY, 'hermes.retired-handrolled': PY, 'svc~': PY})
+        p = self.cli(d)
+        self.assertEqual(p.returncode, 0, p.stdout)
+        self.assertIn('scanned=6 active=1', p.stdout); self.assertIn('inactive_copies=5 inactive_copies_with_fault=5', p.stdout)
+        self.assertIn('FAULT (inactive copy)', p.stdout)
+
+    def test_dotfiles_and_directories_are_not_scripts(self):
+        d = self.tree({'.depend.boot': 'TARGETS = x\n', 'sub': None, 'svc': PY + SAFE_STOP})
+        p = self.cli(d, '--json'); j = json.loads(p.stdout)
+        self.assertEqual(j['summary']['scanned'], 1); self.assertEqual(j['directories_skipped'], 2)
+
+    def test_json_carries_the_summary_the_exit_and_each_finding(self):
+        d = self.tree({'bad': PY})
+        j = json.loads(self.cli(d, '--json').stdout)
+        self.assertEqual((j['exit'], j['summary']['fault']), (1, 1))
+        self.assertEqual(j['results'][0]['faults'][0][1], 'no-own-stop')
+
+    def test_an_unreadable_directory_is_exit_2(self):
+        p = subprocess.run([sys.executable, '-I', LINT, '--dir', '/nonexistent-init-d'], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 2)
+
+    def test_unknown_option_is_exit_2(self):
+        self.assertEqual(subprocess.run([sys.executable, '-I', LINT, '--bogus'], capture_output=True, text=True).returncode, 2)
+
+    def test_the_lint_reads_and_never_runs_a_script(self):
+        marker = os.path.join(tempfile.gettempdir(), 'initd-lint-ran-%d' % os.getpid())
+        d = self.tree({'trap': OPENRC + 'touch %s\ncommand=/opt/x/y\nstop() {\n  touch %s\n}\n' % (marker, marker)})
+        self.cli(d)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_explicit_file_arguments_are_linted(self):
+        d = self.tree({'bad': PY})
+        p = subprocess.run([sys.executable, '-I', LINT, os.path.join(d, 'bad')], capture_output=True, text=True)
+        self.assertEqual(p.returncode, 1)
+
+
+class ParserDetails(unittest.TestCase):
+    def test_brace_on_the_next_line_and_one_line_functions(self):
+        for body in ('stop()\n{\n    start-stop-daemon --stop --pidfile "${pidfile}"\n}\n', 'stop() { start-stop-daemon --stop --pidfile "${pidfile}"; }\n',
+                     'function stop {\n}\n' if False else 'stop() {\n    local x="${y:-{}}"\n    start-stop-daemon --stop --pidfile "${pidfile}"\n}\n'):
+            with self.subTest(body=body):
+                self.assertEqual(run(PY + body)['status'], 'OK')
+
+    def test_continuation_lines_join_in_openrc_stop(self):
+        r = run(PY + 'stop() {\n    start-stop-daemon --stop \\\n        --exec /usr/bin/python3 \\\n        --pidfile "${pidfile}"\n}\n')
+        self.assertEqual(rules(r), ['stop-exec'])
+
+    def test_a_quoted_semicolon_does_not_split_a_command(self):
+        r = run(PY + SAFE_STOP + 'stop_post() {\n    einfo "pkill python3; really"\n}\n')
+        self.assertEqual(r['status'], 'OK')
+
+    def test_redirections_are_not_taken_for_patterns(self):
+        r = run(OPENRC + 'command=/opt/x/relay\nstop() {\n    pkill -u svc -f /opt/x/relay 2>/dev/null >/dev/null\n}\n')
+        self.assertEqual(r['faults'], []); self.assertIn('/opt/x/relay', r['notes'][0][1])
+
+    def test_dollar_paren_command_values_are_not_resolved(self):
+        self.assertIsNone(lint.expand('$(getent passwd x)', {}))
+        self.assertIsNone(lint.expand('${undefined}/x', {}))
+        self.assertEqual(lint.expand('${a:-b}/c', {}), 'b/c')
+        self.assertEqual(lint.expand('${a:-b}/c', {'a': 'z'}), 'z/c')
+
+    def test_default_that_contains_a_path_is_not_an_unsupported_operator(self):
+        self.assertEqual(lint.expand('${honey_voice_python:-/usr/bin/python3}', {}), '/usr/bin/python3')
+
+
+@unittest.skipUnless(WATCH and all(subprocess.run(['sh', '-c', 'command -v ' + c], capture_output=True).returncode == 0 for c in ('flock', 'sha256sum', 'xargs')),
+                     'SKIPPED: honey-initd-lint-watch or flock/sha256sum/xargs is not available')
+class Watcher(unittest.TestCase):
+    def setUp(self):
+        self.d = tempfile.mkdtemp(); self.addCleanup(lambda: __import__('shutil').rmtree(self.d, ignore_errors=True))
+        for sub in ('init.d', 'conf.d', 'state'):
+            os.mkdir(os.path.join(self.d, sub))
+        wr(os.path.join(self.d, 'init.d', 'good'), PY + SAFE_STOP)
+        self.alert = os.path.join(self.d, 'alert.sh'); wr(self.alert, '#!/bin/sh\necho "$1" >> %s/alerts\n' % self.d); os.chmod(self.alert, 0o755)
+
+    def watch(self, *a, alert=True):
+        env = dict(os.environ, HONEY_INITD_LINT=LINT, HONEY_INITD_DIR=self.d + '/init.d', HONEY_INITD_CONFD=self.d + '/conf.d', HONEY_INITD_LINT_STATE=self.d + '/state')
+        env.pop('HONEY_INITD_LINT_ALERT', None)
+        if alert: env['HONEY_INITD_LINT_ALERT'] = self.alert
+        return subprocess.run(['bash', WATCH, *a], capture_output=True, text=True, env=env, timeout=60)
+
+    def history(self):
+        p = os.path.join(self.d, 'state', 'history.log')
+        return rd(p).splitlines() if os.path.exists(p) else []
+
+    def alerts(self):
+        p = os.path.join(self.d, 'alerts')
+        return rd(p).splitlines() if os.path.exists(p) else []
+
+    def test_first_run_records_a_status_line_and_exits_clean(self):
+        self.assertEqual(self.watch().returncode, 0)
+        self.assertRegex(rd(os.path.join(self.d, 'state', 'status')), r' rc=0 fault=0 unparsed=0 scanned=1 faulting=none')
+
+    def test_an_unchanged_tree_is_not_linted_again(self):
+        self.watch(); self.watch(); self.watch()
+        self.assertEqual(len(self.history()), 1)
+
+    def test_a_changed_init_script_triggers_a_run_and_a_new_fault_exits_1(self):
+        self.watch()
+        wr(os.path.join(self.d, 'init.d', 'newsvc'), PY)
+        p = self.watch()
+        self.assertEqual(p.returncode, 1); self.assertEqual(len(self.history()), 2)
+        self.assertIn('faulting=newsvc', self.history()[-1])
+
+    def test_a_changed_conf_d_triggers_a_run(self):
+        self.watch(); wr(os.path.join(self.d, 'conf.d', 'good'), 'x=1\n'); self.watch()
+        self.assertEqual(len(self.history()), 2)
+
+    def test_an_edit_that_keeps_the_size_and_mtime_is_still_seen(self):
+        p = os.path.join(self.d, 'init.d', 'a'); wr(p, OPENRC + 'command=/opt/x/aaa\n'); self.watch()
+        st = os.stat(p); wr(p, OPENRC + 'command=/opt/x/bbb\n'); os.utime(p, (st.st_atime, st.st_mtime)); self.watch()
+        self.assertEqual(len(self.history()), 2)
+
+    def test_a_stale_status_forces_a_daily_rerun(self):
+        self.watch(); old = os.path.join(self.d, 'state', 'status'); os.utime(old, (0, 0))
+        self.watch(); self.assertEqual(len(self.history()), 2)
+
+    def test_force_always_runs(self):
+        self.watch(); self.watch('--force'); self.assertEqual(len(self.history()), 2)
+
+    def test_the_alert_fires_when_the_faulting_set_changes_and_not_on_repeats(self):
+        self.watch(); self.assertEqual(self.alerts(), [])
+        wr(os.path.join(self.d, 'init.d', 'newsvc'), PY); self.watch(); self.watch('--force'); self.watch('--force')
+        self.assertEqual(len(self.alerts()), 1); self.assertIn('none -> newsvc', self.alerts()[0])
+        wr(os.path.join(self.d, 'init.d', 'newsvc'), PY + SAFE_STOP); self.watch()
+        self.assertEqual(len(self.alerts()), 2); self.assertIn('newsvc -> none', self.alerts()[1])
+
+    def test_alerting_is_off_unless_asked_for(self):
+        wr(os.path.join(self.d, 'init.d', 'newsvc'), PY); self.watch(alert=False)
+        self.assertEqual(self.alerts(), [])
+
+    def test_a_lint_change_triggers_a_run(self):
+        copy = os.path.join(self.d, 'lintcopy'); wr(copy, rd(LINT)); self.watch()
+        env = dict(os.environ, HONEY_INITD_LINT=copy, HONEY_INITD_DIR=self.d + '/init.d', HONEY_INITD_CONFD=self.d + '/conf.d', HONEY_INITD_LINT_STATE=self.d + '/state')
+        subprocess.run(['bash', WATCH], env=env, capture_output=True, timeout=60)
+        wr(copy, rd(LINT) + '\n# changed\n'); subprocess.run(['bash', WATCH], env=env, capture_output=True, timeout=60)
+        self.assertEqual(len(self.history()), 3)
+
+    def test_a_missing_lint_is_exit_2_and_writes_nothing(self):
+        env = dict(os.environ, HONEY_INITD_LINT='/nonexistent/lint', HONEY_INITD_LINT_STATE=self.d + '/state')
+        self.assertEqual(subprocess.run(['bash', WATCH], env=env, capture_output=True).returncode, 2)
+        self.assertEqual(self.history(), [])
+
+
+@unittest.skipUnless(PROOF, 'SKIPPED: initd-stop-proof is not beside this test')
+class StopProofGate(unittest.TestCase):
+    """The namespace proof must refuse BEFORE it mounts or starts anything when it is not inside a private PID namespace.
+    These run without root: they call its inside-half directly, in the host namespace, and expect the gate to say no."""
+    def run_inside(self, hostns):
+        return subprocess.run(['bash', PROOF, '--inside', hostns, tempfile.gettempdir(), os.devnull], capture_output=True, text=True, timeout=60)
+
+    def test_refuses_in_the_host_pid_namespace(self):
+        p = self.run_inside(os.readlink('/proc/self/ns/pid'))
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr); self.assertIn('GATE REFUSED', p.stdout)
+
+    def test_refuses_when_pid_is_not_an_early_namespace_pid(self):
+        p = self.run_inside('pid:[0]')
+        self.assertEqual(p.returncode, 5, p.stdout + p.stderr)
+        self.assertNotIn('GATE:', p.stdout)
+
+    def test_the_gate_precedes_every_mount_and_every_start_in_the_source(self):
+        text = rd(PROOF)
+        inside = text[text.index('if [ "${1:-}" = --inside ]'):]
+        gate_end = inside.index('say "GATE:')
+        before = inside[:gate_end]
+        self.assertIn('mount -t tmpfs tmpfs /run', before)
+        self.assertNotIn('openrc-run', '\n'.join(l for l in before.splitlines() if not l.strip().startswith('#')))
+        code = '\n'.join(l for l in before.splitlines() if not l.strip().startswith('#'))
+        self.assertNotRegex(code, r'(^|\s)(start_all|mkunit)\b|units/[a-z-]+" start')
+        for tag in ('GATE REFUSED', 'ns/pid', '/proc/1/cmdline', 'stat -f -c %T /run', 'ls -A /run', 'llama-swap', 'identity_proxy', '*.pid'):
+            self.assertIn(tag, before, tag)
+
+    def test_the_proof_refuses_to_say_proven_when_the_control_is_vacuous(self):
+        text = rd(PROOF)
+        self.assertRegex(text, r'CONTROL" != reproduced \]; then say "RESULT: CONTROL DID NOT REPRODUCE.*exit 3')
+
+    def test_the_proof_labels_its_own_claim(self):
+        text = rd(PROOF)
+        self.assertIn('this stop function signals only its own pid', text)
+        self.assertIn('NOT shown: that the default no longer mass-kills on the real host', text)
+
+
+if __name__ == '__main__':
+    unittest.main(verbosity=2)
+#+END_SRC
+
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/honey-initd-lint/mutation-check-initd-lint.sh :tangle-mode (identity #o755) :comments no :shebang "#!/usr/bin/env bash"
+# Mutation proof for honey-initd-lint (generated by agents-bots-honey.org): each sabotaged copy of the lint MUST fail test_initd_lint.py by a NAMED
+# unittest failure. A pass, a timeout or an infrastructure error is never a kill. Pure Python, no root, no OpenRC; the real lint is not modified.
+# Exit 0 = every mutant killed, 1 = a survivor or an error.
+set -uo pipefail
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+LINT="${HONEY_INITD_LINT:-}"
+[ -n "$LINT" ] || for c in "$HERE/../../../bin/honey-initd-lint" "$HERE/honey-initd-lint"; do [ -f "$c" ] && { LINT="$c"; break; }; done
+[ -f "$LINT" ] || { echo "mutation-check-initd-lint: lint not found"; exit 1; }
+TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
+fail=0; killed=0
+mutate() { # name sed-expression
+  local name="$1" expr="$2" d="$TMP/$1" out rc names
+  mkdir -p "$d"; cp "$LINT" "$d/honey-initd-lint"; sed -i "$expr" "$d/honey-initd-lint"
+  if cmp -s "$LINT" "$d/honey-initd-lint"; then echo "MUTATION NOT APPLIED: $name"; fail=1; return; fi
+  out="$(HONEY_INITD_LINT="$d/honey-initd-lint" timeout 300 python3 "$HERE/test_initd_lint.py" 2>&1)"; rc=$?
+  if [ "$rc" = 124 ]; then echo "TIMEOUT (infrastructure, NOT a kill): $name"; fail=1; return; fi
+  if ! printf '%s\n' "$out" | grep -qE '^(FAILED \(|OK)'; then echo "INFRASTRUCTURE ERROR (not a kill): $name"; printf '%s\n' "$out" | tail -5 | sed 's/^/    | /'; fail=1; return; fi
+  names="$(printf '%s\n' "$out" | grep -E '^(FAIL|ERROR):' | sed 's/^[A-Z]*: //; s/ (.*//' | head -3 | tr '\n' ' ')"
+  if [ -n "$names" ]; then killed=$((killed+1)); echo "killed: $name by: $names"
+  else echo "SURVIVED (tests too weak): $name"; fail=1; fi
+}
+mutate no-own-stop-rule-off        "s/^        if daemon_shared:\$/        if False:/"
+mutate stop-exec-rule-off          "s/elif shared_reason(ev):/elif False:/"
+mutate stop-exec-unresolved-off    "s/if ev is None and daemon_shared:/if False:/"
+mutate unscoped-pattern-ok         "s/elif not uid:/elif False:/"
+mutate bare-interpreter-ok         "s/bare = bool(pv and pv.split() and is_shared(pv.split()\[0\]))/bare = False/"
+mutate shared-daemon-pattern-ok    "s/if daemon_shared or bare:/if bare:/"
+mutate ssd-name-rule-off           "s/if (nv is None and daemon_shared) or (nv is not None and shared_reason(nv)):/if False:/"
+mutate uid-scoped-becomes-fault    "s/notes.append((n, '%s: pattern %r, uid-scoped' % (cmd, pv)))/faults.append((n, 'stop-by-name', 'x'))/"
+mutate unparsed-fails-the-run      "s/rc = 1 if s\['fault'\] else 0/rc = 1 if (s['fault'] or s['unparsed']) else 0/"
+mutate inactive-copies-count       "s/act = \[r for r in rows if not r\['inactive'\]\]/act = rows/"
+mutate comments-not-stripped       "s/if c == '#' and (k == 0 or cur\[k - 1\] in ' \\\\t;&|('):/if False:/"
+mutate heredoc-not-skipped         "s/m = HEREDOC_RE.search(line)/m = None/"
+mutate confd-ignored               "s/if confd and os.path.isfile(os.path.join(confd, name)):/if False:/"
+mutate default-expansion-broken    "s/if op in (':-', '-', ':=', '='):/if False:/"
+mutate sysv-pidfile-narrowing-off  "s/narrowed = kind == 'sysv' and pid is not None/narrowed = False/"
+mutate perl-not-shared             "s/perl\[0-9.\]\*|//"
+mutate node-not-shared             "s/node(js)?|//"
+mutate dotfiles-scanned            "s/ or os.path.basename(p).startswith('.')//"
+mutate stop-post-not-examined      "s/^STOP_FUNCS = .*/STOP_FUNCS = ('stop',)/"
+mutate stop-pre-not-examined       "s/^STOP_FUNCS = .*/STOP_FUNCS = ('stop', 'stop_post')/"
+mutate lint-bug-becomes-ok         "s/return dict(base, why='lint error: %s: %s' % (type(e).__name__, e))/return dict(base, status='OK')/"
+mutate unreadable-dir-is-ok        "s/            return 2\$/            return 0/"
+mutate computed-command-is-na      "s/if not cmd_known and cmd_line:/if False:/"
+mutate tail-hint-removed           "s/if len(tail) == 2 and tail\[1\] and '\$' not in tail\[1\]:/if False:/"
+mutate supervise-shared-is-fault   "s/return dict(res, status='UNPARSED', line=0, why='supervisor=%s on a shared-interpreter daemon: its stop semantics are not modelled' % sup)/res['faults'].append((0, 'no-own-stop', 'x'))/"
+mutate sh-c-not-followed           "s/if depth < 3 and os.path.basename(words\[0\]) in ('su', 'sh', 'bash', 'dash') and '-c' in words\[:-1\]:/if False:/"
+mutate substitutions-not-followed  "s/    for s in inner:\$/    for s in []:/"
+mutate pgrep-needs-no-kill         "s/or (cmd == 'pgrep' and kills):/or cmd == 'pgrep':/"
+mutate redirections-kept           "s/        words = strip_redirections(words)/        pass/"
+WATCHSRC="${HONEY_INITD_LINT_WATCH:-}"
+[ -n "$WATCHSRC" ] || for c in "$HERE/../../../bin/honey-initd-lint-watch" "$HERE/honey-initd-lint-watch"; do [ -f "$c" ] && { WATCHSRC="$c"; break; }; done
+mutate_watch() { # name sed-expression  (mutates the watcher, not the lint)
+  local name="$1" expr="$2" d="$TMP/w-$1" out names
+  mkdir -p "$d"; cp "$WATCHSRC" "$d/honey-initd-lint-watch"; sed -i "$expr" "$d/honey-initd-lint-watch"
+  if cmp -s "$WATCHSRC" "$d/honey-initd-lint-watch"; then echo "MUTATION NOT APPLIED: $name"; fail=1; return; fi
+  out="$(HONEY_INITD_LINT_WATCH="$d/honey-initd-lint-watch" HONEY_INITD_LINT="$LINT" timeout 300 python3 "$HERE/test_initd_lint.py" 2>&1)"
+  if ! printf '%s\n' "$out" | grep -qE '^(FAILED \(|OK)'; then echo "INFRASTRUCTURE ERROR (not a kill): $name"; fail=1; return; fi
+  names="$(printf '%s\n' "$out" | grep -E '^(FAIL|ERROR):' | sed 's/^[A-Z]*: //; s/ (.*//' | head -3 | tr '\n' ' ')"
+  if [ -n "$names" ]; then killed=$((killed+1)); echo "killed: $name [watcher] by: $names"; else echo "SURVIVED (tests too weak): $name [watcher]"; fail=1; fi
+}
+if [ -n "$WATCHSRC" ]; then
+mutate_watch ignores-conf-d            "s|find \"\$DIR\" \"\$CONFD\" -maxdepth|find \"\$DIR\" -maxdepth|"
+mutate_watch hashes-names-not-content  "s/xargs -0 -r sha256sum/xargs -0 -r ls -l/"
+mutate_watch no-daily-rerun            "s/-lt \"\$MAX_AGE\" \]/-ge 0 ]/"
+mutate_watch alert-on-every-run        "s/\[ \"\${faulting:-none}\" != \"\${prev_faulting:-none}\" \]/true/"
+mutate_watch lint-change-not-seen      "s/; sha256sum \"\$LINT\"//"
+mutate_watch force-ignored             "s/\[ \"\$FORCE\" = 0 \] \&\& //"
+mutate_watch missing-lint-not-checked  "s/^\[ -f \"\$LINT\" \] || .*\$/:/"
+fi
+echo "mutants: $killed killed"
+[ "$fail" = 0 ] || exit 1
+exit 0
+#+END_SRC
+
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/honey-initd-lint/initd-stop-proof :tangle-mode (identity #o755) :comments no :shebang "#!/usr/bin/env bash"
+# initd-stop-proof (generated by agents-bots-honey.org): run a unit's OWN stop() under the real openrc-run, inside a private PID namespace,
+# with the pidfile deleted, and show whether any other process is signalled.
+#
+# WHAT THIS PROVES: "this stop function signals only its own pid".
+# WHAT IT DOES NOT PROVE: that OpenRC's default stop no longer mass-kills on the real host. It never touches the real host's services, and it
+# says nothing about any init script you have not run through it.
+#
+# Three conditions, all asserted by a gate BEFORE anything is started (the script aborts, having done nothing, if any one is false):
+#   1. its own /proc   : a private PID namespace (unshare --pid --fork --mount-proc), so OpenRC's start-stop-daemon, which scans /proc, can only see
+#                        processes that were started inside it;
+#   2. a private /run  : a fresh tmpfs over /run (and over /sys/fs/cgroup, so OpenRC creates no cgroup on the real host), inside a private mount namespace;
+#   3. no production pid visible: the namespace holds only this script's own processes, none of the production services' command lines, and no
+#                        production pidfile.
+# A CONTROL runs first: the same unit shape WITHOUT a stop() of its own. If the control does not reproduce the mass-kill the proof is vacuous and
+# the script exits 3, never 0.
+#
+# Usage: initd-stop-proof [--unit PATH_TO_UNIT_WITH_stop()]   (default: ../honey-fca-dsh/openrc/honey-fca-egress, next to this script's lane)
+# Needs: passwordless sudo, unshare, /sbin/openrc-run. Without them it says SKIP and exits 4. Exit: 0 proven, 1 a check failed, 3 control vacuous,
+# 4 skipped, 5 the gate refused.
+set -u
+SELF="$(readlink -f "$0")"; HERE="$(dirname "$SELF")"
+UNIT="${HERE}/../honey-fca-dsh/openrc/honey-fca-egress"
+OPENRC=/sbin/openrc-run
+
+if [ "${1:-}" = --inside ]; then
+  # ---------------------------------------------------------------- inside the namespaces
+  HOSTNS="$2"; WORK="$3"; UNIT="$4"
+  say() { printf '%s\n' "$*"; }
+  refuse() { say "GATE REFUSED: $*"; exit 5; }
+  # --- gate: all three conditions, before anything is started ---
+  [ "$(readlink /proc/self/ns/pid)" != "$HOSTNS" ] || refuse "this is the host PID namespace"
+  [ "$$" -lt 100 ] || refuse "pid $$ is not a fresh namespace's early pid"
+  tr '\0' ' ' < /proc/1/cmdline | grep -q -- '--inside' || refuse "pid 1 here is not this script: the PID namespace is not private"
+  mount -t tmpfs tmpfs /run || refuse "cannot mount a private /run"
+  [ "$(stat -f -c %T /run)" = tmpfs ] || refuse "/run is not a fresh tmpfs"
+  [ -z "$(ls -A /run)" ] || refuse "/run is not empty: it is not private"   # checked first: mount(8) itself writes /run/mount afterwards
+  mount -t tmpfs tmpfs /sys/fs/cgroup 2>/dev/null || refuse "cannot hide /sys/fs/cgroup"
+  [ -z "$(ls -A /sys/fs/cgroup)" ] || refuse "/sys/fs/cgroup still shows the host's cgroups"
+  nproc_seen="$(ls /proc | grep -c '^[0-9]\+$')"
+  [ "$nproc_seen" -le 15 ] || refuse "$nproc_seen processes visible: not a private PID namespace"
+  for p in /proc/[0-9]*; do
+    c="$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)"
+    case "$c" in *llama-swap*|*hermes*|*identity_proxy*|*llama-server*|*ornith*|*r2d2*|*honey-voice*|*review_desk*|*gille-*|*image-bridge*|*syncthing*)
+      refuse "production-looking process visible: ${p#/proc/} $c";; esac
+  done
+  [ -z "$(ls /run/*.pid 2>/dev/null)" ] || refuse "a pidfile exists in /run"
+  say "GATE: own PID namespace ($nproc_seen processes, none production), fresh tmpfs /run (empty), /sys/fs/cgroup hidden"
+  mkdir -p /run/openrc/{started,starting,stopping,inactive,hotplugged,failed,scheduled,exclusive,daemons,options} /run/lock
+  touch /run/openrc/softlevel   # OpenRC refuses to run a service on a system it did not boot; this /run is private, so the marker is too
+
+  # --- the bystander: a python3 that LOGS every signal it is sent (and who sent it) instead of dying ---
+  cat > "$WORK/bystander.py" <<'PY'
+import os, signal, sys, time
+log = sys.argv[1]
+sigs = {signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGUSR2}
+signal.pthread_sigmask(signal.SIG_BLOCK, sigs)
+end = time.time() + 120
+while time.time() < end:
+    info = signal.sigtimedwait(sigs, 1)
+    if info is None:
+        continue
+    try:
+        who = open('/proc/%d/cmdline' % info.si_pid, 'rb').read().replace(b'\0', b' ').decode('utf-8', 'replace').strip()
+    except OSError:
+        who = '(gone)'
+    with open(log, 'a') as f:
+        f.write('%s from pid %d: %s\n' % (signal.Signals(info.si_signo).name, info.si_pid, who))
+    if info.si_signo == signal.SIGUSR2:
+        break
+PY
+  # --- units: production shape (command=/usr/bin/python3, command_background, pidfile in /run), differing only in having a stop() or not ---
+  mkunit() { # name args [stop-function-file]
+    { printf '#!/sbin/openrc-run\nname="%s"\ncommand="/usr/bin/python3"\ncommand_args="-I %s/bystander.py %s/%s.sig"\ncommand_background=true\npidfile="/run/%s.pid"\n' "$1" "$WORK" "$WORK" "$1" "$1"
+      printf 'depend() { :; }\n'
+      [ -n "${2:-}" ] && { printf 'relay_user=root\n'; cat "$2"; }
+    } > "$WORK/units/$1"; chmod 755 "$WORK/units/$1"; }
+  mkdir -p "$WORK/units"
+  awk '/^stop\(\) \{/{p=1} p{print} p&&/^\}/{exit}' "$UNIT" > "$WORK/stop.fn"
+  grep -q '^stop() {' "$WORK/stop.fn" || { say "no stop() found in $UNIT"; exit 1; }
+  for u in bystander-a bystander-b control-subject; do mkunit "$u"; done
+  mkunit safe-subject "$WORK/stop.fn"
+  alive() { [ -d "/proc/$1" ]; }
+  pidof_unit() { cat "/run/$1.pid" 2>/dev/null; }
+  sigs_of() { cat "$WORK/$1.sig" 2>/dev/null | tr '\n' ';'; }
+  fails=0
+  check() { if [ "$2" = ok ]; then say "  ok   $1"; else say "  FAIL $1"; fails=$((fails+1)); fi; }
+  start_all() {
+    for u in bystander-a bystander-b "$1"; do "$WORK/units/$u" start >/dev/null 2>&1; done
+    sleep 1
+    setsid python3 -I "$WORK/bystander.py" "$WORK/plain.sig" </dev/null >/dev/null 2>&1 &  # a bystander NOT started by OpenRC
+    sleep 1
+    PLAIN="$(pgrep -f 'bystander.py .*plain.sig' | head -1)"
+    for u in bystander-a bystander-b "$1"; do alive "$(pidof_unit $u)" || { say "setup failed: $u did not start"; exit 1; }; done
+    alive "$PLAIN" || { say "setup failed: plain bystander did not start"; exit 1; }
+  }
+  reset_all() { for u in bystander-a bystander-b control-subject safe-subject; do
+      p="$(pidof_unit $u)"; [ -n "$p" ] && kill -USR2 "$p" 2>/dev/null; rm -f "/run/$u.pid" "$WORK/$u.sig"
+      "$WORK/units/$u" zap >/dev/null 2>&1; done
+    pkill -USR2 -f 'bystander.py .*plain.sig'; sleep 1.2; rm -f "$WORK/plain.sig" "$WORK/"*.sig; }
+
+  say "== CONTROL: the same shape with NO stop(); pidfile deleted, then stop (this is the failure the lint exists to prevent)"
+  start_all control-subject
+  rm -f /run/control-subject.pid
+  "$WORK/units/control-subject" stop >"$WORK/control.out" 2>&1; say "  stop rc=$?"; sed 's/^/    | /' "$WORK/control.out"
+  sleep 2
+  ca="$(sigs_of bystander-a)"; cb="$(sigs_of bystander-b)"; cp="$(sigs_of plain)"
+  say "  bystander-a (OpenRC-started) signals: ${ca:-none}"; say "  bystander-b (OpenRC-started) signals: ${cb:-none}"; say "  plain bystander (setsid, not OpenRC) signals: ${cp:-none}"
+  CONTROL=vacuous; case "$ca$cb" in *SIGTERM*) CONTROL=reproduced;; esac
+  say "  control: $CONTROL"
+  reset_all
+
+  say "== SAFE: the unit's own stop() (verbatim from $(basename "$UNIT")), three conditions of the pidfile"
+  say "-- (1) pidfile deleted, then stop"
+  start_all safe-subject
+  rm -f /run/safe-subject.pid
+  "$WORK/units/safe-subject" stop >"$WORK/safe1.out" 2>&1; rc=$?; say "  stop rc=$rc"; sleep 2
+  [ -z "$(sigs_of bystander-a)$(sigs_of bystander-b)$(sigs_of plain)" ] && r=ok || r=bad
+  check "no signal reached any bystander (a: $(sigs_of bystander-a)| b: $(sigs_of bystander-b)| plain: $(sigs_of plain)|)" $r
+  alive "$(pidof_unit bystander-a)" && alive "$(pidof_unit bystander-b)" && alive "$PLAIN" && r=ok || r=bad
+  check "all three bystanders still alive" $r
+  reset_all
+  say "-- (2) pidfile holds a dead pid, then stop"
+  start_all safe-subject
+  sp="$(pidof_unit safe-subject)"; kill -USR2 "$sp"; sleep 1.5; alive "$sp" && { say "  setup: subject did not exit"; exit 1; }
+  "$WORK/units/safe-subject" stop >"$WORK/safe2.out" 2>&1; rc=$?; say "  stop rc=$rc"; sleep 2
+  [ -z "$(sigs_of bystander-a)$(sigs_of bystander-b)$(sigs_of plain)" ] && r=ok || r=bad
+  check "no signal reached any bystander" $r
+  reset_all
+  say "-- (3) pidfile intact: stop must signal its OWN pid, and only that"
+  start_all safe-subject
+  sp="$(pidof_unit safe-subject)"
+  "$WORK/units/safe-subject" stop >"$WORK/safe3.out" 2>&1; rc=$?; say "  stop rc=$rc"; sleep 2
+  alive "$sp" && r=bad || r=ok; check "the subject itself was stopped (pid $sp)" $r
+  [ -z "$(sigs_of bystander-a)$(sigs_of bystander-b)$(sigs_of plain)" ] && r=ok || r=bad
+  check "no signal reached any bystander" $r
+  reset_all
+
+  say
+  if [ "$CONTROL" != reproduced ]; then say "RESULT: CONTROL DID NOT REPRODUCE the mass-kill, so the SAFE result proves nothing (exit 3)"; exit 3; fi
+  if [ "$fails" != 0 ]; then say "RESULT: $fails check(s) FAILED"; exit 1; fi
+  say "RESULT: PROVEN, and only this: this stop function signals only its own pid (control reproduced the hazard in the same namespace)."
+  say "        NOT shown: that the default no longer mass-kills on the real host, or anything about any other init script."
+  exit 0
+fi
+
+# -------------------------------------------------------------------- outside
+[ "${1:-}" = --unit ] && UNIT="$2"
+[ -f "$UNIT" ] || { echo "initd-stop-proof: unit not found: $UNIT" >&2; exit 1; }
+for x in unshare stat; do command -v "$x" >/dev/null || { echo "SKIPPED: $x is not installed"; exit 4; }; done
+[ -x "$OPENRC" ] || { echo "SKIPPED: no $OPENRC on this host"; exit 4; }
+sudo -n true 2>/dev/null || { echo "SKIPPED: passwordless sudo is needed for the namespaces"; exit 4; }
+WORK="$(mktemp -d /tmp/initd-stop-proof.XXXXXX)"; trap 'sudo -n rm -rf "$WORK"' EXIT
+cgbefore="$(ls /sys/fs/cgroup 2>/dev/null | grep -c '^openrc\.')"
+pidfiles_before="$(ls -l --time-style=+%s /run/*.pid 2>/dev/null | awk '{print $6,$7}' | sort | md5sum)"
+HOSTNS="$(readlink /proc/self/ns/pid)"
+sudo -n unshare --pid --fork --mount-proc --mount --propagation private bash "$SELF" --inside "$HOSTNS" "$WORK" "$UNIT"
+rc=$?
+cgafter="$(ls /sys/fs/cgroup 2>/dev/null | grep -c '^openrc\.')"
+pidfiles_after="$(ls -l --time-style=+%s /run/*.pid 2>/dev/null | awk '{print $6,$7}' | sort | md5sum)"
+echo "HOST AFTER: openrc cgroups before=$cgbefore after=$cgafter; production pidfile listing $( [ "$pidfiles_before" = "$pidfiles_after" ] && echo unchanged || echo CHANGED)"
+[ "$cgbefore" = "$cgafter" ] && [ "$pidfiles_before" = "$pidfiles_after" ] || { echo "HOST CHANGED DURING THE PROOF: treat it as a failure"; [ "$rc" = 0 ] && rc=1; }
+exit "$rc"
+#+END_SRC
+
 * Ductor voice service lane (Badger and Flying Fox)
 
 The Ductor voice watcher is a host service, not a stowed dotfile. Its implementation is canonical in [[file:agents-voice.org][agents-voice.org]]; this host module owns only the OpenRC body, private configuration template, and narrow installer. The installer copies exactly the provider-aware watcher and service body, backs up each replaced file, never starts or restarts a service, and never contains a bot token, owner chat ID, host address, or account-specific home path. The live engine root and Ductor homes are supplied by the machine-local =/etc/conf.d= file.
