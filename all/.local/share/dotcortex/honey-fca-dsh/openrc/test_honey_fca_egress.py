@@ -3,7 +3,11 @@
 
 The unit is exercised without starting anything: its start_pre runs in a harness shell with stubbed identity and
 OpenRC helpers (every refusal path), and the installer runs against a scratch PREFIX. The root-owned checks need
-passwordless sudo; without it those tests are SKIPPED by name, never passed."""
+passwordless sudo; without it those tests are SKIPPED by name, never passed.
+
+The RealOpenRC class runs the unit under the real openrc-run and is GATED: it FAILS, naming the hazard, unless HONEY_DISPOSABLE_OPENRC_HOST
+carries the exact statement in DISPOSABLE_VALUE, and it fails even then on a host with production init scripts (see rehearsal_gate). On a host
+with no openrc-run it is a named skip. Do not run it on Honey: it is followed by OpenRC-managed python3 services crashing there (2026-11-12)."""
 import os
 import re
 import shutil
@@ -71,7 +75,7 @@ class UnitBody(unittest.TestCase):
 
     def test_egress_md_documents_the_unit_and_installer(self):
         text = read(EGRESS_MD)
-        for name in ('honey-fca-egress', 'honey-fca-egress-install', '--expect-relay-sha256', 'S04honey-fca-egress'):
+        for name in ('honey-fca-egress', 'honey-fca-egress-install', '--expect-relay-sha256', 'S04honey-fca-egress', 'start_post', 'command_user'):
             self.assertIn(name, text)
 
 
@@ -178,6 +182,265 @@ class StartPre(unittest.TestCase):
         rc, err, calls = self.run_pre()
         self.assertEqual((rc, calls), ('rc=1', []))
         self.assertIn('not root-owned and read-only', err)
+
+
+OPENRC_RUN = '/sbin/openrc-run'
+RC_BIN = '/lib/rc/bin'
+
+# The RealOpenRC tests run the unit under the REAL openrc-run. On 2026-11-12 they were followed, on Honey, by OpenRC-managed python3
+# services crashing (identity-proxy, which Aura's every chat depends on, and others; the mechanism is NOT confirmed). They therefore
+# refuse to run unless the operator states that the host is disposable, and refuse even then if it carries production services.
+# A refusal is a FAILURE on purpose: a skip that looks like a pass is how a hazard ships a second time.
+DISPOSABLE_VAR = 'HONEY_DISPOSABLE_OPENRC_HOST'
+DISPOSABLE_VALUE = 'yes-this-host-may-lose-every-python3-service'
+PRODUCTION_MARKERS = ('/etc/init.d/identity-proxy', '/etc/init.d/gille-llama-swap', '/etc/init.d/hermes-gateway')
+
+
+def rehearsal_gate(env, exists, sudo, identities):
+    """('skip' | 'refuse' | 'run', message). Pure: no command is run here. Order matters: without openrc-run nothing can happen, so
+    that is a named skip; with it, the operator's explicit statement comes before anything else."""
+    if not exists(OPENRC_RUN):
+        return 'skip', 'SKIPPED: there is no %s on this host; the RealOpenRC tests need a DISPOSABLE OpenRC host' % OPENRC_RUN
+    if env.get(DISPOSABLE_VAR) != DISPOSABLE_VALUE:
+        return 'refuse', ('REFUSED: the RealOpenRC tests run %s on THIS host, and on 2026-11-12 they were followed by OpenRC-managed python3 '
+                          'services (identity-proxy and others) crashing on Honey. Run them only on a DISPOSABLE OpenRC host and say so with '
+                          '%s=%s. This is a failure on purpose: a skip would look like a pass.' % (OPENRC_RUN, DISPOSABLE_VAR, DISPOSABLE_VALUE))
+    marked = [m for m in PRODUCTION_MARKERS if exists(m)]
+    if marked:
+        return 'refuse', ('REFUSED: %s is set but this host carries production services (%s). The variable does not override that; '
+                          'use a host that has none.' % (DISPOSABLE_VAR, ', '.join(marked)))
+    if not (sudo() and identities()):
+        return 'skip', 'SKIPPED: needs passwordless sudo and the fca-egress and agent-deepseek identities'
+    return 'run', ''
+
+
+def have_identities():
+    return all(subprocess.run(['id', '-u', u], capture_output=True).returncode == 0 for u in ('fca-egress', 'agent-deepseek'))
+
+
+class RealOpenRC(unittest.TestCase):
+    """The unit under the real OpenRC. Rehearsals use a COPY with four path variables pointed at a scratch directory and a stand-in
+    for the relay (a different service name), so nothing of the real service, /run/fca-dsh-egress or /etc/init.d is touched."""
+
+    def setUp(self):
+        verdict, why = rehearsal_gate(os.environ, os.path.exists, sudo_ok, have_identities)
+        if verdict == 'skip':
+            self.skipTest(why)
+        if verdict == 'refuse':
+            self.fail(why)
+        self.tmp = tempfile.mkdtemp(prefix='fca-rehearsal-')
+        subprocess.run(['sudo', '-n', 'chown', 'root:root', self.tmp], check=True)
+        subprocess.run(['sudo', '-n', 'chmod', '0755', self.tmp], check=True)
+        self.relay_dir = os.path.join(self.tmp, 'relay')
+        self.run_dir = os.path.join(self.tmp, 'run')
+        self.pidfile = os.path.join(self.tmp, 'unit.pid')
+        self.unit = os.path.join(self.tmp, 'honey-fca-egress-rehearsal')
+        subprocess.run(['sudo', '-n', 'install', '-d', '-m', '0755', '-o', 'root', '-g', 'root', self.relay_dir], check=True)
+        text = read(BODY)
+        for old, new in (('relay_root:=/opt/honey-fca-dsh/egress', 'relay_root:=%s' % self.relay_dir),
+                         ('run_dir=/run/fca-dsh-egress', 'run_dir=%s' % self.run_dir),
+                         ('log_file=/var/log/honey-fca-egress.log', 'log_file=%s/unit.log' % self.tmp),
+                         ('pidfile="/run/honey-fca-egress.pid"', 'pidfile="%s"' % self.pidfile)):
+            self.assertEqual(text.count(old), 1, old)
+            text = text.replace(old, new)
+        staged = os.path.join(tempfile.gettempdir(), os.path.basename(self.tmp) + '.unit')
+        with open(staged, 'w') as f:
+            f.write(text)
+        subprocess.run(['sudo', '-n', 'install', '-m', '0755', '-o', 'root', '-g', 'root', staged, self.unit], check=True)
+        os.unlink(staged)
+
+    def tearDown(self):
+        if not hasattr(self, 'tmp'):
+            return
+        subprocess.run(['sudo', '-n', OPENRC_RUN, self.unit, 'stop'], capture_output=True)
+        if os.path.exists(self.pidfile):
+            pid = read(self.pidfile).strip()
+            subprocess.run(['sudo', '-n', 'kill', '-KILL', pid], capture_output=True)
+        subprocess.run(['sudo', '-n', 'rm', '-rf', self.tmp], capture_output=True)
+
+    def stand_in(self, binds):
+        body = ('import socket, time\n'
+                + ('s = socket.socket(socket.AF_UNIX)\ns.bind(%r)\n' % (self.run_dir + '/relay.sock') if binds else '')
+                + 'time.sleep(60)\n')
+        staged = os.path.join(tempfile.gettempdir(), os.path.basename(self.tmp) + '.relay')
+        with open(staged, 'w') as f:
+            f.write(body)
+        subprocess.run(['sudo', '-n', 'install', '-m', '0644', '-o', 'root', '-g', 'root', staged,
+                        os.path.join(self.relay_dir, 'fca_egress_relay.py')], check=True)
+        os.unlink(staged)
+
+    def dir_state(self):
+        """The socket directory's ACL entries (owner rwx, the worker traverse-only, nothing for group or other) and its owner. stat's mode
+        is not used: with a named ACL entry its group bits show the mask, so 0700 plus u:2012:--x reads as 710."""
+        acl = subprocess.run(['sudo', '-n', 'getfacl', '-p', '-c', self.run_dir], capture_output=True, text=True).stdout.split()
+        owner = subprocess.run(['sudo', '-n', 'stat', '-c', '%U:%G', self.run_dir], capture_output=True, text=True).stdout.strip()
+        return sorted(acl), owner
+
+    def rc(self, verb):
+        return subprocess.run(['sudo', '-n', OPENRC_RUN, self.unit, verb], capture_output=True, text=True, timeout=90)
+
+    def owner_of(self, pid):
+        return subprocess.run(['ps', '-o', 'user=', '-p', pid], capture_output=True, text=True).stdout.strip()
+
+    def test_openrc_accepts_the_real_unit_file(self):
+        r = subprocess.run(['sudo', '-n', OPENRC_RUN, BODY, 'describe'], capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('fixed-upstream egress relay', r.stdout)
+        r = subprocess.run(['sudo', '-n', OPENRC_RUN, BODY, 'status'], capture_output=True, text=True)
+        self.assertIn(r.returncode, (0, 3), r.stdout + r.stderr)  # started or stopped, but parsed and answered
+        self.assertIn('status:', r.stdout)
+
+    def test_a_second_start_is_a_no_op_and_the_relay_never_runs_as_root(self):
+        self.stand_in(binds=True)
+        first = self.rc('start')
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        pid = read(self.pidfile).strip()
+        self.assertEqual(self.owner_of(pid), 'fca-egress')
+        second = self.rc('start')
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn('already', second.stdout + second.stderr)
+        self.assertEqual(read(self.pidfile).strip(), pid)
+        self.assertEqual(self.dir_state(), (['group::---', 'mask::--x', 'other::---', 'user::rwx', 'user:agent-deepseek:--x'], 'fca-egress:fca-egress'))
+        stopped = self.rc('stop')
+        self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        self.assertEqual(subprocess.run(['sudo', '-n', 'test', '-e', self.run_dir + '/relay.sock']).returncode, 1)  # the socket is gone
+        self.assertEqual(subprocess.run(['sudo', '-n', 'test', '-f', self.relay_dir + '/fca_egress_relay.py']).returncode, 0)  # the code is not
+        self.assertEqual(subprocess.run(['sudo', '-n', 'test', '-d', self.run_dir]).returncode, 0)  # nor is the directory
+
+    def test_a_relay_that_never_binds_its_socket_fails_the_start_loudly_and_is_not_left_running(self):
+        self.stand_in(binds=False)
+        r = self.rc('start')
+        self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn('did not create', r.stdout + r.stderr)
+        status = self.rc('status')
+        self.assertNotEqual(status.returncode, 0, status.stdout)  # not reported as started
+        leftover = subprocess.run(['pgrep', '-u', 'fca-egress', '-f', 'fca_egress_relay.py'], capture_output=True, text=True).stdout.split()
+        self.assertEqual(leftover, [])
+
+    def test_start_pre_twice_is_idempotent_and_corrects_a_loosened_directory(self):
+        self.stand_in(binds=True)
+        script = ('eerror() { echo "E: $*" >&2; }; PATH="%s:$PATH"; . "%s"; relay_root="%s"; run_dir="%s"; log_file="%s/unit.log"; '
+                  'start_pre; echo first=$?; chmod 0755 "$run_dir"; start_pre; echo second=$?'
+                  % (RC_BIN, BODY, self.relay_dir, self.run_dir, self.tmp))
+        r = subprocess.run(['sudo', '-n', 'sh', '-c', script], capture_output=True, text=True, timeout=60)
+        self.assertEqual([l for l in r.stdout.split() if l.startswith(('first=', 'second='))], ['first=0', 'second=0'], r.stdout + r.stderr)
+        self.assertEqual(self.dir_state(), (['group::---', 'mask::--x', 'other::---', 'user::rwx', 'user:agent-deepseek:--x'], 'fca-egress:fca-egress'))
+
+
+STOP_HARNESS = r'''
+ebegin() { :; }
+eend() { return "${1:-0}"; }
+eerror() { echo "E: $*" >&2; }
+. "$BODY"
+pidfile="$T_PID"
+stop
+echo "rc=$?"
+'''
+
+
+class StopSafety(unittest.TestCase):
+    """The unit's own stop(). OpenRC's default stop passes --exec /usr/bin/python3, which with no pidfile SIGTERMs every OpenRC-started python3
+    process on the host (reproduced 2026-11-12). These tests run stop() in a stubbed shell: no real start-stop-daemon, no real signal."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix='fca-stop-')
+        self.log = os.path.join(self.tmp, 'calls.log')
+        self.pid = os.path.join(self.tmp, 'unit.pid')
+        open(self.log, 'w').close()
+        self.bin = os.path.join(self.tmp, 'bin')
+        os.makedirs(self.bin)
+        stub = os.path.join(self.bin, 'start-stop-daemon')   # a hyphenated name cannot be a shell function in dash: a stub on PATH
+        with open(stub, 'w') as f:
+            f.write('#!/bin/sh\necho "ssd $*" >> "$LOG"\n')
+        os.chmod(stub, 0o755)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_stop(self):
+        r = sh(STOP_HARNESS, env=dict(os.environ, LOG=self.log, BODY=BODY, T_PID=self.pid, PATH=self.bin + ':' + os.environ['PATH']))
+        self.assertIn('rc=0', r.stdout, r.stdout + r.stderr)
+        return read(self.log).splitlines()
+
+    def test_the_unit_never_passes_exec_to_start_stop_daemon(self):
+        code = '\n'.join(l for l in read(BODY).splitlines() if not l.lstrip().startswith('#'))
+        self.assertNotIn('--exec', code)
+        self.assertRegex(code, r'(?m)^stop\(\) \{')
+
+    def test_no_pidfile_means_nothing_is_signalled(self):
+        self.assertEqual(self.run_stop(), [])
+
+    def test_an_empty_pidfile_means_nothing_is_signalled(self):
+        open(self.pid, 'w').close()
+        self.assertEqual(self.run_stop(), [])
+
+    def test_a_pidfile_of_a_dead_process_is_cleared_and_nothing_is_signalled(self):
+        p = subprocess.Popen(['true'])
+        p.wait()
+        with open(self.pid, 'w') as f:
+            f.write('%d\n' % p.pid)
+        self.assertEqual(self.run_stop(), [])
+        self.assertFalse(os.path.exists(self.pid))
+
+    def test_a_live_pid_is_stopped_by_pidfile_and_user_only(self):
+        p = subprocess.Popen(['sleep', '30'])
+        try:
+            with open(self.pid, 'w') as f:
+                f.write('%d\n' % p.pid)
+            calls = self.run_stop()
+        finally:
+            p.kill()
+            p.wait()
+        self.assertEqual(len(calls), 1, calls)
+        self.assertEqual(calls[0], 'ssd --stop --quiet --retry TERM/5/KILL/3 --user fca-egress --pidfile %s' % self.pid)
+
+    def test_a_failed_start_stops_through_the_same_safe_stop(self):
+        text = '\n'.join(l for l in read(BODY).splitlines() if not l.lstrip().startswith('#'))
+        post = text[text.index('start_post()'):text.index('stop() {')]
+        self.assertRegex(post, r'(?m)^    stop >/dev/null 2>&1$')
+        self.assertNotIn('start-stop-daemon', post)
+
+
+class RehearsalGate(unittest.TestCase):
+    """The gate in front of the RealOpenRC tests, tested as pure logic: none of these runs openrc-run."""
+    VAR = {DISPOSABLE_VAR: DISPOSABLE_VALUE}
+
+    def gate(self, env, present=(OPENRC_RUN,), sudo=True, identities=True):
+        return rehearsal_gate(env, lambda p: p in present, lambda: sudo, lambda: identities)
+
+    def test_no_openrc_on_the_host_is_a_named_skip(self):
+        verdict, msg = self.gate({}, present=())
+        self.assertEqual(verdict, 'skip')
+        self.assertIn('SKIPPED', msg)
+
+    def test_openrc_present_and_no_statement_is_a_refusal_that_names_the_hazard(self):
+        verdict, msg = self.gate({})
+        self.assertEqual(verdict, 'refuse')
+        for word in ('REFUSED', 'identity-proxy', 'DISPOSABLE', DISPOSABLE_VAR, 'failure on purpose'):
+            self.assertIn(word, msg)
+
+    def test_a_loose_or_wrong_statement_does_not_count(self):
+        for value in ('', '1', 'yes', 'true', DISPOSABLE_VALUE.upper(), DISPOSABLE_VALUE + ' '):
+            self.assertEqual(self.gate({DISPOSABLE_VAR: value})[0], 'refuse', value)
+
+    def test_the_statement_is_overridden_by_any_production_service_on_the_host(self):
+        for marker in PRODUCTION_MARKERS:
+            verdict, msg = self.gate(self.VAR, present=(OPENRC_RUN, marker))
+            self.assertEqual(verdict, 'refuse', marker)
+            self.assertIn(marker, msg)
+
+    def test_only_the_exact_statement_on_a_clean_host_runs(self):
+        self.assertEqual(self.gate(self.VAR), ('run', ''))
+        self.assertEqual(self.gate(self.VAR, sudo=False)[0], 'skip')
+        self.assertEqual(self.gate(self.VAR, identities=False)[0], 'skip')
+
+    def test_the_real_tests_ask_the_gate_before_anything_else_in_setup(self):
+        src = read(__file__)
+        setup = src[src.index('class RealOpenRC'):]
+        setup = setup[setup.index('def setUp'):setup.index('def tearDown')]
+        self.assertIn('rehearsal_gate(', setup)
+        self.assertLess(setup.index('rehearsal_gate('), setup.index('mkdtemp'))
+        self.assertLess(setup.index('rehearsal_gate('), setup.index('subprocess'))
 
 
 class Installer(unittest.TestCase):
