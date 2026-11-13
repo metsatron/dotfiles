@@ -5,6 +5,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -440,6 +441,52 @@ class SparseTests(unittest.TestCase):
                 for hook in group["hooks"]:
                     name = hook["command"].split()[0]
                     self.assertTrue((BIN / name).is_file() or self.covered(f"all/.local/bin/{name}"), name)
+
+    def test_settings_register_the_snapshot_writer_as_the_status_line(self):
+        # 2026-11-13: no statusLine meant no status.json, so claude-warm's gate said busy to every wake after the first.
+        settings = json.loads((SHARE / "claude-settings.json").read_text())
+        self.assertEqual(settings["statusLine"], {"type": "command", "command": "claude-statusline"})
+        self.assertTrue((ROOT / "all/.local/bin/claude-statusline").is_file())
+        self.assertTrue(self.covered("all/.local/bin/claude-statusline"))
+
+    @unittest.skipUnless(shutil.which("jq"), "SKIPPED: jq is not installed")
+    def test_the_status_line_writes_the_snapshot_the_gate_reads_and_only_for_the_live_session(self):
+        # Rehearsal of a seat: a runtime directory with the supervisor's state.json for this session, the status-line payload on stdin.
+        channel, session = "claude-" + "ab" * 16, "11111111-2222-3333-4444-555555555555"
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            chan = run / "claude-idle-compaction" / channel
+            chan.mkdir(parents=True)
+            (chan / "state.json").write_text(json.dumps({"session_id": session, "pid": os.getpid(), "pty_master_owned": True}))
+            def feed(session_id):
+                payload = {"session_id": session_id, "cwd": tmp, "workspace": {"current_dir": tmp}, "model": {"display_name": "Claude Haiku 5.5"},
+                           "context_window": {"total_input_tokens": 41234, "used_percentage": 4.1}}
+                env = {"PATH": os.environ["PATH"], "XDG_RUNTIME_DIR": str(run), "HOME": tmp}
+                return subprocess.run(["bash", str(ROOT / "all/.local/bin/claude-statusline")], input=json.dumps(payload), text=True, capture_output=True, env=env, timeout=30)
+            result = feed("00000000-0000-0000-0000-000000000000")
+            self.assertEqual(result.returncode, 0)
+            self.assertFalse((chan / "status.json").exists(), "a snapshot was written for a session the supervisor does not own")
+            result = feed(session)
+            self.assertEqual(result.returncode, 0)
+            snap = json.loads((chan / "status.json").read_text())
+            self.assertEqual((snap["channel"], snap["session_id"], snap["current_input_context_tokens"]), (channel, session, 41234))
+            self.assertEqual(snap["model"], "Haiku 5.5")
+            self.assertEqual(stat.S_IMODE((chan / "status.json").stat().st_mode), 0o600)
+
+    def test_a_missing_status_line_is_a_warning_not_a_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = json.loads((SHARE / "claude-settings.json").read_text())
+            del settings["statusLine"]
+            path = Path(tmp) / "settings.json"
+            path.write_text(json.dumps(settings))
+            fake = Path(tmp) / "bin"
+            fake.mkdir()
+            (fake / "claude-hook-idle-event").write_text("#!/bin/sh\n")
+            (fake / "claude-hook-idle-event").chmod(0o755)
+            run = subprocess.run(["bash", "-c", f'source "{SHARE}/lib/launch.bash"; honey_claude_idle_hooks_preflight test "{path}"'],
+                                 capture_output=True, text=True, env={"PATH": f"{fake}:/usr/bin:/bin"})
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertIn("warning: no claude-statusline snapshot writer", run.stderr)
 
     def test_settings_carry_the_telegram_delivery_guard(self):
         # The bots are unstowed: --settings is their only hook source, so the guard must live here.

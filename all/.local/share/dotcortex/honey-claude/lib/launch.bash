@@ -28,6 +28,10 @@ honey_claude_idle_hooks_preflight() {
         printf '%s\n' "$name: refused: claude-hook-idle-event is not on PATH (is it in the lane's SPARSE?)" >&2
         return 1
     }
+    # A warning, not a refusal: without the snapshot writer the seat still runs, but MailCortex wakes queue as busy (2026-11-13).
+    { jq -e '.statusLine.command == "claude-statusline"' "$settings" >/dev/null 2>&1 && command -v claude-statusline >/dev/null 2>&1; } || \
+        printf '%s\n' "$name: warning: no claude-statusline snapshot writer (is it in the lane's SPARSE and settings?); MailCortex wakes will queue as busy" >&2
+    return 0
 }
 
 # honey_claude_launch <bot> <model> [--telegram] [claude args...]
