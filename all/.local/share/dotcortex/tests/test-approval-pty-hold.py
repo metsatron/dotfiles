@@ -411,6 +411,35 @@ class PtyHoldTests(unittest.TestCase):
         self.assertEqual(self.read_master(master, 1), b"\x1b")
         self.assertEqual(len(queued), 1)
 
+    def test_warm_permission_hold_denies_and_queues_independent_of_presence(self):
+        # Presence controls hook-time deferral. The warm PTY owner must still
+        # bound an unanswered native prompt while the Admiral is present.
+        warm = load("warm_present_hold", BIN / "claude-warm")
+        owner, master, _slave = self.deny_owner("x")
+        self.addCleanup(lambda: os.close(master))
+        owner.screen_classifier = warm.ClaudeScreenClassifier()
+        owner.session_id = "fixture-session"
+        owner.hold_timer = None
+        owner.status = "active"
+        owner._hold_screen = warm.Supervisor._hold_screen.__get__(owner)
+        owner._hold_maybe_record = warm.Supervisor._hold_maybe_record.__get__(owner)
+        owner._hold_expire = warm.Supervisor._hold_expire.__get__(owner)
+        dialog = ("\x1b[2J\x1b[Hrm OLD\\nDo you want to proceed?\\n"
+                  "❯ 1. Yes\\n  2. No\\nEsc to cancel")
+        owner.screen_classifier.feed(dialog.encode())
+        queued = []
+        with mock.patch.object(warm, "_hold_now", return_value=100):
+            owner._hold_maybe_record("blocked")
+        self.assertIsNotNone(owner.hold_timer)
+        owner.hold_timer.timeout = 1
+        with mock.patch.object(warm, "_hold_now", return_value=101), \
+             mock.patch.object(warm, "_hold_queue_write",
+                               side_effect=lambda *args: queued.append(args)), \
+             mock.patch.object(os, "write", return_value=1) as write:
+            owner._hold_expire()
+        write.assert_called_once_with(owner.master_fd, b"\x1b")
+        self.assertEqual(len(queued), 1)
+
     def test_supervisor_seam_clears_when_prompt_answered(self):
         # the Admiral answers: the dialog disappears; the timer clears; at
         # the (fake) deadline nothing fires
