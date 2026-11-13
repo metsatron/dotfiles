@@ -715,17 +715,68 @@ def wake_idle_boundary(owner):
     return None
 
 
-def admission_busy(owner):
+def admission_refusal_reason(owner):
+    """Name the first term that refuses admission, or None when the seat is free.
+
+    A queued wake used to leave nothing behind but the watcher's reason=busy: the
+    channel guard logged compact refusals and never mail ones, so a seat that
+    refused every wake looked identical to one that never woke, and a day went on
+    guessing (2026-11-13). admission_busy is defined by this function, so the log
+    and the gate cannot disagree.
+    """
+    if owner.status != "idle":
+        return f"status-{owner.status}"
+    if owner.screen_state != "idle":
+        return f"screen-{owner.screen_state}"
+    if owner.lifecycle_health != "wired":
+        return f"lifecycle-{owner.lifecycle_health}"
+    if owner.compacting:
+        return "compacting"
+    if owner.recovery_pending:
+        return "recovery-pending"
+    if owner.recovery_awaiting:
+        return "recovery-awaiting"
+    if getattr(owner, "mailcortex_input_dirty", True):
+        return "input-dirty"
+    if owner.transcript_gate_blocked:
+        return "transcript-gate-blocked"
+    if owner.transcript_partial:
+        return "transcript-partial"
+    if owner.transcript_quiescence_deadline is not None:
+        return "transcript-not-quiescent"
     boundary = wake_idle_boundary(owner)
-    return (owner.status != "idle" or owner.screen_state != "idle" or owner.lifecycle_health != "wired"
-            or owner.compacting or owner.recovery_pending or owner.recovery_awaiting
-            or getattr(owner, "mailcortex_input_dirty", True)
-            or owner.transcript_gate_blocked or owner.transcript_partial
-            or owner.transcript_quiescence_deadline is not None
-            or not boundary
-            or (owner.last_local_input is not None and owner.last_local_input >= boundary)
-            or (owner.last_lifecycle_activity is not None and owner.last_lifecycle_activity > boundary)
-            or owner._gate_reason("mailcortex") is not None)
+    if not boundary:
+        return "no-idle-boundary"
+    if owner.last_local_input is not None and owner.last_local_input >= boundary:
+        return "local-input"
+    if owner.last_lifecycle_activity is not None and owner.last_lifecycle_activity > boundary:
+        return "lifecycle-activity"
+    gate = owner._gate_reason("mailcortex")
+    if gate is not None:
+        return f"gate-{gate}"
+    return None
+
+
+def note_admission_refusal(owner, reason):
+    """Record a refusal once per distinct reason, so a stuck seat leaves a trace."""
+    previous = getattr(owner, "mailcortex_last_refusal_reason", None)
+    if previous == reason:
+        return
+    owner.mailcortex_last_refusal_reason = reason
+    if reason is None:
+        return
+    # Guard log only: the state transition name is an audit trail other code
+    # asserts on, and a refusal is not a transition - it is a reason.
+    try:
+        owner._guard_log("mailcortex-refused", reason=reason)
+    except (OSError, AttributeError, TypeError):
+        pass
+
+
+def admission_busy(owner):
+    reason = admission_refusal_reason(owner)
+    note_admission_refusal(owner, reason)
+    return reason is not None
 
 
 def barrier_guardian(descriptor):
