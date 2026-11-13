@@ -85,9 +85,36 @@ def _protected(value):
         return True
     if re.search(r'(?:^|/)proc/[^/]+/environ(?:$|[\s\"\'])', lowered):
         return True
-    if any(part in {".ssh", ".secrets", "private", "secrets", "keys", "credentials"} for part in parts):
+    if any(part in {".ssh", ".secrets", "private", "secrets", "keys", "credentials", ".gnupg"} for part in parts):
+        return True
+    # System secret files, named by absolute path (2026-11-12, Hermes delegation unit 2): the shadow and
+    # sudoers files, the ssh host private keys and root's home were never on this list, so the plain
+    # read-only prover allowed `cat /etc/shadow` as local_read. The OS refused it for this user only
+    # because of file modes. A relative argument is resolved against cwd by the callers before this runs.
+    if re.search(r'(?:^|[\s\"\'=:;|&<>(])/(?:etc/(?:shadow|gshadow|sudoers|security/opasswd|ssh/ssh_host_[\w.-]*)|root)(?:$|[/\s\"\'.;|&<>)_-])',
+                 lowered):
+        return True
+    # Interim denylist, second tier (Fable's ruling via Hermes, 2026-11-13): a glob is matched against the
+    # protected /etc names by its form, so `cat /etc/shad*` and `cat /etc/sh?dow` are refused while an
+    # ordinary glob such as /etc/*release stays a plain read. The approval engine's own ledgers, queues and
+    # manifests are state a seat can read and the kernel does not refuse, so they are named here too.
+    import fnmatch
+    for glob_word in re.findall(r'/etc/[^\s\"\'|;&<>()]*[*?\[][^\s\"\'|;&<>()]*', lowered):
+        if any(fnmatch.fnmatchcase(secret, glob_word) for secret in (
+                '/etc/shadow', '/etc/gshadow', '/etc/sudoers', '/etc/sudoers.d', '/etc/security/opasswd',
+                '/etc/ssh/ssh_host_rsa_key', '/etc/ssh/ssh_host_ecdsa_key', '/etc/ssh/ssh_host_ed25519_key')):
+            return True
+    # Seat-readable secrets that Hermes measured as allowed on 2026-11-13 (`cat ~/.hermes/config.yaml`,
+    # mode 600, 22 key or token references): the Hermes config, the MailCortex seat config and the keyrings.
+    if re.search(r'(?:^|/)\.hermes/config\.ya?ml(?:$|[\s\"\'.;|&<>)_-])'
+                 r'|(?:^|/)\.config/mailcortex/[^\s\"\'/]'
+                 r'|(?:^|/)\.local/share/keyrings/[^\s\"\'/]', lowered):
         return True
     basename = parts[-1] if parts else ""
+    if (re.search(r'\.jsonl?(?:[.\-].*)?$', basename)
+            and basename.startswith(('claude-approval', 'claude_approval', 'approval-morning-queue', 'approval-queue',
+                                     'approval-guard', 'telegram-permission-recall', 'pty-hold-ledger'))):
+        return True
     return (basename in AUTH or basename == ".credentials.json"
             or basename.startswith((".env", "auth.", "credential"))
             or basename.startswith("keepass")
