@@ -573,7 +573,7 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
     # Parse the complete request, never a body-stripped incomplete << header.
     # The stripped command above remains the effect/operand scan projection.
     split = _split_approval_compound(tool_input['command'])
-    if coordinator not in {'coordinator_codex_dispatch', 'coordinator_scratch_scp', 'coordinator_remote_mail_send', 'coordinator_ops_tool', 'coordinator_peer_fetch', 'coordinator_ops_redirect'}:
+    if coordinator not in COORDINATOR_GRANTS:
         if split is None:
             if _unsafe_redirect(tool_input['command']):
                 return True
@@ -603,7 +603,7 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
     # a hard floor; only the reviewed coordinator shape may use this carveout.
     if landing_candidate:
         return False
-    if (not readonly_proven and coordinator not in {'coordinator_codex_dispatch', 'coordinator_scratch_scp', 'coordinator_remote_mail_send', 'coordinator_ops_tool', 'coordinator_peer_fetch', 'coordinator_ops_redirect'}
+    if (not readonly_proven and coordinator not in COORDINATOR_GRANTS
             and _split_approval_compound(tool_input['command']) is None):
         substitutions = _shell_substitutions(command)
         if (not substitutions or not _substitution_data_only(command, substitutions)
@@ -623,7 +623,7 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
         return False
     if manifest is not None and _for_readonly(floor_event, manifest):
         return False
-    if not readonly_proven and coordinator not in {'coordinator_codex_dispatch', 'coordinator_scratch_scp', 'coordinator_remote_mail_send', 'coordinator_ops_tool', 'coordinator_peer_fetch', 'coordinator_ops_redirect'}:
+    if not readonly_proven and coordinator not in COORDINATOR_GRANTS:
         residual = command
         if split is not None:
             # A proven split gets one shell-effect decision per segment. The
@@ -752,7 +752,7 @@ def _true_floor(event, manifest=None, coordinator=None, readonly_proven=None):
         # checked every parseable line; anything left unparsed is floor.
         return True
     lowered = [word if word in {"-C", "-F"} else word.casefold() for word in words]
-    if coordinator not in {"coordinator_codex_dispatch", "coordinator_scratch_scp", "coordinator_remote_mail_send", "coordinator_ops_tool", "coordinator_peer_fetch", "coordinator_ops_redirect"} and any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
+    if coordinator not in COORDINATOR_GRANTS and any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
         # 2026-10-10 shared-engine carve-out: the ssh_readonly class (p3 port)
         # may allow a parser-PROVEN readonly ssh command to the reviewed host.
         # The proof runs here, inside the floor, so no other REMOTE shape and
@@ -823,7 +823,7 @@ def _floor_verb(lowered, coordinator=None):
     if verb == "awk" and len(lowered) > 1 and any(token in " ".join(lowered[1:]) for token in ("system(", "getline", ">", "|")):
         return True
     # Remote and service control also floor per segment ('cd X && ssh y'):
-    if coordinator not in {"coordinator_codex_dispatch", "coordinator_scratch_scp", "coordinator_remote_mail_send", "coordinator_ops_tool", "coordinator_peer_fetch", "coordinator_ops_redirect"} and any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
+    if coordinator not in COORDINATOR_GRANTS and any(word in REMOTE or word.startswith(("http://", "https://")) for word in lowered):
         return True
     if any(word in SERVICE or word in {"pkill", "killall"} for word in lowered):
         return True
@@ -4653,6 +4653,10 @@ OPTIONAL_COORDINATOR_CLASSES = ('ops_tool',)
 # The vetted Kikin tool's fixed verb set (bunta-ops; agents-bunta-ops.org).
 # Every argument must be shell-inert: the remote shell re-parses the argv.
 OPS_TOOL = 'bunta-ops'
+# Every proven coordinator grant that narrows the overlapping floor clauses.
+# One set, so a new grant cannot be missed in one of the floor checks.
+COORDINATOR_GRANTS = frozenset({'coordinator_codex_dispatch', 'coordinator_scratch_scp', 'coordinator_remote_mail_send',
+                                'coordinator_ops_tool', 'coordinator_peer_fetch', 'coordinator_ops_redirect'})
 OPS_VERBS = frozenset({'mail-inbox', 'mail-new', 'mail-read', 'mail-receipt', 'mail-send',
                        'status', 'logs', 'git', 'x230-fetch', 'x230-push'})
 OPS_ARG = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_./:@=+,-]*$')
