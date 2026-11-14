@@ -738,6 +738,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import fcntl
 import hashlib
 import ipaddress
@@ -1051,6 +1052,10 @@ def load_registry(path: Path, host: str) -> dict:
         # otherwise every scan re-attempts it and the log fills with one "status is
         # unknown" per queued item.
         optional = {"parked", "parked_reason"}
+        if transport == "opencode":
+            # Honey's OpenCode server answers 401 without credentials and kikin's has no auth,
+            # so one seat may name a 0600 credential file. The secret never lives in this registry.
+            optional = optional | {"opencode_auth_file"}
         if transport == "hermes" and seat == "aura":
             # Aura's lane alone may carry the trusted read selector (Hermes, 2026-11-07).
             optional = optional | {"wake_read_selector"}
@@ -1683,13 +1688,46 @@ class OpenCodeAdapter:
                 or len(directory) > 4096 or any(ord(c) < 32 for c in directory)
                 or str(Path(directory)) != directory or ".." in Path(directory).parts):
             raise WatcherError("invalid OpenCode session directory")
+        auth_file = record.get("opencode_auth_file")
+        if auth_file is not None and (
+                not isinstance(auth_file, str) or not auth_file.startswith("/")
+                or len(auth_file) > 4096 or any(ord(c) < 32 for c in auth_file)
+                or ".." in Path(auth_file).parts):
+            raise WatcherError("invalid OpenCode auth file path")
+
+    @staticmethod
+    def _auth_header(record: dict) -> dict:
+        """Optional HTTP basic auth from a per-seat file, read on every request.
+
+        Honey's OpenCode server answers 401 without credentials while kikin's has no auth, so
+        the seat row names a 0600 file instead of carrying a secret. A file anyone else can read
+        is refused rather than used, and its contents never appear in an error message.
+        """
+        path = record.get("opencode_auth_file")
+        if path is None:
+            return {}
+        try:
+            info = os.stat(path)
+        except OSError:
+            raise WatcherError("OpenCode auth file is unreadable") from None
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise WatcherError("OpenCode auth file must be owned by the watcher and unreadable by others")
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                raw = handle.read(4097).strip()
+        except (OSError, UnicodeError):
+            raise WatcherError("OpenCode auth file is unreadable") from None
+        if not raw or ":" not in raw or len(raw) > 4096 or any(ord(c) < 32 for c in raw):
+            raise WatcherError("OpenCode auth file is malformed")
+        token = base64.b64encode(raw.encode("utf-8")).decode("ascii")
+        return {"Authorization": "Basic " + token}
 
     def _request(self, record: dict, method: str, route: str, payload=None) -> dict:
         self.validate_target(record)
         request = urllib.request.Request(
             loopback_url(record["opencode_url"], "OpenCode URL") + route,
             data=None if payload is None else json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}, method=method)
+            headers={"Content-Type": "application/json", **self._auth_header(record)}, method=method)
         try:
             with self.opener(request, timeout=15) as response:
                 if response.status != 200:
@@ -1735,7 +1773,8 @@ class OpenCodeAdapter:
         base = loopback_url(record["opencode_url"], "OpenCode URL")
         last_error = None
         for path in (f"/session/{target}/message", f"/api/session/{target}/message"):
-            request = urllib.request.Request(base + path, method="GET")
+            request = urllib.request.Request(base + path, method="GET",
+                                             headers=self._auth_header(record))
             try:
                 with self.opener(request, timeout=15) as response:
                     if response.status != 200:
