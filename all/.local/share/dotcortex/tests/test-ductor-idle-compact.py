@@ -160,6 +160,20 @@ class IdleCompactTests(unittest.IsolatedAsyncioTestCase):
         await self.tick(comp)
         self.assertEqual(cli.calls, [])
 
+    async def test_antigravity_compacts_after_55_minutes_once(self):
+        s = FakeSession("a1", "antigravity", ago(56))
+        comp, cli, _, _ = self.make([s])
+        await self.tick(comp)
+        await self.tick(comp)
+        self.assertEqual([r.prompt for r in cli.calls], ["/compact"])
+        self.assertEqual(cli.calls[0].resume_session, "a1")
+        self.assertEqual(cli.calls[0].provider_override, "antigravity")
+
+    async def test_antigravity_not_before_threshold(self):
+        comp, cli, _, _ = self.make([FakeSession("a1", "antigravity", ago(40))])
+        await self.tick(comp)
+        self.assertEqual(cli.calls, [])
+
     async def test_codex_compacts_after_25_not_claude_window(self):
         comp, cli, codex, _ = self.make([FakeSession("x1", "codex", ago(26))])
         await self.tick(comp)

@@ -63,6 +63,8 @@ class IdleCompactSettings:
     claude_cache_minutes: float = 60.0
     codex_idle_minutes: float = 25.0
     codex_cache_minutes: float = 30.0
+    antigravity_idle_minutes: float = 55.0
+    antigravity_cache_minutes: float = 60.0
     tick_seconds: float = 60.0
     timeout_seconds: float = 900.0
 
@@ -88,6 +90,9 @@ class IdleCompactSettings:
         elif provider == "codex":
             fallback = (self.codex_idle_minutes * 60, self.codex_cache_minutes * 60)
             policy_provider, endpoint = "openai", "openai-codex-oauth"
+        elif provider == "antigravity":
+            fallback = (self.antigravity_idle_minutes * 60, self.antigravity_cache_minutes * 60)
+            policy_provider, endpoint = "google", "antigravity"
         else:
             return None
         helper = Path(os.environ.get(
@@ -130,11 +135,13 @@ class IdleCompactor:
             return
         self._task = asyncio.create_task(self._run())
         logger.info(
-            "Idle compaction started (claude %.0fm/%.0fm, codex %.0fm/%.0fm)",
+            "Idle compaction started (claude %.0fm/%.0fm, codex %.0fm/%.0fm, antigravity %.0fm/%.0fm)",
             settings.claude_idle_minutes,
             settings.claude_cache_minutes,
             settings.codex_idle_minutes,
             settings.codex_cache_minutes,
+            settings.antigravity_idle_minutes,
+            settings.antigravity_cache_minutes,
         )
 
     async def stop(self) -> None:
@@ -245,6 +252,8 @@ class IdleCompactor:
             try:
                 if session.provider == "claude":
                     ok = await self._compact_claude(session, settings)
+                elif session.provider == "antigravity":
+                    ok = await self._compact_antigravity(session, settings)
                 else:
                     ok = await self._compact_codex(session, settings)
             except asyncio.CancelledError:
@@ -283,6 +292,32 @@ class IdleCompactor:
         if response.session_id and response.session_id != session.session_id:
             logger.warning(
                 "Claude idle compaction returned a new session id %s (kept %s)",
+                response.session_id,
+                session.session_id,
+            )
+        return "done"
+
+    async def _compact_antigravity(self, session: SessionData, settings: IdleCompactSettings) -> str:
+        key = session.session_key
+        request = AgentRequest(
+            prompt="/compact",
+            model_override=session.model or None,
+            provider_override="antigravity",
+            effort_override=session.reasoning_effort or None,
+            chat_id=key.chat_id,
+            topic_id=key.topic_id,
+            transport=key.transport,
+            process_label="idle-compact",
+            resume_session=session.session_id,
+            timeout_seconds=settings.timeout_seconds,
+        )
+        response = await self._orch._cli_service.execute(request)
+        if response.is_error:
+            logger.warning("Antigravity idle compaction error: %s", response.result[:200])
+            return "failed"
+        if response.session_id and response.session_id != session.session_id:
+            logger.warning(
+                "Antigravity idle compaction returned a new session id %s (kept %s)",
                 response.session_id,
                 session.session_id,
             )
