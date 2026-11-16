@@ -1558,6 +1558,29 @@ STALLED_WAKE_REASONS = frozenset({"busy", "rate_limited", "transport_unavailable
 REQUEUE_MAX_AGE_SECONDS = 12 * 60 * 60
 REQUEUE_MAX_ATTEMPTS = 8
 
+# A wake recorded as delivered is only evidence that a prompt entered the pane. When the
+# turn it entered dies - a provider 529, a crash, a supervisor restart - the prompt goes
+# with it, the message stays in new/, and every later scan skips it because the receipt
+# says injected. The seat then looks idle while mail piles up. Age is the only signal that
+# separates a lost wake from work in progress, so this is generous with time and strict
+# with attempts.
+INJECTION_STALE_SECONDS = 15 * 60
+INJECTION_MAX_REATTEMPTS = 2
+INJECTION_REPLAY_STATES = frozenset({"injected", "delivery_unknown"})
+
+
+def injection_stranded(receipt: dict | None, now: float) -> bool:
+    """True when a wake was recorded as delivered but the mail is demonstrably unconsumed."""
+    if not receipt or receipt.get("wake_state") not in INJECTION_REPLAY_STATES:
+        return False
+    if receipt.get("handling_state") in {"handling_completed", "handling_rejected"}:
+        return False
+    updated = receipt.get("wake_updated_at")
+    if not isinstance(updated, (int, float)) or now - updated < INJECTION_STALE_SECONDS:
+        return False
+    attempts = receipt.get("reinject_attempts", 0)
+    return isinstance(attempts, int) and attempts < INJECTION_MAX_REATTEMPTS
+
 
 def requeue_stalled(seat: str, mailbox: Path, now: float) -> int:
     """Re-offer queued wakes that were filed to `cur/` while the seat was busy.
@@ -1671,7 +1694,14 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                 continue
             seen.add((seat, mid))
             if old and old["wake_state"] in {"injecting", "injected", "delivery_unknown"}:
-                continue
+                if not injection_stranded(old, now):
+                    continue
+                # The wake landed in a turn that did not survive it. Re-offer it, and count
+                # the attempt so a lane that cannot deliver cannot loop forever.
+                MAILCORTEX.write_wake_receipt(
+                    seat, mid, "observed", filename=path.name, reason="stale_injection",
+                    reinject_attempts=(old.get("reinject_attempts") or 0) + 1,
+                    wake_updated_at=now)
             if record["transport"] == "deepseek" and str(parsed.get("Auto-Submitted", "no")).lower() != "no":
                 if not old or old.get("reason") != "auto_submitted":
                     MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
