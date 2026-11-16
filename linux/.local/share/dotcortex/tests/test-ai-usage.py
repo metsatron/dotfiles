@@ -932,14 +932,19 @@ class BankedResetTests(unittest.TestCase):
                 }
             }
         )
-        line = self.ai_usage.format_banked_resets_line(raw)
-        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", line)
-        self.assertTrue(plain.startswith("  Banked:"), plain)
-        self.assertIn("1 x fbl (exp ", plain)
-        self.assertIn("1 x wk (exp ", plain)
-        self.assertIn("17 Nov", plain)
-        self.assertIn("11 Dec", plain)
-        self.assertNotIn("\n", plain)
+        rows = [
+            self.ai_usage.ANSI_ESCAPE_RE.sub("", row)
+            for row in self.ai_usage.format_banked_resets_lines(raw)
+        ]
+        self.assertEqual(len(rows), 2, rows)
+        # codex's own reset credits render as "bank N  [bar]  pct  <hourglass> countdown  kind";
+        # the claude inventory speaks the same shape instead of its own sentence.
+        self.assertTrue(rows[0].startswith("  bank 1 "), rows[0])
+        self.assertTrue(rows[1].startswith("  bank 2 "), rows[1])
+        self.assertIn("Fable", rows[0])
+        self.assertIn("Weekly", rows[1])
+        self.assertIn("17 Nov", rows[0])
+        self.assertIn("11 Dec", rows[1])
 
     def test_expired_entry_is_reported_and_never_available(self):
         raw = self.claude_raw(
@@ -960,12 +965,16 @@ class BankedResetTests(unittest.TestCase):
         self.assertFalse(entries[1]["expired"])
         self.assertEqual(self.ai_usage.banked_available_count(entries), 2)
         self.assertEqual(self.ai_usage.banked_available_count(entries, "fbl"), 0)
-        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", self.ai_usage.format_banked_resets_line(raw))
-        self.assertIn("0 x fbl", plain)
-        self.assertIn("expired", plain)
-        self.assertIn("2 x wk", plain)
-        self.assertEqual(plain.count("Banked:"), 1)
-        self.assertNotIn("\n", plain)
+        rows = [
+            self.ai_usage.ANSI_ESCAPE_RE.sub("", row)
+            for row in self.ai_usage.format_banked_resets_lines(raw)
+        ]
+        self.assertEqual(len(rows), 2, rows)
+        self.assertIn("Fable", rows[0])
+        self.assertIn("expired", rows[0])
+        self.assertIn("Weekly", rows[1])
+        self.assertIn("2 available", rows[1])
+        self.assertNotIn("expired", rows[1])
 
     def test_two_accounts_are_named_not_pooled(self):
         raw = self.claude_raw(
@@ -982,10 +991,15 @@ class BankedResetTests(unittest.TestCase):
                 }
             }
         )
-        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", self.ai_usage.format_banked_resets_line(raw))
-        self.assertIn("1 x fbl @cc-main", plain)
-        self.assertIn("4 x fbl @cc-alt", plain)
-        self.assertEqual(plain.count("Banked:"), 1)
+        rows = [
+            self.ai_usage.ANSI_ESCAPE_RE.sub("", row)
+            for row in self.ai_usage.format_banked_resets_lines(raw)
+        ]
+        self.assertEqual(len(rows), 2, rows)
+        self.assertIn("@cc-main", rows[0])
+        self.assertIn("@cc-alt", rows[1])
+        self.assertIn("4 available", rows[1])
+        self.assertNotIn("@cc-alt", rows[0])
 
     def test_no_entries_renders_no_line(self):
         self.assertIsNone(self.ai_usage.format_banked_resets_line({"usage": {"primary": {}}}))
@@ -1012,8 +1026,9 @@ class BankedResetTests(unittest.TestCase):
         with redirect_stdout(output):
             self.ai_usage.render_text([self.claude_item(raw)])
         plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", output.getvalue())
-        self.assertEqual(plain.count("Banked:"), 1, plain)
-        self.assertIn("1 x fbl", plain)
+        self.assertIn("bank 1", plain)
+        self.assertIn("Fable", plain)
+        self.assertEqual(plain.count("bank 1"), 1, plain)
         self.assertNotIn("$", plain)
 
     def test_cli_refuses_a_bad_kind(self):
