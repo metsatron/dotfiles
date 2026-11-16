@@ -5,9 +5,10 @@ import io
 import json
 import os
 import re
+import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
@@ -809,6 +810,351 @@ class NeuralWattAddendumTests(unittest.TestCase):
         script = Path(self.ai_usage.__file__).read_text()
         self.assertNotIn("NEURALWATT_COOKIE_JAR = os.path.expanduser(", script)
         self.assertNotIn("NEURALWATT_OFFERS_FEED = os.path.expanduser(", script)
+
+
+class BankedResetTests(unittest.TestCase):
+    """Banked limit resets: local inventory (fbl / wk), never a quota window."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+        cls.now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)
+
+    def store(self, payload=None, text=None):
+        """A throwaway store path; callers apply the env override themselves."""
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        path = Path(tmpdir.name) / "banked-resets.json"
+        if text is not None:
+            path.write_text(text, encoding="utf-8")
+        elif payload is not None:
+            path.write_text(json.dumps(payload), encoding="utf-8")
+        return path
+
+    def loaded(self, payload=None, text=None, now=None):
+        path = self.store(payload, text)
+        return self.ai_usage.load_banked_resets(path, now or self.now)
+
+    def claude_raw(self, payload):
+        path = self.store(payload)
+        entries, reason = self.ai_usage.banked_resets_for("claude", path, self.now)
+        self.assertIsNone(reason)
+        return {"usage": {"primary": {}, "secondary": {}}, "banked": entries}
+
+    def claude_item(self, raw):
+        return {
+            "provider": "claude",
+            "label": "Claude Code",
+            "state": "ok",
+            "source": "oauth",
+            "summary": "Claude usage",
+            "raw": raw,
+        }
+
+    def assert_cli_refusal(self, spec, message):
+        path = self.store()
+        err = io.StringIO()
+        with patch.dict(os.environ, {"AI_USAGE_BANKED_RESETS": str(path)}), redirect_stderr(err):
+            code = self.ai_usage.cmd_bank_set(spec)
+        self.assertEqual(code, 2, spec)
+        self.assertIn(message, err.getvalue(), spec)
+        self.assertFalse(path.exists(), "a refused --bank-set must not create the store")
+
+    def test_absent_store_means_no_banked_resets_not_an_error(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(tmpdir.cleanup)
+        missing = Path(tmpdir.name) / "banked-resets.json"
+        self.assertFalse(missing.exists())
+        accounts, reason = self.ai_usage.load_banked_resets(missing, self.now)
+        self.assertEqual(accounts, {})
+        self.assertIsNone(reason)
+
+    def test_malformed_store_degrades_to_empty_with_a_reason(self):
+        accounts, reason = self.loaded(text="{ this is not json")
+        self.assertEqual(accounts, {})
+        self.assertIsInstance(reason, str)
+        self.assertIn("malformed store", reason)
+        # ... and reading it never raises into the panel path.
+        self.assertIsNone(self.ai_usage.format_banked_resets_line({"banked": []}))
+
+    def test_bad_entry_shapes_are_dropped_with_a_reason(self):
+        accounts, reason = self.loaded(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00"},
+                        {"kind": "month", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00"},
+                        {"kind": "wk", "count": 0, "expiresAt": "2030-12-11T12:00:00+00:00"},
+                        {"kind": "wk", "count": 1, "expiresAt": "next tuesday"},
+                        # naive stamp: refused, never assumed UTC
+                        {"kind": "wk", "count": 1, "expiresAt": "2030-12-11T12:00:00"},
+                    ]
+                }
+            }
+        )
+        self.assertEqual(list(accounts), ["cc-main"])
+        self.assertEqual([entry["kind"] for entry in accounts["cc-main"]], ["fbl"])
+        self.assertIn("ignored", reason)
+
+    def test_fbl_and_wk_are_distinguished(self):
+        accounts, reason = self.loaded(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "wk", "count": 1, "expiresAt": "2030-12-11T12:00:00+00:00",
+                         "source": "manual"},
+                        {"kind": "fbl", "count": 2, "expiresAt": "2030-11-17T12:00:00+00:00",
+                         "source": "collector"},
+                    ]
+                }
+            }
+        )
+        self.assertIsNone(reason)
+        entries = accounts["cc-main"]
+        self.assertEqual([entry["kind"] for entry in entries], ["fbl", "wk"])
+        self.assertEqual([entry["label"] for entry in entries], ["Fable", "Weekly"])
+        self.assertEqual([entry["count"] for entry in entries], [2, 1])
+        self.assertEqual([entry["source"] for entry in entries], ["collector", "manual"])
+        self.assertEqual([entry["expired"] for entry in entries], [False, False])
+        self.assertEqual(self.ai_usage.banked_available_count(entries, "fbl"), 2)
+        self.assertEqual(self.ai_usage.banked_available_count(entries), 3)
+
+    def test_count_and_expiry_are_rendered_on_one_line(self):
+        raw = self.claude_raw(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00",
+                         "source": "manual"},
+                        {"kind": "wk", "count": 1, "expiresAt": "2030-12-11T12:00:00+00:00",
+                         "source": "manual"},
+                    ]
+                }
+            }
+        )
+        line = self.ai_usage.format_banked_resets_line(raw)
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", line)
+        self.assertTrue(plain.startswith("  Banked:"), plain)
+        self.assertIn("1 x fbl (exp ", plain)
+        self.assertIn("1 x wk (exp ", plain)
+        self.assertIn("17 Nov", plain)
+        self.assertIn("11 Dec", plain)
+        self.assertNotIn("\n", plain)
+
+    def test_expired_entry_is_reported_and_never_available(self):
+        raw = self.claude_raw(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2026-11-10T12:00:00+00:00",
+                         "source": "manual"},
+                        {"kind": "wk", "count": 2, "expiresAt": "2030-12-11T12:00:00+00:00",
+                         "source": "manual"},
+                    ]
+                }
+            }
+        )
+        entries = raw["banked"]
+        self.assertTrue(entries[0]["expired"])
+        self.assertEqual(entries[0]["expiresIn"], 0)
+        self.assertFalse(entries[1]["expired"])
+        self.assertEqual(self.ai_usage.banked_available_count(entries), 2)
+        self.assertEqual(self.ai_usage.banked_available_count(entries, "fbl"), 0)
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", self.ai_usage.format_banked_resets_line(raw))
+        self.assertIn("0 x fbl", plain)
+        self.assertIn("expired", plain)
+        self.assertIn("2 x wk", plain)
+        self.assertEqual(plain.count("Banked:"), 1)
+        self.assertNotIn("\n", plain)
+
+    def test_two_accounts_are_named_not_pooled(self):
+        raw = self.claude_raw(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00",
+                         "source": "manual"},
+                    ],
+                    "cc-alt": [
+                        {"kind": "fbl", "count": 4, "expiresAt": "2030-11-18T12:00:00+00:00",
+                         "source": "manual"},
+                    ],
+                }
+            }
+        )
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", self.ai_usage.format_banked_resets_line(raw))
+        self.assertIn("1 x fbl @cc-main", plain)
+        self.assertIn("4 x fbl @cc-alt", plain)
+        self.assertEqual(plain.count("Banked:"), 1)
+
+    def test_no_entries_renders_no_line(self):
+        self.assertIsNone(self.ai_usage.format_banked_resets_line({"usage": {"primary": {}}}))
+        self.assertIsNone(self.ai_usage.format_banked_resets_line({"banked": []}))
+
+    def test_panel_prints_one_banked_line_and_no_dollar_line(self):
+        raw = self.claude_raw(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00",
+                         "source": "manual"},
+                    ]
+                }
+            }
+        )
+        raw["usage"] = {
+            "primary": {"label": "5h", "usedPercent": 12, "windowMinutes": 300,
+                        "resetsAt": "2030-11-17T12:00:00+00:00"},
+            "secondary": {"label": "wk", "usedPercent": 41, "windowMinutes": 10080,
+                          "resetsAt": "2030-11-20T12:00:00+00:00"},
+        }
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.ai_usage.render_text([self.claude_item(raw)])
+        plain = self.ai_usage.ANSI_ESCAPE_RE.sub("", output.getvalue())
+        self.assertEqual(plain.count("Banked:"), 1, plain)
+        self.assertIn("1 x fbl", plain)
+        self.assertNotIn("$", plain)
+
+    def test_cli_refuses_a_bad_kind(self):
+        self.assert_cli_refusal(
+            "claude:cc-main:month:1:2030-11-17T18:59:00+11:00", "kind must be one of"
+        )
+        self.assert_cli_refusal(
+            "nosuch:cc-main:fbl:1:2030-11-17T18:59:00+11:00", "unknown provider"
+        )
+
+    def test_cli_refuses_a_bad_count(self):
+        for spec in (
+            "claude:cc-main:fbl:0:2030-11-17T18:59:00+11:00",
+            "claude:cc-main:fbl:-2:2030-11-17T18:59:00+11:00",
+            "claude:cc-main:fbl:many:2030-11-17T18:59:00+11:00",
+        ):
+            self.assert_cli_refusal(spec, "count must be a positive integer")
+
+    def test_cli_refuses_a_bad_date(self):
+        for spec in (
+            "claude:cc-main:fbl:1:next tuesday",
+            "claude:cc-main:fbl:1:2030-11-17T18:59:00",
+            "claude:cc-main:fbl:1:2030-13-40T18:59:00+11:00",
+        ):
+            self.assert_cli_refusal(spec, "timezone-aware ISO-8601")
+
+    def test_cli_bank_set_roundtrip_and_correction(self):
+        path = self.store()
+        out = io.StringIO()
+        err = io.StringIO()
+        with patch.dict(os.environ, {"AI_USAGE_BANKED_RESETS": str(path)}), \
+             redirect_stdout(out), redirect_stderr(err):
+            first = self.ai_usage.cmd_bank_set("claude:cc-main:fbl:1:2030-11-17T12:00:00+00:00")
+            second = self.ai_usage.cmd_bank_set("claude:cc-main:fbl:3:2030-11-17T12:00:00+00:00")
+        self.assertEqual((first, second), (0, 0))
+        self.assertEqual(err.getvalue(), "")
+
+        accounts, reason = self.ai_usage.load_banked_resets(path, self.now)
+        self.assertIsNone(reason)
+        entries = accounts["cc-main"]
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0]["count"], 3)
+        self.assertEqual(entries[0]["source"], "manual")
+        self.assertEqual(entries[0]["provider"], "claude")
+        self.assertEqual(entries[0]["kind"], "fbl")
+
+        stored = json.loads(path.read_text())
+        self.assertEqual(sorted(stored["accounts"]["cc-main"][0]),
+                         ["count", "expiresAt", "kind", "provider", "source"])
+        self.assertEqual(stored["accounts"]["cc-main"][0]["count"], 3)
+
+    def test_bank_set_warns_before_rewriting_a_damaged_store(self):
+        path = self.store(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "wk", "count": 1, "expiresAt": "2030-12-11T12:00:00+00:00",
+                         "source": "collector"},
+                        {"kind": "month", "count": 9, "expiresAt": "2030-12-11T12:00:00+00:00"},
+                    ]
+                }
+            }
+        )
+        err = io.StringIO()
+        with patch.dict(os.environ, {"AI_USAGE_BANKED_RESETS": str(path)}), \
+             redirect_stdout(io.StringIO()), redirect_stderr(err):
+            code = self.ai_usage.cmd_bank_set("claude:cc-main:fbl:1:2030-11-17T12:00:00+00:00")
+        self.assertEqual(code, 0)
+        self.assertIn("ignored", err.getvalue())
+        accounts, reason = self.ai_usage.load_banked_resets(path, self.now)
+        self.assertIsNone(reason)
+        self.assertEqual([entry["kind"] for entry in accounts["cc-main"]], ["fbl", "wk"])
+        self.assertEqual(accounts["cc-main"][1]["count"], 1)
+
+    def test_bank_list_honours_json(self):
+        path = self.store(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00",
+                         "source": "manual"},
+                    ]
+                }
+            }
+        )
+        output = io.StringIO()
+        with patch.dict(os.environ, {"AI_USAGE_BANKED_RESETS": str(path)}), \
+             redirect_stdout(output):
+            code = self.ai_usage.cmd_bank_list(as_json=True)
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertIsNone(payload["error"])
+        self.assertEqual(payload["accounts"]["cc-main"][0]["kind"], "fbl")
+
+    def test_json_envelope_carries_raw_banked_kinds(self):
+        path = self.store(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2030-11-17T12:00:00+00:00",
+                         "source": "manual"},
+                        {"kind": "wk", "count": 2, "expiresAt": "2030-12-11T12:00:00+00:00",
+                         "source": "collector"},
+                    ]
+                }
+            }
+        )
+        fetched = {
+            "provider": "claude",
+            "label": "Claude Code",
+            "state": "ok",
+            "source": "oauth",
+            "summary": "Claude usage",
+            "raw": {
+                "usage": {
+                    "primary": {"label": "5h", "usedPercent": 10, "windowMinutes": 300,
+                                "resetsAt": "2030-11-17T12:00:00+00:00"},
+                    "secondary": {"label": "wk", "usedPercent": 40, "windowMinutes": 10080,
+                                  "resetsAt": "2030-11-20T12:00:00+00:00"},
+                },
+                "scoped": [],
+            },
+        }
+        output = io.StringIO()
+        with patch.dict(os.environ, {"AI_USAGE_BANKED_RESETS": str(path)}), \
+             patch.object(self.ai_usage, "load_dotenv_exports", return_value={}), \
+             patch.object(self.ai_usage, "_cache_read", return_value={}), \
+             patch.object(self.ai_usage, "_cache_write"), \
+             patch.object(self.ai_usage, "_fetch_provider_uncached", return_value=fetched), \
+             patch.object(sys, "argv",
+                          ["ai-usage", "--json", "--providers", "claude", "--no-remote"]), \
+             redirect_stdout(output):
+            code = self.ai_usage.main()
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        banked = payload[0]["raw"]["banked"]
+        self.assertEqual([entry["kind"] for entry in banked], ["fbl", "wk"])
+        self.assertEqual([entry["label"] for entry in banked], ["Fable", "Weekly"])
+        self.assertEqual([entry["count"] for entry in banked], [1, 2])
+        self.assertEqual([entry["expired"] for entry in banked], [False, False])
+        self.assertIsNone(payload[0]["raw"].get("bankedError"))
 
 
 class AntigravityPoolTests(unittest.TestCase):

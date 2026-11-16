@@ -856,6 +856,352 @@ def format_codex_reset_credit_lines(raw: dict[str, Any]) -> list[str]:
     return lines
 
 
+# Banked limit resets (2026-11-16) — spare, spendable resets are inventory, not
+# a quota window. Two kinds, and only these two: "fbl" (Fable bank — refills the
+# 5h limit and the Fable allowance) and "wk" (weekly bank — refills the whole
+# week). They live in a small local JSON store so `--bank-set` can record one by
+# hand today and a collector can append later. Store shape:
+#   {"accounts": {"<account-id>": [
+#       {"kind": "fbl"|"wk", "count": <int>,
+#        "expiresAt": "<ISO-8601 with offset>",
+#        "source": "manual"|"collector", "note": "<optional>"}]}}
+BANKED_RESETS_KINDS = ("fbl", "wk")
+BANKED_RESETS_LABELS = {"fbl": "Fable", "wk": "Weekly"}
+BANKED_RESETS_STORE_DEFAULT = Path.home() / ".config" / "ai-usage" / "banked-resets.json"
+
+
+def banked_resets_path() -> Path:
+    """The store path, resolved at call time: AI_USAGE_BANKED_RESETS wins so a
+    host (or a test) can point at its own store without touching the default."""
+    override = os.environ.get("AI_USAGE_BANKED_RESETS", "")
+    if override.strip():
+        return Path(override.strip()).expanduser()
+    return BANKED_RESETS_STORE_DEFAULT
+
+
+def _banked_expiry(value: Any) -> datetime | None:
+    """Strict ISO-8601 instant, and it must carry an offset.
+
+    A naive stamp is refused rather than assumed UTC: a banked reset recorded
+    at the wrong hour is worse than one we never recorded.
+    """
+    if not isinstance(value, str):
+        return None
+    text = value.strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def normalize_banked_entry(entry: Any, now: datetime | None = None) -> dict[str, Any] | None:
+    """One stored entry -> the panel/JSON shape, or None when it is unusable."""
+    if not isinstance(entry, dict):
+        return None
+    kind = entry.get("kind")
+    if not isinstance(kind, str) or kind.strip().lower() not in BANKED_RESETS_KINDS:
+        return None
+    kind = kind.strip().lower()
+    count = entry.get("count")
+    if isinstance(count, bool) or not isinstance(count, int) or count <= 0:
+        return None
+    expiry = _banked_expiry(entry.get("expiresAt"))
+    if expiry is None:
+        return None
+
+    current = now or datetime.now(timezone.utc)
+    seconds_left = int((expiry - current).total_seconds())
+    source = entry.get("source")
+    normalized: dict[str, Any] = {
+        "kind": kind,
+        "label": BANKED_RESETS_LABELS[kind],
+        "count": count,
+        "expiresAt": expiry.isoformat(),
+        "expiresIn": max(0, seconds_left),
+        "expired": seconds_left <= 0,
+        "source": source if source in ("manual", "collector") else "manual",
+    }
+    note = entry.get("note")
+    if isinstance(note, str) and note.strip():
+        normalized["note"] = note.strip()
+    provider = entry.get("provider")
+    if isinstance(provider, str) and provider.strip():
+        normalized["provider"] = provider.strip().lower()
+    return normalized
+
+
+def load_banked_resets(
+    path: Path | None = None, now: datetime | None = None
+) -> tuple[dict[str, list[dict[str, Any]]], str | None]:
+    """Read the banked store. Never raises into the panel path.
+
+    An absent (or empty) file means "no banked resets", not an error. Malformed
+    content degrades to empty and hands back the reason so the panel can say so
+    instead of guessing.
+    """
+    store_path = path or banked_resets_path()
+    try:
+        text = store_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {}, None
+    except OSError as error:
+        return {}, f"store unreadable: {error.strerror or error}"
+    if not text.strip():
+        return {}, None
+    try:
+        doc = json.loads(text)
+    except ValueError as error:
+        return {}, f"malformed store: {error}"
+    if not isinstance(doc, dict):
+        return {}, "malformed store: top level is not an object"
+    accounts = doc.get("accounts")
+    if accounts is None:
+        return {}, None
+    if not isinstance(accounts, dict):
+        return {}, "malformed store: accounts is not an object"
+
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    skipped = 0
+    for account, entries in accounts.items():
+        if not isinstance(account, str) or not account.strip():
+            skipped += 1
+            continue
+        if isinstance(entries, dict):
+            entries = [entries]
+        if not isinstance(entries, list):
+            skipped += 1
+            continue
+        kept: list[dict[str, Any]] = []
+        for entry in entries:
+            cleaned = normalize_banked_entry(entry, now)
+            if cleaned is None:
+                skipped += 1
+                continue
+            cleaned["account"] = account.strip()
+            kept.append(cleaned)
+        if kept:
+            kept.sort(
+                key=lambda item: (BANKED_RESETS_KINDS.index(item["kind"]), item["expiresAt"])
+            )
+            normalized[account.strip()] = kept
+
+    if skipped:
+        plural = "entry" if skipped == 1 else "entries"
+        return normalized, f"{skipped} banked {plural} ignored (bad kind, count or expiry)"
+    return normalized, None
+
+
+def banked_resets_for(
+    provider: str, path: Path | None = None, now: datetime | None = None
+) -> tuple[list[dict[str, Any]], str | None]:
+    """Every banked entry that belongs to *provider*, kind then expiry order."""
+    accounts, reason = load_banked_resets(path, now)
+    entries: list[dict[str, Any]] = []
+    for account_entries in accounts.values():
+        for entry in account_entries:
+            owner = entry.get("provider")
+            if isinstance(owner, str) and owner and owner != provider:
+                continue
+            entries.append(dict(entry))
+    entries.sort(key=lambda item: (BANKED_RESETS_KINDS.index(item["kind"]), item["expiresAt"]))
+    return entries, reason
+
+
+def banked_available_count(entries: Any, kind: str | None = None) -> int:
+    """Spendable inventory: an expired entry never counts as available."""
+    if not isinstance(entries, list):
+        return 0
+    total = 0
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("expired"):
+            continue
+        if kind is not None and entry.get("kind") != kind:
+            continue
+        count = entry.get("count")
+        if isinstance(count, int) and not isinstance(count, bool) and count > 0:
+            total += count
+    return total
+
+
+def format_banked_resets_line(raw: dict[str, Any]) -> str | None:
+    """The claude panel's one banked line.
+
+    Nothing at all when the account holds no banked resets; an expired entry is
+    marked in place (shown as 0 available), never summed into the count and
+    never given a second line.
+    """
+    entries = raw.get("banked")
+    segments: list[str] = []
+    if isinstance(entries, list):
+        # One host normally banks for one account, so the compact form is bare.
+        # If a store does hold several, name the account rather than pooling one
+        # account's inventory into another's line.
+        accounts = {
+            entry.get("account")
+            for entry in entries
+            if isinstance(entry, dict) and isinstance(entry.get("account"), str) and entry["account"]
+        }
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = entry.get("kind")
+            if kind not in BANKED_RESETS_KINDS:
+                continue
+            expired = bool(entry.get("expired"))
+            count = 0 if expired else banked_available_count([entry])
+            expires_at = entry.get("expiresAt")
+            absolute = format_absolute_reset(expires_at if isinstance(expires_at, str) else None)
+            segment = f"{count} x {kind}"
+            if len(accounts) > 1 and isinstance(entry.get("account"), str) and entry["account"]:
+                segment += f" @{entry['account']}"
+            if absolute:
+                segment += f" (exp {absolute}{', expired' if expired else ''})"
+            elif expired:
+                segment += " (expired)"
+            segments.append(f"{RD}{segment}{R}" if expired else f"{FGY}{segment}{R}")
+    if not segments:
+        error = raw.get("bankedError")
+        if isinstance(error, str) and error.strip():
+            return f"  {FGY}Banked:{R} {RD}{error.strip()}{R}"
+        return None
+    return f"  {FGY}Banked:{R} " + ", ".join(segments)
+
+
+def _persistable_banked_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    """Only the stored fields go back to disk — never the derived panel ones."""
+    persisted = {
+        key: entry[key] for key in ("kind", "count", "expiresAt", "source") if key in entry
+    }
+    for key in ("note", "provider"):
+        if isinstance(entry.get(key), str) and entry[key]:
+            persisted[key] = entry[key]
+    return persisted
+
+
+def write_banked_resets(accounts: dict[str, list[dict[str, Any]]], path: Path | None = None) -> None:
+    """Atomic write, same pattern as the provider cache: a concurrent panel must
+    never read a half-written store."""
+    store_path = path or banked_resets_path()
+    store_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "accounts": {
+            account: [_persistable_banked_entry(entry) for entry in entries]
+            for account, entries in accounts.items()
+            if entries
+        }
+    }
+    tmp_path = f"{store_path}.{os.getpid()}.tmp"
+    with open(tmp_path, "w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+        handle.write("\n")
+    os.replace(tmp_path, store_path)
+
+
+def parse_banked_set_spec(spec: str) -> dict[str, Any]:
+    """PROVIDER:ACCOUNT:KIND:COUNT:EXPIRES -> a validated banked entry.
+
+    Raises ValueError with a terminal-readable message: a bad kind, a non
+    positive count and a naive (offset-less) date are refused outright rather
+    than quietly recorded.
+    """
+    parts = str(spec or "").split(":", 4)
+    if len(parts) != 5:
+        raise ValueError("expected PROVIDER:ACCOUNT:KIND:COUNT:EXPIRES")
+    provider, account, kind, count_text, expires_text = (part.strip() for part in parts)
+    known = sorted(spec_item.key for spec_item in PROVIDERS)
+    if provider.lower() not in known:
+        raise ValueError(f"unknown provider {provider!r}; known: {', '.join(known)}")
+    if not account:
+        raise ValueError("account id is empty")
+    if kind.lower() not in BANKED_RESETS_KINDS:
+        raise ValueError(f"kind must be one of {', '.join(BANKED_RESETS_KINDS)}, not {kind!r}")
+    try:
+        count = int(count_text)
+    except ValueError:
+        raise ValueError(f"count must be a positive integer, not {count_text!r}") from None
+    if count <= 0:
+        raise ValueError(f"count must be a positive integer, not {count_text!r}")
+    expiry = _banked_expiry(expires_text)
+    if expiry is None:
+        raise ValueError(f"expiry must be a timezone-aware ISO-8601 instant, not {expires_text!r}")
+    return {
+        "provider": provider.lower(),
+        "account": account,
+        "kind": kind.lower(),
+        "count": count,
+        "expiresAt": expiry.isoformat(),
+        "source": "manual",
+    }
+
+
+def cmd_bank_set(spec: str, as_json: bool = False) -> int:
+    """`--bank-set`: record one manual banked reset in the local store."""
+    try:
+        parsed = parse_banked_set_spec(spec)
+    except ValueError as error:
+        eprint(f"ai-usage --bank-set: {error}")
+        return 2
+
+    accounts, reason = load_banked_resets()
+    if reason:
+        # Never clobber silently: a rewrite keeps only the entries we could read.
+        eprint(f"ai-usage --bank-set: {reason}; rewriting the store without them")
+    bucket = accounts.setdefault(parsed["account"], [])
+    entry = {key: value for key, value in parsed.items() if key != "account"}
+    for index, existing in enumerate(bucket):
+        # Same kind and same expiry is a correction, not a second reset.
+        if existing.get("kind") == entry["kind"] and existing.get("expiresAt") == entry["expiresAt"]:
+            bucket[index] = {**existing, **entry}
+            break
+    else:
+        bucket.append(entry)
+    bucket.sort(key=lambda item: (BANKED_RESETS_KINDS.index(item["kind"]), item["expiresAt"]))
+
+    try:
+        write_banked_resets(accounts)
+    except OSError as error:
+        eprint(f"ai-usage --bank-set: cannot write the banked store: {error.strerror or error}")
+        return 1
+
+    if as_json:
+        print(json.dumps({"accounts": accounts}, indent=2, ensure_ascii=True))
+        return 0
+    absolute = format_absolute_reset(entry["expiresAt"]) or entry["expiresAt"]
+    print(f"{parsed['account']}: {parsed['count']} x {parsed['kind']} (exp {absolute})")
+    return 0
+
+
+def cmd_bank_list(as_json: bool = False) -> int:
+    """`--bank-list`: what is banked, expired entries included and marked."""
+    accounts, reason = load_banked_resets()
+    if as_json:
+        print(json.dumps({"accounts": accounts, "error": reason}, indent=2, ensure_ascii=True))
+        return 0
+    if not accounts:
+        suffix = f" ({reason})." if reason else "."
+        print(f"No banked resets in {banked_resets_path()}{suffix}")
+        return 0
+    for account in sorted(accounts):
+        print(f"{account}:")
+        for entry in accounts[account]:
+            absolute = format_absolute_reset(entry.get("expiresAt")) or str(entry.get("expiresAt"))
+            suffix = ", expired" if entry.get("expired") else ""
+            print(
+                f"  {entry['count']} x {entry['kind']} "
+                f"({entry['label']}, exp {absolute}{suffix})"
+            )
+    if reason:
+        print(f"({reason})")
+    return 0
+
+
 def week_of_year_label(value: str | None) -> str | None:
     dt = parse_iso_datetime(value)
     if not dt:
@@ -3250,6 +3596,27 @@ def _provider_cache_key(spec: ProviderSpec) -> str:
     return spec.key
 
 
+def _attach_banked_resets(result: dict[str, Any]) -> dict[str, Any]:
+    """Fold locally banked limit resets into a claude result's raw extras.
+
+    Attached in the pipeline rather than in the fetch so cache hits, stale
+    panels and a store edited minutes ago all show today's bank; a probe never
+    has to run for the inventory to be visible.
+    """
+    if result.get("provider") != "claude":
+        return result
+    raw = result.get("raw")
+    if not isinstance(raw, dict):
+        return result
+    entries, reason = banked_resets_for("claude")
+    raw["banked"] = entries
+    if reason:
+        raw["bankedError"] = reason
+    else:
+        raw.pop("bankedError", None)
+    return result
+
+
 def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
     now = time.time()
     cache_key = _provider_cache_key(spec)
@@ -3259,14 +3626,14 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
     # Serve a fresh cache without touching the network. This is what makes N
     # concurrent watchers cost one fetch instead of N.
     if cached and (now - float(entry.get("ts", 0))) < CACHE_TTL_SECONDS:
-        return _revive(cached, spec)
+        return _attach_banked_resets(_revive(cached, spec))
 
     # Still inside a backoff window from a previous 429: do not make it worse.
     # Serve the last good result if we have one, marked stale.
     backoff_until = float(entry.get("backoff_until", 0))
     if now < backoff_until:
         if cached:
-            return _revive({**cached, "stale": True}, spec)
+            return _attach_banked_resets(_revive({**cached, "stale": True}, spec))
         wait = int(backoff_until - now)
         # Standard result shape (with label, JSON-serializable) — a bare
         # {spec, state, detail} dict has no label for render_text and cannot be
@@ -3296,7 +3663,7 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
             },
         )
         if cached:
-            return _revive({**cached, "stale": True}, spec)
+            return _attach_banked_resets(_revive({**cached, "stale": True}, spec))
         return result
 
     # Success: reset the backoff ladder. Only good results are cached — caching
@@ -3306,7 +3673,7 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
             cache_key,
             {"ts": now, "result": _cacheable(result), "backoff_until": 0, "backoff_step": 0},
         )
-    return result
+    return _attach_banked_resets(result)
 
 
 def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
@@ -3589,6 +3956,12 @@ def render_text(results: list[dict[str, Any]]) -> None:
             if item["provider"] == "codex":
                 for line in format_codex_reset_credit_lines(raw):
                     print(line)
+            else:
+                # One compact line for the operator's banked resets (fbl / wk);
+                # nothing at all when the account holds none.
+                banked_line = format_banked_resets_line(raw)
+                if banked_line:
+                    print(banked_line)
 
         elif item["provider"] == "gemini" and isinstance(raw, dict):
             account_quota = raw.get("account_quota")
@@ -3912,11 +4285,27 @@ def parse_args() -> argparse.Namespace:
         default=str(REMOTES_FILE_DEFAULT),
         help=f"JSON file listing remote fleet feeds (default: {REMOTES_FILE_DEFAULT}).",
     )
+    parser.add_argument(
+        "--bank-set",
+        metavar="PROVIDER:ACCOUNT:KIND:COUNT:EXPIRES",
+        help="Record a banked limit reset by hand. KIND is fbl (Fable) or wk (weekly); "
+        "EXPIRES is an ISO-8601 instant with an offset.",
+    )
+    parser.add_argument(
+        "--bank-list",
+        action="store_true",
+        help="List banked limit resets, expired ones included (add --json for machine output).",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    if args.bank_list:
+        return cmd_bank_list(args.json)
+    if args.bank_set:
+        return cmd_bank_set(args.bank_set, args.json)
 
     if args.providers == "all":
         selected = list(DEFAULT_PROVIDER_KEYS)
