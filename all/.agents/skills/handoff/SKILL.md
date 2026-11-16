@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: Session Handoff
+description: Write a concise handoff for another session — what changed, what was verified, open questions and risks. Use when ending a session or passing work to a fresh window.
 ---
 
 # Session Handoff

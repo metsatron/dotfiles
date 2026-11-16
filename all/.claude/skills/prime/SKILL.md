@@ -1,6 +1,6 @@
 ---
 name: prime
-description: DotCortex Orientation
+description: Orient at the start of a DotCortex session — directory structure, recent history, the root Org files for the scope. Use at session start or when switching scope.
 ---
 
 # DotCortex Orientation

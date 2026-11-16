@@ -1,6 +1,6 @@
 ---
 name: todo
-description: DotCortex Task Routing
+description: Route and update TODO items in ~/HelmCortex/LOGS/TODO/ while keeping the LightCone section within its limits. Use whenever adding, completing or moving a TODO item.
 ---
 
 # DotCortex Task Routing

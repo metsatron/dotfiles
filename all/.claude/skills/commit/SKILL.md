@@ -1,6 +1,6 @@
 ---
 name: commit
-description: /commit — Structured Git Commit
+description: Create a structured git commit — review status and diff, classify type and scope, stage explicit paths, commit by pathspec. Use for every commit except standing WIP checkpoints.
 ---
 
 # /commit — Structured Git Commit
