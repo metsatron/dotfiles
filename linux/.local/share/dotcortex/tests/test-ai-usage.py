@@ -943,8 +943,9 @@ class BankedResetTests(unittest.TestCase):
         self.assertTrue(rows[1].startswith("  bank 2 "), rows[1])
         self.assertIn("Fable", rows[0])
         self.assertIn("Weekly", rows[1])
-        self.assertIn("17 Nov", rows[0])
-        self.assertIn("11 Dec", rows[1])
+        # the countdown is the whole story; the wall clock is gone
+        self.assertNotIn("Nov", rows[0])
+        self.assertNotIn("Dec", rows[1])
 
     def test_expired_entry_is_reported_and_never_available(self):
         raw = self.claude_raw(
