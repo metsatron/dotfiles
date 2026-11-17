@@ -117,7 +117,29 @@ class RecallTests(unittest.TestCase):
         self.assertEqual(self.run_sweep(fake), [])
         self.assertEqual(fake.stripped, [])
 
-    def test_permission_prompt_outside_the_window_is_kept(self):
+    def test_older_dead_permission_card_is_deleted_and_the_sweep_reaches_its_own_card(self):
+        # A sweep that missed leaves a card behind. The next sweep used to stop at it,
+        # strip its buttons and leave both cards in the chat.
+        fake = FakeTelegram({
+            101: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 600},
+            102: {'kind': 'bot', 'text': PERM.replace('Bash', 'Write'), 'buttons': True, 'date': self.now - 300},
+            103: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now},
+        })
+        self.assertEqual(self.run_sweep(fake), [103])
+        self.assertEqual(sorted(fake.messages), [])
+        self.assertEqual(fake.deleted, [101, 102, 103])
+        rows = [json.loads(line) for line in recall.LOG.read_text().splitlines()]
+        self.assertEqual([row['message_id'] for row in rows if row.get('action') == 'deleted_stale'], [101, 102])
+
+    def test_older_permission_card_is_kept_while_a_sibling_request_waits(self):
+        # With another request pending in the same batch the older card may be its live ask.
+        fake = FakeTelegram({101: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 600}})
+        self.assertEqual(self.run_sweep(fake, tools=('Bash', 'Write')), [])
+        self.assertIn(101, fake.messages)
+        self.assertEqual(fake.deleted, [])
+
+    def test_older_card_is_kept_when_settling_an_outcome(self):
+        self.sweep_args = {'outcome': 'denied'}
         fake = FakeTelegram({101: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 600}})
         self.assertEqual(self.run_sweep(fake), [])
         self.assertIn(101, fake.messages)

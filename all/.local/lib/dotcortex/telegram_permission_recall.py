@@ -345,6 +345,18 @@ def sweep(event, started, *, state_dir, base, now=time.time, sleep=time.sleep, s
                 deadline = 0
                 break
             if not in_window:
+                if (not outcome and not parallel and isinstance(date, int)
+                        and date < int(started) - 1):
+                    # A permission card older than this request, with no sibling
+                    # request waiting. The probe above has already removed its
+                    # buttons, so it is dead either way: it is the leftover of a
+                    # sweep that missed. Left in place it stopped this sweep and
+                    # every later one at the same card (71 dead cards on
+                    # 2026-11-17). Delete it and go on to this request's own card.
+                    gone = _call(base, token, 'deleteMessage', {'chat_id': chat, 'message_id': message_id}).get('ok')
+                    _log(session=session, action='deleted_stale' if gone else 'cleanup_failed', message_id=message_id)
+                    seen = message_id if seen is None else max(seen, message_id)
+                    continue
                 _log(session=session, action='skip', message_id=message_id, why='prompt_outside_window')
                 deadline = 0
                 break
