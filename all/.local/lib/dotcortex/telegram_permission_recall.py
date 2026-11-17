@@ -25,6 +25,10 @@ ANCHOR_RES = (
     re.compile(r'sent \(id: (\d+)\)'),
 )
 LOG = Path(os.path.expanduser('~/.local/state/dotcortex/telegram-permission-recall.jsonl'))
+# Per bot and chat: the lowest message id not yet checked for an open card.
+CLEAR_STATE = Path(os.path.expanduser('~/.local/state/dotcortex/telegram-permission-clear.json'))
+CLEAR_BACKFILL = 300  # first run for a bot: how far below the ceiling to start
+CLEAR_LIMIT = 400  # Telegram calls per clear; the mark keeps the rest for the next run
 
 
 def _log(**row):
@@ -377,7 +381,123 @@ def sweep(event, started, *, state_dir, base, now=time.time, sleep=time.sleep, s
     return deleted
 
 
+def _marks():
+    try:
+        data = json.loads(CLEAR_STATE.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_mark(key, value):
+    try:
+        marks = _marks()  # re-read: a parallel clear may have moved it further
+        if type(marks.get(key)) is int and marks[key] >= value:
+            return
+        marks[key] = value
+        CLEAR_STATE.parent.mkdir(parents=True, exist_ok=True)
+        temp = CLEAR_STATE.with_name(CLEAR_STATE.name + f'.{os.getpid()}.tmp')
+        temp.write_text(json.dumps(marks, sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temp, CLEAR_STATE)
+    except OSError:
+        pass
+
+
+def clear_open(session, ceiling, *, state_dir, base, sleep=time.sleep, start=None, limit=CLEAR_LIMIT):
+    """Delete every permission card that still has buttons, up to ceiling.
+
+    Mètsàtron's rule (Telegram 12310, 12313, 2026-11-18; first stated
+    2026-11-17 03:23): once a request is approved, every card still showing
+    its buttons is already settled, so the chat keeps at most one open card,
+    the live ask. The ceiling is this request's own card or the newest message
+    the session knows, so a card newer than it, a later request's live ask,
+    is never touched. The plugin keeps no record of its card ids, so each id
+    from the stored mark up to the ceiling is checked once; the mark then
+    moves past it and the next clear starts there."""
+    token, chat = _token(state_dir), _chat(state_dir)
+    if not token or not chat or type(ceiling) is not int or ceiling < 1:
+        _log(session=session, action='skip', why='clear_unbounded')
+        return []
+    key = hashlib.sha256((token + ':' + chat).encode()).hexdigest()[:16]
+    low = start if type(start) is int else _marks().get(key)
+    if type(low) is not int:
+        low = max(1, ceiling - CLEAR_BACKFILL)
+    message_id, calls, deleted, failures, stopped = max(1, low), 0, [], 0, None
+    while message_id <= ceiling:
+        if calls >= limit:
+            stopped = 'call_limit'
+            break
+        reply = _call(base, token, 'editMessageReplyMarkup', {'chat_id': chat, 'message_id': message_id})
+        calls += 1
+        if not reply.get('ok'):
+            params = reply.get('parameters') if isinstance(reply.get('parameters'), dict) else {}
+            retry = params.get('retry_after')
+            if type(retry) is int and retry <= 5:
+                sleep(retry)
+                continue  # same id again
+            if retry is not None:
+                stopped = f'rate_limited_{retry}s'
+                break  # keep the mark here; the next clear resumes at this id
+            if reply.get('description') in ('transport', None) or str(reply.get('description', '')).startswith('http '):
+                failures += 1
+                if failures <= 2:
+                    sleep(1)
+                    continue
+                stopped = 'transport'
+                break
+            message_id += 1  # a user message, a buttonless reply, or a deleted id
+            continue
+        message = reply.get('result') if isinstance(reply.get('result'), dict) else {}
+        text = message.get('text', '')
+        if isinstance(text, str) and text.startswith(PREFIX):
+            gone = _call(base, token, 'deleteMessage', {'chat_id': chat, 'message_id': message_id}).get('ok')
+            calls += 1
+            _log(session=session, action='deleted_open' if gone else 'cleanup_failed', message_id=message_id)
+            if gone:
+                deleted.append(message_id)
+        else:
+            _log(session=session, action='anomaly', message_id=message_id, why='buttoned_non_permission')
+        message_id += 1
+    _save_mark(key, message_id)
+    _log(session=session, action='cleared', low=low, ceiling=ceiling, next=message_id, deleted=deleted,
+         calls=calls, **({'stopped': stopped} if stopped else {}))
+    return deleted
+
+
+def clear_after_allow(event, *, state_dir, base, sleep=time.sleep):
+    """After an allow: clear every open card up to this request's own card.
+
+    The ceiling is the highest id this session's sweeps have seen (its own
+    card when the sweep found it) or the newest Telegram message in the
+    transcript. While a parallel sibling is still waiting, the ceiling drops
+    to the transcript's newest message, so the batch's live cards stay; the
+    last allow in the batch clears them."""
+    session = event.get('session_id', '') if isinstance(event, dict) else ''
+    tail = _transcript_tail(event.get('transcript_path')) if isinstance(event, dict) else None
+    if tail is None:
+        _log(session=session, action='skip', why='clear_no_transcript')
+        return []
+    anchor = _anchor(tail)
+    floor = _logged_floor(session) if session else None
+    if len(_unresolved(tail)) > 1:
+        ceiling = anchor
+    else:
+        ceiling = max((value for value in (anchor, floor) if value is not None), default=None)
+    return clear_open(session, ceiling, state_dir=state_dir, base=base, sleep=sleep)
+
+
 def main(argv):
+    if len(argv)==4 and argv[1]=='--clear':
+        # Manual backlog clear: --clear <first-id> <ceiling-id>, TELEGRAM_STATE_DIR set.
+        state = os.environ.get('TELEGRAM_STATE_DIR')
+        if not state or not argv[2].isdecimal() or not argv[3].isdecimal():
+            print('usage: TELEGRAM_STATE_DIR=<dir> telegram_permission_recall.py --clear <first-id> <ceiling-id>', file=sys.stderr)
+            return 2
+        base = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org').rstrip('/')
+        gone = clear_open('manual', int(argv[3]), state_dir=Path(state), base=base, start=int(argv[2]),
+                          limit=4 * (int(argv[3]) - int(argv[2]) + 1) + 20)
+        print(json.dumps({'deleted': gone}))
+        return 0
     if len(argv)==2 and argv[1]=='--outcome':
         try:
             value=json.loads(sys.stdin.read(1024*1024));return 0 if settle(value['item'],value['outcome']) else 1
@@ -394,7 +514,10 @@ def main(argv):
         _log(action='skip', why='bad_input')
         return 0
     base = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org').rstrip('/')
-    sweep(event, started, state_dir=Path(state), base=base,outcome=argv[2] if len(argv)==3 else None)
+    outcome = argv[2] if len(argv)==3 else None
+    sweep(event, started, state_dir=Path(state), base=base,outcome=outcome)
+    if outcome is None:
+        clear_after_allow(event, state_dir=Path(state), base=base)
     return 0
 
 

@@ -50,6 +50,9 @@ class FakeTelegram:
         self.base = f'http://127.0.0.1:{self.server.server_address[1]}'
 
     def handle(self, method, body):
+        self.calls = getattr(self, 'calls', []) + [(method, body.get('message_id'))]
+        if body.get('message_id') in getattr(self, 'limited', ()):
+            return {'ok': False, 'description': 'Too Many Requests: retry after 30', 'parameters': {'retry_after': 30}}
         message = self.messages.get(body.get('message_id'))
         if str(body.get('chat_id')) != CHAT:
             return {'ok': False, 'description': 'Bad Request: chat not found'}
@@ -283,6 +286,80 @@ class RecallTests(unittest.TestCase):
             del os.environ['TELEGRAM_API_BASE']
         self.assertEqual(fake.edited, [])
         self.assertIn(101, fake.messages)
+
+
+class ClearOpenTests(unittest.TestCase):
+    """Mètsàtron's rule (Telegram 12310, 12313): every open card up to this request goes; a later live ask stays."""
+
+    transcript = RecallTests.transcript
+
+    def setUp(self):
+        RecallTests.setUp(self)
+        recall.CLEAR_STATE = self.dir / 'clear.json'  # never write the live mark
+
+    def chat(self):
+        return FakeTelegram({
+            90: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 3600},
+            91: {'kind': 'user', 'text': 'Admiral words', 'buttons': False, 'date': self.now - 3000},
+            92: {'kind': 'bot', 'text': '\U0001f510 Permission: Edit', 'buttons': True, 'date': self.now - 2000},
+            93: {'kind': 'bot', 'text': 'my plain reply', 'buttons': False, 'date': self.now - 1000},
+            99: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 10},
+            100: {'kind': 'bot', 'text': 'sent reply', 'buttons': False, 'date': self.now - 5},
+            103: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now},
+            104: {'kind': 'bot', 'text': '\U0001f510 Permission: Write', 'buttons': True, 'date': self.now + 1},
+        })
+
+    def test_every_open_card_up_to_the_ceiling_goes_and_the_newer_one_stays(self):
+        fake = self.chat()
+        self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base, start=85), [90, 92, 99, 103])
+        self.assertEqual(sorted(fake.messages), [91, 93, 100, 104])
+        self.assertTrue(fake.messages[104]['buttons'])  # the live ask keeps its buttons
+        self.assertNotIn(104, [mid for _, mid in fake.calls])
+
+    def test_the_mark_moves_on_so_the_next_clear_starts_after_the_ceiling(self):
+        fake = self.chat()
+        recall.clear_open('s', 99, state_dir=self.state, base=fake.base, start=85)
+        fake.calls = []
+        self.assertEqual(recall.clear_open('s', 104, state_dir=self.state, base=fake.base), [103, 104])
+        self.assertEqual([mid for _, mid in fake.calls if mid is not None and mid < 100], [])
+
+    def test_first_clear_for_a_bot_reaches_back_a_fixed_distance(self):
+        fake = self.chat()
+        saved = recall.CLEAR_BACKFILL
+        recall.CLEAR_BACKFILL = 10
+        try:
+            self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base), [99, 103])
+        finally:
+            recall.CLEAR_BACKFILL = saved
+        self.assertIn(90, fake.messages)
+
+    def test_a_long_rate_limit_stops_and_keeps_the_mark_at_that_id(self):
+        fake = self.chat()
+        fake.limited = {92}
+        self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base, start=85, sleep=lambda s: None), [90])
+        fake.limited = set()
+        self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base), [92, 99, 103])
+
+    def test_after_an_allow_the_ceiling_is_this_requests_own_card(self):
+        fake = self.chat()
+        recall.LOG.write_text(json.dumps({'session': 's', 'action': 'swept', 'seen': 103}) + '\n')
+        event = {'session_id': 's', 'tool_name': 'Bash', 'transcript_path': self.transcript(anchor=100)}
+        recall._save_mark(hashlib_key(), 85)
+        self.assertEqual(recall.clear_after_allow(event, state_dir=self.state, base=fake.base), [90, 92, 99, 103])
+        self.assertTrue(fake.messages[104]['buttons'])
+
+    def test_a_waiting_parallel_sibling_keeps_the_batch_cards(self):
+        fake = self.chat()
+        recall.LOG.write_text(json.dumps({'session': 's', 'action': 'swept', 'seen': 103}) + '\n')
+        event = {'session_id': 's', 'tool_name': 'Bash', 'transcript_path': self.transcript(anchor=100, tools=('Bash', 'Write'))}
+        recall._save_mark(hashlib_key(), 85)
+        self.assertEqual(recall.clear_after_allow(event, state_dir=self.state, base=fake.base), [90, 92, 99])
+        self.assertTrue(fake.messages[103]['buttons'] and fake.messages[104]['buttons'])
+
+
+def hashlib_key():
+    import hashlib
+    return hashlib.sha256(('123:abc:' + CHAT).encode()).hexdigest()[:16]
 
 
 if __name__ == '__main__':

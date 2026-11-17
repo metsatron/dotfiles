@@ -21,7 +21,8 @@ The Admiral ruled (Telegram 7116, 7118) that these must vanish, without modifyin
   sibling's pending prompt just to discover its text.
 - A stripped message is deleted only when its returned text starts with =🔐 Permission: = *and* its date falls inside this request's window: from the hook's start to one second after the gate's decision. Anything else is left in place and logged as an anomaly.
 - An older dead card is cleared on the way (2026-11-17, Telegram 12264, 12267). When the sweep reaches a permission card dated *before* this request's window, and no sibling request is waiting in the same batch, it deletes that card and goes on to its own. This amends the window rule above, and the reason is in the mechanism: the probe has already stripped that card's buttons, so it is dead either way, and it can only be the leftover of an earlier sweep that missed (=request_slot_unknown=, or a sweep that ran out of time). Left in place it stopped this sweep and every later one at the same card: on 2026-11-17 the log shows 80 cards deleted, 39 sweeps that could not find their slot and 32 that stopped at an older card. It is logged as =deleted_stale=. With a sibling waiting, or when settling an outcome, an older card is still left alone, because there it may be a live ask. A card dated *after* the window is never deleted.
-- It deletes at most one message of its own request, then stops. The sweep ends three seconds after the decision. A prompt dated after the decision belongs to a later request, so the sweep stops there too. (Found 2026-10-16, Telegram 7224: an eight-second sweep deleted the live prompt of the *next* request, a real floor ask, which then never reached the Admiral.)
+- *At most one open card (Mètsàtron, Telegram 12310 and 12313, 2026-11-18; first stated 2026-11-17 03:23).* Once a request is approved, every card still showing its buttons is already settled and is deleted, so the chat keeps at most one open card: the live ask. This supersedes the "only within the window" limit above, and the older-card exceptions in the previous bullet, for every card up to this request's own. After each allow, =clear_after_allow= checks every message id from a stored per-bot mark (=~/.local/state/dotcortex/telegram-permission-clear.json=) up to a ceiling, deletes each one that turns out to be a permission card with buttons (logged =deleted_open=), and moves the mark past the ceiling. The ceiling is this request's own card (the highest id its sweeps saw) or the newest Telegram message in the transcript, so a card newer than it, a later request's live ask, is never touched. While a parallel sibling in the same batch is still waiting, the ceiling drops to the transcript's newest message and the batch's cards stay until the last of them is allowed. The plugin keeps no record of its card ids, and the 2026-10-16 ruling keeps the vendor plugin unmodified, so checking each id once is the only way to find them. A first clear for a bot reaches back 300 ids; a Telegram rate limit longer than five seconds stops the clear with the mark left at that id. A backlog is cleared by hand with =TELEGRAM_STATE_DIR=<dir> telegram_permission_recall.py --clear <first-id> <ceiling-id>=.
+- Its own sweep deletes at most one message of its own request, then stops. The sweep ends three seconds after the decision. A prompt dated after the decision belongs to a later request, so the sweep stops there too. (Found 2026-10-16, Telegram 7224: an eight-second sweep deleted the live prompt of the *next* request, a real floor ask, which then never reached the Admiral.)
 - A prompt is matched to its request by tool and ordered request slot: the card
   text carries the tool name, and only a windowed prompt at this request's slot
   is ever touched. In a parallel batch each sweep attempts its own slot only;
@@ -62,6 +63,10 @@ ANCHOR_RES = (
     re.compile(r'sent \(id: (\d+)\)'),
 )
 LOG = Path(os.path.expanduser('~/.local/state/dotcortex/telegram-permission-recall.jsonl'))
+# Per bot and chat: the lowest message id not yet checked for an open card.
+CLEAR_STATE = Path(os.path.expanduser('~/.local/state/dotcortex/telegram-permission-clear.json'))
+CLEAR_BACKFILL = 300  # first run for a bot: how far below the ceiling to start
+CLEAR_LIMIT = 400  # Telegram calls per clear; the mark keeps the rest for the next run
 
 
 def _log(**row):
@@ -414,7 +419,123 @@ def sweep(event, started, *, state_dir, base, now=time.time, sleep=time.sleep, s
     return deleted
 
 
+def _marks():
+    try:
+        data = json.loads(CLEAR_STATE.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _save_mark(key, value):
+    try:
+        marks = _marks()  # re-read: a parallel clear may have moved it further
+        if type(marks.get(key)) is int and marks[key] >= value:
+            return
+        marks[key] = value
+        CLEAR_STATE.parent.mkdir(parents=True, exist_ok=True)
+        temp = CLEAR_STATE.with_name(CLEAR_STATE.name + f'.{os.getpid()}.tmp')
+        temp.write_text(json.dumps(marks, sort_keys=True) + '\n', encoding='utf-8')
+        os.replace(temp, CLEAR_STATE)
+    except OSError:
+        pass
+
+
+def clear_open(session, ceiling, *, state_dir, base, sleep=time.sleep, start=None, limit=CLEAR_LIMIT):
+    """Delete every permission card that still has buttons, up to ceiling.
+
+    Mètsàtron's rule (Telegram 12310, 12313, 2026-11-18; first stated
+    2026-11-17 03:23): once a request is approved, every card still showing
+    its buttons is already settled, so the chat keeps at most one open card,
+    the live ask. The ceiling is this request's own card or the newest message
+    the session knows, so a card newer than it, a later request's live ask,
+    is never touched. The plugin keeps no record of its card ids, so each id
+    from the stored mark up to the ceiling is checked once; the mark then
+    moves past it and the next clear starts there."""
+    token, chat = _token(state_dir), _chat(state_dir)
+    if not token or not chat or type(ceiling) is not int or ceiling < 1:
+        _log(session=session, action='skip', why='clear_unbounded')
+        return []
+    key = hashlib.sha256((token + ':' + chat).encode()).hexdigest()[:16]
+    low = start if type(start) is int else _marks().get(key)
+    if type(low) is not int:
+        low = max(1, ceiling - CLEAR_BACKFILL)
+    message_id, calls, deleted, failures, stopped = max(1, low), 0, [], 0, None
+    while message_id <= ceiling:
+        if calls >= limit:
+            stopped = 'call_limit'
+            break
+        reply = _call(base, token, 'editMessageReplyMarkup', {'chat_id': chat, 'message_id': message_id})
+        calls += 1
+        if not reply.get('ok'):
+            params = reply.get('parameters') if isinstance(reply.get('parameters'), dict) else {}
+            retry = params.get('retry_after')
+            if type(retry) is int and retry <= 5:
+                sleep(retry)
+                continue  # same id again
+            if retry is not None:
+                stopped = f'rate_limited_{retry}s'
+                break  # keep the mark here; the next clear resumes at this id
+            if reply.get('description') in ('transport', None) or str(reply.get('description', '')).startswith('http '):
+                failures += 1
+                if failures <= 2:
+                    sleep(1)
+                    continue
+                stopped = 'transport'
+                break
+            message_id += 1  # a user message, a buttonless reply, or a deleted id
+            continue
+        message = reply.get('result') if isinstance(reply.get('result'), dict) else {}
+        text = message.get('text', '')
+        if isinstance(text, str) and text.startswith(PREFIX):
+            gone = _call(base, token, 'deleteMessage', {'chat_id': chat, 'message_id': message_id}).get('ok')
+            calls += 1
+            _log(session=session, action='deleted_open' if gone else 'cleanup_failed', message_id=message_id)
+            if gone:
+                deleted.append(message_id)
+        else:
+            _log(session=session, action='anomaly', message_id=message_id, why='buttoned_non_permission')
+        message_id += 1
+    _save_mark(key, message_id)
+    _log(session=session, action='cleared', low=low, ceiling=ceiling, next=message_id, deleted=deleted,
+         calls=calls, **({'stopped': stopped} if stopped else {}))
+    return deleted
+
+
+def clear_after_allow(event, *, state_dir, base, sleep=time.sleep):
+    """After an allow: clear every open card up to this request's own card.
+
+    The ceiling is the highest id this session's sweeps have seen (its own
+    card when the sweep found it) or the newest Telegram message in the
+    transcript. While a parallel sibling is still waiting, the ceiling drops
+    to the transcript's newest message, so the batch's live cards stay; the
+    last allow in the batch clears them."""
+    session = event.get('session_id', '') if isinstance(event, dict) else ''
+    tail = _transcript_tail(event.get('transcript_path')) if isinstance(event, dict) else None
+    if tail is None:
+        _log(session=session, action='skip', why='clear_no_transcript')
+        return []
+    anchor = _anchor(tail)
+    floor = _logged_floor(session) if session else None
+    if len(_unresolved(tail)) > 1:
+        ceiling = anchor
+    else:
+        ceiling = max((value for value in (anchor, floor) if value is not None), default=None)
+    return clear_open(session, ceiling, state_dir=state_dir, base=base, sleep=sleep)
+
+
 def main(argv):
+    if len(argv)==4 and argv[1]=='--clear':
+        # Manual backlog clear: --clear <first-id> <ceiling-id>, TELEGRAM_STATE_DIR set.
+        state = os.environ.get('TELEGRAM_STATE_DIR')
+        if not state or not argv[2].isdecimal() or not argv[3].isdecimal():
+            print('usage: TELEGRAM_STATE_DIR=<dir> telegram_permission_recall.py --clear <first-id> <ceiling-id>', file=sys.stderr)
+            return 2
+        base = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org').rstrip('/')
+        gone = clear_open('manual', int(argv[3]), state_dir=Path(state), base=base, start=int(argv[2]),
+                          limit=4 * (int(argv[3]) - int(argv[2]) + 1) + 20)
+        print(json.dumps({'deleted': gone}))
+        return 0
     if len(argv)==2 and argv[1]=='--outcome':
         try:
             value=json.loads(sys.stdin.read(1024*1024));return 0 if settle(value['item'],value['outcome']) else 1
@@ -431,7 +552,10 @@ def main(argv):
         _log(action='skip', why='bad_input')
         return 0
     base = os.environ.get('TELEGRAM_API_BASE', 'https://api.telegram.org').rstrip('/')
-    sweep(event, started, state_dir=Path(state), base=base,outcome=argv[2] if len(argv)==3 else None)
+    outcome = argv[2] if len(argv)==3 else None
+    sweep(event, started, state_dir=Path(state), base=base,outcome=outcome)
+    if outcome is None:
+        clear_after_allow(event, state_dir=Path(state), base=base)
     return 0
 
 
@@ -493,6 +617,9 @@ class FakeTelegram:
         self.base = f'http://127.0.0.1:{self.server.server_address[1]}'
 
     def handle(self, method, body):
+        self.calls = getattr(self, 'calls', []) + [(method, body.get('message_id'))]
+        if body.get('message_id') in getattr(self, 'limited', ()):
+            return {'ok': False, 'description': 'Too Many Requests: retry after 30', 'parameters': {'retry_after': 30}}
         message = self.messages.get(body.get('message_id'))
         if str(body.get('chat_id')) != CHAT:
             return {'ok': False, 'description': 'Bad Request: chat not found'}
@@ -726,6 +853,80 @@ class RecallTests(unittest.TestCase):
             del os.environ['TELEGRAM_API_BASE']
         self.assertEqual(fake.edited, [])
         self.assertIn(101, fake.messages)
+
+
+class ClearOpenTests(unittest.TestCase):
+    """Mètsàtron's rule (Telegram 12310, 12313): every open card up to this request goes; a later live ask stays."""
+
+    transcript = RecallTests.transcript
+
+    def setUp(self):
+        RecallTests.setUp(self)
+        recall.CLEAR_STATE = self.dir / 'clear.json'  # never write the live mark
+
+    def chat(self):
+        return FakeTelegram({
+            90: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 3600},
+            91: {'kind': 'user', 'text': 'Admiral words', 'buttons': False, 'date': self.now - 3000},
+            92: {'kind': 'bot', 'text': '\U0001f510 Permission: Edit', 'buttons': True, 'date': self.now - 2000},
+            93: {'kind': 'bot', 'text': 'my plain reply', 'buttons': False, 'date': self.now - 1000},
+            99: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now - 10},
+            100: {'kind': 'bot', 'text': 'sent reply', 'buttons': False, 'date': self.now - 5},
+            103: {'kind': 'bot', 'text': PERM, 'buttons': True, 'date': self.now},
+            104: {'kind': 'bot', 'text': '\U0001f510 Permission: Write', 'buttons': True, 'date': self.now + 1},
+        })
+
+    def test_every_open_card_up_to_the_ceiling_goes_and_the_newer_one_stays(self):
+        fake = self.chat()
+        self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base, start=85), [90, 92, 99, 103])
+        self.assertEqual(sorted(fake.messages), [91, 93, 100, 104])
+        self.assertTrue(fake.messages[104]['buttons'])  # the live ask keeps its buttons
+        self.assertNotIn(104, [mid for _, mid in fake.calls])
+
+    def test_the_mark_moves_on_so_the_next_clear_starts_after_the_ceiling(self):
+        fake = self.chat()
+        recall.clear_open('s', 99, state_dir=self.state, base=fake.base, start=85)
+        fake.calls = []
+        self.assertEqual(recall.clear_open('s', 104, state_dir=self.state, base=fake.base), [103, 104])
+        self.assertEqual([mid for _, mid in fake.calls if mid is not None and mid < 100], [])
+
+    def test_first_clear_for_a_bot_reaches_back_a_fixed_distance(self):
+        fake = self.chat()
+        saved = recall.CLEAR_BACKFILL
+        recall.CLEAR_BACKFILL = 10
+        try:
+            self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base), [99, 103])
+        finally:
+            recall.CLEAR_BACKFILL = saved
+        self.assertIn(90, fake.messages)
+
+    def test_a_long_rate_limit_stops_and_keeps_the_mark_at_that_id(self):
+        fake = self.chat()
+        fake.limited = {92}
+        self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base, start=85, sleep=lambda s: None), [90])
+        fake.limited = set()
+        self.assertEqual(recall.clear_open('s', 103, state_dir=self.state, base=fake.base), [92, 99, 103])
+
+    def test_after_an_allow_the_ceiling_is_this_requests_own_card(self):
+        fake = self.chat()
+        recall.LOG.write_text(json.dumps({'session': 's', 'action': 'swept', 'seen': 103}) + '\n')
+        event = {'session_id': 's', 'tool_name': 'Bash', 'transcript_path': self.transcript(anchor=100)}
+        recall._save_mark(hashlib_key(), 85)
+        self.assertEqual(recall.clear_after_allow(event, state_dir=self.state, base=fake.base), [90, 92, 99, 103])
+        self.assertTrue(fake.messages[104]['buttons'])
+
+    def test_a_waiting_parallel_sibling_keeps_the_batch_cards(self):
+        fake = self.chat()
+        recall.LOG.write_text(json.dumps({'session': 's', 'action': 'swept', 'seen': 103}) + '\n')
+        event = {'session_id': 's', 'tool_name': 'Bash', 'transcript_path': self.transcript(anchor=100, tools=('Bash', 'Write'))}
+        recall._save_mark(hashlib_key(), 85)
+        self.assertEqual(recall.clear_after_allow(event, state_dir=self.state, base=fake.base), [90, 92, 99])
+        self.assertTrue(fake.messages[103]['buttons'] and fake.messages[104]['buttons'])
+
+
+def hashlib_key():
+    import hashlib
+    return hashlib.sha256(('123:abc:' + CHAT).encode()).hexdigest()[:16]
 
 
 if __name__ == '__main__':
