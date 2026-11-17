@@ -110,6 +110,18 @@ class DeciderWarmTests(unittest.TestCase):
             receipt.write_text("[]")
             self.assertFalse(obj._decider_summary_ready())
 
+    def test_launcher_loads_the_present_native_mod_once(self):
+        obj = self.make()
+        obj.argv = ["--model", "fixture"]
+        with tempfile.TemporaryDirectory() as directory:
+            obj.decider_mod_path = Path(directory)
+            (obj.decider_mod_path / ".claude-plugin").mkdir()
+            (obj.decider_mod_path / ".claude-plugin/plugin.json").write_text("{}")
+            expected = [*obj.argv, "--plugin-dir", directory]
+            self.assertEqual(obj._child_argv(), expected)
+            obj.argv = expected
+            self.assertEqual(obj._child_argv(), expected)
+
     def test_ordinary_no_mod_compact_and_manual_controls_remain_guarded(self):
         obj = self.make()
         obj._decider_summary_ready = lambda: False
