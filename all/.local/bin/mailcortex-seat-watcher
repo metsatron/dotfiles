@@ -1638,6 +1638,33 @@ def requeue_stalled(seat: str, mailbox: Path, now: float) -> int:
     return moved
 
 
+def requeue_with_attempts(seat: str, mid: str, reason: str, old: dict | None, now: float,
+                          wake_error: str | None = None) -> int:
+    """Write a queued wake that carries its own attempt count forward.
+
+    A wake refused for a stalled reason (busy, rate_limited, transport_unavailable) is
+    written back to `queued` and its mail returns to `new/`, so the next scan offers it
+    again. Writing `queued` WITHOUT the previous `wake_attempts` resets the counter to
+    zero, and requeue_stalled's REQUEUE_MAX_ATTEMPTS cap can never be reached: the seat
+    is woken with the same mail forever. Carry the count and retire the receipt once the
+    budget is spent.
+    """
+    attempts = (old or {}).get("wake_attempts")
+    attempts = attempts if isinstance(attempts, int) else 0
+    attempts += 1
+    if attempts > REQUEUE_MAX_ATTEMPTS:
+        # "observed" is the schema's terminal state: the scanner never re-offers it and
+        # requeue_stalled only moves wakes still marked queued, so a spent receipt stays
+        # spent. (There is no "abandoned" state - writing one raises unknown wake state.)
+        MAILCORTEX.write_wake_receipt(seat, mid, "observed",
+            reason=f"{reason}_attempts_exhausted", wake_attempts=attempts, wake_updated_at=now)
+        return attempts
+    extra = {"wake_error": wake_error} if wake_error else {}
+    MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason=reason,
+        wake_attempts=attempts, wake_updated_at=now, **extra)
+    return attempts
+
+
 def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int:
     now = time.time() if now is None else now
     count = 0
@@ -1692,9 +1719,9 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                     ack = transport_adapter.store(record, path)
                 except Exception as error:
                     unavailable = isinstance(error, (OSError, transport_adapter.peer.CoordinatorUnavailable))
-                    MAILCORTEX.write_wake_receipt(seat, mid, "queued",
-                        reason="transport_unavailable" if unavailable else "authentication_refused", wake_error=type(error).__name__,
-                        wake_updated_at=now)
+                    requeue_with_attempts(seat, mid,
+                        "transport_unavailable" if unavailable else "authentication_refused",
+                        old, now, wake_error=type(error).__name__)
                     continue
                 MAILCORTEX.write_wake_receipt(seat, mid, "injected", filename=path.name,
                     transport_ack=ack["state"], peer_message_id=ack["message_id"],
@@ -1730,26 +1757,24 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
                                                   reason="auto_submitted", wake_updated_at=now)
                 continue
             if last_injected and last_injected + record["rate_limit_seconds"] > now:
-                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="rate_limited",
-                                              wake_updated_at=now)
+                requeue_with_attempts(seat, mid, "rate_limited", old, now)
                 continue
             MAILCORTEX.write_wake_receipt(seat, mid, "observed", filename=path.name,
                                           wake_updated_at=now)
             if pending_reply:
-                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="reply_pending", wake_updated_at=now)
+                requeue_with_attempts(seat, mid, "reply_pending", old, now)
                 continue
             try:
                 pane_id = transport_adapter.resolve_idle_pane(record)
             except Exception as error:
                 if record["transport"] not in {"herdr", "deepseek", "ductor", "hermes", "nanobot", "opencode", "claude-local", "gemma-pi", "codex-telegram"}:
                     raise
-                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="transport_unavailable",
-                                              wake_error=diagnostic(error), wake_updated_at=now)
+                requeue_with_attempts(seat, mid, "transport_unavailable", old, now,
+                                      wake_error=diagnostic(error))
                 report_error(seat, path.name, error)
                 continue
             if pane_id is None:
-                MAILCORTEX.write_wake_receipt(seat, mid, "queued", reason="busy",
-                                              wake_updated_at=now)
+                requeue_with_attempts(seat, mid, "busy", old, now)
                 continue
             extra = {}
             mailback_error = None
