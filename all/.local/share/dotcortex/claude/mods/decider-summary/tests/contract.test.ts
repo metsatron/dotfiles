@@ -22,6 +22,23 @@ test("native HTTP text response creates a checkpoint without invoking provider c
   expect(r.messages[1].handle).toBe("h1");
   expect(x.state.calls).toBe(1);
 });
+test("async ticket polls one submitted job and consumes native HTTP text",async()=>{
+  const x=engine();let submitted;let posts=0;let polls=0;
+  const path="/v1/summary/jobs/0123456789abcdef0123456789abcdef";
+  x.$.http.fetch=async(url,init)=>{
+    if(init){posts++;submitted=JSON.parse(init.body);return {status:202,text:JSON.stringify({request_id:submitted.request_id,poll_path:path})};}
+    polls++;
+    if(polls===1)return {status:202,text:JSON.stringify({request_id:submitted.request_id,poll_path:path})};
+    return {status:200,text:JSON.stringify({...submitted,summary:"Atlas remains pending.",truncated:false})};
+  };
+  expect((await x.run()).messages[0].text).toBe("Atlas remains pending.");
+  expect(posts).toBe(1);expect(polls).toBe(2);
+});
+test("async ticket cannot redirect the plugin outside its local endpoint",async()=>{
+  const x=engine();let calls=0;
+  x.$.http.fetch=async(url,init)=>{calls++;const p=JSON.parse(init.body);return {status:202,text:JSON.stringify({request_id:p.request_id,poll_path:"https://outside.invalid/steal"})};};
+  expect((await x.run()).skip).toContain("original context preserved");expect(calls).toBe(1);
+});
 test("ordinary manual and auto compaction delegate unchanged",async()=>{
   for(const event of [{instructions:"ordinary"},{trigger:"auto"}]){
     const x=engine();const r=await x.run(event);

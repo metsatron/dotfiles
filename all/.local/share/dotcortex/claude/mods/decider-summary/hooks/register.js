@@ -147,15 +147,35 @@ async function summaryRequest($, rows, sourceEpoch, phase) {
     request_id: `${session}:${sourceEpoch}:${phase}:${sourceHash.slice(0, 16)}:${Date.now()}`,
     source_session_id: session, source_epoch: sourceEpoch,
     source_hash: sourceHash, canonical_messages: canonicalMessages, messages: normalized,
-    max_output_tokens: 256, phase, limits: { deadline_ms: 120000 },
+    max_output_tokens: 256, phase, async: true, limits: { deadline_ms: 120000 },
   };
 }
 
 async function requestSummary($, rows, sourceEpoch, phase) {
   const payload = await summaryRequest($, rows, sourceEpoch, phase);
-  const response = testTransport ? await testTransport(payload) : await $.http.fetch(SUMMARY_URL, {
+  let response = testTransport ? await testTransport(payload) : await $.http.fetch(SUMMARY_URL, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
   });
+  if (!testTransport && response.status === 202) {
+    const ticket = JSON.parse(response.text);
+    if (ticket.request_id !== payload.request_id || typeof ticket.poll_path !== "string" ||
+        !/^\/v1\/summary\/jobs\/[a-f0-9]{32}$/.test(ticket.poll_path)) {
+      throw new Error("invalid local summary ticket");
+    }
+    const origin = new URL(SUMMARY_URL).origin;
+    const deadline = Date.now() + 120000;
+    let polls = 0;
+    do {
+      if (Date.now() >= deadline || ++polls > 25) throw new Error("local summary deadline exceeded");
+      response = await $.http.fetch(origin + ticket.poll_path);
+      if (response.status === 202) {
+        const pending = JSON.parse(response.text);
+        if (pending.poll_path !== ticket.poll_path || pending.request_id !== payload.request_id) {
+          throw new Error("stale local summary ticket");
+        }
+      }
+    } while (response.status === 202);
+  }
   const body = testTransport ? response : JSON.parse(response.text);
   if ((!testTransport && response.status !== 200) || body.operation !== "summary.v1" || body.request_id !== payload.request_id ||
       body.source_session_id !== payload.source_session_id || body.source_epoch !== payload.source_epoch ||

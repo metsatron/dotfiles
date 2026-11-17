@@ -4650,15 +4650,35 @@ async function summaryRequest($, rows, sourceEpoch, phase) {
     request_id: `${session}:${sourceEpoch}:${phase}:${sourceHash.slice(0, 16)}:${Date.now()}`,
     source_session_id: session, source_epoch: sourceEpoch,
     source_hash: sourceHash, canonical_messages: canonicalMessages, messages: normalized,
-    max_output_tokens: 256, phase, limits: { deadline_ms: 120000 },
+    max_output_tokens: 256, phase, async: true, limits: { deadline_ms: 120000 },
   };
 }
 
 async function requestSummary($, rows, sourceEpoch, phase) {
   const payload = await summaryRequest($, rows, sourceEpoch, phase);
-  const response = testTransport ? await testTransport(payload) : await $.http.fetch(SUMMARY_URL, {
+  let response = testTransport ? await testTransport(payload) : await $.http.fetch(SUMMARY_URL, {
     method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(payload),
   });
+  if (!testTransport && response.status === 202) {
+    const ticket = JSON.parse(response.text);
+    if (ticket.request_id !== payload.request_id || typeof ticket.poll_path !== "string" ||
+        !/^\/v1\/summary\/jobs\/[a-f0-9]{32}$/.test(ticket.poll_path)) {
+      throw new Error("invalid local summary ticket");
+    }
+    const origin = new URL(SUMMARY_URL).origin;
+    const deadline = Date.now() + 120000;
+    let polls = 0;
+    do {
+      if (Date.now() >= deadline || ++polls > 25) throw new Error("local summary deadline exceeded");
+      response = await $.http.fetch(origin + ticket.poll_path);
+      if (response.status === 202) {
+        const pending = JSON.parse(response.text);
+        if (pending.poll_path !== ticket.poll_path || pending.request_id !== payload.request_id) {
+          throw new Error("stale local summary ticket");
+        }
+      }
+    } while (response.status === 202);
+  }
   const body = testTransport ? response : JSON.parse(response.text);
   if ((!testTransport && response.status !== 200) || body.operation !== "summary.v1" || body.request_id !== payload.request_id ||
       body.source_session_id !== payload.source_session_id || body.source_epoch !== payload.source_epoch ||
@@ -4754,6 +4774,23 @@ test("native HTTP text response creates a checkpoint without invoking provider c
   expect(r.messages[0].text).toContain("Atlas");
   expect(r.messages[1].handle).toBe("h1");
   expect(x.state.calls).toBe(1);
+});
+test("async ticket polls one submitted job and consumes native HTTP text",async()=>{
+  const x=engine();let submitted;let posts=0;let polls=0;
+  const path="/v1/summary/jobs/0123456789abcdef0123456789abcdef";
+  x.$.http.fetch=async(url,init)=>{
+    if(init){posts++;submitted=JSON.parse(init.body);return {status:202,text:JSON.stringify({request_id:submitted.request_id,poll_path:path})};}
+    polls++;
+    if(polls===1)return {status:202,text:JSON.stringify({request_id:submitted.request_id,poll_path:path})};
+    return {status:200,text:JSON.stringify({...submitted,summary:"Atlas remains pending.",truncated:false})};
+  };
+  expect((await x.run()).messages[0].text).toBe("Atlas remains pending.");
+  expect(posts).toBe(1);expect(polls).toBe(2);
+});
+test("async ticket cannot redirect the plugin outside its local endpoint",async()=>{
+  const x=engine();let calls=0;
+  x.$.http.fetch=async(url,init)=>{calls++;const p=JSON.parse(init.body);return {status:202,text:JSON.stringify({request_id:p.request_id,poll_path:"https://outside.invalid/steal"})};};
+  expect((await x.run()).skip).toContain("original context preserved");expect(calls).toBe(1);
 });
 test("ordinary manual and auto compaction delegate unchanged",async()=>{
   for(const event of [{instructions:"ordinary"},{trigger:"auto"}]){
