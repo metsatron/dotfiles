@@ -303,7 +303,7 @@ def validate_inject_command(
     """Allow only fixed governor commands and the session's watched reconnect."""
     if not isinstance(command, str) or len(command) > 256:
         return False
-    if command in {"/compact", "/reload-plugins"}:
+    if command in {"/compact", "/compact decider-local-only", "/reload-plugins"}:
         return True
     if command == reconnect_command:
         return True
@@ -2397,6 +2397,7 @@ class Supervisor:
 
     def __init__(self, argv: list[str], executable: str):
         self.argv = argv
+        self.decider_mod_path = pathlib.Path.home() / ".local/share/dotcortex/claude/mods/decider-summary"
         self.executable = executable
         self.development_channel_opt_ins = accepted_development_channels()
         self.development_channel_prompt_matcher = DevelopmentChannelPromptMatcher(
@@ -3500,6 +3501,7 @@ class Supervisor:
         environment = os.environ.copy()
         environment.update(
             {
+                "CLAUDE_WARM_DECIDER_READY": str(self.session_dir / "decider-summary-ready.json"),
                 "CLAUDE_IDLE_CHANNEL": self.channel,
                 "CLAUDE_IDLE_OWNER": "pty-supervisor",
                 "CLAUDE_IDLE_CONTROL_SOCKET": str(self.socket_path),
@@ -3685,13 +3687,31 @@ class Supervisor:
             self._debug(f"lifecycle-alarm-write-failed channel={short_id(self.channel)} error={error}")
         self._write_state()
 
+    def _decider_summary_ready(self) -> bool:
+        """Require a native mod receipt for this supervisor and session."""
+        if not getattr(self, "session_dir", None):
+            return False
+        try:
+            receipt = json.loads((self.session_dir / "decider-summary-ready.json").read_text())
+        except (OSError, ValueError, TypeError):
+            return False
+        return isinstance(receipt, dict) and (
+            receipt.get("protocol") == "decider-summary.v1"
+            and receipt.get("session_id") == self.session_id
+            and receipt.get("channel") == self.channel
+        )
+
     def _child_argv(self) -> list[str]:
-        """Add private Claude debug capture only for channel sessions."""
-        if not self.watched_servers:
-            return list(self.argv)
-        if any(argument == "--debug" or argument.startswith("--debug-") for argument in self.argv):
-            return list(self.argv)
-        return [*self.argv, "--debug-file", str(self.debug_log_path)]
+        """Load the local summary mod and private channel debug capture."""
+        argv = list(self.argv)
+        if getattr(self, "decider_mod_path", None) and (self.decider_mod_path / ".claude-plugin/plugin.json").is_file():
+            if str(self.decider_mod_path) not in argv:
+                argv.extend(["--plugin-dir", str(self.decider_mod_path)])
+        if self.watched_servers and not any(
+            argument == "--debug" or argument.startswith("--debug-") for argument in argv
+        ):
+            argv.extend(["--debug-file", str(self.debug_log_path)])
+        return argv
 
     def _read_snapshot(self) -> tuple[dict | None, str | None]:
         """Read a session-bound snapshot valid for the governed Stop epoch."""
@@ -3808,11 +3828,13 @@ class Supervisor:
             and self.last_local_input > idle_boundary
         ):
             return "user-input"
-        if purpose == "compact":
+        if purpose in {"compact", "decider-compact"}:
             if not self.dirty:
                 return "clean"
-            if self.usage_limit_until and now() < self.usage_limit_until:
+            if purpose == "compact" and self.usage_limit_until and now() < self.usage_limit_until:
                 return "usage-limited"
+            if purpose == "decider-compact" and not self._decider_summary_ready():
+                return "decider-mod-not-ready"
             if self.recovery_pending:
                 return "channel-recovery-pending"
             if (
@@ -3856,9 +3878,9 @@ class Supervisor:
         # paid once over a compacted context.  Warm/cold is recorded on the
         # compaction-requested event instead.
         _, snapshot_error = self._read_snapshot()
-        if purpose == "compact" and snapshot_error:
+        if purpose in {"compact", "decider-compact"} and snapshot_error:
             return snapshot_error
-        if purpose == "compact":
+        if purpose in {"compact", "decider-compact"}:
             unpreserved_tokens = max(
                 0,
                 (self.current_tokens or 0) - (self.post_compact_baseline_tokens or 0),
@@ -3943,6 +3965,10 @@ class Supervisor:
         purpose: str = "compact",
     ) -> bool:
         """Run the final gate and inject one validated command through the PTY."""
+        # Every governor caller, including the idle timer and preservation,
+        # takes this same local path once the native mod confirms its load.
+        if purpose == "compact" and command == "/compact" and self._decider_summary_ready():
+            command, purpose = "/compact decider-local-only", "decider-compact"
         if expected_generation is not None and expected_generation != self.timer_generation:
             self.last_gate_rejection_reason = "stale-timer"
             self.last_state_transition = "gate-refused:stale-timer"
@@ -3950,7 +3976,7 @@ class Supervisor:
             self._write_state()
             return False
         if (
-            purpose == "compact"
+            purpose in {"compact", "decider-compact"}
             and expected_generation is not None
             and not self._refresh_cache_policy_for_action()
         ):
@@ -3968,20 +3994,27 @@ class Supervisor:
                 transient=reason not in DORMANT_GATE_REASONS,
             )
             self._write_state()
-            if purpose == "compact" and self.preservation_state == "requested":
+            if purpose in {"compact", "decider-compact"} and self.preservation_state == "requested":
                 self.preservation_state = "pending_recovery"
                 self.preservation_failure = reason
                 self._save_preservation()
                 self._guard_log(
                     "preservation-pending-recovery", request_id=self.preservation_request_id, reason=reason
                 )
-            if purpose == "compact" and reason not in DORMANT_GATE_REASONS and self.preservation_state != "pending_recovery":
+            if purpose in {"compact", "decider-compact"} and reason not in DORMANT_GATE_REASONS and self.preservation_state != "pending_recovery":
                 self.rearm(f"gate-refused:{reason}")
             return False
         if not validate_inject_command(command, self.watched_servers, self.recovery_command):
             self.last_cancellation_reason = "inject-command-refused"
             self.last_gate_rejection_reason = "inject-command-refused"
             self.last_state_transition = "gate-refused:inject-command-refused"
+            self._guard_log("inject-refused", purpose=purpose)
+            self._write_state()
+            return False
+        if command == "/compact decider-local-only" and purpose != "decider-compact":
+            self.last_cancellation_reason = "inject-command-refused"
+            self.last_gate_rejection_reason = "decider-purpose-required"
+            self.last_state_transition = "gate-refused:decider-purpose-required"
             self._guard_log("inject-refused", purpose=purpose)
             self._write_state()
             return False
@@ -3993,7 +4026,7 @@ class Supervisor:
         self.timer_deadline = None
         self.timer_kind = None
         self.timer_generation += 1
-        if purpose == "compact":
+        if purpose in {"compact", "decider-compact"}:
             self.compacting = True
             self.compaction_requested_at = now()
             self.compaction_ignore_next_stop = False
@@ -4012,7 +4045,7 @@ class Supervisor:
                 raise OSError(errno.EIO, "PTY master unavailable")
             write_all(self.master_fd, (command + "\r").encode("utf-8"))
         except OSError as error:
-            if purpose == "compact":
+            if purpose in {"compact", "decider-compact"}:
                 self.compacting = False
                 self.compaction_requested_at = None
                 self.dirty = True
@@ -4048,7 +4081,7 @@ class Supervisor:
             self.timer_kind = "channel-recovery-confirm"
             self.timer_deadline = now() + CHANNEL_RECOVERY_CONFIRM_SECONDS
             self._guard_log("channel-recovery-requested", command=command)
-        elif purpose == "compact":
+        elif purpose in {"compact", "decider-compact"}:
             self.last_injection_result = "requested"
             self.last_state_transition = "compaction-requested"
             self._debug(f"compaction-requested channel={short_id(self.channel)}")
