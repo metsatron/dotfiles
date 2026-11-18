@@ -15,6 +15,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -160,6 +161,19 @@ class Harness:
         obj.preservation_state = None
         obj.preservation_request_id = None
         obj.cache_ttl_seconds = 3600
+        # The idle window this fixture used to reach the pass by size alone is
+        # now the cold-boundary trigger's input: 100s idle against a 60s
+        # compact-before window is a COLD cache, so the mechanics tests keep
+        # testing the pass rather than the trigger.  The trigger tests set their
+        # own values.
+        obj.cache_idle_seconds = 60
+        # A precomputed harness keeps these tests independent of this host's
+        # instruction files; the harness tests supply their own numbers.
+        obj.harness_baseline_cache = {
+            "harness_tokens": 0,
+            "harness_source": "test-fixture",
+            "harness_files": [],
+        }
         obj.watched_servers = ()
         obj.development_channel_opt_ins = ()
         obj.timer_generation = 0
@@ -511,10 +525,18 @@ class OfflineCompactModeTests(unittest.TestCase):
             kept = compacted[0]["message"]["content"][0]["content"]
             self.assertEqual(len(kept), len(rows[0]["message"]["content"][0]["content"]))
             elided = compacted[1]["message"]["content"][0]["content"]
-            self.assertIn("tool output elided", elided)
+            # R-0032 restated this pin: an elided block is a POINTER into the
+            # retained transcript (path, line, char count), not a bare stub.
+            self.assertIn("elided", elided)
+            self.assertIn("line 2 of", elided)
+            self.assertIn(str(source), elided)
+            self.assertIn("{:,}".format(len(rows[1]["message"]["content"][0]["content"])), elided)
             self.assertLess(len(elided), 400)
             self.assertGreater(report["elided_blocks"], 1)
             self.assertGreaterEqual(report["kept_verbatim"], 1)
+            self.assertEqual(report["pointer_stubs"], report["elided_blocks"])
+            self.assertEqual(report["pointers_verified"], report["pointer_stubs"])
+            self.assertEqual(report["pointer_mismatch_count"], 0)
 
     def test_ceiling_that_cannot_be_met_refuses_to_ship(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -621,8 +643,11 @@ class OfflineCompactModeTests(unittest.TestCase):
                 self.assertEqual(rows[0][0], len(text))
                 self.assertIn(key, hits, "the archived body must already be searchable")
                 written = out.read_text() if out.exists() else ""
+                # R-0032: the replacement is a pointer, so the absence to prove is
+                # that no pointer for THIS record has been written yet.
+                promised = "at line %d of" % (int(key[1:].split("-")[0]) + 1)
                 self.assertNotIn(
-                    "archived as %s" % key, written, "no stub may be written before its index row"
+                    promised, written, "no pointer may be written before its index row"
                 )
 
             result = self.module.compact(
@@ -828,6 +853,451 @@ class OfflineCompactModeTests(unittest.TestCase):
             self.assertEqual(
                 [row["uuid"] for row in landed_rows], [row["uuid"] for row in rows]
             )
+
+
+    # -- 9. R-0032: the COLD BOUNDARY is the trigger, not the token count -----
+
+    def test_due_rule_reads_the_cache_not_the_transcript_size(self):
+        due = self.warm.offline_compact_due
+        self.assertEqual(
+            due(status="idle", idle_age=10, cache_idle_seconds=3300, usage_limited=False),
+            (False, "cache-warm"),
+        )
+        self.assertEqual(
+            due(status="idle", idle_age=4000, cache_idle_seconds=3300, usage_limited=False),
+            (True, "cache-cold"),
+        )
+        self.assertEqual(
+            due(status="active", idle_age=4000, cache_idle_seconds=3300, usage_limited=False),
+            (False, "seat-active"),
+        )
+        self.assertEqual(
+            due(status="idle", idle_age=1, cache_idle_seconds=3300, usage_limited=True),
+            (True, "usage-limited"),
+        )
+        self.assertEqual(
+            due(status="active", idle_age=None, cache_idle_seconds=None, usage_limited=True),
+            (False, "seat-active"),
+        )
+        self.assertEqual(
+            due(status="idle", idle_age=None, cache_idle_seconds=None, usage_limited=False),
+            (True, "cache-unmeasured"),
+        )
+
+    def test_warm_cache_and_idle_seat_do_not_run_the_pass(self):
+        """A 900K-token session at a warm cache is the NORMAL state: do nothing."""
+        harness = self.harness(mode="deterministic", tokens=900_000)
+        obj = harness.obj
+        obj.cache_idle_seconds = 3300  # 55 minutes of cache left
+        obj.last_normal_stop = time.time() - 120  # two minutes idle: WARM
+
+        self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+
+        self.assertEqual(read_written(harness.read_fd), b"")
+        self.assertEqual(harness.installed_sessions(), [])
+        self.assertEqual(harness.stops, 0)
+        self.assertEqual(obj.launches, [])
+        trigger = obj.guard.find("offline-compact:trigger")[-1]
+        self.assertFalse(trigger["due"])
+        self.assertEqual(trigger["trigger"], "cache-warm")
+        not_due = obj.guard.find("offline-compact:not-due")
+        self.assertTrue(not_due, obj.guard.events)
+        self.assertEqual(not_due[-1]["reason"], "cache-warm")
+        # correct behaviour, never a failure and never a gate refusal
+        self.assertNotIn("offline-compact:failed", obj.guard.names())
+        self.assertNotIn("offline-compact:refused", obj.guard.names())
+        self.assertNotIn("injection-attempted", obj.guard.names())
+
+    def test_active_seat_never_compacts_however_cold_the_cache_is(self):
+        harness = self.harness(mode="deterministic", tokens=900_000)
+        obj = harness.obj
+        obj.status = "active"
+        obj.cache_idle_seconds = 1  # unequivocally cold
+        obj.last_normal_stop = time.time() - 100_000
+
+        self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+
+        self.assertEqual(read_written(harness.read_fd), b"")
+        self.assertEqual(harness.installed_sessions(), [])
+        refused = obj.guard.find("offline-compact:refused")
+        self.assertTrue(refused, obj.guard.events)
+        self.assertEqual(refused[-1]["reason"], "session-active")
+
+    def test_cold_cache_and_idle_seat_run_the_pass(self):
+        harness = self.harness(mode="deterministic", tokens=300_000)
+        obj = harness.obj
+        obj.cache_idle_seconds = 60
+        obj.last_normal_stop = time.time() - 300  # past the boundary
+
+        self.assertTrue(obj.attempt(command="/compact", purpose="compact"))
+
+        trigger = obj.guard.find("offline-compact:trigger")[-1]
+        self.assertTrue(trigger["due"])
+        self.assertEqual(trigger["trigger"], "cache-cold")
+        self.assertEqual(len(harness.installed_sessions()), 1)
+
+    def test_usage_limited_runs_the_pass_even_on_a_warm_cache(self):
+        harness = self.harness(
+            mode="deterministic", tokens=300_000, usage_limit_until=time.time() + 600
+        )
+        obj = harness.obj
+        obj.cache_idle_seconds = 3300
+        obj.last_normal_stop = time.time() - 30  # WARM: the paid path is blocked
+
+        self.assertTrue(obj.attempt(command="/compact", purpose="compact"))
+
+        trigger = obj.guard.find("offline-compact:trigger")[-1]
+        self.assertEqual(trigger["trigger"], "usage-limited")
+        self.assertTrue(trigger["due"])
+        self.assertEqual(len(harness.installed_sessions()), 1)
+
+    def test_tiny_session_under_the_floor_never_runs_the_pass(self):
+        harness = self.harness(
+            mode="deterministic", tokens=1_000, usage_limit_until=time.time() + 600
+        )
+        obj = harness.obj
+        obj.cache_idle_seconds = 1
+        obj.last_normal_stop = time.time() - 3_600
+
+        self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+
+        self.assertEqual(harness.installed_sessions(), [])
+        self.assertEqual(read_written(harness.read_fd), b"")
+        refused = obj.guard.find("offline-compact:refused")
+        self.assertTrue(refused, obj.guard.events)
+        self.assertEqual(refused[-1]["reason"], "below-token-threshold")
+        # the floor is a floor: the trigger was never consulted
+        self.assertEqual(obj.guard.find("offline-compact:trigger"), [])
+
+    # -- 10. R-0032: an elided block becomes a LINE-NUMBER POINTER ------------
+
+    def test_pointer_stub_names_the_source_line_and_char_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "90035468-c967-4a1b-8a2e-0123456789ab.jsonl"
+            rows = build_transcript(source, big=4, tail=1, tool_chars=90_000)
+            out = root / "out.jsonl"
+            result = self.module.compact(
+                source, out, root / "archive", keep_recent_records=1, ceiling_tokens=10_000
+            )
+            self.assertTrue(result.ok, result.reason)
+            compacted = [
+                json.loads(line) for line in out.read_text().splitlines() if line.strip()
+            ]
+            pointers = 0
+            for index, record in enumerate(compacted):
+                part = record["message"]["content"][0]
+                if "elided" not in str(part.get("content")):
+                    continue
+                pointers += 1
+                original = rows[index]["message"]["content"][0]["content"]
+                self.assertEqual(
+                    part["content"],
+                    self.module.pointer_text(len(original), index + 1, str(source)),
+                )
+                self.assertIn(str(source), part["content"])
+                self.assertIn("line %d of" % (index + 1), part["content"])
+                self.assertIn("{:,} chars".format(len(original)), part["content"])
+                self.assertLess(len(part["content"]), 400)
+            self.assertGreater(pointers, 0)
+            self.assertEqual(pointers, result.report["pointer_stubs"])
+
+    def test_every_pointer_resolves_to_the_record_it_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            build_transcript(source, big=5, tail=1, tool_chars=90_000)
+            result = self.module.compact(
+                source,
+                root / "out.jsonl",
+                root / "archive",
+                keep_recent_records=1,
+                ceiling_tokens=10_000,
+            )
+            self.assertTrue(result.ok, result.reason)
+            self.assertEqual(result.report["pointer_stubs"], result.report["elided_blocks"])
+            self.assertEqual(
+                result.report["pointers_verified"], result.report["pointer_stubs"]
+            )
+            self.assertEqual(result.report["pointer_mismatch_count"], 0)
+            self.assertEqual(result.report["pointer_verification_basis"], "copy")
+
+            # Independent re-check against the source file itself.
+            lines = source.read_text().splitlines()
+            compacted = [
+                json.loads(line)
+                for line in Path(result.report["out"]).read_text().splitlines()
+                if line.strip()
+            ]
+            checked = 0
+            for index, record in enumerate(compacted):
+                part = record["message"]["content"][0]
+                if "elided" not in str(part.get("content")):
+                    continue
+                match = re.search(r"at line (\d+) of", part["content"])
+                self.assertIsNotNone(match)
+                line_number = int(match.group(1))
+                self.assertEqual(line_number, index + 1)
+                named = json.loads(lines[line_number - 1])
+                self.assertEqual(named["uuid"], record["uuid"])
+                checked += 1
+            self.assertGreater(checked, 0)
+            self.assertEqual(checked, result.report["pointer_stubs"])
+
+    def test_a_pointer_that_names_the_wrong_line_refuses_and_installs_nothing(self):
+        harness = self.harness(mode="deterministic", usage_limit_until=time.time() + 600)
+        obj = harness.obj
+        real = self.module.pointer_text
+        self.module.pointer_text = lambda chars, line, name: real(chars, line + 1, name)
+        try:
+            self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+        finally:
+            self.module.pointer_text = real
+
+        self.assertEqual(read_written(harness.read_fd), b"")
+        self.assertEqual(harness.installed_sessions(), [])
+        self.assertEqual(obj.session_id, SESSION)
+        self.assertEqual(harness.stops, 0)
+        self.assertEqual(obj.launches, [])
+        self.assertEqual(
+            list(Path(obj.offline_compact_root).glob("*/*/compacted.jsonl")), [],
+            "a refused output must not be left behind",
+        )
+        failures = obj.guard.find("offline-compact:failed")
+        self.assertTrue(failures, obj.guard.events)
+        self.assertEqual(failures[-1]["reason"], "pointer-mismatch")
+        compacted = obj.guard.find("offline-compact:compacted")[-1]
+        self.assertGreater(compacted["pointer_mismatch_count"], 0)
+        self.assertEqual(compacted["pointers_verified"], 0)
+
+    # -- 11. the ceiling is a cold RELOAD total: harness + conversation --------
+
+    def test_harness_resolver_counts_one_global_and_exactly_one_scope_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "CLAUDE.md").write_text("g" * 4_000)
+            (home / "HelmCortex").mkdir()
+            (home / "HelmCortex" / "CLAUDE.md").write_text("s" * 40_000)
+            # Present on disk, and must NOT be summed in for the Claude family.
+            (home / "HelmCortex" / "AGENTS.md").write_text("a" * 60_000)
+
+            baseline = self.module.resolve_harness("claude", "helmcortex", home=home)
+            self.assertEqual(baseline.source, "measured")
+            self.assertEqual([item["role"] for item in baseline.files], ["global", "scope"])
+            self.assertTrue(baseline.files[0]["path"].endswith(".claude/CLAUDE.md"))
+            self.assertTrue(baseline.files[1]["path"].endswith("HelmCortex/CLAUDE.md"))
+            self.assertEqual(baseline.chars, 44_000)
+            self.assertEqual(baseline.tokens, 11_000)
+
+            codex = self.module.resolve_harness("codex", "helmcortex", home=home)
+            self.assertEqual([item["role"] for item in codex.files], ["global", "scope"])
+            self.assertTrue(codex.files[1]["path"].endswith("HelmCortex/AGENTS.md"))
+            self.assertEqual(codex.chars, 64_000)
+            self.assertEqual(codex.tokens, 16_000)
+
+    def test_harness_resolver_refuses_two_scope_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "CLAUDE.md").write_text("g" * 400)
+            helm = home / "HelmCortex"
+            dot = home / "DotCortex"
+            helm.mkdir()
+            dot.mkdir()
+            (helm / "CLAUDE.md").write_text("h" * 400)
+            (dot / "CLAUDE.md").write_text("d" * 400)
+
+            with self.assertRaises(self.module.HarnessScopeError):
+                self.module.resolve_harness(
+                    "claude",
+                    "helmcortex",
+                    home=home,
+                    scope_files=[helm / "CLAUDE.md", dot / "CLAUDE.md"],
+                )
+            with self.assertRaises(self.module.HarnessScopeError):
+                self.module.resolve_harness("claude", "helmcortex", home=home, scope_files=[])
+            # HelmCortex and DotCortex are never summed for one seat either.
+            single = self.module.resolve_harness(
+                "claude", "dotcortex", home=home, scope_files=[dot / "CLAUDE.md"]
+            )
+            self.assertEqual(single.chars, 800)
+            self.assertEqual(len(single.files), 2)
+
+    def test_hermes_harness_is_excluded_not_modelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "HelmCortex").mkdir()
+            (home / "HelmCortex" / "CLAUDE.md").write_text("x" * 400_000)
+            baseline = self.module.resolve_harness("hermes", "helmcortex", home=home)
+            self.assertEqual(baseline.tokens, 0)
+            self.assertEqual(baseline.source, "excluded:hermes")
+            self.assertEqual(baseline.files, [])
+
+    def test_harness_falls_back_to_a_documented_estimate_and_says_so(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)  # no instruction files at all
+            baseline = self.module.resolve_harness("claude", "helmcortex", home=home)
+            self.assertEqual(baseline.source, "estimate:measurement-failed")
+            self.assertEqual(baseline.tokens, self.module.DEFAULT_HARNESS_ESTIMATE_TOKENS)
+            self.assertEqual(baseline.files, [])
+
+    def test_harness_measurement_is_cached_per_seat_and_re_measured_on_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "CLAUDE.md").write_text("g" * 4_000)
+            (home / "DotCortex").mkdir()
+            scope = home / "DotCortex" / "CLAUDE.md"
+            scope.write_text("s" * 8_000)
+            cache = home / "state" / "harness-baseline.json"
+
+            first = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-a"
+            )
+            self.assertEqual((first.source, first.tokens), ("measured", 3_000))
+            self.assertTrue(cache.is_file())
+
+            cached = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-a"
+            )
+            self.assertEqual((cached.source, cached.tokens), ("cache", 3_000))
+
+            other_seat = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-b"
+            )
+            self.assertEqual(other_seat.source, "measured")
+
+            scope.write_text("s" * 12_000)  # the instruction file changed
+            revised = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-a"
+            )
+            self.assertEqual((revised.source, revised.tokens), ("measured", 4_000))
+
+            override = self.module.measure_harness(
+                "claude",
+                "dotcortex",
+                home=home,
+                cache_path=cache,
+                seat="seat-a",
+                override_tokens=12_345,
+            )
+            self.assertEqual((override.source, override.tokens), ("override", 12_345))
+
+    def test_harness_that_pushes_the_total_over_the_ceiling_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            # 10 text records x 22_000 chars = 55K conversation tokens: inside the
+            # 70K ceiling on its own, outside a 50K conversation budget.
+            rows = []
+            previous = None
+            for index in range(10):
+                uid = str(uuid.uuid4())
+                rows.append(
+                    {
+                        "type": "user",
+                        "uuid": uid,
+                        "parentUuid": previous,
+                        "sessionId": SESSION,
+                        "timestamp": "2026-11-18T09:%02d:00Z" % index,
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "note %d " % index + "y" * 22_000}
+                            ],
+                        },
+                    }
+                )
+                previous = uid
+            source.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+            )
+
+            alone = self.module.compact(
+                source, root / "alone.jsonl", root / "archive-alone", keep_recent_records=0
+            )
+            self.assertEqual(alone.reason, "no-elision-needed")
+            self.assertTrue(alone.report["ceiling_met"])
+            self.assertEqual(alone.report["harness_tokens"], 0)
+            self.assertEqual(alone.report["conversation_budget_tokens"], 70_000)
+            self.assertEqual(
+                alone.report["total_reload_tokens"], alone.report["est_tokens_after"]
+            )
+
+            harness = {
+                "harness_family": "claude",
+                "harness_scope": "helmcortex",
+                "harness_tokens": 20_000,
+                "harness_source": "test",
+                "harness_files": [],
+            }
+            pushed = self.module.compact(
+                source,
+                root / "pushed.jsonl",
+                root / "archive-pushed",
+                keep_recent_records=0,
+                harness=harness,
+            )
+            self.assertFalse(pushed.ok)
+            self.assertEqual(pushed.reason, "ceiling-not-met")
+            self.assertIsNone(pushed.out_path)
+            self.assertEqual(pushed.report["harness_tokens"], 20_000)
+            self.assertEqual(pushed.report["conversation_budget_tokens"], 50_000)
+            self.assertGreater(pushed.report["total_reload_tokens"], 70_000)
+            self.assertFalse(pushed.report["ceiling_met"])
+
+            printed = json.loads(
+                (root / "archive-pushed" / "compaction-report.json").read_text()
+            )
+            for key in ("harness_tokens", "conversation_budget_tokens", "total_reload_tokens"):
+                self.assertIn(key, printed)
+            self.assertEqual(
+                printed["total_reload_tokens"],
+                printed["harness_tokens"] + printed["est_tokens_after"],
+            )
+
+    def test_supervisor_reports_harness_budget_and_pointer_basis(self):
+        harness = self.harness(mode="deterministic", usage_limit_until=time.time() + 600)
+        obj = harness.obj
+        obj.harness_baseline_cache = {
+            "harness_family": "claude",
+            "harness_scope": "helmcortex",
+            "harness_tokens": 16_000,
+            "harness_source": "measured",
+            "harness_files": [
+                {"role": "global", "path": "/home/x/.claude/CLAUDE.md", "chars": 15_555},
+                {"role": "scope", "path": "/home/x/HelmCortex/CLAUDE.md", "chars": 48_930},
+            ],
+        }
+
+        self.assertTrue(obj.attempt(command="/compact", purpose="compact"))
+
+        compacted = obj.guard.find("offline-compact:compacted")[-1]
+        self.assertEqual(compacted["harness_tokens"], 16_000)
+        self.assertEqual(compacted["harness_source"], "measured")
+        self.assertEqual(compacted["conversation_budget_tokens"], 54_000)
+        self.assertLessEqual(compacted["total_reload_tokens"], 70_000)
+        self.assertGreaterEqual(compacted["pointer_stubs"], 1)
+        self.assertEqual(compacted["pointers_verified"], compacted["pointer_stubs"])
+        self.assertEqual(compacted["pointer_mismatch_count"], 0)
+
+        report = json.loads(
+            next(
+                iter(Path(obj.offline_compact_root).glob("*/*/archive/compaction-report.json"))
+            ).read_text()
+        )
+        self.assertEqual(report["harness_tokens"], 16_000)
+        self.assertEqual(report["conversation_budget_tokens"], 54_000)
+        self.assertEqual(
+            report["total_reload_tokens"], 16_000 + report["est_tokens_after"]
+        )
+        self.assertLessEqual(report["total_reload_tokens"], 70_000)
+        self.assertEqual(report["pointer_verification_basis"], "pointer-source")
+        self.assertEqual(
+            [item["role"] for item in report["harness_files"]], ["global", "scope"]
+        )
+        self.assertEqual(obj.current_tokens, report["total_reload_tokens"])
 
 
 class StubRanker:

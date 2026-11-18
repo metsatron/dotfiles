@@ -505,6 +505,54 @@ OFFLINE_COMPACT_STUB_OVER_CHARS = env_int(
 OFFLINE_COMPACT_STOP_GRACE_SECONDS = env_float(
     "CLAUDE_IDLE_COMPACT_STOP_GRACE_SECONDS", 5.0, 0.1
 )
+# Ruling R-0032: the deterministic pass is due at the COLD CACHE BOUNDARY, not at
+# a token threshold.  Normal operation keeps a large session and pays for it out
+# of the provider prompt cache, so size is not a reason to compact; the risk
+# being managed is re-ingesting a cold session of hundreds of thousands of
+# tokens.  MIN_TOKENS above stays as a FLOOR ("do not bother with a tiny
+# session"), never as the trigger.
+OFFLINE_COMPACT_AGENT_FAMILY = (
+    os.environ.get("CLAUDE_IDLE_COMPACT_AGENT_FAMILY", "claude").strip().lower() or "claude"
+)
+OFFLINE_COMPACT_SCOPE = os.environ.get("CLAUDE_IDLE_COMPACT_SCOPE", "").strip().lower()
+OFFLINE_COMPACT_HARNESS_INDEX_TOKENS = env_int(
+    "CLAUDE_IDLE_COMPACT_HARNESS_INDEX_TOKENS", 0, 0
+)
+OFFLINE_COMPACT_HARNESS_OVERRIDE = env_int(
+    "CLAUDE_IDLE_COMPACT_HARNESS_TOKENS", 0, 0
+)
+
+
+def offline_compact_due(
+    *,
+    status: str,
+    idle_age: float | None,
+    cache_idle_seconds: float | None,
+    usage_limited: bool,
+) -> tuple[bool, str]:
+    """Is the deterministic pass due?  The cold boundary, not the transcript size.
+
+    A large session is the NORMAL state and is paid for out of the provider
+    prompt cache, so size alone must never trigger a pass.  It is due when
+
+      (a) the seat is idle and the measured cache window says the cache is at or
+          past its compact-before boundary, or
+      (b) the provider is usage-limited, so the paid path cannot run at all.
+
+    If the cache is warm and the seat is active, doing nothing is CORRECT
+    behaviour, not a skipped compaction -- the caller logs it as ``not-due`` and
+    never as a failure.  Without a measurement the armed timer is the only
+    evidence there is, and it has already fired: warmth is never invented.
+    """
+    if status == "active":
+        return False, "seat-active"
+    if usage_limited:
+        return True, "usage-limited"
+    if idle_age is None or cache_idle_seconds is None:
+        return True, "cache-unmeasured"
+    if idle_age < cache_idle_seconds:
+        return False, "cache-warm"
+    return True, "cache-cold"
 
 
 def compaction_mode() -> str:
@@ -2666,6 +2714,9 @@ class Supervisor:
         self.offline_compact_chars_per_token = OFFLINE_COMPACT_CHARS_PER_TOKEN
         self.session_override: str | None = None
         self.offline_compact_stage: str | None = None
+        # Measured once per process and cached on the instance; None means "not
+        # measured yet", never "zero harness".
+        self.harness_baseline_cache: dict | None = None
         self.dialog_unknown_logged = False  # one dialog_unknown record per episode
         self.preservation_federation = PreservationFederationClient(self)
         self.lifecycle_health = "pending"
@@ -2678,6 +2729,12 @@ class Supervisor:
             configured=configured_mode[:40],
             ceiling_tokens=self.offline_compact_ceiling,
             chars_per_token=self.offline_compact_chars_per_token,
+            agent_family=OFFLINE_COMPACT_AGENT_FAMILY,
+            scope=self._infer_scope(),
+            harness_index_tokens=OFFLINE_COMPACT_HARNESS_INDEX_TOKENS,
+            harness_override_tokens=OFFLINE_COMPACT_HARNESS_OVERRIDE,
+            trigger="cold-cache-or-usage-limited",
+            floor_tokens=MIN_TOKENS,
         )
         self._write_state()
 
@@ -4195,18 +4252,102 @@ class Supervisor:
         self._guard_log(f"offline-compact:{stage}", **fields)
         self._write_state()
 
+    def _offline_idle_age(self) -> float | None:
+        """Seconds since anything last moved this seat's idle window."""
+        anchor = self._idle_anchor()
+        return None if anchor is None else max(0.0, now() - anchor)
+
+    def _offline_compact_trigger(self) -> tuple[bool, str]:
+        """Ask the cold-boundary rule whether this pass is due, and say why."""
+        cache_idle = getattr(self, "cache_idle_seconds", None)
+        if cache_idle is None:
+            try:
+                cache_idle, ttl, policy = measured_cache_window(
+                    self.current_model, getattr(self, "cache_profile", "long")
+                )
+                self.cache_idle_seconds, self.cache_ttl_seconds = cache_idle, ttl
+                self.cache_policy = policy
+            except Exception:
+                cache_idle = None
+        usage_limited = bool(self.usage_limit_until and now() < self.usage_limit_until)
+        return offline_compact_due(
+            status=self.status,
+            idle_age=self._offline_idle_age(),
+            cache_idle_seconds=cache_idle,
+            usage_limited=usage_limited,
+        )
+
+    def _infer_scope(self) -> str:
+        """Which instruction tree this seat operates in (helmcortex | dotcortex)."""
+        if OFFLINE_COMPACT_SCOPE:
+            return OFFLINE_COMPACT_SCOPE
+        try:
+            cwd = pathlib.Path.cwd().resolve()
+            home = pathlib.Path.home().resolve()
+        except OSError:
+            return "unknown"
+        for scope, directory in (("helmcortex", "HelmCortex"), ("dotcortex", "DotCortex")):
+            try:
+                cwd.relative_to(home / directory)
+                return scope
+            except ValueError:
+                continue
+        return "unknown"
+
+    def harness_baseline(self) -> dict:
+        """The harness this seat reloads from cold: measured, cached per seat.
+
+        Never a hardcoded number.  The resolver counts ONE global instruction
+        file plus exactly ONE scope file -- CLAUDE.md for Claude, AGENTS.md for
+        Codex-style agents; HelmCortex OR DotCortex, never both -- plus the
+        configured index estimate, and the report carries the paths it counted so
+        the arithmetic is auditable.  A precomputed baseline on the instance wins,
+        and that is what the tests pin.
+        """
+        prepared = getattr(self, "harness_baseline_cache", None)
+        if isinstance(prepared, dict):
+            return prepared
+        module = _offline_compact_module()
+        if module is None:
+            return {
+                "harness_tokens": 0,
+                "harness_source": "unmeasured:module-unavailable",
+                "harness_files": [],
+            }
+        try:
+            baseline = module.measure_harness(
+                OFFLINE_COMPACT_AGENT_FAMILY,
+                self._infer_scope(),
+                index_tokens=OFFLINE_COMPACT_HARNESS_INDEX_TOKENS,
+                override_tokens=OFFLINE_COMPACT_HARNESS_OVERRIDE,
+                cache_path=self.offline_compact_root / "harness-baseline.json",
+                seat=self.channel,
+            )
+        except Exception as error:
+            return {
+                "harness_tokens": module.DEFAULT_HARNESS_ESTIMATE_TOKENS,
+                "harness_source": "estimate:resolver-error:{}".format(type(error).__name__),
+                "harness_files": [],
+            }
+        report = baseline.as_report()
+        self.harness_baseline_cache = report
+        return report
+
     def _offline_compact_attempt(self) -> tuple[str, str | None]:
         """Replace one /compact injection with a local pass over a transcript copy.
 
-        Returns (outcome, reason) with outcome in {"landed", "refused", "failed"}:
-        ``refused`` is an ordinary gate veto that changed nothing, ``failed`` is a
-        loud local failure the caller may answer with the native path when the
-        provider is not usage-limited.
+        Returns (outcome, reason) with outcome in {"landed", "refused", "not-due",
+        "failed"}: ``refused`` is an ordinary gate veto that changed nothing,
+        ``not-due`` means the cold-boundary rule says there is nothing to do (a
+        warm cache and a live seat: correct behaviour, never a failure), and
+        ``failed`` is a loud local failure the caller may answer with the native
+        path when the provider is not usage-limited.
 
         This method owns no wall-clock timer.  It is reachable only through
         ``attempt(purpose="compact")`` -- the same funnel the Stop-driven idle
-        timer and the preservation path use -- and it refuses below the token
-        threshold, so the trigger stays the compaction event.
+        timer and the preservation path use -- so the trigger is that event, and
+        ``offline_compact_due`` then decides whether the event means the cache
+        boundary was crossed.  The token count is only a floor.
         """
         if self.offline_compact_stage not in (None, "failed", "relaunched", "waiting"):
             return "refused", "already-running"
@@ -4224,8 +4365,23 @@ class Supervisor:
             return "refused", "transcript-not-quiescent"
         if self.transcript_gate_blocked:
             return "refused", "transcript-uncertain"
+        # MIN_TOKENS is a FLOOR -- "do not bother on a tiny session" -- and not
+        # the trigger.  R-0032 makes the cold cache boundary the trigger, below.
         if self.current_tokens is not None and self.current_tokens < MIN_TOKENS:
             return "refused", "below-token-threshold"
+        due, trigger = self._offline_compact_trigger()
+        self._guard_offline(
+            "trigger",
+            due=due,
+            trigger=trigger,
+            idle_age=int(self._offline_idle_age() or 0),
+            cache_idle_seconds=getattr(self, "cache_idle_seconds", None),
+            usage_limited=bool(self.usage_limit_until and now() < self.usage_limit_until),
+        )
+        if not due:
+            # A large session at a warm cache is exactly what the provider cache
+            # is for: there is nothing to do and nothing to alarm about.
+            return "not-due", trigger
         module = _offline_compact_module()
         if module is None:
             self._guard_offline("failed", reason="module-unavailable")
@@ -4256,6 +4412,7 @@ class Supervisor:
             # not a failed compaction: the deterministic pass still runs.
             ranker = None
         out_path = workdir / "compacted.jsonl"
+        harness = self.harness_baseline()
         try:
             result = module.compact(
                 copy_path,
@@ -4266,6 +4423,8 @@ class Supervisor:
                 ceiling_tokens=self.offline_compact_ceiling,
                 chars_per_token=self.offline_compact_chars_per_token,
                 ranker=ranker,
+                harness=harness,
+                pointer_source=str(source),
             )
         except Exception as error:  # a compactor bug must never take the seat down
             self._guard_offline("failed", reason=f"compactor-error:{type(error).__name__}")
@@ -4281,6 +4440,13 @@ class Supervisor:
             index_entries=report.get("index_entries"),
             est_tokens_before=report.get("est_tokens_before"),
             est_tokens_after=report.get("est_tokens_after"),
+            harness_tokens=report.get("harness_tokens"),
+            harness_source=report.get("harness_source"),
+            conversation_budget_tokens=report.get("conversation_budget_tokens"),
+            total_reload_tokens=report.get("total_reload_tokens"),
+            pointer_stubs=report.get("pointer_stubs"),
+            pointers_verified=report.get("pointers_verified"),
+            pointer_mismatch_count=report.get("pointer_mismatch_count"),
             ceiling_tokens=report.get("ceiling_tokens"),
             ceiling_met=report.get("ceiling_met"),
             tokenizer=report.get("tokenizer"),
@@ -4303,11 +4469,20 @@ class Supervisor:
             self._guard_offline("failed", reason="identity-not-preserved")
             return "failed", "identity-not-preserved"
         after = report.get("est_tokens_after")
-        if not report.get("ceiling_met") or not isinstance(after, int) or after > self.offline_compact_ceiling:
+        total = report.get("total_reload_tokens")
+        if (
+            not report.get("ceiling_met")
+            or not isinstance(after, int)
+            or not isinstance(total, int)
+            or after > self.offline_compact_ceiling
+            or total > self.offline_compact_ceiling
+        ):
             self._guard_offline(
                 "failed",
                 reason="ceiling-not-met",
                 est_tokens_after=after,
+                harness_tokens=report.get("harness_tokens"),
+                total_reload_tokens=total,
                 ceiling_tokens=self.offline_compact_ceiling,
             )
             return "failed", "ceiling-not-met"
@@ -4371,8 +4546,10 @@ class Supervisor:
         self.compacting = False
         self.compaction_requested_at = None
         self.compaction_ignore_next_stop = False
-        self.current_tokens = after
-        self.post_compact_baseline_tokens = after
+        # The CLI will re-read the harness AND the conversation, so the size it
+        # reports after the relaunch is the total reload, not the conversation.
+        self.current_tokens = total
+        self.post_compact_baseline_tokens = total
         self.post_compact_baseline_at = now()
         self.last_cancellation_reason = "offline-compaction-landed"
         self.last_injection_result = "requested"
@@ -4486,6 +4663,15 @@ class Supervisor:
             outcome, offline_reason = self._offline_compact_attempt()
             if outcome == "landed":
                 return True
+            if outcome == "not-due":
+                # Warm cache, idle seat, large session: nothing to do and nothing
+                # to alarm about.  This is correct behaviour (R-0032), logged as
+                # such so an operator never reads it as a skipped compaction.
+                self.last_gate_rejection_reason = None
+                self.last_state_transition = f"offline-compact:not-due:{offline_reason}"
+                self._guard_log("offline-compact:not-due", reason=offline_reason)
+                self._write_state()
+                return False
             if outcome == "refused":
                 self.last_gate_rejection_reason = offline_reason
                 self.last_state_transition = f"offline-compact:refused:{offline_reason}"
@@ -5641,9 +5827,14 @@ def main(argv: list[str]) -> int:
         print("CLAUDE_WARM_PRESERVATION_* (all bindings are required; unset is inert)")
         print("CLAUDE_IDLE_COMPACT_MODE=native|deterministic (deterministic runs a local,")
         print("provider-free pass over a transcript copy instead of injecting /compact)")
-        print("CLAUDE_IDLE_COMPACT_CEILING_TOKENS, CLAUDE_IDLE_COMPACT_CHARS_PER_TOKEN,")
+        print("  deterministic is due at the COLD CACHE BOUNDARY (idle + cache at/over its")
+        print("  compact-before window) or when the provider is usage-limited -- never")
+        print("  merely because the transcript is large; MIN_TOKENS is only a floor)")
+        print("CLAUDE_IDLE_COMPACT_CEILING_TOKENS (total cold reload), CLAUDE_IDLE_COMPACT_CHARS_PER_TOKEN,")
         print("CLAUDE_IDLE_COMPACT_KEEP_RECENT_RECORDS, CLAUDE_IDLE_COMPACT_STUB_OVER_CHARS,")
         print("CLAUDE_PROJECTS_DIR, CLAUDE_IDLE_COMPACT_STATE_DIR, CLAUDE_WARM_OFFLINE_COMPACT_MODULE")
+        print("CLAUDE_IDLE_COMPACT_AGENT_FAMILY=claude|codex, CLAUDE_IDLE_COMPACT_SCOPE=helmcortex|dotcortex,")
+        print("CLAUDE_IDLE_COMPACT_HARNESS_TOKENS (override), CLAUDE_IDLE_COMPACT_HARNESS_INDEX_TOKENS")
         print("CLAUDE_IDLE_COMPACT_DECIDER=auto|off, CLAUDE_IDLE_COMPACT_HONEY_DECIDER_URL,")
         print("CLAUDE_IDLE_COMPACT_KIKIN_DECIDER_URL, CLAUDE_IDLE_COMPACT_DECIDER_BUDGET_MS")
         print("Use claude-warmctl for per-session state and controls.")

@@ -686,6 +686,54 @@ OFFLINE_COMPACT_STUB_OVER_CHARS = env_int(
 OFFLINE_COMPACT_STOP_GRACE_SECONDS = env_float(
     "CLAUDE_IDLE_COMPACT_STOP_GRACE_SECONDS", 5.0, 0.1
 )
+# Ruling R-0032: the deterministic pass is due at the COLD CACHE BOUNDARY, not at
+# a token threshold.  Normal operation keeps a large session and pays for it out
+# of the provider prompt cache, so size is not a reason to compact; the risk
+# being managed is re-ingesting a cold session of hundreds of thousands of
+# tokens.  MIN_TOKENS above stays as a FLOOR ("do not bother with a tiny
+# session"), never as the trigger.
+OFFLINE_COMPACT_AGENT_FAMILY = (
+    os.environ.get("CLAUDE_IDLE_COMPACT_AGENT_FAMILY", "claude").strip().lower() or "claude"
+)
+OFFLINE_COMPACT_SCOPE = os.environ.get("CLAUDE_IDLE_COMPACT_SCOPE", "").strip().lower()
+OFFLINE_COMPACT_HARNESS_INDEX_TOKENS = env_int(
+    "CLAUDE_IDLE_COMPACT_HARNESS_INDEX_TOKENS", 0, 0
+)
+OFFLINE_COMPACT_HARNESS_OVERRIDE = env_int(
+    "CLAUDE_IDLE_COMPACT_HARNESS_TOKENS", 0, 0
+)
+
+
+def offline_compact_due(
+    *,
+    status: str,
+    idle_age: float | None,
+    cache_idle_seconds: float | None,
+    usage_limited: bool,
+) -> tuple[bool, str]:
+    """Is the deterministic pass due?  The cold boundary, not the transcript size.
+
+    A large session is the NORMAL state and is paid for out of the provider
+    prompt cache, so size alone must never trigger a pass.  It is due when
+
+      (a) the seat is idle and the measured cache window says the cache is at or
+          past its compact-before boundary, or
+      (b) the provider is usage-limited, so the paid path cannot run at all.
+
+    If the cache is warm and the seat is active, doing nothing is CORRECT
+    behaviour, not a skipped compaction -- the caller logs it as ``not-due`` and
+    never as a failure.  Without a measurement the armed timer is the only
+    evidence there is, and it has already fired: warmth is never invented.
+    """
+    if status == "active":
+        return False, "seat-active"
+    if usage_limited:
+        return True, "usage-limited"
+    if idle_age is None or cache_idle_seconds is None:
+        return True, "cache-unmeasured"
+    if idle_age < cache_idle_seconds:
+        return False, "cache-warm"
+    return True, "cache-cold"
 
 
 def compaction_mode() -> str:
@@ -2847,6 +2895,9 @@ class Supervisor:
         self.offline_compact_chars_per_token = OFFLINE_COMPACT_CHARS_PER_TOKEN
         self.session_override: str | None = None
         self.offline_compact_stage: str | None = None
+        # Measured once per process and cached on the instance; None means "not
+        # measured yet", never "zero harness".
+        self.harness_baseline_cache: dict | None = None
         self.dialog_unknown_logged = False  # one dialog_unknown record per episode
         self.preservation_federation = PreservationFederationClient(self)
         self.lifecycle_health = "pending"
@@ -2859,6 +2910,12 @@ class Supervisor:
             configured=configured_mode[:40],
             ceiling_tokens=self.offline_compact_ceiling,
             chars_per_token=self.offline_compact_chars_per_token,
+            agent_family=OFFLINE_COMPACT_AGENT_FAMILY,
+            scope=self._infer_scope(),
+            harness_index_tokens=OFFLINE_COMPACT_HARNESS_INDEX_TOKENS,
+            harness_override_tokens=OFFLINE_COMPACT_HARNESS_OVERRIDE,
+            trigger="cold-cache-or-usage-limited",
+            floor_tokens=MIN_TOKENS,
         )
         self._write_state()
 
@@ -4376,18 +4433,102 @@ class Supervisor:
         self._guard_log(f"offline-compact:{stage}", **fields)
         self._write_state()
 
+    def _offline_idle_age(self) -> float | None:
+        """Seconds since anything last moved this seat's idle window."""
+        anchor = self._idle_anchor()
+        return None if anchor is None else max(0.0, now() - anchor)
+
+    def _offline_compact_trigger(self) -> tuple[bool, str]:
+        """Ask the cold-boundary rule whether this pass is due, and say why."""
+        cache_idle = getattr(self, "cache_idle_seconds", None)
+        if cache_idle is None:
+            try:
+                cache_idle, ttl, policy = measured_cache_window(
+                    self.current_model, getattr(self, "cache_profile", "long")
+                )
+                self.cache_idle_seconds, self.cache_ttl_seconds = cache_idle, ttl
+                self.cache_policy = policy
+            except Exception:
+                cache_idle = None
+        usage_limited = bool(self.usage_limit_until and now() < self.usage_limit_until)
+        return offline_compact_due(
+            status=self.status,
+            idle_age=self._offline_idle_age(),
+            cache_idle_seconds=cache_idle,
+            usage_limited=usage_limited,
+        )
+
+    def _infer_scope(self) -> str:
+        """Which instruction tree this seat operates in (helmcortex | dotcortex)."""
+        if OFFLINE_COMPACT_SCOPE:
+            return OFFLINE_COMPACT_SCOPE
+        try:
+            cwd = pathlib.Path.cwd().resolve()
+            home = pathlib.Path.home().resolve()
+        except OSError:
+            return "unknown"
+        for scope, directory in (("helmcortex", "HelmCortex"), ("dotcortex", "DotCortex")):
+            try:
+                cwd.relative_to(home / directory)
+                return scope
+            except ValueError:
+                continue
+        return "unknown"
+
+    def harness_baseline(self) -> dict:
+        """The harness this seat reloads from cold: measured, cached per seat.
+
+        Never a hardcoded number.  The resolver counts ONE global instruction
+        file plus exactly ONE scope file -- CLAUDE.md for Claude, AGENTS.md for
+        Codex-style agents; HelmCortex OR DotCortex, never both -- plus the
+        configured index estimate, and the report carries the paths it counted so
+        the arithmetic is auditable.  A precomputed baseline on the instance wins,
+        and that is what the tests pin.
+        """
+        prepared = getattr(self, "harness_baseline_cache", None)
+        if isinstance(prepared, dict):
+            return prepared
+        module = _offline_compact_module()
+        if module is None:
+            return {
+                "harness_tokens": 0,
+                "harness_source": "unmeasured:module-unavailable",
+                "harness_files": [],
+            }
+        try:
+            baseline = module.measure_harness(
+                OFFLINE_COMPACT_AGENT_FAMILY,
+                self._infer_scope(),
+                index_tokens=OFFLINE_COMPACT_HARNESS_INDEX_TOKENS,
+                override_tokens=OFFLINE_COMPACT_HARNESS_OVERRIDE,
+                cache_path=self.offline_compact_root / "harness-baseline.json",
+                seat=self.channel,
+            )
+        except Exception as error:
+            return {
+                "harness_tokens": module.DEFAULT_HARNESS_ESTIMATE_TOKENS,
+                "harness_source": "estimate:resolver-error:{}".format(type(error).__name__),
+                "harness_files": [],
+            }
+        report = baseline.as_report()
+        self.harness_baseline_cache = report
+        return report
+
     def _offline_compact_attempt(self) -> tuple[str, str | None]:
         """Replace one /compact injection with a local pass over a transcript copy.
 
-        Returns (outcome, reason) with outcome in {"landed", "refused", "failed"}:
-        ``refused`` is an ordinary gate veto that changed nothing, ``failed`` is a
-        loud local failure the caller may answer with the native path when the
-        provider is not usage-limited.
+        Returns (outcome, reason) with outcome in {"landed", "refused", "not-due",
+        "failed"}: ``refused`` is an ordinary gate veto that changed nothing,
+        ``not-due`` means the cold-boundary rule says there is nothing to do (a
+        warm cache and a live seat: correct behaviour, never a failure), and
+        ``failed`` is a loud local failure the caller may answer with the native
+        path when the provider is not usage-limited.
 
         This method owns no wall-clock timer.  It is reachable only through
         ``attempt(purpose="compact")`` -- the same funnel the Stop-driven idle
-        timer and the preservation path use -- and it refuses below the token
-        threshold, so the trigger stays the compaction event.
+        timer and the preservation path use -- so the trigger is that event, and
+        ``offline_compact_due`` then decides whether the event means the cache
+        boundary was crossed.  The token count is only a floor.
         """
         if self.offline_compact_stage not in (None, "failed", "relaunched", "waiting"):
             return "refused", "already-running"
@@ -4405,8 +4546,23 @@ class Supervisor:
             return "refused", "transcript-not-quiescent"
         if self.transcript_gate_blocked:
             return "refused", "transcript-uncertain"
+        # MIN_TOKENS is a FLOOR -- "do not bother on a tiny session" -- and not
+        # the trigger.  R-0032 makes the cold cache boundary the trigger, below.
         if self.current_tokens is not None and self.current_tokens < MIN_TOKENS:
             return "refused", "below-token-threshold"
+        due, trigger = self._offline_compact_trigger()
+        self._guard_offline(
+            "trigger",
+            due=due,
+            trigger=trigger,
+            idle_age=int(self._offline_idle_age() or 0),
+            cache_idle_seconds=getattr(self, "cache_idle_seconds", None),
+            usage_limited=bool(self.usage_limit_until and now() < self.usage_limit_until),
+        )
+        if not due:
+            # A large session at a warm cache is exactly what the provider cache
+            # is for: there is nothing to do and nothing to alarm about.
+            return "not-due", trigger
         module = _offline_compact_module()
         if module is None:
             self._guard_offline("failed", reason="module-unavailable")
@@ -4437,6 +4593,7 @@ class Supervisor:
             # not a failed compaction: the deterministic pass still runs.
             ranker = None
         out_path = workdir / "compacted.jsonl"
+        harness = self.harness_baseline()
         try:
             result = module.compact(
                 copy_path,
@@ -4447,6 +4604,8 @@ class Supervisor:
                 ceiling_tokens=self.offline_compact_ceiling,
                 chars_per_token=self.offline_compact_chars_per_token,
                 ranker=ranker,
+                harness=harness,
+                pointer_source=str(source),
             )
         except Exception as error:  # a compactor bug must never take the seat down
             self._guard_offline("failed", reason=f"compactor-error:{type(error).__name__}")
@@ -4462,6 +4621,13 @@ class Supervisor:
             index_entries=report.get("index_entries"),
             est_tokens_before=report.get("est_tokens_before"),
             est_tokens_after=report.get("est_tokens_after"),
+            harness_tokens=report.get("harness_tokens"),
+            harness_source=report.get("harness_source"),
+            conversation_budget_tokens=report.get("conversation_budget_tokens"),
+            total_reload_tokens=report.get("total_reload_tokens"),
+            pointer_stubs=report.get("pointer_stubs"),
+            pointers_verified=report.get("pointers_verified"),
+            pointer_mismatch_count=report.get("pointer_mismatch_count"),
             ceiling_tokens=report.get("ceiling_tokens"),
             ceiling_met=report.get("ceiling_met"),
             tokenizer=report.get("tokenizer"),
@@ -4484,11 +4650,20 @@ class Supervisor:
             self._guard_offline("failed", reason="identity-not-preserved")
             return "failed", "identity-not-preserved"
         after = report.get("est_tokens_after")
-        if not report.get("ceiling_met") or not isinstance(after, int) or after > self.offline_compact_ceiling:
+        total = report.get("total_reload_tokens")
+        if (
+            not report.get("ceiling_met")
+            or not isinstance(after, int)
+            or not isinstance(total, int)
+            or after > self.offline_compact_ceiling
+            or total > self.offline_compact_ceiling
+        ):
             self._guard_offline(
                 "failed",
                 reason="ceiling-not-met",
                 est_tokens_after=after,
+                harness_tokens=report.get("harness_tokens"),
+                total_reload_tokens=total,
                 ceiling_tokens=self.offline_compact_ceiling,
             )
             return "failed", "ceiling-not-met"
@@ -4552,8 +4727,10 @@ class Supervisor:
         self.compacting = False
         self.compaction_requested_at = None
         self.compaction_ignore_next_stop = False
-        self.current_tokens = after
-        self.post_compact_baseline_tokens = after
+        # The CLI will re-read the harness AND the conversation, so the size it
+        # reports after the relaunch is the total reload, not the conversation.
+        self.current_tokens = total
+        self.post_compact_baseline_tokens = total
         self.post_compact_baseline_at = now()
         self.last_cancellation_reason = "offline-compaction-landed"
         self.last_injection_result = "requested"
@@ -4667,6 +4844,15 @@ class Supervisor:
             outcome, offline_reason = self._offline_compact_attempt()
             if outcome == "landed":
                 return True
+            if outcome == "not-due":
+                # Warm cache, idle seat, large session: nothing to do and nothing
+                # to alarm about.  This is correct behaviour (R-0032), logged as
+                # such so an operator never reads it as a skipped compaction.
+                self.last_gate_rejection_reason = None
+                self.last_state_transition = f"offline-compact:not-due:{offline_reason}"
+                self._guard_log("offline-compact:not-due", reason=offline_reason)
+                self._write_state()
+                return False
             if outcome == "refused":
                 self.last_gate_rejection_reason = offline_reason
                 self.last_state_transition = f"offline-compact:refused:{offline_reason}"
@@ -5822,9 +6008,14 @@ def main(argv: list[str]) -> int:
         print("CLAUDE_WARM_PRESERVATION_* (all bindings are required; unset is inert)")
         print("CLAUDE_IDLE_COMPACT_MODE=native|deterministic (deterministic runs a local,")
         print("provider-free pass over a transcript copy instead of injecting /compact)")
-        print("CLAUDE_IDLE_COMPACT_CEILING_TOKENS, CLAUDE_IDLE_COMPACT_CHARS_PER_TOKEN,")
+        print("  deterministic is due at the COLD CACHE BOUNDARY (idle + cache at/over its")
+        print("  compact-before window) or when the provider is usage-limited -- never")
+        print("  merely because the transcript is large; MIN_TOKENS is only a floor)")
+        print("CLAUDE_IDLE_COMPACT_CEILING_TOKENS (total cold reload), CLAUDE_IDLE_COMPACT_CHARS_PER_TOKEN,")
         print("CLAUDE_IDLE_COMPACT_KEEP_RECENT_RECORDS, CLAUDE_IDLE_COMPACT_STUB_OVER_CHARS,")
         print("CLAUDE_PROJECTS_DIR, CLAUDE_IDLE_COMPACT_STATE_DIR, CLAUDE_WARM_OFFLINE_COMPACT_MODULE")
+        print("CLAUDE_IDLE_COMPACT_AGENT_FAMILY=claude|codex, CLAUDE_IDLE_COMPACT_SCOPE=helmcortex|dotcortex,")
+        print("CLAUDE_IDLE_COMPACT_HARNESS_TOKENS (override), CLAUDE_IDLE_COMPACT_HARNESS_INDEX_TOKENS")
         print("CLAUDE_IDLE_COMPACT_DECIDER=auto|off, CLAUDE_IDLE_COMPACT_HONEY_DECIDER_URL,")
         print("CLAUDE_IDLE_COMPACT_KIKIN_DECIDER_URL, CLAUDE_IDLE_COMPACT_DECIDER_BUDGET_MS")
         print("Use claude-warmctl for per-session state and controls.")
@@ -7084,16 +7275,24 @@ claude-warm.  It never calls a provider, never injects ``/compact`` and never
 touches a live transcript: it reads a COPY, writes a new file, and archives plus
 indexes every byte it elides BEFORE that byte leaves the context.
 
-Policy (the same stub policy as FORGE/scripts/context_retention/compact_offline.py,
-asserted against that tool by test-offline-compact-mode.py):
+Policy:
 
   * the last ``keep_recent_records`` records are untouched, whatever their size;
-  * elsewhere, a ``tool_result`` block whose text exceeds ``stub_over_chars`` is
-    replaced by a one-line stub;
+  * elsewhere, a ``tool_result`` block whose text exceeds ``stub_over_chars`` may
+    be replaced by a POINTER, never silently deleted (ruling R-0032): the
+    replacement names the source transcript path, the 1-based JSONL line of that
+    record and the original character count, so the agent can always walk back
+    to the full text.  The source transcript is never deleted, so a pointer
+    always resolves;
   * user and assistant text is never modified, only tool output;
   * uuid, parentUuid, timestamps, types and record order are never touched.
 
-Three rules the standalone tool's CLI cannot express, and that this path exists
+``STUB_TEMPLATE`` still holds the legacy bare stub of
+FORGE/scripts/context_retention/compact_offline.py because that standalone tool
+emits it and test-offline-compact-mode.py pins text-extraction parity against
+it; this engine writes ``POINTER_TEMPLATE``.
+
+Four rules the standalone tool's CLI cannot express, and that this path exists
 to enforce:
 
   1. **Index before elision.**  Every elided block gets a durable FTS5 row (plus
@@ -7113,6 +7312,16 @@ to enforce:
 
 Token accounting is explicit: ``chars / chars_per_token`` over message text,
 with the assumption printed in the report.  No provider tokenizer is invoked.
+
+  4. **The ceiling is a COLD-RELOAD total, not a transcript budget.**  A resume
+     re-reads the harness -- one global instruction file, exactly ONE scope file
+     (CLAUDE.md for Claude, AGENTS.md for Codex-style agents; HelmCortex OR
+     DotCortex, never both), plus the skill/tool/MCP index estimate -- before it
+     reads a single conversation token.  So the conversation is allowed only
+     ``ceiling - harness_tokens``.  The harness is measured by
+     ``resolve_harness`` / ``measure_harness`` (never a hardcoded 40K), the
+     report prints the files it counted so the arithmetic is auditable, and an
+     output whose harness + conversation total exceeds the ceiling is refused.
 """
 from __future__ import annotations
 
@@ -7122,10 +7331,15 @@ import math
 import os
 import re
 import sqlite3
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 STUB_TEMPLATE = "[tool output elided: {chars} chars, archived as {key}; first line: {first}]"
+POINTER_TEMPLATE = (
+    "[elided {chars:,} chars at line {line:,} of {name} \u2014 full text retained; "
+    "read it or query the FTS index]"
+)
 
 DEFAULT_CEILING_TOKENS = 70_000
 DEFAULT_CHARS_PER_TOKEN = 4.0
@@ -7134,6 +7348,20 @@ DEFAULT_STUB_OVER_CHARS = 400
 DEFAULT_DECIDER_BUDGET_MS = 2_500
 DEFAULT_DECIDER_MAX_QUESTIONS = 24
 DEFAULT_DECIDER_EXCERPT_CHARS = 600
+
+# Harness accounting (rule 4).  The four combinations below are the only ones a
+# seat loads: one global instruction file plus exactly ONE scope file, chosen by
+# agent family and scope.  Hermes carries its own harness and is excluded rather
+# than modelled as a normal seat.
+HARNESS_FAMILY_FILENAME = {"claude": "CLAUDE.md", "codex": "AGENTS.md"}
+HARNESS_SCOPE_DIRECTORY = {"helmcortex": "HelmCortex", "dotcortex": "DotCortex"}
+HARNESS_EXCLUDED_FAMILIES = frozenset({"hermes"})
+HARNESS_SCHEMA = "dotcortex.harness-baseline.v1"
+# Documented fallback ONLY when measurement is impossible (no global file, no
+# scope file, or an unreadable one).  The measured pairs on this machine are
+# ~10.6k (Claude/DotCortex) to ~16.4k (Codex/HelmCortex) tokens; 20k therefore
+# over-reserves, which is the safe direction for a ceiling.
+DEFAULT_HARNESS_ESTIMATE_TOKENS = 20_000
 
 # The deployed approval gate ships placeholder URLs until a host is wired
 # (all/.config/dotcortex/claude-approval-*.json); the same law applies here --
@@ -7257,13 +7485,24 @@ def tokenizer_label(chars_per_token: float) -> str:
 # --------------------------------------------------------------------------
 
 
-def load_records(path: Path) -> list[dict]:
-    rows = []
+def load_records_with_lines(path: Path) -> list[tuple[int, dict]]:
+    """Read a JSONL transcript as (1-based line number, record) pairs.
+
+    The line number is the PHYSICAL line in the file, because that is what a
+    pointer stub promises the agent.  Blank lines are skipped but never
+    renumbered: a pointer to line 3,412 must name line 3,412 of the file on
+    disk, so the numbering can never drift from what ``readline`` reports.
+    """
+    rows: list[tuple[int, dict]] = []
     with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
-        for line in handle:
+        for number, line in enumerate(handle, start=1):
             if line.strip():
-                rows.append(json.loads(line))
+                rows.append((number, json.loads(line)))
     return rows
+
+
+def load_records(path: Path) -> list[dict]:
+    return [record for _number, record in load_records_with_lines(path)]
 
 
 def parent_chain(records: list[dict]) -> list[str]:
@@ -7372,6 +7611,277 @@ class ElisionIndex:
                 self.journal.close()
             except OSError:
                 pass
+
+
+# --------------------------------------------------------------------------
+# harness accounting: what a cold reload pays before the conversation
+# --------------------------------------------------------------------------
+
+
+class HarnessScopeError(ValueError):
+    """The harness resolver was given an ambiguous scope (two files, or none)."""
+
+
+@dataclass
+class HarnessBaseline:
+    """What one cold reload pays before it reads a single conversation token."""
+
+    family: str
+    scope: str
+    tokens: int
+    chars: int
+    index_tokens: int = 0
+    source: str = "measured"
+    files: list = field(default_factory=list)
+
+    def as_report(self) -> dict:
+        return {
+            "harness_family": self.family,
+            "harness_scope": self.scope,
+            "harness_tokens": int(self.tokens),
+            "harness_chars": int(self.chars),
+            "harness_index_tokens": int(self.index_tokens),
+            "harness_source": self.source,
+            "harness_files": [dict(item) for item in self.files],
+        }
+
+
+def _normalised(value: object) -> str:
+    return str(value or "").strip().lower()
+
+
+def _first_existing(paths: list[Path]) -> Path | None:
+    for path in paths:
+        try:
+            if path.is_file():
+                return path
+        except OSError:
+            continue
+    return None
+
+
+def _harness_estimate(
+    family: str,
+    scope: str,
+    index_tokens: int,
+    reason: str,
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+) -> HarnessBaseline:
+    """The documented fallback, labelled with WHY it had to be used."""
+    return HarnessBaseline(
+        family=family,
+        scope=scope,
+        tokens=DEFAULT_HARNESS_ESTIMATE_TOKENS + int(index_tokens),
+        chars=int(DEFAULT_HARNESS_ESTIMATE_TOKENS * float(chars_per_token)),
+        index_tokens=int(index_tokens),
+        source=reason,
+        files=[],
+    )
+
+
+def _harness_paths(
+    family: str,
+    scope: str,
+    home: Path | None = None,
+    scope_files: list[Path] | None = None,
+) -> tuple[Path | None, Path] | None:
+    """Name the two files a seat loads, or None when the pair is unnameable."""
+    family, scope = _normalised(family), _normalised(scope)
+    if family not in HARNESS_FAMILY_FILENAME or scope not in HARNESS_SCOPE_DIRECTORY:
+        return None
+    home = Path(home).expanduser() if home is not None else Path.home()
+    filename = HARNESS_FAMILY_FILENAME[family]
+    if scope_files is not None:
+        supplied = [Path(item).expanduser() for item in scope_files]
+        if len(supplied) != 1:
+            raise HarnessScopeError(
+                "harness-scope-ambiguous: {} scope files supplied ({}); a seat "
+                "loads exactly one".format(
+                    len(supplied), ", ".join(str(item) for item in supplied) or "none"
+                )
+            )
+        scope_path = supplied[0]
+    else:
+        scope_path = home / HARNESS_SCOPE_DIRECTORY[scope] / filename
+    global_path = _first_existing(
+        [home / ".claude" / filename, home / filename, home / ".claude" / "CLAUDE.md"]
+    )
+    return global_path, scope_path
+
+
+def resolve_harness(
+    family: str,
+    scope: str,
+    *,
+    home: Path | None = None,
+    scope_files: list[Path] | None = None,
+    index_tokens: int = 0,
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+) -> HarnessBaseline:
+    """Measure ONE global instruction file plus exactly ONE scope file.
+
+    ``family`` is the agent family (``claude`` reads CLAUDE.md, Codex-style
+    agents read AGENTS.md); ``scope`` is ``helmcortex`` or ``dotcortex``.  The
+    two names are never summed, and the two scopes are never summed: doing
+    either doubles the harness and starves the conversation.  A caller that
+    supplies two scope files is refused loudly instead of quietly counting both.
+    Hermes is excluded -- it carries its own harness and is not a normal seat --
+    so its baseline is zero and the report says ``excluded:hermes``.
+    """
+    family, scope = _normalised(family), _normalised(scope)
+    index_tokens = max(0, int(index_tokens))
+    if family in HARNESS_EXCLUDED_FAMILIES:
+        return HarnessBaseline(family, scope, 0, 0, index_tokens, "excluded:hermes", [])
+    paths = _harness_paths(family, scope, home, scope_files)
+    if paths is None:
+        reason = (
+            "estimate:family-unknown"
+            if family not in HARNESS_FAMILY_FILENAME
+            else "estimate:scope-unknown"
+        )
+        return _harness_estimate(family, scope, index_tokens, reason, chars_per_token)
+    global_path, scope_path = paths
+    if global_path is None or not scope_path.is_file():
+        return _harness_estimate(
+            family, scope, index_tokens, "estimate:measurement-failed", chars_per_token
+        )
+    files: list[dict] = []
+    chars = 0
+    for role, path in (("global", global_path), ("scope", scope_path)):
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return _harness_estimate(
+                family, scope, index_tokens, "estimate:measurement-failed", chars_per_token
+            )
+        files.append({"role": role, "path": str(path), "chars": len(text)})
+        chars += len(text)
+    return HarnessBaseline(
+        family=family,
+        scope=scope,
+        tokens=estimate_tokens(chars, chars_per_token) + index_tokens,
+        chars=chars,
+        index_tokens=index_tokens,
+        source="measured",
+        files=files,
+    )
+
+
+def harness_signature(
+    paths: list[Path], family: str, scope: str, index_tokens: int = 0
+) -> str:
+    """Cheap identity of the counted files: a cache hit then needs no read."""
+    material = [_normalised(family), _normalised(scope), str(int(index_tokens))]
+    for path in paths:
+        try:
+            stat = path.stat()
+            material.append("{}:{}:{}".format(path, stat.st_size, stat.st_mtime_ns))
+        except OSError:
+            material.append("{}:missing".format(path))
+    return hashlib.sha256("\n".join(material).encode("utf-8")).hexdigest()
+
+
+def _read_harness_cache(cache_path: Path, seat: str | None, signature: str) -> HarnessBaseline | None:
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(payload, dict) or payload.get("schema") != HARNESS_SCHEMA:
+        return None
+    if payload.get("signature") != signature or payload.get("seat") != seat:
+        return None
+    report = payload.get("baseline")
+    if not isinstance(report, dict):
+        return None
+    tokens = report.get("harness_tokens")
+    if isinstance(tokens, bool) or not isinstance(tokens, int):
+        return None
+    files = report.get("harness_files")
+    return HarnessBaseline(
+        family=str(report.get("harness_family") or ""),
+        scope=str(report.get("harness_scope") or ""),
+        tokens=tokens,
+        chars=int(report.get("harness_chars") or 0),
+        index_tokens=int(report.get("harness_index_tokens") or 0),
+        source="cache",
+        files=[item for item in files if isinstance(item, dict)] if isinstance(files, list) else [],
+    )
+
+
+def _write_harness_cache(
+    cache_path: Path, seat: str | None, signature: str, baseline: HarnessBaseline
+) -> None:
+    payload = {
+        "schema": HARNESS_SCHEMA,
+        "seat": seat,
+        "signature": signature,
+        "measured_at": int(time.time()),
+        "baseline": baseline.as_report(),
+    }
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = cache_path.with_name(cache_path.name + ".tmp")
+        temporary.write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+        os.replace(temporary, cache_path)
+    except OSError:
+        # A cache that cannot be written is a slow path, never a failed pass.
+        pass
+
+
+def measure_harness(
+    family: str,
+    scope: str,
+    *,
+    home: Path | None = None,
+    scope_files: list[Path] | None = None,
+    index_tokens: int = 0,
+    chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
+    cache_path: Path | None = None,
+    seat: str | None = None,
+    override_tokens: int = 0,
+    refresh: bool = False,
+) -> HarnessBaseline:
+    """Measure the harness once, cache it per seat, and label where it came from.
+
+    ``override_tokens`` (CLAUDE_IDLE_COMPACT_HARNESS_TOKENS) wins outright and is
+    reported as ``override``.  The cache is keyed by seat AND by the (path, size,
+    mtime) signature of the two counted files, so a changed instruction file
+    re-measures and an unchanged one costs two stats.  Everything that cannot be
+    measured falls back to the documented estimate with the reason in ``source``.
+    """
+    family, scope = _normalised(family), _normalised(scope)
+    if int(override_tokens or 0) > 0:
+        return HarnessBaseline(
+            family=family,
+            scope=scope,
+            tokens=int(override_tokens),
+            chars=int(int(override_tokens) * float(chars_per_token)),
+            index_tokens=0,
+            source="override",
+            files=[],
+        )
+    index_tokens = max(0, int(index_tokens))
+    paths = _harness_paths(family, scope, home, scope_files)
+    signature = None
+    if paths is not None:
+        signature = harness_signature(
+            [path for path in paths if path is not None], family, scope, index_tokens
+        )
+    if cache_path is not None and signature is not None and not refresh:
+        cached = _read_harness_cache(Path(cache_path), seat, signature)
+        if cached is not None:
+            return cached
+    baseline = resolve_harness(
+        family,
+        scope,
+        home=home,
+        scope_files=scope_files,
+        index_tokens=index_tokens,
+        chars_per_token=chars_per_token,
+    )
+    if cache_path is not None and signature is not None and baseline.source == "measured":
+        _write_harness_cache(Path(cache_path), seat, signature, baseline)
+    return baseline
 
 
 # --------------------------------------------------------------------------
@@ -7653,13 +8163,46 @@ def drop_order(candidates: list[Candidate], scores: dict[str, float] | None) -> 
     )
 
 
-def stub_length_bound(candidate: Candidate) -> int:
-    """Upper bound on a stub's length for this candidate.
+def pointer_text(chars: int, line: int, name: str) -> str:
+    """The replacement for an elided block: a POINTER into the full transcript.
 
-    The first line is capped at 120 chars by ``_stub_text``, so this bound is
-    exact enough for the ceiling arithmetic below and never under-counts.
+    Ruling R-0032: an elided block is not deleted, it is moved out of the working
+    context and pointed at.  The pointer names the source file, the 1-based JSONL
+    line of that record and the original character count, so the agent can read
+    the full text back or query the FTS index for it.  The source transcript is
+    never deleted, so every pointer resolves.
     """
-    return len(STUB_TEMPLATE.format(chars=candidate.chars, key=candidate.key, first="x" * 120))
+    return POINTER_TEMPLATE.format(chars=int(chars), line=int(line), name=name)
+
+
+POINTER_LINE_RE = re.compile(r"at line ([\d,]+) of ")
+
+
+def pointer_line(text: object) -> int | None:
+    """The line number a pointer stub CLAIMS, or None when it names none.
+
+    Verification reads this number out of the text it actually wrote, never from
+    the bookkeeping around it: a pointer whose printed line disagrees with the
+    record it came from must be caught, and only the text is what the agent sees.
+    """
+    match = POINTER_LINE_RE.search(str(text))
+    if not match:
+        return None
+    try:
+        return int(match.group(1).replace(",", ""))
+    except ValueError:
+        return None
+
+
+def stub_length_bound(candidate: Candidate, name: str = "source.jsonl", line: int = 10**9) -> int:
+    """Upper bound on a pointer's length for this candidate.
+
+    ``line`` defaults to a nine-digit number so the bound never under-counts when
+    the real line is shorter than the bound assumes; the ceiling arithmetic below
+    therefore always errs toward eliding one more block, never toward breaching
+    the ceiling.
+    """
+    return len(pointer_text(candidate.chars, line, name))
 
 
 def choose_elisions(
@@ -7668,11 +8211,16 @@ def choose_elisions(
     ceiling_tokens: int,
     chars_per_token: float,
     scores: dict[str, float] | None,
+    *,
+    pointer_name: str = "source.jsonl",
+    max_line: int = 10**9,
 ) -> tuple[list[Candidate], int]:
     """Elide lowest-relevance candidates until the ceiling is met.
 
-    Returns (chosen, chars_after).  Comparison happens in characters (the unit
-    actually measured) so rounding never hides a breach of the ceiling.
+    Returns (chosen, chars_after).  ``ceiling_tokens`` is the CONVERSATION budget
+    (the cold-reload ceiling minus the measured harness), and comparison happens
+    in characters -- the unit actually measured -- so rounding never hides a
+    breach of the ceiling.
     """
     ceiling_chars = ceiling_tokens * chars_per_token
     remaining = chars_before
@@ -7682,7 +8230,7 @@ def choose_elisions(
     for candidate in drop_order(candidates, scores):
         if remaining <= ceiling_chars:
             break
-        saving = candidate.chars - stub_length_bound(candidate)
+        saving = candidate.chars - stub_length_bound(candidate, pointer_name, max_line)
         if saving <= 0:
             continue
         chosen.append(candidate)
@@ -7690,9 +8238,89 @@ def choose_elisions(
     return chosen, remaining
 
 
-def _stub_text(candidate: Candidate, text: str) -> str:
-    first = next((line.strip() for line in text.splitlines() if line.strip()), "")[:120]
-    return STUB_TEMPLATE.format(chars=len(text), key=candidate.key, first=first)
+def verify_pointers(path: Path, pointers: list[dict]) -> list[dict]:
+    """Re-read every pointer's line and confirm it names the record it claims.
+
+    A pointer is a promise about a line in a file on disk.  This walks the file
+    once, and for each promised line parses the record and checks the uuid (and
+    the block's original character count) against what the pointer asserts.  Any
+    discrepancy -- wrong line, moved record, unparseable line, missing line -- is
+    returned as a mismatch, and the caller refuses to ship the output.
+    """
+    wanted: dict[int, list[dict]] = {}
+    for pointer in pointers:
+        wanted.setdefault(int(pointer["line"]), []).append(pointer)
+    mismatches: list[dict] = []
+    seen: set[int] = set()
+    try:
+        with Path(path).open("r", encoding="utf-8", errors="replace") as handle:
+            for number, raw in enumerate(handle, start=1):
+                promised = wanted.get(number)
+                if not promised:
+                    continue
+                seen.add(number)
+                try:
+                    record = json.loads(raw)
+                except ValueError:
+                    mismatches.append({"line": number, "reason": "unparseable"})
+                    continue
+                if not isinstance(record, dict):
+                    mismatches.append({"line": number, "reason": "not-a-record"})
+                    continue
+                for pointer in promised:
+                    if not pointer.get("names_line", True):
+                        mismatches.append(
+                            {"line": number, "key": pointer.get("key"), "reason": "no-line-number"}
+                        )
+                        continue
+                    expected_uuid = pointer.get("uuid")
+                    if expected_uuid is not None and record.get("uuid") != expected_uuid:
+                        mismatches.append(
+                            {
+                                "line": number,
+                                "key": pointer.get("key"),
+                                "reason": "uuid-mismatch",
+                                "expected": expected_uuid,
+                                "found": record.get("uuid"),
+                            }
+                        )
+                        continue
+                    block_index = pointer.get("block_index")
+                    message = record.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if (
+                        not isinstance(content, list)
+                        or not isinstance(block_index, int)
+                        or block_index >= len(content)
+                        or not isinstance(content[block_index], dict)
+                    ):
+                        mismatches.append(
+                            {"line": number, "key": pointer.get("key"), "reason": "block-missing"}
+                        )
+                        continue
+                    found_chars = len(text_of_part(content[block_index]))
+                    if found_chars != int(pointer.get("chars", -1)):
+                        mismatches.append(
+                            {
+                                "line": number,
+                                "key": pointer.get("key"),
+                                "reason": "char-count-mismatch",
+                                "expected": int(pointer.get("chars", -1)),
+                                "found": found_chars,
+                            }
+                        )
+    except OSError:
+        mismatches.append({"line": None, "reason": "source-unreadable"})
+    for number in sorted(set(wanted) - seen):
+        for pointer in wanted[number]:
+            mismatches.append(
+                {"line": number, "key": pointer.get("key"), "reason": "line-missing"}
+            )
+    return mismatches
+
+
+def _stub_text(candidate: Candidate, text: str, line: int, name: str) -> str:
+    return pointer_text(len(text), line, name)
 
 
 # --------------------------------------------------------------------------
@@ -7711,11 +8339,23 @@ def compact(
     chars_per_token: float = DEFAULT_CHARS_PER_TOKEN,
     ranker: DeciderRanker | None = None,
     on_indexed=None,
+    harness: dict | None = None,
+    pointer_source: str | None = None,
 ) -> CompactResult:
-    """Compact a transcript COPY into ``out``; never mutates ``source``."""
+    """Compact a transcript COPY into ``out``; never mutates ``source``.
+
+    ``ceiling_tokens`` is the COLD-RELOAD ceiling (70_000 by default) and
+    ``harness`` is the measured baseline a resume pays before the conversation
+    (see ``resolve_harness``).  The conversation is therefore allowed only
+    ``ceiling - harness_tokens``; a total reload above the ceiling refuses.
+    """
     source = Path(source).expanduser()
     out = Path(out).expanduser()
     archive_dir = Path(archive_dir).expanduser()
+    harness_report = dict(harness or {})
+    harness_tokens = max(0, int(harness_report.get("harness_tokens") or 0))
+    conversation_budget_tokens = max(0, int(ceiling_tokens) - harness_tokens)
+    pointer_name = str(pointer_source) if pointer_source else str(source)
     report: dict = {
         "schema": "dotcortex.offline-compact.v1",
         "source": str(source),
@@ -7729,6 +8369,15 @@ def compact(
         ),
         "keep_recent_records": int(keep_recent_records),
         "stub_over_chars": int(stub_over_chars),
+        "pointer_source": pointer_name,
+        "harness_family": harness_report.get("harness_family"),
+        "harness_scope": harness_report.get("harness_scope"),
+        "harness_tokens": harness_tokens,
+        "harness_chars": int(harness_report.get("harness_chars") or 0),
+        "harness_index_tokens": int(harness_report.get("harness_index_tokens") or 0),
+        "harness_source": harness_report.get("harness_source", "unaccounted:no-harness-supplied"),
+        "harness_files": list(harness_report.get("harness_files") or []),
+        "conversation_budget_tokens": conversation_budget_tokens,
     }
 
     if source.is_symlink() or not source.is_file():
@@ -7739,7 +8388,8 @@ def compact(
         return CompactResult(False, "out-exists", report)
 
     try:
-        records = load_records(source)
+        rows = load_records_with_lines(source)
+        records = [record for _number, record in rows]
     except (OSError, ValueError) as error:
         report["error"] = type(error).__name__
         return CompactResult(False, "source-unreadable", report)
@@ -7786,7 +8436,13 @@ def compact(
     scores = outcome.scores if outcome.usable else {}
 
     chosen, _projected = choose_elisions(
-        candidates, chars_before, int(ceiling_tokens), float(chars_per_token), scores
+        candidates,
+        chars_before,
+        conversation_budget_tokens,
+        float(chars_per_token),
+        scores,
+        pointer_name=pointer_name,
+        max_line=len(rows) + 1,
     )
     chosen_keys = {candidate.key: candidate for candidate in chosen}
     report["selected_for_elision"] = len(chosen)
@@ -7799,9 +8455,10 @@ def compact(
         return CompactResult(False, "index-open-failed", report, index_path=index_dir)
 
     elided = 0
+    pointers: list[dict] = []
     try:
         with out.open("w", encoding="utf-8") as handle:
-            for position, record in enumerate(records):
+            for position, (line_number, record) in enumerate(rows):
                 message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
                 if isinstance(content, list):
@@ -7815,11 +8472,26 @@ def compact(
                         index.add(candidate.key, text)
                         if on_indexed is not None:
                             on_indexed(candidate.key, text)
-                        stub = _stub_text(candidate, text)
+                        stub = _stub_text(candidate, text, line_number, pointer_name)
                         content[block_index] = {
                             key: value for key, value in part.items() if key != "content"
                         }
                         content[block_index]["content"] = stub
+                        # The line the TEXT names, not the line we meant to name:
+                        # verification must judge what the agent will actually
+                        # read, so a stub that misstates its line is caught here.
+                        claimed_line = pointer_line(stub)
+                        pointers.append(
+                            {
+                                "line": line_number if claimed_line is None else claimed_line,
+                                "names_line": claimed_line is not None,
+                                "record_line": line_number,
+                                "uuid": candidate.uuid,
+                                "block_index": block_index,
+                                "chars": len(text),
+                                "key": candidate.key,
+                            }
+                        )
                         elided += 1
                 handle.write(json.dumps(record) + "\n")
                 handle.flush()
@@ -7852,9 +8524,27 @@ def compact(
         report["chain_error"] = str(error)
         chain_after = []
 
+    # Every pointer is a promise about a line on disk: re-read it and check the
+    # record it names.  A mismatch means the pointer lies, so nothing ships.
+    verification_path = source
+    verification_basis = "copy"
+    if pointer_source:
+        promised = Path(str(pointer_source)).expanduser()
+        try:
+            if promised.is_file() and not promised.is_symlink():
+                verification_path = promised
+                verification_basis = "pointer-source"
+        except OSError:
+            pass
+    pointer_mismatches = verify_pointers(verification_path, pointers) if pointers else []
+    mismatched_keys = {item.get("key") for item in pointer_mismatches}
+    pointers_verified = sum(1 for pointer in pointers if pointer.get("key") not in mismatched_keys)
+
+    total_reload_tokens = harness_tokens + tokens_after
     ceiling_met = (
-        tokens_after <= int(ceiling_tokens)
-        and chars_after <= int(ceiling_tokens) * float(chars_per_token)
+        total_reload_tokens <= int(ceiling_tokens)
+        and tokens_after <= conversation_budget_tokens
+        and chars_after <= conversation_budget_tokens * float(chars_per_token)
     )
     report.update(
         {
@@ -7862,12 +8552,18 @@ def compact(
             "kept_verbatim": len(candidates) - elided,
             "text_chars_after": chars_after,
             "est_tokens_after": tokens_after,
+            "total_reload_tokens": total_reload_tokens,
             "size_after_bytes": out.stat().st_size,
             "ceiling_met": ceiling_met,
-            "ceiling_headroom_tokens": int(ceiling_tokens) - tokens_after,
+            "ceiling_headroom_tokens": int(ceiling_tokens) - total_reload_tokens,
             "chain_length_after": len(chain_after),
             "human_words_changed": human_changed,
             "identity_preserved": identities_before == identities_after,
+            "pointer_stubs": elided,
+            "pointers_verified": pointers_verified,
+            "pointer_mismatch_count": len(pointer_mismatches),
+            "pointer_mismatches": pointer_mismatches[:10],
+            "pointer_verification_basis": verification_basis,
             "index_path": str(index_dir),
             "index_entries": elided,
         }
@@ -7885,6 +8581,14 @@ def compact(
         reason = "human-words-changed"
     elif len(chain_after) != len(chain_before) or chain_after != chain_before:
         reason = "chain-changed"
+    elif pointer_mismatches:
+        # A pointer that names the wrong line is worse than no compaction: the
+        # agent would be sent to text that is not its own.  Nothing ships.
+        reason = "pointer-mismatch"
+        try:
+            out.unlink()
+        except OSError:
+            pass
     elif not ceiling_met:
         reason = "ceiling-not-met"
     elif elided == 0:
@@ -7968,6 +8672,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 import sqlite3
 import stat
 import sys
@@ -8113,6 +8818,19 @@ class Harness:
         obj.preservation_state = None
         obj.preservation_request_id = None
         obj.cache_ttl_seconds = 3600
+        # The idle window this fixture used to reach the pass by size alone is
+        # now the cold-boundary trigger's input: 100s idle against a 60s
+        # compact-before window is a COLD cache, so the mechanics tests keep
+        # testing the pass rather than the trigger.  The trigger tests set their
+        # own values.
+        obj.cache_idle_seconds = 60
+        # A precomputed harness keeps these tests independent of this host's
+        # instruction files; the harness tests supply their own numbers.
+        obj.harness_baseline_cache = {
+            "harness_tokens": 0,
+            "harness_source": "test-fixture",
+            "harness_files": [],
+        }
         obj.watched_servers = ()
         obj.development_channel_opt_ins = ()
         obj.timer_generation = 0
@@ -8464,10 +9182,18 @@ class OfflineCompactModeTests(unittest.TestCase):
             kept = compacted[0]["message"]["content"][0]["content"]
             self.assertEqual(len(kept), len(rows[0]["message"]["content"][0]["content"]))
             elided = compacted[1]["message"]["content"][0]["content"]
-            self.assertIn("tool output elided", elided)
+            # R-0032 restated this pin: an elided block is a POINTER into the
+            # retained transcript (path, line, char count), not a bare stub.
+            self.assertIn("elided", elided)
+            self.assertIn("line 2 of", elided)
+            self.assertIn(str(source), elided)
+            self.assertIn("{:,}".format(len(rows[1]["message"]["content"][0]["content"])), elided)
             self.assertLess(len(elided), 400)
             self.assertGreater(report["elided_blocks"], 1)
             self.assertGreaterEqual(report["kept_verbatim"], 1)
+            self.assertEqual(report["pointer_stubs"], report["elided_blocks"])
+            self.assertEqual(report["pointers_verified"], report["pointer_stubs"])
+            self.assertEqual(report["pointer_mismatch_count"], 0)
 
     def test_ceiling_that_cannot_be_met_refuses_to_ship(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8574,8 +9300,11 @@ class OfflineCompactModeTests(unittest.TestCase):
                 self.assertEqual(rows[0][0], len(text))
                 self.assertIn(key, hits, "the archived body must already be searchable")
                 written = out.read_text() if out.exists() else ""
+                # R-0032: the replacement is a pointer, so the absence to prove is
+                # that no pointer for THIS record has been written yet.
+                promised = "at line %d of" % (int(key[1:].split("-")[0]) + 1)
                 self.assertNotIn(
-                    "archived as %s" % key, written, "no stub may be written before its index row"
+                    promised, written, "no pointer may be written before its index row"
                 )
 
             result = self.module.compact(
@@ -8781,6 +9510,451 @@ class OfflineCompactModeTests(unittest.TestCase):
             self.assertEqual(
                 [row["uuid"] for row in landed_rows], [row["uuid"] for row in rows]
             )
+
+
+    # -- 9. R-0032: the COLD BOUNDARY is the trigger, not the token count -----
+
+    def test_due_rule_reads_the_cache_not_the_transcript_size(self):
+        due = self.warm.offline_compact_due
+        self.assertEqual(
+            due(status="idle", idle_age=10, cache_idle_seconds=3300, usage_limited=False),
+            (False, "cache-warm"),
+        )
+        self.assertEqual(
+            due(status="idle", idle_age=4000, cache_idle_seconds=3300, usage_limited=False),
+            (True, "cache-cold"),
+        )
+        self.assertEqual(
+            due(status="active", idle_age=4000, cache_idle_seconds=3300, usage_limited=False),
+            (False, "seat-active"),
+        )
+        self.assertEqual(
+            due(status="idle", idle_age=1, cache_idle_seconds=3300, usage_limited=True),
+            (True, "usage-limited"),
+        )
+        self.assertEqual(
+            due(status="active", idle_age=None, cache_idle_seconds=None, usage_limited=True),
+            (False, "seat-active"),
+        )
+        self.assertEqual(
+            due(status="idle", idle_age=None, cache_idle_seconds=None, usage_limited=False),
+            (True, "cache-unmeasured"),
+        )
+
+    def test_warm_cache_and_idle_seat_do_not_run_the_pass(self):
+        """A 900K-token session at a warm cache is the NORMAL state: do nothing."""
+        harness = self.harness(mode="deterministic", tokens=900_000)
+        obj = harness.obj
+        obj.cache_idle_seconds = 3300  # 55 minutes of cache left
+        obj.last_normal_stop = time.time() - 120  # two minutes idle: WARM
+
+        self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+
+        self.assertEqual(read_written(harness.read_fd), b"")
+        self.assertEqual(harness.installed_sessions(), [])
+        self.assertEqual(harness.stops, 0)
+        self.assertEqual(obj.launches, [])
+        trigger = obj.guard.find("offline-compact:trigger")[-1]
+        self.assertFalse(trigger["due"])
+        self.assertEqual(trigger["trigger"], "cache-warm")
+        not_due = obj.guard.find("offline-compact:not-due")
+        self.assertTrue(not_due, obj.guard.events)
+        self.assertEqual(not_due[-1]["reason"], "cache-warm")
+        # correct behaviour, never a failure and never a gate refusal
+        self.assertNotIn("offline-compact:failed", obj.guard.names())
+        self.assertNotIn("offline-compact:refused", obj.guard.names())
+        self.assertNotIn("injection-attempted", obj.guard.names())
+
+    def test_active_seat_never_compacts_however_cold_the_cache_is(self):
+        harness = self.harness(mode="deterministic", tokens=900_000)
+        obj = harness.obj
+        obj.status = "active"
+        obj.cache_idle_seconds = 1  # unequivocally cold
+        obj.last_normal_stop = time.time() - 100_000
+
+        self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+
+        self.assertEqual(read_written(harness.read_fd), b"")
+        self.assertEqual(harness.installed_sessions(), [])
+        refused = obj.guard.find("offline-compact:refused")
+        self.assertTrue(refused, obj.guard.events)
+        self.assertEqual(refused[-1]["reason"], "session-active")
+
+    def test_cold_cache_and_idle_seat_run_the_pass(self):
+        harness = self.harness(mode="deterministic", tokens=300_000)
+        obj = harness.obj
+        obj.cache_idle_seconds = 60
+        obj.last_normal_stop = time.time() - 300  # past the boundary
+
+        self.assertTrue(obj.attempt(command="/compact", purpose="compact"))
+
+        trigger = obj.guard.find("offline-compact:trigger")[-1]
+        self.assertTrue(trigger["due"])
+        self.assertEqual(trigger["trigger"], "cache-cold")
+        self.assertEqual(len(harness.installed_sessions()), 1)
+
+    def test_usage_limited_runs_the_pass_even_on_a_warm_cache(self):
+        harness = self.harness(
+            mode="deterministic", tokens=300_000, usage_limit_until=time.time() + 600
+        )
+        obj = harness.obj
+        obj.cache_idle_seconds = 3300
+        obj.last_normal_stop = time.time() - 30  # WARM: the paid path is blocked
+
+        self.assertTrue(obj.attempt(command="/compact", purpose="compact"))
+
+        trigger = obj.guard.find("offline-compact:trigger")[-1]
+        self.assertEqual(trigger["trigger"], "usage-limited")
+        self.assertTrue(trigger["due"])
+        self.assertEqual(len(harness.installed_sessions()), 1)
+
+    def test_tiny_session_under_the_floor_never_runs_the_pass(self):
+        harness = self.harness(
+            mode="deterministic", tokens=1_000, usage_limit_until=time.time() + 600
+        )
+        obj = harness.obj
+        obj.cache_idle_seconds = 1
+        obj.last_normal_stop = time.time() - 3_600
+
+        self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+
+        self.assertEqual(harness.installed_sessions(), [])
+        self.assertEqual(read_written(harness.read_fd), b"")
+        refused = obj.guard.find("offline-compact:refused")
+        self.assertTrue(refused, obj.guard.events)
+        self.assertEqual(refused[-1]["reason"], "below-token-threshold")
+        # the floor is a floor: the trigger was never consulted
+        self.assertEqual(obj.guard.find("offline-compact:trigger"), [])
+
+    # -- 10. R-0032: an elided block becomes a LINE-NUMBER POINTER ------------
+
+    def test_pointer_stub_names_the_source_line_and_char_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "90035468-c967-4a1b-8a2e-0123456789ab.jsonl"
+            rows = build_transcript(source, big=4, tail=1, tool_chars=90_000)
+            out = root / "out.jsonl"
+            result = self.module.compact(
+                source, out, root / "archive", keep_recent_records=1, ceiling_tokens=10_000
+            )
+            self.assertTrue(result.ok, result.reason)
+            compacted = [
+                json.loads(line) for line in out.read_text().splitlines() if line.strip()
+            ]
+            pointers = 0
+            for index, record in enumerate(compacted):
+                part = record["message"]["content"][0]
+                if "elided" not in str(part.get("content")):
+                    continue
+                pointers += 1
+                original = rows[index]["message"]["content"][0]["content"]
+                self.assertEqual(
+                    part["content"],
+                    self.module.pointer_text(len(original), index + 1, str(source)),
+                )
+                self.assertIn(str(source), part["content"])
+                self.assertIn("line %d of" % (index + 1), part["content"])
+                self.assertIn("{:,} chars".format(len(original)), part["content"])
+                self.assertLess(len(part["content"]), 400)
+            self.assertGreater(pointers, 0)
+            self.assertEqual(pointers, result.report["pointer_stubs"])
+
+    def test_every_pointer_resolves_to_the_record_it_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            build_transcript(source, big=5, tail=1, tool_chars=90_000)
+            result = self.module.compact(
+                source,
+                root / "out.jsonl",
+                root / "archive",
+                keep_recent_records=1,
+                ceiling_tokens=10_000,
+            )
+            self.assertTrue(result.ok, result.reason)
+            self.assertEqual(result.report["pointer_stubs"], result.report["elided_blocks"])
+            self.assertEqual(
+                result.report["pointers_verified"], result.report["pointer_stubs"]
+            )
+            self.assertEqual(result.report["pointer_mismatch_count"], 0)
+            self.assertEqual(result.report["pointer_verification_basis"], "copy")
+
+            # Independent re-check against the source file itself.
+            lines = source.read_text().splitlines()
+            compacted = [
+                json.loads(line)
+                for line in Path(result.report["out"]).read_text().splitlines()
+                if line.strip()
+            ]
+            checked = 0
+            for index, record in enumerate(compacted):
+                part = record["message"]["content"][0]
+                if "elided" not in str(part.get("content")):
+                    continue
+                match = re.search(r"at line (\d+) of", part["content"])
+                self.assertIsNotNone(match)
+                line_number = int(match.group(1))
+                self.assertEqual(line_number, index + 1)
+                named = json.loads(lines[line_number - 1])
+                self.assertEqual(named["uuid"], record["uuid"])
+                checked += 1
+            self.assertGreater(checked, 0)
+            self.assertEqual(checked, result.report["pointer_stubs"])
+
+    def test_a_pointer_that_names_the_wrong_line_refuses_and_installs_nothing(self):
+        harness = self.harness(mode="deterministic", usage_limit_until=time.time() + 600)
+        obj = harness.obj
+        real = self.module.pointer_text
+        self.module.pointer_text = lambda chars, line, name: real(chars, line + 1, name)
+        try:
+            self.assertFalse(obj.attempt(command="/compact", purpose="compact"))
+        finally:
+            self.module.pointer_text = real
+
+        self.assertEqual(read_written(harness.read_fd), b"")
+        self.assertEqual(harness.installed_sessions(), [])
+        self.assertEqual(obj.session_id, SESSION)
+        self.assertEqual(harness.stops, 0)
+        self.assertEqual(obj.launches, [])
+        self.assertEqual(
+            list(Path(obj.offline_compact_root).glob("*/*/compacted.jsonl")), [],
+            "a refused output must not be left behind",
+        )
+        failures = obj.guard.find("offline-compact:failed")
+        self.assertTrue(failures, obj.guard.events)
+        self.assertEqual(failures[-1]["reason"], "pointer-mismatch")
+        compacted = obj.guard.find("offline-compact:compacted")[-1]
+        self.assertGreater(compacted["pointer_mismatch_count"], 0)
+        self.assertEqual(compacted["pointers_verified"], 0)
+
+    # -- 11. the ceiling is a cold RELOAD total: harness + conversation --------
+
+    def test_harness_resolver_counts_one_global_and_exactly_one_scope_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "CLAUDE.md").write_text("g" * 4_000)
+            (home / "HelmCortex").mkdir()
+            (home / "HelmCortex" / "CLAUDE.md").write_text("s" * 40_000)
+            # Present on disk, and must NOT be summed in for the Claude family.
+            (home / "HelmCortex" / "AGENTS.md").write_text("a" * 60_000)
+
+            baseline = self.module.resolve_harness("claude", "helmcortex", home=home)
+            self.assertEqual(baseline.source, "measured")
+            self.assertEqual([item["role"] for item in baseline.files], ["global", "scope"])
+            self.assertTrue(baseline.files[0]["path"].endswith(".claude/CLAUDE.md"))
+            self.assertTrue(baseline.files[1]["path"].endswith("HelmCortex/CLAUDE.md"))
+            self.assertEqual(baseline.chars, 44_000)
+            self.assertEqual(baseline.tokens, 11_000)
+
+            codex = self.module.resolve_harness("codex", "helmcortex", home=home)
+            self.assertEqual([item["role"] for item in codex.files], ["global", "scope"])
+            self.assertTrue(codex.files[1]["path"].endswith("HelmCortex/AGENTS.md"))
+            self.assertEqual(codex.chars, 64_000)
+            self.assertEqual(codex.tokens, 16_000)
+
+    def test_harness_resolver_refuses_two_scope_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "CLAUDE.md").write_text("g" * 400)
+            helm = home / "HelmCortex"
+            dot = home / "DotCortex"
+            helm.mkdir()
+            dot.mkdir()
+            (helm / "CLAUDE.md").write_text("h" * 400)
+            (dot / "CLAUDE.md").write_text("d" * 400)
+
+            with self.assertRaises(self.module.HarnessScopeError):
+                self.module.resolve_harness(
+                    "claude",
+                    "helmcortex",
+                    home=home,
+                    scope_files=[helm / "CLAUDE.md", dot / "CLAUDE.md"],
+                )
+            with self.assertRaises(self.module.HarnessScopeError):
+                self.module.resolve_harness("claude", "helmcortex", home=home, scope_files=[])
+            # HelmCortex and DotCortex are never summed for one seat either.
+            single = self.module.resolve_harness(
+                "claude", "dotcortex", home=home, scope_files=[dot / "CLAUDE.md"]
+            )
+            self.assertEqual(single.chars, 800)
+            self.assertEqual(len(single.files), 2)
+
+    def test_hermes_harness_is_excluded_not_modelled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / "HelmCortex").mkdir()
+            (home / "HelmCortex" / "CLAUDE.md").write_text("x" * 400_000)
+            baseline = self.module.resolve_harness("hermes", "helmcortex", home=home)
+            self.assertEqual(baseline.tokens, 0)
+            self.assertEqual(baseline.source, "excluded:hermes")
+            self.assertEqual(baseline.files, [])
+
+    def test_harness_falls_back_to_a_documented_estimate_and_says_so(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)  # no instruction files at all
+            baseline = self.module.resolve_harness("claude", "helmcortex", home=home)
+            self.assertEqual(baseline.source, "estimate:measurement-failed")
+            self.assertEqual(baseline.tokens, self.module.DEFAULT_HARNESS_ESTIMATE_TOKENS)
+            self.assertEqual(baseline.files, [])
+
+    def test_harness_measurement_is_cached_per_seat_and_re_measured_on_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            (home / ".claude").mkdir()
+            (home / ".claude" / "CLAUDE.md").write_text("g" * 4_000)
+            (home / "DotCortex").mkdir()
+            scope = home / "DotCortex" / "CLAUDE.md"
+            scope.write_text("s" * 8_000)
+            cache = home / "state" / "harness-baseline.json"
+
+            first = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-a"
+            )
+            self.assertEqual((first.source, first.tokens), ("measured", 3_000))
+            self.assertTrue(cache.is_file())
+
+            cached = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-a"
+            )
+            self.assertEqual((cached.source, cached.tokens), ("cache", 3_000))
+
+            other_seat = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-b"
+            )
+            self.assertEqual(other_seat.source, "measured")
+
+            scope.write_text("s" * 12_000)  # the instruction file changed
+            revised = self.module.measure_harness(
+                "claude", "dotcortex", home=home, cache_path=cache, seat="seat-a"
+            )
+            self.assertEqual((revised.source, revised.tokens), ("measured", 4_000))
+
+            override = self.module.measure_harness(
+                "claude",
+                "dotcortex",
+                home=home,
+                cache_path=cache,
+                seat="seat-a",
+                override_tokens=12_345,
+            )
+            self.assertEqual((override.source, override.tokens), ("override", 12_345))
+
+    def test_harness_that_pushes_the_total_over_the_ceiling_refuses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.jsonl"
+            # 10 text records x 22_000 chars = 55K conversation tokens: inside the
+            # 70K ceiling on its own, outside a 50K conversation budget.
+            rows = []
+            previous = None
+            for index in range(10):
+                uid = str(uuid.uuid4())
+                rows.append(
+                    {
+                        "type": "user",
+                        "uuid": uid,
+                        "parentUuid": previous,
+                        "sessionId": SESSION,
+                        "timestamp": "2026-11-18T09:%02d:00Z" % index,
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "note %d " % index + "y" * 22_000}
+                            ],
+                        },
+                    }
+                )
+                previous = uid
+            source.write_text(
+                "\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8"
+            )
+
+            alone = self.module.compact(
+                source, root / "alone.jsonl", root / "archive-alone", keep_recent_records=0
+            )
+            self.assertEqual(alone.reason, "no-elision-needed")
+            self.assertTrue(alone.report["ceiling_met"])
+            self.assertEqual(alone.report["harness_tokens"], 0)
+            self.assertEqual(alone.report["conversation_budget_tokens"], 70_000)
+            self.assertEqual(
+                alone.report["total_reload_tokens"], alone.report["est_tokens_after"]
+            )
+
+            harness = {
+                "harness_family": "claude",
+                "harness_scope": "helmcortex",
+                "harness_tokens": 20_000,
+                "harness_source": "test",
+                "harness_files": [],
+            }
+            pushed = self.module.compact(
+                source,
+                root / "pushed.jsonl",
+                root / "archive-pushed",
+                keep_recent_records=0,
+                harness=harness,
+            )
+            self.assertFalse(pushed.ok)
+            self.assertEqual(pushed.reason, "ceiling-not-met")
+            self.assertIsNone(pushed.out_path)
+            self.assertEqual(pushed.report["harness_tokens"], 20_000)
+            self.assertEqual(pushed.report["conversation_budget_tokens"], 50_000)
+            self.assertGreater(pushed.report["total_reload_tokens"], 70_000)
+            self.assertFalse(pushed.report["ceiling_met"])
+
+            printed = json.loads(
+                (root / "archive-pushed" / "compaction-report.json").read_text()
+            )
+            for key in ("harness_tokens", "conversation_budget_tokens", "total_reload_tokens"):
+                self.assertIn(key, printed)
+            self.assertEqual(
+                printed["total_reload_tokens"],
+                printed["harness_tokens"] + printed["est_tokens_after"],
+            )
+
+    def test_supervisor_reports_harness_budget_and_pointer_basis(self):
+        harness = self.harness(mode="deterministic", usage_limit_until=time.time() + 600)
+        obj = harness.obj
+        obj.harness_baseline_cache = {
+            "harness_family": "claude",
+            "harness_scope": "helmcortex",
+            "harness_tokens": 16_000,
+            "harness_source": "measured",
+            "harness_files": [
+                {"role": "global", "path": "/home/x/.claude/CLAUDE.md", "chars": 15_555},
+                {"role": "scope", "path": "/home/x/HelmCortex/CLAUDE.md", "chars": 48_930},
+            ],
+        }
+
+        self.assertTrue(obj.attempt(command="/compact", purpose="compact"))
+
+        compacted = obj.guard.find("offline-compact:compacted")[-1]
+        self.assertEqual(compacted["harness_tokens"], 16_000)
+        self.assertEqual(compacted["harness_source"], "measured")
+        self.assertEqual(compacted["conversation_budget_tokens"], 54_000)
+        self.assertLessEqual(compacted["total_reload_tokens"], 70_000)
+        self.assertGreaterEqual(compacted["pointer_stubs"], 1)
+        self.assertEqual(compacted["pointers_verified"], compacted["pointer_stubs"])
+        self.assertEqual(compacted["pointer_mismatch_count"], 0)
+
+        report = json.loads(
+            next(
+                iter(Path(obj.offline_compact_root).glob("*/*/archive/compaction-report.json"))
+            ).read_text()
+        )
+        self.assertEqual(report["harness_tokens"], 16_000)
+        self.assertEqual(report["conversation_budget_tokens"], 54_000)
+        self.assertEqual(
+            report["total_reload_tokens"], 16_000 + report["est_tokens_after"]
+        )
+        self.assertLessEqual(report["total_reload_tokens"], 70_000)
+        self.assertEqual(report["pointer_verification_basis"], "pointer-source")
+        self.assertEqual(
+            [item["role"] for item in report["harness_files"]], ["global", "scope"]
+        )
+        self.assertEqual(obj.current_tokens, report["total_reload_tokens"])
 
 
 class StubRanker:
