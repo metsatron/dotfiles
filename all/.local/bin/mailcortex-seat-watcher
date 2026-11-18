@@ -267,8 +267,18 @@ class ClaudeLocalAdapter:
         value = self._request(record, "status")
         if value["status"] == "busy":
             return None
-        if value["status"] != "idle" or not claude_wake().valid_owner(value.get("owner")):
-            raise WatcherError("Claude local conditional idle authority unavailable")
+        if value["status"] != "idle":
+            # A live supervisor answering unavailable/invalid/unknown is transient:
+            # its owner record was taken between our status read and now, or it is
+            # mid-transition. Raising counted as a hard failure, fed the seat
+            # failure marks and burned the receipt's attempt budget until the mail
+            # was retired as `observed` — the 18 Nov wedge, where Fable's mail died
+            # as "conditional idle authority unavailable" while the seat was merely
+            # busy. Defer instead: the next scan re-reads the owner and the mail
+            # keeps its place in the queue.
+            return None
+        if not claude_wake().valid_owner(value.get("owner")):
+            return None
         return value["owner"]
 
     def deliver(self, record: dict, owner: dict, prompt: str) -> None:
@@ -1567,6 +1577,10 @@ def reconcile_replies(seat: str, record: dict, adapter: object, now: float) -> b
 STALLED_WAKE_REASONS = frozenset({"busy", "rate_limited", "transport_unavailable"})
 REQUEUE_MAX_AGE_SECONDS = 12 * 60 * 60
 REQUEUE_MAX_ATTEMPTS = 8
+# Transient refusals never retire a mail; they cool off and return with a fresh budget.
+TRANSIENT_DEFER_REASONS = {"busy", "rate_limited", "reply_pending", "transport_unavailable",
+                           "observe_deadline"}
+DEFERRED_RETRY_SECONDS = 15 * 60
 
 # A wake recorded as delivered is only evidence that a prompt entered the pane. When the
 # turn it entered dies - a provider 529, a crash, a supervisor restart - the prompt goes
@@ -1648,11 +1662,26 @@ def requeue_with_attempts(seat: str, mid: str, reason: str, old: dict | None, no
     zero, and requeue_stalled's REQUEUE_MAX_ATTEMPTS cap can never be reached: the seat
     is woken with the same mail forever. Carry the count and retire the receipt once the
     budget is spent.
+
+    Retiring is only for reasons that will not clear on their own. A transient refusal —
+    the seat is busy, the transport is briefly unavailable, the supervisor answered
+    unavailable mid-transition — must never consume the mail: the 18 Nov wedge retired
+    every one of Fable's mails as `observed` because a busy seat spent the attempt budget
+    and the scanner never re-offers a terminal receipt. Transient reasons therefore cool
+    off for DEFERRED_RETRY_SECONDS and come back with a fresh budget instead.
     """
     attempts = (old or {}).get("wake_attempts")
     attempts = attempts if isinstance(attempts, int) else 0
     attempts += 1
     if attempts > REQUEUE_MAX_ATTEMPTS:
+        if reason in TRANSIENT_DEFER_REASONS:
+            cycles = (old or {}).get("defer_cycles")
+            cycles = (cycles if isinstance(cycles, int) else 0) + 1
+            MAILCORTEX.write_wake_receipt(
+                seat, mid, "queued", reason=f"{reason}_deferred",
+                wake_attempts=0, defer_cycles=cycles,
+                wake_defer_until=now + DEFERRED_RETRY_SECONDS, wake_updated_at=now)
+            return 0
         # "observed" is the schema's terminal state: the scanner never re-offers it and
         # requeue_stalled only moves wakes still marked queued, so a spent receipt stays
         # spent. (There is no "abandoned" state - writing one raises unknown wake state.)
@@ -1710,6 +1739,14 @@ def scan_seats(registry: dict, adapter: object, now: float | None = None) -> int
             # A handling disposition is independent of the last wake attempt.
             # Reconciled queued/manual mail must not reenter transport admission.
             if old and old.get("handling_state") in {"handling_completed", "handling_rejected"}:
+                continue
+            # A deferred transient refusal is a cool-off, not a verdict: skip the mail
+            # until its window closes, then offer it again with a fresh budget.
+            try:
+                defer_until = float((old or {}).get("wake_defer_until") or 0)
+            except (TypeError, ValueError):
+                defer_until = 0.0
+            if defer_until > now:
                 continue
             if record["transport"] == "agent-peer-native":
                 if old and (old["wake_state"] in {"injecting", "injected", "delivery_unknown"}
