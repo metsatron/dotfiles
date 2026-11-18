@@ -1239,6 +1239,34 @@ class WatcherTests(unittest.TestCase):
         self.registry["seats"]["builder"]["parked"] = True
         self.assertEqual(self.watcher.check_stale_lanes(self.registry, now + 400, notify), [])
 
+    def refused_in_new(self, *, age_seconds, wake, reason):
+        """Mail still in new/ whose wakes the seat keeps refusing."""
+        mid = "<refused-1@test-host.helm>"
+        self.mail(mid, "refused-1")
+        now = 1_800_000_000
+        path = self.mailbox / "new" / "refused-1"
+        os.utime(path, (now - age_seconds, now - age_seconds))
+        self.watcher.MAILCORTEX.write_wake_receipt("builder", mid, wake, reason=reason,
+                                                   wake_attempts=9, wake_updated_at=now - 5)
+        return now
+
+    def test_stale_lane_counts_refused_mail_in_new_after_thirty_minutes(self):
+        # 2026-11-18: five mails to Fable sat in new/ refused as busy for an hour
+        # while a failed compaction held the seat; only the six-hour bound applied.
+        for wake, reason in (("queued", "busy"), ("observed", "busy_attempts_exhausted")):
+            now = self.refused_in_new(age_seconds=45 * 60, wake=wake, reason=reason)
+            sent = []
+            self.assertEqual(self.watcher.check_stale_lanes(self.registry, now, lambda e: sent.append(e) or True),
+                             ["builder"], reason)
+            self.assertEqual(sent[0]["kind"], "mail_lane_stale")
+            (self.runtime / "stale-lanes.json").unlink(missing_ok=True)
+            for item in (self.mailbox / "new").iterdir():
+                item.unlink()
+
+    def test_stale_lane_ignores_mail_refused_only_minutes_ago(self):
+        now = self.refused_in_new(age_seconds=10 * 60, wake="queued", reason="busy")
+        self.assertEqual(self.watcher.check_stale_lanes(self.registry, now, lambda event: True), [])
+
     def parked_in_cur(self, *, age_seconds, wake="queued", handling=None):
         """Mail the transport refused and requeue_stalled left in cur/, where the scan cannot see it."""
         mid = "<parked-1@test-host.helm>"
