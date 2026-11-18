@@ -276,6 +276,15 @@ class Shared(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertIn("{man,org,md}", r.stdout)
 
+    def test_man_page_heading_id_becomes_the_chunk_anchor(self):
+        # mandoc output: id on the heading, none on the section.
+        html = ('<section class="Sh"><h1 class="Sh" id="SYNOPSIS"><a href="#SYNOPSIS">SYNOPSIS</a></h1>'
+                '<p>chmod OPTION</p></section>'
+                '<section class="Sh" id="own"><h1 class="Sh" id="ignored">OWN</h1><p>x</p></section>')
+        got = {h: a for a, h, _ in corpus.chunk_html(html)}
+        self.assertEqual(got["SYNOPSIS"], "SYNOPSIS")
+        self.assertEqual(got["OWN"], "own", "a section id outranks the heading id")
+
     def test_sectionize_flat_nests_by_level(self):
         body = "<h1>A</h1><p>a</p><h2>B</h2><p>b</p><h2>C</h2><p>c</p><h1>D</h1><p>d</p>"
         html = gen.sectionize_flat(body, "T")
