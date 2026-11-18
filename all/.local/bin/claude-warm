@@ -145,6 +145,20 @@ TRANSCRIPT_INTERNAL_TYPES = frozenset(
     }
 )
 COMPACTION_FAILURE_MARKER = "not enough messages"
+# Claude prints "Not compacted · <reason>" when a session.compact hook skips
+# the compaction; the decider-summary mod does this whenever the local model
+# cannot produce a summary.  No PostCompact and no Stop follow, so a governor
+# that misses this line holds the seat `active' for COMPACT_TIMEOUT_SECONDS
+# and every MailCortex wake in that window is refused as busy (2026-11-18,
+# Fable: three failed decider compactions from 14:09 to 15:04, five mails
+# refused until their wake attempts ran out).
+COMPACTION_SKIP_MARKER = "not compacted"
+# Consecutive failed decider compactions back off: 30 min, 1 h, 2 h ... 6 h.
+DECIDER_COMPACT_BACKOFF_SECONDS = 30 * 60
+DECIDER_COMPACT_BACKOFF_MAX_SECONDS = 6 * 60 * 60
+# A rejection line is appended after the injection; its embedded timestamp
+# can trail the governor's own clock by the PTY write, so allow this slack.
+COMPACTION_MARKER_SLACK_SECONDS = 5.0
 USAGE_LIMIT_RE = re.compile(
     r"hit your [\w -]*limit\b.*?resets\s+(?:([A-Za-z]{3,9})\s+(\d{1,2}),\s*)?"
     r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)\s*(?:\(([\w/+-]+)\))?",
@@ -2464,6 +2478,10 @@ class Supervisor:
         self.compacting = False
         self.compaction_requested_at: float | None = None
         self.compaction_ignore_next_stop = False
+        self.compaction_behind_turn = False
+        self.compaction_purpose: str | None = None
+        self.decider_compact_failures = 0
+        self.decider_compact_hold_until: float | None = None
         self.rearm_count = 0
         self.last_rearm_reason: str | None = None
         self.current_tokens: int | None = None
@@ -2946,6 +2964,8 @@ class Supervisor:
         delay = float(COMPACT_RETRY_SECONDS)
         if anchor is not None:
             delay = max(delay, anchor + self.cache_idle_seconds - now())
+        if self.decider_compact_hold_until and self._decider_summary_ready():
+            delay = max(delay, self.decider_compact_hold_until - now())
         self.timer_generation += 1
         self.timer_deadline = now() + delay
         self.timer_kind = "compact"
@@ -3208,6 +3228,7 @@ class Supervisor:
             f"compaction-failed channel={short_id(self.channel)} reason={reason}"
         )
         self._guard_log("compaction-failed", reason=reason)
+        self._release_after_failed_compaction(reason)
         if self.preservation_state == "native_started":
             self.preservation_state = "pending_recovery"
             self.preservation_failure = reason
@@ -3217,8 +3238,38 @@ class Supervisor:
             )
         self._write_state()
 
+    def _release_after_failed_compaction(self, reason: str) -> None:
+        """Give the seat back and back off after a compaction that did not happen.
+
+        attempt() marks the seat `active' when it injects /compact, and only
+        PostCompact or a Stop marks it idle again.  A skipped or lost
+        compaction produces neither, so the seat stayed `active' and
+        MailCortex refused every wake as busy (2026-11-18).  When the command
+        was not queued behind a live turn, nothing is running: say so.  A
+        failed decider compaction also backs off, doubling each time, so a
+        local model that cannot summarize does not retake the seat every
+        twenty minutes."""
+        if not self.compaction_behind_turn and self.status == "active":
+            self.status = "idle"
+            self._guard_log("compaction-released-seat", reason=reason)
+        self.compaction_behind_turn = False
+        if self.compaction_purpose == "decider-compact":
+            self.decider_compact_failures += 1
+            hold = min(
+                DECIDER_COMPACT_BACKOFF_MAX_SECONDS,
+                DECIDER_COMPACT_BACKOFF_SECONDS * 2 ** (self.decider_compact_failures - 1),
+            )
+            self.decider_compact_hold_until = now() + hold
+            self._guard_log(
+                "decider-compact-backoff",
+                failures=self.decider_compact_failures,
+                hold_seconds=int(hold),
+                reason=reason,
+            )
+        self.compaction_purpose = None
+
     def _is_failed_compaction_entry(self, entry: dict) -> bool:
-        """Recognize only Claude's observed fixed marker for rejected /compact."""
+        """Recognize Claude's fixed markers for a rejected or skipped /compact."""
         if not self.compacting:
             return False
         if entry.get("type") != "system" or entry.get("subtype") != "local_command":
@@ -3227,13 +3278,17 @@ class Supervisor:
         if not isinstance(content, str):
             return False
         lowered = content.lower()
-        if COMPACTION_FAILURE_MARKER not in lowered and not is_usage_limit_text(content):
+        if (
+            COMPACTION_FAILURE_MARKER not in lowered
+            and COMPACTION_SKIP_MARKER not in lowered
+            and not is_usage_limit_text(content)
+        ):
             return False
         entry_timestamp = transcript_entry_timestamp(entry)
         return not (
             self.compaction_requested_at
             and entry_timestamp is not None
-            and entry_timestamp <= self.compaction_requested_at
+            and entry_timestamp < self.compaction_requested_at - COMPACTION_MARKER_SLACK_SECONDS
         )
 
     def _abort_recovery(self, reason: str) -> None:
@@ -3838,6 +3893,12 @@ class Supervisor:
                 return "usage-limited"
             if purpose == "decider-compact" and not self._decider_summary_ready():
                 return "decider-mod-not-ready"
+            if (
+                purpose == "decider-compact"
+                and self.decider_compact_hold_until
+                and now() < self.decider_compact_hold_until
+            ):
+                return "decider-compact-backoff"
             if self.recovery_pending:
                 return "channel-recovery-pending"
             if (
@@ -4032,6 +4093,8 @@ class Supervisor:
         if purpose in {"compact", "decider-compact"}:
             self.compacting = True
             self.compaction_requested_at = now()
+            self.compaction_behind_turn = queued_behind_turn
+            self.compaction_purpose = purpose
             self.compaction_ignore_next_stop = False
             self.last_cancellation_reason = "compaction-requested"
         elif purpose == "recovery":
@@ -4258,6 +4321,10 @@ class Supervisor:
             self.status = "active"
             self.last_lifecycle_activity = current
             self.compaction_ignore_next_stop = False
+            if self.compacting:
+                # A real turn is now running; a failed compaction must not
+                # mark this seat idle under it.
+                self.compaction_behind_turn = True
             if self.recovery_ignore_next_stop:
                 self._guard_log("recovery-command-prompt-submit")
             elif self.recovery_awaiting and self.recovery_command_inflight:
@@ -4273,6 +4340,10 @@ class Supervisor:
             self.compacting = False
             self.compaction_requested_at = None
             self.compaction_ignore_next_stop = False
+            self.compaction_behind_turn = False
+            self.compaction_purpose = None
+            self.decider_compact_failures = 0
+            self.decider_compact_hold_until = None
             self.current_tokens = None
             self._load_latest_compaction_baseline(require_recent=True)
             self.status_timestamp = None
@@ -4869,7 +4940,9 @@ class Supervisor:
                         )
                     self._debug(f"compaction-timeout channel={short_id(self.channel)}")
                     self._guard_log("compaction-failed", reason="timeout")
+                    self._release_after_failed_compaction("timeout")
                     self.rearm("compaction-timeout")
+                    self._write_state()
                 if self.timer_deadline is not None and now() >= self.timer_deadline:
                     generation = self.timer_generation
                     kind = self.timer_kind
