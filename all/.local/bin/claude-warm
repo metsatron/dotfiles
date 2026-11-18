@@ -482,6 +482,59 @@ def measured_cache_window(model: str | None, profile: str) -> tuple[int, int, di
     except (OSError, TypeError, ValueError, KeyError, OverflowError, subprocess.SubprocessError):
         return fallback_idle, fallback_ttl, {"mode": "fallback", "reason": "resolver-error"}
 MIN_TOKENS = env_int("CLAUDE_IDLE_COMPACT_MIN_TOKENS", 70000)
+# Deterministic offline compaction (CLAUDE_IDLE_COMPACT_MODE=deterministic).
+# The pass runs on a COPY of the transcript, indexes every block it elides
+# BEFORE eliding it, and never installs a session above the ceiling.  70_000 is
+# the operator's hard post-compaction ceiling, not a target to approach.
+OFFLINE_COMPACT_MODES = frozenset({"native", "deterministic"})
+# Compactor verdicts that mean "nothing to do", not "the pass broke": they must
+# never be answered with a paid /compact on a session that is already small.
+OFFLINE_COMPACT_REFUSALS = frozenset({"no-elision-needed"})
+OFFLINE_COMPACT_CEILING_TOKENS = env_int(
+    "CLAUDE_IDLE_COMPACT_CEILING_TOKENS", 70_000, 1_000
+)
+OFFLINE_COMPACT_CHARS_PER_TOKEN = env_float(
+    "CLAUDE_IDLE_COMPACT_CHARS_PER_TOKEN", 4.0, 0.5
+)
+OFFLINE_COMPACT_KEEP_RECENT_RECORDS = env_int(
+    "CLAUDE_IDLE_COMPACT_KEEP_RECENT_RECORDS", 60, 0
+)
+OFFLINE_COMPACT_STUB_OVER_CHARS = env_int(
+    "CLAUDE_IDLE_COMPACT_STUB_OVER_CHARS", 400, 80
+)
+OFFLINE_COMPACT_STOP_GRACE_SECONDS = env_float(
+    "CLAUDE_IDLE_COMPACT_STOP_GRACE_SECONDS", 5.0, 0.1
+)
+
+
+def compaction_mode() -> str:
+    """Return the compaction mode; an unrecognised value keeps today's native path."""
+    value = os.environ.get("CLAUDE_IDLE_COMPACT_MODE", "native").strip().lower()
+    return value if value in OFFLINE_COMPACT_MODES else "native"
+
+
+def argv_with_session(argv: list[str], session_id: str) -> list[str]:
+    """Return argv that resumes exactly ``session_id``.
+
+    Rewrites an existing ``--resume``/``-r`` value, replaces ``--continue``/``-c``
+    (which cannot name a session), or inserts ``--resume <id>`` when the launcher
+    named no session at all.  Only the offline-compaction swap calls this; the
+    native path keeps the launcher's argv byte for byte.
+    """
+    out = list(argv)
+    for index, token in enumerate(out):
+        if token in {"--resume", "-r"} and index + 1 < len(out):
+            out[index + 1] = session_id
+            return out
+        if token.startswith("--resume="):
+            out[index] = "--resume=" + session_id
+            return out
+    for index, token in enumerate(out):
+        if token in {"--continue", "-c"}:
+            out[index:index + 1] = ["--resume", session_id]
+            return out
+    return ["--resume", session_id, *out]
+
 # An unknown transcript record fails closed (transcript-uncertain), but the
 # uncertainty must be a bounded caution, never a permanent veto: with the
 # latch unexpired and hook Stops not arriving (dead control socket,
@@ -1558,6 +1611,44 @@ def _hold_module():
     return module
 
 
+def _offline_compact_module():
+    """Load offline_compact.py (sibling in the dotcortex lib path).
+
+    Returns None when the module is absent: the deterministic mode then fails
+    closed (logged as offline-compact:failed) instead of guessing.
+    """
+    import importlib.util as _util
+    import sys as _sys
+    cached = _sys.modules.get("offline_compact")
+    if cached is not None:
+        return cached
+    override = os.environ.get("CLAUDE_WARM_OFFLINE_COMPACT_MODULE", "").strip()
+    candidates = [pathlib.Path(override)] if override else []
+    candidates.extend(
+        (
+            pathlib.Path(__file__).resolve().parent.parent / "lib/dotcortex/offline_compact.py",
+            pathlib.Path.home() / ".local/lib/dotcortex/offline_compact.py",
+        )
+    )
+    path = None
+    for candidate in candidates:
+        if candidate.is_file():
+            path = candidate
+            break
+    if path is None:
+        return None
+    spec = _util.spec_from_file_location("offline_compact", path)
+    if spec is None or spec.loader is None:
+        return None
+    module = _util.module_from_spec(spec)
+    # Registered before exec: dataclass() resolves annotations through
+    # sys.modules[cls.__module__], so a module missing from sys.modules during
+    # execution fails at the first @dataclass.
+    _sys.modules["offline_compact"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _hold_profile():
     module = _hold_module()
     if module is None:
@@ -2554,12 +2645,40 @@ class Supervisor:
         self.hold_timer = None  # created on first permission-prompt sighting
         self.dialog_timer = None  # settle timer for known non-permission dialogs
         self.usage_limit_until = None  # /compact is refused until this reset instant
+        # Deterministic offline compaction: what replaces the paid /compact
+        # injection, and the paths the pass needs.  CLAUDE_PROJECTS_DIR and
+        # CLAUDE_IDLE_COMPACT_STATE_DIR are overridable so a test never reads
+        # or writes a real ~/.claude session.
+        self.compact_mode = compaction_mode()
+        configured_mode = os.environ.get("CLAUDE_IDLE_COMPACT_MODE", "native").strip().lower()
+        self.compact_projects_dir = pathlib.Path(
+            os.environ.get("CLAUDE_PROJECTS_DIR")
+            or (pathlib.Path.home() / ".claude/projects")
+        ).expanduser()
+        state_home = os.environ.get("XDG_STATE_HOME") or str(
+            pathlib.Path.home() / ".local/state"
+        )
+        self.offline_compact_root = pathlib.Path(
+            os.environ.get("CLAUDE_IDLE_COMPACT_STATE_DIR")
+            or (pathlib.Path(state_home) / "dotcortex" / "compaction")
+        ).expanduser()
+        self.offline_compact_ceiling = OFFLINE_COMPACT_CEILING_TOKENS
+        self.offline_compact_chars_per_token = OFFLINE_COMPACT_CHARS_PER_TOKEN
+        self.session_override: str | None = None
+        self.offline_compact_stage: str | None = None
         self.dialog_unknown_logged = False  # one dialog_unknown record per episode
         self.preservation_federation = PreservationFederationClient(self)
         self.lifecycle_health = "pending"
         self.lifecycle_deadline = monotonic() + LIFECYCLE_WAIT_SECONDS
         self.lifecycle_alarm_path = self.state_root / f"{self.channel}.LIFECYCLE-HOOKS-MISSING"
         self._guard_log("supervisor-started")
+        self._guard_log(
+            "offline-compact:mode",
+            mode=self.compact_mode,
+            configured=configured_mode[:40],
+            ceiling_tokens=self.offline_compact_ceiling,
+            chars_per_token=self.offline_compact_chars_per_token,
+        )
         self._write_state()
 
     def _default_recovery_command(self) -> str | None:
@@ -2662,6 +2781,7 @@ class Supervisor:
             "last_gate_rejection_reason": self.last_gate_rejection_reason,
             "last_injection_result": self.last_injection_result,
             "last_state_transition": self.last_state_transition,
+            "compact_mode": getattr(self, "compact_mode", "native"),
             "preservation_request_id": self.preservation_request_id,
             "preservation_reservation_id": self.preservation_reservation_id,
             "preservation_state": self.preservation_state,
@@ -2678,7 +2798,8 @@ class Supervisor:
     def _guard_log(self, event: str, **fields: object) -> None:
         """Append one safe, durable channel-guard observation."""
         if (not self.watched_servers and not self.development_channel_opt_ins
-                and not event.startswith("pty-hold-")):
+                and not event.startswith("pty-hold-")
+                and not event.startswith("offline-compact:")):
             return
         payload = {
             "timestamp": now(),
@@ -3762,6 +3883,11 @@ class Supervisor:
     def _child_argv(self) -> list[str]:
         """Load the local summary mod and private channel debug capture."""
         argv = list(self.argv)
+        override = getattr(self, "session_override", None)
+        if override:
+            # Deterministic offline compaction installs a new session id; the
+            # child must resume THAT session, not whatever argv originally named.
+            argv = argv_with_session(argv, override)
         if getattr(self, "decider_mod_path", None) and (self.decider_mod_path / ".claude-plugin/plugin.json").is_file():
             if str(self.decider_mod_path) not in argv:
                 argv.extend(["--plugin-dir", str(self.decider_mod_path)])
@@ -4022,6 +4148,327 @@ class Supervisor:
         )
         self._schedule_next_recovery()
 
+    # ---- deterministic offline compaction ---------------------------------
+
+    def _offline_transcript_path(self) -> pathlib.Path | None:
+        """Return the live transcript bound to this seat, if there is one.
+
+        Prefers the path the lifecycle hook reported; falls back to a bounded
+        search of the projects directory for this session id.  The file is only
+        read (and only ever copied) -- nothing here writes a live transcript.
+        """
+        candidates: list[pathlib.Path] = []
+        if self.transcript_path is not None:
+            candidates.append(pathlib.Path(self.transcript_path))
+        if isinstance(self.session_id, str) and re.fullmatch(r"[A-Za-z0-9-]{8,64}", self.session_id):
+            try:
+                candidates.extend(
+                    sorted(self.compact_projects_dir.glob(f"*/{self.session_id}.jsonl"))
+                )
+            except OSError:
+                pass
+        for candidate in candidates:
+            try:
+                if candidate.is_file() and not candidate.is_symlink():
+                    return candidate
+            except OSError:
+                continue
+        return None
+
+    def _compaction_workdir(self) -> pathlib.Path:
+        """Create this pass's private working directory under the state root."""
+        stamp = time.strftime("%Y%m%dT%H%M%S", time.localtime(now()))
+        root = self.offline_compact_root
+        path = root / self.channel / f"{stamp}-{uuid.uuid4().hex[:8]}"
+        path.mkdir(parents=True, exist_ok=True)
+        for directory in (root, path.parent, path):
+            try:
+                os.chmod(directory, 0o700)
+            except OSError:
+                pass
+        return path
+
+    def _guard_offline(self, stage: str, **fields: object) -> None:
+        """Record one offline-compaction stage in the log, state and transition."""
+        self.offline_compact_stage = stage
+        self.last_state_transition = f"offline-compact:{stage}"
+        self._guard_log(f"offline-compact:{stage}", **fields)
+        self._write_state()
+
+    def _offline_compact_attempt(self) -> tuple[str, str | None]:
+        """Replace one /compact injection with a local pass over a transcript copy.
+
+        Returns (outcome, reason) with outcome in {"landed", "refused", "failed"}:
+        ``refused`` is an ordinary gate veto that changed nothing, ``failed`` is a
+        loud local failure the caller may answer with the native path when the
+        provider is not usage-limited.
+
+        This method owns no wall-clock timer.  It is reachable only through
+        ``attempt(purpose="compact")`` -- the same funnel the Stop-driven idle
+        timer and the preservation path use -- and it refuses below the token
+        threshold, so the trigger stays the compaction event.
+        """
+        if self.offline_compact_stage not in (None, "failed", "relaunched", "waiting"):
+            return "refused", "already-running"
+        if not self.enabled:
+            return "refused", "session-disabled"
+        if self.status == "active":
+            return "refused", "session-active"
+        if self.compacting:
+            return "refused", "already-compacting"
+        if not self.dirty:
+            return "refused", "clean"
+        if not self.pid or not child_alive(self.pid):
+            return "refused", "session-not-running"
+        if self.transcript_quiescence_deadline is not None:
+            return "refused", "transcript-not-quiescent"
+        if self.transcript_gate_blocked:
+            return "refused", "transcript-uncertain"
+        if self.current_tokens is not None and self.current_tokens < MIN_TOKENS:
+            return "refused", "below-token-threshold"
+        module = _offline_compact_module()
+        if module is None:
+            self._guard_offline("failed", reason="module-unavailable")
+            return "failed", "module-unavailable"
+        source = self._offline_transcript_path()
+        if source is None:
+            self._guard_offline("failed", reason="no-transcript")
+            return "failed", "no-transcript"
+        workdir = self._compaction_workdir()
+        self._guard_offline(
+            "start",
+            session=short_id(self.session_id or ""),
+            source=source.name,
+            workdir=str(workdir),
+        )
+        copy_path = workdir / "source.jsonl"
+        try:
+            shutil.copyfile(source, copy_path)
+            os.chmod(copy_path, 0o600)
+        except OSError as error:
+            self._guard_offline("failed", reason="copy-failed", errno=error.errno)
+            return "failed", "copy-failed"
+        self._guard_offline("copy", bytes=copy_path.stat().st_size)
+        try:
+            ranker = module.DeciderRanker.from_env()
+        except Exception:
+            # A selector that cannot even be constructed is the fallback case,
+            # not a failed compaction: the deterministic pass still runs.
+            ranker = None
+        out_path = workdir / "compacted.jsonl"
+        try:
+            result = module.compact(
+                copy_path,
+                out_path,
+                workdir / "archive",
+                keep_recent_records=OFFLINE_COMPACT_KEEP_RECENT_RECORDS,
+                stub_over_chars=OFFLINE_COMPACT_STUB_OVER_CHARS,
+                ceiling_tokens=self.offline_compact_ceiling,
+                chars_per_token=self.offline_compact_chars_per_token,
+                ranker=ranker,
+            )
+        except Exception as error:  # a compactor bug must never take the seat down
+            self._guard_offline("failed", reason=f"compactor-error:{type(error).__name__}")
+            return "failed", "compactor-error"
+        report = getattr(result, "report", None) or {}
+        self._guard_offline(
+            "compacted",
+            ok=bool(getattr(result, "ok", False)),
+            reason=getattr(result, "reason", None),
+            selector=report.get("selector"),
+            decider_status=report.get("decider_status"),
+            elided=report.get("elided_blocks"),
+            index_entries=report.get("index_entries"),
+            est_tokens_before=report.get("est_tokens_before"),
+            est_tokens_after=report.get("est_tokens_after"),
+            ceiling_tokens=report.get("ceiling_tokens"),
+            ceiling_met=report.get("ceiling_met"),
+            tokenizer=report.get("tokenizer"),
+        )
+        if not getattr(result, "ok", False):
+            refusal = str(getattr(result, "reason", None) or "compactor-refused")
+            self._guard_offline("failed", step="compactor", reason=refusal)
+            if refusal in OFFLINE_COMPACT_REFUSALS:
+                # Nothing needed eliding: this is not a failure and must not
+                # spend a paid /compact on a session that is already under the
+                # ceiling.
+                return "refused", refusal
+            return "failed", refusal
+        if report.get("human_words_changed") not in (0, None):
+            self._guard_offline(
+                "failed", reason="human-words-changed", changed=report.get("human_words_changed")
+            )
+            return "failed", "human-words-changed"
+        if report.get("identity_preserved") is not True:
+            self._guard_offline("failed", reason="identity-not-preserved")
+            return "failed", "identity-not-preserved"
+        after = report.get("est_tokens_after")
+        if not report.get("ceiling_met") or not isinstance(after, int) or after > self.offline_compact_ceiling:
+            self._guard_offline(
+                "failed",
+                reason="ceiling-not-met",
+                est_tokens_after=after,
+                ceiling_tokens=self.offline_compact_ceiling,
+            )
+            return "failed", "ceiling-not-met"
+        project_dir = self.transcript_project_dir or source.parent
+        new_session = str(uuid.uuid4())
+        try:
+            installed = module.install_as_session(out_path, project_dir, new_session)
+        except (OSError, ValueError) as error:
+            self._guard_offline(
+                "failed", reason=f"install-failed:{type(error).__name__}"
+            )
+            return "failed", "install-failed"
+        self._guard_offline(
+            "installed", session=new_session, name=installed.name, bytes=installed.stat().st_size
+        )
+        # The chain is verified AFTER the copy is installed: a resume walks
+        # parentUuid, so a shorter chain or a missing parent would silently
+        # truncate the history the agent resumes into.
+        try:
+            chain_source = module.parent_chain(module.load_records(copy_path))
+            chain_installed = module.parent_chain(module.load_records(installed))
+        except Exception as error:
+            try:
+                installed.unlink()
+            except OSError:
+                pass
+            self._guard_offline("failed", reason="chain-check-error", detail=type(error).__name__)
+            return "failed", "chain-check-error"
+        if len(chain_installed) != len(chain_source) or chain_installed != chain_source:
+            try:
+                installed.unlink()
+            except OSError:
+                pass
+            self._guard_offline(
+                "failed",
+                reason="chain-mismatch",
+                chain_before=len(chain_source),
+                chain_after=len(chain_installed),
+            )
+            return "failed", "chain-mismatch"
+        self._guard_offline("verified", chain_length=len(chain_installed))
+        previous_session = self.session_id
+        self._guard_offline(
+            "swap",
+            from_session=short_id(previous_session or ""),
+            to_session=new_session,
+        )
+        if not self._stop_child_for_relaunch():
+            try:
+                installed.unlink()
+            except OSError:
+                pass
+            self._guard_offline("failed", reason="child-stop-failed")
+            return "failed", "child-stop-failed"
+        self.session_id = new_session
+        self.session_override = new_session
+        self.transcript_path = installed
+        self.transcript_project_dir = installed.parent
+        self._reset_transcript_cursor()
+        self.dirty = False
+        self.compacting = False
+        self.compaction_requested_at = None
+        self.compaction_ignore_next_stop = False
+        self.current_tokens = after
+        self.post_compact_baseline_tokens = after
+        self.post_compact_baseline_at = now()
+        self.last_cancellation_reason = "offline-compaction-landed"
+        self.last_injection_result = "requested"
+        try:
+            self.launch()
+        except Exception as error:
+            self._guard_offline("failed", reason="relaunch-failed", detail=type(error).__name__)
+            # Put the seat back on the session it had, rather than leaving it
+            # stopped on a session nothing is running.
+            self.session_id = previous_session
+            self.session_override = previous_session
+            self.transcript_path = source
+            self.dirty = True
+            try:
+                self.launch()
+            except Exception as restore_error:
+                self._guard_offline(
+                    "failed", reason="restore-failed", detail=type(restore_error).__name__
+                )
+                return "failed", "relaunch-failed"
+            return "failed", "relaunch-failed"
+        self._guard_offline(
+            "relaunched",
+            session=new_session,
+            child_pid=self.pid,
+            est_tokens_after=after,
+            ceiling_tokens=self.offline_compact_ceiling,
+        )
+        return "landed", None
+
+    def _detach_master_fd(self) -> None:
+        """Drop the old PTY master from the selector and close it."""
+        fd = self.master_fd
+        self.master_fd = None
+        if fd is None:
+            return
+        try:
+            self.selector.unregister(fd)
+        except (KeyError, ValueError, OSError):
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    def _stop_child_for_relaunch(self) -> bool:
+        """Stop the agent child gracefully, reap it and detach its PTY.
+
+        SIGHUP is what the supervisor forwards for a normal terminal shutdown;
+        SIGTERM and SIGKILL are bounded escalations.  Every wait is capped so a
+        wedged child cannot hold the supervisor forever, and a zombie is reaped
+        explicitly (a zombie still answers ``kill(pid, 0)``).  Returns True only
+        when the child is gone.
+        """
+        pid = self.pid
+        if not pid:
+            self._detach_master_fd()
+            return True
+        for signum, wait_for in (
+            (signal.SIGHUP, OFFLINE_COMPACT_STOP_GRACE_SECONDS),
+            (signal.SIGTERM, OFFLINE_COMPACT_STOP_GRACE_SECONDS),
+            (signal.SIGKILL, 2.0),
+        ):
+            if not child_alive(pid):
+                break
+            try:
+                os.killpg(pid, signum)
+            except OSError:
+                try:
+                    os.kill(pid, signum)
+                except OSError:
+                    pass
+            deadline = monotonic() + wait_for
+            while monotonic() < deadline:
+                try:
+                    waited, _status = os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    break
+                if waited == pid or not child_alive(pid):
+                    break
+                time.sleep(0.02)
+            if not child_alive(pid):
+                break
+        try:
+            os.waitpid(pid, os.WNOHANG)
+        except (ChildProcessError, OSError):
+            pass
+        alive = child_alive(pid)
+        self._detach_master_fd()
+        self.pid = None
+        self.child_status = None
+        self.child_tty = None
+        self.child_tty_device = None
+        self._guard_offline("child-stopped", pid=pid, alive=alive)
+        return not alive
+
     def attempt(
         self,
         expected_generation: int | None = None,
@@ -4029,6 +4476,35 @@ class Supervisor:
         purpose: str = "compact",
     ) -> bool:
         """Run the final gate and inject one validated command through the PTY."""
+        # Deterministic mode replaces THIS injection, not the trigger: the same
+        # Stop-driven funnel calls in, and no /compact ever reaches the PTY.
+        if (
+            purpose == "compact"
+            and command == "/compact"
+            and getattr(self, "compact_mode", "native") == "deterministic"
+        ):
+            outcome, offline_reason = self._offline_compact_attempt()
+            if outcome == "landed":
+                return True
+            if outcome == "refused":
+                self.last_gate_rejection_reason = offline_reason
+                self.last_state_transition = f"offline-compact:refused:{offline_reason}"
+                self._guard_log("offline-compact:refused", reason=offline_reason)
+                self._write_state()
+                return False
+            if self.usage_limit_until and now() < self.usage_limit_until:
+                # The native path is refused by the provider right now: spending
+                # the attempt on it would only burn the retry budget.
+                self.last_state_transition = "offline-compact:waiting"
+                self._guard_log(
+                    "offline-compact:waiting",
+                    reason=offline_reason,
+                    until=int(self.usage_limit_until),
+                )
+                self._write_state()
+                return False
+            self._guard_log("offline-compact:native-fallback", reason=offline_reason)
+            self._write_state()
         # Every governor caller, including the idle timer and preservation,
         # takes this same local path once the native mod confirms its load.
         if purpose == "compact" and command == "/compact" and self._decider_summary_ready():
@@ -5163,6 +5639,13 @@ def main(argv: list[str]) -> int:
         print("CLAUDE_WARM_HERDR_AGENT, CLAUDE_WARM_HERDR_HEARTBEAT_SECONDS,")
         print("CLAUDE_WARM_HERDR_REGISTRATION_TTL_MS")
         print("CLAUDE_WARM_PRESERVATION_* (all bindings are required; unset is inert)")
+        print("CLAUDE_IDLE_COMPACT_MODE=native|deterministic (deterministic runs a local,")
+        print("provider-free pass over a transcript copy instead of injecting /compact)")
+        print("CLAUDE_IDLE_COMPACT_CEILING_TOKENS, CLAUDE_IDLE_COMPACT_CHARS_PER_TOKEN,")
+        print("CLAUDE_IDLE_COMPACT_KEEP_RECENT_RECORDS, CLAUDE_IDLE_COMPACT_STUB_OVER_CHARS,")
+        print("CLAUDE_PROJECTS_DIR, CLAUDE_IDLE_COMPACT_STATE_DIR, CLAUDE_WARM_OFFLINE_COMPACT_MODULE")
+        print("CLAUDE_IDLE_COMPACT_DECIDER=auto|off, CLAUDE_IDLE_COMPACT_HONEY_DECIDER_URL,")
+        print("CLAUDE_IDLE_COMPACT_KIKIN_DECIDER_URL, CLAUDE_IDLE_COMPACT_DECIDER_BUDGET_MS")
         print("Use claude-warmctl for per-session state and controls.")
         return 0
     try:
