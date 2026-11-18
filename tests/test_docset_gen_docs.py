@@ -224,6 +224,9 @@ class MarkdownMode(Common, unittest.TestCase):
         self.assertIn('href="README.md.html"', forge_html)
         self.assertIn('href="FORGE__docs__pvox.md.html#usage"', forge_html)
         self.assertIn('href="./CONTRIBUTING.md"', forge_html)
+        # Bracketed placeholder hrefs in literate docs (e.g. `http://[host]/`) must not crash urlsplit.
+        rewriter = gen.build_link_rewriter([("README.md", self.base / "README.md")])
+        self.assertEqual(rewriter("README.md", '<a href="http://[host]/x">x</a>'), '<a href="http://[host]/x">x</a>')
 
     def test_adding_target_doc_invalidates_cached_index_links(self):
         (self.base / "README.md").write_text("# Scope\n\nSee [Guide](./docs/guide.md).\n")
