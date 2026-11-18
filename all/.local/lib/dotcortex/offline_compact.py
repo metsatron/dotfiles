@@ -291,6 +291,23 @@ INDEX_SCHEMA = (
     "key UNINDEXED, sha256 UNINDEXED, chars UNINDEXED, body)"
 )
 
+# A pointer may point at an INDEX OF POINTERS rather than at one block.  The
+# group row is the summary the operator asked for: a collection of elided
+# blocks described by task and project, so the stub itself says what it covers
+# instead of being a bare "something was here".  Members are listed separately
+# so a group stub can be expanded back into the individual pointers.
+GROUP_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS pointer_groups("
+    "gid TEXT PRIMARY KEY, label TEXT, project TEXT, summary TEXT, "
+    "chars INTEGER, blocks INTEGER, first_line INTEGER, last_line INTEGER)"
+)
+MEMBER_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS pointer_group_members("
+    "gid TEXT, key TEXT, line INTEGER, uuid TEXT, chars INTEGER, "
+    "PRIMARY KEY (gid, key))"
+)
+
+
 
 class ElisionIndex:
     """Durable archive + FTS5 index of every elided block.
@@ -309,6 +326,8 @@ class ElisionIndex:
         self.connection = sqlite3.connect(str(self.database_path))
         self.connection.execute("PRAGMA synchronous=FULL")
         self.connection.execute(INDEX_SCHEMA)
+        self.connection.execute(GROUP_SCHEMA)
+        self.connection.execute(MEMBER_SCHEMA)
         self.connection.commit()
         fd = os.open(self.index_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         self.journal = os.fdopen(fd, "a", encoding="utf-8")
@@ -333,6 +352,59 @@ class ElisionIndex:
             "SELECT key FROM elided WHERE elided MATCH ? LIMIT ?", (query, limit)
         ).fetchall()
         return [row[0] for row in rows]
+
+    def add_group(self, group: dict) -> None:
+        """Record one pointer group and its members, committed before use.
+
+        The group row carries the summary; the member rows carry the individual
+        pointers it stands for.  A group stub whose ``gid`` is not here, or whose
+        member count disagrees, is refused by ``verify_groups`` -- a group stub is
+        a promise that the index it names can expand it.
+        """
+        self.connection.execute(
+            "INSERT OR REPLACE INTO pointer_groups"
+            "(gid, label, project, summary, chars, blocks, first_line, last_line)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                group["gid"],
+                group.get("label", ""),
+                group.get("project", ""),
+                group.get("summary", ""),
+                int(group.get("chars") or 0),
+                int(group.get("blocks") or len(group.get("members") or [])),
+                int(group.get("first_line") or 0),
+                int(group.get("last_line") or 0),
+            ),
+        )
+        for member in group.get("members") or []:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO pointer_group_members"
+                "(gid, key, line, uuid, chars) VALUES (?, ?, ?, ?, ?)",
+                (
+                    group["gid"],
+                    member["key"],
+                    int(member.get("line") or 0),
+                    member.get("uuid"),
+                    int(member.get("chars") or 0),
+                ),
+            )
+        self.connection.commit()
+
+    def group_members(self, gid: str) -> list[dict]:
+        rows = self.connection.execute(
+            "SELECT key, line, uuid, chars FROM pointer_group_members"
+            " WHERE gid = ? ORDER BY line",
+            (gid,),
+        ).fetchall()
+        return [
+            {"key": row[0], "line": row[1], "uuid": row[2], "chars": row[3]} for row in rows
+        ]
+
+    def has_group(self, gid: str) -> bool:
+        row = self.connection.execute(
+            "SELECT 1 FROM pointer_groups WHERE gid = ?", (gid,)
+        ).fetchone()
+        return row is not None
 
     def close(self) -> None:
         try:
@@ -1055,6 +1127,274 @@ def _stub_text(candidate: Candidate, text: str, line: int, name: str) -> str:
 
 
 # --------------------------------------------------------------------------
+# pointers to indexes of pointers: grouped stubs, summarised by task
+# --------------------------------------------------------------------------
+#
+# One stub per elided block costs about 100 characters each, and a long session
+# elides thousands of blocks: the stubs themselves become a payload.  So a run of
+# elisions that belongs to ONE task can be replaced by a single stub that points
+# at a group in the index, which in turn lists the individual pointers.  Two
+# rules make that safe and useful:
+#
+#   * a group stub is only used when it is genuinely cheaper than the individual
+#     stubs it replaces (otherwise the finer pointer is strictly better);
+#   * a group stub MUST carry a summary of what the group covers, by task and
+#     project -- a bare group id is refused, because a pointer nobody can read is
+#     worse than the text it replaced.
+
+POINTER_GROUP_MAX_LABEL_CHARS = 88
+POINTER_GROUP_MAX_SUMMARY_CHARS = 360
+POINTER_GROUP_MIN_MEMBERS = 3
+POINTER_GROUP_MIN_SAVING_CHARS = 400
+POINTER_GROUP_TEMPLATE = (
+    "[elided {count} blocks, {chars:,} chars \u2014 {label} \u2014 at line {line:,} of {name} "
+    "through line {last:,}; group {gid} of {index}; {summary}]"
+)
+POINTER_GROUP_MEMBER_TEMPLATE = "[{gid} member: {chars:,} chars at line {line:,} of {name}]"
+POINTER_GROUP_RE = re.compile(r"; group (g[\w-]+) of ")
+
+
+SYNTHETIC_TURN_MARKERS = (
+    "this session is being continued",
+    "my reply to",
+    "caveat: the messages below",
+    "context compacted",
+    "tool loaded",
+    "stop hook feedback",
+    "hook feedback",
+    "system:",
+    "base directory for this skill",
+    "skill loaded",
+    "working directory:",
+)
+# A task label must be long enough to name work.  Short interjections ("Yes",
+# "Do it") answer the current task rather than starting a new one, so they keep
+# the label they inherited instead of splitting a group in two.
+TASK_LABEL_MIN_CHARS = 16
+
+
+def _task_instruction(record: dict, max_chars: int) -> str:
+    """The operator's instruction in this record, or "" when it is not one.
+
+    A task label must be something a human said: continuation summaries, tool
+    echoes and harness notes all arrive as ``user`` records, and labelling a
+    group "This session is being continued..." would describe the bookkeeping
+    instead of the work.
+    """
+    if record.get("isCompactSummary") or record.get("type") == "summary":
+        return ""
+    message = record.get("message")
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return ""
+    text = human_text(record).strip()
+    if not text:
+        return ""
+    lowered = text.lower()
+    if lowered.startswith(SYNTHETIC_TURN_MARKERS):
+        return ""
+    first = " ".join(text.splitlines()[0].split())
+    if not first or first.startswith(("<", "[", "Caveat:")):
+        return ""
+    if first.endswith(":"):
+        return ""
+    if "/.claude/" in first or "/skills/" in first:
+        return ""
+    return first[:max_chars]
+
+
+def task_labels(records: list[dict], max_chars: int = POINTER_GROUP_MAX_LABEL_CHARS) -> list[str]:
+    """Label every record with the task it belongs to.
+
+    A task starts at a human turn: the operator's own words are what define a
+    unit of work, so the label is the first line of the most recent human message.
+    Records before the first human turn carry no label, and their elisions stay
+    ungrouped rather than being filed under a task nobody stated.
+    """
+    labels: list[str] = []
+    current = ""
+    for record in records:
+        instruction = _task_instruction(record, max_chars)
+        if instruction:
+            # A short reply ("Yes", "Do it") answers the task it inherited; it
+            # only becomes a label when there is nothing else to name.
+            if len(instruction) >= TASK_LABEL_MIN_CHARS or not current:
+                current = instruction
+        labels.append(current)
+    return labels
+
+
+def _group_summary(count: int, chars: int, members: list[Candidate], texts: dict[str, str]) -> str:
+    """A deterministic summary of what a group contains: no model, no guessing.
+
+    What a reader needs from a summary is what the blocks WERE: which files they
+    touched and how they began.  Both are read off the text itself, so the summary
+    cannot drift from the content it describes.
+    """
+    paths: list[str] = []
+    for candidate in members:
+        for match in re.findall(r"(?:/[\w.+-]+){2,}", texts.get(candidate.key, "")[:2000]):
+            if match not in paths:
+                paths.append(match)
+        if len(paths) >= 4:
+            break
+    heads: list[str] = []
+    seen: set[str] = set()
+    for candidate in members:
+        first = next((line.strip() for line in texts.get(candidate.key, "").splitlines() if line.strip()), "")
+        first = " ".join(first.split())[:60]
+        if first and first not in seen:
+            seen.add(first)
+            heads.append(first)
+        if len(heads) >= 2:
+            break
+    parts = ["{} blocks, {:,} chars".format(count, chars)]
+    if paths:
+        parts.append("files: " + ", ".join(paths[:4]))
+    if heads:
+        parts.append('begins: "' + '" / "'.join(heads) + '"')
+    summary = "; ".join(parts)
+    return summary[:POINTER_GROUP_MAX_SUMMARY_CHARS]
+
+
+def build_pointer_groups(
+    rows: list[tuple[int, dict]],
+    chosen: list[Candidate],
+    *,
+    texts: dict[str, str],
+    project: str = "",
+    pointer_name: str = "source.jsonl",
+    min_members: int = POINTER_GROUP_MIN_MEMBERS,
+    min_saving_chars: int = POINTER_GROUP_MIN_SAVING_CHARS,
+) -> tuple[list[dict], dict[str, tuple[str, str]]]:
+    """Group elisions by task; collapse only the groups where that saves space.
+
+    Returns (groups, plan).  ``plan`` maps a candidate key to ``(gid, role)``
+    where role is ``"head"`` (the stub that carries the group's summary) or
+    ``"member"``.  Candidates absent from ``plan`` keep their individual pointer,
+    so a group that would cost more than it saves never appears.
+    """
+    labels = task_labels([record for _number, record in rows])
+    number_by_position = {position: number for position, (number, _record) in enumerate(rows)}
+    # A pointer must name the line in the file on disk, which is the row's own
+    # number, never an index we recomputed from arithmetic.
+    line_of: dict[str, int] = {
+        candidate.key: int(number_by_position.get(candidate.position, 0)) for candidate in chosen
+    }
+
+    buckets: dict[str, list[Candidate]] = {}
+    for candidate in chosen:
+        label = labels[candidate.position] if candidate.position < len(labels) else ""
+        buckets.setdefault(label, []).append(candidate)
+
+    groups: list[dict] = []
+    plan: dict[str, tuple[str, str]] = {}
+    for label, members in buckets.items():
+        if len(members) < max(2, int(min_members)):
+            continue
+        members = sorted(members, key=lambda c: (line_of.get(c.key, 0), c.block_index))
+        chars = sum(candidate.chars for candidate in members)
+        summary = _group_summary(len(members), chars, members, texts)
+        if not summary or not summary.strip():
+            # No summary, no group: a group stub must say what it covers.
+            continue
+        gid = "g{:02d}".format(len(groups) + 1)
+        first_line = line_of.get(members[0].key, 0)
+        last_line = line_of.get(members[-1].key, 0)
+        head = POINTER_GROUP_TEMPLATE.format(
+            count=len(members),
+            chars=chars,
+            label=label or "unlabelled task",
+            line=first_line,
+            name=pointer_name,
+            last=last_line,
+            gid=gid,
+            index="index",
+            summary=summary,
+        )
+        collapsed_cost = len(head) + sum(
+            len(
+                POINTER_GROUP_MEMBER_TEMPLATE.format(
+                    gid=gid, chars=candidate.chars, line=line_of.get(candidate.key, 0), name=pointer_name
+                )
+            )
+            for candidate in members[1:]
+        )
+        individual_cost = sum(
+            len(pointer_text(candidate.chars, line_of.get(candidate.key, 0), pointer_name))
+            for candidate in members
+        )
+        if individual_cost - collapsed_cost < int(min_saving_chars):
+            continue
+        group = {
+            "gid": gid,
+            "label": label,
+            "project": project,
+            "summary": summary,
+            "chars": chars,
+            "blocks": len(members),
+            "first_line": first_line,
+            "last_line": last_line,
+            "members": [
+                {
+                    "key": candidate.key,
+                    "line": line_of.get(candidate.key, 0),
+                    "uuid": candidate.uuid,
+                    "chars": candidate.chars,
+                }
+                for candidate in members
+            ],
+            "stub": head,
+            "individual_cost": individual_cost,
+            "collapsed_cost": collapsed_cost,
+        }
+        groups.append(group)
+        plan[members[0].key] = (gid, "head")
+        for candidate in members[1:]:
+            plan[candidate.key] = (gid, "member")
+    return groups, plan
+
+
+def group_stub_for(gid: str, group: dict, member: Candidate, line: int, name: str) -> str:
+    """The text written into an elided block that belongs to a collapsed group."""
+    if group.get("stub") and group["members"] and group["members"][0]["key"] == member.key:
+        return str(group["stub"])
+    return POINTER_GROUP_MEMBER_TEMPLATE.format(gid=gid, chars=member.chars, line=line, name=name)
+
+
+def group_id_in(text: str) -> str | None:
+    """The group a stub CLAIMS, read out of the text itself."""
+    match = POINTER_GROUP_RE.search(str(text))
+    return match.group(1) if match else None
+
+
+def verify_groups(index: "ElisionIndex", groups: list[dict]) -> list[dict]:
+    """Every group stub must be expandable: the row exists and lists its members.
+
+    A group stub is a promise that "group gNN of the index" can be opened.  If the
+    group row is missing, or its member list is not exactly the set of blocks the
+    stub swallowed, the promise is a lie and the pass must not ship.
+    """
+    mismatches: list[dict] = []
+    for group in groups:
+        gid = group["gid"]
+        if not index.has_group(gid):
+            mismatches.append({"gid": gid, "reason": "group-missing"})
+            continue
+        listed = {member["key"] for member in index.group_members(gid)}
+        wanted = {member["key"] for member in group.get("members") or []}
+        if listed != wanted:
+            mismatches.append(
+                {
+                    "gid": gid,
+                    "reason": "member-set-mismatch",
+                    "missing": sorted(wanted - listed)[:5],
+                    "extra": sorted(listed - wanted)[:5],
+                }
+            )
+    return mismatches
+
+
+# --------------------------------------------------------------------------
 # the pass
 # --------------------------------------------------------------------------
 
@@ -1072,6 +1412,10 @@ def compact(
     on_indexed=None,
     harness: dict | None = None,
     pointer_source: str | None = None,
+    group_pointers: bool = False,
+    group_min_members: int = POINTER_GROUP_MIN_MEMBERS,
+    group_min_saving_chars: int = POINTER_GROUP_MIN_SAVING_CHARS,
+    project: str = "",
 ) -> CompactResult:
     """Compact a transcript COPY into ``out``; never mutates ``source``.
 
@@ -1178,6 +1522,36 @@ def compact(
     chosen_keys = {candidate.key: candidate for candidate in chosen}
     report["selected_for_elision"] = len(chosen)
 
+    # Grouping is decided BEFORE anything is written: the group's summary has to
+    # exist in the index before the first block that points at it can lose its
+    # text, exactly as with an individual pointer.
+    groups: list[dict] = []
+    groups_by_id: dict[str, dict] = {}
+    group_plan: dict[str, tuple[str, str]] = {}
+    group_mismatches: list[dict] = []
+    if group_pointers and chosen:
+        grouping_texts: dict[str, str] = {}
+        for candidate in chosen:
+            record = records[candidate.position] if candidate.position < len(records) else None
+            message = record.get("message") if isinstance(record, dict) else None
+            content = message.get("content") if isinstance(message, dict) else None
+            part = None
+            if isinstance(content, list) and 0 <= candidate.block_index < len(content):
+                part = content[candidate.block_index]
+            if isinstance(part, dict):
+                grouping_texts[candidate.key] = text_of_part(part)
+        groups, group_plan = build_pointer_groups(
+            rows,
+            chosen,
+            texts=grouping_texts,
+            project=project,
+            pointer_name=pointer_name,
+            min_members=group_min_members,
+            min_saving_chars=group_min_saving_chars,
+        )
+        groups_by_id = {group["gid"]: group for group in groups}
+    report["pointer_groups_offered"] = len(groups)
+
     index_dir = archive_dir / "index"
     try:
         index = ElisionIndex(index_dir)
@@ -1188,6 +1562,9 @@ def compact(
     elided = 0
     pointers: list[dict] = []
     try:
+        # The group summaries exist before any block may point at them.
+        for group in groups:
+            index.add_group(group)
         with out.open("w", encoding="utf-8") as handle:
             for position, (line_number, record) in enumerate(rows):
                 message = record.get("message")
@@ -1203,7 +1580,19 @@ def compact(
                         index.add(candidate.key, text)
                         if on_indexed is not None:
                             on_indexed(candidate.key, text)
-                        stub = _stub_text(candidate, text, line_number, pointer_name)
+                        planned = group_plan.get(candidate.key)
+                        group_id = None
+                        if planned:
+                            group_id, _role = planned
+                            stub = group_stub_for(
+                                group_id,
+                                groups_by_id[group_id],
+                                candidate,
+                                line_number,
+                                pointer_name,
+                            )
+                        else:
+                            stub = _stub_text(candidate, text, line_number, pointer_name)
                         content[block_index] = {
                             key: value for key, value in part.items() if key != "content"
                         }
@@ -1221,11 +1610,13 @@ def compact(
                                 "block_index": block_index,
                                 "chars": len(text),
                                 "key": candidate.key,
+                                "group": group_id,
                             }
                         )
                         elided += 1
                 handle.write(json.dumps(record) + "\n")
                 handle.flush()
+        group_mismatches = verify_groups(index, groups) if groups else []
     except (OSError, sqlite3.Error) as error:
         try:
             out.unlink()
@@ -1297,6 +1688,28 @@ def compact(
             "pointer_verification_basis": verification_basis,
             "index_path": str(index_dir),
             "index_entries": elided,
+            "pointer_groups": len(groups),
+            "pointer_group_blocks": sum(len(group.get("members") or []) for group in groups),
+            "pointer_group_stub_chars": sum(len(str(group.get("stub", ""))) for group in groups),
+            "pointer_group_saved_chars": sum(
+                int(group.get("individual_cost") or 0) - int(group.get("collapsed_cost") or 0)
+                for group in groups
+            ),
+            "group_mismatch_count": len(group_mismatches),
+            "group_mismatches": group_mismatches[:10],
+            "pointer_groups_detail": [
+                {
+                    "gid": group["gid"],
+                    "label": group["label"],
+                    "project": group["project"],
+                    "summary": group["summary"],
+                    "blocks": group["blocks"],
+                    "chars": group["chars"],
+                    "first_line": group["first_line"],
+                    "last_line": group["last_line"],
+                }
+                for group in groups
+            ],
         }
     )
 
@@ -1316,6 +1729,14 @@ def compact(
         # A pointer that names the wrong line is worse than no compaction: the
         # agent would be sent to text that is not its own.  Nothing ships.
         reason = "pointer-mismatch"
+        try:
+            out.unlink()
+        except OSError:
+            pass
+    elif group_mismatches:
+        # A group stub that the index cannot expand is a dead end: it says
+        # "group g07" and there is no g07 to read.  Nothing ships.
+        reason = "group-mismatch"
         try:
             out.unlink()
         except OSError:
