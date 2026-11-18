@@ -26,19 +26,29 @@ One docset per invocation. Mode =man= takes any number of man roots; later modes
 
 #+BEGIN_SRC python :tangle all/.local/bin/dotcortex-docset-gen :shebang "#!/usr/bin/env python3" :tangle-mode (identity #o755)
 """Generate a Dash/Zeal docset. Mode `man`: render man roots via mandoc.
+Modes `org` and `md`: render authored documents (Emacs ox-html / Python-Markdown).
 
 Usage:
   dotcortex-docset-gen man --name "T480s Manuals" --keyword t480s \
       --out /path/Name.docset ROOT [ROOT ...]
+  dotcortex-docset-gen org --name "DotCortex Docs" --keyword dotcortex \
+      --out /path/Name.docset --base ~/DotCortex [--exclude GLOB ...] ROOT [ROOT ...]
+  dotcortex-docset-gen md  --name "HelmCortex Docs" --keyword helmcortex \
+      --out /path/Name.docset --base ~/HelmCortex [--exclude GLOB ...] ROOT [ROOT ...]
 
 Rules honoured here:
   - English pages only (locale subdirs like man/fr/man1 are skipped).
   - First root wins on (name, section) collisions.
   - `.so` redirect pages resolve to their target's HTML.
   - Incremental: unchanged sources (mtime+size) are not re-rendered.
+  - org/md: one page per file, named by its path relative to --base; every
+    heading becomes a <section class="Sh|Ss"> so dotcortex-help-corpus-build
+    chunks per heading exactly as it does for man pages. Symlinks are never
+    followed, hidden directories are skipped, and oversize files are reported.
 """
-import argparse, gzip, json, re, shutil, sqlite3, subprocess, sys
+import argparse, fnmatch, gzip, html as htmllib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile
 from datetime import datetime
+from html.parser import HTMLParser
 from pathlib import Path
 
 TYPE_MAP = {"1": "Command", "8": "Command", "2": "Function", "3": "Function",
@@ -114,16 +124,364 @@ def discover(roots):
         yield name, sec, digit, page
 
 
+DOC_RENDERER = "docs-1"
+DOC_SKIP_DIRS = {"node_modules", "__pycache__", "__pycache", ".git"}
+DOC_SUFFIX = {"org": ".org", "md": ".md"}
+OUTLINE_RE = re.compile(r"^outline-container-(.+)$")
+HEADING_RE = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.S)
+TAG_RE = re.compile(r"<[^>]+>")
+ORG_JOB_ELISP = r"""
+(progn
+  (require 'org) (require 'ox-html)
+  (setq max-lisp-eval-depth 20000
+        enable-local-variables :none enable-local-eval nil
+        org-export-use-babel nil org-confirm-babel-evaluate nil
+        org-export-with-sub-superscripts nil org-export-with-smart-quotes nil
+        org-export-with-toc nil org-export-with-section-numbers nil
+        org-export-with-broken-links t org-export-with-timestamps nil
+        org-html-htmlize-output-type nil org-html-container-element "section")
+  (dolist (line (split-string (with-temp-buffer
+                                (insert-file-contents (getenv "DOTCORTEX_DOCS_JOBS"))
+                                (buffer-string)) "\n" t))
+    (let* ((parts (split-string line "\t")) (src (nth 0 parts)) (dest (nth 1 parts)))
+      (condition-case err
+          (with-temp-buffer
+            (insert-file-contents src)
+            (setq default-directory (file-name-directory src))
+            (org-mode)
+            (let ((out (org-export-as 'html nil nil t)))
+              (with-temp-file dest (insert out))))
+        (error (princ (format "FAIL\t%s\t%s\n" src (error-message-slot err))))))))
+""".replace("(error-message-slot err)", "(error-message-string err)")
+
+
+def slugify(text, seen):
+    base = re.sub(r"[^a-z0-9]+", "-", htmllib.unescape(text).lower()).strip("-") or "section"
+    slug, n = base, 0
+    while slug in seen:
+        n += 1
+        slug = f"{base}-{n}"
+    seen.add(slug)
+    return slug
+
+
+def section_open(level, slug, heading_html):
+    cls, tag = ("Sh", "h1") if level == 1 else ("Ss", "h2")
+    return (f'<section class="{cls}" id="{slug}" data-level="{level}">'
+            f'<{tag} class="{cls}" id="{slug}">{heading_html}</{tag}>')
+
+
+def sectionize_flat(body, title):
+    """Wrap flat HTML (Markdown output) into nested Sh/Ss sections by heading level."""
+    out, stack, pos, seen = [], [], 0, set()
+    first = HEADING_RE.search(body)
+    lead = body[:first.start()] if first else body
+    if lead.strip():
+        slug = slugify(title, seen)
+        out.append(section_open(1, slug, htmllib.escape(title)))
+        out.append(lead)
+        out.append("</section>")
+    for m in HEADING_RE.finditer(body):
+        level = int(m.group(1))
+        if m.start() > pos and pos:
+            out.append(body[pos:m.start()])
+        while stack and stack[-1] >= level:
+            stack.pop()
+            out.append("</section>")
+        slug = slugify(TAG_RE.sub("", m.group(2)), seen)
+        out.append(section_open(level, slug, m.group(2)))
+        stack.append(level)
+        pos = m.end()
+    if first:
+        out.append(body[pos:])
+    out.extend("</section>" for _ in stack)
+    return "".join(out)
+
+
+class OrgRewriter(HTMLParser):
+    """Rewrite ox-html's outline containers (section/div id=outline-container-X) into
+    the Sh/Ss contract with stable text-derived anchors; keep everything else verbatim."""
+
+    def __init__(self, idmap, title):
+        super().__init__(convert_charrefs=False)
+        self.idmap, self.title = idmap, title
+        self.out, self.stack, self.in_heading, self.heading_level = [], [], None, 2
+
+    def handle_starttag(self, tag, attrs):
+        d = dict(attrs)
+        if tag in ("div", "section"):
+            m = OUTLINE_RE.match(d.get("id", ""))
+            if m and m.group(1) in self.idmap:
+                level, slug = self.idmap[m.group(1)]
+                cls = "Sh" if level == 1 else "Ss"
+                self.out.append(f'<section class="{cls}" id="{slug}" data-level="{level}">')
+                self.stack.append("section")
+                return
+            self.stack.append(tag)
+        if tag in ("h1", "h2", "h3", "h4", "h5", "h6") and d.get("id") in self.idmap:
+            level, slug = self.idmap[d["id"]]
+            cls, htag = ("Sh", "h1") if level == 1 else ("Ss", "h2")
+            self.out.append(f'<{htag} class="{cls}" id="{slug}">')
+            self.in_heading, self.heading_level = tag, level
+            return
+        text = self.get_starttag_text()
+        for k, v in attrs:
+            if k == "href" and v and v.startswith("#") and v[1:] in self.idmap:
+                text = text.replace(f'"{v}"', f'"#{self.idmap[v[1:]][1]}"')
+        self.out.append(text)
+
+    def handle_startendtag(self, tag, attrs):
+        self.out.append(self.get_starttag_text())
+
+    def handle_endtag(self, tag):
+        if self.in_heading == tag:
+            self.out.append("</h1>" if self.heading_level == 1 else "</h2>")
+            self.in_heading = None
+            return
+        if tag in ("div", "section") and self.stack:
+            self.out.append(f"</{self.stack.pop()}>")
+            return
+        self.out.append(f"</{tag}>")
+
+    def handle_data(self, data):
+        self.out.append(data)
+
+    def handle_entityref(self, name):
+        self.out.append(f"&{name};")
+
+    def handle_charref(self, name):
+        self.out.append(f"&#{name};")
+
+
+def sectionize_org(body, title):
+    """Turn ox-html body output into the Sh/Ss contract."""
+    seen, idmap = set(), {}
+    levels = {}
+    for m in re.finditer(r'<(?:div|section) id="outline-container-([^"]+)" class="outline-(\d+)"', body):
+        levels[m.group(1)] = int(m.group(2)) - 1      # outline-2 is org level 1
+    for m in re.finditer(r'<h([1-6]) id="([^"]+)">(.*?)</h\1>', body, re.S):
+        if m.group(2) in levels:
+            idmap[m.group(2)] = (levels[m.group(2)], slugify(TAG_RE.sub("", m.group(3)), seen))
+    first = re.search(r'<(?:div|section) id="outline-container-', body)
+    lead = body[:first.start()] if first else body
+    rest = body[first.start():] if first else ""
+    out = []
+    if lead.strip():
+        slug = slugify(title, seen)
+        out.append(section_open(1, slug, htmllib.escape(title)) + lead + "</section>")
+    rw = OrgRewriter(idmap, title)
+    rw.feed(rest)
+    rw.close()
+    out.append("".join(rw.out))
+    return "".join(out)
+
+
+def discover_docs(mode, roots, base, excludes, max_bytes):
+    """Return (pages, skipped) where pages is [(rel, path)] sorted by rel and skipped
+    maps reason -> list of rel paths. Never follows symlinks."""
+    suffix, pages, skipped, seen = DOC_SUFFIX[mode], [], {"symlink": [], "oversize": [], "excluded": []}, set()
+    base = os.path.abspath(base)
+
+    def relpath(path):
+        return Path(os.path.relpath(os.path.abspath(path), base)).as_posix()
+
+    def excluded(rel):
+        parts = rel.split("/")
+        return any(fnmatch.fnmatch(rel, g) or any(fnmatch.fnmatch(x, g) for x in parts) for g in excludes)
+
+    def consider(path):
+        rel = relpath(path)
+        if path.is_symlink():
+            skipped["symlink"].append(rel)
+        elif excluded(rel):
+            skipped["excluded"].append(rel)
+        elif path.stat().st_size > max_bytes:
+            skipped["oversize"].append(rel)
+        elif rel not in seen:
+            seen.add(rel)
+            pages.append((rel, path))
+
+    for root in roots:
+        root = Path(root)
+        if root.is_file() and not root.is_symlink():
+            if root.name.endswith(suffix):
+                consider(root)
+            continue
+        for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
+            keep = []
+            for name in sorted(dirnames):
+                full = Path(dirpath) / name
+                if name.startswith(".") or name in DOC_SKIP_DIRS:
+                    continue
+                if full.is_symlink():
+                    skipped["symlink"].append(relpath(full))
+                    continue
+                if excluded(relpath(full)):
+                    skipped["excluded"].append(relpath(full) + "/")
+                    continue
+                keep.append(name)
+            dirnames[:] = keep
+            for name in sorted(filenames):
+                if name.endswith(suffix) and not name.startswith("."):
+                    consider(Path(dirpath) / name)
+    return sorted(pages), skipped
+
+
+def find_emacs():
+    found = shutil.which("emacs")
+    if found:
+        return found
+    guix = Path.home() / ".guix-extra-profiles/core/core/bin/emacs"
+    return str(guix) if guix.exists() else None
+
+
+def doc_title(mode, src_text, rel):
+    if mode == "org":
+        m = re.search(r"^#\+TITLE:\s*(.+)$", src_text, re.M | re.I)
+        if m:
+            return m.group(1).strip()
+    return rel
+
+
+def render_docs(args):
+    mode = args.mode
+    roots = [Path(r) for r in args.roots]
+    if args.base:
+        base = Path(args.base)
+    elif len(roots) == 1 and roots[0].is_dir():
+        base = roots[0]
+    else:
+        sys.exit("dotcortex-docset-gen: --base is required with several roots or a file root")
+    for r in roots:
+        try:
+            r.resolve().relative_to(base.resolve())
+        except ValueError:
+            sys.exit(f"dotcortex-docset-gen: root {r} is outside --base {base}")
+    pages, skipped = discover_docs(mode, roots, base, args.exclude, args.max_bytes)
+    names = {}
+    for rel, _ in pages:
+        html = rel.replace("/", "__") + ".html"
+        if html in names:
+            sys.exit(f"dotcortex-docset-gen: page name collision: {rel} and {names[html]}")
+        names[html] = rel
+
+    out = Path(args.out)
+    docs = out / "Contents/Resources/Documents"
+    docs.mkdir(parents=True, exist_ok=True)
+    manifest_path = out / "Contents/.build-manifest.json"
+    manifest = {}
+    if manifest_path.is_file():
+        try:
+            manifest = json.loads(manifest_path.read_text())
+        except (json.JSONDecodeError, OSError):
+            manifest = {}
+    if manifest.get("__renderer__") != DOC_RENDERER:
+        manifest = {}
+    ident = re.sub(r"[^a-z0-9]+", "-", args.name.lower()).strip("-")
+    (out / "Contents/Info.plist").write_text(PLIST.format(ident=ident, name=args.name, keyword=args.keyword))
+    (docs / "style.css").write_text(CSS)
+
+    new_manifest = {"__renderer__": DOC_RENDERER}
+    stale, entries, skipped_n, failed = [], [], 0, []
+    for rel, path in pages:
+        html = rel.replace("/", "__") + ".html"
+        st = path.stat()
+        stamp = [st.st_mtime, st.st_size]
+        new_manifest[rel] = stamp
+        if manifest.get(rel) == stamp and (docs / html).is_file():
+            skipped_n += 1
+            entries.append((rel, "Guide", html))
+        else:
+            stale.append((rel, path, html))
+
+    rendered = 0
+    if stale and mode == "org":
+        emacs = find_emacs()
+        if not emacs:
+            sys.exit("dotcortex-docset-gen: emacs not found (Guix core profile provides it)")
+        with tempfile.TemporaryDirectory(prefix="dotcortex-docs-") as tmp:
+            tmp = Path(tmp)
+            jobs = tmp / "jobs.tsv"
+            jobs.write_text("".join(f"{path}\t{tmp / (html + '.body')}\n" for _, path, html in stale))
+            env = dict(os.environ, DOTCORTEX_DOCS_JOBS=str(jobs))
+            proc = subprocess.run([emacs, "--batch", "-Q", "--eval", ORG_JOB_ELISP],
+                                  env=env, capture_output=True, text=True, timeout=args.timeout)
+            for line in proc.stdout.splitlines():
+                if line.startswith("FAIL\t"):
+                    print(line, file=sys.stderr)
+            for rel, path, html in stale:
+                body_file = tmp / (html + ".body")
+                if not body_file.is_file():
+                    failed.append(rel)
+                    new_manifest.pop(rel, None)
+                    continue
+                title = doc_title(mode, path.read_text(errors="replace"), rel)
+                (docs / html).write_text(wrap_page(title, sectionize_org(body_file.read_text(), title)))
+                entries.append((rel, "Guide", html))
+                rendered += 1
+    elif stale and mode == "md":
+        try:
+            import markdown
+        except ImportError:
+            sys.exit("dotcortex-docset-gen: python 'markdown' module not importable "
+                     "(HelmCortex hosts: run with the helmcortex conda python)")
+        for rel, path, html in stale:
+            text = path.read_text(errors="replace")
+            body = markdown.markdown(text, extensions=["extra", "sane_lists"])
+            title = doc_title(mode, text, rel)
+            (docs / html).write_text(wrap_page(title, sectionize_flat(body, title)))
+            entries.append((rel, "Guide", html))
+            rendered += 1
+
+    valid = {html for _, _, html in entries}
+    for f in docs.glob("*.html"):
+        if f.name not in valid and f.name != "index.html":
+            f.unlink()
+    db = out / "Contents/Resources/docSet.dsidx"
+    db.unlink(missing_ok=True)
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE searchIndex(id INTEGER PRIMARY KEY, name TEXT, type TEXT, path TEXT)")
+    con.execute("CREATE UNIQUE INDEX anchor ON searchIndex (name, type, path)")
+    con.executemany("INSERT OR IGNORE INTO searchIndex(name, type, path) VALUES (?, ?, ?)", entries)
+    con.commit()
+    con.close()
+    (docs / "index.html").write_text(f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>{htmllib.escape(args.name)}</title><link rel="stylesheet" href="style.css"></head><body>
+<h1>{htmllib.escape(args.name)}</h1>
+<p>{len(entries)} documents, generated {datetime.now():%Y-%m-%d %H:%M} by dotcortex-docset-gen ({mode}).</p>
+</body></html>""")
+    manifest_path.write_text(json.dumps(new_manifest))
+    note = "".join(f", {len(v)} {k}" for k, v in skipped.items() if v)
+    print(f"{args.name}: {len(entries)} entries ({rendered} rendered, {skipped_n} cached, {len(failed)} failed{note})")
+    if skipped["oversize"]:
+        print("oversize: " + ", ".join(skipped["oversize"]), file=sys.stderr)
+    if failed:
+        print("failed: " + ", ".join(failed), file=sys.stderr)
+        sys.exit(1)
+
+
+def wrap_page(title, body):
+    return (f'<!DOCTYPE html><html><head><meta charset="utf-8"><title>{htmllib.escape(title)}</title>'
+            f'<link rel="stylesheet" href="style.css"></head><body>{body}</body></html>')
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["man"])
+    ap.add_argument("mode", choices=["man", "org", "md"])
     ap.add_argument("--name", required=True)
     ap.add_argument("--keyword", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--icon-dir", default=str(Path.home() / ".local/share/icons/Chicago95/apps"))
+    ap.add_argument("--base", help="org/md: directory page names are relative to")
+    ap.add_argument("--exclude", action="append", default=[],
+                    help="org/md: fnmatch glob on a relative path or any path component (repeatable)")
+    ap.add_argument("--max-bytes", type=int, default=2_000_000, help="org/md: skip larger files (reported)")
+    ap.add_argument("--timeout", type=int, default=1800, help="org: emacs batch deadline in seconds")
     ap.add_argument("roots", nargs="+")
     args = ap.parse_args()
 
+    if args.mode in DOC_SUFFIX:
+        return render_docs(args)
     if shutil.which("mandoc") is None:
         sys.exit("dotcortex-docset-gen: mandoc not on PATH (run via dotcortex-docs-build, which wraps guix shell)")
 
@@ -459,7 +817,7 @@ Usage:
   dotcortex-help-query search "<query>" [--docset NAME] [--limit N] [--corpus PATH]
   dotcortex-help-query read <chunk-id> [--corpus PATH]
 """
-import argparse, json, sqlite3, sys
+import argparse, json, re, sqlite3, sys
 from pathlib import Path
 
 DEFAULT_CORPUS = Path.home() / ".local/share/dotcortex/help/help-corpus.sqlite"
@@ -482,13 +840,23 @@ def cmd_search(con, query, docset, limit):
     JOIN documents d ON d.id = c.document_id
     WHERE chunks_fts MATCH ?
     """
-    params = [query]
+    tail, tail_params = "", []
     if docset:
-        sql += " AND d.docset = ?"
-        params.append(docset)
-    sql += " ORDER BY score LIMIT ?"
-    params.append(limit)
-    rows = con.execute(sql, params).fetchall()
+        tail += " AND d.docset = ?"
+        tail_params.append(docset)
+    tail += " ORDER BY score LIMIT ?"
+    tail_params.append(limit)
+    try:
+        rows = con.execute(sql + tail, [query] + tail_params).fetchall()
+    except sqlite3.OperationalError:
+        # Not valid FTS5 syntax: a hyphenated command name parses as a column filter
+        # ("no such column: help") and "why use chmod 2755?" is a syntax error. Retry
+        # the same words as quoted tokens joined by OR; bm25 still ranks rare terms first.
+        tokens = list(dict.fromkeys(re.findall(r"[A-Za-z0-9_]+", query)))[:12]
+        if not tokens:
+            return []
+        fallback = " OR ".join(f'"{t}"' for t in tokens)
+        rows = con.execute(sql + tail, [fallback] + tail_params).fetchall()
     return [
         {"docset": r[0], "name": r[1], "type": r[2], "path": r[3],
          "chunk_id": r[4], "anchor": r[5], "heading": r[6], "snippet": r[7]}
