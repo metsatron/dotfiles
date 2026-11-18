@@ -91,10 +91,16 @@ class RecallTests(unittest.TestCase):
         recall.LOG = self.dir / 'recall.jsonl'  # never write the live log
         self.sweep_args = {}
 
-    def transcript(self, *, anchor=100, tools=('Bash',)):
-        rows = [{'message': {'content': [{'type': 'text', 'text': f'<channel source="telegram" chat_id="{CHAT}" message_id="{anchor - 1}">hi</channel>'}]}},
-                {'message': {'content': [{'type': 'tool_result', 'tool_use_id': 'old', 'content': f'sent (id: {anchor})'}]}},
-                {'message': {'content': [{'type': 'tool_use', 'id': 'old', 'name': 'x', 'input': {}}]}}]
+    def transcript(self, *, anchor=100, tools=('Bash',), extra=()):
+        # The shapes Claude Code writes: a channel-origin user row for the
+        # inbound message, then the reply tool's call and its result.
+        rows = [{'type': 'user', 'isMeta': True, 'origin': {'kind': 'channel', 'server': 'plugin:telegram:telegram'},
+                 'message': {'role': 'user', 'content': f'<channel source="plugin:telegram:telegram" chat_id="{CHAT}" message_id="{anchor - 1}" user="op">\nhi\n</channel>'}},
+                {'type': 'assistant', 'message': {'id': 'reply-turn', 'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': 'old', 'name': 'mcp__plugin_telegram_telegram__reply', 'input': {}}]}},
+                {'type': 'user', 'message': {'role': 'user', 'content': [
+                    {'type': 'tool_result', 'tool_use_id': 'old', 'content': [{'type': 'text', 'text': f'sent (id: {anchor})'}]}]}},
+                *extra]
         for index, name in enumerate(tools):
             rows.append({'message': {'content': [{'type': 'tool_use', 'id': f'open{index}', 'name': name, 'input': {}}]}})
         path = self.dir / 'transcript.jsonl'
@@ -355,6 +361,64 @@ class ClearOpenTests(unittest.TestCase):
         recall._save_mark(hashlib_key(), 85)
         self.assertEqual(recall.clear_after_allow(event, state_dir=self.state, base=fake.base), [90, 92, 99])
         self.assertTrue(fake.messages[103]['buttons'] and fake.messages[104]['buttons'])
+
+    def test_mark_reset_lowers_a_mark_that_ran_past_the_chat(self):
+        recall._save_mark(hashlib_key(), 12172)
+        recall._save_mark(hashlib_key(), 85)  # the ordinary path only raises
+        self.assertEqual(recall._marks()[hashlib_key()], 12172)
+        self.assertEqual(recall.reset_mark(self.state, 85), 12172)
+        self.assertEqual(recall._marks()[hashlib_key()], 85)
+        fake = self.chat()
+        event = {'session_id': 's', 'tool_name': 'Bash', 'transcript_path': self.transcript(anchor=100)}
+        self.assertEqual(recall.clear_after_allow(event, state_dir=self.state, base=fake.base), [90, 92, 99])
+
+
+class AnchorProvenanceTests(unittest.TestCase):
+    """2026-11-18: an id quoted in a file read became Auryn's anchor and stalled the janitor."""
+
+    def setUp(self):
+        RecallTests.setUp(self)
+
+    transcript = RecallTests.transcript
+
+    def anchor(self, *extra, anchor=100):
+        return recall._anchor(Path(self.transcript(anchor=anchor, tools=(), extra=extra)).read_text())
+
+    @staticmethod
+    def result(use_id, name, text):
+        return [{'type': 'assistant', 'message': {'id': 'm-' + use_id, 'role': 'assistant', 'content': [
+                    {'type': 'tool_use', 'id': use_id, 'name': name, 'input': {}}]}},
+                {'type': 'user', 'message': {'role': 'user', 'content': [
+                    {'type': 'tool_result', 'tool_use_id': use_id, 'content': [{'type': 'text', 'text': text}]}]}}]
+
+    def test_own_inbound_and_reply_set_the_anchor(self):
+        self.assertEqual(self.anchor(), 100)
+
+    def test_enqueued_channel_message_moves_the_anchor(self):
+        row = {'type': 'queue-operation', 'operation': 'enqueue',
+               'content': f'<channel source="plugin:telegram:telegram" chat_id="{CHAT}" message_id="104" user="op">\nyo'}
+        self.assertEqual(self.anchor(row), 104)
+
+    def test_multi_part_reply_moves_the_anchor_to_its_last_part(self):
+        self.assertEqual(self.anchor(*self.result('r2', recall.REPLY_TOOL, 'sent 3 parts (ids: 101, 102, 103)')), 103)
+
+    def test_quoted_sent_id_in_a_file_read_never_moves_the_anchor(self):
+        quoted = 'Telegram reply 12171 (result `sent (id: 12171)`) and Telegram (12155 and 12171)'
+        self.assertEqual(self.anchor(*self.result('x1', 'Read', quoted), *self.result('x2', 'Read', 'sent (id: 12171)')), 100)
+
+    def test_quoted_channel_tag_in_a_tool_result_never_moves_the_anchor(self):
+        tag = f'<channel source="plugin:telegram:telegram" chat_id="{CHAT}" message_id="12171">'
+        self.assertEqual(self.anchor(*self.result('x1', 'Bash', tag)), 100)
+
+    def test_quoted_ids_in_typed_text_or_a_summary_never_move_the_anchor(self):
+        typed = {'type': 'user', 'message': {'role': 'user', 'content':
+                 f'look: <channel source="plugin:telegram:telegram" chat_id="{CHAT}" message_id="12171"> and sent (id: 12350)'}}
+        self.assertEqual(self.anchor(typed), 100)
+
+    def test_no_telegram_traffic_means_no_anchor(self):
+        path = self.dir / 'bare.jsonl'
+        path.write_text('\n'.join(json.dumps(row) for row in self.result('x', 'Read', 'sent (id: 9)')) + '\n')
+        self.assertIsNone(recall._anchor(path.read_text()))
 
 
 def hashlib_key():

@@ -20,10 +20,16 @@ SWEEP_SECONDS = 8.0
 SETTLE_SECONDS = 3.0  # our prompt is posted while the hook runs; the next request comes later
 PROBE_AHEAD = 12  # buttonless gaps only; a buttoned message ends the sweep
 TAIL_BYTES = 4 * 1024 * 1024
-ANCHOR_RES = (
-    re.compile(r'message_id=\\?"(\d+)\\?"'),
-    re.compile(r'sent \(id: (\d+)\)'),
-)
+# The anchor is read by provenance, never by matching numbers anywhere in the
+# transcript: on 2026-11-18 Auryn read a Fable handoff quoting
+# "sent (id: 12171)", the regex took Fable's chat id as Auryn's newest message,
+# and every later sweep and clear looked above 12171 in a chat whose ids were
+# near 5600. Chat id cannot separate the two chats either: every bot DMs the
+# same operator, so every seat's chat has the same chat_id.
+REPLY_TOOL = 'mcp__plugin_telegram_telegram__reply'
+CHANNEL_SERVERS = ('plugin:telegram:telegram',)
+CHANNEL_TAG_RE = re.compile(r'\A\s*<channel source="(?:plugin:telegram:)?telegram"[^>]*\smessage_id="(\d+)"')
+SENT_RE = re.compile(r'\Asent (?:\(id: (\d+)\)|\d+ parts \(ids: ([\d, ]+)\))\s*\Z')
 LOG = Path(os.path.expanduser('~/.local/state/dotcortex/telegram-permission-recall.jsonl'))
 # Per bot and chat: the lowest message id not yet checked for an open card.
 CLEAR_STATE = Path(os.path.expanduser('~/.local/state/dotcortex/telegram-permission-clear.json'))
@@ -75,8 +81,57 @@ def _transcript_tail(path):
     return data if size <= TAIL_BYTES else data.split('\n', 1)[-1]
 
 
+def _texts(content):
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        return [block.get('text', '') for block in content
+                if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str)]
+    return []
+
+
 def _anchor(tail):
-    ids = [int(m) for regex in ANCHOR_RES for m in regex.findall(tail)]
+    """Newest Telegram message id this session's own chat produced.
+
+    Inbound: a channel-origin user row, or a queue-operation enqueue, whose
+    content opens with the channel tag. Outbound: a tool_result answering a
+    tool_use of the Telegram reply tool. Ids quoted anywhere else (a file
+    read, a mail, a log, a compaction summary) are ignored."""
+    ids, reply_uses = [], set()
+    for line in (tail or '').splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        if row.get('type') == 'queue-operation' and row.get('operation') == 'enqueue':
+            content = row.get('content')
+            match = CHANNEL_TAG_RE.match(content) if isinstance(content, str) else None
+            if match:
+                ids.append(int(match.group(1)))
+            continue
+        message = row.get('message') if isinstance(row.get('message'), dict) else {}
+        content = message.get('content')
+        origin = row.get('origin') if isinstance(row.get('origin'), dict) else {}
+        if row.get('type') == 'user' and origin.get('kind') == 'channel' and origin.get('server') in CHANNEL_SERVERS:
+            for text in _texts(content):
+                match = CHANNEL_TAG_RE.match(text)
+                if match:
+                    ids.append(int(match.group(1)))
+            continue
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get('type') == 'tool_use' and block.get('name') == REPLY_TOOL:
+                reply_uses.add(block.get('id'))
+            elif block.get('type') == 'tool_result' and block.get('tool_use_id') in reply_uses:
+                for text in _texts(block.get('content')):
+                    match = SENT_RE.match(text.strip())
+                    if match:
+                        ids.extend(int(part) for part in (match.group(1) or match.group(2)).replace(' ', '').split(',') if part)
     return max(ids) if ids else None
 
 
@@ -403,6 +458,27 @@ def _save_mark(key, value):
         pass
 
 
+def reset_mark(state_dir, value):
+    """Set a bot's clear mark to value, lower or higher. Operator-run only.
+
+    _save_mark only raises a mark, so a mark pushed too far (2026-11-18:
+    Auryn's bot at 12172 after a quoted id became its anchor) could never come
+    back down by itself and every later clear checked nothing."""
+    token, chat = _token(state_dir), _chat(state_dir)
+    if not token or not chat or type(value) is not int or value < 1:
+        raise ValueError('state dir has no bot token or single chat, or the id is not positive')
+    key = hashlib.sha256((token + ':' + chat).encode()).hexdigest()[:16]
+    marks = _marks()
+    before = marks.get(key)
+    marks[key] = value
+    CLEAR_STATE.parent.mkdir(parents=True, exist_ok=True)
+    temp = CLEAR_STATE.with_name(CLEAR_STATE.name + f'.{os.getpid()}.tmp')
+    temp.write_text(json.dumps(marks, sort_keys=True) + '\n', encoding='utf-8')
+    os.replace(temp, CLEAR_STATE)
+    _log(session='manual', action='mark_reset', before=before, after=value)
+    return before
+
+
 def clear_open(session, ceiling, *, state_dir, base, sleep=time.sleep, start=None, limit=CLEAR_LIMIT):
     """Delete every permission card that still has buttons, up to ceiling.
 
@@ -487,6 +563,19 @@ def clear_after_allow(event, *, state_dir, base, sleep=time.sleep):
 
 
 def main(argv):
+    if len(argv)==3 and argv[1]=='--reset-mark':
+        # Manual repair: --reset-mark <next-id>, TELEGRAM_STATE_DIR set.
+        state = os.environ.get('TELEGRAM_STATE_DIR')
+        if not state or not argv[2].isdecimal():
+            print('usage: TELEGRAM_STATE_DIR=<dir> telegram_permission_recall.py --reset-mark <next-id>', file=sys.stderr)
+            return 2
+        try:
+            before = reset_mark(Path(state), int(argv[2]))
+        except (OSError, ValueError) as error:
+            print(f'reset-mark refused: {error}', file=sys.stderr)
+            return 1
+        print(json.dumps({'before': before, 'after': int(argv[2])}))
+        return 0
     if len(argv)==4 and argv[1]=='--clear':
         # Manual backlog clear: --clear <first-id> <ceiling-id>, TELEGRAM_STATE_DIR set.
         state = os.environ.get('TELEGRAM_STATE_DIR')
