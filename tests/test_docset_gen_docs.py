@@ -246,6 +246,18 @@ class QueryRobustness(unittest.TestCase):
         hits = self.search("How do I export a conversation?")
         self.assertTrue(hits[0]["path"].startswith("Export.md"), [h["path"] for h in hits])
 
+    def test_plain_words_that_do_not_all_co_occur_are_relaxed_not_empty(self):
+        # "chmod" and "setgid" are in the page; "numeric" is not in any chunk. Implicit AND would
+        # return nothing; the relaxed query ranks the chunk that has the most of them.
+        hits = self.search("chmod setgid numeric")
+        self.assertTrue(hits, "an implicit-AND miss must fall back to any-word matching")
+        self.assertEqual(hits[0]["heading"], "Build")
+
+    def test_an_explicit_boolean_query_is_never_relaxed(self):
+        self.assertEqual(self.search("chmod AND numericxyz"), [])
+        self.assertEqual(self.search('"chmod numericxyz"'), [])
+        self.assertEqual(self.search("chmod NOT setgid"), [])
+
     def test_punctuation_only_returns_empty_not_error(self):
         self.assertEqual(self.search("?!"), [])
 
