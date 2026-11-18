@@ -693,6 +693,12 @@ OFFLINE_COMPACT_GROUP_MIN_SAVING_CHARS = env_int(
     "CLAUDE_IDLE_COMPACT_GROUP_MIN_SAVING_CHARS", 400, 0
 )
 OFFLINE_COMPACT_PROJECT = os.environ.get("CLAUDE_IDLE_COMPACT_PROJECT", "")
+# Older PROSE (a human turn, an assistant turn, a tool call's arguments) may leave
+# the working copy too -- as a pointer into the retained transcript, with the text
+# byte-exact in the index.  Off by default: eliding tool output was always safe,
+# moving a human word out of the working set is a decision, so it is opt-in per
+# seat until the numbers are accepted.
+OFFLINE_COMPACT_FOLD_PROSE = env_int("CLAUDE_IDLE_COMPACT_FOLD_PROSE", 0, 0)
 OFFLINE_COMPACT_STOP_GRACE_SECONDS = env_float(
     "CLAUDE_IDLE_COMPACT_STOP_GRACE_SECONDS", 5.0, 0.1
 )
@@ -4617,6 +4623,7 @@ class Supervisor:
                 harness=harness,
                 pointer_source=str(source),
                 group_pointers=bool(OFFLINE_COMPACT_GROUP_POINTERS),
+                fold_prose=bool(OFFLINE_COMPACT_FOLD_PROSE),
                 group_min_saving_chars=OFFLINE_COMPACT_GROUP_MIN_SAVING_CHARS,
                 project=OFFLINE_COMPACT_PROJECT or (source.parent.name if source.parent else ""),
             )
@@ -6029,6 +6036,8 @@ def main(argv: list[str]) -> int:
         print("CLAUDE_IDLE_COMPACT_GROUP_POINTERS=1|0 (group elisions by task into one")
         print("  summarised stub that points at a group in the index; only when it saves),")
         print("CLAUDE_IDLE_COMPACT_GROUP_MIN_SAVING_CHARS, CLAUDE_IDLE_COMPACT_PROJECT,")
+        print("CLAUDE_IDLE_COMPACT_FOLD_PROSE=1|0 (older prose and tool arguments leave the")
+        print("  working copy as indexed pointers; the recent tail stays verbatim),")
         print("CLAUDE_PROJECTS_DIR, CLAUDE_IDLE_COMPACT_STATE_DIR, CLAUDE_WARM_OFFLINE_COMPACT_MODULE")
         print("CLAUDE_IDLE_COMPACT_AGENT_FAMILY=claude|codex, CLAUDE_IDLE_COMPACT_SCOPE=helmcortex|dotcortex,")
         print("CLAUDE_IDLE_COMPACT_HARNESS_TOKENS (override), CLAUDE_IDLE_COMPACT_HARNESS_INDEX_TOKENS")
@@ -7441,6 +7450,48 @@ class CompactResult:
 # --------------------------------------------------------------------------
 
 
+PROSE_BLOCK_TYPES = ("text", "tool_use")
+
+
+def block_text(part: dict) -> str:
+    """The text a block carries, whatever kind of block it is.
+
+    Tool output lives in ``content``; prose lives in ``text``; a tool call's
+    arguments live in ``input``.  Folding an old prose turn or an old tool call
+    needs all three, so the extractor speaks for all three instead of pretending
+    every block is a tool result.
+    """
+    kind = part.get("type")
+    if kind == "tool_result":
+        return text_of_part(part)
+    if kind == "text":
+        value = part.get("text")
+        return value if isinstance(value, str) else ""
+    if kind == "tool_use":
+        return json.dumps(part.get("input") or {}, ensure_ascii=False, sort_keys=True)
+    return ""
+
+
+def staged_stub(part: dict, stub: str) -> dict:
+    """The block with its text replaced by a pointer, in the field that held it.
+
+    A tool_result keeps its ``content`` key, a text block keeps ``text``, and a
+    tool call keeps a structurally valid ``input`` whose only member is the
+    pointer -- so the record still parses as a tool call while carrying no prose.
+    """
+    kind = part.get("type")
+    out = {key: value for key, value in part.items()}
+    if kind == "tool_use":
+        out["input"] = {"_elided_pointer": stub}
+        return out
+    if kind == "text":
+        out["text"] = stub
+        return out
+    out.pop("content", None)
+    out["content"] = stub
+    return out
+
+
 def text_of_part(part: dict) -> str:
     content = part.get("content")
     if isinstance(content, str):
@@ -7461,11 +7512,15 @@ def all_text(record: dict) -> int:
     total = 0
     if isinstance(content, list):
         for part in content:
-            if isinstance(part, dict):
-                if isinstance(part.get("text"), str):
-                    total += len(part["text"])
-                else:
-                    total += len(text_of_part(part))
+            if not isinstance(part, dict):
+                continue
+            if part.get("type") == "tool_use":
+                # A tool call's arguments are prose the model reads back too.
+                total += len(block_text(part))
+            elif isinstance(part.get("text"), str):
+                total += len(part["text"])
+            else:
+                total += len(text_of_part(part))
     return total
 
 
@@ -7684,6 +7739,10 @@ class ElisionIndex:
         return [
             {"key": row[0], "line": row[1], "uuid": row[2], "chars": row[3]} for row in rows
         ]
+
+    def body(self, key: str) -> str | None:
+        row = self.connection.execute("SELECT body FROM elided WHERE key = ?", (key,)).fetchone()
+        return None if row is None else row[0]
 
     def has_group(self, gid: str) -> bool:
         row = self.connection.execute(
@@ -8205,6 +8264,7 @@ def elidable_candidates(
     keep_recent_records: int,
     stub_over_chars: int,
     excerpt_chars: int = DEFAULT_DECIDER_EXCERPT_CHARS,
+    include_prose: bool = False,
 ) -> list[Candidate]:
     boundary = max(0, len(records) - max(0, keep_recent_records))
     found: list[Candidate] = []
@@ -8216,9 +8276,10 @@ def elidable_candidates(
         if not isinstance(content, list):
             continue
         for block_index, part in enumerate(content):
-            if not isinstance(part, dict) or part.get("type") != "tool_result":
+            kinds = ("tool_result",) + (PROSE_BLOCK_TYPES if include_prose else ())
+            if not isinstance(part, dict) or part.get("type") not in kinds:
                 continue
-            text = text_of_part(part)
+            text = block_text(part)
             if len(text) <= stub_over_chars:
                 continue
             excerpt = "\n".join(text.splitlines()[:6])[:excerpt_chars]
@@ -8386,7 +8447,11 @@ def verify_pointers(path: Path, pointers: list[dict]) -> list[dict]:
                             {"line": number, "key": pointer.get("key"), "reason": "block-missing"}
                         )
                         continue
-                    found_chars = len(text_of_part(content[block_index]))
+                    # Measure the same text the compactor folded: a prose
+                    # block's text and a tool call's arguments are not in
+                    # ``content``, and counting them as zero would flag every
+                    # honest prose pointer as a lie.
+                    found_chars = len(block_text(content[block_index]))
                     if found_chars != int(pointer.get("chars", -1)):
                         mismatches.append(
                             {
@@ -8698,6 +8763,7 @@ def compact(
     harness: dict | None = None,
     pointer_source: str | None = None,
     group_pointers: bool = False,
+    fold_prose: bool = False,
     group_min_members: int = POINTER_GROUP_MIN_MEMBERS,
     group_min_saving_chars: int = POINTER_GROUP_MIN_SAVING_CHARS,
     project: str = "",
@@ -8774,8 +8840,11 @@ def compact(
         }
     )
 
-    candidates = elidable_candidates(records, keep_recent_records, stub_over_chars)
+    candidates = elidable_candidates(
+        records, keep_recent_records, stub_over_chars, include_prose=fold_prose
+    )
     report["elidable_candidates"] = len(candidates)
+    report["fold_prose"] = bool(fold_prose)
 
     if candidates and ranker is not None:
         outcome = ranker.rank(candidates)
@@ -8824,7 +8893,7 @@ def compact(
             if isinstance(content, list) and 0 <= candidate.block_index < len(content):
                 part = content[candidate.block_index]
             if isinstance(part, dict):
-                grouping_texts[candidate.key] = text_of_part(part)
+                grouping_texts[candidate.key] = block_text(part)
         groups, group_plan = build_pointer_groups(
             rows,
             chosen,
@@ -8846,6 +8915,8 @@ def compact(
 
     elided = 0
     pointers: list[dict] = []
+    relocated_human: list[dict] = []
+    folded_prose = 0
     try:
         # The group summaries exist before any block may point at them.
         for group in groups:
@@ -8859,7 +8930,7 @@ def compact(
                         candidate = chosen_keys.get("r{}-{}".format(position, block_index))
                         if candidate is None or not isinstance(part, dict):
                             continue
-                        text = text_of_part(part)
+                        text = block_text(part)
                         # 1. durable archive + FTS row, COMMITTED;
                         # 2. only then may the record lose the text.
                         index.add(candidate.key, text)
@@ -8878,10 +8949,19 @@ def compact(
                             )
                         else:
                             stub = _stub_text(candidate, text, line_number, pointer_name)
-                        content[block_index] = {
-                            key: value for key, value in part.items() if key != "content"
-                        }
-                        content[block_index]["content"] = stub
+                        # The pointer goes back into the field that held the
+                        # text (content / text / input), so the record still
+                        # parses as the kind of block it was.
+                        content[block_index] = staged_stub(part, stub)
+                        kind = part.get("type")
+                        if kind in PROSE_BLOCK_TYPES:
+                            folded_prose += 1
+                        # Only PROSE moves a human word: a tool_result in a
+                        # user record is tool output, not something he typed.
+                        if kind == "text" and isinstance(message, dict) and message.get("role") == "user":
+                            relocated_human.append(
+                                {"key": candidate.key, "chars": len(text), "kind": kind}
+                            )
                         # The line the TEXT names, not the line we meant to name:
                         # verification must judge what the agent will actually
                         # read, so a stub that misstates its line is caught here.
@@ -8902,6 +8982,9 @@ def compact(
                 handle.write(json.dumps(record) + "\n")
                 handle.flush()
         group_mismatches = verify_groups(index, groups) if groups else []
+        relocated_missing = [
+            item["key"] for item in relocated_human if index.body(item["key"]) is None
+        ]
     except (OSError, sqlite3.Error) as error:
         try:
             out.unlink()
@@ -8973,6 +9056,10 @@ def compact(
             "pointer_verification_basis": verification_basis,
             "index_path": str(index_dir),
             "index_entries": elided,
+            "fold_prose": bool(fold_prose),
+            "prose_blocks_folded": folded_prose,
+            "human_blocks_relocated": len(relocated_human),
+            "human_relocation_missing": relocated_missing[:10],
             "pointer_groups": len(groups),
             "pointer_group_blocks": sum(len(group.get("members") or []) for group in groups),
             "pointer_group_stub_chars": sum(len(str(group.get("stub", ""))) for group in groups),
@@ -9006,8 +9093,14 @@ def compact(
     reason = None
     if not report["identity_preserved"]:
         reason = "identity-not-preserved"
-    elif human_changed:
+    elif human_changed and (relocated_missing or not fold_prose):
+        # A human word may leave the working copy only by becoming an indexed
+        # pointer: if the text is not byte-exact in the index, nothing ships.
         reason = "human-words-changed"
+        try:
+            out.unlink()
+        except OSError:
+            pass
     elif len(chain_after) != len(chain_before) or chain_after != chain_before:
         reason = "chain-changed"
     elif pointer_mismatches:
