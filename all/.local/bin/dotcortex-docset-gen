@@ -20,10 +20,11 @@ Rules honoured here:
     chunks per heading exactly as it does for man pages. Symlinks are never
     followed, hidden directories are skipped, and oversize files are reported.
 """
-import argparse, fnmatch, gzip, html as htmllib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile
+import argparse, fnmatch, gzip, hashlib, html as htmllib, json, os, re, shutil, sqlite3, subprocess, sys, tempfile
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 TYPE_MAP = {"1": "Command", "8": "Command", "2": "Function", "3": "Function",
             "9": "Function", "4": "File", "5": "File", "6": "Game", "7": "Guide"}
@@ -98,12 +99,13 @@ def discover(roots):
         yield name, sec, digit, page
 
 
-DOC_RENDERER = "docs-1"
+DOC_RENDERER = "docs-2"
 DOC_SKIP_DIRS = {"node_modules", "__pycache__", "__pycache", ".git"}
 DOC_SUFFIX = {"org": ".org", "md": ".md"}
 OUTLINE_RE = re.compile(r"^outline-container-(.+)$")
 HEADING_RE = re.compile(r"<h([1-6])\b[^>]*>(.*?)</h\1>", re.S)
 TAG_RE = re.compile(r"<[^>]+>")
+HREF_ATTR_RE = re.compile(r'(\bhref=")([^"]+)(")')
 ORG_JOB_ELISP = r"""
 (progn
   (require 'org) (require 'ox-html)
@@ -317,6 +319,38 @@ def doc_title(mode, src_text, rel):
     return rel
 
 
+def build_link_rewriter(pages):
+    """Build a function(src_rel, html_body) that rewrites relative inter-document links
+    (e.g. `./docs/pvox.md#usage` in `FORGE/README.md`, or ox-html's `CODE_OF_SOVEREIGNTY.html`
+    in `README.org`) to the flat docset HTML filenames (`FORGE__docs__pvox.md.html#usage`),
+    leaving external URLs, same-page `#anchor` links, and non-docset targets unchanged."""
+    html_by_rel = {rel: rel.replace("/", "__") + ".html" for rel, _ in pages}
+    stem_to_rel = {os.path.splitext(rel)[0] + ".html": rel for rel, _ in pages}
+
+    def resolve_href(src_rel, raw_href):
+        href = htmllib.unescape(raw_href).strip()
+        if not href or href.startswith("#"):
+            return raw_href
+        parts = urlsplit(href)
+        if parts.scheme or parts.netloc or parts.query or not parts.path:
+            return raw_href
+        joined = os.path.normpath(os.path.join(os.path.dirname(src_rel), unquote(parts.path))).replace(os.sep, "/")
+        if joined.startswith("..") or joined.startswith("/"):
+            return raw_href
+        target_rel = joined if joined in html_by_rel else stem_to_rel.get(joined)
+        if not target_rel:
+            return raw_href
+        out = html_by_rel[target_rel]
+        if parts.fragment:
+            out += "#" + parts.fragment
+        return htmllib.escape(out, quote=True)
+
+    def rewrite(src_rel, body):
+        return HREF_ATTR_RE.sub(lambda m: m.group(1) + resolve_href(src_rel, m.group(2)) + m.group(3), body)
+
+    return rewrite
+
+
 def render_docs(args):
     mode = args.mode
     roots = [Path(r) for r in args.roots]
@@ -338,6 +372,8 @@ def render_docs(args):
         if html in names:
             sys.exit(f"dotcortex-docset-gen: page name collision: {rel} and {names[html]}")
         names[html] = rel
+    rewrite_links = build_link_rewriter(pages)
+    membership = hashlib.sha256("\n".join(rel for rel, _ in pages).encode("utf-8")).hexdigest()[:16]
 
     out = Path(args.out)
     docs = out / "Contents/Resources/Documents"
@@ -349,13 +385,13 @@ def render_docs(args):
             manifest = json.loads(manifest_path.read_text())
         except (json.JSONDecodeError, OSError):
             manifest = {}
-    if manifest.get("__renderer__") != DOC_RENDERER:
+    if manifest.get("__renderer__") != DOC_RENDERER or manifest.get("__pages__") != membership:
         manifest = {}
     ident = re.sub(r"[^a-z0-9]+", "-", args.name.lower()).strip("-")
     (out / "Contents/Info.plist").write_text(PLIST.format(ident=ident, name=args.name, keyword=args.keyword))
     (docs / "style.css").write_text(CSS)
 
-    new_manifest = {"__renderer__": DOC_RENDERER}
+    new_manifest = {"__renderer__": DOC_RENDERER, "__pages__": membership}
     stale, entries, skipped_n, failed = [], [], 0, []
     for rel, path in pages:
         html = rel.replace("/", "__") + ".html"
@@ -390,7 +426,8 @@ def render_docs(args):
                     new_manifest.pop(rel, None)
                     continue
                 title = doc_title(mode, path.read_text(errors="replace"), rel)
-                (docs / html).write_text(wrap_page(title, sectionize_org(body_file.read_text(), title)))
+                sectioned = rewrite_links(rel, sectionize_org(body_file.read_text(), title))
+                (docs / html).write_text(wrap_page(title, sectioned))
                 entries.append((rel, "Guide", html))
                 rendered += 1
     elif stale and mode == "md":
@@ -403,7 +440,8 @@ def render_docs(args):
             text = path.read_text(errors="replace")
             body = markdown.markdown(text, extensions=["extra", "sane_lists"])
             title = doc_title(mode, text, rel)
-            (docs / html).write_text(wrap_page(title, sectionize_flat(body, title)))
+            sectioned = rewrite_links(rel, sectionize_flat(body, title))
+            (docs / html).write_text(wrap_page(title, sectioned))
             entries.append((rel, "Guide", html))
             rendered += 1
 

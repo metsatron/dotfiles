@@ -183,6 +183,16 @@ class OrgMode(Common, unittest.TestCase):
         self.assertIn("my_var_name", html)
         self.assertNotIn("<sub>", html)
 
+    def test_relative_links_rewrite_to_docset_html(self):
+        (self.base / "README.org").write_text(
+            "#+TITLE: Index\n* Links\nSee [[file:Probe.org][Probe]] and [[file:sub/Nested.org::#sub-a][Nested]].\n"
+        )
+        r = run_gen("org", self.out, self.base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        html = (docs_dir(self.out) / "README.org.html").read_text()
+        self.assertIn('href="Probe.org.html"', html)
+        self.assertIn('href="sub__Nested.org.html#sub-a"', html)
+
     def test_a_failing_file_fails_the_run_loudly(self):
         # An unterminated source block with a broken include still exports; a binary file does not.
         (self.base / "Bad.org").write_bytes(b"\xff\xfe\x00\x00" * 4)
@@ -200,6 +210,29 @@ class OrgMode(Common, unittest.TestCase):
 @unittest.skipUnless(HAVE_MD, "python markdown module not importable: md mode untested here")
 class MarkdownMode(Common, unittest.TestCase):
     suffix, text, mode = ".md", MD, "md"
+
+    def test_scope_readme_relative_links_rewrite_to_appendage_html(self):
+        (self.base / "FORGE" / "docs").mkdir(parents=True)
+        (self.base / "README.md").write_text("# Root\n\nSee [FORGE](./FORGE/README.md).\n")
+        (self.base / "FORGE" / "README.md").write_text(
+            "# FORGE\n\n- [Root](../README.md)\n- [pvox](./docs/pvox.md#usage)\n- [missing](./CONTRIBUTING.md)\n"
+        )
+        (self.base / "FORGE" / "docs" / "pvox.md").write_text("# pvox\n\n## Usage\n\nSpeak.\n")
+        r = run_gen("md", self.out, self.base)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        forge_html = (docs_dir(self.out) / "FORGE__README.md.html").read_text()
+        self.assertIn('href="README.md.html"', forge_html)
+        self.assertIn('href="FORGE__docs__pvox.md.html#usage"', forge_html)
+        self.assertIn('href="./CONTRIBUTING.md"', forge_html)
+
+    def test_adding_target_doc_invalidates_cached_index_links(self):
+        (self.base / "README.md").write_text("# Scope\n\nSee [Guide](./docs/guide.md).\n")
+        self.assertEqual(run_gen("md", self.out, self.base).returncode, 0)
+        self.assertIn('href="./docs/guide.md"', (docs_dir(self.out) / "README.md.html").read_text())
+        (self.base / "docs").mkdir()
+        (self.base / "docs" / "guide.md").write_text("# Guide\n\nBody.\n")
+        self.assertEqual(run_gen("md", self.out, self.base).returncode, 0)
+        self.assertIn('href="docs__guide.md.html"', (docs_dir(self.out) / "README.md.html").read_text())
 
 
 @unittest.skipUnless(HAVE_MD, "python markdown module not importable")
