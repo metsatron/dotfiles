@@ -235,6 +235,17 @@ class QueryRobustness(unittest.TestCase):
         self.assertTrue(self.search("chmod AND setgid"))
         self.assertEqual(self.search("chmod AND nonexistentword"), [])
 
+    def test_question_words_do_not_outrank_the_real_match(self):
+        base = Path(self.tmp.name) / "src"
+        (base / "Noise.md").write_text("# Noise\n\nhow do i get started with the calendar\n")
+        (base / "Export.md").write_text("# Export\n\nexport a conversation from the browser\n")
+        out = Path(self.tmp.name) / "G.docset"
+        self.assertEqual(run_gen("md", out, base).returncode, 0)
+        subprocess.run([sys.executable, str(CORPUS), "--docsets-dir", str(Path(self.tmp.name) / "shelf"),
+                        "--out", str(self.db)], check=True, capture_output=True)
+        hits = self.search("How do I export a conversation?")
+        self.assertTrue(hits[0]["path"].startswith("Export.md"), [h["path"] for h in hits])
+
     def test_punctuation_only_returns_empty_not_error(self):
         self.assertEqual(self.search("?!"), [])
 
