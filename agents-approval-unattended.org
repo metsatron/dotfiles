@@ -214,27 +214,53 @@ def _morning_queue_path():
 def _morning_queue_file():
     path = _morning_queue_path()
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
-    try:
-        info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
-            raise OSError('queue is not a private regular file')
-        os.fchmod(fd, 0o600)
-        deadline = time.monotonic() + 1.0
-        while True:
+    deadline = time.monotonic() + 1.0
+    while True:
+        fd = os.open(path, os.O_RDWR | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+                raise OSError('queue is not a private regular file')
+            os.fchmod(fd, 0o600)
+            while True:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError('queue lock deadline')
+                    time.sleep(0.005)
+            # A compaction renames a new file over the path while holding the old
+            # inode's lock: a waiter that wakes on the old inode must reopen, or its
+            # append lands in an unlinked file.
             try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
+                current = os.stat(path)
+            except FileNotFoundError:
+                current = None
+            if current is None or (current.st_ino, current.st_dev) != (info.st_ino, info.st_dev):
                 if time.monotonic() >= deadline:
-                    raise TimeoutError('queue lock deadline')
-                time.sleep(0.005)
-        with os.fdopen(fd, 'a+', encoding='utf-8') as file:
+                    raise TimeoutError('queue replaced during lock wait')
+                os.close(fd)
+                fd = None
+                continue
+            file = os.fdopen(fd, 'a+', encoding='utf-8')
             fd = None
-            yield file
-    finally:
-        if fd is not None:
-            os.close(fd)
+            try:
+                compacted = _queue_compact(file)
+            except Exception:
+                compacted = None
+                _guard_warning('queue-compaction-failed')
+            if compacted is not None:
+                file.close()
+                continue
+            try:
+                yield file
+            finally:
+                file.close()
+            return
+        finally:
+            if fd is not None:
+                os.close(fd)
 
 
 def _normalized_command(command):
@@ -392,9 +418,17 @@ QUEUE_COMPACT_BYTES = 2 * 1024 * 1024
 
 def _queue_compact(file, threshold=None):
     """Fold the journal to its latest revision per id. The caller holds the
-    exclusive queue lock. The whole original is archived and verified first;
-    an unreadable row, a row without an id, or a failed archive leaves the
-    journal untouched. Returns a summary, or None when nothing was done."""
+    exclusive lock on FILE. Order is the crash contract: (1) the whole original
+    is gzipped to an immutable archive and its decompressed hash is verified;
+    (2) one line naming the archive, its hash and every id it holds is appended
+    to approval-queue-archive/index.jsonl, so a row that left the queue can be
+    found by id; (3) the folded journal is written to a private temp file,
+    fsynced, and renamed over the queue. A crash before (3) leaves the original
+    untouched, with an extra archive (a duplicate, never a loss); a crash after
+    it leaves the folded journal whole. An unreadable row, a row without an id,
+    or any failure leaves the journal untouched. The caller must reopen the
+    path afterwards, because FILE now names the replaced inode. Returns a
+    summary, or None when nothing was done."""
     import gzip
     limit = QUEUE_COMPACT_BYTES if threshold is None else threshold
     file.seek(0, 2)
@@ -417,9 +451,11 @@ def _queue_compact(file, threshold=None):
         return None
     raw = original.encode('utf-8')
     digest = hashlib.sha256(raw).hexdigest()
-    folder = _morning_queue_path().parent / 'approval-queue-archive'
+    path = _morning_queue_path()
+    folder = path.parent / 'approval-queue-archive'
     folder.mkdir(mode=0o700, parents=True, exist_ok=True)
     archive = folder / f"queue-{_utc().replace(':', '').replace('-', '')}-{digest[:12]}.jsonl.gz"
+    temp = path.with_name(path.name + f'.compact-{secrets.token_hex(6)}')
     try:
         descriptor = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         with os.fdopen(descriptor, 'wb') as handle:
@@ -437,25 +473,35 @@ def _queue_compact(file, threshold=None):
         return None
     kept = ''.join(lines[index] for index in keep)
     try:
-        file.truncate(0)
-        file.write(kept)
-        file.flush()
-        os.fsync(file.fileno())
+        entry = {'ts': _utc(), 'archive': archive.name, 'sha256': digest, 'rows': len(lines),
+                 'ids': sorted(last)}
+        descriptor = os.open(folder / 'index.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'a', encoding='utf-8') as handle:
+            handle.write(json.dumps(entry, separators=(',', ':')) + '\n')
+            handle.flush()
+            os.fsync(handle.fileno())
+        descriptor = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'w', encoding='utf-8') as handle:
+            handle.write(kept)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
     except OSError:
-        file.truncate(0)
-        file.write(original)
-        file.flush()
-        os.fsync(file.fileno())
+        try:
+            temp.unlink()
+        except OSError:
+            pass
         raise
     return {'archive': str(archive), 'sha256': digest, 'rows_before': len(lines), 'rows_after': len(keep),
             'bytes_before': len(raw), 'bytes_after': len(kept.encode('utf-8'))}
 
 
 def _queue_append(file, item):
-    try:
-        _queue_compact(file)
-    except Exception:
-        _guard_warning('queue-compaction-failed')
     file.seek(0, 2)
     item['revision'] = item.get('revision', 0) + 1
     file.write(json.dumps(item, ensure_ascii=True, separators=(',', ':')) + '\n')

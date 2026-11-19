@@ -11,6 +11,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import patch, MagicMock
 
@@ -423,17 +424,45 @@ class QueueCompactionTests(unittest.TestCase):
         self.assertIsNone(result);self.assertEqual(self.queue.read_text(),text)
         self.assertEqual(list((self.queue.parent/'approval-queue-archive').glob('*')),[])
 
-    def test_a_failed_rewrite_restores_the_original(self):
-        text=self.write([self.row('a',1),self.row('a',2)])
-        real=os.fsync;calls=[]
-        def flaky(fd):
-            calls.append(1)
-            if len(calls)==2:raise OSError('rewrite')
-            return real(fd)
-        with patch.object(os,'fsync',side_effect=flaky):
+    def test_a_crash_before_the_rename_leaves_the_original_whole_and_only_adds_an_archive(self):
+        text=self.write([self.row('a',1),self.row('a',2),self.row('b',1)])
+        with patch.object(runtime.os,'replace',side_effect=OSError('crash before rename')):
             with runtime._morning_queue_file() as stream:
                 with self.assertRaises(OSError):runtime._queue_compact(stream,10)
-        self.assertEqual(self.queue.read_text(),text)
+        self.assertEqual(self.queue.read_text(),text,'the live journal is byte for byte the original')
+        self.assertEqual(list(self.queue.parent.glob('*.compact-*')),[],'no temp file is left behind')
+        archives=list((self.queue.parent/'approval-queue-archive').glob('queue-*.jsonl.gz'))
+        self.assertEqual(len(archives),1,'a duplicate archive exists, nothing was lost')
+
+    def test_the_archive_index_names_every_id_so_a_row_can_be_found_after_it_leaves_the_queue(self):
+        self.write([self.row('a',1),self.row('b',1),self.row('a',2),self.row('c',1,'resolved'),self.row('b',2)])
+        summary=self.compact(10)
+        index=[json.loads(l) for l in (self.queue.parent/'approval-queue-archive'/'index.jsonl').read_text().splitlines()]
+        self.assertEqual(len(index),1)
+        self.assertEqual(index[0]['archive'],Path(summary['archive']).name)
+        self.assertEqual(index[0]['sha256'],summary['sha256'])
+        self.assertEqual(index[0]['ids'],['a','b','c'])
+        self.compact(10)
+        self.assertEqual(len((self.queue.parent/'approval-queue-archive'/'index.jsonl').read_text().splitlines()),1,'an already folded journal adds nothing')
+
+    def test_a_writer_waiting_on_the_old_inode_reopens_the_replaced_file(self):
+        import threading
+        self.write([self.row('a',n,pad=300) for n in range(1,30)])
+        inside=threading.Event();release=threading.Event();seen={}
+        def holder():
+            with runtime._morning_queue_file() as stream:
+                inside.set();release.wait(5)
+                runtime._queue_compact(stream,10)   # renames a folded file over the path while holding the old lock
+        def waiter():
+            inside.wait(5)
+            with runtime._morning_queue_file() as stream:
+                seen['rows']=len(runtime._queue_read(stream))
+                runtime._queue_append(stream,self.row('z',0))
+        t1=threading.Thread(target=holder);t2=threading.Thread(target=waiter);t1.start();t2.start()
+        time.sleep(0.2);release.set();t1.join(10);t2.join(10)
+        self.assertEqual(seen.get('rows'),1,'the waiter read the compacted file, not the unlinked one')
+        ids=sorted(r['id'] for r in self.folded())
+        self.assertEqual(ids,['a','z'],'the waiter append reached the live journal')
 
     def test_append_compacts_a_queue_over_the_limit_and_stays_under_the_collector_cap(self):
         rows=[self.row('a',n,pad=60000) for n in range(1,40)]
