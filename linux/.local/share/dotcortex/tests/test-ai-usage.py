@@ -1010,6 +1010,33 @@ class BankedResetTests(unittest.TestCase):
             [],
         )
 
+    def test_banked_store_prefers_shared_then_legacy_then_new_shared(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        shared = root / "HelmCortex" / "ROOTS" / "JSON" / "ai-usage" / "banked-resets.json"
+        legacy = root / ".config" / "ai-usage" / "banked-resets.json"
+        env = {k: v for k, v in os.environ.items() if k != "AI_USAGE_BANKED_RESETS"}
+        with patch.dict(os.environ, env, clear=True), \
+             patch.object(self.ai_usage, "BANKED_RESETS_SHARED_DEFAULT", shared), \
+             patch.object(self.ai_usage, "BANKED_RESETS_STORE_DEFAULT", legacy):
+            # no shared tree, no files: the per-host default
+            self.assertEqual(self.ai_usage.banked_resets_path(), legacy)
+            # the shared ROOTS/JSON tree exists: new records go to the shared file
+            shared.parent.parent.mkdir(parents=True)
+            self.assertEqual(self.ai_usage.banked_resets_path(), shared)
+            # a legacy per-host file is read until the shared one exists
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text("{}")
+            self.assertEqual(self.ai_usage.banked_resets_path(), legacy)
+            # once the shared file exists it wins everywhere
+            shared.parent.mkdir(parents=True)
+            shared.write_text("{}")
+            self.assertEqual(self.ai_usage.banked_resets_path(), shared)
+            # an explicit override beats both
+            with patch.dict(os.environ, {"AI_USAGE_BANKED_RESETS": str(root / "x.json")}):
+                self.assertEqual(self.ai_usage.banked_resets_path(), root / "x.json")
+
     def _fleet_file(self, source="api", credits=50, age_seconds=60, state="ok"):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
