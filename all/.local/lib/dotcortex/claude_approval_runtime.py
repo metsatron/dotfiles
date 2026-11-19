@@ -367,7 +367,80 @@ def _queue_read(file):
     return list(items.values())
 
 
+# The Desk collector refuses a queue above 4 MiB (centre_admirals_collect.py),
+# and the journal never shrank: on 2026-11-19 it reached 4,330,152 bytes with
+# 126 logical items in 517 revision rows, and every Desk entry vanished while
+# the page still rendered. Compaction folds the journal to the latest revision
+# per id, which is how the contract above already says to read it.
+QUEUE_COMPACT_BYTES = 2 * 1024 * 1024
+
+
+def _queue_compact(file, threshold=None):
+    """Fold the journal to its latest revision per id. The caller holds the
+    exclusive queue lock. The whole original is archived and verified first;
+    an unreadable row, a row without an id, or a failed archive leaves the
+    journal untouched. Returns a summary, or None when nothing was done."""
+    import gzip
+    limit = QUEUE_COMPACT_BYTES if threshold is None else threshold
+    file.seek(0, 2)
+    if file.tell() <= limit:
+        return None
+    file.seek(0)
+    original = file.read()
+    lines = [line if line.endswith('\n') else line + '\n' for line in original.splitlines(keepends=True) if line.strip()]
+    last = {}
+    for index, line in enumerate(lines):
+        try:
+            record = json.loads(line)
+        except ValueError:
+            return None
+        if not isinstance(record, dict) or not isinstance(record.get('id'), str):
+            return None
+        last[record['id']] = index
+    keep = sorted(last.values())
+    if len(keep) == len(lines):
+        return None
+    raw = original.encode('utf-8')
+    digest = hashlib.sha256(raw).hexdigest()
+    folder = _morning_queue_path().parent / 'approval-queue-archive'
+    folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+    archive = folder / f"queue-{_utc().replace(':', '').replace('-', '')}-{digest[:12]}.jsonl.gz"
+    try:
+        descriptor = os.open(archive, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(descriptor, 'wb') as handle:
+            handle.write(gzip.compress(raw))
+            handle.flush()
+            os.fsync(handle.fileno())
+        with gzip.open(archive, 'rb') as handle:
+            if hashlib.sha256(handle.read()).hexdigest() != digest:
+                raise ValueError('archive hash mismatch')
+    except (OSError, ValueError):
+        try:
+            archive.unlink()
+        except OSError:
+            pass
+        return None
+    kept = ''.join(lines[index] for index in keep)
+    try:
+        file.truncate(0)
+        file.write(kept)
+        file.flush()
+        os.fsync(file.fileno())
+    except OSError:
+        file.truncate(0)
+        file.write(original)
+        file.flush()
+        os.fsync(file.fileno())
+        raise
+    return {'archive': str(archive), 'sha256': digest, 'rows_before': len(lines), 'rows_after': len(keep),
+            'bytes_before': len(raw), 'bytes_after': len(kept.encode('utf-8'))}
+
+
 def _queue_append(file, item):
+    try:
+        _queue_compact(file)
+    except Exception:
+        _guard_warning('queue-compaction-failed')
     file.seek(0, 2)
     item['revision'] = item.get('revision', 0) + 1
     file.write(json.dumps(item, ensure_ascii=True, separators=(',', ':')) + '\n')

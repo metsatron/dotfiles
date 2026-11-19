@@ -353,4 +353,97 @@ class PtyHoldDedupTests(unittest.TestCase):
         self.assertEqual(rows['b'*24]['status'],'open')
         self.assertEqual(rows['c'*24]['status'],'obsolete')
 
+class QueueCompactionTests(unittest.TestCase):
+    """The journal folds to its latest revision per id, archived and verified first."""
+    def setUp(self):
+        self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup)
+        self.home=Path(self.tmp.name)
+        self.queue=self.home/'state'/'queue.jsonl'
+        self.queue.parent.mkdir()
+        self.env=patch.dict(os.environ,{'HOME':str(self.home),'SO_APPROVAL_MORNING_QUEUE':str(self.queue),
+            'CLAUDE_IDLE_GUARD_LOG':str(self.home/'guard.jsonl')},clear=True)
+        self.env.start();self.addCleanup(self.env.stop)
+
+    def row(self,ident,revision,status='open',pad=0):
+        return {'schema':'dotcortex.approval.queue.v2','id':ident,'seat':'fixture@example.invalid','revision':revision,
+            'status':status,'pad':'x'*pad}
+
+    def write(self,rows):
+        text=''.join(json.dumps(r,separators=(',',':'))+'\n' for r in rows)
+        self.queue.write_text(text);return text
+
+    def compact(self,threshold):
+        with runtime._morning_queue_file() as stream:
+            return runtime._queue_compact(stream,threshold)
+
+    def folded(self):
+        with self.queue.open() as stream:return runtime._queue_read(stream)
+
+    def test_keeps_the_latest_revision_per_id_and_archives_the_whole_original(self):
+        rows=[self.row('a',1,pad=500),self.row('b',1,pad=500),self.row('a',2,pad=500),self.row('a',3,'resolved',pad=500),self.row('b',2,pad=500)]
+        original=self.write(rows)
+        summary=self.compact(100)
+        self.assertEqual((summary['rows_before'],summary['rows_after']),(5,2))
+        left=[json.loads(l) for l in self.queue.read_text().splitlines()]
+        self.assertEqual([(r['id'],r['revision'],r['status']) for r in left],[('a',3,'resolved'),('b',2,'open')])
+        import gzip
+        archived=gzip.open(summary['archive'],'rb').read()
+        self.assertEqual(archived.decode(),original)
+        self.assertEqual(hashlib.sha256(archived).hexdigest(),summary['sha256'])
+        self.assertEqual(oct(Path(summary['archive']).stat().st_mode&0o777),'0o600')
+
+    def test_open_items_survive_and_the_fold_reads_the_same(self):
+        rows=[self.row('a',1),self.row('b',1),self.row('b',2,'resolved'),self.row('c',1),self.row('c',2),self.row('c',3)]
+        self.write(rows);before={r['id']:(r['status'],r['revision']) for r in self.folded()}
+        self.assertIsNotNone(self.compact(10))
+        after={r['id']:(r['status'],r['revision']) for r in self.folded()}
+        self.assertEqual(before,after)
+        self.assertEqual({k for k,v in after.items() if v[0]=='open'},{'a','c'})
+
+    def test_below_the_threshold_or_already_folded_nothing_happens(self):
+        text=self.write([self.row('a',1),self.row('b',1)])
+        self.assertIsNone(self.compact(10**9))
+        self.assertIsNone(self.compact(10))
+        self.assertEqual(self.queue.read_text(),text)
+        self.assertFalse((self.queue.parent/'approval-queue-archive').exists())
+
+    def test_unreadable_or_id_less_rows_refuse_compaction_and_change_nothing(self):
+        for bad in ('not json\n',json.dumps({'tool':'legacy'})+'\n'):
+            with self.subTest(bad=bad[:12]):
+                text=self.write([self.row('a',1),self.row('a',2)])+bad
+                self.queue.write_text(text)
+                self.assertIsNone(self.compact(10))
+                self.assertEqual(self.queue.read_text(),text)
+
+    def test_archive_failure_leaves_the_journal_untouched(self):
+        text=self.write([self.row('a',1),self.row('a',2)])
+        with patch.object(os,'fsync',side_effect=OSError('disk')) as sync:
+            with runtime._morning_queue_file() as stream:
+                result=runtime._queue_compact(stream,10)
+        self.assertIsNone(result);self.assertEqual(self.queue.read_text(),text)
+        self.assertEqual(list((self.queue.parent/'approval-queue-archive').glob('*')),[])
+
+    def test_a_failed_rewrite_restores_the_original(self):
+        text=self.write([self.row('a',1),self.row('a',2)])
+        real=os.fsync;calls=[]
+        def flaky(fd):
+            calls.append(1)
+            if len(calls)==2:raise OSError('rewrite')
+            return real(fd)
+        with patch.object(os,'fsync',side_effect=flaky):
+            with runtime._morning_queue_file() as stream:
+                with self.assertRaises(OSError):runtime._queue_compact(stream,10)
+        self.assertEqual(self.queue.read_text(),text)
+
+    def test_append_compacts_a_queue_over_the_limit_and_stays_under_the_collector_cap(self):
+        rows=[self.row('a',n,pad=60000) for n in range(1,40)]
+        self.write(rows)
+        self.assertGreater(self.queue.stat().st_size,2*1024*1024)
+        with runtime._morning_queue_file() as stream:
+            runtime._queue_append(stream,self.row('b',0))
+        size=self.queue.stat().st_size
+        self.assertLess(size,runtime.QUEUE_COMPACT_BYTES);self.assertLess(size,4*1024*1024)
+        ids=[(r['id'],r['revision']) for r in self.folded()]
+        self.assertEqual(sorted(ids),[('a',39),('b',1)])
+
 if __name__=='__main__':unittest.main()
