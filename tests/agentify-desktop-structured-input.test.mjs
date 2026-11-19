@@ -33,6 +33,7 @@ test('structured prompts use Shift+Enter and submit exactly once', async () => {
   const page = {
     async navigate() {},
     async evaluate(js) {
+      if (js.includes('HELMCORTEX_AGENTIFY_RESEARCH_LANE_PROBE_V1')) return { applies: true, chat: true, work: false, effort: 'high', picker: true, expanded: true, selected: ['GPT-6'] };
       if (js.includes('const hasTurnstile')) return readyState();
       if (js.includes('selectNodeContents')) {
         clearChecks += 1;
@@ -107,6 +108,7 @@ test('a composer that cannot be emptied fails before typing or submitting', asyn
   const page = {
     async navigate() {},
     async evaluate(js) {
+      if (js.includes('HELMCORTEX_AGENTIFY_RESEARCH_LANE_PROBE_V1')) return { applies: true, chat: true, work: false, effort: 'high', picker: true, expanded: true, selected: ['GPT-6'] };
       if (js.includes('const hasTurnstile')) return readyState();
       if (js.includes('selectNodeContents')) return { ok: true, promptLen: 7 };
       if (js.includes('const text = el.matches')) return { ok: true, promptLen: 7 };
