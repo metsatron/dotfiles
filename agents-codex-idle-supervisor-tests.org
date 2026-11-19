@@ -316,7 +316,8 @@ class CodexWarmTests(unittest.TestCase):
         session.event("session-start", model="claimed-runtime-model", endpoint_id="claimed-endpoint")
         session.event("stop", stop_hook_active=False, model="claimed-runtime-model", context_tokens=100000)
         session.config_path.write_text('model="later-disk-model"\n', encoding="utf-8")
-        wait_until(lambda: session.read_state() and session.read_state()["last_gate_rejection_reason"] == "token-count-unknown", timeout=3)
+        time.sleep(1.2)
+        self.assertIsNone(session.read_state()["timer_deadline"])
         state = session.read_state()
         self.assertEqual((state["model"], state["endpoint_id"]), ("unknown", "unknown"))
         self.assertEqual(state["cache_policy"]["mode"], "fallback")
@@ -326,7 +327,8 @@ class CodexWarmTests(unittest.TestCase):
     def test_automatic_cache_action_unknown_tokens_fails_closed(self):
         session = self.make_session(delay=1, ttl=2, min_tokens=70000)
         session.stop_and_bind()
-        wait_until(lambda: session.read_state() and session.read_state()["last_gate_rejection_reason"] == "token-count-unknown", timeout=3)
+        time.sleep(1.2)
+        self.assertIsNone(session.read_state()["timer_deadline"])
         self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
     def test_declared_model_selection_is_separate_from_runtime_identity(self):
@@ -374,7 +376,7 @@ class CodexWarmTests(unittest.TestCase):
                 "model": "fixture-model", "compact_before_seconds": compact,
                 "cache_expires_seconds": expiry, "reason": "exact-harness"}
 
-    def test_cache_adversarial_stdout_uses_fixed_fallback_timer(self):
+    def test_malformed_cache_diagnostics_never_arm_timer(self):
         valid = self.cache_decision()
         invalid = [[], None, True, 5, "wrong", {},
                    {**valid, "mode": "fallback", "confidence": "fallback", "reason": "policy-stale"},
@@ -399,27 +401,22 @@ class CodexWarmTests(unittest.TestCase):
                 session.stop_and_bind()
                 state = session.read_state()
                 self.assertEqual(state["cache_policy"]["mode"], "fallback")
-                self.assertAlmostEqual(state["timer_deadline"] - state["last_normal_stop"], 20, delta=0.1)
+                self.assertIsNone(state["timer_deadline"])
                 self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
                 session.close()
 
-    def test_automatic_action_refreshes_unknown_identity_and_rearms_fallback(self):
+    def test_inherited_timer_is_refused_without_resolving_or_injecting(self):
         supervisor = object.__new__(self.module.Supervisor)
-        supervisor.argv = ["--model", "launch-model"]
-        supervisor.model, supervisor.endpoint = "stale-model", "openai-codex-oauth"
-        supervisor.last_normal_stop = time.time() - 1
         supervisor.timer_generation = 7
-        supervisor.timer_deadline = supervisor.last_normal_stop + 1
+        supervisor.timer_deadline = time.time()-1
         supervisor.timer_kind = "compact"
         supervisor._write_state = mock.Mock()
-        supervisor._gate_reason = mock.Mock(side_effect=AssertionError("must rearm before injection gate"))
-        with mock.patch.object(self.module, "IDLE_SECONDS", 5), mock.patch.object(self.module, "TTL_SECONDS", 6), mock.patch.object(self.module, "write_all") as inject, mock.patch.object(self.module.subprocess, "run", side_effect=AssertionError("unknown identity must not resolve")):
+        supervisor._refresh_cache_policy_for_action = mock.Mock(side_effect=AssertionError("time is not authority"))
+        with mock.patch.object(self.module, "write_all") as inject:
             self.assertFalse(supervisor.attempt(expected_generation=7))
-        self.assertEqual((supervisor.model, supervisor.endpoint), ("unknown", "unknown"))
-        self.assertEqual(supervisor.cache_policy["mode"], "fallback")
-        self.assertEqual(supervisor.timer_deadline, supervisor.last_normal_stop + 5)
-        self.assertEqual(supervisor.last_state_transition, "policy-refreshed-rearmed")
-        self.assertEqual(supervisor.timer_generation, 8)
+        self.assertIsNone(supervisor.timer_deadline)
+        self.assertIsNone(supervisor.timer_kind)
+        self.assertEqual(supervisor.last_gate_rejection_reason, "time-based-compaction-disabled")
         inject.assert_not_called()
 
     def test_measured_window_defaults_to_supported_endpoint_policy(self):
@@ -509,7 +506,7 @@ class CodexWarmTests(unittest.TestCase):
             reason = supervisor._gate_reason("compact")
         self.assertIsNone(reason)
 
-    def test_gate_allows_large_context_after_cache_expiry(self):
+    def test_explicit_compaction_gate_allows_large_context_after_cache_expiry(self):
         """A cold compaction still prevents repeated full-context ingestion."""
         supervisor = object.__new__(self.module.Supervisor)
         supervisor.enabled = True
@@ -553,6 +550,7 @@ class CodexWarmTests(unittest.TestCase):
         session = self.make_session(delay=0, extra_args=("--model", "test"))
         session.wait_output("ARGS:['--model', 'test']")
         session.stop_and_bind()
+        self.assertTrue(session.control("trigger")["ok"])
         session.wait_output("COMPACT_RECEIVED")
         self.assertEqual(session.read_state()["compacting"], True)
         session.event("post-compact")
@@ -562,22 +560,19 @@ class CodexWarmTests(unittest.TestCase):
         self.assertEqual(state["last_injection_result"], "succeeded")
         self.assertEqual(state["last_state_transition"], "compaction-completed")
 
-    def test_later_normal_turn_arms_a_fresh_timer(self):
-        session = self.make_session(delay=1)
+    def test_later_turn_and_enable_cannot_arm_time_based_compaction(self):
+        session = self.make_session(delay=0)
         session.stop_and_bind()
-        session.wait_output("COMPACT_RECEIVED", timeout=3)
-        session.event("post-compact")
-        wait_until(lambda: session.read_state() and not session.read_state()["dirty"])
-        session.event("user-prompt-submit")
-        session.event("stop", stop_hook_active=False)
-        wait_until(
-            lambda: session.read_state()
-            and session.read_state()["timer_deadline"] is not None,
-            message="later normal turn did not arm a fresh timer",
-        )
-        self.assertTrue(session.read_state()["dirty"])
+        for unused in range(2):
+            session.event("user-prompt-submit")
+            session.event("stop", stop_hook_active=False)
+            session.control("enable")
+            self.assertTrue(session.read_state()["dirty"])
+            self.assertIsNone(session.read_state()["timer_deadline"])
+        time.sleep(1.2)
+        self.assertFalse(session.output_contains("COMPACT_RECEIVED"))
 
-    def test_compaction_stop_recovers_and_rearms_without_post_compact(self):
+    def test_compaction_stop_recovers_without_rearming(self):
         session = self.make_session(delay=60)
         session.stop_and_bind()
         session.control("trigger")
@@ -588,13 +583,14 @@ class CodexWarmTests(unittest.TestCase):
         wait_until(
             lambda: session.read_state()
             and not session.read_state()["compacting"]
-            and session.read_state()["timer_deadline"] is not None
+            and session.read_state()["last_state_transition"] == "compaction-recovered"
+            and session.read_state()["timer_deadline"] is None
         )
         state = session.read_state()
         self.assertTrue(state["dirty"])
         self.assertEqual(state["last_state_transition"], "compaction-recovered")
 
-    def test_compaction_timeout_recovers_and_rearms_without_post_compact(self):
+    def test_compaction_timeout_recovers_without_rearming(self):
         session = self.make_session(
             delay=60,
             compaction_timeout=0.2,
@@ -606,7 +602,8 @@ class CodexWarmTests(unittest.TestCase):
         wait_until(
             lambda: session.read_state()
             and not session.read_state()["compacting"]
-            and session.read_state()["timer_deadline"] is not None,
+            and session.read_state()["last_state_transition"] == "compaction-recovered"
+            and session.read_state()["timer_deadline"] is None,
             timeout=3,
             message="compaction timeout did not recover and re-arm",
         )
@@ -620,6 +617,7 @@ class CodexWarmTests(unittest.TestCase):
     def test_stop_failure_clears_compacting_and_preserves_dirty(self):
         session = self.make_session(delay=0)
         session.stop_and_bind()
+        self.assertTrue(session.control("trigger")["ok"])
         session.wait_output("COMPACT_RECEIVED")
         session.event("stop-failure")
         wait_until(
@@ -669,7 +667,7 @@ class CodexWarmTests(unittest.TestCase):
         try:
             wait_until(
                 lambda: session.read_state()
-                and session.read_state()["last_cancellation_reason"] == "user-input"
+                and session.read_state()["last_local_input_classification"] == "keyboard-input"
             )
         except AssertionError as error:
             raise AssertionError(
@@ -705,7 +703,7 @@ class CodexWarmTests(unittest.TestCase):
         self.assertIsNone(state["timer_deadline"])
         session.control("enable")
         state = session.read_state()
-        self.assertTrue(state.get("timer_deadline") is not None or state["last_cancellation_reason"] == "session-disabled")
+        self.assertIsNone(state["timer_deadline"])
 
     def test_control_trigger(self):
         session = self.make_session(delay=999)

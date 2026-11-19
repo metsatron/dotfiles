@@ -67,6 +67,13 @@ subscription/usage-credit TTL."
   :type '(choice (const long) (const short) (const auto))
   :group 'metsatron-idle-compaction)
 
+(defcustom codex-time-based-compaction-enabled nil
+  "Whether Codex IDE may schedule compaction from elapsed idle time.
+Disabled by operator policy. Global idle-compaction controls and historical
+cache-policy settings do not enable this switch. Explicit manual compaction
+and native Codex context-pressure handling remain independent."
+  :type 'boolean :group 'metsatron-idle-compaction)
+
 (defcustom codex-idle-compact-seconds (* 27 60)
   "Idle delay before presumed warm-cache-budget compaction for Codex.
 This is a local governor delay, not a backend-reported cache lifetime."
@@ -932,6 +939,7 @@ re-arm the governor."
            (delay (car window))
            (warm (cadr window)))
       (when (and metsatron-idle-compaction-enabled
+                 codex-time-based-compaction-enabled
                  (not (eq policy 'disabled))
                  (plist-get state :enabled)
                  (plist-get state :dirty)
@@ -967,7 +975,8 @@ re-arm the governor."
     (session thread-id completion generation)
   "Run the atomic Codex gate for captured timer identity."
   (when-let ((state (metsatron/codex-idle-compact--state session)))
-    (when (and (= generation (plist-get state :timer-generation))
+    (when (and codex-time-based-compaction-enabled
+               (= generation (plist-get state :timer-generation))
                (equal thread-id (plist-get state :thread-id))
                (equal completion (plist-get state :last-normal-turn-completed-at)))
       (metsatron/codex-idle-compact--put session :timer nil)
@@ -1055,6 +1064,8 @@ generation.  A nil value is used by the manual command."
                    :presumed-warm-seconds warm
                    :idle-compaction-delay-seconds delay))
       (cond
+       ((and expected-generation (not codex-time-based-compaction-enabled))
+        (metsatron/codex-idle-compact--cancel session "time-based-compaction-disabled"))
        ((not metsatron-idle-compaction-enabled)
         (metsatron/idle-compaction--log 'cancelled thread-id "globally-disabled"))
        ((eq policy 'disabled)

@@ -128,6 +128,8 @@
     (metsatron/idle-test--kill-buffer (plist-get state :buffer))))
 
 (ert-deftest metsatron/idle-codex-token-fixture-uses-last-total ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -153,9 +155,11 @@
       (should (= (plist-get (gethash metsatron/codex-idle-compact--metadata-key
                                      metadata)
                             :current-context-tokens)
-                 83000)))))
+                 83000))))))
 
 (ert-deftest metsatron/idle-codex-turn-fixture-uses-owning-session ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -191,9 +195,11 @@
       (should (plist-get (gethash metsatron/codex-idle-compact--metadata-key
                                   metadata)
                          :dirty))
-      (should (= timers 1)))))
+      (should (= timers 1))))))
 
 (ert-deftest metsatron/idle-codex-duplicate-idle-does-not-arm-twice ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -219,9 +225,11 @@
               ((symbol-function 'cancel-timer) (lambda (_timer) nil)))
       (metsatron/codex-idle-compact--arm session)
       (metsatron/codex-idle-compact--arm session)
-      (should (= timers 1)))))
+      (should (= timers 1))))))
 
 (ert-deftest metsatron/idle-codex-duplicate-completion-keeps-timer-identity ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "Normalized and raw completion evidence for one turn is idempotent."
   (let* ((session 'codex-duplicate-completion)
          (metadata (make-hash-table :test #'eq))
@@ -258,9 +266,11 @@
           (should (= (plist-get first :last-normal-turn-completed-at)
                      (plist-get second :last-normal-turn-completed-at)))
           (should (= (plist-get second :completion-lifecycle-sequence) 3))
-          (should (= timers 1)))))))
+          (should (= timers 1))))))))
 
 (ert-deftest metsatron/idle-codex-draft-and-active-gates-block ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -289,9 +299,11 @@
       (should (= requests 0))
       (metsatron/codex-idle-compact--put session :status "idle")
       (metsatron/codex-idle-compact--attempt session)
-      (should (= requests 0)))))
+      (should (= requests 0))))))
 
 (ert-deftest metsatron/idle-codex-empty-authoritative-prompt-is-not-a-draft ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "The package input-boundary predicate must override the visible prompt prefix."
   (let* ((session 'codex-empty-prompt)
          (metadata (make-hash-table :test #'eq))
@@ -303,9 +315,11 @@
                (lambda (_session) t))
               ((symbol-function 'codex-ide-session-prompt-history-draft)
                (lambda (_session) nil)))
-      (should-not (metsatron/codex-idle-compact--draft-present-p session)))))
+      (should-not (metsatron/codex-idle-compact--draft-present-p session))))))
 
 (ert-deftest metsatron/idle-codex-compaction-completion-cleans-without-loop ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -340,9 +354,11 @@
                              (items . (((type . "contextCompaction"))))))))))
       (let ((state (gethash metsatron/codex-idle-compact--metadata-key metadata)))
         (should-not (plist-get state :dirty))
-        (should-not (plist-get state :compacting))))))
+        (should-not (plist-get state :compacting)))))))
 
 (ert-deftest metsatron/idle-codex-stale-timer-cannot-request ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -359,9 +375,11 @@
               ((symbol-function 'codex-ide--request-async)
                (lambda (&rest _args) (setq requests (1+ requests)))))
       (metsatron/codex-idle-compact--timer-fired session "thread-old" 100 1)
-      (should (= requests 0)))))
+      (should (= requests 0))))))
 
 (ert-deftest metsatron/idle-codex-ownership-check-uses-session-directory ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "A timer callback does not depend on its current buffer directory."
   (let ((session 'codex-owned-session)
         (seen nil))
@@ -375,7 +393,7 @@
                  session)))
       (should (metsatron/codex-idle-compact--owned-p
                session "thread-owned"))
-      (should (equal seen '("thread-owned" "/tmp/codex-owned-project"))))))
+      (should (equal seen '("thread-owned" "/tmp/codex-owned-project")))))))
 
 (ert-deftest metsatron/idle-claude-local-input-cancels-pending-timer ()
   (let ((state (metsatron/idle-test--claude-state 80000)))
@@ -412,6 +430,8 @@
     (metsatron/idle-test--kill-buffer (plist-get state :buffer))))
 
 (ert-deftest metsatron/idle-codex-eligible-session-requests-once ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-session)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -440,9 +460,11 @@
       (should (= requests 1))
       (should (plist-get (gethash metsatron/codex-idle-compact--metadata-key
                                   metadata)
-                         :compacting)))))
+                         :compacting))))))
 
 (ert-deftest metsatron/idle-codex-sessions-are-isolated ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let ((metadata (make-hash-table :test #'eq)))
     (dolist (session '(one two))
       (puthash session (list :session session :thread-id (symbol-name session)
@@ -450,9 +472,11 @@
                              :status "idle" :enabled t :dirty nil)
                metadata))
     (should-not (plist-get (gethash 'one metadata) :dirty))
-    (should-not (plist-get (gethash 'two metadata) :dirty))))
+    (should-not (plist-get (gethash 'two metadata) :dirty)))))
 
 (ert-deftest metsatron/idle-codex-observed-idle-without-turn-completed-marks-dirty ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "The installed live path can finish through item completion plus idle."
   (let* ((session 'codex-no-raw-turn)
          (metadata (make-hash-table :test #'eq))
@@ -490,9 +514,11 @@
         (should (plist-get state :dirty))
         (should (= timers 1))
         (should (equal (plist-get state :last-lifecycle-evidence)
-                       "agent-item-plus-idle"))))))
+                       "agent-item-plus-idle")))))))
 
 (ert-deftest metsatron/idle-codex-initialization-active-idle-stays-clean ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-initialization)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -513,9 +539,11 @@
       (metsatron/codex-idle-compact--handle-status session "idle")
       (let ((state (gethash metsatron/codex-idle-compact--metadata-key metadata)))
         (should-not (plist-get state :dirty))
-        (should (= timers 0))))))
+        (should (= timers 0)))))))
 
 (ert-deftest metsatron/idle-codex-incomplete-agent-work-does-not-mark-dirty ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "An observed item without completion is not a completed normal turn."
   (let* ((session 'codex-incomplete-turn)
          (metadata (make-hash-table :test #'eq))
@@ -545,9 +573,11 @@
                     (status . "idle")))))
       (let ((state (gethash metsatron/codex-idle-compact--metadata-key metadata)))
         (should-not (plist-get state :dirty))
-        (should (= timers 0))))))
+        (should (= timers 0)))))))
 
 (ert-deftest metsatron/idle-codex-event-installs-local-input-hook-after-mode-hook ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "A newly created session installs local-input handling after binding.
 `emacs-codex-ide' runs its session-mode hook before binding the owning session
 in the buffer, so the normalized lifecycle event is the reliable fallback."
@@ -578,16 +608,20 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
             (should (memq #'metsatron/codex-idle-compact--local-activity
                           pre-command-hook))))
       (when (buffer-live-p buffer)
-        (kill-buffer buffer)))))
+        (kill-buffer buffer))))))
 
 (ert-deftest metsatron/idle-codex-default-policy-is-heuristic ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (should (eq codex-cache-policy 'presumed-30m))
   (should (= codex-presumed-warm-seconds (* 30 60)))
   (should (= codex-idle-compact-seconds (* 27 60)))
   (should (string-match-p "heuristic" codex-cache-policy-confidence))
-  (should (string-match-p "GPT-5.6" codex-cache-policy-source)))
+  (should (string-match-p "GPT-5.6" codex-cache-policy-source))))
 
 (ert-deftest metsatron/idle-codex-compaction-idle-without-success-is-unknown ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-ambiguous-compaction)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -624,9 +658,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
         (should (plist-get state :dirty))
         (should-not (plist-get state :compacting))
          (should (eq (plist-get state :compaction-result) 'unknown))
-        (should (= timers 0))))))
+        (should (= timers 0)))))))
 
 (ert-deftest metsatron/idle-codex-ambiguous-idle-followed-by-completed-turn-succeeds ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "A later successful compaction turn completion resolves an early idle race."
   (let* ((session 'codex-late-compaction-success)
          (metadata (make-hash-table :test #'eq))
@@ -660,9 +696,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
       (let ((state (gethash metsatron/codex-idle-compact--metadata-key metadata)))
         (should-not (plist-get state :dirty))
         (should-not (plist-get state :compacting))
-        (should (eq (plist-get state :compaction-result) 'succeeded))))))
+        (should (eq (plist-get state :compaction-result) 'succeeded)))))))
 
 (ert-deftest metsatron/idle-codex-failed-compaction-preserves-dirty ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-failed-compaction)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -681,9 +719,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
       (let ((state (gethash metsatron/codex-idle-compact--metadata-key metadata)))
         (should (plist-get state :dirty))
         (should-not (plist-get state :compacting))
-        (should (eq (plist-get state :compaction-result) 'failed))))))
+        (should (eq (plist-get state :compaction-result) 'failed)))))))
 
 (ert-deftest metsatron/idle-codex-disabled-policy-never-compacts ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((codex-cache-policy 'disabled)
          (session 'codex-disabled)
          (metadata (make-hash-table :test #'eq))
@@ -702,9 +742,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
               ((symbol-function 'codex-ide--request-async)
                (lambda (&rest _args) (setq requests (1+ requests)))))
       (metsatron/codex-idle-compact--attempt session)
-      (should (= requests 0)))))
+      (should (= requests 0))))))
 
 (ert-deftest metsatron/idle-codex-custom-budget-controls-delay-and-gate ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-custom)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -741,9 +783,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
       (metsatron/codex-idle-compact--put
        session :last-normal-turn-completed-at (- (float-time) 11))
       (metsatron/codex-idle-compact--attempt session)
-      (should (= requests 0)))))
+      (should (= requests 0))))))
 
 (ert-deftest metsatron/idle-codex-cumulative-total-never-raises-threshold ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-cumulative)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -767,9 +811,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
       (should (= (plist-get
                   (gethash metsatron/codex-idle-compact--metadata-key metadata)
                   :current-context-tokens)
-                 69999)))))
+                 69999))))))
 
 (ert-deftest metsatron/idle-codex-raw-usage-missing-fields-stay-unknown ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-raw-usage)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -793,9 +839,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
       (let ((state (gethash metsatron/codex-idle-compact--metadata-key metadata)))
         (should-not (plist-get state :raw-cached-input-tokens))
         (should-not (plist-get state :raw-cache-write-input-tokens))
-        (should (= (plist-get state :raw-input-tokens) 100))))))
+        (should (= (plist-get state :raw-input-tokens) 100)))))))
 
 (ert-deftest metsatron/idle-codex-raw-usage-records-cache-counters-without-retention-claim ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let* ((session 'codex-raw-hit)
          (metadata (make-hash-table :test #'eq))
          (get (lambda (_s key) (gethash key metadata)))
@@ -824,9 +872,11 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
         (should (= (plist-get state :raw-cached-input-tokens) 80))
         (should (= (plist-get state :raw-cache-write-input-tokens) 10))
         (should (equal (plist-get state :raw-model) "gpt-5.6-sol"))
-        (should (numberp (plist-get state :last-raw-usage-at)))))))
+        (should (numberp (plist-get state :last-raw-usage-at))))))))
 
 (ert-deftest metsatron/idle-codex-raw-request-opt-in-is-explicit ()
+  ;; Historical governor coverage requires an explicit test-only opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   (let ((codex-idle-compact-raw-telemetry-enabled t)
         (args (list 'session "thread/start" '((foo . bar)))))
     (setq args (metsatron/codex-idle-compact--request-sync-filter args))
@@ -835,7 +885,7 @@ in the buffer, so the normalized lifecycle event is the reliable fallback."
       (should (equal
                (metsatron/codex-idle-compact--request-sync-filter
                 (list 'session "thread/start" '((foo . bar))))
-               (list 'session "thread/start" '((foo . bar))))))))
+               (list 'session "thread/start" '((foo . bar)))))))))
 
 (defun metsatron/idle-test--policy-action (harness payload &optional model elapsed endpoint automatic action-payload hazard)
   "Exercise HARNESS arming and public action with resolver PAYLOAD.
@@ -971,6 +1021,8 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
       (should-not (member "--allow-observed" args)))))
 
 (ert-deftest metsatron/cache-policy-malformed-and-observed-retain-fallback ()
+  ;; Exercise the historical diagnostic governor only by explicit opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "Malformed decisions cannot supply timer values to either public consumer."
   (dolist (harness '(claude codex))
     (dolist (payload '("{}" "[]" "null" "42" "[300,900]"
@@ -987,7 +1039,7 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
                        "{bad-json}"))
       (let ((result (metsatron/idle-test--policy-action harness payload)))
         (should (= (plist-get result :armed-delay)
-                   (if (eq harness 'claude) 3300 1620)))))))
+                   (if (eq harness 'claude) 3300 1620))))))))
 
 (ert-deftest metsatron/cache-policy-public-action-skips-freshly-cold-cache ()
   "A formerly warm cached decision cannot authorize an action after fresh expiry."
@@ -999,6 +1051,8 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
       (should (= (plist-get result :requests) 0)))))
 
 (ert-deftest metsatron/cache-policy-timer-rearms-at-later-fresh-deadline ()
+  ;; Exercise the historical diagnostic governor only by explicit opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "A fresh later deadline schedules only the remaining delay and submits nothing."
   (dolist (harness '(claude codex))
     (let ((result (metsatron/idle-test--policy-action
@@ -1007,9 +1061,11 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
                    "{\"mode\":\"measured\",\"confidence\":\"supported\",\"compact_before_seconds\":1000,\"cache_expires_seconds\":1200}")))
       (should (= (plist-get result :requests) 0))
       (should (equal (plist-get result :delays) '(500)))
-      (should (= (length (plist-get result :calls)) 1)))))
+      (should (= (length (plist-get result :calls)) 1))))))
 
 (ert-deftest metsatron/cache-policy-stale-evidence-rearms-declared-fallback ()
+  ;; Exercise the historical diagnostic governor only by explicit opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "Fallback after measured evidence disappears never inherits the old timers."
   (dolist (harness '(claude codex))
     (let ((result (metsatron/idle-test--policy-action
@@ -1017,9 +1073,11 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
                    nil 500 nil t "{}")))
       (should (= (plist-get result :requests) 0))
       (should (equal (plist-get result :delays)
-                     (list (- (if (eq harness 'claude) 3300 1620) 500)))))))
+                     (list (- (if (eq harness 'claude) 3300 1620) 500))))))))
 
 (ert-deftest metsatron/cache-policy-unknown-identity-keeps-fallback ()
+  ;; Exercise the historical diagnostic governor only by explicit opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "Unknown models/endpoints never resolve generic-provider evidence."
   (dolist (harness '(claude codex))
     (dolist (identity '(("" "fixture-endpoint") ("current-model" "")))
@@ -1028,7 +1086,7 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
                      (car identity) 500 (cadr identity))))
         (should-not (plist-get result :calls))
         (should (= (plist-get result :armed-delay)
-                   (if (eq harness 'claude) 3300 1620)))))))
+                   (if (eq harness 'claude) 3300 1620))))))))
 
 (ert-deftest metsatron/cache-policy-public-action-preserves-safety-gates ()
   "Supported timing never overrides unknown tokens, input or owner safety."
@@ -1040,6 +1098,8 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
         (should (= (plist-get result :requests) 0))))))
 
 (ert-deftest metsatron/cache-policy-lost-identity-rearms-without-foreign-evidence ()
+  ;; Exercise the historical diagnostic governor only by explicit opt-in.
+  (let ((codex-time-based-compaction-enabled t))
   "Endpoint-owner drift or a missing current model selects the declared fallback."
   (dolist (harness '(claude codex))
     (dolist (hazard '(owner-change missing-model))
@@ -1049,4 +1109,37 @@ MODEL, ELAPSED and ENDPOINT describe the current owning session."
         (should-not (plist-get result :calls))
         (should (= (plist-get result :requests) 0))
         (should (equal (plist-get result :delays)
-                       (list (- (if (eq harness 'claude) 3300 1620) 500))))))))
+                       (list (- (if (eq harness 'claude) 3300 1620) 500)))))))))
+
+
+(ert-deftest metsatron/idle-codex-time-policy-default-prevents-all-timer-actions ()
+  (should-not codex-time-based-compaction-enabled)
+  (let* ((session 'codex-no-idle-policy)
+         (metadata (make-hash-table :test #'eq))
+         (scheduled 0)
+         (requests 0)
+         (completion (- (float-time) 86400)))
+    (puthash metsatron/codex-idle-compact--metadata-key
+             (list :session session :thread-id "no-idle-thread"
+                   :connection 'process :owning-buffer 'buffer
+                   :status "idle" :enabled t :dirty t
+                   :cache-policy 'custom :timer-generation 1
+                   :last-normal-turn-completed-at completion
+                   :current-context-tokens 400000)
+             metadata)
+    (cl-letf (((symbol-function 'codex-ide--session-metadata-get)
+               (lambda (_session key) (gethash key metadata)))
+              ((symbol-function 'codex-ide--session-metadata-put)
+               (lambda (_session key value) (puthash key value metadata)))
+              ((symbol-function 'metsatron/codex-idle-compact--window)
+               (lambda (&rest _args) '(1 2 nil)))
+              ((symbol-function 'run-at-time)
+               (lambda (&rest _args) (setq scheduled (1+ scheduled))))
+              ((symbol-function 'codex-ide--request-async)
+               (lambda (&rest _args) (setq requests (1+ requests)))))
+      (metsatron/codex-idle-compact--arm session)
+      (metsatron/codex-idle-compact--timer-fired session "no-idle-thread" completion 1)
+      (metsatron/codex-idle-compact--attempt session 1)
+      (should (= scheduled 0))
+      (should (= requests 0))
+      (should (plist-get (gethash metsatron/codex-idle-compact--metadata-key metadata) :dirty)))))
