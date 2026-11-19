@@ -2827,7 +2827,99 @@ def _bearer_json_probe(
     }
 
 
+FLEET_SNAPSHOT_MAX_AGE_SECONDS = 1800
+
+
+def fleet_snapshot_path() -> Path:
+    """The fleet's own ai-usage basis file (written by the hub's usage refresh
+    into the shared HelmCortex tree). AI_USAGE_FLEET_SNAPSHOT overrides it."""
+    override = os.environ.get("AI_USAGE_FLEET_SNAPSHOT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return (
+        Path.home() / "HelmCortex" / "ROOTS" / "DotRoot" / "agent-session"
+        / "centre" / "data" / "ai-usage-basis.json"
+    )
+
+
+def fleet_openrouter_usage(
+    path: Path | None = None, now: datetime | None = None
+) -> dict[str, Any] | None:
+    """The hub's OpenRouter numbers, or None.
+
+    Taken only when the file is fresh, the entry is the hub's own live API read
+    (raw.source == "api", never an earlier fleet fallback, so a stale number can
+    never feed itself), and the account actually holds credits. Reads numbers
+    only: never the identity or key label."""
+    try:
+        data = json.loads((path or fleet_snapshot_path()).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    stamp = parse_iso_datetime(data.get("generated_at"))
+    current = now or datetime.now(timezone.utc)
+    if stamp is None or (current - stamp).total_seconds() > FLEET_SNAPSHOT_MAX_AGE_SECONDS:
+        return None
+    for entry in data.get("entries") or []:
+        if not isinstance(entry, dict) or entry.get("provider") != "openrouter":
+            continue
+        raw = entry.get("raw")
+        if entry.get("state") != "ok" or not isinstance(raw, dict) or raw.get("source") != "api":
+            continue
+        usage = nested_get(raw, "usage", "openRouterUsage")
+        if not isinstance(usage, dict):
+            continue
+        credits = usage.get("totalCredits")
+        balance = usage.get("balance")
+        if (isinstance(credits, (int, float)) and not isinstance(credits, bool) and credits > 0
+                and isinstance(balance, (int, float)) and not isinstance(balance, bool)):
+            return {
+                "balance": balance,
+                "keyUsage": usage.get("keyUsage"),
+                "totalCredits": credits,
+                "ageSeconds": int((current - stamp).total_seconds()),
+            }
+    return None
+
+
 def fetch_openrouter(timeout_seconds: float) -> dict[str, Any]:
+    """This host's OpenRouter key, else the fleet's number when this host has none.
+
+    A machine whose key is absent, or belongs to an account with no credits,
+    would show a meaningless zero. The fleet hub's fresh live read is shown
+    instead, labelled as the fleet snapshot (2026-11-19, operator: every machine
+    shows the same OpenRouter balance as CoinHeaven)."""
+    local = _fetch_openrouter_local(timeout_seconds)
+    local_usage = nested_get(local.get("raw"), "usage", "openRouterUsage") if isinstance(local.get("raw"), dict) else None
+    local_credits = local_usage.get("totalCredits") if isinstance(local_usage, dict) else None
+    needs_fleet = local.get("state") == "missing" or (
+        local.get("state") == "ok" and isinstance(local_credits, (int, float)) and local_credits <= 0
+    )
+    if not needs_fleet:
+        return local
+    fleet = fleet_openrouter_usage()
+    if fleet is None:
+        return local
+    balance = fleet["balance"]
+    minutes = max(0, fleet["ageSeconds"] // 60)
+    usage = {"openRouterUsage": {k: fleet[k] for k in ("balance", "keyUsage", "totalCredits")}}
+    return {
+        "provider": "openrouter",
+        "label": "OpenRouter",
+        "state": "ok",
+        "source": "fleet-snapshot",
+        "summary": f"balance=${balance:g}; fleet snapshot {minutes}m old",
+        "raw": {
+            "provider": "openrouter",
+            "source": "fleet-snapshot",
+            "usage": usage,
+            "identity": {"loginMethod": f"Balance: ${balance:g} (fleet snapshot)"},
+        },
+    }
+
+
+def _fetch_openrouter_local(timeout_seconds: float) -> dict[str, Any]:
     # Native OpenRouter probe (2026-10-09), replacing the codexbar dependency.
     # codexbar's openrouter fetch needs cookie auth (a signed-in web session) —
     # on every Linux host in the fleet it reported $0 from stale cookie caches

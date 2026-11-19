@@ -678,7 +678,7 @@ class OpenRouterProbeTests(unittest.TestCase):
         self.assertEqual(result["raw"]["usage"]["openRouterUsage"]["balance"], 49.5)
 
     def test_openrouter_missing_key_reports_missing(self):
-        with patch.dict(os.environ, {"OPENROUTER_API_KEY": ""}), \
+        with patch.dict(os.environ, {"OPENROUTER_API_KEY": "", "AI_USAGE_FLEET_SNAPSHOT": "/nonexistent/ai-usage-basis.json"}), \
              patch.object(self.ai_usage, "load_dotenv_exports", return_value={}):
             result = self.ai_usage.fetch_openrouter(1.0)
         self.assertEqual(result["state"], "missing")
@@ -1009,6 +1009,53 @@ class BankedResetTests(unittest.TestCase):
             ),
             [],
         )
+
+    def _fleet_file(self, source="api", credits=50, age_seconds=60, state="ok"):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        stamp = (datetime.now(timezone.utc) - timedelta(seconds=age_seconds)).isoformat()
+        path = Path(tmp.name) / "ai-usage-basis.json"
+        path.write_text(json.dumps({
+            "generated_at": stamp,
+            "entries": [{
+                "provider": "openrouter", "state": state,
+                "raw": {"source": source, "usage": {"openRouterUsage": {
+                    "balance": credits, "keyUsage": 0, "totalCredits": credits}}},
+            }],
+        }))
+        return path
+
+    def test_fleet_openrouter_taken_only_when_fresh_live_and_funded(self):
+        fn = self.ai_usage.fleet_openrouter_usage
+        self.assertEqual(fn(self._fleet_file())["balance"], 50)
+        self.assertIsNone(fn(self._fleet_file(age_seconds=7200)))
+        self.assertIsNone(fn(self._fleet_file(source="fleet-snapshot")))
+        self.assertIsNone(fn(self._fleet_file(credits=0)))
+        self.assertIsNone(fn(self._fleet_file(state="missing")))
+        self.assertIsNone(fn(Path("/nonexistent/ai-usage-basis.json")))
+
+    def test_openrouter_uses_fleet_when_local_account_has_no_credits(self):
+        fleet = self._fleet_file()
+        old_env = os.environ.get("AI_USAGE_FLEET_SNAPSHOT")
+        os.environ["AI_USAGE_FLEET_SNAPSHOT"] = str(fleet)
+        self.addCleanup(
+            lambda: os.environ.__setitem__("AI_USAGE_FLEET_SNAPSHOT", old_env)
+            if old_env is not None else os.environ.pop("AI_USAGE_FLEET_SNAPSHOT", None)
+        )
+        empty = {"provider": "openrouter", "state": "ok", "source": "api", "raw": {
+            "usage": {"openRouterUsage": {"balance": -0.000413, "keyUsage": 0.000413, "totalCredits": 0}}}}
+        funded = {"provider": "openrouter", "state": "ok", "source": "api", "raw": {
+            "usage": {"openRouterUsage": {"balance": 12.0, "keyUsage": 1.0, "totalCredits": 13}}}}
+        missing = {"provider": "openrouter", "state": "missing", "source": "env", "raw": None}
+        original = self.ai_usage._fetch_openrouter_local
+        self.addCleanup(lambda: setattr(self.ai_usage, "_fetch_openrouter_local", original))
+        for local, expect_source, expect_balance in (
+            (empty, "fleet-snapshot", 50), (missing, "fleet-snapshot", 50), (funded, "api", 12.0)
+        ):
+            self.ai_usage._fetch_openrouter_local = lambda timeout, _l=local: _l
+            result = self.ai_usage.fetch_openrouter(5)
+            self.assertEqual(result["source"], expect_source)
+            self.assertEqual(result["raw"]["usage"]["openRouterUsage"]["balance"], expect_balance)
 
     def test_two_accounts_are_named_not_pooled(self):
         raw = self.claude_raw(
