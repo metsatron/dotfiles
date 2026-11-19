@@ -970,12 +970,45 @@ class BankedResetTests(unittest.TestCase):
             self.ai_usage.ANSI_ESCAPE_RE.sub("", row)
             for row in self.ai_usage.format_banked_resets_lines(raw)
         ]
-        self.assertEqual(len(rows), 2, rows)
-        self.assertIn("Fable", rows[0])
-        self.assertIn("expired", rows[0])
-        self.assertIn("Weekly", rows[1])
-        self.assertIn("2 available", rows[1])
-        self.assertNotIn("expired", rows[1])
+        # The expired Fable entry is hidden; only the spendable weekly bank shows.
+        self.assertEqual(len(rows), 1, rows)
+        self.assertTrue(rows[0].startswith("  bank 1 "), rows[0])
+        self.assertNotIn("Fable", rows[0])
+        self.assertNotIn("expired", rows[0])
+        self.assertIn("Weekly", rows[0])
+        self.assertIn("2 available", rows[0])
+
+    def test_all_expired_banked_entries_show_no_rows(self):
+        raw = self.claude_raw(
+            {
+                "accounts": {
+                    "cc-main": [
+                        {"kind": "fbl", "count": 1, "expiresAt": "2026-11-10T12:00:00+00:00",
+                         "source": "manual"},
+                    ]
+                }
+            }
+        )
+        self.assertEqual(self.ai_usage.format_banked_resets_lines(raw), [])
+
+    def test_codex_reset_credits_at_zero_are_hidden(self):
+        soon = (datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+        later = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
+        rows = self.ai_usage.format_codex_reset_credit_lines(
+            {"resetCredits": {"availableCount": 2, "credits": [
+                {"status": "available", "expiresAt": soon},
+                {"status": "available", "expiresAt": later},
+            ]}}
+        )
+        plain = [self.ai_usage.ANSI_ESCAPE_RE.sub("", row) for row in rows]
+        self.assertEqual(len(plain), 1, plain)
+        self.assertTrue(plain[0].startswith("  bank 1 "), plain[0])
+        self.assertEqual(
+            self.ai_usage.format_codex_reset_credit_lines(
+                {"resetCredits": {"availableCount": 0, "credits": []}}
+            ),
+            [],
+        )
 
     def test_two_accounts_are_named_not_pooled(self):
         raw = self.claude_raw(
