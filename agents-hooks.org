@@ -2829,6 +2829,14 @@ set -euo pipefail
 
 [ -n "${PVOX_REPLY_OFF:-}" ] && exit 0
 
+# Deliberate human override: --force (or CORTEX_VOICE_FORCE=1) bypasses the
+# refusal gate further down, so a person can always speak something on purpose.
+VOICE_FORCE=0
+[ "${CORTEX_VOICE_FORCE:-}" = "1" ] && VOICE_FORCE=1
+for _arg in "$@"; do
+    case "$_arg" in --force) VOICE_FORCE=1 ;; esac
+done
+
 LOG="${XDG_CACHE_HOME:-$HOME/.cache}/pvox-reply.log"
 mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
 
@@ -2907,6 +2915,45 @@ case "${PVOX_HUD_AGENT:-}" in
     helmastra|helmductor|auryn|fable|claudeificus|haiku|nanobot|orcinus-orca|ecco-dolphinus|hermes-agent|gemma)
         HUD_AGENT="$PVOX_HUD_AGENT" ;;
 esac
+
+# Refusal gate (2026-11-19, the "no reply" incident): the outbound voice lane
+# must not speak machine chatter to the phone speaker. Before synthesis, refuse
+# when the reply is the NO_REPLY sentinel or empty (1), too short to be a real
+# spoken message (2), carries structured machine content — a 40+ hex run,
+# Message-ID, OPERATOR-QUOTE, a quoted ">" line, or sha256 (3), or is a
+# mail-turn envelope (4). Direction is default-safe: we speak ONLY when none of
+# the four rules apply. --force / CORTEX_VOICE_FORCE=1 bypasses the gate so a
+# human can always speak something deliberately. A single line naming the rule
+# that refused is logged (existing voice=/chars= fields plus a refused= field);
+# anything that IS spoken keeps the existing log format untouched below.
+if [ "$VOICE_FORCE" != "1" ]; then
+    # Trim leading/trailing whitespace (newlines included) for the identity and
+    # length rules; the content/envelope rules scan the full untrimmed text.
+    _trimmed="$TEXT"
+    _trimmed="${_trimmed#"${_trimmed%%[![:space:]]*}"}"
+    _trimmed="${_trimmed%"${_trimmed##*[![:space:]]}"}"
+    _upper="$(printf '%s' "$_trimmed" | tr '[:lower:]' '[:upper:]')"
+    _refused=""
+    if [ -z "$_trimmed" ] || [ "$_upper" = "NO_REPLY" ]; then
+        _refused="no-reply-or-empty"                                   # rule 1
+    elif [ "${#_trimmed}" -lt 40 ]; then
+        _refused="too-short"                                           # rule 2
+    elif grep -qE '[0-9a-fA-F]{40}' <<<"$TEXT" \
+         || grep -qF 'Message-ID' <<<"$TEXT" \
+         || grep -qF 'OPERATOR-QUOTE' <<<"$TEXT" \
+         || grep -qE '^>' <<<"$TEXT" \
+         || grep -qF 'sha256' <<<"$TEXT"; then
+        _refused="structured-content"                                  # rule 3
+    elif grep -qF 'MailCortex delivery' <<<"$TEXT" \
+         || grep -qF 'ESCALATION LEDGER' <<<"$TEXT"; then
+        _refused="mail-envelope"                                       # rule 4
+    fi
+    if [ -n "$_refused" ]; then
+        printf '%s voice=%s chars=%s refused=%s\n' \
+          "$(date '+%F %T')" "$VOICE" "${#TEXT}" "$_refused" >> "$LOG" 2>/dev/null || true
+        exit 0
+    fi
+fi
 
 # Split lanes (Mètsàtron's ruling 2026-08-17): synth where pvox lives (this
 # machine — HelmCortex is NFS-shared fleet-wide), play wherever he is. The
@@ -3012,6 +3059,152 @@ fi" < "$W" >/dev/null 2>&1; then
 ' _ "$VOICE" "$TEXT" "$PLAY_HOST" "$FALLBACK_HOST" "$REMOTE_PLAY" "$HUD_AGENT" >/dev/null 2>&1 &
 
 exit 0
+#+END_SRC
+
+** Refusal gate test (NO_REPLY / mail envelope / normal paragraph)
+
+The refusal gate above (2026-11-19) must suppress the NO_REPLY sentinel and mail-turn envelopes while still speaking a normal reply. This test drives the real =claude-hook-voice-reply= with the normalizer and synthesizer stubbed out (a pass-through normalizer, a fake =pvox= that writes a WAV, and a fake =ssh= that drains it and succeeds), feeds the three canonical fixtures, and asserts **2 refusals + 1 spoken** by reading the per-fixture =pvox-reply.log=. Synthesis is fully stubbed, so the test never touches pvox, the fleet, or the phone.
+
+#+BEGIN_SRC bash :tangle all/.local/share/dotcortex/tests/test-voice-reply-gate.sh :shebang "#!/usr/bin/env bash"
+# ~/DotCortex/all/.local/share/dotcortex/tests/test-voice-reply-gate.sh
+# Failing-first test for the claude-hook-voice-reply refusal gate.
+# Feeds three fixtures (NO_REPLY, a mail envelope, a normal paragraph) with
+# synthesis stubbed out and asserts 2 refusals + 1 spoken, by reading the
+# per-fixture pvox-reply.log. No real pvox / ssh / phone is touched.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+HOOK="${VOICE_REPLY_HOOK:-$HERE/../../../bin/claude-hook-voice-reply}"
+if [ ! -x "$HOOK" ]; then
+    echo "FAIL: hook not found/executable at $HOOK" >&2
+    exit 1
+fi
+
+SANDBOX="$(mktemp -d "${TMPDIR:-/tmp}/voice-gate-test-XXXXXX")"
+trap 'rm -rf "$SANDBOX"' EXIT
+
+# Stub normalizer: emit stdin verbatim (ignore --hook-json), so TEXT == fixture.
+NORM="$SANDBOX/voice-text-normalize"
+cat > "$NORM" <<'EOF'
+#!/usr/bin/env bash
+cat
+EOF
+chmod +x "$NORM"
+
+# Fake HOME carrying a fake pvox: voicespec prints nothing (skips the on-device
+# lane), render writes a stub WAV to its output path and succeeds.
+FAKEHOME="$SANDBOX/home"
+mkdir -p "$FAKEHOME/.local/share/pvox-clone/client/bin"
+PVOX="$FAKEHOME/.local/share/pvox-clone/client/bin/pvox"
+cat > "$PVOX" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    voicespec) exit 0 ;;                 # empty spec -> ship lane, not on-device
+    render)    out="${@: -1}"; printf 'RIFFstub' > "$out"; exit 0 ;;
+    *)         exit 0 ;;
+esac
+EOF
+chmod +x "$PVOX"
+
+# Fake ssh: drain the shipped WAV from stdin and succeed (delivery OK).
+BIN="$SANDBOX/bin"
+mkdir -p "$BIN"
+cat > "$BIN/ssh" <<'EOF'
+#!/usr/bin/env bash
+cat >/dev/null 2>&1 || true
+exit 0
+EOF
+chmod +x "$BIN/ssh"
+
+run_fixture() {
+    # run_fixture <name> <fixture-file>
+    local name="$1" fixture="$2"
+    local cache="$SANDBOX/cache-$name"
+    mkdir -p "$cache"
+    env -i \
+        PATH="$BIN:/usr/bin:/bin" \
+        HOME="$FAKEHOME" \
+        XDG_CACHE_HOME="$cache" \
+        VOICE_TEXT_NORMALIZER="$NORM" \
+        CLAUDE_WARM_HERDR_AGENT="hermes" \
+        "$HOOK" < "$fixture" >/dev/null 2>&1 || true
+    # The spoken lane synthesizes in a detached worker; poll its log briefly.
+    local log="$cache/pvox-reply.log" i
+    for i in $(seq 1 50); do
+        if [ -s "$log" ]; then break; fi
+        sleep 0.1
+    done
+    cat "$log" 2>/dev/null || true
+}
+
+# Fixtures ------------------------------------------------------------------
+F_NOREPLY="$SANDBOX/fx-noreply"
+printf 'NO_REPLY' > "$F_NOREPLY"
+
+F_ENVELOPE="$SANDBOX/fx-envelope"
+cat > "$F_ENVELOPE" <<'EOF'
+MailCortex delivery for honey-badger@honey.helm
+From: operator
+Subject: nightly rollup
+The backup stratum rotated cleanly and the health check is green across all seats this evening.
+EOF
+
+F_NORMAL="$SANDBOX/fx-normal"
+printf '%s' "Yes, I restarted the gateway and confirmed the web UI came back up on its port. Everything looks healthy now." > "$F_NORMAL"
+
+# Run ----------------------------------------------------------------------
+OUT_NOREPLY="$(run_fixture noreply "$F_NOREPLY")"
+OUT_ENVELOPE="$(run_fixture envelope "$F_ENVELOPE")"
+OUT_NORMAL="$(run_fixture normal "$F_NORMAL")"
+
+echo "---- NO_REPLY ----";        echo "${OUT_NOREPLY:-<empty>}"
+echo "---- mail envelope ----";   echo "${OUT_ENVELOPE:-<empty>}"
+echo "---- normal paragraph ----"; echo "${OUT_NORMAL:-<empty>}"
+echo "--------------------------"
+
+fail=0
+assert_refused() {
+    local name="$1" out="$2" rule="$3"
+    if printf '%s' "$out" | grep -q "refused=$rule"; then
+        echo "PASS: $name refused ($rule)"
+    else
+        echo "FAIL: $name should have been refused with $rule; got: ${out:-<empty>}"
+        fail=1
+    fi
+}
+assert_spoken() {
+    local name="$1" out="$2"
+    if printf '%s' "$out" | grep -q 'refused='; then
+        echo "FAIL: $name was refused but should have been spoken; got: $out"
+        fail=1
+    elif printf '%s' "$out" | grep -Eq 'delivered=|rendered=on-device|RENDER-FAIL'; then
+        echo "PASS: $name spoken (reached synthesis)"
+    else
+        echo "FAIL: $name produced no synthesis evidence; got: ${out:-<empty>}"
+        fail=1
+    fi
+}
+
+assert_refused "NO_REPLY"      "$OUT_NOREPLY"  "no-reply-or-empty"
+assert_refused "mail envelope" "$OUT_ENVELOPE" "mail-envelope"
+assert_spoken  "normal paragraph" "$OUT_NORMAL"
+
+refusals=0
+printf '%s' "$OUT_NOREPLY"  | grep -q 'refused=' && refusals=$((refusals+1)) || true
+printf '%s' "$OUT_ENVELOPE" | grep -q 'refused=' && refusals=$((refusals+1)) || true
+printf '%s' "$OUT_NORMAL"   | grep -q 'refused=' && refusals=$((refusals+1)) || true
+echo "SUMMARY: refusals=$refusals (expected 2)"
+
+if [ "$refusals" -ne 2 ]; then
+    echo "FAIL: expected exactly 2 refusals, got $refusals"
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "RESULT: FAIL"
+    exit 1
+fi
+echo "RESULT: PASS (2 refusals + 1 spoken)"
 #+END_SRC
 
 ** Agent voice spool (sandboxed agents speak without the operator's SSH key)
