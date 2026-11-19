@@ -177,6 +177,28 @@ def patch_dests(args: dict):
 
 
 # ------------------------------------------------------------- wrong paths
+def path_form_class(raw):
+    """Classify notation only; never return path text or a content-derived ID."""
+    if not isinstance(raw, str) or not raw.strip():
+        return "invalid"
+    value = raw.strip()
+    if value.startswith(('"', "'")):
+        return "quoted"
+    if re.search(r"%[0-9A-Fa-f]{2}", value):
+        return "percent_encoded"
+    if value.startswith("file://"):
+        return "file_uri"
+    if re.match(r"^(https?|data|ftp):", value, re.I):
+        return "unsupported_url"
+    return "bare_absolute" if value.startswith("/") else "relative"
+
+
+def log_path_diagnostic(raw, tool, directive, normalized_exists):
+    """Only enum labels and a boolean; deliberately no session, name or path."""
+    R.log("path_diagnostic", tool=tool, form_class=path_form_class(raw),
+          directive=directive, normalized_exists=bool(normalized_exists))
+
+
 def check_paths(sid: str, tool: str, args: dict, cwd: str | None):
     """Rewrite a non-existent path to its one clear match. Logs labels only, never paths."""
     if R.mode("path_fixer") == "off" or tool not in pathfix.PATH_ARGS:
@@ -184,7 +206,34 @@ def check_paths(sid: str, tool: str, args: dict, cwd: str | None):
     key = pathfix.PATH_ARGS[tool]
     raw = args.get(key)
     path = pathfix.local_path(raw, cwd)
-    if not path or os.path.exists(path):
+    if not path:
+        log_path_diagnostic(raw, tool, "none", False)
+        return
+    if os.path.exists(path):
+        # Normalize only copy/paste syntax that the public reader does not
+        # accept. Bare paths keep their exact reader semantics, including
+        # symlink/parent traversal and leading double slashes.
+        raw_s = raw.strip() if isinstance(raw, str) else ""
+        syntax = raw_s.strip("\"'")
+        syntax_changed = (raw_s != raw or raw_s.startswith(("\"", "'")) or
+                          syntax.startswith("file://"))
+        if syntax_changed:
+            if syntax.startswith("file://"):
+                syntax = syntax[7:]
+            syntax = os.path.expanduser(syntax)
+            if not syntax.startswith("/") and cwd:
+                syntax = os.path.join(cwd, syntax)
+            # Only rewrite when the syntax-stripped reader target is the same
+            # semantic target as pathfix's normalized existing path.
+            safe = syntax.startswith("/") and os.path.realpath(syntax) == os.path.realpath(path)
+            if safe:
+                active = R.mode("path_fixer") == "active"
+                R.log("path_fixer", action="fix" if active else "would_fix",
+                      tool=tool, reason="normalize", n_candidates=0)
+                if active:
+                    log_path_diagnostic(raw, tool, "modify", True)
+                    out({"action": "modify", "args": {key: path}})
+        log_path_diagnostic(raw, tool, "none", True)
         return
     rooted = pathfix.home_rooted(path)     # Filebrowser-style '/Secret Vault/...'
     if rooted:
@@ -197,12 +246,14 @@ def check_paths(sid: str, tool: str, args: dict, cwd: str | None):
         folder, names = pathfix.suggestions(path)
         if not names:
             R.log("path_fixer", action="none", tool=tool, reason=reason, n_candidates=n)
+            log_path_diagnostic(raw, tool, "none", False)
             return
         base = os.path.basename(path)
         # These blocks are R2D2 STEERING Aura, not the tool failing. Mark them so the
         # post_tool hook doesn't count them toward the consecutive-failure wall and lock
         # read_file after 3 (the recurring "Aura can't read the report", 2026-10-20).
         R.mark_steer(sid, tool)
+        log_path_diagnostic(raw, tool, "block" if R.mode("path_fixer") == "active" else "none", False)
         # Ambiguous among near-identical siblings (e.g. three copies of one client's
         # report): show just that short, numbered cluster so the right one is obvious and
         # copyable, instead of a 15-line folder dump.
@@ -229,6 +280,7 @@ def check_paths(sid: str, tool: str, args: dict, cwd: str | None):
               reason="suggest_" + reason, tool=tool, n_candidates=n)
     active = R.mode("path_fixer") == "active"
     R.log("path_fixer", action="fix" if active else "would_fix", tool=tool, reason=reason, n_candidates=n)
+    log_path_diagnostic(raw, tool, "modify" if active else "none", False)
     if active:
         out({"action": "modify", "args": {key: fixed}})
 
