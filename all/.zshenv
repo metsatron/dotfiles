@@ -67,6 +67,30 @@ if [ -r "$HOME/.guix-extra-profiles/core/core/etc/profile" ]; then
   esac
 fi
 
+# Guix prepended its share dir to a possibly-empty XDG_DATA_DIRS above; re-assert
+# the system dirs so GLib can still see /usr/share (schemas, mime, icons).
+# Guix's etc/profile prepends its share dir to XDG_DATA_DIRS. When the variable
+# is empty at that moment -- a fresh login or ssh shell -- the result is
+# Guix-only, /usr/share drops out, and GLib can no longer see
+# /usr/share/glib-2.0/schemas: `gsettings list-schemas` loses every system
+# schema and any GTK3 app that loads a module aborts with
+# "Settings schema 'org.appmenu.gtk-module' is not installed".
+# Unlike GST_PLUGIN_SYSTEM_PATH this variable is additive, so re-asserting the
+# system dirs after the Guix sourcing is enough; the case guard keeps the pass
+# idempotent and also repairs an inherited Guix-only value in a shell that
+# skipped the sourcing above.
+for __xdg_data in /usr/local/share /usr/share; do
+  [ -d "$__xdg_data" ] || continue
+  case ":${XDG_DATA_DIRS:-}:" in
+    *":$__xdg_data:"*) ;;                                    # already present
+    *) XDG_DATA_DIRS="${XDG_DATA_DIRS:+$XDG_DATA_DIRS:}$__xdg_data" ;;
+  esac
+done
+if [ -n "${XDG_DATA_DIRS:-}" ]; then
+  export XDG_DATA_DIRS
+fi
+unset __xdg_data
+
 # Guix's etc/profile sets GST_PLUGIN_SYSTEM_PATH to ONLY the Guix plugin dir.
 # That var REPLACES (does not append to) GStreamer's compiled-in OS default, so
 # system apps (e.g. Debian Quod Libet) stop scanning /usr/lib/.../gstreamer-1.0,
