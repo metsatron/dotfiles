@@ -917,6 +917,10 @@ def _queue_obsolete_reason(item):
 
 def _queue_sweep():
     changed = []; expired=[]; routed=[]
+    try:
+        window = _desk_window_seconds(_runtime_manifest())
+    except (OSError, ValueError, TypeError):
+        window = None
     with _morning_queue_file() as file:
         for item in _queue_read(file):
             if item['status'] == 'held' and item.get('hold_deadline', float('inf')) <= time.time():
@@ -930,9 +934,59 @@ def _queue_sweep():
                     _queue_append(file, item); changed.append(item['id'])
                     if reason == 'done by another route':
                         routed.append(dict(item))
+        if window is not None:
+            for item_id in _reap_replay_claims(file, window):
+                if item_id not in changed:
+                    changed.append(item_id)
     for item in expired:_telegram_outcome(item,'hold_timeout')
     for item in routed:_telegram_outcome(item,'done_by_another_route')
     return changed
+
+
+def _epochish(value):
+    """Seconds since the epoch from a number or an ISO-8601 stamp; None if neither."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value:
+        try:
+            return datetime.datetime.fromisoformat(value.replace('Z', '+00:00')).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
+def _reap_replay_claims(file, window, seat=None, now=None):
+    """Retire replay_claimed items whose Desk approval window has passed.
+
+    A replay_claimed item is the seat-side proof that the Admiral approved one
+    exact request hash on that seat (Admiral ruling 7874), and _desk_approval_consume
+    clears it when that same request recurs. A claim whose request never comes back
+    would otherwise stay replay_claimed for ever and read as outstanding work, so age
+    is applied here as well as at consumption. Behaviour is unchanged: the consume
+    path already refuses a claim older than the window, so an expired claim could
+    never have been honoured; this only stops it looking like outstanding work.
+    `seat` scopes the pass to one seat; the sweep passes none and reaps every seat.
+    """
+    if not isinstance(window, (int, float)) or window <= 0:
+        return []
+    now = time.time() if now is None else now
+    reaped = []
+    for item in _queue_read(file):
+        if item.get('status') != 'replay_claimed':
+            continue
+        if seat is not None and item.get('seat') != seat:
+            continue
+        stamp = _epochish(item.get('approved_at'))
+        if stamp is None:
+            stamp = _epochish(item.get('claimed_at'))
+        if stamp is None or now - stamp <= window:
+            continue
+        item.update(status='obsolete', resolution='desk approval expired (never recurred)', resolved_at=_utc())
+        _queue_append(file, item)
+        reaped.append(item['id'])
+    return reaped
 
 
 def _queue_confirm(item_id, needed, session):

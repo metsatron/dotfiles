@@ -312,6 +312,71 @@ class DeskApprovalGateTests(unittest.TestCase):
             probe.assert_not_called()
 
 
+# Desk approval gate:1 ends here
+
+class ReplayClaimReaperTests(unittest.TestCase):
+    """A replay_claimed item is an Admiral approval waiting for its request."""
+
+    SEAT = 'fable@kikin-kushi.helm'
+    OTHER = 'auryn@kikin.helm'
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='approval-reaper.')
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name)
+        self.queue = self.base / 'queue.jsonl'
+
+    def env(self):
+        return {'SO_APPROVAL_MORNING_QUEUE': str(self.queue),
+                'HOME': str(self.base), 'DOTCORTEX_HOME': str(self.base)}
+
+    def claim(self, item_id, seat, age_seconds, now):
+        stamp = now - age_seconds
+        return {'schema': 'dotcortex.approval.queue.v2', 'id': item_id, 'seat': seat,
+                'status': 'replay_claimed', 'approved_by': '424242', 'approved_at': stamp,
+                'approved_request_sha': '0' * 64, 'claimed_at': stamp,
+                'command_hashes': ['0' * 64], 'request': {'tool_name': 'Bash'}, 'count': 1}
+
+    def append(self, items):
+        with mock.patch.dict(os.environ, self.env()):
+            with e._morning_queue_file() as file:
+                for item in items:
+                    e._queue_append(file, item)
+
+    def items(self):
+        with mock.patch.dict(os.environ, self.env()):
+            with e._morning_queue_file() as file:
+                return {x['id']: x for x in e._queue_read(file)}
+
+    def reap(self, window, seat=None, now=None):
+        with mock.patch.dict(os.environ, self.env()):
+            with e._morning_queue_file() as file:
+                return e._reap_replay_claims(file, window, seat=seat, now=now)
+
+    def test_a_fresh_claim_is_left_alone(self):
+        now = time.time()
+        self.append([self.claim('fresh01', self.SEAT, 60, now)])
+        self.assertEqual(self.reap(24 * 3600.0, now=now), [])
+        self.assertEqual(self.items()['fresh01']['status'], 'replay_claimed')
+
+    def test_an_expired_claim_becomes_obsolete_and_says_why(self):
+        now = time.time()
+        self.append([self.claim('stale01', self.SEAT, 48 * 3600, now)])
+        self.assertEqual(self.reap(24 * 3600.0, now=now), ['stale01'])
+        item = self.items()['stale01']
+        self.assertEqual(item['status'], 'obsolete')
+        self.assertEqual(item['resolution'], 'desk approval expired (never recurred)')
+        self.assertTrue(item.get('resolved_at'))
+
+    def test_a_claim_for_another_seat_is_not_touched(self):
+        now = time.time()
+        self.append([self.claim('mine01', self.SEAT, 48 * 3600, now),
+                     self.claim('theirs01', self.OTHER, 48 * 3600, now)])
+        self.assertEqual(self.reap(24 * 3600.0, seat=self.SEAT, now=now), ['mine01'])
+        items = self.items()
+        self.assertEqual(items['mine01']['status'], 'obsolete')
+        self.assertEqual(items['theirs01']['status'], 'replay_claimed')
+
+
 if __name__ == '__main__':
     unittest.main()
-# Desk approval gate:1 ends here
