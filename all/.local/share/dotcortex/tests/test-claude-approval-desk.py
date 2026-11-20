@@ -312,8 +312,6 @@ class DeskApprovalGateTests(unittest.TestCase):
             probe.assert_not_called()
 
 
-# Desk approval gate:1 ends here
-
 class ReplayClaimReaperTests(unittest.TestCase):
     """A replay_claimed item is an Admiral approval waiting for its request."""
 
@@ -380,3 +378,4 @@ class ReplayClaimReaperTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+# Desk approval gate:1 ends here

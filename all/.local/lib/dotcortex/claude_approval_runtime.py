@@ -961,13 +961,13 @@ def _reap_replay_claims(file, window, seat=None, now=None):
     """Retire replay_claimed items whose Desk approval window has passed.
 
     A replay_claimed item is the seat-side proof that the Admiral approved one
-    exact request hash on that seat (Admiral ruling 7874), and _desk_approval_consume
-    clears it when that same request recurs. A claim whose request never comes back
-    would otherwise stay replay_claimed for ever and read as outstanding work, so age
-    is applied here as well as at consumption. Behaviour is unchanged: the consume
-    path already refuses a claim older than the window, so an expired claim could
-    never have been honoured; this only stops it looking like outstanding work.
-    `seat` scopes the pass to one seat; the sweep passes none and reaps every seat.
+    exact request hash on that seat, and _desk_approval_consume clears it when
+    that same request recurs. A claim whose request never comes back would stay
+    replay_claimed for ever and read as outstanding work, so age is applied here
+    as well as at consumption. Behaviour is unchanged: the consume path already
+    refuses a claim older than the window, so an expired claim could never have
+    been honoured; this only stops it looking like outstanding work. `seat`
+    scopes the pass to one seat; the sweep passes none and reaps every seat.
     """
     if not isinstance(window, (int, float)) or window <= 0:
         return []
