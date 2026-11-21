@@ -4,6 +4,23 @@ o.number = true
 o.relativenumber = false
 o.mouse = "a"
 o.clipboard = "unnamedplus"
+
+-- Over SSH there is no local display clipboard, so a yank on a remote host
+-- never reached the machine in front of him. Copy goes to the terminal's own
+-- clipboard with OSC 52 (kitty accepts it); paste reads the unnamed register
+-- and never asks the terminal, because most terminals do not answer a
+-- clipboard read and the query would hang.
+if vim.env.SSH_TTY or vim.env.SSH_CONNECTION then
+  local osc52 = require("vim.ui.clipboard.osc52")
+  local function paste_from_register()
+    return { vim.fn.split(vim.fn.getreg('"'), "\n"), vim.fn.getregtype('"') }
+  end
+  vim.g.clipboard = {
+    name = "OSC 52 copy, register paste",
+    copy = { ["+"] = osc52.copy("+"), ["*"] = osc52.copy("*") },
+    paste = { ["+"] = paste_from_register, ["*"] = paste_from_register },
+  }
+end
 o.breakindent = true
 o.smartindent = true
 o.ignorecase = true
