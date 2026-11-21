@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Isolated approval lifecycle regression checks; no live state or network."""
 import copy
+import datetime
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -299,9 +300,11 @@ class PtyHoldDedupTests(unittest.TestCase):
             with log.open('a') as stream:
                 stream.write(json.dumps({'ts':ts,'session':'fixture-session','tool':'Bash',
                     'decision':'allow','reason':'decider_allow','input_sha':sha})+'\n')
-        append('2026-10-16T00:00:00+00:00')
+        started=datetime.datetime.fromisoformat(row['first_seen'])
+        day=datetime.timedelta(days=1)
+        append((started-day).isoformat())
         self.assertIsNone(runtime._queue_obsolete_reason(row))
-        append('2026-10-18T00:00:00+00:00')
+        append((started+day).isoformat())
         self.assertEqual(runtime._queue_obsolete_reason(row),'done by another route')
         with patch.object(runtime,'_telegram_outcome') as cleanup:
             self.assertEqual(runtime._queue_sweep(),[item])
