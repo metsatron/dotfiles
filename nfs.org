@@ -249,10 +249,32 @@ reload_autofs() {
   fi
 }
 
+# A busy server is not a dead one (22 Nov 2026: a CPU-saturated X230 made a 5-second stat fail
+# for hours and this watchdog could have force-unmounted a mount in active use). The mount is
+# stale only when stat has failed for a patient 30 seconds, the server does not answer an NFS
+# RPC either, and that has held for STALE_RUNS consecutive runs.
+STALE_STAT_TIMEOUT="${NFS_DOCTOR_STAT_TIMEOUT:-30}"
+STALE_RUNS="${NFS_DOCTOR_STALE_RUNS:-3}"
+STALE_STATE_DIR="${NFS_DOCTOR_STATE:-/var/tmp/nfs-doctor}"
 mount_is_stale() {
-  local mp="$1"
-  grep -q " $mp " /proc/mounts 2>/dev/null || return 1   # not mounted -> not stale
-  timeout 5 stat "$mp" >/dev/null 2>&1 && return 1
+  local mp="$1" host counter count
+  host="$(basename "$mp")"
+  mkdir -p "$STALE_STATE_DIR" 2>/dev/null || true
+  counter="$STALE_STATE_DIR/stale.${host//\//_}"
+  grep -q " $mp " /proc/mounts 2>/dev/null || { rm -f "$counter"; return 1; }   # not mounted -> not stale
+  if timeout "$STALE_STAT_TIMEOUT" stat "$mp" >/dev/null 2>&1; then
+    rm -f "$counter"; return 1
+  fi
+  if timeout 5 rpcinfo -t "$host" nfs >/dev/null 2>&1; then
+    log "client: $mp is slow but $host answers NFS; not treating it as stale"
+    rm -f "$counter"; return 1
+  fi
+  count=$(( $(cat "$counter" 2>/dev/null || echo 0) + 1 ))
+  echo "$count" > "$counter" 2>/dev/null || true
+  if [ "$count" -lt "$STALE_RUNS" ]; then
+    log "client: $mp failed the stat probe ($count of $STALE_RUNS runs); waiting before any unmount"
+    return 1
+  fi
   return 0
 }
 
@@ -1391,3 +1413,70 @@ should be removed once NFS via autofs is confirmed stable — it was created man
 
 The =sshfs-open-home= script in =shell.org= remains useful for SSHFS to other hosts
 (e.g. t430) and should not be removed.
+
+* nfs-doctor patience test
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-nfs-doctor-patience.py :shebang "#!/usr/bin/env python3"
+"""nfs-doctor must not call a busy NFS server stale, and must wait several runs before it unmounts anything."""
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import tempfile
+import unittest
+
+REPO = pathlib.Path(__file__).resolve().parents[5]
+DOCTOR = REPO / "all/.local/bin/nfs-doctor"
+
+
+class PatienceTests(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = pathlib.Path(tmp.name)
+        self.stubs = self.root / "stubs"
+        self.stubs.mkdir()
+        self.state = self.root / "state"
+        text = DOCTOR.read_text()
+        match = re.search(r"STALE_STAT_TIMEOUT=.*?\nmount_is_stale\(\) \{.*?\n\}\n", text, re.S)
+        self.assertIsNotNone(match, "the patient probe is missing from nfs-doctor")
+        self.code = match.group(0)
+        self.stub("timeout", 'shift; exec "$@"')
+        self.stub("stat", 'exit "${STAT_RC:-0}"')
+        self.stub("rpcinfo", 'exit "${RPC_RC:-0}"')
+
+    def stub(self, name, body):
+        path = self.stubs / name
+        path.write_text("#!/bin/bash\n" + body + "\n")
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
+
+    def run_probe(self, stat_rc, rpc_rc, mp="/"):
+        env = {"PATH": f"{self.stubs}:/usr/bin:/bin", "STAT_RC": str(stat_rc), "RPC_RC": str(rpc_rc),
+               "NFS_DOCTOR_STATE": str(self.state)}
+        script = 'log() { echo "log: $*"; }\n' + self.code + f'\nmount_is_stale "{mp}"; echo rc=$?'
+        return subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=30).stdout
+
+    def test_a_working_stat_is_never_stale(self):
+        self.assertIn("rc=1", self.run_probe(0, 1))
+
+    def test_a_slow_stat_while_the_server_answers_is_not_stale(self):
+        out = self.run_probe(1, 0)
+        self.assertIn("rc=1", out)
+        self.assertIn("answers NFS", out)
+
+    def test_a_dead_server_is_stale_only_after_the_third_consecutive_run(self):
+        self.assertIn("rc=1", self.run_probe(1, 1))
+        self.assertIn("rc=1", self.run_probe(1, 1))
+        self.assertIn("rc=0", self.run_probe(1, 1))
+
+    def test_one_good_run_resets_the_count(self):
+        self.run_probe(1, 1)
+        self.run_probe(1, 1)
+        self.run_probe(0, 0)
+        self.assertIn("rc=1", self.run_probe(1, 1))
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
