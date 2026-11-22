@@ -7501,8 +7501,29 @@ def text_of_part(part: dict) -> str:
     return ""
 
 
+CONTEXT_RECORD_TYPES = ("user", "assistant")
+
+
+def is_context_record(record: dict) -> bool:
+    """True when the model reads this record on resume.
+
+    A transcript also carries records a logging mod wrote beside the
+    conversation (api-request-blob, api-request, api-request-shape, ...). They
+    have a ``message`` field, but they are not conversation: counting them fills
+    the ceiling with text the model never loads, and an index stub placed in one
+    of them is a pointer the model cannot read. A record with no type is treated
+    as conversation, so older fixtures keep working.
+    """
+    kind = record.get("type")
+    return kind is None or kind in CONTEXT_RECORD_TYPES
+
+
 def all_text(record: dict) -> int:
-    """Every character of message text in this record, tool output included."""
+    """Every character of message text in this record, tool output included.
+
+    Zero for a record the model does not read (see is_context_record)."""
+    if not is_context_record(record):
+        return 0
     message = record.get("message")
     if not isinstance(message, dict):
         return 0
@@ -7612,6 +7633,52 @@ def parent_chain(records: list[dict]) -> list[str]:
         seen.add(parent)
         chain.append(parent)
         node = by_uuid[parent]
+
+
+def main_chain(records: list[dict]) -> tuple[list[str], list[dict]]:
+    """The real chain, tolerating a trailing orphan fragment.
+
+    Walk back from the newest uuid-bearing record exactly as parent_chain does.
+    When that record's chain does not reach the root (a missing parent, a
+    cycle), it is a trailing orphan: report it and try the next-newest, until
+    one reaches the root. The chain is never shortened and nothing is dropped
+    silently: every skipped record is returned with its position, role, uuid and
+    the reason. When no record reaches the root, ChainError is raised as before.
+
+    Returns (chain newest-first, orphans oldest-first).
+    """
+    positions = [
+        position
+        for position, record in enumerate(records)
+        if isinstance(record.get("uuid"), str) and record.get("uuid")
+    ]
+    orphans: list[dict] = []
+    for position in reversed(positions):
+        try:
+            chain = parent_chain(records[: position + 1])
+        except ChainError as error:
+            record = records[position]
+            orphans.append(
+                {
+                    "position": position,
+                    "type": record.get("type"),
+                    "role": (record.get("message") or {}).get("role") if isinstance(record.get("message"), dict) else None,
+                    "uuid": record.get("uuid"),
+                    "parentUuid": record.get("parentUuid"),
+                    "reason": str(error),
+                    "excluded": True,
+                }
+            )
+            continue
+        orphans.reverse()
+        return chain, orphans
+    if not positions:
+        return [], []
+    raise ChainError(
+        "no uuid-bearing record reaches the root; newest failure: {}".format(
+            orphans[0]["reason"] if orphans else "unknown"
+        )
+    )
 
 
 def identity_snapshot(records: list[dict]) -> list[tuple]:
@@ -8269,10 +8336,28 @@ def elidable_candidates(
     boundary = max(0, len(records) - max(0, keep_recent_records))
     found: list[Candidate] = []
     for position, record in enumerate(records[:boundary]):
+        if not is_context_record(record):
+            continue
         message = record.get("message")
         if not isinstance(message, dict):
             continue
         content = message.get("content")
+        if isinstance(content, str):
+            # A record whose whole content is one string: Claude Code writes the
+            # native compaction summary ("This session is being continued...")
+            # and every channel message this way. block_index -1 names it.
+            if include_prose and len(content) > stub_over_chars:
+                found.append(
+                    Candidate(
+                        key="r{}-s".format(position),
+                        position=position,
+                        block_index=-1,
+                        chars=len(content),
+                        uuid=record.get("uuid") if isinstance(record.get("uuid"), str) else None,
+                        excerpt="\n".join(content.splitlines()[:6])[:excerpt_chars],
+                    )
+                )
+            continue
         if not isinstance(content, list):
             continue
         for block_index, part in enumerate(content):
@@ -8437,6 +8522,19 @@ def verify_pointers(path: Path, pointers: list[dict]) -> list[dict]:
                     block_index = pointer.get("block_index")
                     message = record.get("message")
                     content = message.get("content") if isinstance(message, dict) else None
+                    if block_index == -1 and isinstance(content, str):
+                        # A whole-string record: measure the string itself.
+                        if len(content) != int(pointer.get("chars", -1)):
+                            mismatches.append(
+                                {
+                                    "line": number,
+                                    "key": pointer.get("key"),
+                                    "reason": "char-count-mismatch",
+                                    "expected": int(pointer.get("chars", -1)),
+                                    "found": len(content),
+                                }
+                            )
+                        continue
                     if (
                         not isinstance(content, list)
                         or not isinstance(block_index, int)
@@ -8821,14 +8919,28 @@ def compact(
         return CompactResult(False, "source-unreadable", report)
 
     try:
-        chain_before = parent_chain(records)
+        chain_before, orphans = main_chain(records)
     except ChainError as error:
         report["chain_error"] = str(error)
         return CompactResult(False, "chain-broken-before", report)
+    # A trailing orphan fragment is excluded from the working copy and reported
+    # in full; the source file is never altered, so nothing is lost.
+    excluded_positions = {item["position"] for item in orphans}
+    report["orphans_excluded"] = orphans
+    report["orphan_count"] = len(orphans)
 
     identities_before = identity_snapshot(records)
     human_before = [human_text(record) for record in records]
-    chars_before = sum(all_text(record) for record in records)
+    non_context_chars = sum(
+        len(json.dumps(record.get("message"))) if isinstance(record.get("message"), dict) else 0
+        for record in records
+        if not is_context_record(record)
+    )
+    report["non_context_chars_excluded"] = non_context_chars
+    report["non_context_records_excluded"] = sum(1 for record in records if not is_context_record(record))
+    chars_before = sum(
+        all_text(record) for position, record in enumerate(records) if position not in excluded_positions
+    )
     tokens_before = estimate_tokens(chars_before, chars_per_token)
     report.update(
         {
@@ -8894,6 +9006,8 @@ def compact(
                 part = content[candidate.block_index]
             if isinstance(part, dict):
                 grouping_texts[candidate.key] = block_text(part)
+            elif candidate.block_index == -1 and isinstance(content, str):
+                grouping_texts[candidate.key] = content
         groups, group_plan = build_pointer_groups(
             rows,
             chosen,
@@ -8923,8 +9037,46 @@ def compact(
             index.add_group(group)
         with out.open("w", encoding="utf-8") as handle:
             for position, (line_number, record) in enumerate(rows):
+                if position in excluded_positions:
+                    continue
                 message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str):
+                    candidate = chosen_keys.get("r{}-s".format(position))
+                    if candidate is not None:
+                        text = content
+                        index.add(candidate.key, text)
+                        if on_indexed is not None:
+                            on_indexed(candidate.key, text)
+                        planned = group_plan.get(candidate.key)
+                        group_id = None
+                        if planned:
+                            group_id, _role = planned
+                            stub = group_stub_for(
+                                group_id, groups_by_id[group_id], candidate, line_number, pointer_name
+                            )
+                        else:
+                            stub = _stub_text(candidate, text, line_number, pointer_name)
+                        message["content"] = stub
+                        folded_prose += 1
+                        if message.get("role") == "user":
+                            relocated_human.append(
+                                {"key": candidate.key, "chars": len(text), "kind": "text"}
+                            )
+                        claimed_line = pointer_line(stub)
+                        pointers.append(
+                            {
+                                "line": line_number if claimed_line is None else claimed_line,
+                                "names_line": claimed_line is not None,
+                                "record_line": line_number,
+                                "uuid": candidate.uuid,
+                                "block_index": -1,
+                                "chars": len(text),
+                                "key": candidate.key,
+                                "group": group_id,
+                            }
+                        )
+                        elided += 1
                 if isinstance(content, list):
                     for block_index, part in enumerate(content):
                         candidate = chosen_keys.get("r{}-{}".format(position, block_index))
@@ -9002,14 +9154,25 @@ def compact(
         except (OSError, sqlite3.Error):
             pass
 
-    chars_after = sum(all_text(record) for record in records)
+    kept_records = [record for position, record in enumerate(records) if position not in excluded_positions]
+    chars_after = sum(all_text(record) for record in kept_records)
     tokens_after = estimate_tokens(chars_after, chars_per_token)
     identities_after = identity_snapshot(records)
     human_changed = sum(
         1 for before, record in zip(human_before, records) if before != human_text(record)
     )
+    # Every elision stub and group description must sit in a record the model
+    # reads: a stub in a logging record is a pointer to nothing.
+    unreadable_stub_records = [
+        position
+        for position, record in enumerate(records)
+        if position not in excluded_positions
+        and not is_context_record(record)
+        and "[elided" in json.dumps(record.get("message"))
+    ]
+    report["index_unreadable_records"] = unreadable_stub_records[:10]
     try:
-        chain_after = parent_chain(records)
+        chain_after = parent_chain(kept_records)
     except ChainError as error:
         report["chain_error"] = str(error)
         chain_after = []
@@ -9115,6 +9278,12 @@ def compact(
         # A group stub that the index cannot expand is a dead end: it says
         # "group g07" and there is no g07 to read.  Nothing ships.
         reason = "group-mismatch"
+        try:
+            out.unlink()
+        except OSError:
+            pass
+    elif unreadable_stub_records:
+        reason = "index-unreadable"
         try:
             out.unlink()
         except OSError:
