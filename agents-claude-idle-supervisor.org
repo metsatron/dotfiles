@@ -7681,6 +7681,90 @@ def main_chain(records: list[dict]) -> tuple[list[str], list[dict]]:
     )
 
 
+def repair_orphan_chain(lines: list[str]) -> tuple[list[str], list[dict]]:
+    """Reconnect a trailing orphan fragment to the real tip by rewriting ONE parentUuid.
+
+    Native Claude Code's failed /compact (a 5-hour-limited one, 17 Nov 2026) writes a
+    record whose parentUuid names a uuid that no record defines. ``claude --resume``
+    walks back from the newest record, stops at that dangling parent and loads only the
+    fragment, dropping everything older. The repair sets the fragment's first record's
+    parentUuid to the newest record that does reach the root (the real tip) and touches
+    no other byte of the transcript.
+
+    Takes raw lines (newlines kept) and returns (new lines, repairs). Returns the lines
+    unchanged and an empty list when there is no orphan. Raises ChainError, changing
+    nothing, when the damage is not exactly one fragment hanging off one missing uuid:
+    a cycle, a second gap, a fragment whose members do not chain to its first record, or
+    a line whose parentUuid cannot be rewritten with the result parsing to exactly the
+    expected record.
+    """
+    live = [(index, line) for index, line in enumerate(lines) if line.strip()]
+    records = [json.loads(line) for _index, line in live]
+    chain, orphans = main_chain(records)
+    if not orphans:
+        return list(lines), []
+    first = orphans[0]
+    missing = first["parentUuid"]
+    defined = {r.get("uuid") for r in records if isinstance(r.get("uuid"), str)}
+    if not isinstance(missing, str) or not missing or missing in defined:
+        raise ChainError("the first orphan is not hanging off a missing parent: {}".format(first["reason"]))
+    fragment = {first["uuid"]}
+    for orphan in orphans[1:]:
+        if orphan["parentUuid"] not in fragment:
+            raise ChainError(
+                "orphan {!r} does not chain to the fragment's first record; more than one gap".format(orphan["uuid"])
+            )
+        fragment.add(orphan["uuid"])
+    tip = chain[0]
+    line_index = live[first["position"]][0]
+    old = lines[line_index]
+    needle = '"parentUuid":"{}"'.format(missing)
+    if old.count(needle) < 1:
+        raise ChainError("line {} does not carry {} in the compact form".format(line_index + 1, needle))
+    new = old.replace(needle, '"parentUuid":"{}"'.format(tip), 1)
+    expected = dict(records[first["position"]])
+    expected["parentUuid"] = tip
+    if json.loads(new) != expected:
+        raise ChainError("line {}: the rewrite changed more than parentUuid; refusing".format(line_index + 1))
+    repaired = list(lines)
+    repaired[line_index] = new
+    after_chain, after_orphans = main_chain([json.loads(line) for line in repaired if line.strip()])
+    if after_orphans:
+        raise ChainError("the repair did not reconnect the fragment; refusing")
+    return repaired, [
+        {
+            "line": line_index + 1,
+            "uuid": first["uuid"],
+            "old_parentUuid": missing,
+            "new_parentUuid": tip,
+            "fragment_records": len(orphans),
+            "chain_records": len(after_chain),
+        }
+    ]
+
+
+def repair_orphan_chain_file(source: Path, out: Path) -> list[dict]:
+    """Write a repaired copy of a transcript to ``out``; never edits ``source``.
+
+    Returns the repairs made. Writes nothing when the chain is already whole. ``out``
+    must be a different path from ``source``: swapping the repaired copy into place is
+    the caller's act, done only while the seat that owns the session is stopped.
+    """
+    source, out = Path(source), Path(out)
+    if out.resolve() == source.resolve():
+        raise ChainError("refusing to repair in place: pass a different output path")
+    with source.open("r", encoding="utf-8", newline="") as handle:
+        lines = handle.readlines()
+    repaired, report = repair_orphan_chain(lines)
+    if not report:
+        return []
+    partial = out.with_name(out.name + ".partial")
+    with partial.open("w", encoding="utf-8", newline="") as handle:
+        handle.writelines(repaired)
+    partial.replace(out)
+    return report
+
+
 SUMMARY_PREFIX = "This session is being continued from a previous conversation"
 
 
@@ -10894,4 +10978,141 @@ class FakeSelector:
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+#+END_SRC
+
+** Orphan-chain repair tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-offline-compact-repair.py :comments no
+#!/usr/bin/env python3
+"""repair_orphan_chain: reconnect a trailing orphan fragment, touch nothing else, refuse the rest.
+
+Shape from the real case (Fable's session 4d8d0ba3, 17 Nov 2026): a 5-hour-limited native
+/compact wrote a record whose parentUuid names a uuid no record defines.
+
+Run: python3 test-offline-compact-repair.py
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+MODULE = Path(__file__).resolve().parents[5] / "all/.local/lib/dotcortex/offline_compact.py"
+
+
+def load():
+    loader = importlib.machinery.SourceFileLoader("offline_compact_repair", str(MODULE))
+    spec = importlib.util.spec_from_loader("offline_compact_repair", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["offline_compact_repair"] = module
+    loader.exec_module(module)
+    return module
+
+
+oc = load()
+
+
+def line(uid, parent, text="x"):
+    return json.dumps({"parentUuid": parent, "uuid": uid, "type": "user", "message": {"role": "user", "content": text}}, separators=(",", ":")) + "\n"
+
+
+def healthy():
+    return [line("a", None), line("b", "a"), line("c", "b")]
+
+
+def with_orphan_fragment():
+    # d hangs off a uuid nothing defines; e and f follow d (the post-failed-compact fragment)
+    return healthy() + [line("d", "ghost", "caveat"), line("e", "d"), line("f", "e")]
+
+
+class RepairTests(unittest.TestCase):
+    def test_a_whole_chain_is_returned_unchanged_with_no_repairs(self):
+        lines = healthy()
+        repaired, report = oc.repair_orphan_chain(lines)
+        self.assertEqual(repaired, lines)
+        self.assertEqual(report, [])
+
+    def test_the_fragment_is_reconnected_to_the_real_tip(self):
+        lines = with_orphan_fragment()
+        repaired, report = oc.repair_orphan_chain(lines)
+        self.assertEqual(len(report), 1)
+        self.assertEqual((report[0]["old_parentUuid"], report[0]["new_parentUuid"], report[0]["uuid"]), ("ghost", "c", "d"))
+        records = [json.loads(x) for x in repaired]
+        self.assertEqual(oc.parent_chain(records), ["f", "e", "d", "c", "b", "a"])
+
+    def test_only_the_one_line_changes_and_only_its_parent(self):
+        lines = with_orphan_fragment()
+        repaired, _ = oc.repair_orphan_chain(lines)
+        changed = [i for i, (a, b) in enumerate(zip(lines, repaired)) if a != b]
+        self.assertEqual(changed, [3])
+        before, after = json.loads(lines[3]), json.loads(repaired[3])
+        after["parentUuid"] = before["parentUuid"]
+        self.assertEqual(before, after)
+
+    def test_repairing_twice_is_a_no_op(self):
+        once, _ = oc.repair_orphan_chain(with_orphan_fragment())
+        twice, report = oc.repair_orphan_chain(once)
+        self.assertEqual((twice, report), (once, []))
+
+    def test_a_second_gap_is_refused_and_nothing_is_returned(self):
+        lines = with_orphan_fragment() + [line("g", "ghost2"), line("h", "g")]
+        # g/h hang off a different missing parent; the fragment has two roots
+        with self.assertRaises(oc.ChainError):
+            oc.repair_orphan_chain(lines)
+
+    def test_a_parent_text_inside_message_content_is_not_what_gets_rewritten(self):
+        # the needle also appears inside the content of the orphan record; the top-level key wins
+        text = 'see "parentUuid":"ghost" in the log'
+        lines = healthy() + [line("d", "ghost", text), line("e", "d")]
+        repaired, report = oc.repair_orphan_chain(lines)
+        self.assertEqual(json.loads(repaired[3])["message"]["content"], text)
+        self.assertEqual(json.loads(repaired[3])["parentUuid"], "c")
+
+    def test_a_line_not_in_the_compact_form_is_refused_not_guessed_at(self):
+        spaced = json.dumps({"parentUuid": "ghost", "uuid": "d", "type": "user", "message": {"role": "user", "content": "x"}}) + "\n"
+        self.assertIn('"parentUuid": "ghost"', spaced)
+        with self.assertRaises(oc.ChainError):
+            oc.repair_orphan_chain(healthy() + [spaced])
+
+    def test_a_rewrite_that_would_hit_a_nested_copy_of_the_key_is_refused(self):
+        # a nested {"parentUuid":"ghost"} comes first in the line, so the first textual match is not the record's own
+        tricky = '{"meta":{"parentUuid":"ghost"},"parentUuid":"ghost","uuid":"d","type":"user","message":{"role":"user","content":"x"}}\n'
+        with self.assertRaises(oc.ChainError):
+            oc.repair_orphan_chain(healthy() + [tricky])
+
+    def test_the_file_form_writes_a_copy_and_never_touches_the_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "s.jsonl"
+            out = Path(tmp) / "fixed.jsonl"
+            source.write_text("".join(with_orphan_fragment()), encoding="utf-8")
+            before = source.read_bytes()
+            report = oc.repair_orphan_chain_file(source, out)
+            self.assertEqual(len(report), 1)
+            self.assertEqual(source.read_bytes(), before)
+            fixed = [json.loads(x) for x in out.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(oc.parent_chain(fixed)[-1], "a")
+            self.assertEqual(len(oc.parent_chain(fixed)), 6)
+
+    def test_repair_in_place_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "s.jsonl"
+            source.write_text("".join(with_orphan_fragment()), encoding="utf-8")
+            with self.assertRaises(oc.ChainError):
+                oc.repair_orphan_chain_file(source, source)
+
+    def test_a_whole_file_writes_no_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "s.jsonl"
+            out = Path(tmp) / "fixed.jsonl"
+            source.write_text("".join(healthy()), encoding="utf-8")
+            self.assertEqual(oc.repair_orphan_chain_file(source, out), [])
+            self.assertFalse(out.exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
 #+END_SRC

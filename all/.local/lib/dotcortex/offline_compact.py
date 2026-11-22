@@ -387,6 +387,90 @@ def main_chain(records: list[dict]) -> tuple[list[str], list[dict]]:
     )
 
 
+def repair_orphan_chain(lines: list[str]) -> tuple[list[str], list[dict]]:
+    """Reconnect a trailing orphan fragment to the real tip by rewriting ONE parentUuid.
+
+    Native Claude Code's failed /compact (a 5-hour-limited one, 17 Nov 2026) writes a
+    record whose parentUuid names a uuid that no record defines. ``claude --resume``
+    walks back from the newest record, stops at that dangling parent and loads only the
+    fragment, dropping everything older. The repair sets the fragment's first record's
+    parentUuid to the newest record that does reach the root (the real tip) and touches
+    no other byte of the transcript.
+
+    Takes raw lines (newlines kept) and returns (new lines, repairs). Returns the lines
+    unchanged and an empty list when there is no orphan. Raises ChainError, changing
+    nothing, when the damage is not exactly one fragment hanging off one missing uuid:
+    a cycle, a second gap, a fragment whose members do not chain to its first record, or
+    a line whose parentUuid cannot be rewritten with the result parsing to exactly the
+    expected record.
+    """
+    live = [(index, line) for index, line in enumerate(lines) if line.strip()]
+    records = [json.loads(line) for _index, line in live]
+    chain, orphans = main_chain(records)
+    if not orphans:
+        return list(lines), []
+    first = orphans[0]
+    missing = first["parentUuid"]
+    defined = {r.get("uuid") for r in records if isinstance(r.get("uuid"), str)}
+    if not isinstance(missing, str) or not missing or missing in defined:
+        raise ChainError("the first orphan is not hanging off a missing parent: {}".format(first["reason"]))
+    fragment = {first["uuid"]}
+    for orphan in orphans[1:]:
+        if orphan["parentUuid"] not in fragment:
+            raise ChainError(
+                "orphan {!r} does not chain to the fragment's first record; more than one gap".format(orphan["uuid"])
+            )
+        fragment.add(orphan["uuid"])
+    tip = chain[0]
+    line_index = live[first["position"]][0]
+    old = lines[line_index]
+    needle = '"parentUuid":"{}"'.format(missing)
+    if old.count(needle) < 1:
+        raise ChainError("line {} does not carry {} in the compact form".format(line_index + 1, needle))
+    new = old.replace(needle, '"parentUuid":"{}"'.format(tip), 1)
+    expected = dict(records[first["position"]])
+    expected["parentUuid"] = tip
+    if json.loads(new) != expected:
+        raise ChainError("line {}: the rewrite changed more than parentUuid; refusing".format(line_index + 1))
+    repaired = list(lines)
+    repaired[line_index] = new
+    after_chain, after_orphans = main_chain([json.loads(line) for line in repaired if line.strip()])
+    if after_orphans:
+        raise ChainError("the repair did not reconnect the fragment; refusing")
+    return repaired, [
+        {
+            "line": line_index + 1,
+            "uuid": first["uuid"],
+            "old_parentUuid": missing,
+            "new_parentUuid": tip,
+            "fragment_records": len(orphans),
+            "chain_records": len(after_chain),
+        }
+    ]
+
+
+def repair_orphan_chain_file(source: Path, out: Path) -> list[dict]:
+    """Write a repaired copy of a transcript to ``out``; never edits ``source``.
+
+    Returns the repairs made. Writes nothing when the chain is already whole. ``out``
+    must be a different path from ``source``: swapping the repaired copy into place is
+    the caller's act, done only while the seat that owns the session is stopped.
+    """
+    source, out = Path(source), Path(out)
+    if out.resolve() == source.resolve():
+        raise ChainError("refusing to repair in place: pass a different output path")
+    with source.open("r", encoding="utf-8", newline="") as handle:
+        lines = handle.readlines()
+    repaired, report = repair_orphan_chain(lines)
+    if not report:
+        return []
+    partial = out.with_name(out.name + ".partial")
+    with partial.open("w", encoding="utf-8", newline="") as handle:
+        handle.writelines(repaired)
+    partial.replace(out)
+    return report
+
+
 SUMMARY_PREFIX = "This session is being continued from a previous conversation"
 
 
