@@ -7501,8 +7501,29 @@ def text_of_part(part: dict) -> str:
     return ""
 
 
+CONTEXT_RECORD_TYPES = ("user", "assistant")
+
+
+def is_context_record(record: dict) -> bool:
+    """True when the model reads this record on resume.
+
+    A transcript also carries records a logging mod wrote beside the
+    conversation (api-request-blob, api-request, api-request-shape, ...). They
+    have a ``message`` field, but they are not conversation: counting them fills
+    the ceiling with text the model never loads, and an index stub placed in one
+    of them is a pointer the model cannot read. A record with no type is treated
+    as conversation, so older fixtures keep working.
+    """
+    kind = record.get("type")
+    return kind is None or kind in CONTEXT_RECORD_TYPES
+
+
 def all_text(record: dict) -> int:
-    """Every character of message text in this record, tool output included."""
+    """Every character of message text in this record, tool output included.
+
+    Zero for a record the model does not read (see is_context_record)."""
+    if not is_context_record(record):
+        return 0
     message = record.get("message")
     if not isinstance(message, dict):
         return 0
@@ -7612,6 +7633,73 @@ def parent_chain(records: list[dict]) -> list[str]:
         seen.add(parent)
         chain.append(parent)
         node = by_uuid[parent]
+
+
+def main_chain(records: list[dict]) -> tuple[list[str], list[dict]]:
+    """The real chain, tolerating a trailing orphan fragment.
+
+    Walk back from the newest uuid-bearing record exactly as parent_chain does.
+    When that record's chain does not reach the root (a missing parent, a
+    cycle), it is a trailing orphan: report it and try the next-newest, until
+    one reaches the root. The chain is never shortened and nothing is dropped
+    silently: every skipped record is returned with its position, role, uuid and
+    the reason. When no record reaches the root, ChainError is raised as before.
+
+    Returns (chain newest-first, orphans oldest-first).
+    """
+    positions = [
+        position
+        for position, record in enumerate(records)
+        if isinstance(record.get("uuid"), str) and record.get("uuid")
+    ]
+    orphans: list[dict] = []
+    for position in reversed(positions):
+        try:
+            chain = parent_chain(records[: position + 1])
+        except ChainError as error:
+            record = records[position]
+            orphans.append(
+                {
+                    "position": position,
+                    "type": record.get("type"),
+                    "role": (record.get("message") or {}).get("role") if isinstance(record.get("message"), dict) else None,
+                    "uuid": record.get("uuid"),
+                    "parentUuid": record.get("parentUuid"),
+                    "reason": str(error),
+                    "excluded": True,
+                }
+            )
+            continue
+        orphans.reverse()
+        return chain, orphans
+    if not positions:
+        return [], []
+    raise ChainError(
+        "no uuid-bearing record reaches the root; newest failure: {}".format(
+            orphans[0]["reason"] if orphans else "unknown"
+        )
+    )
+
+
+SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+
+
+def newest_summary_position(records: list[dict], excluded: set[int] | None = None) -> int | None:
+    """Position of the newest whole-string user record that is a carried summary."""
+    skip = excluded or set()
+    for position in range(len(records) - 1, -1, -1):
+        if position in skip:
+            continue
+        record = records[position]
+        if not is_context_record(record):
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str) and content.startswith(SUMMARY_PREFIX):
+            return position
+    return None
 
 
 def identity_snapshot(records: list[dict]) -> list[tuple]:
@@ -8269,10 +8357,28 @@ def elidable_candidates(
     boundary = max(0, len(records) - max(0, keep_recent_records))
     found: list[Candidate] = []
     for position, record in enumerate(records[:boundary]):
+        if not is_context_record(record):
+            continue
         message = record.get("message")
         if not isinstance(message, dict):
             continue
         content = message.get("content")
+        if isinstance(content, str):
+            # A record whose whole content is one string: Claude Code writes the
+            # native compaction summary ("This session is being continued...")
+            # and every channel message this way. block_index -1 names it.
+            if include_prose and len(content) > stub_over_chars:
+                found.append(
+                    Candidate(
+                        key="r{}-s".format(position),
+                        position=position,
+                        block_index=-1,
+                        chars=len(content),
+                        uuid=record.get("uuid") if isinstance(record.get("uuid"), str) else None,
+                        excerpt="\n".join(content.splitlines()[:6])[:excerpt_chars],
+                    )
+                )
+            continue
         if not isinstance(content, list):
             continue
         for block_index, part in enumerate(content):
@@ -8437,6 +8543,19 @@ def verify_pointers(path: Path, pointers: list[dict]) -> list[dict]:
                     block_index = pointer.get("block_index")
                     message = record.get("message")
                     content = message.get("content") if isinstance(message, dict) else None
+                    if block_index == -1 and isinstance(content, str):
+                        # A whole-string record: measure the string itself.
+                        if len(content) != int(pointer.get("chars", -1)):
+                            mismatches.append(
+                                {
+                                    "line": number,
+                                    "key": pointer.get("key"),
+                                    "reason": "char-count-mismatch",
+                                    "expected": int(pointer.get("chars", -1)),
+                                    "found": len(content),
+                                }
+                            )
+                        continue
                     if (
                         not isinstance(content, list)
                         or not isinstance(block_index, int)
@@ -8821,14 +8940,28 @@ def compact(
         return CompactResult(False, "source-unreadable", report)
 
     try:
-        chain_before = parent_chain(records)
+        chain_before, orphans = main_chain(records)
     except ChainError as error:
         report["chain_error"] = str(error)
         return CompactResult(False, "chain-broken-before", report)
+    # A trailing orphan fragment is excluded from the working copy and reported
+    # in full; the source file is never altered, so nothing is lost.
+    excluded_positions = {item["position"] for item in orphans}
+    report["orphans_excluded"] = orphans
+    report["orphan_count"] = len(orphans)
 
     identities_before = identity_snapshot(records)
     human_before = [human_text(record) for record in records]
-    chars_before = sum(all_text(record) for record in records)
+    non_context_chars = sum(
+        len(json.dumps(record.get("message"))) if isinstance(record.get("message"), dict) else 0
+        for record in records
+        if not is_context_record(record)
+    )
+    report["non_context_chars_excluded"] = non_context_chars
+    report["non_context_records_excluded"] = sum(1 for record in records if not is_context_record(record))
+    chars_before = sum(
+        all_text(record) for position, record in enumerate(records) if position not in excluded_positions
+    )
     tokens_before = estimate_tokens(chars_before, chars_per_token)
     report.update(
         {
@@ -8843,6 +8976,18 @@ def compact(
     candidates = elidable_candidates(
         records, keep_recent_records, stub_over_chars, include_prose=fold_prose
     )
+    # The newest carried summary ("This session is being continued...") is the
+    # one block that says what the work is. It stays verbatim: a pointer to it
+    # would leave a resuming model with the last hour and not the week. Older
+    # carried summaries are summaries of summaries and may become pointers.
+    pinned_summary = newest_summary_position(records, excluded_positions)
+    if pinned_summary is not None:
+        candidates = [
+            candidate
+            for candidate in candidates
+            if not (candidate.position == pinned_summary and candidate.block_index == -1)
+        ]
+    report["pinned_summary_position"] = pinned_summary
     report["elidable_candidates"] = len(candidates)
     report["fold_prose"] = bool(fold_prose)
 
@@ -8894,6 +9039,8 @@ def compact(
                 part = content[candidate.block_index]
             if isinstance(part, dict):
                 grouping_texts[candidate.key] = block_text(part)
+            elif candidate.block_index == -1 and isinstance(content, str):
+                grouping_texts[candidate.key] = content
         groups, group_plan = build_pointer_groups(
             rows,
             chosen,
@@ -8923,8 +9070,46 @@ def compact(
             index.add_group(group)
         with out.open("w", encoding="utf-8") as handle:
             for position, (line_number, record) in enumerate(rows):
+                if position in excluded_positions:
+                    continue
                 message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
+                if isinstance(content, str):
+                    candidate = chosen_keys.get("r{}-s".format(position))
+                    if candidate is not None:
+                        text = content
+                        index.add(candidate.key, text)
+                        if on_indexed is not None:
+                            on_indexed(candidate.key, text)
+                        planned = group_plan.get(candidate.key)
+                        group_id = None
+                        if planned:
+                            group_id, _role = planned
+                            stub = group_stub_for(
+                                group_id, groups_by_id[group_id], candidate, line_number, pointer_name
+                            )
+                        else:
+                            stub = _stub_text(candidate, text, line_number, pointer_name)
+                        message["content"] = stub
+                        folded_prose += 1
+                        if message.get("role") == "user":
+                            relocated_human.append(
+                                {"key": candidate.key, "chars": len(text), "kind": "text"}
+                            )
+                        claimed_line = pointer_line(stub)
+                        pointers.append(
+                            {
+                                "line": line_number if claimed_line is None else claimed_line,
+                                "names_line": claimed_line is not None,
+                                "record_line": line_number,
+                                "uuid": candidate.uuid,
+                                "block_index": -1,
+                                "chars": len(text),
+                                "key": candidate.key,
+                                "group": group_id,
+                            }
+                        )
+                        elided += 1
                 if isinstance(content, list):
                     for block_index, part in enumerate(content):
                         candidate = chosen_keys.get("r{}-{}".format(position, block_index))
@@ -9002,14 +9187,25 @@ def compact(
         except (OSError, sqlite3.Error):
             pass
 
-    chars_after = sum(all_text(record) for record in records)
+    kept_records = [record for position, record in enumerate(records) if position not in excluded_positions]
+    chars_after = sum(all_text(record) for record in kept_records)
     tokens_after = estimate_tokens(chars_after, chars_per_token)
     identities_after = identity_snapshot(records)
     human_changed = sum(
         1 for before, record in zip(human_before, records) if before != human_text(record)
     )
+    # Every elision stub and group description must sit in a record the model
+    # reads: a stub in a logging record is a pointer to nothing.
+    unreadable_stub_records = [
+        position
+        for position, record in enumerate(records)
+        if position not in excluded_positions
+        and not is_context_record(record)
+        and "[elided" in json.dumps(record.get("message"))
+    ]
+    report["index_unreadable_records"] = unreadable_stub_records[:10]
     try:
-        chain_after = parent_chain(records)
+        chain_after = parent_chain(kept_records)
     except ChainError as error:
         report["chain_error"] = str(error)
         chain_after = []
@@ -9119,6 +9315,12 @@ def compact(
             out.unlink()
         except OSError:
             pass
+    elif unreadable_stub_records:
+        reason = "index-unreadable"
+        try:
+            out.unlink()
+        except OSError:
+            pass
     elif not ceiling_met:
         reason = "ceiling-not-met"
     elif elided == 0:
@@ -9183,6 +9385,174 @@ def install_as_session(compacted: Path, project_dir: Path, session_id: str) -> P
 #+END_SRC
 
 * Deterministic offline compaction regression tests
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-offline-compact-context.py :comments no
+#!/usr/bin/env python3
+"""Orphan-tolerant chain, context-only accounting, string-content folding.
+
+Each test is built from the real 17 Nov 4d8d0ba3 failure shapes: a trailing
+orphan fragment, logging-mod records that carry a message, and whole-string
+records (native summaries and channel messages).
+
+Run: python3 test-offline-compact-context.py
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import sys
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+
+MODULE = Path(__file__).resolve().parents[5] / "all/.local/lib/dotcortex/offline_compact.py"
+SUMMARY_HEAD = "This session is being continued from a previous conversation that ran out of context. "
+SUMMARY = SUMMARY_HEAD + "x" * 3000
+OLD_SUMMARY = SUMMARY_HEAD + "o" * 3000
+
+
+def load():
+    loader = importlib.machinery.SourceFileLoader("offline_compact_ctx", str(MODULE))
+    spec = importlib.util.spec_from_loader("offline_compact_ctx", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["offline_compact_ctx"] = module
+    loader.exec_module(module)
+    return module
+
+
+oc = load()
+
+
+def record(kind, role, content, parent, **extra):
+    row = {
+        "type": kind,
+        "uuid": str(uuid.uuid4()),
+        "parentUuid": parent,
+        "message": {"role": role, "content": content},
+    }
+    row.update(extra)
+    return row
+
+
+def chain_rows(older_summary=False, newest_summary=True, length=12):
+    rows = []
+    parent = None
+    if older_summary:
+        rows.append(record("user", "user", OLD_SUMMARY, parent))
+        parent = rows[-1]["uuid"]
+    if newest_summary:
+        rows.append(record("user", "user", SUMMARY, parent))
+        parent = rows[-1]["uuid"]
+    for index in range(length):
+        role = "user" if index % 2 == 0 else "assistant"
+        rows.append(record(role, role, [{"type": "text", "text": "turn %d " % index + "w" * 500}], parent))
+        parent = rows[-1]["uuid"]
+    return rows
+
+
+class ContextTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    runs = 0
+
+    def run_compact(self, rows, **kwargs):
+        self.runs += 1
+        source = self.dir / "src{}.jsonl".format(self.runs)
+        source.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        out = self.dir / "out{}.jsonl".format(self.runs)
+        archive = self.dir / "arch{}".format(self.runs)
+        # A small ceiling forces elision: the engine only folds what it must.
+        params = dict(
+            ceiling_tokens=1500,
+            harness={"harness_tokens": 1000},
+            keep_recent_records=2,
+            stub_over_chars=300,
+            fold_prose=True,
+            group_pointers=False,
+            pointer_source=str(source),
+        )
+        params.update(kwargs)
+        result = oc.compact(source, out, archive, **params)
+        written = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()] if out.exists() else []
+        return result, written
+
+    def test_trailing_orphan_is_reported_excluded_and_chain_unchanged(self):
+        rows = chain_rows()
+        real = len(rows)
+        rows.append(record("user", "user", "orphan one", "does-not-exist"))
+        rows.append(record("system", None, "orphan two", "does-not-exist"))
+        result, written = self.run_compact(rows)
+        report = result.report
+        self.assertEqual(report["chain_length"], real)
+        self.assertEqual(report["chain_length_after"], real)
+        self.assertEqual(report["orphan_count"], 2)
+        self.assertTrue(all(item["excluded"] for item in report["orphans_excluded"]))
+        self.assertEqual({item["parentUuid"] for item in report["orphans_excluded"]}, {"does-not-exist"})
+        self.assertEqual(len(written), real)
+        self.assertNotIn("orphan one", json.dumps(written))
+
+    def test_no_complete_chain_is_still_refused(self):
+        rows = [record("user", "user", "a", "missing-1"), record("assistant", "assistant", "b", "missing-2")]
+        result, _ = self.run_compact(rows)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "chain-broken-before")
+
+    def test_source_with_a_healthy_chain_reports_no_orphans(self):
+        result, _ = self.run_compact(chain_rows())
+        self.assertEqual(result.report["orphan_count"], 0)
+
+    def test_logging_records_are_not_counted_and_carry_no_stub(self):
+        rows = chain_rows()
+        blob = record("api-request-blob", "user", "B" * 200_000, None)
+        blob.pop("uuid")
+        rows.insert(3, blob)
+        plain, _ = self.run_compact(chain_rows())
+        mixed, written = self.run_compact(rows)
+        self.assertEqual(mixed.report["est_tokens_before"], plain.report["est_tokens_before"])
+        self.assertEqual(mixed.report["non_context_records_excluded"], 1)
+        self.assertEqual(mixed.report["index_unreadable_records"], [])
+        blobs = [row for row in written if row.get("type") == "api-request-blob"]
+        self.assertEqual(blobs[0]["message"]["content"], "B" * 200_000)
+
+    def test_whole_string_record_folds_byte_exact_and_verifies(self):
+        rows = chain_rows(newest_summary=False)
+        big = "channel text " * 80
+        rows.insert(2, record("user", "user", big, rows[1]["uuid"]))
+        rows[3]["parentUuid"] = rows[2]["uuid"]
+        result, written = self.run_compact(rows)
+        report = result.report
+        self.assertGreaterEqual(report["elided_blocks"], 1)
+        self.assertEqual(report["pointer_mismatch_count"], 0)
+        self.assertEqual(report["human_relocation_missing"], [])
+        folded = [row for row in written if isinstance(row["message"]["content"], str) and "elided" in row["message"]["content"]]
+        self.assertTrue(folded)
+        self.assertNotIn(big, json.dumps(written))
+
+    def test_newest_summary_stays_verbatim_and_older_one_folds(self):
+        rows = chain_rows(older_summary=True, newest_summary=True)
+        result, written = self.run_compact(rows)
+        texts = [row["message"]["content"] for row in written if isinstance(row["message"]["content"], str)]
+        self.assertIn(SUMMARY, texts)
+        self.assertNotIn(OLD_SUMMARY, texts)
+        self.assertEqual(result.report["pinned_summary_position"], 1)
+
+    def test_a_logging_copy_of_the_summary_is_never_the_pinned_one(self):
+        rows = chain_rows(newest_summary=True)
+        copy = record("api-request-blob", "user", SUMMARY, None)
+        copy.pop("uuid")
+        rows.append(copy)
+        result, _ = self.run_compact(rows)
+        self.assertEqual(result.report["pinned_summary_position"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
 
 #+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-offline-compact-mode.py :comments no
 #!/usr/bin/env python3
