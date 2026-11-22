@@ -1168,9 +1168,14 @@ MEM_FLOOR_GIB="${MEM_FLOOR_GIB:-2.0}"
 SI_SO_THRESHOLD="${SI_SO_THRESHOLD:-100}"
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/swap-guardian"
 STATE_FILE="$STATE_DIR/state.json"
+SHM_WARN_MIB="${SHM_WARN_MIB:-1024}"
+SHM_MIN_AGE_MIN="${SHM_MIN_AGE_MIN:-30}"
+SHM_PROC_FILE="${SHM_PROC_FILE:-/proc/sysvipc/shm}"
+IPCRM_BIN="${IPCRM_BIN:-ipcrm}"
 DRY_RUN=0
 TEST_FIRE=0
 DO_HEAL=0
+REAP_SHM=0
 RESTART_SERVICES=()
 
 usage() {
@@ -1179,8 +1184,14 @@ Usage: swap-guardian [options]
 
 Devuan-native swap and thrash supervisor. Cron cadence: */5min.
 Alert-only by default. Enforces RAM-safety law before any swapoff.
+Also watches leaked SysV shared memory: segments of this user that no process is
+attached to (X11 shared-memory buffers left by killed graphical programs; 107 of
+them held 10.9 GB on kikin-kushi on 22 Nov 2026 and filled RAM and swap).
 
 Options:
+  --shm-warn-mib MIB     Warn when orphaned shared memory reaches MIB (default: 1024)
+  --shm-min-age MIN      Only count/reap orphans idle for MIN minutes (default: 30)
+  --reap-shm             Remove this user's orphaned (unattached, idle) segments
   --swap-limit PCT       Swap usage percent threshold (default: 85)
   --mem-floor-gib GIB    MemAvailable floor in GiB (default: 2.0)
   --si-so-rate RATE      Thrash rate threshold in pages/sec (default: 100)
@@ -1203,6 +1214,14 @@ while [ "$#" -gt 0 ]; do
     --si-so-rate)
       [ "$#" -ge 2 ] || { echo "$TAG: --si-so-rate requires a number" >&2; exit 2; }
       SI_SO_THRESHOLD="$2"; shift ;;
+    --shm-warn-mib)
+      [ "$#" -ge 2 ] || { echo "$TAG: --shm-warn-mib requires a MiB value" >&2; exit 2; }
+      SHM_WARN_MIB="$2"; shift ;;
+    --shm-min-age)
+      [ "$#" -ge 2 ] || { echo "$TAG: --shm-min-age requires minutes" >&2; exit 2; }
+      SHM_MIN_AGE_MIN="$2"; shift ;;
+    --reap-shm)
+      REAP_SHM=1 ;;
     --heal)
       DO_HEAL=1 ;;
     --restart)
@@ -1303,6 +1322,35 @@ EOF
   mv -f "$STATE_FILE.tmp" "$STATE_FILE"
 fi
 
+# Orphaned SysV shared memory: this user's segments with no process attached, idle for at least
+# SHM_MIN_AGE_MIN. /proc/sysvipc/shm carries epoch atime/dtime/ctime, so no ipcs text is parsed.
+# Prints "<shmid> <size-bytes>" per orphan; reads only.
+shm_orphans() {
+  SHM_PROC_FILE="$SHM_PROC_FILE" SHM_MIN_AGE_MIN="$SHM_MIN_AGE_MIN" SHM_NOW="${SHM_NOW:-$(date +%s)}" SHM_UID="${SHM_UID:-$(id -u)}" python3 - <<'PY'
+import os
+rows = open(os.environ["SHM_PROC_FILE"]).read().splitlines()[1:]
+now = int(os.environ["SHM_NOW"]); uid = int(os.environ["SHM_UID"]); idle = int(os.environ["SHM_MIN_AGE_MIN"]) * 60
+for row in rows:
+    f = row.split()
+    if len(f) < 14:
+        continue
+    shmid, size, nattch, owner = int(f[1]), int(f[3]), int(f[6]), int(f[7])
+    last = max(int(f[11]), int(f[12]), int(f[13]))
+    if owner == uid and nattch == 0 and now - last >= idle:
+        print(shmid, size)
+PY
+}
+
+shm_count=0
+shm_mib=0
+if [ "$TEST_FIRE" -eq 0 ]; then
+  shm_list="$(shm_orphans 2>/dev/null || true)"
+  if [ -n "$shm_list" ]; then
+    shm_count=$(printf '%s\n' "$shm_list" | wc -l)
+    shm_mib=$(printf '%s\n' "$shm_list" | awk '{s+=$2} END {printf "%d", s/1048576}')
+  fi
+fi
+
 is_critical=0
 is_warning=0
 reason=""
@@ -1319,6 +1367,13 @@ else
   reason="NORMAL: swap=${swap_pct}% (limit ${SWAP_LIMIT}%), MemAvailable=${mem_avail_gib}GiB, si/so=${si_so_rate}/s"
 fi
 
+if [ "$shm_mib" -ge "$SHM_WARN_MIB" ]; then
+  [ "$is_critical" -eq 1 ] || is_warning=1
+  reason="$reason | SHM: ${shm_count} orphaned SysV segment(s), ${shm_mib}MiB (warn at ${SHM_WARN_MIB}MiB)"
+elif [ "$shm_count" -gt 0 ]; then
+  reason="$reason | shm-orphans=${shm_count} (${shm_mib}MiB)"
+fi
+
 printf '[%s] %s\n' "$TAG" "$reason"
 
 # Alert via TimeArk lane
@@ -1331,6 +1386,24 @@ if [ "$is_critical" -eq 1 ] || [ "$is_warning" -eq 1 ]; then
   else
     printf '[%s] [DRY RUN] Would invoke timeark-herald-dispatch.\n' "$TAG"
   fi
+fi
+
+# Orphaned shared memory: only with --reap-shm, only segments of this user that nothing is attached to
+# and that have been idle for SHM_MIN_AGE_MIN, each re-checked right before its removal.
+if [ "$REAP_SHM" -eq 1 ] && [ "$shm_count" -gt 0 ]; then
+  reaped=0
+  while read -r shm_id shm_size; do
+    [ -n "$shm_id" ] || continue
+    if [ "$DRY_RUN" -eq 1 ]; then
+      printf '[%s] [DRY RUN] Would remove orphaned shm segment %s (%d MiB)\n' "$TAG" "$shm_id" $(( shm_size / 1048576 ))
+      continue
+    fi
+    still_attached="$(awk -v id="$shm_id" '$2 == id {print $7}' "$SHM_PROC_FILE")"
+    if [ "$still_attached" = "0" ] && "$IPCRM_BIN" -m "$shm_id" 2>/dev/null; then
+      reaped=$(( reaped + 1 ))
+    fi
+  done <<< "$shm_list"
+  [ "$DRY_RUN" -eq 1 ] || printf '[%s] Reaped %d orphaned shm segment(s) of %d found.\n' "$TAG" "$reaped" "$shm_count"
 fi
 
 # RAM-safety law before any swap purge
@@ -1380,6 +1453,96 @@ if [ ${#RESTART_SERVICES[@]} -gt 0 ] && [ "$is_critical" -eq 1 ]; then
 elif [ ${#RESTART_SERVICES[@]} -gt 0 ]; then
   printf '[%s] Condition not critical; skipping service restarts.\n' "$TAG"
 fi
+#+END_SRC
+
+** swap-guardian shared-memory tests
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-swap-guardian-shm.py :comments no
+#!/usr/bin/env python3
+"""swap-guardian: orphaned SysV shared memory is reported, and reaped only when asked, and only the right ones.
+
+HOME is a temporary directory in every run so the guardian can never call the real herald dispatch."""
+from __future__ import annotations
+
+import os
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+GUARDIAN = Path(__file__).resolve().parents[5] / "linux/.local/bin/swap-guardian"
+NOW = 1_800_000_000
+HEADER = "key shmid perms size cpid lpid nattch uid gid cuid cgid atime dtime ctime rss swap\n"
+MIB = 1024 * 1024
+
+
+def row(shmid, size_mib, nattch, uid, idle_min):
+    t = NOW - idle_min * 60
+    return f"0 {shmid} 1600 {size_mib * MIB} 100 100 {nattch} {uid} {uid} {uid} {uid} {t} {t} {t} 0 0\n"
+
+
+class SwapGuardianShmTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.me = os.getuid()
+        self.removed = self.dir / "removed.txt"
+        self.ipcrm = self.dir / "ipcrm"
+        self.ipcrm.write_text(f'#!/bin/sh\necho "$2" >> {self.removed}\n')
+        self.ipcrm.chmod(0o755)
+        self.proc = self.dir / "shm"
+
+    def run_guardian(self, rows, *args):
+        self.proc.write_text(HEADER + "".join(rows))
+        env = {
+            "PATH": os.environ["PATH"], "HOME": str(self.dir), "XDG_STATE_HOME": str(self.dir / "state"),
+            "SHM_PROC_FILE": str(self.proc), "SHM_NOW": str(NOW), "IPCRM_BIN": str(self.ipcrm),
+        }
+        return subprocess.run([str(GUARDIAN), *args], env=env, capture_output=True, text=True, timeout=60)
+
+    def removed_ids(self):
+        return self.removed.read_text().split() if self.removed.exists() else []
+
+    ROWS = None
+
+    def mixed(self):
+        return [
+            row(11, 128, 0, self.me, 120),   # orphan, idle two hours: counts and is reapable
+            row(12, 128, 0, self.me, 5),     # orphan but idle only 5 minutes: not yet
+            row(13, 128, 2, self.me, 120),   # attached: never
+            row(14, 128, 0, self.me + 1, 120),  # another user's orphan: never
+        ]
+
+    def test_it_reports_only_the_orphans_that_are_old_enough_and_removes_nothing_by_default(self):
+        result = self.run_guardian(self.mixed(), "--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("shm-orphans=1 (128MiB)", result.stdout)
+        self.run_guardian(self.mixed())  # a real run without --reap-shm
+        self.assertEqual(self.removed_ids(), [])
+
+    def test_the_warning_threshold_names_the_leak(self):
+        result = self.run_guardian(self.mixed(), "--dry-run", "--shm-warn-mib", "100")
+        self.assertIn("SHM: 1 orphaned SysV segment(s), 128MiB (warn at 100MiB)", result.stdout)
+
+    def test_reap_removes_exactly_the_idle_unattached_segments_of_this_user(self):
+        result = self.run_guardian(self.mixed(), "--reap-shm")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.removed_ids(), ["11"])
+        self.assertIn("Reaped 1 orphaned shm segment(s) of 1 found", result.stdout)
+
+    def test_reap_in_dry_run_removes_nothing_and_says_what_it_would_do(self):
+        result = self.run_guardian(self.mixed(), "--reap-shm", "--dry-run")
+        self.assertEqual(self.removed_ids(), [])
+        self.assertIn("[DRY RUN] Would remove orphaned shm segment 11 (128 MiB)", result.stdout)
+
+    def test_no_orphans_is_quiet_and_removes_nothing(self):
+        result = self.run_guardian([row(13, 128, 2, self.me, 120)], "--reap-shm", "--dry-run")
+        self.assertNotIn("shm-orphans", result.stdout)
+        self.assertEqual(self.removed_ids(), [])
+
+
+if __name__ == "__main__":
+    unittest.main()
 #+END_SRC
 
 ** swap-guardian-cron-apply
