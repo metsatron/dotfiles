@@ -86,6 +86,9 @@ class Contracts(unittest.TestCase):
         old=re.search(r'#\+BEGIN_SRC yaml :tangle linux/\.local/share/filebrowser/config.template.yaml\n(.*?)#\+END_SRC',baseline,re.S).group(1)
         user=subprocess.check_output(['id','-un'],text=True).strip()
         expected=yaml.safe_load(old.replace('$HOME',str(self.home)).replace('RENDERED_USER',user))['server']['sources']
+        # 24 Nov 2026: root, home and mnt browse but are not indexed, so each carries a viewable rule first; everything else must stay exactly as at the baseline.
+        for src in expected:
+            if src['name'] in ('root','home','mnt'):src['config'].setdefault('rules',[]).insert(0,{'folderPath':'/','viewable':True})
         env=self.env|{'FILEBROWSER_TEMPLATE':str(DATA/'config.template.yaml')}
         self.config.unlink();self.run_script('filebrowser-provision',env=env)
         actual=yaml.safe_load(self.config.read_text())
