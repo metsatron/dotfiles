@@ -147,7 +147,7 @@ esac''')
     def test_builder_gate_payload_provenance_and_source_output_parity(self):
         self.run_script('filebrowser-milkdown-build',ok=False)
         payload=b''.join((DATA/'patches'/('milkdown.patch.gz.b64.part'+n)).read_bytes() for n in ('1','2'))
-        diff=gzip.decompress(base64.b64decode(payload));self.assertEqual(len(diff),143513);self.assertEqual(hashlib.sha256(diff).hexdigest(),'11c9a3f009fccb2fbde4e4d79bbee3bd0347a4127db1e16e9d945949338ddfb4')
+        diff=gzip.decompress(base64.b64decode(payload));self.assertEqual(len(diff),143519);self.assertEqual(hashlib.sha256(diff).hexdigest(),'0f1a967082f903b7d539f4a8ae64b943c6649b7608663bb6c8242891832350f2')
         for source in ['app.org','tools-filebrowser-milkdown.org','tools-filebrowser-milkdown-payload.org','tools-filebrowser-tests.org']:
             text=(REPO/source).read_text()
             for header,body in re.findall(r'#\+BEGIN_SRC ([^\n]+)\n(.*?)#\+END_SRC',text,re.S):
