@@ -26,7 +26,8 @@ class LaneTests(unittest.TestCase):
         self.assertIn("--ignore=^\\.config/bspwm", run("ignore-args").stdout.splitlines())
         self.assertEqual(run("skip-hook", "icons-home-sync", check=False).returncode, 0)
         for host in OTHER_HOSTS:
-            self.assertEqual(run("ignore-args", host=host).stdout, "", host)
+            # kikin-kushi is not headless in the Honey sense; its one stow row exists because ~/HelmCortex is a symlink to the X230 mount.
+            self.assertEqual(run("ignore-args", host=host).stdout, "--ignore=^HelmCortex\n" if host == "kikin-kushi" else "", host)
             self.assertEqual(run("skip-hook", "icons-home-sync", host=host, check=False).returncode, 1, host)
             with tempfile.TemporaryDirectory() as tmp:
                 out = run("prune", "--target", tmp, "--repo", str(ROOT), host=host)
