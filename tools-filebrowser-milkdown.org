@@ -337,3 +337,136 @@ IVeQAI0m0GItThU+YjEG8HbNJ5Sh+0XjDx/Yt/HPaHt7tHXMlPzUIfdDymSXdp0HH82q20wUw+0B
 VP1hg++Pm1K9f97y7zUyfpLPed+Gjbd4vTESHjM8u23WyBaHGA1ZpQLn2yhmwn28pFrdb3AwSSzX
 GjYVJQi2NFrKw9F6SWGbacvzrbLkKiBFFg6zyo/2arjrEbqxHiwSwJQYdE7/USPg683Jvx2Qnydi
 #+END_SRC
+
+* Candidate installer with rollback
+
+Installs a reviewed candidate built above, for any release. Dry run by default. It proves the candidate parses this machine's own config before touching anything, backs up the old binary, config and database, swaps the binary atomically, lets the supervisor respawn the service, proves the running binary is the candidate and restores the old one on any failure. A major release with a new config schema fails the precheck, so the service is never touched for it; the migration itself is a separate, rehearsed step.
+
+#+BEGIN_SRC bash :tangle linux/.local/bin/filebrowser-milkdown-install :shebang "#!/usr/bin/env bash" :tangle-mode (identity #o755) :comments no
+set -euo pipefail
+# Install a reviewed filebrowser-milkdown candidate with a backup and an automatic rollback.
+# Dry run by default; --apply is required to change anything. Works for any release: it checks
+# that the candidate parses THIS machine's config (a major release with a new schema fails here,
+# before the service is touched), backs up the old binary, config and database, swaps the binary
+# atomically, restarts the service through its supervisor, proves the running binary is the
+# candidate, and puts the old binary back if any step fails.
+TAG="filebrowser-milkdown-install"
+usage() {
+  cat <<'EOF'
+Usage: filebrowser-milkdown-install --candidate PATH [--expect-version VERSION] [--apply]
+       filebrowser-milkdown-install --rollback [--backup DIR] [--apply]
+Default is a dry run that prints the plan. --apply changes the installed binary and restarts
+the service; the supervisor respawns it on the new binary. Backups live under
+~/.local/state/filebrowser/install-backups/. Exit: 0 ok, 2 usage, 3 refused before any change,
+4 failed and rolled back, 5 failed and the rollback also failed.
+EOF
+}
+candidate=""; expect=""; apply=0; rollback=0; backup_dir=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -h|--help|help) usage; exit 0 ;;
+    --candidate) [ "$#" -ge 2 ] || { echo "$TAG: --candidate needs a path" >&2; exit 2; }; candidate="$2"; shift ;;
+    --expect-version) [ "$#" -ge 2 ] || { echo "$TAG: --expect-version needs a value" >&2; exit 2; }; expect="$2"; shift ;;
+    --backup) [ "$#" -ge 2 ] || { echo "$TAG: --backup needs a directory" >&2; exit 2; }; backup_dir="$2"; shift ;;
+    --apply) apply=1 ;;
+    --rollback) rollback=1 ;;
+    *) echo "$TAG: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+[ "$(id -u)" != 0 ] || { echo "$TAG: refusing to run as root" >&2; exit 2; }
+bin="${FILEBROWSER_BIN:-$HOME/.local/bin/filebrowser-milkdown}"
+config_dir="${FILEBROWSER_CONFIG:-$HOME/.config/filebrowser}"
+config="$config_dir/config.yaml"
+state="$HOME/.local/state/filebrowser"
+backups="$state/install-backups"
+[ -f "$config" ] || { echo "$TAG: missing $config" >&2; exit 3; }
+sha() { sha256sum "$1" | cut -d' ' -f1; }
+conf_value() { awk -v k="$1" '$1==k":"{print $2; exit}' "$config"; }
+version_of() { "$1" version 2>/dev/null | awk -F': ' '/Version/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' || true; }
+port="$(conf_value port)"; port="${port:-9091}"
+db="$(conf_value database)"
+log() { printf '%s %s\n' "$TAG:" "$*"; }
+
+restart_service() {
+  if [ -n "${FILEBROWSER_INSTALL_RESTART:-}" ]; then bash -c "$FILEBROWSER_INSTALL_RESTART"; return; fi
+  local pids; pids="$(pgrep -u "$(id -u)" -f "^$bin -c " || true)"
+  [ -n "$pids" ] || { log "no running service found; the binary is swapped but nothing was restarted"; return 0; }
+  # shellcheck disable=SC2086
+  kill -TERM $pids   # the supervisor respawns the launcher, which execs the binary now on disk
+}
+healthy() {  # healthy EXPECTED_SHA
+  if [ -n "${FILEBROWSER_INSTALL_HEALTH:-}" ]; then bash -c "$FILEBROWSER_INSTALL_HEALTH" _ "$1"; return; fi
+  local pid; pid="$(pgrep -u "$(id -u)" -f "^$bin -c " | head -1 || true)"
+  [ -n "$pid" ] || return 1
+  [ "$(sha "/proc/$pid/exe")" = "$1" ] || return 1
+  curl -fsS -m 5 -o /dev/null "http://127.0.0.1:$port/"
+}
+wait_healthy() {  # wait_healthy EXPECTED_SHA
+  local i; for i in $(seq 1 "${FILEBROWSER_INSTALL_WAIT:-60}"); do healthy "$1" && return 0; sleep 1; done; return 1
+}
+place_binary() {  # place_binary SOURCE : atomic rename into the install path
+  local tmp="$bin.new.$$"; cp -p "$1" "$tmp"; chmod 755 "$tmp"; mv -f "$tmp" "$bin"
+}
+precheck() {  # precheck CANDIDATE : does it parse this machine's config and reach "Running at"?
+  local scratch out pid i; scratch="$(mktemp -d "${TMPDIR:-/tmp}/fb-precheck.XXXXXX")"
+  out="$scratch/out.log"
+  sed -e "s#^\\(  port:\\).*#\\1 $((20000 + RANDOM % 9000))#" \
+      -e "s#^\\(  database:\\).*#\\1 $scratch/db#" \
+      -e "s#^\\(  cacheDir:\\).*#\\1 $scratch/cache#" "$config" > "$scratch/config.yaml"
+  # Start it the way filebrowser-serve does: through the Office helper when one is installed, because
+  # the helper supplies the OnlyOffice secret and the config does not validate without it.
+  local helper="${FILEBROWSER_OFFICE_HELPER:-$HOME/.local/bin/filebrowser-office}" launch
+  if [ -x "$helper" ]; then launch=("$helper" --exec "$1" -c "$scratch/config.yaml"); else launch=("$1" -c "$scratch/config.yaml"); fi
+  ( cd "$scratch" && exec "${launch[@]}" ) > "$out" 2>&1 & pid=$!
+  for i in $(seq 1 "${FILEBROWSER_INSTALL_PRECHECK_WAIT:-20}"); do
+    if grep -q 'Running at' "$out" 2>/dev/null; then break; fi
+    if grep -q 'FATAL' "$out" 2>/dev/null; then break; fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 1
+  done
+  kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true
+  if grep -q 'Running at' "$out" && ! grep -q 'FATAL' "$out"; then rm -rf "$scratch"; return 0; fi
+  log "the candidate did not start on a copy of this config:"; grep -E 'FATAL|ERROR|unknown|error' "$out" | head -5 | sed 's/^/  /' >&2 || true
+  rm -rf "$scratch"; return 1
+}
+
+if [ "$rollback" = 1 ]; then
+  [ -n "$backup_dir" ] || backup_dir="$(ls -1d "$backups"/*/ 2>/dev/null | sort | tail -1 || true)"
+  backup_dir="${backup_dir%/}"
+  [ -n "$backup_dir" ] && [ -f "$backup_dir/filebrowser-milkdown" ] || { log "no backup to roll back to"; exit 3; }
+  want="$(sha "$backup_dir/filebrowser-milkdown")"
+  log "rollback: $bin <- $backup_dir/filebrowser-milkdown (sha256 $want)"
+  [ "$apply" = 1 ] || { log "dry run: nothing changed (add --apply)"; exit 0; }
+  place_binary "$backup_dir/filebrowser-milkdown"; restart_service
+  if wait_healthy "$want"; then log "rolled back; the running binary is the backup"; exit 0; fi
+  log "rolled back the file but the service did not come up on it"; exit 5
+fi
+
+[ -n "$candidate" ] || { usage >&2; exit 2; }
+[ -f "$candidate" ] && [ -x "$candidate" ] || { log "candidate is not an executable file: $candidate"; exit 3; }
+new_sha="$(sha "$candidate")"; old_sha=""; [ -f "$bin" ] && old_sha="$(sha "$bin")"
+new_version="$(version_of "$candidate")"; old_version=""; [ -f "$bin" ] && old_version="$(version_of "$bin")"
+log "installed : ${old_version:-none} (${old_sha:-no file})"
+log "candidate : ${new_version:-unknown} ($new_sha)"
+if [ -n "$expect" ] && [ "$new_version" != "$expect" ]; then log "candidate reports '$new_version', expected '$expect'; refusing"; exit 3; fi
+[ "$new_sha" != "$old_sha" ] || { log "the candidate is already installed; nothing to do"; exit 0; }
+precheck "$candidate" || exit 3
+log "candidate starts on a copy of the live config"
+if [ "$apply" != 1 ]; then log "dry run: would back up the binary, config and database, swap, restart and verify (add --apply)"; exit 0; fi
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup="$backups/$stamp"; mkdir -p "$backup"
+if [ -f "$bin" ]; then cp -p "$bin" "$backup/filebrowser-milkdown"; fi
+cp -p "$config" "$backup/config.yaml"; { [ -n "$db" ] && [ -f "$db" ] && cp -p "$db" "$backup/database.db"; } || true
+printf 'installed_sha256=%s\ninstalled_version=%s\ncandidate_sha256=%s\ncandidate_version=%s\n' "$old_sha" "$old_version" "$new_sha" "$new_version" > "$backup/manifest"
+log "backup: $backup"
+
+place_binary "$candidate"; restart_service
+if wait_healthy "$new_sha"; then log "installed ${new_version:-candidate}; the running binary is the candidate. Backup: $backup"; exit 0; fi
+log "the service did not come up healthy on the candidate; restoring the previous binary"
+if [ -f "$backup/filebrowser-milkdown" ]; then
+  place_binary "$backup/filebrowser-milkdown"; restart_service
+  if wait_healthy "$old_sha"; then log "rolled back; the service runs the previous binary"; exit 4; fi
+fi
+log "ROLLBACK FAILED: restore by hand from $backup"; exit 5
+#+END_SRC

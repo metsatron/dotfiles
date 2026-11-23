@@ -161,5 +161,74 @@ esac''')
                 output=(REPO/m[1]).read_text()
                 self.assertIn(body.rstrip('\n'),output,source+' -> '+m[1])
 
+    # -- filebrowser-milkdown-install: dry run, backup, swap, health proof, rollback ---------------
+    def fake_binary(self, path, version, parses=True):
+        body = ('#!/bin/bash\nif [ "${1:-}" = version ]; then echo "FileBrowser Quantum"; printf "\\tVersion \\t : %s\\n" "' + version + '"; exit 0; fi\n'
+                + ('echo "[INFO ] Running at               : http://127.0.0.1:1/"; exec sleep 30\n' if parses else 'echo "[FATAL] error unmarshaling YAML data: unknown field"; exit 1\n'))
+        pathlib.Path(path).write_text(body); pathlib.Path(path).chmod(0o755)
+        return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    def install_env(self):
+        (self.home / '.config/filebrowser/config.yaml').write_text('server:\n  port: 9091\n  database: ' + str(self.home / 'db.db') + '\n  cacheDir: ' + str(self.home / 'cache') + '\n')
+        (self.home / 'db.db').write_bytes(b'users')
+        env = dict(self.env)
+        env.update({'FILEBROWSER_BIN': str(self.home / '.local/bin/filebrowser-milkdown'), 'FILEBROWSER_CONFIG': str(self.home / '.config/filebrowser'),
+                    'FILEBROWSER_INSTALL_RESTART': 'echo restarted >> "$HOME/restart.log"', 'FILEBROWSER_INSTALL_WAIT': '2', 'FILEBROWSER_INSTALL_PRECHECK_WAIT': '5',
+                    'FILEBROWSER_INSTALL_HEALTH': 'test "$(sha256sum "$HOME/.local/bin/filebrowser-milkdown" | cut -d" " -f1)" = "$1" && test "$1" != "$(cat "$HOME/sickfor" 2>/dev/null)"'})
+        return env
+    def installed(self, version='v1.5.6-stable'):
+        return self.fake_binary(self.home / '.local/bin/filebrowser-milkdown', version)
+    def sha_of(self, path):
+        return hashlib.sha256(pathlib.Path(path).read_bytes()).hexdigest()
+    def test_installer_dry_run_changes_nothing(self):
+        env = self.install_env(); old = self.installed(); cand = self.home / 'cand'; self.fake_binary(cand, 'v1.5.8-stable')
+        r = self.run_script('filebrowser-milkdown-install', '--candidate', str(cand), env=env)
+        self.assertIn('dry run', r.stdout)
+        self.assertEqual(self.sha_of(self.home / '.local/bin/filebrowser-milkdown'), old)
+        self.assertFalse((self.home / '.local/state/filebrowser/install-backups').exists()); self.assertFalse((self.home / 'restart.log').exists())
+    def test_installer_apply_backs_up_swaps_restarts_and_proves_the_running_binary(self):
+        env = self.install_env(); old = self.installed(); cand = self.home / 'cand'; new = self.fake_binary(cand, 'v1.5.8-stable')
+        r = self.run_script('filebrowser-milkdown-install', '--candidate', str(cand), '--expect-version', 'v1.5.8-stable', '--apply', env=env)
+        self.assertEqual(self.sha_of(self.home / '.local/bin/filebrowser-milkdown'), new)
+        backup = sorted((self.home / '.local/state/filebrowser/install-backups').iterdir())[-1]
+        self.assertEqual(self.sha_of(backup / 'filebrowser-milkdown'), old)
+        self.assertTrue((backup / 'config.yaml').exists()); self.assertEqual((backup / 'database.db').read_bytes(), b'users')
+        self.assertIn('installed_version=v1.5.6-stable', (backup / 'manifest').read_text())
+        self.assertEqual((self.home / 'restart.log').read_text().count('restarted'), 1)
+    def test_installer_restores_the_old_binary_when_the_candidate_is_not_healthy(self):
+        env = self.install_env(); old = self.installed(); cand = self.home / 'cand'; new = self.fake_binary(cand, 'v1.5.8-stable')
+        (self.home / 'sickfor').write_text(new)
+        r = subprocess.run(['/usr/bin/env', '-i', *[k + '=' + v for k, v in env.items()], str(BIN / 'filebrowser-milkdown-install'), '--candidate', str(cand), '--apply'], text=True, capture_output=True)
+        self.assertEqual(r.returncode, 4, r.stdout + r.stderr)
+        self.assertEqual(self.sha_of(self.home / '.local/bin/filebrowser-milkdown'), old)
+        self.assertEqual((self.home / 'restart.log').read_text().count('restarted'), 2)
+    def test_installer_refuses_a_candidate_that_cannot_parse_the_live_config_and_touches_nothing(self):
+        env = self.install_env(); old = self.installed(); cand = self.home / 'cand'; self.fake_binary(cand, 'v2.0.2-stable', parses=False)
+        r = subprocess.run(['/usr/bin/env', '-i', *[k + '=' + v for k, v in env.items()], str(BIN / 'filebrowser-milkdown-install'), '--candidate', str(cand), '--apply'], text=True, capture_output=True)
+        self.assertEqual(r.returncode, 3, r.stdout + r.stderr)
+        self.assertEqual(self.sha_of(self.home / '.local/bin/filebrowser-milkdown'), old)
+        self.assertFalse((self.home / '.local/state/filebrowser/install-backups').exists()); self.assertFalse((self.home / 'restart.log').exists())
+    def test_installer_refuses_an_unexpected_version_and_a_no_op(self):
+        env = self.install_env(); old = self.installed(); cand = self.home / 'cand'; self.fake_binary(cand, 'v1.5.8-stable')
+        r = subprocess.run(['/usr/bin/env', '-i', *[k + '=' + v for k, v in env.items()], str(BIN / 'filebrowser-milkdown-install'), '--candidate', str(cand), '--expect-version', 'v9', '--apply'], text=True, capture_output=True)
+        self.assertEqual(r.returncode, 3)
+        same = self.run_script('filebrowser-milkdown-install', '--candidate', str(self.home / '.local/bin/filebrowser-milkdown'), '--apply', env=env)
+        self.assertIn('already installed', same.stdout); self.assertFalse((self.home / '.local/state/filebrowser/install-backups').exists())
+    def test_installer_rollback_restores_the_latest_backup(self):
+        env = self.install_env(); old = self.installed(); cand = self.home / 'cand'; self.fake_binary(cand, 'v1.5.8-stable')
+        self.run_script('filebrowser-milkdown-install', '--candidate', str(cand), '--apply', env=env)
+        self.run_script('filebrowser-milkdown-install', '--rollback', '--apply', env=env)
+        self.assertEqual(self.sha_of(self.home / '.local/bin/filebrowser-milkdown'), old)
+    def test_installer_precheck_starts_the_candidate_through_the_office_helper(self):
+        # The live config only validates with the secret the helper injects; a bare start would refuse a good candidate.
+        env = self.install_env(); self.installed(); cand = self.home / 'cand'; self.fake_binary(cand, 'v1.5.8-stable')
+        helper = self.home / 'office-helper'
+        helper.write_text('#!/bin/bash\necho "helper $*" >> "$HOME/helper.log"\nshift\nexec "$@"\n'); helper.chmod(0o755)
+        env['FILEBROWSER_OFFICE_HELPER'] = str(helper)
+        self.run_script('filebrowser-milkdown-install', '--candidate', str(cand), env=env)
+        self.assertIn('--exec', (self.home / 'helper.log').read_text())
+    def test_installer_help_and_unknown_flag(self):
+        self.run_script('filebrowser-milkdown-install', '-h')
+        r = self.run_script('filebrowser-milkdown-install', '--bogus', ok=False); self.assertEqual(r.returncode, 2)
+
 if __name__=='__main__':unittest.main(verbosity=2)
 #+END_SRC
