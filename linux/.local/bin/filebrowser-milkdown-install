@@ -41,6 +41,18 @@ sha() { sha256sum "$1" | cut -d' ' -f1; }
 conf_value() { awk -v k="$1" '$1==k":"{print $2; exit}' "$config"; }
 version_of() { "$1" version 2>/dev/null | awk -F': ' '/Version/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}' || true; }
 port="$(conf_value port)"; port="${port:-9091}"
+# Quantum 2 configs have an http: block and a nested server.database; Quantum 1 has a scalar.
+db_paths() {  # prints the current database path, then the legacy path to migrate from (either may be empty)
+  python3 - "$config" <<'PY'
+import sys, yaml
+c = yaml.safe_load(open(sys.argv[1])) or {}
+d = (c.get('server') or {}).get('database')
+if isinstance(d, dict):
+    print(d.get('path') or ''); print(d.get('migrateFrom') or '')
+else:
+    print(d or ''); print('')
+PY
+}
 db="$(conf_value database)"
 log() { printf '%s %s\n' "$TAG:" "$*"; }
 
@@ -67,15 +79,37 @@ place_binary() {  # place_binary SOURCE : atomic rename into the install path
 precheck() {  # precheck CANDIDATE : does it parse this machine's config and reach "Running at"?
   local scratch out pid i; scratch="$(mktemp -d "${TMPDIR:-/tmp}/fb-precheck.XXXXXX")"
   out="$scratch/out.log"
-  sed -e "s#^\\(  port:\\).*#\\1 $((20000 + RANDOM % 9000))#" \
-      -e "s#^\\(  database:\\).*#\\1 $scratch/db#" \
-      -e "s#^\\(  cacheDir:\\).*#\\1 $scratch/cache#" "$config" > "$scratch/config.yaml"
+  # Stage a copy of the config that cannot touch live state: a random port, a scratch cache, and a
+  # scratch database. For Quantum 2 the legacy BoltDB is copied too, so the candidate migrates a copy.
+  python3 - "$config" "$scratch" <<'PY' || { log "could not stage a scratch copy of the config"; rm -rf "$scratch"; return 1; }
+import os, random, shutil, sys, yaml
+src, scratch = sys.argv[1:3]
+c = yaml.safe_load(open(src)) or {}
+port = 20000 + random.randrange(9000)
+server = c.setdefault('server', {})
+if isinstance(c.get('http'), dict):
+    c['http']['port'] = port
+else:
+    server['port'] = port
+server['cacheDir'] = scratch + '/cache'
+db = server.get('database')
+if isinstance(db, dict):
+    db['path'] = scratch + '/db.sqlite'
+    legacy = db.get('migrateFrom')
+    if legacy and os.path.isfile(legacy):
+        shutil.copy(legacy, scratch + '/legacy.db')
+        db['migrateFrom'] = scratch + '/legacy.db'
+else:
+    server['database'] = scratch + '/db'
+with open(scratch + '/config.yaml', 'w') as out:
+    yaml.safe_dump(c, out, sort_keys=False)
+PY
   # Start it the way filebrowser-serve does: through the Office helper when one is installed, because
   # the helper supplies the OnlyOffice secret and the config does not validate without it.
   local helper="${FILEBROWSER_OFFICE_HELPER:-$HOME/.local/bin/filebrowser-office}" launch
   if [ -x "$helper" ]; then launch=("$helper" --exec "$1" -c "$scratch/config.yaml"); else launch=("$1" -c "$scratch/config.yaml"); fi
   ( cd "$scratch" && exec "${launch[@]}" ) > "$out" 2>&1 & pid=$!
-  for i in $(seq 1 "${FILEBROWSER_INSTALL_PRECHECK_WAIT:-20}"); do
+  for i in $(seq 1 "${FILEBROWSER_INSTALL_PRECHECK_WAIT:-120}"); do
     if grep -q 'Running at' "$out" 2>/dev/null; then break; fi
     if grep -q 'FATAL' "$out" 2>/dev/null; then break; fi
     kill -0 "$pid" 2>/dev/null || break
@@ -113,7 +147,15 @@ if [ "$apply" != 1 ]; then log "dry run: would back up the binary, config and da
 
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"; backup="$backups/$stamp"; mkdir -p "$backup"
 if [ -f "$bin" ]; then cp -p "$bin" "$backup/filebrowser-milkdown"; fi
-cp -p "$config" "$backup/config.yaml"; { [ -n "$db" ] && [ -f "$db" ] && cp -p "$db" "$backup/database.db"; } || true
+cp -p "$config" "$backup/config.yaml"
+if grep -q '^http:' "$config"; then
+  # Quantum 2: the SQLite database (with any journal files) and the legacy BoltDB it migrated from.
+  { read -r sqlite_path; read -r legacy_path; } < <(db_paths)
+  for f in "" -wal -shm; do { [ -n "$sqlite_path" ] && [ -f "$sqlite_path$f" ] && cp -p "$sqlite_path$f" "$backup/database.sqlite$f"; } || true; done
+  { [ -n "$legacy_path" ] && [ -f "$legacy_path" ] && cp -p "$legacy_path" "$backup/database.db"; } || true
+else
+  { [ -n "$db" ] && [ -f "$db" ] && cp -p "$db" "$backup/database.db"; } || true
+fi
 printf 'installed_sha256=%s\ninstalled_version=%s\ncandidate_sha256=%s\ncandidate_version=%s\n' "$old_sha" "$old_version" "$new_sha" "$new_version" > "$backup/manifest"
 log "backup: $backup"
 

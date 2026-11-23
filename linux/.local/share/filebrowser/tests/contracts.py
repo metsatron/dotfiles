@@ -224,5 +224,62 @@ esac''')
     def test_installer_help_and_unknown_flag(self):
         self.run_script('filebrowser-milkdown-install', '-h')
         r = self.run_script('filebrowser-milkdown-install', '--bogus', ok=False); self.assertEqual(r.returncode, 2)
+    # -- Quantum 2: provisioning, conversion, settings and the installer's pre-check ----------------
+    def test_provision_renders_the_schema_of_the_installed_binary(self):
+        self.addresses()
+        env=self.env|{'FILEBROWSER_TEMPLATE':str(DATA/'config.template.yaml')}
+        v1_sources=yaml.safe_load((DATA/'config.template.yaml').read_text().replace('$HOME',str(self.home)).replace('RENDERED_USER',subprocess.check_output(['id','-un'],text=True).strip()))['server']['sources']
+        for version,quantum2 in (('v1.5.8-stable',False),('v2.0.2-stable',True)):
+            self.fake('filebrowser-milkdown','[ "${1:-}" = version ] && printf "\\tVersion \\t : %s\\n" '+version+' || true')
+            self.config.unlink();self.run_script('filebrowser-provision',env=env)
+            d=yaml.safe_load(self.config.read_text())
+            self.assertEqual('http' in d,quantum2)
+            if quantum2:
+                self.assertEqual(d['http']['port'],9091);self.assertEqual(d['http']['internalUrl'],'https://test.example:'+self.file_port)
+                self.assertTrue(d['server']['database']['path'].endswith('/filebrowser.sqlite'));self.assertNotIn('migrateFrom',d['server']['database']);self.assertNotIn('port',d['server'])
+            else:
+                self.assertEqual(d['server']['port'],9091);self.assertIsInstance(d['server']['database'],str)
+            self.assertEqual(d['server']['sources'],v1_sources)
+            self.assertTrue(d['userDefaults']['fileViewer']['preferEditorForMarkdown']);self.assertEqual(d['integrations']['office']['url'],self.office_url)
+        self.config.unlink();self.run_script('filebrowser-provision','--schema','v2',env=env);self.assertIn('http',yaml.safe_load(self.config.read_text()))
+        self.config.unlink();self.run_script('filebrowser-provision','--schema','bogus',env=env,ok=False)
+    def test_config_v2_conversion_is_dry_by_default_and_refuses_a_second_run(self):
+        legacy=self.home/'legacy.db';legacy.write_bytes(b'bolt')
+        v1={'server':{'port':9091,'listen':'127.0.0.1','database':str(legacy),'cacheDir':'c','internalUrl':'https://cb.example','sources':[{'name':'kept','path':'/x'}]},'auth':{'tokenExpirationHours':720},'frontend':{'styling':{'customCSS':'x.css'}}}
+        self.config.write_text(yaml.safe_dump(v1));orig=self.config.read_bytes()
+        sq=self.home/'state/filebrowser.sqlite'
+        self.run_script('filebrowser-config-v2','--sqlite',str(sq));self.assertEqual(self.config.read_bytes(),orig)
+        self.run_script('filebrowser-config-v2','--apply','--sqlite',str(self.home/'database.db'),ok=False);self.assertEqual(self.config.read_bytes(),orig)
+        self.run_script('filebrowser-config-v2','--apply','--sqlite',str(sq))
+        d=yaml.safe_load(self.config.read_text())
+        self.assertEqual(d['http'],{'port':9091,'listen':'127.0.0.1','internalUrl':'https://cb.example'})
+        self.assertEqual(d['server']['database'],{'path':str(sq),'migrateFrom':str(legacy)});self.assertNotIn('port',d['server'])
+        self.assertEqual(d['server']['sources'],v1['server']['sources']);self.assertEqual(d['frontend'],v1['frontend']);self.assertEqual(d['auth'],v1['auth']);self.assertEqual(legacy.read_bytes(),b'bolt')
+        b=list(self.config.parent.glob('*.before-quantum2-*'));self.assertEqual(len(b),1);self.assertEqual(b[0].read_bytes(),orig);self.assertEqual(stat.S_IMODE(b[0].stat().st_mode),0o600)
+        self.run_script('filebrowser-config-v2','--apply','--sqlite',str(sq),ok=False)
+    def test_settings_apply_writes_the_callback_under_http_for_quantum_2(self):
+        self.config.write_text(yaml.safe_dump({'http':{'port':9091},'server':{'database':{'path':'x.sqlite'}}}))
+        self.run_script('filebrowser-settings-apply','--apply','--office-url','https://test.example','--office-internal-url','http://localhost','--callback-url','https://callback.example')
+        d=yaml.safe_load(self.config.read_text());self.assertEqual(d['http']['internalUrl'],'https://callback.example');self.assertNotIn('internalUrl',d['server'])
+    def test_installer_precheck_runs_a_quantum_2_candidate_on_scratch_copies_never_the_live_database(self):
+        env=self.install_env();self.installed()
+        live=self.home/'live.sqlite';legacy=self.home/'legacy.db';legacy.write_bytes(b'bolt')
+        (self.home/'.config/filebrowser/config.yaml').write_text(yaml.safe_dump({'http':{'port':9091},'server':{'cacheDir':str(self.home/'cache'),'database':{'path':str(live),'migrateFrom':str(legacy)}}}))
+        cand=self.home/'cand'
+        cand.write_text('#!/bin/bash\nif [ "${1:-}" = version ]; then printf "\\tVersion \\t : v2.0.2-stable\\n"; exit 0; fi\n'
+                        '/usr/bin/python3 - "$2" >> "$HOME/seen.txt" <<PY\nimport sys, yaml\nc = yaml.safe_load(open(sys.argv[1]))\nprint(c["http"]["port"], c["server"]["database"]["path"], c["server"]["database"]["migrateFrom"], c["server"]["cacheDir"])\nPY\n'
+                        'echo "[INFO ] Running at               : http://127.0.0.1:1/"; exec sleep 30\n');cand.chmod(0o755)
+        self.run_script('filebrowser-milkdown-install','--candidate',str(cand),env=env)
+        port,sqlite,mig,cache=(self.home/'seen.txt').read_text().split()
+        self.assertNotEqual(port,'9091');self.assertNotEqual(sqlite,str(live));self.assertNotEqual(mig,str(legacy));self.assertNotEqual(cache,str(self.home/'cache'))
+        self.assertFalse(live.exists());self.assertEqual(legacy.read_bytes(),b'bolt')
+    def test_installer_backs_up_a_quantum_2_database_and_its_legacy_file(self):
+        env=self.install_env();self.installed()
+        live=self.home/'live.sqlite';legacy=self.home/'legacy.db';live.write_bytes(b'sqlite');legacy.write_bytes(b'bolt')
+        (self.home/'.config/filebrowser/config.yaml').write_text(yaml.safe_dump({'http':{'port':9091},'server':{'cacheDir':str(self.home/'cache'),'database':{'path':str(live),'migrateFrom':str(legacy)}}}))
+        cand=self.home/'cand';self.fake_binary(cand,'v2.0.2-stable')
+        self.run_script('filebrowser-milkdown-install','--candidate',str(cand),'--apply',env=env)
+        backup=sorted((self.home/'.local/state/filebrowser/install-backups').iterdir())[-1]
+        self.assertEqual((backup/'database.sqlite').read_bytes(),b'sqlite');self.assertEqual((backup/'database.db').read_bytes(),b'bolt')
 
 if __name__=='__main__':unittest.main(verbosity=2)
