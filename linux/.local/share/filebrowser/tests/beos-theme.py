@@ -40,6 +40,16 @@ with tempfile.TemporaryDirectory(prefix='fb-beos-transitions-') as tmp:
  run('off',ok=False);run('beos-r5',ok=False);assert config.read_bytes()==before
  # Missing frontend must return to absent, rather than adding empty maps.
  (Path(tmp)/'.beos-r5-theme.json').unlink();config.write_text('server: {}\n');run('beos-r5');run('off');assert yaml.safe_load(config.read_text())=={'server':{}}
+ # Quantum 2 (an http: block): the theme becomes a per-user customThemes entry, customCSS is parked and restored.
+ v2={'http':{'port':9091},'server':{'database':{'path':'x.sqlite'}},'frontend':{'styling':{'customCSS':'old.css','customThemes':{'mine':{'description':'m','css':'m.css'}}}}}
+ config.write_text(yaml.safe_dump(v2));run('beos-r5');d=yaml.safe_load(config.read_text());st=d['frontend']['styling']
+ assert 'customCSS' not in st and st['customThemes']['default']['description']=='BeOS R5' and Path(st['customThemes']['default']['css']).is_file() and st['customThemes']['stock']['css']==''
+ assert d['http']==v2['http'] and d['server']==v2['server']
+ before=config.read_bytes();run('beos-r5');assert config.read_bytes()==before
+ run('beos-r5',False);run('off',False);assert config.read_bytes()==before
+ run('off');assert yaml.safe_load(config.read_text())==v2
+ st2=copy.deepcopy(v2);st2['frontend']['styling']['customThemes']['mine']['css']='moved.css';config.write_text(yaml.safe_dump(st2));run('beos-r5');config.write_text(yaml.safe_dump(v2));run('off',ok=False)
+ (Path(tmp)/'.beos-r5-theme.json').unlink()
  config.write_text('frontend: {}\nfrontend: {}\n');run('beos-r5',ok=False)
  config.unlink();config.symlink_to(Path(tmp)/'other.yaml');(Path(tmp)/'other.yaml').write_text('server: {}\n');run('beos-r5',ok=False)
 print(f'PASS: {checks} transitions/guards, field-only rollback, unrelated settings preserved, cap and font table identity')
