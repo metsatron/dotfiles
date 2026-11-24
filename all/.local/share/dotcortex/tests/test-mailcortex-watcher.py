@@ -459,6 +459,19 @@ class WatcherTests(unittest.TestCase):
         self.assertEqual(receipt["handling_state"], "handling_deferred")
         self.assertEqual(len(adapter.deliveries), 1)
 
+    def test_delivered_reply_is_not_stranded_and_never_reinjected(self):
+        # Orca, 2026-11-24: a refill the seat answered and published as a reply was
+        # still treated as stranded, because only handling_state was consulted, so
+        # the watcher re-offered it twice and the seat answered twice.
+        now = 10_000.0
+        stale = now - self.watcher.INJECTION_STALE_SECONDS - 1
+        receipt = {"wake_state": "injected", "wake_updated_at": stale, "reinject_attempts": 0}
+        self.assertTrue(self.watcher.injection_stranded(dict(receipt), now))
+        receipt.update(reply_state="delivered", reply_delivered_at=now - 60)
+        self.assertFalse(self.watcher.injection_stranded(dict(receipt), now))
+        receipt.update(reply_state="failed")
+        self.assertTrue(self.watcher.injection_stranded(dict(receipt), now))
+
     def test_ambiguous_delivery_is_not_retried(self):
         mid = "<unknown@node.helm>"
         self.mail(mid, "a")
