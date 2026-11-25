@@ -1851,6 +1851,7 @@ def compact(
         return CompactResult(False, "index-open-failed", report, index_path=index_dir)
 
     elided = 0
+    rewritten_positions: set[int] = set()
     pointers: list[dict] = []
     relocated_human: list[dict] = []
     folded_prose = 0
@@ -1900,6 +1901,7 @@ def compact(
                             }
                         )
                         elided += 1
+                        rewritten_positions.add(position)
                 if isinstance(content, list):
                     for block_index, part in enumerate(content):
                         candidate = chosen_keys.get("r{}-{}".format(position, block_index))
@@ -1954,6 +1956,7 @@ def compact(
                             }
                         )
                         elided += 1
+                        rewritten_positions.add(position)
                 handle.write(json.dumps(record) + "\n")
                 handle.flush()
         group_mismatches = verify_groups(index, groups) if groups else []
@@ -1985,11 +1988,15 @@ def compact(
         1 for before, record in zip(human_before, records) if before != human_text(record)
     )
     # Every elision stub and group description must sit in a record the model
-    # reads: a stub in a logging record is a pointer to nothing.
+    # reads: a stub in a logging record is a pointer to nothing.  Only a record
+    # THIS pass rewrote can hold such a stub.  A logging record that merely
+    # quotes the stub text (a session that read this engine's source) was never
+    # rewritten, and counting it made the pass refuse every such transcript.
     unreadable_stub_records = [
         position
         for position, record in enumerate(records)
-        if position not in excluded_positions
+        if position in rewritten_positions
+        and position not in excluded_positions
         and not is_context_record(record)
         and "[elided" in json.dumps(record.get("message"))
     ]

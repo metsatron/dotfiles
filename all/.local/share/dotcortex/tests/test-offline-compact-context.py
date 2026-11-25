@@ -130,6 +130,22 @@ class ContextTests(unittest.TestCase):
         blobs = [row for row in written if row.get("type") == "api-request-blob"]
         self.assertEqual(blobs[0]["message"]["content"], "B" * 200_000)
 
+    def test_logging_record_quoting_a_stub_is_not_an_unreadable_stub(self):
+        """A session that READ this engine's source carries the stub text inside
+        an api-request-blob record the engine never rewrote. That quote is not a
+        stub pointing at nothing, and it must not make the whole pass refuse
+        with index-unreadable (found 2026-11-25 on the live 185 MB Auryn
+        transcript: records 50811 and 52479 were exactly such quotes)."""
+        rows = chain_rows()
+        quote = record("api-request-blob", "user", "POINTER = '[elided 1,234 chars at line 5 of x.jsonl'", None)
+        quote.pop("uuid")
+        rows.insert(3, quote)
+        result, written = self.run_compact(rows)
+        self.assertEqual(result.report["index_unreadable_records"], [])
+        self.assertNotEqual(result.reason, "index-unreadable")
+        quoted = [row for row in written if row.get("type") == "api-request-blob"]
+        self.assertEqual(quoted[0]["message"]["content"], quote["message"]["content"])
+
     def test_whole_string_record_folds_byte_exact_and_verifies(self):
         rows = chain_rows(newest_summary=False)
         big = "channel text " * 80
