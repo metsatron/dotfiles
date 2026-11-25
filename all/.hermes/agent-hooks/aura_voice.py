@@ -6,7 +6,7 @@ Mètsàtron's gift (2026-08-17): every Telegram reply Aura sends is also
 rendered in Amy's voice — the voice he recorded her with and shared with
 the operator that same day — and lands as a native voice bubble in the same chat.
 Transport is Telegram itself via `hermes send` (gateway credentials, no keys,
-no SSH); synthesis uses her selected OmniVoice profile in the local pvox renderer.
+no SSH); synthesis runs Piper locally with the original en_US-amy-medium model.
 
 Contract (same as aura_recall.py): read a JSON payload on stdin, print a JSON
 object on stdout, ALWAYS exit 0 — a hook must never break Aura's turn. All
@@ -14,9 +14,9 @@ real work (synthesis, encode, send) happens in a detached worker process, so
 turn finalization is never held back by audio time.
 
 Pipeline: assistant_response → sanitize (fenced code, URLs, kaomoji stripped
-for the ear) → pvox (Aura clone profile, headered WAV) → ffmpeg (OGG Opus — the .ogg
+for the ear) → Piper (original Amy, headered WAV) → ffmpeg (OGG Opus — the .ogg
 extension is what the Telegram adapter routes to a round voice bubble) →
-`hermes send --to telegram:<chat_id> MEDIA:<path>`. chat_id comes from a
+`hermes send --to telegram:<chat_id> "[[audio_as_voice]] MEDIA:<path>"`. chat_id comes from a
 read-only lookup of session_id in state.db.
 
 Artifacts live in ~/.hermes/audio_cache/aura-voice/ (pruned after 3 days);
@@ -35,7 +35,6 @@ HOME = os.path.expanduser("~")
 STATE_DB = os.path.join(HOME, ".hermes", "state.db")
 PIPER_PY = os.path.join(HOME, ".local", "share", "aura-voice", "venv", "bin", "python")
 AMY = os.path.join(HOME, ".local", "share", "aura-voice", "en_US-amy-medium.onnx")
-PVOX = os.path.join(HOME, ".local", "share", "pvox-clone", "client", "bin", "pvox")
 HERMES = os.path.join(HOME, ".hermes", "hermes-agent", "venv", "bin", "hermes")
 CACHE = os.path.join(HOME, ".hermes", "audio_cache", "aura-voice")
 LOG = os.path.join(CACHE, "voice.log")
@@ -97,7 +96,8 @@ def worker(chat_id, text_path):
     ogg = os.path.join(CACHE, "aura-%s.ogg" % stamp)
     try:
         subprocess.run(
-            [sys.executable, PVOX, "render", "--agent", "Aura", "--no-play", text_path, raw],
+            [PIPER_PY, "-m", "piper", "--model", AMY, "--output_file", raw],
+            input=text.encode("utf-8"),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             check=True, timeout=1800, env=child_env(),
         )
