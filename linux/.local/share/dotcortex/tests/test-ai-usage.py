@@ -1385,6 +1385,35 @@ class ClaudeNoCrossAccountFallbackTests(unittest.TestCase):
             self.assertIsNone(token, bad)
             self.assertEqual(reason, "malformed-expiry")
 
+    def load_with_config(self, config, env_value=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remotes.json"
+            if config is not None:
+                path.write_text(json.dumps(config), encoding="utf-8")
+            env = {k: v for k, v in os.environ.items() if k != "AI_USAGE_CLAUDE_CREDENTIAL_HOSTS"}
+            env["AI_USAGE_REMOTES_FILE"] = str(path)
+            if env_value is not None:
+                env["AI_USAGE_CLAUDE_CREDENTIAL_HOSTS"] = env_value
+            with patch.dict(os.environ, env, clear=True):
+                return load_ai_usage()
+
+    def test_the_machines_own_config_can_name_the_login_it_borrows(self):
+        module = self.load_with_config({"remotes": [], "claude_credential_hosts": ["kikin"]})
+        self.assertEqual(module.CLAUDE_CREDENTIAL_HOSTS, ["kikin"])
+
+    def test_no_config_key_means_no_borrowing(self):
+        self.assertEqual(self.load_with_config({"remotes": []}).CLAUDE_CREDENTIAL_HOSTS, [])
+        self.assertEqual(self.load_with_config(None).CLAUDE_CREDENTIAL_HOSTS, [])
+
+    def test_an_explicit_environment_value_beats_the_config_even_when_empty(self):
+        config = {"claude_credential_hosts": ["kikin"]}
+        self.assertEqual(self.load_with_config(config, env_value="").CLAUDE_CREDENTIAL_HOSTS, [])
+        self.assertEqual(self.load_with_config(config, env_value="other").CLAUDE_CREDENTIAL_HOSTS, ["other"])
+
+    def test_unsafe_or_odd_names_in_the_config_are_dropped_and_the_list_is_capped(self):
+        config = {"claude_credential_hosts": ["-oProxyCommand=x", 5, "a b", "", "ok1", "ok2", "u@ok3", "ok4"]}
+        self.assertEqual(self.load_with_config(config).CLAUDE_CREDENTIAL_HOSTS, ["ok1", "ok2", "u@ok3"])
+
     def test_an_explicit_opt_in_still_works(self):
         with patch.dict(os.environ, {"AI_USAGE_CLAUDE_CREDENTIAL_HOSTS": "kikin"}):
             module = load_ai_usage()
