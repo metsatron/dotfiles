@@ -53,6 +53,7 @@ Usage:
 #+BEGIN_SRC python :tangle linux/.local/bin/ai-usage :shebang "#!/usr/bin/env python3" :comments no
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
@@ -2450,13 +2451,12 @@ CLAUDE_OAUTH_BETA = "oauth-2025-04-20"
 CLAUDE_CREDENTIALS = os.environ.get(
     "AI_USAGE_CLAUDE_CREDENTIALS", os.path.expanduser("~/.claude/.credentials.json")
 )
-# Claude Code stores its OAuth session per machine. A host that never signed in,
-# or whose copy was left hollow by a logout, can still have a live session next
-# door — and "signed in elsewhere" is not the same fact as "no usable token".
-# The local file is tried first, then these hosts over ssh, in order.
+# Local OAuth only by default. Named credential hosts are an explicit opt-in;
+# their account ownership must be established by the operator. Never substitute
+# browser/Fuelcheck sessions for this OAuth identity.
 CLAUDE_CREDENTIAL_HOSTS = [
     host.strip()
-    for host in os.environ.get("AI_USAGE_CLAUDE_CREDENTIAL_HOSTS", "kikin").split(",")
+    for host in os.environ.get("AI_USAGE_CLAUDE_CREDENTIAL_HOSTS", "").split(",")
     if host.strip()
 ]
 
@@ -2478,10 +2478,18 @@ def _claude_token_from_oauth(oauth: dict[str, Any]) -> tuple[str | None, str]:
     token = oauth.get("accessToken")
     if not isinstance(token, str) or not token.strip():
         return None, "empty"
-    # expiresAt is epoch milliseconds. Refreshing is not our job — but an
-    # expired local copy is exactly when another host's live session matters.
+    # expiresAt must be a finite positive epoch-millisecond number. A missing
+    # or malformed expiry is not evidence of a usable login. Never refresh it.
     expires_at = oauth.get("expiresAt")
-    if isinstance(expires_at, (int, float)) and time.time() >= (float(expires_at) / 1000.0):
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return None, "malformed-expiry"
+    try:
+        expires_at = float(expires_at)
+    except OverflowError:
+        return None, "malformed-expiry"
+    if not 0 < expires_at < float("inf"):
+        return None, "malformed-expiry"
+    if time.time() >= (expires_at / 1000.0):
         return None, "expired"
     return token, "ok"
 
@@ -2490,10 +2498,12 @@ def _claude_local_oauth() -> tuple[dict[str, Any] | None, str]:
     try:
         with open(CLAUDE_CREDENTIALS, encoding="utf-8") as handle:
             oauth = _claude_oauth_fields(json.load(handle))
-    except OSError:
+    except FileNotFoundError:
         return None, "absent"
-    except ValueError:
+    except OSError:
         return None, "unreadable"
+    except ValueError:
+        return None, "invalid-json"
     return (oauth, "present") if oauth is not None else (None, "malformed")
 
 
@@ -2594,7 +2604,20 @@ def _ensure_claude_window_minutes(result: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
+def _claude_missing_result(spec: ProviderSpec) -> dict[str, Any]:
+    return {
+        "provider": spec.key,
+        "label": spec.label,
+        "state": "missing",
+        "source": "oauth",
+        "summary": f"No usable Claude OAuth token ({CLAUDE_TOKEN_REASON}).",
+        "raw": None,
+    }
+
+
+def fetch_claude_oauth(
+    spec: ProviderSpec, timeout_seconds: float, token: str | None = None
+) -> dict[str, Any]:
     """Read Claude usage straight from the OAuth endpoint.
 
     fuelcheck-cli only reports the top-level five_hour/seven_day figures and drops
@@ -2603,27 +2626,11 @@ def fetch_claude_oauth(spec: ProviderSpec, timeout_seconds: float) -> dict[str, 
     That array is the only place a Fable limit is visible, and it can sit at 99%
     while the headline weekly reads a comfortable 70%. So fetch it ourselves and
     render every limit the account actually has, whatever models Anthropic adds
-    later. Falls back to fuelcheck when there is no usable token.
+    later. A missing OAuth identity is terminal; never borrow a web session.
     """
-    token = claude_oauth_token()
+    token = token if token is not None else claude_oauth_token()
     if not token:
-        return {
-            "provider": spec.key,
-            "label": spec.label,
-            "state": "missing",
-            "source": "oauth",
-            "summary": (
-                "No usable Claude OAuth token in "
-                f"{CLAUDE_CREDENTIALS}"
-                + (
-                    f" or on {', '.join(CLAUDE_CREDENTIAL_HOSTS)}"
-                    if CLAUDE_CREDENTIAL_HOSTS
-                    else ""
-                )
-                + f" ({CLAUDE_TOKEN_REASON})."
-            ),
-            "raw": None,
-        }
+        return _claude_missing_result(spec)
 
     request = urllib.request.Request(
         CLAUDE_USAGE_URL,
@@ -3706,8 +3713,29 @@ def _attach_banked_resets(result: dict[str, Any]) -> dict[str, Any]:
 def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]:
     now = time.time()
     cache_key = _provider_cache_key(spec)
+    claude_token = None
+    if spec.key == "claude":
+        # Validate the current identity before any cache/backoff lookup. Missing
+        # credentials perform no cache IO. Old claude.json is never consulted.
+        claude_token = claude_oauth_token()
+        if not claude_token:
+            return _claude_missing_result(spec)
+        # Opaque credential/policy binding: no token or account ID is persisted.
+        # Token rotation, credential path, origin or opt-in order changes isolate
+        # both good results and 429 backoff. Reuse this exact token for the GET.
+        binding = json.dumps([
+            CLAUDE_CREDENTIALS, CLAUDE_CREDENTIAL_HOSTS,
+            CLAUDE_TOKEN_ORIGIN, claude_token,
+        ], separators=(",", ":"))
+        cache_key = "claude-oauth-v2-" + hashlib.sha256(binding.encode()).hexdigest()
     entry = _cache_read(cache_key)
     cached = entry.get("result")
+    if spec.key == "claude" and cached and (
+        not isinstance(cached, dict) or cached.get("provider") != "claude"
+        or cached.get("source") != "oauth" or cached.get("remote")
+        or cached.get("credential_origin") != CLAUDE_TOKEN_ORIGIN
+    ):
+        entry, cached = {}, None
 
     # Serve a fresh cache without touching the network. This is what makes N
     # concurrent watchers cost one fetch instead of N.
@@ -3733,7 +3761,12 @@ def fetch_provider(spec: ProviderSpec, timeout_seconds: float) -> dict[str, Any]
             "raw": None,
         }
 
-    result = _fetch_provider_uncached(spec, timeout_seconds)
+    if spec.key == "claude":
+        result = _ensure_claude_window_minutes(
+            fetch_claude_oauth(spec, timeout_seconds, claude_token)
+        )
+    else:
+        result = _fetch_provider_uncached(spec, timeout_seconds)
 
     if _is_rate_limited(result):
         # Escalate the backoff each consecutive time we are throttled.
@@ -3782,14 +3815,8 @@ def _fetch_provider_uncached(spec: ProviderSpec, timeout_seconds: float) -> dict
         return result
 
     if spec.key == "claude":
-        # Native OAuth first: it is the only source that carries the per-model
-        # scoped limits (Fable). fuelcheck stays as the fallback for when there
-        # is no usable token.
-        result = _ensure_claude_window_minutes(fetch_claude_oauth(spec, timeout_seconds))
-        if result["state"] == "ok":
-            return result
-        fallback = _ensure_claude_window_minutes(fetch_fuelcheck(spec, timeout_seconds))
-        return fallback if fallback["state"] == "ok" else result
+        # OAuth is the sole Claude source, including missing/error responses.
+        return _ensure_claude_window_minutes(fetch_claude_oauth(spec, timeout_seconds))
 
     if spec.kind == "openrouter":
         # Native OpenRouter API first (2026-10-09): works on any host from
