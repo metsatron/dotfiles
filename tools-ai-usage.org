@@ -4433,7 +4433,62 @@ def fetch_one_remote(entry: dict[str, Any], default_timeout: float) -> list[dict
         merged["label"] = f"{label} · {item.get('label', '')}".rstrip(" ·")
         merged["remote"] = label
         out.append(merged)
+    if entry.get("also_ssh"):
+        out = _fill_from_same_persons_other_logins(out, label, entry["also_ssh"], timeout)
     return out or [_remote_error(label, "remote returned no panels")]
+
+
+def _fill_from_same_persons_other_logins(
+    panels: list[dict[str, Any]], label: str, targets: Any, timeout: float
+) -> list[dict[str, Any]]:
+    """Fill a panel that reads as not signed in from the SAME person's other login.
+
+    A person can be signed in under more than one UNIX user on one machine
+    (Gillean on Honey: her own user, and the agent user her seats run under).
+    ``also_ssh`` lists those other ssh targets, in order, in the remotes file, so
+    this is explicit configuration and never a guess: nothing is borrowed from a
+    target the operator did not name for this person.  The other user may not
+    have this tool installed, so the script is sent over stdin.  A panel that is
+    already ok is left alone, and a panel nothing can fill stays "missing".
+    """
+    if isinstance(targets, str):
+        targets = [targets]
+    try:
+        script = Path(__file__).read_text(encoding="utf-8")
+    except OSError:
+        return panels
+    filled: list[dict[str, Any]] = []
+    for panel in panels:
+        provider = str(panel.get("provider", ""))
+        if panel.get("state") == "ok" or provider != "claude":
+            filled.append(panel)
+            continue
+        replacement = None
+        for target in targets:
+            ssh_cmd = [
+                "ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+                "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey",
+                "-o", f"ConnectTimeout={max(1, int(timeout))}", "-o", "ConnectionAttempts=1",
+                str(target), f"python3 - --providers {provider} --json --no-remote",
+            ]
+            try:
+                proc = subprocess.run(
+                    ssh_cmd, input=script, capture_output=True, text=True, timeout=timeout + 5.0
+                )
+                items = json.loads(proc.stdout) if proc.returncode == 0 else []
+            except (subprocess.TimeoutExpired, OSError, ValueError):
+                continue
+            for item in items if isinstance(items, list) else []:
+                if isinstance(item, dict) and item.get("provider") == provider and item.get("state") == "ok":
+                    replacement = dict(item)
+                    replacement["label"] = panel.get("label")
+                    replacement["remote"] = label
+                    replacement["credential_origin"] = f"{target}"
+                    break
+            if replacement is not None:
+                break
+        filled.append(replacement if replacement is not None else panel)
+    return filled
 
 
 def fetch_remote_results(remotes_file: Path, default_timeout: float) -> list[dict[str, Any]]:
@@ -4667,6 +4722,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -6024,6 +6080,64 @@ class ClaudeNoCrossAccountFallbackTests(unittest.TestCase):
         with patch.dict(os.environ, {"AI_USAGE_CLAUDE_CREDENTIAL_HOSTS": "kikin"}):
             module = load_ai_usage()
         self.assertEqual(module.CLAUDE_CREDENTIAL_HOSTS, ["kikin"])
+
+
+class SamePersonsOtherLoginTests(unittest.TestCase):
+    """her own UNIX user is logged out; the agent user her seats run under is her
+    account too.  The remotes file names that user, and only that user is tried."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def fake_run(self, outputs, calls):
+        def run(cmd, **kwargs):
+            calls.append(cmd[-2] if len(cmd) > 1 else cmd)
+            target = next((c for c in cmd if c in outputs), None)
+            body = outputs.get(target, "[]")
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(body), stderr="")
+        return run
+
+    PRIMARY_MISSING = [{"provider": "claude", "label": "Claude Code", "state": "missing", "raw": None, "summary": "logged out"}]
+    OTHER_OK = [{"provider": "claude", "label": "Claude Code", "state": "ok", "raw": {"usage": {"primary": {"usedPercent": 0.0}, "secondary": {"usedPercent": 25.0}}}}]
+
+    def entry(self, **extra):
+        item = {"label": "Gillean", "ssh": "honey", "providers": "claude"}
+        item.update(extra)
+        return item
+
+    def test_a_logged_out_panel_is_filled_from_the_named_other_login(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.OTHER_OK}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "ok")
+        self.assertEqual(panels[0]["label"], "Gillean \u00b7 Claude Code")
+        self.assertEqual(panels[0]["credential_origin"], "agent-claude@honey")
+        self.assertEqual(panels[0]["raw"]["usage"]["secondary"]["usedPercent"], 25.0)
+
+    def test_without_also_ssh_nothing_is_borrowed(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.OTHER_OK}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(), 5.0)
+        self.assertEqual(panels[0]["state"], "missing")
+        self.assertNotIn("agent-claude@honey", calls)
+
+    def test_if_no_named_login_works_the_panel_stays_missing(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.PRIMARY_MISSING}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "missing")
+
+    def test_an_ok_panel_is_never_replaced(self):
+        calls = []
+        outputs = {"honey": self.OTHER_OK, "agent-claude@honey": self.PRIMARY_MISSING}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "ok")
+        self.assertNotIn("agent-claude@honey", calls)
 
 
 if __name__ == "__main__":

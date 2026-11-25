@@ -5,6 +5,7 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -1362,6 +1363,64 @@ class ClaudeNoCrossAccountFallbackTests(unittest.TestCase):
         with patch.dict(os.environ, {"AI_USAGE_CLAUDE_CREDENTIAL_HOSTS": "kikin"}):
             module = load_ai_usage()
         self.assertEqual(module.CLAUDE_CREDENTIAL_HOSTS, ["kikin"])
+
+
+class SamePersonsOtherLoginTests(unittest.TestCase):
+    """her own UNIX user is logged out; the agent user her seats run under is her
+    account too.  The remotes file names that user, and only that user is tried."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.ai_usage = load_ai_usage()
+
+    def fake_run(self, outputs, calls):
+        def run(cmd, **kwargs):
+            calls.append(cmd[-2] if len(cmd) > 1 else cmd)
+            target = next((c for c in cmd if c in outputs), None)
+            body = outputs.get(target, "[]")
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(body), stderr="")
+        return run
+
+    PRIMARY_MISSING = [{"provider": "claude", "label": "Claude Code", "state": "missing", "raw": None, "summary": "logged out"}]
+    OTHER_OK = [{"provider": "claude", "label": "Claude Code", "state": "ok", "raw": {"usage": {"primary": {"usedPercent": 0.0}, "secondary": {"usedPercent": 25.0}}}}]
+
+    def entry(self, **extra):
+        item = {"label": "Gillean", "ssh": "honey", "providers": "claude"}
+        item.update(extra)
+        return item
+
+    def test_a_logged_out_panel_is_filled_from_the_named_other_login(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.OTHER_OK}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "ok")
+        self.assertEqual(panels[0]["label"], "Gillean \u00b7 Claude Code")
+        self.assertEqual(panels[0]["credential_origin"], "agent-claude@honey")
+        self.assertEqual(panels[0]["raw"]["usage"]["secondary"]["usedPercent"], 25.0)
+
+    def test_without_also_ssh_nothing_is_borrowed(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.OTHER_OK}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(), 5.0)
+        self.assertEqual(panels[0]["state"], "missing")
+        self.assertNotIn("agent-claude@honey", calls)
+
+    def test_if_no_named_login_works_the_panel_stays_missing(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.PRIMARY_MISSING}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "missing")
+
+    def test_an_ok_panel_is_never_replaced(self):
+        calls = []
+        outputs = {"honey": self.OTHER_OK, "agent-claude@honey": self.PRIMARY_MISSING}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "ok")
+        self.assertNotIn("agent-claude@honey", calls)
 
 
 if __name__ == "__main__":
