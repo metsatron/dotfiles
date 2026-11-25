@@ -1357,7 +1357,33 @@ class ClaudeNoCrossAccountFallbackTests(unittest.TestCase):
                 result = module.fetch_claude_oauth(spec, 1.0)
         self.assertEqual(result["state"], "missing")
         self.assertIsNone(result["raw"])
-        self.assertIn("logged out", result["summary"])
+        self.assertIn("No usable Claude OAuth token", result["summary"])
+        self.assertIn("local-empty", result["summary"])
+
+    def test_a_cached_result_from_another_origin_is_never_served_without_a_login(self):
+        module = self.load_without_opt_in()
+        spec = next(item for item in module.PROVIDERS if item.key == "claude")
+        stale = {"result": {"provider": "claude", "state": "ok", "source": "oauth", "credential_origin": "kikin", "raw": {}}, "fetched_at": 1e12}
+        with patch.object(module, "claude_oauth_token", return_value=None), \
+             patch.object(module, "_cache_read", side_effect=AssertionError("cache consulted before the login was checked")) as cache:
+            result = module.fetch_provider(spec, 1.0)
+        self.assertEqual(result["state"], "missing")
+        cache.assert_not_called()
+
+    def test_a_missing_login_never_asks_the_web_session(self):
+        module = self.load_without_opt_in()
+        spec = next(item for item in module.PROVIDERS if item.key == "claude")
+        with patch.object(module, "claude_oauth_token", return_value=None), \
+             patch.object(module, "fetch_fuelcheck", side_effect=AssertionError("web session borrowed")):
+            result = module._fetch_provider_uncached(spec, 1.0)
+        self.assertEqual(result["state"], "missing")
+
+    def test_an_expiry_that_is_not_a_number_is_not_a_usable_login(self):
+        module = self.load_without_opt_in()
+        for bad in (None, "later", True, float("inf"), -1):
+            token, reason = module._claude_token_from_oauth({"accessToken": "t", "expiresAt": bad})
+            self.assertIsNone(token, bad)
+            self.assertEqual(reason, "malformed-expiry")
 
     def test_an_explicit_opt_in_still_works(self):
         with patch.dict(os.environ, {"AI_USAGE_CLAUDE_CREDENTIAL_HOSTS": "kikin"}):
@@ -1382,7 +1408,9 @@ class SamePersonsOtherLoginTests(unittest.TestCase):
         return run
 
     PRIMARY_MISSING = [{"provider": "claude", "label": "Claude Code", "state": "missing", "raw": None, "summary": "logged out"}]
-    OTHER_OK = [{"provider": "claude", "label": "Claude Code", "state": "ok", "raw": {"usage": {"primary": {"usedPercent": 0.0}, "secondary": {"usedPercent": 25.0}}}}]
+    OTHER_OK = [{"provider": "claude", "label": "Claude Code", "state": "ok", "credential_origin": "local", "raw": {"usage": {"primary": {"usedPercent": 0.0}, "secondary": {"usedPercent": 25.0}}}}]
+    BORROWED = [dict(OTHER_OK[0], credential_origin="kikin")]
+    FAILED = [{"provider": "claude", "label": "Claude Code", "state": "error", "raw": None, "summary": "timed out"}]
 
     def entry(self, **extra):
         item = {"label": "Gillean", "ssh": "honey", "providers": "claude"}
@@ -1396,7 +1424,8 @@ class SamePersonsOtherLoginTests(unittest.TestCase):
             panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
         self.assertEqual(panels[0]["state"], "ok")
         self.assertEqual(panels[0]["label"], "Gillean \u00b7 Claude Code")
-        self.assertEqual(panels[0]["credential_origin"], "agent-claude@honey")
+        self.assertEqual(panels[0]["credential_origin"], "local")
+        self.assertEqual(panels[0]["fetched_via"], "agent-claude@honey")
         self.assertEqual(panels[0]["raw"]["usage"]["secondary"]["usedPercent"], 25.0)
 
     def test_without_also_ssh_nothing_is_borrowed(self):
@@ -1413,6 +1442,30 @@ class SamePersonsOtherLoginTests(unittest.TestCase):
         with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
             panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
         self.assertEqual(panels[0]["state"], "missing")
+
+    def test_an_alternate_that_borrowed_from_a_third_machine_is_refused(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.BORROWED}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "missing")
+
+    def test_an_error_panel_is_shown_not_covered_over(self):
+        calls = []
+        outputs = {"honey": self.FAILED, "agent-claude@honey": self.OTHER_OK}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey"]), 5.0)
+        self.assertEqual(panels[0]["state"], "error")
+        self.assertNotIn("agent-claude@honey", calls)
+
+    def test_unsafe_or_odd_targets_are_never_run(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING}
+        bad = ["-oProxyCommand=touch /tmp/x", 5, {"h": 1}, "a b", ""]
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=bad), 5.0)
+        self.assertEqual(panels[0]["state"], "missing")
+        self.assertEqual(len(calls), 1)
 
     def test_an_ok_panel_is_never_replaced(self):
         calls = []
