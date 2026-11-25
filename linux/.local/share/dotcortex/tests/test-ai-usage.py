@@ -1320,5 +1320,49 @@ class AntigravityPoolTests(unittest.TestCase):
         self.assertEqual(weekly_reset, "2026-10-31T00:03:20Z")
 
 
+class ClaudeNoCrossAccountFallbackTests(unittest.TestCase):
+    """A logged-out Claude login must read as logged out.
+
+    2026-11-25: Gillean's Honey login had ended, and the tool quietly read
+    Kikin's token over ssh, so her row showed Mètsàtron's account under her name.
+    A row names ONE person's account; another machine's login is never borrowed
+    unless someone opts in with AI_USAGE_CLAUDE_CREDENTIAL_HOSTS.
+    """
+
+    def load_without_opt_in(self):
+        env = {k: v for k, v in os.environ.items() if k != "AI_USAGE_CLAUDE_CREDENTIAL_HOSTS"}
+        with patch.dict(os.environ, env, clear=True):
+            return load_ai_usage()
+
+    def test_default_borrows_no_other_machines_login(self):
+        module = self.load_without_opt_in()
+        self.assertEqual(module.CLAUDE_CREDENTIAL_HOSTS, [])
+
+    def test_an_ended_login_reports_logged_out_and_never_reads_another_host(self):
+        module = self.load_without_opt_in()
+        spec = next(item for item in module.PROVIDERS if item.key == "claude")
+        with tempfile.TemporaryDirectory() as tmp:
+            creds = Path(tmp) / "credentials.json"
+            creds.write_text(
+                json.dumps({"claudeAiOauth": {"accessToken": "", "refreshToken": "", "expiresAt": 0, "loginEnded": "2026-11-23"}}),
+                encoding="utf-8",
+            )
+
+            def borrowed(host):
+                raise AssertionError("borrowed another machine's login: " + host)
+
+            with patch.object(module, "CLAUDE_CREDENTIALS", str(creds)), \
+                 patch.object(module, "_claude_remote_oauth", side_effect=borrowed):
+                result = module.fetch_claude_oauth(spec, 1.0)
+        self.assertEqual(result["state"], "missing")
+        self.assertIsNone(result["raw"])
+        self.assertIn("logged out", result["summary"])
+
+    def test_an_explicit_opt_in_still_works(self):
+        with patch.dict(os.environ, {"AI_USAGE_CLAUDE_CREDENTIAL_HOSTS": "kikin"}):
+            module = load_ai_usage()
+        self.assertEqual(module.CLAUDE_CREDENTIAL_HOSTS, ["kikin"])
+
+
 if __name__ == "__main__":
     unittest.main()
