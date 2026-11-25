@@ -4351,6 +4351,17 @@ def load_remotes(path: Path) -> list[dict[str, Any]]:
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
+def _bounded_seconds(value: Any, fallback: float, floor: float = 0.0) -> float:
+    """A finite, positive number of seconds, at least ``floor`` and at most 120."""
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError, OverflowError):
+        seconds = fallback
+    if not math.isfinite(seconds) or seconds <= 0:
+        seconds = fallback
+    return min(max(seconds, floor), 120.0)
+
+
 def fetch_one_remote(entry: dict[str, Any], default_timeout: float) -> list[dict[str, Any]]:
     """SSH to one fleet host, run `ai-usage --json --no-remote`, and prefix its panels."""
     target = entry.get("ssh") or entry.get("host")
@@ -4360,14 +4371,11 @@ def fetch_one_remote(entry: dict[str, Any], default_timeout: float) -> list[dict
     providers = str(entry.get("providers") or "codex,claude").replace(" ", "").lower()
     if not REMOTE_PROVIDERS_RE.match(providers):
         return [_remote_error(label, f"invalid providers spec: {providers!r}")]
-    try:
-        timeout = float(entry.get("timeout", max(default_timeout, 25.0)))
-    except (TypeError, ValueError, OverflowError):
-        timeout = max(default_timeout, 25.0)
-    # A feed's timeout is a bound, so it has to be a finite, positive, capped number.
-    if not math.isfinite(timeout) or timeout <= 0:
-        timeout = max(default_timeout, 25.0)
-    timeout = min(timeout, 120.0)
+    # A feed's timeout is a bound, so it has to be a finite, positive, capped number,
+    # and so does the default it falls back to (a nan default used to survive max()).
+    fallback_timeout = _bounded_seconds(default_timeout, 25.0, floor=25.0)
+    raw_timeout = entry.get("timeout", fallback_timeout)
+    timeout = fallback_timeout if isinstance(raw_timeout, bool) else _bounded_seconds(raw_timeout, fallback_timeout)
 
     # Login shell so ~/.local/bin (and linuxbrew) are on PATH under non-interactive SSH.
     inner = f"ai-usage --providers {providers} --json --no-remote"
@@ -4447,8 +4455,10 @@ def _fill_from_same_persons_other_logins(
     except OSError:
         return panels
     filled: list[dict[str, Any]] = []
-    # One budget for the whole entry: each alternate is asked at most once, however
-    # many panels are missing, and no new ask starts after twice the entry timeout.
+    # One budget for the filling phase: each alternate is asked at most once, however
+    # many panels are missing, and every ask is capped by what is left of twice the
+    # entry timeout (counted from here, after the primary), plus two seconds for the
+    # process to be reaped.  So the phase ends within 2 x timeout + 2 s.
     asked: dict[str, Any] = {}
     budget_end = time.monotonic() + 2.0 * timeout
     for panel in panels:
@@ -4463,17 +4473,19 @@ def _fill_from_same_persons_other_logins(
             if (provider, target) in asked:
                 items = asked[(provider, target)]
             else:
-                if time.monotonic() >= budget_end:
+                remaining = budget_end - time.monotonic()
+                if remaining < 1.0:
                     break
+                call_timeout = min(timeout, remaining)
                 ssh_cmd = [
                     "ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
                     "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey",
-                    "-o", f"ConnectTimeout={max(1, int(timeout))}", "-o", "ConnectionAttempts=1",
+                    "-o", f"ConnectTimeout={max(1, int(call_timeout))}", "-o", "ConnectionAttempts=1",
                     "--", str(target), f"python3 - --providers {provider} --json --no-remote",
                 ]
                 try:
                     proc = subprocess.run(
-                        ssh_cmd, input=script, capture_output=True, text=True, timeout=timeout + 5.0
+                        ssh_cmd, input=script, capture_output=True, text=True, timeout=call_timeout + 2.0
                     )
                     items = json.loads(proc.stdout) if proc.returncode == 0 else []
                 except (subprocess.TimeoutExpired, OSError, ValueError):

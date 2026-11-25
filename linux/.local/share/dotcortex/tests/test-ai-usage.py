@@ -1475,6 +1475,37 @@ class SamePersonsOtherLoginTests(unittest.TestCase):
                 panels = self.ai_usage.fetch_one_remote(self.entry(timeout=bad, also_ssh=["agent-claude@honey"]), 5.0)
             self.assertEqual(panels[0]["state"], "missing", bad)
 
+    def test_a_nan_default_timeout_and_a_boolean_timeout_never_crash_the_feed(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING}
+        for default, entry_timeout in ((float("nan"), None), (float("inf"), None), (5.0, True), (None, None)):
+            entry = self.entry(also_ssh=["agent-claude@honey"])
+            if entry_timeout is not None:
+                entry["timeout"] = entry_timeout
+            with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+                panels = self.ai_usage.fetch_one_remote(entry, default)
+            self.assertEqual(panels[0]["state"], "missing", (default, entry_timeout))
+
+    def test_every_alternate_ask_is_capped_by_what_is_left_of_the_budget(self):
+        seen = []
+        outputs = {"honey": self.PRIMARY_MISSING, "agent-claude@honey": self.PRIMARY_MISSING, "b@honey": self.PRIMARY_MISSING}
+
+        def run(cmd, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            target = next((c for c in cmd if c in outputs), None)
+            return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(outputs.get(target, [])), stderr="")
+
+        # entry timeout 10 -> filling budget 20 s.  The clock says 0 when it starts,
+        # 15 s have gone when the first alternate is asked (5 s left), and 19.5 s
+        # when the second would be (under a second left, so it is not asked at all).
+        clock = iter([0.0, 15.0, 19.5, 19.5])
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=run), \
+             patch.object(self.ai_usage.time, "monotonic", side_effect=lambda: next(clock)):
+            self.ai_usage.fetch_one_remote(self.entry(timeout=10, also_ssh=["agent-claude@honey", "b@honey"]), 5.0)
+        alternate_calls = seen[1:]
+        self.assertEqual(len(alternate_calls), 1)
+        self.assertLessEqual(alternate_calls[0], 5.0 + 2.0)
+
     def test_each_alternate_is_asked_once_however_many_panels_are_missing(self):
         calls = []
         outputs = {"honey": self.PRIMARY_MISSING * 2, "agent-claude@honey": self.PRIMARY_MISSING}
