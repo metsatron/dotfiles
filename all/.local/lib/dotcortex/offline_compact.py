@@ -209,6 +209,43 @@ def text_of_part(part: dict) -> str:
 
 CONTEXT_RECORD_TYPES = ("user", "assistant")
 
+# Attachment records Claude Code writes beside the conversation that it can
+# rebuild itself: it loads fresh copies of CLAUDE.md, the skill listing and the
+# tool definitions on every resume and then ALSO re-reads these old ones, so a
+# long session carries the same bulk several times.  Measured on a real 5,000-record
+# session (2026-11-26): dropping 104 of them took the resumed context from about
+# 326,000 to about 150,000 tokens with every probe answer still right.  Emptying
+# their content instead made it worse (Claude re-loads what it believes missing),
+# so a ledger attachment is archived whole and the RECORD is removed.  Anything
+# that can hold a human word (queued_command, hook_additional_context,
+# edited_text_file, file) is not on this list and is never dropped.
+LEDGER_ATTACHMENT_TYPES = frozenset(
+    {
+        "instructions",
+        "invoked_skills",
+        "prompt_snapshot",
+        "skill_listing",
+        "hook_success",
+        "deferred_tools_delta",
+        "mcp_instructions_delta",
+        "agent_listing_delta",
+    }
+)
+
+
+def attachment_payload(record: dict) -> dict | None:
+    """The attachment body of an attachment record, else None."""
+    if record.get("type") != "attachment":
+        return None
+    payload = record.get("attachment")
+    return payload if isinstance(payload, dict) else None
+
+
+def attachment_chars(record: dict) -> int:
+    """Characters an attachment record puts in front of the model on resume."""
+    payload = attachment_payload(record)
+    return 0 if payload is None else len(json.dumps(payload))
+
 
 def is_context_record(record: dict) -> bool:
     """True when the model reads this record on resume.
@@ -1688,6 +1725,7 @@ def compact(
     group_min_members: int = POINTER_GROUP_MIN_MEMBERS,
     group_min_saving_chars: int = POINTER_GROUP_MIN_SAVING_CHARS,
     project: str = "",
+    drop_ledger_attachments: bool = True,
 ) -> CompactResult:
     """Compact a transcript COPY into ``out``; never mutates ``source``.
 
@@ -1752,7 +1790,36 @@ def compact(
     report["orphans_excluded"] = orphans
     report["orphan_count"] = len(orphans)
 
-    identities_before = identity_snapshot(records)
+    # Ledger attachments (see LEDGER_ATTACHMENT_TYPES) are archived whole and then
+    # removed; the chain is closed over each one by pointing its children at its
+    # parent.  The records list itself keeps its length so positions stay stable.
+    ledger_positions: set[int] = set()
+    dropped_parent: dict[str, object] = {}
+    if drop_ledger_attachments:
+        for position, record in enumerate(records):
+            payload = attachment_payload(record)
+            if (
+                payload is not None
+                and payload.get("type") in LEDGER_ATTACHMENT_TYPES
+                and position not in excluded_positions
+                and isinstance(record.get("uuid"), str)
+                and record.get("uuid")
+            ):
+                ledger_positions.add(position)
+                dropped_parent[record["uuid"]] = record.get("parentUuid")
+
+    def resolve_parent(parent):
+        seen = set()
+        while isinstance(parent, str) and parent in dropped_parent and parent not in seen:
+            seen.add(parent)
+            parent = dropped_parent[parent]
+        return parent
+
+    identities_before = [
+        (record.get("uuid"), resolve_parent(record.get("parentUuid")), record.get("timestamp"), record.get("type"))
+        for position, record in enumerate(records)
+        if position not in ledger_positions
+    ]
     human_before = [human_text(record) for record in records]
     non_context_chars = sum(
         len(json.dumps(record.get("message"))) if isinstance(record.get("message"), dict) else 0
@@ -1762,7 +1829,9 @@ def compact(
     report["non_context_chars_excluded"] = non_context_chars
     report["non_context_records_excluded"] = sum(1 for record in records if not is_context_record(record))
     chars_before = sum(
-        all_text(record) for position, record in enumerate(records) if position not in excluded_positions
+        all_text(record) + attachment_chars(record)
+        for position, record in enumerate(records)
+        if position not in excluded_positions
     )
     tokens_before = estimate_tokens(chars_before, chars_per_token)
     report.update(
@@ -1864,6 +1933,8 @@ def compact(
 
     elided = 0
     rewritten_positions: set[int] = set()
+    attachment_keys: list[str] = []
+    attachment_dropped_chars = 0
     pointers: list[dict] = []
     relocated_human: list[dict] = []
     folded_prose = 0
@@ -1875,6 +1946,16 @@ def compact(
             for position, (line_number, record) in enumerate(rows):
                 if position in excluded_positions:
                     continue
+                if position in ledger_positions:
+                    # Archived and committed BEFORE the record is left out, the
+                    # same rule as every elided block.
+                    attachment_key = "r{}-att".format(position)
+                    index.add(attachment_key, json.dumps(record["attachment"]), line_number)
+                    attachment_keys.append(attachment_key)
+                    attachment_dropped_chars += attachment_chars(record)
+                    continue
+                if dropped_parent:
+                    record["parentUuid"] = resolve_parent(record.get("parentUuid"))
                 message = record.get("message")
                 content = message.get("content") if isinstance(message, dict) else None
                 if isinstance(content, str):
@@ -1975,6 +2056,7 @@ def compact(
         relocated_missing = [
             item["key"] for item in relocated_human if index.body(item["key"]) is None
         ]
+        attachment_index_missing = [key for key in attachment_keys if index.body(key) is None]
     except (OSError, sqlite3.Error) as error:
         try:
             out.unlink()
@@ -1992,10 +2074,16 @@ def compact(
         except (OSError, sqlite3.Error):
             pass
 
-    kept_records = [record for position, record in enumerate(records) if position not in excluded_positions]
-    chars_after = sum(all_text(record) for record in kept_records)
+    kept_records = [
+        record
+        for position, record in enumerate(records)
+        if position not in excluded_positions and position not in ledger_positions
+    ]
+    chars_after = sum(all_text(record) + attachment_chars(record) for record in kept_records)
     tokens_after = estimate_tokens(chars_after, chars_per_token)
-    identities_after = identity_snapshot(records)
+    identities_after = identity_snapshot(
+        [record for position, record in enumerate(records) if position not in ledger_positions]
+    )
     human_changed = sum(
         1 for before, record in zip(human_before, records) if before != human_text(record)
     )
@@ -2052,6 +2140,9 @@ def compact(
             "ceiling_met": ceiling_met,
             "ceiling_headroom_tokens": int(ceiling_tokens) - total_reload_tokens,
             "chain_length_after": len(chain_after),
+            "attachment_records_dropped": len(ledger_positions),
+            "attachment_chars_dropped": attachment_dropped_chars,
+            "attachment_index_missing": attachment_index_missing[:10],
             "human_words_changed": human_changed,
             "identity_preserved": identities_before == identities_after,
             "pointer_stubs": elided,
@@ -2095,6 +2186,7 @@ def compact(
     report_path.write_text(json.dumps(report, indent=1) + "\n", encoding="utf-8")
     report["report_path"] = str(report_path)
 
+    expected_chain_after = [uuid for uuid in chain_before if uuid not in dropped_parent]
     reason = None
     if not report["identity_preserved"]:
         reason = "identity-not-preserved"
@@ -2106,8 +2198,14 @@ def compact(
             out.unlink()
         except OSError:
             pass
-    elif len(chain_after) != len(chain_before) or chain_after != chain_before:
+    elif chain_after != expected_chain_after:
         reason = "chain-changed"
+    elif attachment_index_missing:
+        reason = "attachment-index-missing"
+        try:
+            out.unlink()
+        except OSError:
+            pass
     elif pointer_mismatches:
         # A pointer that names the wrong line is worse than no compaction: the
         # agent would be sent to text that is not its own.  Nothing ships.
