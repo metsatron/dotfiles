@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+"""claude-compact-index: read back what offline compaction elided.
+
+A compacted transcript holds pointers such as "[elided 12,000 chars at line 5,310
+of source.jsonl ...]".  The text is not gone: it sits in the compaction archive,
+indexed.  This tool reads that archive (read-only) and prints it.
+
+  claude-compact-index --seat SEAT latest
+  claude-compact-index --seat SEAT find "words in the lost output"
+  claude-compact-index --seat SEAT show --line 5310
+  claude-compact-index --seat SEAT show --key r5309-0
+  claude-compact-index --seat SEAT show --group GID
+
+--seat uses the newest archive under $DOTCORTEX_COMPACTION_STATE (default
+~/.local/state/dotcortex/compaction/SEAT/<stamp>/archive); --stamp picks another.
+--archive DIR names an archive directly.
+
+Exit codes: 0 found, 1 not found, 2 usage or unreadable archive, 3 an archived
+block no longer matches its recorded sha256 (nothing is printed for it).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+DATABASE = "elided.sqlite3"
+
+
+def state_root() -> Path:
+    override = os.environ.get("DOTCORTEX_COMPACTION_STATE")
+    return Path(override) if override else Path.home() / ".local/state/dotcortex/compaction"
+
+
+def fail(code: int, message: str) -> "None":
+    print("claude-compact-index: " + message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def database_dir(base: Path) -> "Path | None":
+    """The directory that holds elided.sqlite3: the archive itself, its index/
+    subdirectory (what the engine writes), or an archive/ below a stamp."""
+    for candidate in (base, base / "index", base / "archive", base / "archive" / "index"):
+        if (candidate / DATABASE).is_file():
+            return candidate
+    return None
+
+
+def archive_dir(args: argparse.Namespace) -> Path:
+    if args.archive:
+        found = database_dir(Path(args.archive))
+        where = Path(args.archive)
+    elif args.seat:
+        seat_dir = state_root() / args.seat
+        where = seat_dir
+        if args.stamp:
+            found = database_dir(seat_dir / args.stamp)
+            where = seat_dir / args.stamp
+        else:
+            stamps = sorted(p for p in seat_dir.iterdir()) if seat_dir.is_dir() else []
+            usable = [database_dir(p) for p in stamps if database_dir(p) is not None]
+            found = usable[-1] if usable else None
+    else:
+        fail(2, "give --seat SEAT or --archive DIR")
+    if found is None:
+        fail(2, "no compaction archive with {} under {}".format(DATABASE, where))
+    return found
+
+
+def open_readonly(directory: Path) -> sqlite3.Connection:
+    uri = "file:{}?mode=ro".format(directory / DATABASE)
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.execute("SELECT 1 FROM elided LIMIT 1")
+    except sqlite3.Error as error:
+        fail(2, "cannot read archive {}: {}".format(directory, error))
+    return connection
+
+
+def has_table(connection: sqlite3.Connection, name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def keys_for_line(connection: sqlite3.Connection, line: int) -> list[str]:
+    keys: list[str] = []
+    if has_table(connection, "elided_lines"):
+        keys = [
+            row[0]
+            for row in connection.execute(
+                "SELECT key FROM elided_lines WHERE line = ? ORDER BY key", (line,)
+            )
+        ]
+    if not keys and has_table(connection, "pointer_group_members"):
+        keys = [
+            row[0]
+            for row in connection.execute(
+                "SELECT key FROM pointer_group_members WHERE line = ? ORDER BY key", (line,)
+            )
+        ]
+    if not keys:
+        # Archives made before lines were recorded: the key is r<position>-<block>
+        # and position is the 0-based record, which is the line only when the
+        # source had no blank or skipped lines.  Say so rather than guess silently.
+        prefix = "r{}-".format(line - 1)
+        keys = [
+            row[0]
+            for row in connection.execute(
+                "SELECT key FROM elided WHERE key LIKE ? ORDER BY key", (prefix + "%",)
+            )
+        ]
+        if keys:
+            print(
+                "claude-compact-index: archive has no line table; matched by record position",
+                file=sys.stderr,
+            )
+    return keys
+
+
+def body_of(connection: sqlite3.Connection, key: str) -> str:
+    row = connection.execute(
+        "SELECT body, sha256 FROM elided WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        fail(1, "no archived block with key {}".format(key))
+    body, digest = row
+    if hashlib.sha256(body.encode("utf-8")).hexdigest() != digest:
+        fail(3, "archived block {} does not match its recorded sha256".format(key))
+    return body
+
+
+def command_find(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
+    lines = has_table(connection, "elided_lines")
+    sql = (
+        "SELECT key, chars, snippet(elided, 3, '[', ']', '...', 14) FROM elided "
+        "WHERE elided MATCH ? ORDER BY rank LIMIT ?"
+    )
+    query = args.query if args.raw else " ".join(
+        '"{}"'.format(word.replace('"', '""')) for word in args.query.split()
+    )
+    try:
+        rows = connection.execute(sql, (query, args.limit)).fetchall()
+    except sqlite3.OperationalError as error:
+        fail(2, "bad search expression ({}); quote words that contain punctuation".format(error))
+    if not rows:
+        return 1
+    for key, chars, snippet in rows:
+        line = ""
+        if lines:
+            found = connection.execute(
+                "SELECT line FROM elided_lines WHERE key = ?", (key,)
+            ).fetchone()
+            line = "" if found is None else str(found[0])
+        print("{}\tline={}\tchars={}\t{}".format(key, line or "?", chars, " ".join(snippet.split())))
+    return 0
+
+
+def command_show(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
+    chosen = [value for value in (args.key, args.line, args.group) if value is not None]
+    if len(chosen) != 1:
+        fail(2, "show needs exactly one of --key, --line, --group")
+    if args.group is not None:
+        if not has_table(connection, "pointer_groups"):
+            fail(1, "archive has no groups")
+        group = connection.execute(
+            "SELECT label, project, summary, chars, blocks FROM pointer_groups WHERE gid = ?",
+            (args.group,),
+        ).fetchone()
+        if group is None:
+            fail(1, "no group {}".format(args.group))
+        print("group {}: {} | {} | {} chars in {} blocks".format(args.group, group[0], group[1], group[3], group[4]))
+        print(group[2])
+        for key, line, chars in connection.execute(
+            "SELECT key, line, chars FROM pointer_group_members WHERE gid = ? ORDER BY line",
+            (args.group,),
+        ):
+            print("{}\tline={}\tchars={}".format(key, line, chars))
+        return 0
+    if args.key is not None:
+        keys = [args.key]
+    else:
+        keys = keys_for_line(connection, args.line)
+        if not keys:
+            fail(1, "nothing archived for line {}".format(args.line))
+        if args.block is not None:
+            keys = [key for key in keys if key.endswith("-{}".format(args.block))]
+            if not keys:
+                fail(1, "line {} has no block {}".format(args.line, args.block))
+        elif len(keys) > 1:
+            print(
+                "claude-compact-index: line {} holds {} blocks ({}); pick one with --block".format(
+                    args.line, len(keys), ", ".join(keys)
+                ),
+                file=sys.stderr,
+            )
+            return 1
+    sys.stdout.write(body_of(connection, keys[0]))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description="Read back text that offline compaction elided.")
+    root.add_argument("--seat")
+    root.add_argument("--stamp")
+    root.add_argument("--archive")
+    sub = root.add_subparsers(dest="command", required=True)
+    sub.add_parser("latest", help="print the archive directory in use")
+    find = sub.add_parser("find", help="full-text search the archived blocks")
+    find.add_argument("query")
+    find.add_argument("--limit", type=int, default=10)
+    find.add_argument(
+        "--raw", action="store_true", help="pass the query to FTS5 unquoted (AND, OR, NEAR, column filters)"
+    )
+    show = sub.add_parser("show", help="print one archived block, or a group's members")
+    show.add_argument("--key")
+    show.add_argument("--line", type=int)
+    show.add_argument("--block", type=int)
+    show.add_argument("--group")
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    directory = archive_dir(args)
+    if args.command == "latest":
+        print(directory)
+        return 0
+    connection = open_readonly(directory)
+    try:
+        return command_find(connection, args) if args.command == "find" else command_show(connection, args)
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

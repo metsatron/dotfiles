@@ -519,6 +519,13 @@ GROUP_SCHEMA = (
     "gid TEXT PRIMARY KEY, label TEXT, project TEXT, summary TEXT, "
     "chars INTEGER, blocks INTEGER, first_line INTEGER, last_line INTEGER)"
 )
+# The line of the source transcript each archived block came from.  A pointer
+# names that line, so the reader has to find a block BY LINE; the record position
+# in a key is not the line when the source has blank or skipped lines.
+LINE_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS elided_lines("
+    "key TEXT PRIMARY KEY, line INTEGER)"
+)
 MEMBER_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS pointer_group_members("
     "gid TEXT, key TEXT, line INTEGER, uuid TEXT, chars INTEGER, "
@@ -546,12 +553,13 @@ class ElisionIndex:
         self.connection.execute(INDEX_SCHEMA)
         self.connection.execute(GROUP_SCHEMA)
         self.connection.execute(MEMBER_SCHEMA)
+        self.connection.execute(LINE_SCHEMA)
         self.connection.commit()
         fd = os.open(self.index_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         self.journal = os.fdopen(fd, "a", encoding="utf-8")
         self.count = 0
 
-    def add(self, key: str, body: str) -> str:
+    def add(self, key: str, body: str, line: int | None = None) -> str:
         """Archive and index one block; returns its sha256."""
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         self.journal.write(json.dumps({"key": key, "sha256": digest, "chars": len(body)}) + "\n")
@@ -561,6 +569,10 @@ class ElisionIndex:
             "INSERT INTO elided(key, sha256, chars, body) VALUES (?, ?, ?, ?)",
             (key, digest, len(body), body),
         )
+        if line is not None:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO elided_lines(key, line) VALUES (?, ?)", (key, int(line))
+            )
         self.connection.commit()
         self.count += 1
         return digest
@@ -1869,7 +1881,7 @@ def compact(
                     candidate = chosen_keys.get("r{}-s".format(position))
                     if candidate is not None:
                         text = content
-                        index.add(candidate.key, text)
+                        index.add(candidate.key, text, line_number)
                         if on_indexed is not None:
                             on_indexed(candidate.key, text)
                         planned = group_plan.get(candidate.key)
@@ -1910,7 +1922,7 @@ def compact(
                         text = block_text(part)
                         # 1. durable archive + FTS row, COMMITTED;
                         # 2. only then may the record lose the text.
-                        index.add(candidate.key, text)
+                        index.add(candidate.key, text, line_number)
                         if on_indexed is not None:
                             on_indexed(candidate.key, text)
                         planned = group_plan.get(candidate.key)

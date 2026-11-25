@@ -7813,6 +7813,13 @@ GROUP_SCHEMA = (
     "gid TEXT PRIMARY KEY, label TEXT, project TEXT, summary TEXT, "
     "chars INTEGER, blocks INTEGER, first_line INTEGER, last_line INTEGER)"
 )
+# The line of the source transcript each archived block came from.  A pointer
+# names that line, so the reader has to find a block BY LINE; the record position
+# in a key is not the line when the source has blank or skipped lines.
+LINE_SCHEMA = (
+    "CREATE TABLE IF NOT EXISTS elided_lines("
+    "key TEXT PRIMARY KEY, line INTEGER)"
+)
 MEMBER_SCHEMA = (
     "CREATE TABLE IF NOT EXISTS pointer_group_members("
     "gid TEXT, key TEXT, line INTEGER, uuid TEXT, chars INTEGER, "
@@ -7840,12 +7847,13 @@ class ElisionIndex:
         self.connection.execute(INDEX_SCHEMA)
         self.connection.execute(GROUP_SCHEMA)
         self.connection.execute(MEMBER_SCHEMA)
+        self.connection.execute(LINE_SCHEMA)
         self.connection.commit()
         fd = os.open(self.index_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         self.journal = os.fdopen(fd, "a", encoding="utf-8")
         self.count = 0
 
-    def add(self, key: str, body: str) -> str:
+    def add(self, key: str, body: str, line: int | None = None) -> str:
         """Archive and index one block; returns its sha256."""
         digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         self.journal.write(json.dumps({"key": key, "sha256": digest, "chars": len(body)}) + "\n")
@@ -7855,6 +7863,10 @@ class ElisionIndex:
             "INSERT INTO elided(key, sha256, chars, body) VALUES (?, ?, ?, ?)",
             (key, digest, len(body), body),
         )
+        if line is not None:
+            self.connection.execute(
+                "INSERT OR REPLACE INTO elided_lines(key, line) VALUES (?, ?)", (key, int(line))
+            )
         self.connection.commit()
         self.count += 1
         return digest
@@ -9163,7 +9175,7 @@ def compact(
                     candidate = chosen_keys.get("r{}-s".format(position))
                     if candidate is not None:
                         text = content
-                        index.add(candidate.key, text)
+                        index.add(candidate.key, text, line_number)
                         if on_indexed is not None:
                             on_indexed(candidate.key, text)
                         planned = group_plan.get(candidate.key)
@@ -9204,7 +9216,7 @@ def compact(
                         text = block_text(part)
                         # 1. durable archive + FTS row, COMMITTED;
                         # 2. only then may the record lose the text.
-                        index.add(candidate.key, text)
+                        index.add(candidate.key, text, line_number)
                         if on_indexed is not None:
                             on_indexed(candidate.key, text)
                         planned = group_plan.get(candidate.key)
@@ -10336,11 +10348,11 @@ class OfflineCompactModeTests(unittest.TestCase):
             real_add = self.module.ElisionIndex.add
             calls = {"n": 0}
 
-            def flaky(index, key, body):
+            def flaky(index, key, body, line=None):
                 calls["n"] += 1
                 if calls["n"] == 2:
                     raise sqlite3.OperationalError("disk I/O error")
-                return real_add(index, key, body)
+                return real_add(index, key, body, line)
 
             self.module.ElisionIndex.add = flaky
             try:
@@ -11138,4 +11150,414 @@ class RepairTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+#+END_SRC
+
+* Compaction index reader tests
+
+A pointer stub names a line of the transcript and promises that the full text can be read back or searched. These tests hold that promise: the reader finds an elided block by search, by line (including a line that is not its record position) and by group, returns exactly the bytes that were elided, and never writes to the archive.
+
+#+BEGIN_SRC python :tangle all/.local/share/dotcortex/tests/test-compact-index.py :comments no
+#!/usr/bin/env python3
+"""The reader behind a compaction pointer: find, show by line, key and group.
+
+Run: python3 test-compact-index.py
+"""
+from __future__ import annotations
+
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import unittest
+import uuid
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[5]
+MODULE = ROOT / "all/.local/lib/dotcortex/offline_compact.py"
+CLI = ROOT / "all/.local/bin/claude-compact-index"
+
+
+def load():
+    loader = importlib.machinery.SourceFileLoader("offline_compact_idx", str(MODULE))
+    spec = importlib.util.spec_from_loader("offline_compact_idx", loader)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["offline_compact_idx"] = module
+    loader.exec_module(module)
+    return module
+
+
+oc = load()
+NEEDLE = "zebrafish-needle"
+BIG = NEEDLE + " " + ("tool output line\n" * 400)
+
+
+def record(kind, role, content, parent):
+    return {
+        "type": kind,
+        "uuid": str(uuid.uuid4()),
+        "parentUuid": parent,
+        "message": {"role": role, "content": content},
+    }
+
+
+def chain(blank_first=False):
+    rows, parent = [], None
+    for index in range(10):
+        role = "user" if index % 2 == 0 else "assistant"
+        if index == 2:
+            content = [{"type": "tool_result", "tool_use_id": "t1", "content": BIG}]
+        else:
+            content = [{"type": "text", "text": "turn %d " % index + "w" * 500}]
+        rows.append(record(role, role, content, parent))
+        parent = rows[-1]["uuid"]
+    return rows
+
+
+class ReaderTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+
+    def compact(self, rows, blank_first=False, group_pointers=False):
+        source = self.dir / "source.jsonl"
+        text = "".join(json.dumps(row) + "\n" for row in rows)
+        source.write_text(("\n" if blank_first else "") + text, encoding="utf-8")
+        out = self.dir / "compacted.jsonl"
+        archive = self.dir / "archive"
+        result = oc.compact(
+            source, out, archive,
+            ceiling_tokens=3000, harness={"harness_tokens": 1000},
+            keep_recent_records=2, stub_over_chars=300, fold_prose=True,
+            group_pointers=group_pointers, pointer_source=str(source),
+        )
+        self.assertTrue(result.ok, result.reason)
+        self.assertGreaterEqual(result.report["elided_blocks"], 1)
+        return source, archive
+
+    def run_cli(self, *args):
+        env = dict(os.environ, DOTCORTEX_COMPACTION_STATE=str(self.dir / "state"))
+        return subprocess.run(
+            [sys.executable, "-I", str(CLI), *args], capture_output=True, text=True, env=env
+        )
+
+    def test_find_returns_the_block_by_a_word_it_contains(self):
+        _, archive = self.compact(chain())
+        done = self.run_cli("--archive", str(archive), "find", NEEDLE)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("r2-0", done.stdout)
+
+    def test_show_by_line_returns_exactly_the_elided_text(self):
+        _, archive = self.compact(chain())
+        done = self.run_cli("--archive", str(archive), "show", "--line", "3")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, BIG)
+
+    def test_show_by_line_survives_a_blank_line_before_the_record(self):
+        _, archive = self.compact(chain(), blank_first=True)
+        done = self.run_cli("--archive", str(archive), "show", "--line", "4")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, BIG)
+
+    def test_show_by_key_and_unknown_key(self):
+        _, archive = self.compact(chain())
+        good = self.run_cli("--archive", str(archive), "show", "--key", "r2-0")
+        self.assertEqual(good.stdout, BIG)
+        missing = self.run_cli("--archive", str(archive), "show", "--key", "r99-0")
+        self.assertEqual(missing.returncode, 1)
+        self.assertEqual(missing.stdout, "")
+
+    def test_a_tampered_archive_is_reported_not_returned(self):
+        _, archive = self.compact(chain())
+        connection = sqlite3.connect(str(archive / "index" / "elided.sqlite3"))
+        connection.execute("UPDATE elided SET body = 'forged' WHERE key = 'r2-0'")
+        connection.commit()
+        connection.close()
+        done = self.run_cli("--archive", str(archive), "show", "--key", "r2-0")
+        self.assertEqual(done.returncode, 3)
+        self.assertNotIn("forged", done.stdout)
+
+    def test_seat_resolves_the_newest_archive(self):
+        _, archive = self.compact(chain())
+        stamp = self.dir / "state" / "auryn" / "20261126T000000"
+        stamp.parent.mkdir(parents=True)
+        os.symlink(archive.parent, stamp)
+        done = self.run_cli("--seat", "auryn", "show", "--line", "3")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(done.stdout, BIG)
+
+    def test_the_reader_never_writes_to_the_archive(self):
+        _, archive = self.compact(chain())
+        before = sorted((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in archive.iterdir())
+        self.run_cli("--archive", str(archive), "find", NEEDLE)
+        self.run_cli("--archive", str(archive), "show", "--line", "3")
+        after = sorted((p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in archive.iterdir())
+        self.assertEqual(before, after)
+
+    def test_a_hyphenated_word_is_a_word_not_a_column_filter(self):
+        _, archive = self.compact(chain())
+        done = self.run_cli("--archive", str(archive), "find", "zebrafish-needle")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("r2-0", done.stdout)
+
+    def test_a_bad_raw_search_expression_is_a_usage_error_not_a_crash(self):
+        _, archive = self.compact(chain())
+        done = self.run_cli("--archive", str(archive), "find", "--raw", 'unterminated "quote')
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("quote", done.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
+#+END_SRC
+
+* Compaction index reader
+
+~claude-compact-index~ is what a pointer stub's "query the FTS index" means. It opens one compaction archive read-only, finds an elided block by search, line, key or group, and returns the text that was elided, checked against the sha256 recorded when it was archived. It never writes, never touches the live transcript and never starts a seat.
+
+#+BEGIN_SRC python :tangle all/.local/bin/claude-compact-index :shebang "#!/usr/bin/env python3" :comments no :tangle-mode (identity #o755)
+"""claude-compact-index: read back what offline compaction elided.
+
+A compacted transcript holds pointers such as "[elided 12,000 chars at line 5,310
+of source.jsonl ...]".  The text is not gone: it sits in the compaction archive,
+indexed.  This tool reads that archive (read-only) and prints it.
+
+  claude-compact-index --seat SEAT latest
+  claude-compact-index --seat SEAT find "words in the lost output"
+  claude-compact-index --seat SEAT show --line 5310
+  claude-compact-index --seat SEAT show --key r5309-0
+  claude-compact-index --seat SEAT show --group GID
+
+--seat uses the newest archive under $DOTCORTEX_COMPACTION_STATE (default
+~/.local/state/dotcortex/compaction/SEAT/<stamp>/archive); --stamp picks another.
+--archive DIR names an archive directly.
+
+Exit codes: 0 found, 1 not found, 2 usage or unreadable archive, 3 an archived
+block no longer matches its recorded sha256 (nothing is printed for it).
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import sqlite3
+import sys
+from pathlib import Path
+
+DATABASE = "elided.sqlite3"
+
+
+def state_root() -> Path:
+    override = os.environ.get("DOTCORTEX_COMPACTION_STATE")
+    return Path(override) if override else Path.home() / ".local/state/dotcortex/compaction"
+
+
+def fail(code: int, message: str) -> "None":
+    print("claude-compact-index: " + message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def database_dir(base: Path) -> "Path | None":
+    """The directory that holds elided.sqlite3: the archive itself, its index/
+    subdirectory (what the engine writes), or an archive/ below a stamp."""
+    for candidate in (base, base / "index", base / "archive", base / "archive" / "index"):
+        if (candidate / DATABASE).is_file():
+            return candidate
+    return None
+
+
+def archive_dir(args: argparse.Namespace) -> Path:
+    if args.archive:
+        found = database_dir(Path(args.archive))
+        where = Path(args.archive)
+    elif args.seat:
+        seat_dir = state_root() / args.seat
+        where = seat_dir
+        if args.stamp:
+            found = database_dir(seat_dir / args.stamp)
+            where = seat_dir / args.stamp
+        else:
+            stamps = sorted(p for p in seat_dir.iterdir()) if seat_dir.is_dir() else []
+            usable = [database_dir(p) for p in stamps if database_dir(p) is not None]
+            found = usable[-1] if usable else None
+    else:
+        fail(2, "give --seat SEAT or --archive DIR")
+    if found is None:
+        fail(2, "no compaction archive with {} under {}".format(DATABASE, where))
+    return found
+
+
+def open_readonly(directory: Path) -> sqlite3.Connection:
+    uri = "file:{}?mode=ro".format(directory / DATABASE)
+    try:
+        connection = sqlite3.connect(uri, uri=True)
+        connection.execute("SELECT 1 FROM elided LIMIT 1")
+    except sqlite3.Error as error:
+        fail(2, "cannot read archive {}: {}".format(directory, error))
+    return connection
+
+
+def has_table(connection: sqlite3.Connection, name: str) -> bool:
+    row = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE name = ?", (name,)
+    ).fetchone()
+    return row is not None
+
+
+def keys_for_line(connection: sqlite3.Connection, line: int) -> list[str]:
+    keys: list[str] = []
+    if has_table(connection, "elided_lines"):
+        keys = [
+            row[0]
+            for row in connection.execute(
+                "SELECT key FROM elided_lines WHERE line = ? ORDER BY key", (line,)
+            )
+        ]
+    if not keys and has_table(connection, "pointer_group_members"):
+        keys = [
+            row[0]
+            for row in connection.execute(
+                "SELECT key FROM pointer_group_members WHERE line = ? ORDER BY key", (line,)
+            )
+        ]
+    if not keys:
+        # Archives made before lines were recorded: the key is r<position>-<block>
+        # and position is the 0-based record, which is the line only when the
+        # source had no blank or skipped lines.  Say so rather than guess silently.
+        prefix = "r{}-".format(line - 1)
+        keys = [
+            row[0]
+            for row in connection.execute(
+                "SELECT key FROM elided WHERE key LIKE ? ORDER BY key", (prefix + "%",)
+            )
+        ]
+        if keys:
+            print(
+                "claude-compact-index: archive has no line table; matched by record position",
+                file=sys.stderr,
+            )
+    return keys
+
+
+def body_of(connection: sqlite3.Connection, key: str) -> str:
+    row = connection.execute(
+        "SELECT body, sha256 FROM elided WHERE key = ?", (key,)
+    ).fetchone()
+    if row is None:
+        fail(1, "no archived block with key {}".format(key))
+    body, digest = row
+    if hashlib.sha256(body.encode("utf-8")).hexdigest() != digest:
+        fail(3, "archived block {} does not match its recorded sha256".format(key))
+    return body
+
+
+def command_find(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
+    lines = has_table(connection, "elided_lines")
+    sql = (
+        "SELECT key, chars, snippet(elided, 3, '[', ']', '...', 14) FROM elided "
+        "WHERE elided MATCH ? ORDER BY rank LIMIT ?"
+    )
+    query = args.query if args.raw else " ".join(
+        '"{}"'.format(word.replace('"', '""')) for word in args.query.split()
+    )
+    try:
+        rows = connection.execute(sql, (query, args.limit)).fetchall()
+    except sqlite3.OperationalError as error:
+        fail(2, "bad search expression ({}); quote words that contain punctuation".format(error))
+    if not rows:
+        return 1
+    for key, chars, snippet in rows:
+        line = ""
+        if lines:
+            found = connection.execute(
+                "SELECT line FROM elided_lines WHERE key = ?", (key,)
+            ).fetchone()
+            line = "" if found is None else str(found[0])
+        print("{}\tline={}\tchars={}\t{}".format(key, line or "?", chars, " ".join(snippet.split())))
+    return 0
+
+
+def command_show(connection: sqlite3.Connection, args: argparse.Namespace) -> int:
+    chosen = [value for value in (args.key, args.line, args.group) if value is not None]
+    if len(chosen) != 1:
+        fail(2, "show needs exactly one of --key, --line, --group")
+    if args.group is not None:
+        if not has_table(connection, "pointer_groups"):
+            fail(1, "archive has no groups")
+        group = connection.execute(
+            "SELECT label, project, summary, chars, blocks FROM pointer_groups WHERE gid = ?",
+            (args.group,),
+        ).fetchone()
+        if group is None:
+            fail(1, "no group {}".format(args.group))
+        print("group {}: {} | {} | {} chars in {} blocks".format(args.group, group[0], group[1], group[3], group[4]))
+        print(group[2])
+        for key, line, chars in connection.execute(
+            "SELECT key, line, chars FROM pointer_group_members WHERE gid = ? ORDER BY line",
+            (args.group,),
+        ):
+            print("{}\tline={}\tchars={}".format(key, line, chars))
+        return 0
+    if args.key is not None:
+        keys = [args.key]
+    else:
+        keys = keys_for_line(connection, args.line)
+        if not keys:
+            fail(1, "nothing archived for line {}".format(args.line))
+        if args.block is not None:
+            keys = [key for key in keys if key.endswith("-{}".format(args.block))]
+            if not keys:
+                fail(1, "line {} has no block {}".format(args.line, args.block))
+        elif len(keys) > 1:
+            print(
+                "claude-compact-index: line {} holds {} blocks ({}); pick one with --block".format(
+                    args.line, len(keys), ", ".join(keys)
+                ),
+                file=sys.stderr,
+            )
+            return 1
+    sys.stdout.write(body_of(connection, keys[0]))
+    return 0
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description="Read back text that offline compaction elided.")
+    root.add_argument("--seat")
+    root.add_argument("--stamp")
+    root.add_argument("--archive")
+    sub = root.add_subparsers(dest="command", required=True)
+    sub.add_parser("latest", help="print the archive directory in use")
+    find = sub.add_parser("find", help="full-text search the archived blocks")
+    find.add_argument("query")
+    find.add_argument("--limit", type=int, default=10)
+    find.add_argument(
+        "--raw", action="store_true", help="pass the query to FTS5 unquoted (AND, OR, NEAR, column filters)"
+    )
+    show = sub.add_parser("show", help="print one archived block, or a group's members")
+    show.add_argument("--key")
+    show.add_argument("--line", type=int)
+    show.add_argument("--block", type=int)
+    show.add_argument("--group")
+    return root
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parser().parse_args(argv)
+    directory = archive_dir(args)
+    if args.command == "latest":
+        print(directory)
+        return 0
+    connection = open_readonly(directory)
+    try:
+        return command_find(connection, args) if args.command == "find" else command_show(connection, args)
+    finally:
+        connection.close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
 #+END_SRC

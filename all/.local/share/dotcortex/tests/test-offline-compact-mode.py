@@ -672,11 +672,11 @@ class OfflineCompactModeTests(unittest.TestCase):
             real_add = self.module.ElisionIndex.add
             calls = {"n": 0}
 
-            def flaky(index, key, body):
+            def flaky(index, key, body, line=None):
                 calls["n"] += 1
                 if calls["n"] == 2:
                     raise sqlite3.OperationalError("disk I/O error")
-                return real_add(index, key, body)
+                return real_add(index, key, body, line)
 
             self.module.ElisionIndex.add = flaky
             try:
