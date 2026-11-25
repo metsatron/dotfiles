@@ -1467,6 +1467,21 @@ class SamePersonsOtherLoginTests(unittest.TestCase):
         self.assertEqual(panels[0]["state"], "missing")
         self.assertEqual(len(calls), 1)
 
+    def test_a_timeout_that_is_not_finite_never_crashes_the_feed(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING}
+        for bad in ("nan", "inf", "-5", "0", [1]):
+            with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+                panels = self.ai_usage.fetch_one_remote(self.entry(timeout=bad, also_ssh=["agent-claude@honey"]), 5.0)
+            self.assertEqual(panels[0]["state"], "missing", bad)
+
+    def test_each_alternate_is_asked_once_however_many_panels_are_missing(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING * 2, "agent-claude@honey": self.PRIMARY_MISSING}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey", "other@honey"]), 5.0)
+        self.assertEqual(calls.count("agent-claude@honey"), 1)
+
     def test_an_ok_panel_is_never_replaced(self):
         calls = []
         outputs = {"honey": self.OTHER_OK, "agent-claude@honey": self.PRIMARY_MISSING}

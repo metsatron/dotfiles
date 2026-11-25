@@ -55,6 +55,7 @@ import argparse
 import base64
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -4413,8 +4414,12 @@ def fetch_one_remote(entry: dict[str, Any], default_timeout: float) -> list[dict
         return [_remote_error(label, f"invalid providers spec: {providers!r}")]
     try:
         timeout = float(entry.get("timeout", max(default_timeout, 25.0)))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         timeout = max(default_timeout, 25.0)
+    # A feed's timeout is a bound, so it has to be a finite, positive, capped number.
+    if not math.isfinite(timeout) or timeout <= 0:
+        timeout = max(default_timeout, 25.0)
+    timeout = min(timeout, 120.0)
 
     # Login shell so ~/.local/bin (and linuxbrew) are on PATH under non-interactive SSH.
     inner = f"ai-usage --providers {providers} --json --no-remote"
@@ -4494,6 +4499,10 @@ def _fill_from_same_persons_other_logins(
     except OSError:
         return panels
     filled: list[dict[str, Any]] = []
+    # One budget for the whole entry: each alternate is asked at most once, however
+    # many panels are missing, and no new ask starts after twice the entry timeout.
+    asked: dict[str, Any] = {}
+    budget_end = time.monotonic() + 2.0 * timeout
     for panel in panels:
         provider = str(panel.get("provider", ""))
         # Only a panel that says it has NO login is filled.  An error or a timeout
@@ -4503,19 +4512,25 @@ def _fill_from_same_persons_other_logins(
             continue
         replacement = None
         for target in targets:
-            ssh_cmd = [
-                "ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
-                "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey",
-                "-o", f"ConnectTimeout={max(1, int(timeout))}", "-o", "ConnectionAttempts=1",
-                "--", str(target), f"python3 - --providers {provider} --json --no-remote",
-            ]
-            try:
-                proc = subprocess.run(
-                    ssh_cmd, input=script, capture_output=True, text=True, timeout=timeout + 5.0
-                )
-                items = json.loads(proc.stdout) if proc.returncode == 0 else []
-            except (subprocess.TimeoutExpired, OSError, ValueError):
-                continue
+            if (provider, target) in asked:
+                items = asked[(provider, target)]
+            else:
+                if time.monotonic() >= budget_end:
+                    break
+                ssh_cmd = [
+                    "ssh", "-o", "BatchMode=yes", "-o", "PasswordAuthentication=no",
+                    "-o", "KbdInteractiveAuthentication=no", "-o", "PreferredAuthentications=publickey",
+                    "-o", f"ConnectTimeout={max(1, int(timeout))}", "-o", "ConnectionAttempts=1",
+                    "--", str(target), f"python3 - --providers {provider} --json --no-remote",
+                ]
+                try:
+                    proc = subprocess.run(
+                        ssh_cmd, input=script, capture_output=True, text=True, timeout=timeout + 5.0
+                    )
+                    items = json.loads(proc.stdout) if proc.returncode == 0 else []
+                except (subprocess.TimeoutExpired, OSError, ValueError):
+                    items = []
+                asked[(provider, target)] = items
             for item in items if isinstance(items, list) else []:
                 # The alternate login must be that user's OWN local login.  A panel
                 # the alternate itself borrowed from a third machine is refused.
@@ -6228,6 +6243,21 @@ class SamePersonsOtherLoginTests(unittest.TestCase):
             panels = self.ai_usage.fetch_one_remote(self.entry(also_ssh=bad), 5.0)
         self.assertEqual(panels[0]["state"], "missing")
         self.assertEqual(len(calls), 1)
+
+    def test_a_timeout_that_is_not_finite_never_crashes_the_feed(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING}
+        for bad in ("nan", "inf", "-5", "0", [1]):
+            with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+                panels = self.ai_usage.fetch_one_remote(self.entry(timeout=bad, also_ssh=["agent-claude@honey"]), 5.0)
+            self.assertEqual(panels[0]["state"], "missing", bad)
+
+    def test_each_alternate_is_asked_once_however_many_panels_are_missing(self):
+        calls = []
+        outputs = {"honey": self.PRIMARY_MISSING * 2, "agent-claude@honey": self.PRIMARY_MISSING}
+        with patch.object(self.ai_usage.subprocess, "run", side_effect=self.fake_run(outputs, calls)):
+            self.ai_usage.fetch_one_remote(self.entry(also_ssh=["agent-claude@honey", "other@honey"]), 5.0)
+        self.assertEqual(calls.count("agent-claude@honey"), 1)
 
     def test_an_ok_panel_is_never_replaced(self):
         calls = []
