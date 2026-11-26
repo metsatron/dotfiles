@@ -142,6 +142,15 @@ TRANSCRIPT_INTERNAL_TYPES = frozenset(
         # session; it appeared on the first turn after the 2026-11-06 revive
         # and latched the gate again on its own.
         "session-owner",
+        # 2026-11-23 (Claude Code, first seen right after a compaction on every
+        # warm seat): two more session-plumbing rows. data-flow-records carries
+        # type, v, sessionId, snapshot and records (event ids and tool names);
+        # derived-from carries type, v, sessionId and a list of session ids.
+        # Neither holds conversation text.  Left unknown they latched the gate
+        # for 3.8 days: no MailCortex wake and no offline compaction ran on any
+        # Claude seat (Fable, Telegram 12569; Admiral 12576).
+        "data-flow-records",
+        "derived-from",
     }
 )
 COMPACTION_FAILURE_MARKER = "not enough messages"
@@ -2625,6 +2634,13 @@ class Supervisor:
         self.transcript_quiescence_deadline: float | None = None
         self.transcript_gate_blocked = False
         self.transcript_gate_blocked_at: float | None = None
+        # Record types that latched the gate and are still pending, types that
+        # already had one full latch and expired (tolerated for this process,
+        # never again able to latch it), and every type ever seen unknown (for
+        # the one-time alert).
+        self.transcript_gate_pending_types: set[str] = set()
+        self.transcript_gate_tolerated_types: set[str] = set()
+        self.transcript_unknown_types_alerted: set[str] = set()
         self.last_transcript_classification: str | None = None
         self.inotify: Inotify | None = None
         self.status = "starting"
@@ -3247,6 +3263,30 @@ class Supervisor:
         )
         self._write_state()
 
+    def transcript_gate_active(self) -> bool:
+        """True while an unknown transcript record still vetoes a wake or compaction.
+
+        The one reader of the latch. Every path asks here (idle decider, offline
+        compaction, MailCortex admission), so the TRANSCRIPT_GATE_MAX_SECONDS release
+        holds on all of them, not only on the idle-decider branch.
+        """
+        if not self.transcript_gate_blocked:
+            return False
+        blocked_at = self.transcript_gate_blocked_at or now()
+        if now() - blocked_at < TRANSCRIPT_GATE_MAX_SECONDS:
+            return True
+        types = sorted(self.transcript_gate_pending_types)
+        self.transcript_gate_blocked = False
+        self.transcript_gate_blocked_at = None
+        self.transcript_gate_tolerated_types.update(types)
+        self.transcript_gate_pending_types.clear()
+        self._guard_log(
+            "transcript-gate-expired",
+            blocked_seconds=int(now() - blocked_at),
+            record_types=",".join(types)[:200],
+        )
+        return False
+
     def _record_transcript_observation(
         self,
         classification: str,
@@ -3267,9 +3307,26 @@ class Supervisor:
             fields["record_type"] = record_type
         if isinstance(record_subtype, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", record_subtype):
             fields["record_subtype"] = record_subtype
+        known_type = "record_type" in fields
+        if gate_blocked and known_type and record_type in self.transcript_gate_tolerated_types:
+            # This type already latched the gate for a full TRANSCRIPT_GATE_MAX_SECONDS
+            # and expired: caution is bounded, so it cannot latch again in this process.
+            gate_blocked = False
+            fields["action"] = "tolerated-after-expiry"
         if gate_blocked:
+            if known_type and record_type not in self.transcript_unknown_types_alerted:
+                self.transcript_unknown_types_alerted.add(record_type)
+                # Loud, once per type: a new Claude Code record type must not
+                # cost another silent week (2026-11-23 to 27).
+                self._guard_log("transcript-record-type-unknown-alert", record_type=record_type)
+            if not self.transcript_gate_blocked or not known_type:
+                # The clock runs from the FIRST unknown row. An unparseable row
+                # (no usable type) cannot be tolerated later, so it keeps the
+                # conservative refresh.
+                self.transcript_gate_blocked_at = now()
             self.transcript_gate_blocked = True
-            self.transcript_gate_blocked_at = now()
+            if known_type:
+                self.transcript_gate_pending_types.add(record_type)
             self.last_state_transition = "transcript-uncertain"
             self._guard_log("transcript-record-unknown", **fields)
         else:
@@ -4106,19 +4163,10 @@ class Supervisor:
                 and self.transcript_activity_at > self.last_normal_stop
             ):
                 return "transcript-activity"
-            if self.transcript_gate_blocked:
-                blocked_at = self.transcript_gate_blocked_at or now()
-                if now() - blocked_at >= TRANSCRIPT_GATE_MAX_SECONDS:
-                    # Bounded caution, not a permanent veto — see the
-                    # TRANSCRIPT_GATE_MAX_SECONDS rationale.
-                    self.transcript_gate_blocked = False
-                    self.transcript_gate_blocked_at = None
-                    self._guard_log(
-                        "transcript-gate-expired",
-                        blocked_seconds=int(now() - blocked_at),
-                    )
-                else:
-                    return "transcript-uncertain"
+            # Bounded caution, not a permanent veto — see the
+            # TRANSCRIPT_GATE_MAX_SECONDS rationale; transcript_gate_active() expires it.
+            if self.transcript_gate_active():
+                return "transcript-uncertain"
             if self.transcript_quiescence_deadline is not None:
                 return "transcript-not-quiescent"
         elif purpose == "recovery":
@@ -4379,7 +4427,7 @@ class Supervisor:
             return "refused", "session-not-running"
         if self.transcript_quiescence_deadline is not None:
             return "refused", "transcript-not-quiescent"
-        if self.transcript_gate_blocked:
+        if self.transcript_gate_active():
             return "refused", "transcript-uncertain"
         # MIN_TOKENS is a FLOOR -- "do not bother on a tiny session" -- and not
         # the trigger.  R-0032 makes the cold cache boundary the trigger, below.

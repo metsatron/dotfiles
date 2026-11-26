@@ -33,6 +33,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import types
 import termios
 import threading
 import time
@@ -2018,6 +2019,8 @@ class ClaudeWarmTests(unittest.TestCase):
             "cost-state",
             "tools-used",
             "session-owner",
+            "data-flow-records",
+            "derived-from",
         ):
             entry = {"type": record_type, "sessionId": "fixture-session"}
             self.assertEqual(
@@ -2039,6 +2042,78 @@ class ClaudeWarmTests(unittest.TestCase):
         self.assertEqual(
             module.transcript_entry_classification({"type": "user"}), "user-turn"
         )
+
+    def gate_fixture(self):
+        """A bare Supervisor with only what the gate code touches, and a fake clock."""
+        module = self.module
+        log = []
+        clock = [1000.0]
+        obj = types.SimpleNamespace(
+            transcript_gate_blocked=False, transcript_gate_blocked_at=None,
+            transcript_gate_pending_types=set(), transcript_gate_tolerated_types=set(),
+            transcript_unknown_types_alerted=set(), last_transcript_classification=None,
+            last_state_transition=None,
+            _guard_log=lambda event, **fields: log.append((event, fields)),
+            _write_state=lambda: None,
+        )
+        for name in ("transcript_gate_active", "_record_transcript_observation"):
+            setattr(obj, name, types.MethodType(getattr(module.Supervisor, name), obj))
+        patcher = mock.patch.object(module, "now", lambda: clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return obj, log, clock
+
+    def latch(self, obj, record_type="brand-new-record"):
+        obj._record_transcript_observation("unknown", gate_blocked=True, record_type=record_type)
+
+    def test_an_unknown_record_type_raises_one_loud_alert_per_type(self):
+        obj, log, _ = self.gate_fixture()
+        self.latch(obj)
+        self.latch(obj)
+        self.assertEqual([e for e, _ in log].count("transcript-record-type-unknown-alert"), 1)
+
+    def test_the_latch_expires_on_the_maximum_even_while_new_rows_keep_arriving(self):
+        obj, log, clock = self.gate_fixture()
+        max_seconds = self.module.TRANSCRIPT_GATE_MAX_SECONDS
+        self.latch(obj)
+        for _ in range(5):  # the same unknown type keeps arriving, as 3,290 rows did
+            clock[0] += max_seconds / 6
+            self.latch(obj)
+        self.assertTrue(obj.transcript_gate_active())
+        clock[0] += max_seconds / 6 + 1
+        self.assertFalse(obj.transcript_gate_active())
+        self.assertIn("transcript-gate-expired", [e for e, _ in log])
+
+    def test_a_type_that_has_expired_cannot_latch_the_gate_again(self):
+        obj, log, clock = self.gate_fixture()
+        self.latch(obj)
+        clock[0] += self.module.TRANSCRIPT_GATE_MAX_SECONDS + 1
+        self.assertFalse(obj.transcript_gate_active())
+        self.latch(obj)
+        self.assertFalse(obj.transcript_gate_active())
+        self.assertIn("tolerated-after-expiry", [f.get("action") for _, f in log])
+
+    def test_a_different_new_type_still_latches_after_another_expired(self):
+        obj, _, clock = self.gate_fixture()
+        self.latch(obj, "first-new-type")
+        clock[0] += self.module.TRANSCRIPT_GATE_MAX_SECONDS + 1
+        self.assertFalse(obj.transcript_gate_active())
+        self.latch(obj, "second-new-type")
+        self.assertTrue(obj.transcript_gate_active())
+
+    def test_an_unparseable_row_keeps_the_conservative_refresh(self):
+        obj, _, clock = self.gate_fixture()
+        max_seconds = self.module.TRANSCRIPT_GATE_MAX_SECONDS
+        obj._record_transcript_observation("unknown", gate_blocked=True)
+        clock[0] += max_seconds - 1
+        obj._record_transcript_observation("unknown", gate_blocked=True)
+        clock[0] += max_seconds - 1
+        self.assertTrue(obj.transcript_gate_active())
+
+    def test_offline_compaction_refusal_uses_the_same_bounded_reader(self):
+        source = pathlib.Path(WARM).read_text()
+        self.assertNotIn("if self.transcript_gate_blocked:", source)
+        self.assertIn('if self.transcript_gate_active():\n            return "refused", "transcript-uncertain"', source)
 
     def test_production_defaults_and_resolver_rejects_wrapper(self):
         loader = importlib.machinery.SourceFileLoader("claude_warm_defaults", str(WARM))
