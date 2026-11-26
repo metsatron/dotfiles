@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Place and verify the Honey voice engine's code (user level, idempotent).
+set -euo pipefail
+umask 022
+
+LANE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+ENGINE_ROOT="${HONEY_VOICE_ENGINE_ROOT:-$HOME/.local/share/honey-voice}"
+PVOX_CLIENT="${HONEY_VOICE_PVOX_CLIENT:-$HOME/.local/share/pvox-clone/client/bin/pvox}"
+DRY=0
+VERB=check
+for arg in "$@"; do
+    case "$arg" in
+        --dry-run) DRY=1 ;;
+        install|check) VERB="$arg" ;;
+        -h|--help) printf '%s\n' 'honey-voice-engine-install [--dry-run] [check|install]'; exit 0 ;;
+        *) printf 'honey-voice-engine-install: unknown argument: %s\n' "$arg" >&2; exit 2 ;;
+    esac
+done
+case "$ENGINE_ROOT" in /*) ;; *) echo 'HONEY_VOICE_ENGINE_ROOT must be an absolute path' >&2; exit 2 ;; esac
+[ "$(id -u)" -ne 0 ] || { echo 'run as the voice engine account, not root' >&2; exit 2; }
+
+tmp="$(mktemp -d)"
+trap 'rm -rf -- "$tmp"' EXIT
+template="$(<"$LANE/claude-settings.json.template")"
+printf '%s\n' "${template//@ENGINE_ROOT@/"$ENGINE_ROOT"}" > "$tmp/claude-settings.json"
+
+# source|target|mode.  Every entry point is started through an interpreter, so
+# the modes are belt and braces, but a drifted mode is still reported.
+targets=(
+    "$LANE/bin/honey_speak.py|$ENGINE_ROOT/bin/honey_speak.py|755"
+    "$LANE/bin/claude_stop_hook.py|$ENGINE_ROOT/bin/claude_stop_hook.py|755"
+    "$LANE/bin/codex_rollout_watcher.py|$ENGINE_ROOT/bin/codex_rollout_watcher.py|755"
+    "$LANE/bin/provider-rollout-watcher.py|$ENGINE_ROOT/bin/provider-rollout-watcher.py|755"
+    "$tmp/claude-settings.json|$ENGINE_ROOT/claude-settings.json|644"
+)
+ts="$(date +%Y%m%d-%H%M%S)"
+bad=0
+problem() { echo "!! $*"; bad=1; }
+warn() { echo "?? $*"; }
+
+place() {
+    local pair src dst want have
+    for pair in "${targets[@]}"; do
+        IFS='|' read -r src dst want <<<"$pair"
+        [ -r "$src" ] || { echo "missing source $src" >&2; exit 1; }
+        if [ -f "$dst" ] && cmp -s -- "$src" "$dst"; then
+            have="$(stat -c %a -- "$dst")"
+            if [ "$have" = "$want" ]; then echo "unchanged $dst"; continue; fi
+            if [ "$VERB" = check ]; then problem "mode $have (want $want) $dst"; continue; fi
+            if [ "$DRY" -eq 1 ]; then echo "would: chmod $want $dst"; continue; fi
+            chmod -- "$want" "$dst"
+            echo "chmod $want $dst"
+            continue
+        fi
+        if [ "$VERB" = check ]; then
+            if [ -e "$dst" ]; then problem "drift $dst"; else problem "missing $dst"; fi
+            continue
+        fi
+        if [ "$DRY" -eq 1 ]; then echo "would: backup/install $dst"; continue; fi
+        mkdir -p -- "$(dirname -- "$dst")"
+        [ -e "$dst" ] && cp -p -- "$dst" "$dst.bak-$ts"
+        install -m "$want" -- "$src" "$dst.pending"
+        mv -f -- "$dst.pending" "$dst"
+        echo "installed $dst"
+    done
+}
+
+machine_local() {
+    local conf="$ENGINE_ROOT/voices.json" mode first
+    if [ ! -e "$conf" ]; then
+        problem "missing $conf (machine-local: copy $LANE/voices.json.template and fill it in)"
+    elif python3 - "$conf" >/dev/null 2>&1 <<'PY'
+import json, sys
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+for bot in ("badger", "fox"):
+    assert data[bot].get("ductor_home") and data[bot].get("provider")
+PY
+    then
+        echo "ok $conf"
+    else
+        problem "invalid $conf (needs badger and fox with ductor_home and provider)"
+    fi
+    if [ ! -f "$PVOX_CLIENT" ]; then
+        problem "pvox client missing: $PVOX_CLIENT (clone voices cannot render)"
+        return
+    fi
+    first="$(head -n 1 -- "$PVOX_CLIENT")"
+    case "$first" in
+        '#!'*python*) ;;
+        *) warn "pvox client has no Python shebang ($PVOX_CLIENT); honey_speak.py runs it with python" ;;
+    esac
+    mode="$(stat -c %a -- "$PVOX_CLIENT")"
+    if [ -x "$PVOX_CLIENT" ]; then
+        echo "ok pvox client $mode $PVOX_CLIENT"
+    else
+        warn "pvox client not executable (mode $mode): voice notes still render through the interpreter, but direct callers fail; fix: chmod 0755 $PVOX_CLIENT"
+    fi
+    [ ! -e "$ENGINE_ROOT/bin/provider_rollout_watcher.py" ] ||
+        echo "-- legacy $ENGINE_ROOT/bin/provider_rollout_watcher.py: unused by the canonical Fox entrypoint; remove after honey-voice-fox restarts on it"
+}
+
+place
+if [ "$VERB" = install ] && [ "$DRY" -eq 0 ]; then
+    VERB=check
+    echo '== verify'
+    place
+fi
+machine_local
+echo 'No service was started, restarted, or enabled.'
+exit "$bad"
