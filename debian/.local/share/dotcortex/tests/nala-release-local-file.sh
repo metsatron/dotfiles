@@ -84,6 +84,9 @@ expect_refuse missing-extra "$tmp/noextra.ssv" 'needs EXTRA version,sha256'
 row "file://builds/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s 0.1.0,$sha" > "$tmp/rel.ssv"
 expect_refuse non-absolute "$tmp/rel.ssv" 'must be absolute'
 
+# The T480s reports ThinkPad-T480s; hosts.ssv lists it as an alias of t480s, so the row must NOT be skipped there.
+out="$(run "$tmp/good.ssv" "$tmp/log" NALA_RELEASE_DIFF_ONLY=1 NALA_HOSTNAME=ThinkPad-T480s 2>&1)"
+! grep -q 'skip caddy' <<<"$out"
 # Host scope: the t480s row applies on t480s only.
 out="$(run "$tmp/good.ssv" "$tmp/log" NALA_RELEASE_DIFF_ONLY=1 NALA_HOSTNAME=x230 2>&1)"
 grep -q 'skip caddy (scope=t480s, this=ubuntu)' <<<"$out"
