@@ -53,7 +53,16 @@ scope_matches() {
     devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
     ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
     vendefoul-only) [ "$OS_ID" = "vendefoul" ] ;;
-    *) return 0 ;;
+    *)
+      # Host scope (same SCOPE vocabulary as nala-apply, see the packages
+      # manifest note): a SCOPE naming a host the registries know applies on
+      # that host only; anything else keeps the historical applies-everywhere.
+      if known_host_scope "$scope"; then
+        [ "$scope" = "$(nala_hostname)" ]
+        return
+      fi
+      return 0
+      ;;
   esac
 }
 
@@ -64,6 +73,24 @@ arch_matches() {
     "$ARCH") return 0 ;;
     *) return 1 ;;
   esac
+}
+
+nala_hostname() {
+  printf '%s\n' "${NALA_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
+}
+
+# Hostnames the registries know: column 1 of host-excludes.ssv and host-gates.ssv
+# (repo copy and stowed copy, env overrides win, as in nala-apply) plus the fleet
+# hosts.ssv (DOTCORTEX_HOSTS_SSV), which is where t480s is registered.
+known_host_scope() {
+  local root="${DOTCORTEX_ROOT:-$HOME/DotCortex}" f
+  for f in "${HOST_EXCLUDES:-}" "$HOME/.provision/host-excludes.ssv" "$root/all/.provision/host-excludes.ssv" \
+           "${PROVISION_GATES:-}" "$HOME/.provision/host-gates.ssv" "$root/all/.provision/host-gates.ssv" \
+           "${DOTCORTEX_HOSTS_SSV:-}" "$HOME/.config/dotcortex/hosts.ssv" "$root/all/.config/dotcortex/hosts.ssv"; do
+    [ -s "$f" ] || continue
+    awk -v h="$1" '/^[ \t]*#/ || NF==0 { next } $1==h { found=1; exit } END { exit(found?0:1) }' "$f" && return 0
+  done
+  return 1
 }
 
 detect_apt() {
@@ -167,7 +194,7 @@ fi
 sync_one() {
   local apt_bin="$1" repo="$2" pkg="$3" asset_glob="$4" want_arch="$5" scope="$6" extra="$7"
   local json latest_tag latest_ver asset_name asset_url asset_digest dir bundle tmp old_name cached_digest cached_tag installed
-  local bundle_pkg bundle_ver effective_pkg compare_ver
+  local bundle_pkg bundle_ver effective_pkg compare_ver file_bundle=""
   local asset_entry_name asset_entry_url asset_entry_digest
 
   if ! scope_matches "$scope"; then
@@ -253,6 +280,59 @@ sync_one() {
     asset_name="$asset_glob"
     asset_url="${repo#direct://}"
     asset_digest="${extra#*,}"
+  elif [[ "$repo" == file://* ]]; then
+    # Pinned local .deb: absolute path, regular file (never a symlink), realpath
+    # under an allowed root, EXTRA version,sha256, and deb metadata equal to
+    # PKG / EXTRA version / ARCH.  Then the shared install path below runs.
+    local file_path file_real file_ver file_sha file_root file_ok f fb_pkg fb_ver fb_arch
+    file_path="${repo#file://}"
+    case "$file_path" in /*) ;; *) echo "  ! file:// path must be absolute: $repo" >&2; return 1 ;; esac
+    file_ver="${extra%%,*}"
+    file_sha="${extra#*,}"
+    if [ -z "$extra" ] || [ "$file_ver" = "$extra" ] || [ -z "$file_ver" ] || ! [[ "$file_sha" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "  ! file:// row for $pkg needs EXTRA version,sha256 (64 lowercase hex), got '$extra'" >&2
+      return 1
+    fi
+    if [ -L "$file_path" ] || [ ! -f "$file_path" ]; then
+      echo "  ! file:// source must be a regular file, not a symlink: $file_path" >&2
+      return 1
+    fi
+    file_real="$(realpath -- "$file_path")" || { echo "  ! cannot resolve $file_path" >&2; return 1; }
+    file_ok=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      case "$f" in /*) ;; *) continue ;; esac
+      file_root="$(realpath -m -- "$f")"
+      if [[ "$file_real" == "$file_root"/* ]]; then file_ok=1; break; fi
+    done < <(printf '%s\n' "${NALA_LOCAL_DEB_ROOTS:-$HOME/mnt/x230/HelmCortex/NEXUS/builds}" | tr ':' '\n')
+    if [ "$file_ok" != 1 ]; then
+      echo "  ! file:// realpath $file_real is outside the allowed roots (${NALA_LOCAL_DEB_ROOTS:-$HOME/mnt/x230/HelmCortex/NEXUS/builds})" >&2
+      return 1
+    fi
+    if ! printf '%s  %s\n' "$file_sha" "$file_real" | sha256sum -c - >/dev/null 2>&1; then
+      echo "  ! file:// SHA-256 mismatch for $file_real (want $file_sha)" >&2
+      return 1
+    fi
+    fb_pkg="$(dpkg-deb -f "$file_real" Package 2>/dev/null)" || fb_pkg=""
+    fb_ver="$(dpkg-deb -f "$file_real" Version 2>/dev/null)" || fb_ver=""
+    fb_arch="$(dpkg-deb -f "$file_real" Architecture 2>/dev/null)" || fb_arch=""
+    if [ -z "$fb_pkg" ] || [ -z "$fb_ver" ] || [ -z "$fb_arch" ]; then
+      echo "  ! cannot read Package/Version/Architecture from $file_real" >&2
+      return 1
+    fi
+    [ "$fb_pkg" = "$pkg" ] || { echo "  ! file:// Package '$fb_pkg' != manifest PKG '$pkg'" >&2; return 1; }
+    [ "$fb_ver" = "$file_ver" ] || { echo "  ! file:// Version '$fb_ver' != EXTRA version '$file_ver'" >&2; return 1; }
+    case "$want_arch" in
+      any|all|"") ;;
+      *) [ "$fb_arch" = "$want_arch" ] || { echo "  ! file:// Architecture '$fb_arch' != manifest ARCH '$want_arch'" >&2; return 1; } ;;
+    esac
+    json='{}'
+    latest_tag="$file_ver"
+    latest_ver="$file_ver"
+    asset_name="$(basename "$file_real")"
+    asset_url="file://$file_real"
+    asset_digest="$file_sha"
+    file_bundle="$file_real"
   else
     json="$(gh_latest_json "$repo")"
     latest_tag="$(jq -r '.tag_name' <<<"$json")"
@@ -274,50 +354,55 @@ sync_one() {
     echo "  ! no release asset matching $asset_glob for $repo" >&2
     return 1
   }
-  case "$asset_url" in https://*) ;; *) echo "  ! refusing non-HTTPS asset URL: $asset_url" >&2; return 1 ;; esac
+  case "$asset_url" in https://*|file://*) ;; *) echo "  ! refusing non-HTTPS asset URL: $asset_url" >&2; return 1 ;; esac
 
   if [ "${NALA_RELEASE_DIFF_ONLY:-0}" = 1 ]; then
     echo "  release: pkg=$pkg arch=$want_arch latest=$latest_ver installed=$(installed_version "$pkg" || true)"
     return 0
   fi
 
-  dir="$(cache_dir "$pkg")"
-  if ! mkdir -p "$dir"; then
-    echo "  ! cannot create release cache directory $dir" >&2
-    return 1
-  fi
-  bundle="$dir/$asset_name"
-  old_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
-  cached_digest="$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )"
-  cached_tag="$( [ -f "$dir/tag" ] && cat "$dir/tag" || true )"
-
-  if [ -n "$old_name" ] && [ "$old_name" != "$asset_name" ] && [ -f "$dir/$old_name" ]; then
-    rm -f "$dir/$old_name"
-  fi
-
-  if [ ! -s "$bundle" ] \
-    || { [ -n "$asset_digest" ] && [ "$cached_digest" != "$asset_digest" ]; } \
-    || { [ -z "$asset_digest" ] && [ "$cached_tag" != "$latest_tag" ]; }; then
-    tmp="$bundle.part"
-    if ! curl -fL "$asset_url" -o "$tmp"; then
-      echo "  ! cannot download release asset $asset_url" >&2
+  if [ -n "$file_bundle" ]; then
+    # Pinned local file: install it in place — no download, no cache copy.
+    bundle="$file_bundle"
+  else
+    dir="$(cache_dir "$pkg")"
+    if ! mkdir -p "$dir"; then
+      echo "  ! cannot create release cache directory $dir" >&2
       return 1
     fi
-    if [ -n "$asset_digest" ]; then
-      if ! printf '%s  %s\n' "$asset_digest" "$tmp" | sha256sum -c - >/dev/null; then
-        echo "  ! release asset SHA-256 verification failed for $asset_name" >&2
+    bundle="$dir/$asset_name"
+    old_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
+    cached_digest="$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )"
+    cached_tag="$( [ -f "$dir/tag" ] && cat "$dir/tag" || true )"
+
+    if [ -n "$old_name" ] && [ "$old_name" != "$asset_name" ] && [ -f "$dir/$old_name" ]; then
+      rm -f "$dir/$old_name"
+    fi
+
+    if [ ! -s "$bundle" ] \
+      || { [ -n "$asset_digest" ] && [ "$cached_digest" != "$asset_digest" ]; } \
+      || { [ -z "$asset_digest" ] && [ "$cached_tag" != "$latest_tag" ]; }; then
+      tmp="$bundle.part"
+      if ! curl -fL "$asset_url" -o "$tmp"; then
+        echo "  ! cannot download release asset $asset_url" >&2
+        return 1
+      fi
+      if [ -n "$asset_digest" ]; then
+        if ! printf '%s  %s\n' "$asset_digest" "$tmp" | sha256sum -c - >/dev/null; then
+          echo "  ! release asset SHA-256 verification failed for $asset_name" >&2
+          return 1
+        fi
+      fi
+      if ! mv -f "$tmp" "$bundle"; then
+        echo "  ! cannot promote downloaded release asset to $bundle" >&2
         return 1
       fi
     fi
-    if ! mv -f "$tmp" "$bundle"; then
-      echo "  ! cannot promote downloaded release asset to $bundle" >&2
+
+    if ! write_cache_meta "$dir" "$json" "$latest_tag" "$asset_name" "$asset_url" "$asset_digest"; then
+      echo "  ! cannot write release cache metadata in $dir" >&2
       return 1
     fi
-  fi
-
-  if ! write_cache_meta "$dir" "$json" "$latest_tag" "$asset_name" "$asset_url" "$asset_digest"; then
-    echo "  ! cannot write release cache metadata in $dir" >&2
-    return 1
   fi
 
   if ! bundle_pkg="$(dpkg-deb -f "$bundle" Package 2>/dev/null)" || [ -z "$bundle_pkg" ]; then

@@ -473,10 +473,18 @@ For Debian-family apps distributed as GitHub release artifacts instead of apt re
 Columns: REPO, PKG, ASSET_NAME_OR_GLOB, ARCH, SCOPE, EXTRA
 - PKG is the Debian package name from the .deb metadata, not the asset filename.
 - ARCH: =amd64=, =arm64=, =all=, or =any=
-- SCOPE: =shared=, =devuan-only=, =ubuntu-only=, =vendefoul-only=, =chatgpt-supported=
+- SCOPE: =shared=, =devuan-only=, =ubuntu-only=, =vendefoul-only=, =chatgpt-supported=, or a hostname the registries know (=t480s=, see the SCOPE note in the packages manifest above): the row applies on that host only
 
 The same manifest accepts =direct://URL= for a one-off HTTPS asset, but the
-release helper rejects every non-HTTPS direct URL.  OpenAI's official lane uses
+release helper rejects every non-HTTPS direct URL.  It also accepts
+=file://ABSOLUTE_PATH= for a pinned local .deb (a build artifact on a mounted
+fleet host, not a network asset): the row requires EXTRA =version,sha256=,
+the path must be absolute, a regular file (never a symlink) whose realpath sits
+under an allowed root — default =$HOME/mnt/x230/HelmCortex/NEXUS/builds=,
+overridable with the colon-separated =NALA_LOCAL_DEB_ROOTS= env var — and the
+helper verifies the SHA-256 plus the =dpkg-deb -f= Package/Version/Architecture
+against PKG, the EXTRA version and ARCH before the shared install path runs.
+OpenAI's official lane uses
 =signed-deb://BASE= instead: the helper resolves the current =chatgpt= package
 from BASE's signed =dists/stable/InRelease= and SHA-256-checked =Packages=
 metadata, then verifies the .deb against that metadata before installation.
@@ -698,6 +706,25 @@ kept separately from Hugo's install manifest and is not applied by default.
 direct://https://archive.ubuntu.com/ubuntu/pool/main/a/avahi/libavahi-compat-libdnssd1_0.8-13ubuntu6.2_amd64.deb libavahi-compat-libdnssd1 libavahi-compat-libdnssd1_0.8-13ubuntu6.2_amd64.deb amd64 ubuntu-only 0.8-13ubuntu6.2,7542a31f1d271187819c03f772583a0fcd6cd990a7f829159958c0266cb5ed3e
 #+END_SRC
 
+** Pinned local Caddy desktop app (t480s)
+The Caddy desktop app is built as a native Tauri .deb by another seat and lands
+in the HelmCortex NEXUS builds tree on the x230 mount; t480s installs it through
+the release sync instead of a hand-run dpkg/apt.  The manifest is dedicated (not
+part of the default release set) and its row is scoped to the =t480s= host, so
+it never installs on another machine even if that machine points
+=NALA_RELEASES_SSV= at it.  The =file://= row is pinned: absolute path under the
+default allowed root, EXTRA =version,sha256=, and the helper re-verifies the
+checksum and the .deb metadata before the shared install path runs.
+
+#+BEGIN_SRC text :tangle debian/.nala/manifest/caddy-native.ssv :padline no :comments none
+# repo package asset_name_or_glob arch scope extra
+file:///home/metsatron/mnt/x230/HelmCortex/NEXUS/builds/caddy-native-0.1.0/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s 0.1.0,1ae111c1fee13b5ecc6c9a00037dbddcce0091f99d1a02a0d0c4be390bbca223
+#+END_SRC
+
+Dry-run first, then apply, from this checkout on t480s:
+=NALA_RELEASES_SSV=$PWD/debian/.nala/manifest/caddy-native.ssv make -f all/.mk/nala.mk nala-release-diff=
+=NALA_RELEASES_SSV=$PWD/debian/.nala/manifest/caddy-native.ssv make -f all/.mk/nala.mk nala-release-sync=
+
 ** Shared release sync implementation
 #+BEGIN_SRC bash :tangle debian/.local/bin/nala-release-sync :shebang "#!/usr/bin/env bash"
 set -euo pipefail
@@ -751,7 +778,16 @@ scope_matches() {
     devuan-only) [ "$IS_DEVUAN" -eq 1 ] ;;
     ubuntu-only) [ "$OS_ID" = "ubuntu" ] ;;
     vendefoul-only) [ "$OS_ID" = "vendefoul" ] ;;
-    *) return 0 ;;
+    *)
+      # Host scope (same SCOPE vocabulary as nala-apply, see the packages
+      # manifest note): a SCOPE naming a host the registries know applies on
+      # that host only; anything else keeps the historical applies-everywhere.
+      if known_host_scope "$scope"; then
+        [ "$scope" = "$(nala_hostname)" ]
+        return
+      fi
+      return 0
+      ;;
   esac
 }
 
@@ -762,6 +798,24 @@ arch_matches() {
     "$ARCH") return 0 ;;
     *) return 1 ;;
   esac
+}
+
+nala_hostname() {
+  printf '%s\n' "${NALA_HOSTNAME:-$(hostname -s 2>/dev/null || hostname)}"
+}
+
+# Hostnames the registries know: column 1 of host-excludes.ssv and host-gates.ssv
+# (repo copy and stowed copy, env overrides win, as in nala-apply) plus the fleet
+# hosts.ssv (DOTCORTEX_HOSTS_SSV), which is where t480s is registered.
+known_host_scope() {
+  local root="${DOTCORTEX_ROOT:-$HOME/DotCortex}" f
+  for f in "${HOST_EXCLUDES:-}" "$HOME/.provision/host-excludes.ssv" "$root/all/.provision/host-excludes.ssv" \
+           "${PROVISION_GATES:-}" "$HOME/.provision/host-gates.ssv" "$root/all/.provision/host-gates.ssv" \
+           "${DOTCORTEX_HOSTS_SSV:-}" "$HOME/.config/dotcortex/hosts.ssv" "$root/all/.config/dotcortex/hosts.ssv"; do
+    [ -s "$f" ] || continue
+    awk -v h="$1" '/^[ \t]*#/ || NF==0 { next } $1==h { found=1; exit } END { exit(found?0:1) }' "$f" && return 0
+  done
+  return 1
 }
 
 detect_apt() {
@@ -865,7 +919,7 @@ fi
 sync_one() {
   local apt_bin="$1" repo="$2" pkg="$3" asset_glob="$4" want_arch="$5" scope="$6" extra="$7"
   local json latest_tag latest_ver asset_name asset_url asset_digest dir bundle tmp old_name cached_digest cached_tag installed
-  local bundle_pkg bundle_ver effective_pkg compare_ver
+  local bundle_pkg bundle_ver effective_pkg compare_ver file_bundle=""
   local asset_entry_name asset_entry_url asset_entry_digest
 
   if ! scope_matches "$scope"; then
@@ -951,6 +1005,59 @@ sync_one() {
     asset_name="$asset_glob"
     asset_url="${repo#direct://}"
     asset_digest="${extra#*,}"
+  elif [[ "$repo" == file://* ]]; then
+    # Pinned local .deb: absolute path, regular file (never a symlink), realpath
+    # under an allowed root, EXTRA version,sha256, and deb metadata equal to
+    # PKG / EXTRA version / ARCH.  Then the shared install path below runs.
+    local file_path file_real file_ver file_sha file_root file_ok f fb_pkg fb_ver fb_arch
+    file_path="${repo#file://}"
+    case "$file_path" in /*) ;; *) echo "  ! file:// path must be absolute: $repo" >&2; return 1 ;; esac
+    file_ver="${extra%%,*}"
+    file_sha="${extra#*,}"
+    if [ -z "$extra" ] || [ "$file_ver" = "$extra" ] || [ -z "$file_ver" ] || ! [[ "$file_sha" =~ ^[0-9a-f]{64}$ ]]; then
+      echo "  ! file:// row for $pkg needs EXTRA version,sha256 (64 lowercase hex), got '$extra'" >&2
+      return 1
+    fi
+    if [ -L "$file_path" ] || [ ! -f "$file_path" ]; then
+      echo "  ! file:// source must be a regular file, not a symlink: $file_path" >&2
+      return 1
+    fi
+    file_real="$(realpath -- "$file_path")" || { echo "  ! cannot resolve $file_path" >&2; return 1; }
+    file_ok=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      case "$f" in /*) ;; *) continue ;; esac
+      file_root="$(realpath -m -- "$f")"
+      if [[ "$file_real" == "$file_root"/* ]]; then file_ok=1; break; fi
+    done < <(printf '%s\n' "${NALA_LOCAL_DEB_ROOTS:-$HOME/mnt/x230/HelmCortex/NEXUS/builds}" | tr ':' '\n')
+    if [ "$file_ok" != 1 ]; then
+      echo "  ! file:// realpath $file_real is outside the allowed roots (${NALA_LOCAL_DEB_ROOTS:-$HOME/mnt/x230/HelmCortex/NEXUS/builds})" >&2
+      return 1
+    fi
+    if ! printf '%s  %s\n' "$file_sha" "$file_real" | sha256sum -c - >/dev/null 2>&1; then
+      echo "  ! file:// SHA-256 mismatch for $file_real (want $file_sha)" >&2
+      return 1
+    fi
+    fb_pkg="$(dpkg-deb -f "$file_real" Package 2>/dev/null)" || fb_pkg=""
+    fb_ver="$(dpkg-deb -f "$file_real" Version 2>/dev/null)" || fb_ver=""
+    fb_arch="$(dpkg-deb -f "$file_real" Architecture 2>/dev/null)" || fb_arch=""
+    if [ -z "$fb_pkg" ] || [ -z "$fb_ver" ] || [ -z "$fb_arch" ]; then
+      echo "  ! cannot read Package/Version/Architecture from $file_real" >&2
+      return 1
+    fi
+    [ "$fb_pkg" = "$pkg" ] || { echo "  ! file:// Package '$fb_pkg' != manifest PKG '$pkg'" >&2; return 1; }
+    [ "$fb_ver" = "$file_ver" ] || { echo "  ! file:// Version '$fb_ver' != EXTRA version '$file_ver'" >&2; return 1; }
+    case "$want_arch" in
+      any|all|"") ;;
+      *) [ "$fb_arch" = "$want_arch" ] || { echo "  ! file:// Architecture '$fb_arch' != manifest ARCH '$want_arch'" >&2; return 1; } ;;
+    esac
+    json='{}'
+    latest_tag="$file_ver"
+    latest_ver="$file_ver"
+    asset_name="$(basename "$file_real")"
+    asset_url="file://$file_real"
+    asset_digest="$file_sha"
+    file_bundle="$file_real"
   else
     json="$(gh_latest_json "$repo")"
     latest_tag="$(jq -r '.tag_name' <<<"$json")"
@@ -972,50 +1079,55 @@ sync_one() {
     echo "  ! no release asset matching $asset_glob for $repo" >&2
     return 1
   }
-  case "$asset_url" in https://*) ;; *) echo "  ! refusing non-HTTPS asset URL: $asset_url" >&2; return 1 ;; esac
+  case "$asset_url" in https://*|file://*) ;; *) echo "  ! refusing non-HTTPS asset URL: $asset_url" >&2; return 1 ;; esac
 
   if [ "${NALA_RELEASE_DIFF_ONLY:-0}" = 1 ]; then
     echo "  release: pkg=$pkg arch=$want_arch latest=$latest_ver installed=$(installed_version "$pkg" || true)"
     return 0
   fi
 
-  dir="$(cache_dir "$pkg")"
-  if ! mkdir -p "$dir"; then
-    echo "  ! cannot create release cache directory $dir" >&2
-    return 1
-  fi
-  bundle="$dir/$asset_name"
-  old_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
-  cached_digest="$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )"
-  cached_tag="$( [ -f "$dir/tag" ] && cat "$dir/tag" || true )"
-
-  if [ -n "$old_name" ] && [ "$old_name" != "$asset_name" ] && [ -f "$dir/$old_name" ]; then
-    rm -f "$dir/$old_name"
-  fi
-
-  if [ ! -s "$bundle" ] \
-    || { [ -n "$asset_digest" ] && [ "$cached_digest" != "$asset_digest" ]; } \
-    || { [ -z "$asset_digest" ] && [ "$cached_tag" != "$latest_tag" ]; }; then
-    tmp="$bundle.part"
-    if ! curl -fL "$asset_url" -o "$tmp"; then
-      echo "  ! cannot download release asset $asset_url" >&2
+  if [ -n "$file_bundle" ]; then
+    # Pinned local file: install it in place — no download, no cache copy.
+    bundle="$file_bundle"
+  else
+    dir="$(cache_dir "$pkg")"
+    if ! mkdir -p "$dir"; then
+      echo "  ! cannot create release cache directory $dir" >&2
       return 1
     fi
-    if [ -n "$asset_digest" ]; then
-      if ! printf '%s  %s\n' "$asset_digest" "$tmp" | sha256sum -c - >/dev/null; then
-        echo "  ! release asset SHA-256 verification failed for $asset_name" >&2
+    bundle="$dir/$asset_name"
+    old_name="$( [ -f "$dir/asset.name" ] && cat "$dir/asset.name" || true )"
+    cached_digest="$( [ -f "$dir/asset.digest" ] && cat "$dir/asset.digest" || true )"
+    cached_tag="$( [ -f "$dir/tag" ] && cat "$dir/tag" || true )"
+
+    if [ -n "$old_name" ] && [ "$old_name" != "$asset_name" ] && [ -f "$dir/$old_name" ]; then
+      rm -f "$dir/$old_name"
+    fi
+
+    if [ ! -s "$bundle" ] \
+      || { [ -n "$asset_digest" ] && [ "$cached_digest" != "$asset_digest" ]; } \
+      || { [ -z "$asset_digest" ] && [ "$cached_tag" != "$latest_tag" ]; }; then
+      tmp="$bundle.part"
+      if ! curl -fL "$asset_url" -o "$tmp"; then
+        echo "  ! cannot download release asset $asset_url" >&2
+        return 1
+      fi
+      if [ -n "$asset_digest" ]; then
+        if ! printf '%s  %s\n' "$asset_digest" "$tmp" | sha256sum -c - >/dev/null; then
+          echo "  ! release asset SHA-256 verification failed for $asset_name" >&2
+          return 1
+        fi
+      fi
+      if ! mv -f "$tmp" "$bundle"; then
+        echo "  ! cannot promote downloaded release asset to $bundle" >&2
         return 1
       fi
     fi
-    if ! mv -f "$tmp" "$bundle"; then
-      echo "  ! cannot promote downloaded release asset to $bundle" >&2
+
+    if ! write_cache_meta "$dir" "$json" "$latest_tag" "$asset_name" "$asset_url" "$asset_digest"; then
+      echo "  ! cannot write release cache metadata in $dir" >&2
       return 1
     fi
-  fi
-
-  if ! write_cache_meta "$dir" "$json" "$latest_tag" "$asset_name" "$asset_url" "$asset_digest"; then
-    echo "  ! cannot write release cache metadata in $dir" >&2
-    return 1
   fi
 
   if ! bundle_pkg="$(dpkg-deb -f "$bundle" Package 2>/dev/null)" || [ -z "$bundle_pkg" ]; then
@@ -1267,6 +1379,115 @@ fi
 grep -q 'probed later' "$excl_log"
 
 printf '%s\n' 'nala release platform fixtures: ok'
+#+END_SRC
+
+** Local file:// source fixtures
+#+BEGIN_SRC bash :tangle debian/.local/share/dotcortex/tests/nala-release-local-file.sh :shebang "#!/usr/bin/env bash" :comments no
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/../../../../.." && pwd)"
+HELPER="$ROOT/debian/.local/bin/nala-release-sync"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$tmp"' EXIT
+printf '%s\n' 'ID=ubuntu' 'VERSION_ID="24.04"' > "$tmp/os-release"
+touch "$tmp/no-devuan"
+
+stubbin="$tmp/bin"
+mkdir -p "$stubbin" "$tmp/home" "$tmp/builds" "$tmp/elsewhere"
+printf '%s\n' '#!/usr/bin/env bash' '[ "${1:-}" = --print-architecture ] && { printf "amd64\n"; exit 0; }' 'exit 2' > "$stubbin/dpkg"
+printf '%s\n' '#!/usr/bin/env bash' 'case "${3:-}" in Package) printf "%s" "${NALA_TEST_DEB_PKG:-caddy}";; Version) printf "%s" "${NALA_TEST_DEB_VER:-0.1.0}";; Architecture) printf "%s" "${NALA_TEST_DEB_ARCH:-amd64}";; *) exit 2;; esac' > "$stubbin/dpkg-deb"
+printf '%s\n' '#!/usr/bin/env bash' 'if [ ! -f "${NALA_TEST_STATE:-}" ]; then exit 1; fi' 'IFS=$'"'"'\t'"'"' read -r s v < "$NALA_TEST_STATE"' 'case "${2:-}" in *Status*) printf "%s\t%s\n" "$s" "$v";; *) printf "%s\n" "$v";; esac' > "$stubbin/dpkg-query"
+printf '%s\n' '#!/usr/bin/env bash' 'while [[ "${1:-}" == *=* ]]; do export "$1"; shift; done' 'exec "$@"' > "$stubbin/sudo"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "apt-get:%s\n" "$*" >> "$NALA_TEST_LOG"' 'if [ "${NALA_TEST_REPAIR:-0}" = 1 ] && [ -n "${NALA_TEST_STATE:-}" ]; then printf "install ok installed\t0.1.0\n" > "$NALA_TEST_STATE"; fi' 'exit 0' > "$stubbin/apt-get"
+printf '%s\n' '#!/usr/bin/env bash' 'printf "nala:%s\n" "$*" >> "$NALA_TEST_LOG"' 'if [ "${NALA_TEST_REPAIR:-0}" = 1 ] && [ -n "${NALA_TEST_STATE:-}" ]; then printf "install ok installed\t0.1.0\n" > "$NALA_TEST_STATE"; fi' 'exit 0' > "$stubbin/nala"
+printf '%s\n' '#!/usr/bin/env bash' 'printf curl-called >> "$NALA_TEST_LOG"; exit 2' > "$stubbin/curl"
+chmod +x "$stubbin"/*
+
+printf 'fixture-deb\n' > "$tmp/builds/Caddy_0.1.0_amd64.deb"
+printf 'escape-deb\n' > "$tmp/elsewhere/escape.deb"
+ln -s "$tmp/builds/Caddy_0.1.0_amd64.deb" "$tmp/builds/link.deb"
+sha="$(sha256sum "$tmp/builds/Caddy_0.1.0_amd64.deb" | awk '{print $1}')"
+esha="$(sha256sum "$tmp/elsewhere/escape.deb" | awk '{print $1}')"
+
+run() { # run <manifest> <log> [VAR=VAL ...]
+  local man="$1" log="$2"; shift 2
+  : > "$log"
+  env NALA_RELEASES_SSV="$man" NALA_OS_RELEASE="$tmp/os-release" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" \
+    NALA_ARCH=amd64 NALA_HOSTNAME=t480s DOTCORTEX_HOSTS_SSV="$ROOT/all/.config/dotcortex/hosts.ssv" \
+    NALA_LOCAL_DEB_ROOTS="$tmp/builds" NALA_TEST_STATE="$tmp/no-state" NALA_TEST_LOG="$log" \
+    HOME="$tmp/home" XDG_CACHE_HOME="$tmp/cache" PATH="$stubbin:$PATH" "$@" "$HELPER"
+}
+
+row() { printf '%s\n' '# repo package asset_name_or_glob arch scope extra' "$1"; }
+
+expect_refuse() { # expect_refuse <name> <manifest> <pattern> [VAR=VAL ...]
+  local name="$1" man="$2" pat="$3"; shift 3
+  local out rc=0
+  out="$(run "$man" "$tmp/refuse.log" "$@" 2>&1)" || rc=$?
+  [ "$rc" -ne 0 ] || { echo "$name: unexpectedly accepted" >&2; exit 1; }
+  grep -q -- "$pat" <<<"$out" || { echo "$name: missing '$pat' in: $out" >&2; exit 1; }
+  if [ -s "$tmp/refuse.log" ]; then echo "$name: refused row still called apt/curl: $(cat "$tmp/refuse.log")" >&2; exit 1; fi
+}
+
+good="file://$tmp/builds/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s 0.1.0,$sha"
+row "$good" > "$tmp/good.ssv"
+
+# Correct entry accepted in dry-run: prints the plan, installs nothing, writes no cache file.
+out="$(run "$tmp/good.ssv" "$tmp/log" NALA_RELEASE_DIFF_ONLY=1 2>&1)"
+grep -q 'release: pkg=caddy arch=amd64 latest=0.1.0 installed=' <<<"$out"
+if [ -s "$tmp/log" ]; then echo "dry-run called apt/curl: $(cat "$tmp/log")" >&2; exit 1; fi
+if find "$tmp/cache/nala/releases" -type f 2>/dev/null | grep -q .; then
+  echo "dry-run wrote cache files" >&2; exit 1
+fi
+
+# Full run reuses the shared install path: sudo nala install --no-autoremove <pinned file>.
+rpath="$(realpath -- "$tmp/builds/Caddy_0.1.0_amd64.deb")"
+printf 'install ok installed\t0.0.9\n' > "$tmp/state"
+out="$(run "$tmp/good.ssv" "$tmp/log" NALA_TEST_STATE="$tmp/state" NALA_TEST_REPAIR=1 2>&1)"
+grep -q 'release: pkg=caddy arch=amd64 latest=0.1.0 installed=0.0.9' <<<"$out"
+grep -q 'installing Caddy_0.1.0_amd64.deb with nala' <<<"$out"
+grep -qF "nala:install -y --no-autoremove $rpath" "$tmp/log"
+if grep -q curl-called "$tmp/log"; then echo "file:// row downloaded something" >&2; exit 1; fi
+if [ -e "$tmp/cache/nala/releases/caddy" ]; then echo "file:// row wrote a cache copy" >&2; exit 1; fi
+
+# Refusals: each must exit non-zero, say why, and never reach apt/curl.
+row "file://$tmp/builds/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s 0.1.0,0000000000000000000000000000000000000000000000000000000000000000" > "$tmp/badsha.ssv"
+expect_refuse wrong-sha "$tmp/badsha.ssv" 'SHA-256 mismatch'
+row "$good" > "$tmp/badmeta.ssv"
+expect_refuse wrong-pkg "$tmp/badmeta.ssv" "Package 'other' != manifest PKG 'caddy'" NALA_TEST_DEB_PKG=other
+expect_refuse wrong-version "$tmp/badmeta.ssv" "Version '9.9.9' != EXTRA version '0.1.0'" NALA_TEST_DEB_VER=9.9.9
+expect_refuse wrong-arch "$tmp/badmeta.ssv" "Architecture 'arm64' != manifest ARCH 'amd64'" NALA_TEST_DEB_ARCH=arm64
+row "file://$tmp/elsewhere/escape.deb caddy escape.deb amd64 t480s 0.1.0,$esha" > "$tmp/outside.ssv"
+expect_refuse outside-root "$tmp/outside.ssv" 'outside the allowed roots'
+row "file://$tmp/builds/../elsewhere/escape.deb caddy escape.deb amd64 t480s 0.1.0,$esha" > "$tmp/dotdot.ssv"
+expect_refuse dotdot-escape "$tmp/dotdot.ssv" 'outside the allowed roots'
+row "file://$tmp/builds/link.deb caddy link.deb amd64 t480s 0.1.0,$sha" > "$tmp/symlink.ssv"
+expect_refuse symlink "$tmp/symlink.ssv" 'not a symlink'
+row "file://$tmp/builds/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s \"\"" > "$tmp/noextra.ssv"
+expect_refuse missing-extra "$tmp/noextra.ssv" 'needs EXTRA version,sha256'
+row "file://builds/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s 0.1.0,$sha" > "$tmp/rel.ssv"
+expect_refuse non-absolute "$tmp/rel.ssv" 'must be absolute'
+
+# Host scope: the t480s row applies on t480s only.
+out="$(run "$tmp/good.ssv" "$tmp/log" NALA_RELEASE_DIFF_ONLY=1 NALA_HOSTNAME=x230 2>&1)"
+grep -q 'skip caddy (scope=t480s, this=ubuntu)' <<<"$out"
+
+# Default allowed root is $HOME/mnt/x230/HelmCortex/NEXUS/builds when NALA_LOCAL_DEB_ROOTS is unset.
+mkdir -p "$tmp/home/mnt/x230/HelmCortex/NEXUS/builds"
+cp "$tmp/builds/Caddy_0.1.0_amd64.deb" "$tmp/home/mnt/x230/HelmCortex/NEXUS/builds/"
+dsha="$(sha256sum "$tmp/home/mnt/x230/HelmCortex/NEXUS/builds/Caddy_0.1.0_amd64.deb" | awk '{print $1}')"
+row "file://$tmp/home/mnt/x230/HelmCortex/NEXUS/builds/Caddy_0.1.0_amd64.deb caddy Caddy_0.1.0_amd64.deb amd64 t480s 0.1.0,$dsha" > "$tmp/defaultroot.ssv"
+out="$(run "$tmp/defaultroot.ssv" "$tmp/log" NALA_RELEASE_DIFF_ONLY=1 NALA_LOCAL_DEB_ROOTS= 2>&1)"
+grep -q 'release: pkg=caddy arch=amd64 latest=0.1.0 installed=' <<<"$out"
+
+# Non-file:// sources unchanged: direct:// still resolves from EXTRA, non-HTTPS still refused.
+row 'direct://https://fixture.invalid/hugo.deb hugo hugo.deb amd64 shared 0.158.0,568fd95865802ad67b6af59793b78a538f0816b0cbe8d397e6a55311d3cda09c' > "$tmp/direct.ssv"
+out="$(run "$tmp/direct.ssv" "$tmp/log" NALA_RELEASE_DIFF_ONLY=1 2>&1)"
+grep -q 'release: pkg=hugo arch=amd64 latest=0.158.0 installed=' <<<"$out"
+row 'direct://http://fixture.invalid/hugo.deb hugo hugo.deb amd64 shared 0.158.0,568fd95865802ad67b6af59793b78a538f0816b0cbe8d397e6a55311d3cda09c' > "$tmp/directhttp.ssv"
+expect_refuse direct-non-https "$tmp/directhttp.ssv" 'refusing non-HTTPS asset URL'
+
+printf '%s\n' 'nala release local file:// fixtures: ok'
 #+END_SRC
 
 * Apply script
@@ -1781,7 +2002,7 @@ while IFS='|' read -r repo pkg asset_glob want_arch scope _extra; do
     continue
   fi
 
-  if [[ "$repo" == direct://* ]]; then
+  if [[ "$repo" == direct://* || "$repo" == file://* ]]; then
     latest_ver="${_extra%%,*}"
     resolved_asset_name="$asset_glob"
   else
