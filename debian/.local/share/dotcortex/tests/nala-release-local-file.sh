@@ -106,4 +106,14 @@ grep -q 'release: pkg=hugo arch=amd64 latest=0.158.0 installed=' <<<"$out"
 row 'direct://http://fixture.invalid/hugo.deb hugo hugo.deb amd64 shared 0.158.0,568fd95865802ad67b6af59793b78a538f0816b0cbe8d397e6a55311d3cda09c' > "$tmp/directhttp.ssv"
 expect_refuse direct-non-https "$tmp/directhttp.ssv" 'refusing non-HTTPS asset URL'
 
+# nala-release-diff honours the same host scope (Gemma review of 4ddc32b42: its helpers were missing).
+DIFF="$ROOT/debian/.local/bin/nala-release-diff"
+dout() { env NALA_RELEASES_SSV="$tmp/good.ssv" NALA_OS_RELEASE="$tmp/os-release" NALA_DEVUAN_VERSION_FILE="$tmp/no-devuan" \
+  NALA_ARCH=amd64 DOTCORTEX_HOSTS_SSV="$ROOT/all/.config/dotcortex/hosts.ssv" HOME="$tmp/home" PATH="$stubbin:$PATH" "$@" bash "$DIFF" 2>&1 || true; }
+dx="$(dout NALA_HOSTNAME=x230)"
+grep -q 'caddy skipped (scope=t480s' <<<"$dx"
+dt="$(dout NALA_HOSTNAME=ThinkPad-T480s)"
+grep -q '+ caddy (missing -> 0.1.0' <<<"$dt"
+! grep -q 'command not found' <<<"$dx$dt"
+
 printf '%s\n' 'nala release local file:// fixtures: ok'
