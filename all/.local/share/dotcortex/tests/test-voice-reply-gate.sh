@@ -96,9 +96,22 @@ OUT_NOREPLY="$(run_fixture noreply "$F_NOREPLY")"
 OUT_ENVELOPE="$(run_fixture envelope "$F_ENVELOPE")"
 OUT_NORMAL="$(run_fixture normal "$F_NORMAL")"
 
+# Non-executable pvox (2026-11-19 regression: a reinstall left the 0664 client
+# and every render failed). Swap in a Python fake at mode 0644: the hook must
+# run it through the interpreter and still deliver.
+cat > "$PVOX" <<'EOF'
+#!/usr/bin/env python3
+import sys
+if len(sys.argv) > 1 and sys.argv[1] == "render":
+    open(sys.argv[-1], "wb").write(b"RIFFstub")
+EOF
+chmod 0644 "$PVOX"
+OUT_NOEXEC="$(run_fixture noexec "$F_NORMAL")"
+
 echo "---- NO_REPLY ----";        echo "${OUT_NOREPLY:-<empty>}"
 echo "---- mail envelope ----";   echo "${OUT_ENVELOPE:-<empty>}"
 echo "---- normal paragraph ----"; echo "${OUT_NORMAL:-<empty>}"
+echo "---- non-executable pvox ----"; echo "${OUT_NOEXEC:-<empty>}"
 echo "--------------------------"
 
 fail=0
@@ -127,6 +140,12 @@ assert_spoken() {
 assert_refused "NO_REPLY"      "$OUT_NOREPLY"  "no-reply-or-empty"
 assert_refused "mail envelope" "$OUT_ENVELOPE" "mail-envelope"
 assert_spoken  "normal paragraph" "$OUT_NORMAL"
+if printf '%s' "$OUT_NOEXEC" | grep -q 'delivered='; then
+    echo "PASS: non-executable pvox still delivered"
+else
+    echo "FAIL: non-executable pvox did not deliver; got: ${OUT_NOEXEC:-<empty>}"
+    fail=1
+fi
 
 refusals=0
 printf '%s' "$OUT_NOREPLY"  | grep -q 'refused=' && refusals=$((refusals+1)) || true
@@ -143,5 +162,5 @@ if [ "$fail" -ne 0 ]; then
     echo "RESULT: FAIL"
     exit 1
 fi
-echo "RESULT: PASS (2 refusals + 1 spoken)"
+echo "RESULT: PASS (2 refusals + 1 spoken + non-executable pvox delivered)"
 # Refusal gate test (NO_REPLY / mail envelope / normal paragraph):1 ends here
