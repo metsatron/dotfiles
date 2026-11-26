@@ -20,6 +20,7 @@ Built 2026-09-29 by Honey Badger (Claude) for Mètsàtron.
 """
 from __future__ import annotations
 
+import ast
 import hashlib
 import json
 import os
@@ -199,6 +200,48 @@ def log_path_diagnostic(raw, tool, directive, normalized_exists):
           directive=directive, normalized_exists=bool(normalized_exists))
 
 
+def resolve_missing(sid: str, path: str):
+    """read_file's decision for a path that does not exist, shared with the execute_code /
+    terminal literal check. Returns ("fix", fixed_path, reason, n), ("block", message,
+    reason, n) or ("none", None, reason, n). Pure: no logging, no output."""
+    rooted = pathfix.home_rooted(path)     # Filebrowser-style '/Secret Vault/...'
+    if rooted:
+        path = rooted
+    if rooted and os.path.exists(path):
+        return "fix", path, "home_rooted", 1
+    fixed, reason, n = pathfix.find_match(path, sid)
+    if fixed:
+        return "fix", fixed, reason, n
+    folder, names = pathfix.suggestions(path)
+    if not names:
+        return "none", None, reason, n
+    base = os.path.basename(path)
+    # Ambiguous among near-identical siblings (e.g. three copies of one client's
+    # report): show just that short, numbered cluster so the right one is obvious and
+    # copyable, instead of a 15-line folder dump.
+    cluster = pathfix.close_matches(path) if reason == "ambiguous" else []
+    if len(cluster) >= 2:
+        return ("block", f"The exact filename `{base}` does not exist — this is a name mismatch, NOT a "
+                f"permissions or Secret-Vault block and not a broken PDF/Word reader (nothing was read). "
+                f"{len(cluster)} files match it and they are DIFFERENT documents (the size and date after the "
+                f"` · ` tell them apart):\n" +
+                "\n".join(f"{i + 1}. {nm}" for i, nm in enumerate(cluster)) +
+                "\nIf you were given a full file path, read that path verbatim. Otherwise pick the one you need, "
+                "copy its name (everything before the ` · `) character-for-character, and read that — or ask which "
+                "one is meant. Do not guess and do not say the vault blocked you — it didn't.",
+                "ambiguous_client", len(cluster))
+    # No single clear match: show what is really in the folder so she picks a real name.
+    return ("block", f"That file does not exist — this is a wrong filename, NOT a permissions or "
+            f"Secret-Vault block and not a broken PDF/Word reader (nothing was read). The vault is open "
+            f"to you here; you just named a file that isn't there. What is really in `{folder}`:\n- " +
+            "\n- ".join(names) +
+            "\nEach line is a real file; the size and date after the ` · ` tell near-identical names apart. "
+            "Pick the one you need, copy the name (everything before the ` · `) character-for-character, and "
+            "read that. If you were given a full file path, read that path verbatim. "
+            "Do not tell anyone the vault blocked you — it didn't.",
+            "suggest_" + reason, n)
+
+
 def check_paths(sid: str, tool: str, args: dict, cwd: str | None):
     """Rewrite a non-existent path to its one clear match. Logs labels only, never paths."""
     if R.mode("path_fixer") == "off" or tool not in pathfix.PATH_ARGS:
@@ -235,49 +278,18 @@ def check_paths(sid: str, tool: str, args: dict, cwd: str | None):
                     out({"action": "modify", "args": {key: path}})
         log_path_diagnostic(raw, tool, "none", True)
         return
-    rooted = pathfix.home_rooted(path)     # Filebrowser-style '/Secret Vault/...'
-    if rooted:
-        path = rooted
-    if rooted and os.path.exists(path):
-        fixed, reason, n = path, "home_rooted", 1
-    else:
-        fixed, reason, n = pathfix.find_match(path, sid)
-    if not fixed:
-        folder, names = pathfix.suggestions(path)
-        if not names:
-            R.log("path_fixer", action="none", tool=tool, reason=reason, n_candidates=n)
-            log_path_diagnostic(raw, tool, "none", False)
-            return
-        base = os.path.basename(path)
+    kind, fixed, reason, n = resolve_missing(sid, path)
+    if kind == "none":
+        R.log("path_fixer", action="none", tool=tool, reason=reason, n_candidates=n)
+        log_path_diagnostic(raw, tool, "none", False)
+        return
+    if kind == "block":
         # These blocks are R2D2 STEERING Aura, not the tool failing. Mark them so the
         # post_tool hook doesn't count them toward the consecutive-failure wall and lock
         # read_file after 3 (the recurring "Aura can't read the report", 2026-10-20).
         R.mark_steer(sid, tool)
         log_path_diagnostic(raw, tool, "block" if R.mode("path_fixer") == "active" else "none", False)
-        # Ambiguous among near-identical siblings (e.g. three copies of one client's
-        # report): show just that short, numbered cluster so the right one is obvious and
-        # copyable, instead of a 15-line folder dump.
-        cluster = pathfix.close_matches(path) if reason == "ambiguous" else []
-        if len(cluster) >= 2:
-            block("path_fixer", f"The exact filename `{base}` does not exist — this is a name mismatch, NOT a "
-                  f"permissions or Secret-Vault block and not a broken PDF/Word reader (nothing was read). "
-                  f"{len(cluster)} files match it and they are DIFFERENT documents (the size and date after the "
-                  f"` · ` tell them apart):\n" +
-                  "\n".join(f"{i + 1}. {nm}" for i, nm in enumerate(cluster)) +
-                  "\nIf you were given a full file path, read that path verbatim. Otherwise pick the one you need, "
-                  "copy its name (everything before the ` · `) character-for-character, and read that — or ask which "
-                  "one is meant. Do not guess and do not say the vault blocked you — it didn't.",
-                  reason="ambiguous_client", tool=tool, n_candidates=len(cluster))
-        # No single clear match: show what is really in the folder so she picks a real name.
-        block("path_fixer", f"That file does not exist — this is a wrong filename, NOT a permissions or "
-              f"Secret-Vault block and not a broken PDF/Word reader (nothing was read). The vault is open "
-              f"to you here; you just named a file that isn't there. What is really in `{folder}`:\n- " +
-              "\n- ".join(names) +
-              "\nEach line is a real file; the size and date after the ` · ` tell near-identical names apart. "
-              "Pick the one you need, copy the name (everything before the ` · `) character-for-character, and "
-              "read that. If you were given a full file path, read that path verbatim. "
-              "Do not tell anyone the vault blocked you — it didn't.",
-              reason="suggest_" + reason, tool=tool, n_candidates=n)
+        block("path_fixer", fixed, reason=reason, tool=tool, n_candidates=n)
     active = R.mode("path_fixer") == "active"
     R.log("path_fixer", action="fix" if active else "would_fix", tool=tool, reason=reason, n_candidates=n)
     log_path_diagnostic(raw, tool, "modify" if active else "none", False)
@@ -302,6 +314,433 @@ def fix_terminal_paths(command: str):
     active = R.mode("path_fixer") == "active"
     R.log("path_fixer", action="fix" if active else "would_fix", tool="terminal", reason="shell_quoting")
     return new if active else None
+
+
+# ------------------------- file paths READ by execute_code / terminal (2026-11-26)
+# Aura also opens documents from execute_code and terminal, and those paths were never
+# checked: a misnamed file failed as a bare "No such file" and she went round in circles
+# ("R2D2 confirmed it's on disk but the path fails"). Only a path the call clearly READS is
+# checked: a missing OUTPUT path is a file about to be created and must never be retargeted
+# onto an existing document. The decision is read_file's (resolve_missing): one clear match
+# rewrites just that literal; ambiguous / no match blocks with the same pick-list. Existing
+# paths are untouched. Anything unparseable or unexpected lets the call through unchanged.
+LIT_ROOTED = re.compile(r"^/(Secret Vault|Obsidian Vault|Documents|HEEA)/")
+LIT_SKIP = re.compile(r"[*?{}\x00-\x1f]|%[sdr(]")       # globs, templates, control chars
+MAX_LITERALS = 12
+PATH_KW = {"file", "filename", "path", "fp", "docx", "stream", "filepath", "fname", "src", "source", "input"}
+SAME_PATH = {"Path", "PurePath", "PosixPath", "str", "expanduser", "abspath", "normpath", "realpath", "fspath"}
+READ_FIRST = {"open", "Document", "load_workbook", "PdfReader", "PdfFileReader", "PdfDocument", "ZipFile",
+              "convert_from_path", "extract_text", "copy", "copy2", "copyfile", "copyfileobj"}
+WRITE_CALLS = {"save", "write_text", "write_bytes", "mkdir", "makedirs", "touch", "move", "copytree", "rmtree",
+               "remove", "unlink", "rmdir", "savefig", "output", "dump", "write", "writelines", "extractall",
+               "extract", "symlink_to", "hardlink_to", "link", "symlink", "to_csv", "to_excel", "to_json",
+               "to_parquet", "to_html", "to_markdown", "to_pickle", "copy", "copy2", "copyfile"}
+# terminal programs, by which arguments they only READ
+READ_ALL = {"cat", "less", "more", "head", "tail", "file", "stat", "wc", "ls", "md5sum", "sha1sum", "sha256sum",
+            "sha512sum", "strings", "xxd", "hexdump", "od", "pdfinfo", "pdffonts", "identify", "mediainfo",
+            "readlink", "realpath", "zipinfo", "antiword", "catdoc", "xdg-open", "test", "["}
+READ_FIRST_ARG = {"pdftotext", "pdftoppm", "pdftohtml", "pdftocairo", "pdfimages", "docx2txt", "unzip",
+                  "tesseract", "ocrmypdf"}
+READ_BUT_OUT = {"pandoc": {"-o", "--output"}, "libreoffice": {"--outdir"}, "soffice": {"--outdir"},
+                "lowriter": {"--outdir"}}
+WRAPPERS = {"sudo", "nice", "nohup", "command", "exec", "time", "env"}
+PASSIVE = READ_ALL | {"cd", "echo", "printf", "true", "false", ":", "pwd"}   # create nothing
+PRODUCERS = WRITE_CALLS | {"convert", "convert_file", "convert_text", "export", "system", "run", "call",
+                           "check_output", "check_call", "Popen", "urlretrieve", "download"}
+OUT_OPTS = {"-o", "-O", "-d", "--output", "--outdir", "--sidecar"}   # the next word is an output
+
+
+def literal_path(value):
+    """(raw, normalized) when value is plainly a document path in the home folder, else None."""
+    if (not isinstance(value, str) or not value or len(value) > 1024 or value != value.strip()
+            or LIT_SKIP.search(value)):
+        return None
+    if not (value.startswith(("~/", HOME + "/")) or LIT_ROOTED.match(value)):
+        return None
+    if value.endswith("/") or not os.path.splitext(os.path.basename(value))[1]:
+        return None     # folders and extension-less names are not a document read
+    path = pathfix.local_path(value, None)
+    return (value, path) if path else None
+
+
+def literal_decision(sid: str, value: str, path: str, expand_tilde: bool = False):
+    """resolve_missing for one literal. With expand_tilde (Python code, whose open() never
+    expands '~'), an existing '~/' literal becomes the absolute path; any other existing
+    path is left exactly as written."""
+    if os.path.exists(path):
+        if expand_tilde and value.startswith("~/"):
+            return "fix", path, "tilde", 0
+        return "exists", None, "exists", 0
+    return resolve_missing(sid, path)
+
+
+def _callee(node):
+    f = node.func
+    if isinstance(f, ast.Name):
+        return None, f.id
+    if isinstance(f, ast.Attribute):
+        o = f.value
+        return (o.id if isinstance(o, ast.Name) else o.attr if isinstance(o, ast.Attribute) else None), f.attr
+    return None, None
+
+
+def _read_mode(node, pos: int) -> bool:
+    """open()/ZipFile() mode is read-only (absent, or a constant without w/a/x/+)."""
+    mode = node.args[pos] if len(node.args) > pos else next(
+        (k.value for k in node.keywords if k.arg == "mode"), None)
+    if mode is None:
+        return True
+    return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and not re.search(r"[wax+]", mode.value)
+
+
+def code_read_literals(code: str):
+    """{literal_node: (raw, path)} for string literals in Python code that are clearly opened
+    for READING and never written. Raises SyntaxError for code that doesn't parse."""
+    tree = ast.parse(code)
+    parents = {}
+    for node in ast.walk(tree):
+        for child in ast.iter_child_nodes(node):
+            parents[child] = node
+    lits = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            par = parents.get(node)
+            if isinstance(par, (ast.JoinedStr, ast.BinOp)) or (
+                    isinstance(par, ast.Attribute) and par.attr in ("format", "join")):
+                continue    # a piece of a bigger path/template, not a whole path
+            lp = literal_path(node.value)
+            if lp:
+                lits[node] = lp
+    if not lits:
+        return {}
+    taint = {}     # variable name -> literal nodes it holds unchanged
+
+    def refs(e):
+        if isinstance(e, ast.Constant):
+            return {e} if e in lits else set()
+        if isinstance(e, ast.Name):
+            return set(taint.get(e.id, ()))
+        if isinstance(e, ast.Call):
+            owner, name = _callee(e)
+            if name in SAME_PATH and e.args:
+                return refs(e.args[0])
+            if name in ("expanduser", "resolve", "absolute") and isinstance(e.func, ast.Attribute) and not e.args:
+                return refs(e.func.value)
+        return set()
+
+    def bind(target, found):
+        if isinstance(target, ast.Name) and found:
+            if not found <= taint.get(target.id, set()):
+                taint.setdefault(target.id, set()).update(found)
+                return True
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            return any([bind(t, found) for t in target.elts])
+        return False
+
+    for _ in range(4):      # small fixpoint over simple assignments / loops
+        changed = False
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.NamedExpr)) and node.value is not None:
+                for t in (node.targets if isinstance(node, ast.Assign) else [node.target]):
+                    changed |= bind(t, refs(node.value))
+            elif isinstance(node, (ast.For, ast.comprehension)) and isinstance(node.iter, (ast.List, ast.Tuple)):
+                found = set().union(*[refs(x) for x in node.iter.elts]) if node.iter.elts else set()
+                changed |= bind(node.target, found)
+            elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+                changed |= bind(node.optional_vars, refs(node.context_expr))
+        if not changed:
+            break
+
+    def anywhere(e):
+        found = set()
+        for x in ast.walk(e):
+            found |= refs(x) if isinstance(x, (ast.Constant, ast.Name)) else set()
+        return found
+
+    reads, writes, producers = [], set(), []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        owner, name = _callee(node)
+        here = (node.lineno, node.col_offset)
+        args = list(node.args)
+        kw = {k.arg: k.value for k in node.keywords if k.arg}
+        first = args[0] if args else next((kw[k] for k in PATH_KW if k in kw), None)
+        # reads: the path is the call's first / named file argument
+        if first is not None and (name in READ_FIRST or (name or "").startswith("read_") or
+                                  (name == "process" and owner in ("docx2txt", "textract"))):
+            if name not in ("open", "ZipFile") or _read_mode(node, 1):
+                reads.append((here, refs(first)))
+        if isinstance(node.func, ast.Attribute) and name in ("read_text", "read_bytes", "open"):
+            if name != "open" or _read_mode(node, 0):
+                reads.append((here, refs(node.func.value)))
+        passive = False
+        if name in ("run", "call", "check_output", "check_call", "Popen") and args and \
+                isinstance(args[0], (ast.List, ast.Tuple)):
+            argv = [x.value if isinstance(x, ast.Constant) and isinstance(x.value, str) else None
+                    for x in args[0].elts]
+            idx = argv_reads(argv)
+            for i in idx:
+                reads.append((here, refs(args[0].elts[i])))
+            for j, x in enumerate(args[0].elts):
+                if j not in idx:
+                    writes |= refs(x)
+            passive = _prog(argv)[1] in PASSIVE
+        # something that may CREATE files: a read after it may be of its output
+        if (name in PRODUCERS and not passive) or (name in ("open", "ZipFile") and not _read_mode(node, 1)):
+            producers.append(here)
+        # writes: anything inside a writing call (copy*: everything but the source)
+        if name in WRITE_CALLS:
+            pieces = args[1:] + [v for k, v in kw.items() if k not in PATH_KW] if name.startswith("copy") \
+                else args + list(kw.values())
+            for x in pieces:
+                writes |= anywhere(x)
+            if isinstance(node.func, ast.Attribute) and not name.startswith("copy"):
+                writes |= anywhere(node.func.value)
+        if name in ("replace", "rename") and (owner in ("os", "shutil") or (
+                isinstance(node.func, ast.Attribute) and refs(node.func.value))):
+            for x in args + [node.func.value]:
+                writes |= anywhere(x)
+        if name in ("open", "ZipFile") and not _read_mode(node, 1):
+            for x in args[:1] + [kw[k] for k in PATH_KW if k in kw]:
+                writes |= anywhere(x)
+        if name == "open" and isinstance(node.func, ast.Attribute) and not _read_mode(node, 0):
+            writes |= anywhere(node.func.value)
+    written = {lits[n][1] for n in writes}
+    first_producer = min(producers) if producers else None
+    found = {}
+    for pos, nodes in reads:
+        if first_producer is None or pos <= first_producer:     # straight-line order
+            for n in nodes:
+                if lits[n][1] not in written:
+                    found[n] = lits[n]
+    return found
+
+
+def shell_words(cmd: str):
+    """Commands as lists of words {text, start, end, quote, redirect}, or None when the command
+    is too dynamic to analyse (substitution, heredoc, unterminated quote). quote is "'" or '"'
+    for one fully quoted word, "" for a plain unquoted word, None when it can't be rewritten."""
+    if "`" in cmd or "$(" in cmd or "<<" in cmd:
+        return None
+    cmds, cur, i, n, redirect = [], [], 0, len(cmd), None
+    stops = " \t;&|()\n<>"
+    while i < n:
+        c = cmd[i]
+        if c in " \t":
+            i += 1
+            continue
+        if c in stops:
+            j = i
+            while j < n and cmd[j] in stops[2:]:
+                j += 1
+            op = cmd[i:j]
+            if "<" in op or ">" in op:
+                if re.search(r"[;|()\n]", op):
+                    return None
+                if cur and cur[-1]["end"] == i and cur[-1]["text"].isdigit() and cur[-1]["quote"] == "":
+                    cur.pop()   # the '2' of '2>'
+                redirect = "in" if op == "<" else "out"
+            else:
+                if cur:
+                    cmds.append(cur)
+                cur, redirect = [], None
+            i = j
+            continue
+        start, text, kinds, ok = i, "", [], True
+        while i < n and cmd[i] not in stops:
+            c = cmd[i]
+            if c == "'":
+                j = cmd.find("'", i + 1)
+                if j < 0:
+                    return None
+                text += cmd[i + 1:j]
+                kinds.append("'")
+                i = j + 1
+            elif c == '"':
+                j = i + 1
+                while j < n and cmd[j] != '"':
+                    j += 2 if cmd[j] == "\\" else 1
+                if j >= n:
+                    return None
+                inner = cmd[i + 1:j]
+                ok = ok and not re.search(r"[$`\\]", inner)
+                text += inner
+                kinds.append('"')
+                i = j + 1
+            else:
+                j = i
+                while j < n and cmd[j] not in stops and cmd[j] not in "'\"":
+                    j += 2 if cmd[j] == "\\" else 1
+                piece = cmd[i:j]
+                ok = ok and not re.search(r"[$\\*?\[\]{}]", piece)
+                text += piece
+                kinds.append("")
+                i = min(j, n)
+        quote = kinds[0] if ok and len(kinds) == 1 else None
+        cur.append({"text": text, "start": start, "end": i, "quote": quote, "redirect": redirect})
+        redirect = None
+    if cur:
+        cmds.append(cur)
+    return cmds
+
+
+def _prog(words):
+    """(index, program basename) of an argv after VAR=x / sudo / env / timeout N; (k, None)."""
+    k = 0
+    while k < len(words) and words[k] is not None and (
+            words[k] in WRAPPERS or re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[k])):
+        k += 1
+    if k < len(words) and words[k] == "timeout":
+        k += 2
+    if k >= len(words) or words[k] is None:
+        return k, None
+    return k, os.path.basename(words[k])
+
+
+def argv_reads(words):
+    """Indexes of argv entries (None = not a constant) that the program only READS."""
+    words = list(words)
+    k, prog = _prog(words)
+    if prog is None:
+        return set()
+    rest = [(i, w) for i, w in enumerate(words) if i > k]
+    pathish = [(i, w) for i, w in rest if w is not None and w.startswith(("/", "~"))]
+    if prog in READ_ALL:
+        return {i for i, _ in pathish}
+    if prog in READ_FIRST_ARG:
+        inputs = [i for i, _ in pathish if words[i - 1] not in OUT_OPTS]
+        return {inputs[0]} if inputs else set()
+    if prog in ("cp", "rsync"):
+        if any(w is not None and (w == "-t" or w.startswith("--target-directory")) for _, w in rest):
+            return set()
+        positional = [i for i, w in rest if w is None or not w.startswith("-")]
+        return {i for i in positional[:-1] if i in dict(pathish)}
+    if prog in READ_BUT_OUT:
+        outs = READ_BUT_OUT[prog]
+        return {i for i, _ in pathish if words[i - 1] not in outs}
+    return set()
+
+
+def terminal_read_words(cmd: str, workdir):
+    """[(word, raw, path)] for quoted or simple words of `cmd` that a reader program only
+    reads (or that feed a '<' redirect). None when the command can't be analysed."""
+    cmds = shell_words(cmd)
+    if cmds is None:
+        return None
+    dests = set(shell_dests(cmd, workdir))
+    found = []
+    for words in cmds:
+        argv = [w for w in words if w["redirect"] is None]
+        texts = [w["text"] for w in argv]
+        idx = argv_reads(texts)
+        picked = [argv[i] for i in idx] + [w for w in words if w["redirect"] == "in"]
+        for w in picked:
+            lp = literal_path(w["text"])
+            if lp and lp[1] not in dests and w["quote"] is not None:
+                found.append((w, lp[0], lp[1]))
+        if _prog(texts)[1] not in PASSIVE or any(w["redirect"] == "out" for w in words):
+            break   # this command may create files: later reads may be of its output
+    return found
+
+
+def _shell_quote(path: str, quote: str):
+    """The word to put back, or None if `path` can't be written safely in that quoting."""
+    if quote == '"':
+        return None if re.search(r'["$`\\]', path) else '"' + path + '"'
+    if quote == "'" or quote == "":
+        return None if "'" in path else "'" + path + "'"
+    return None
+
+
+def literal_mode() -> str:
+    """path_fixer's mode, unless config key "path_fixer_code" turns just this check down
+    ("shadow" / "off"): a kill switch for the execute_code / terminal coverage alone."""
+    base, own = R.mode("path_fixer"), R.config().get("path_fixer_code")
+    if base == "off" or own == "off":
+        return "off"
+    return "shadow" if own == "shadow" else base
+
+
+def check_literal_paths(sid: str, tool: str, args: dict):
+    """execute_code / terminal: fix or steer document paths the call reads. Returns the
+    args to modify ({"code": ...} / {"command": ...}) or None; may block (exits)."""
+    if tool not in ("execute_code", "terminal"):
+        return None
+    try:
+        lmode = literal_mode()
+        if lmode == "off":
+            return None
+        if tool == "execute_code":
+            code = args.get("code")
+            if not isinstance(code, str) or not code:
+                return None
+            try:
+                hits = [(node, raw, path) for node, (raw, path) in code_read_literals(code).items()]
+            except (SyntaxError, ValueError, RecursionError):
+                R.log("path_fixer", action="none", tool=tool, reason="parse_error", n_candidates=0)
+                return None
+        else:
+            cmd = args.get("command")
+            if not isinstance(cmd, str) or not cmd:
+                return None
+            hits = terminal_read_words(cmd, args.get("workdir"))
+            if hits is None:
+                return None
+        active = lmode == "active"
+        fixes, blocks = [], []
+        for item, raw, path in hits[:MAX_LITERALS]:
+            kind, value, reason, n = literal_decision(sid, raw, path, tool == "execute_code")
+            if kind == "exists":
+                continue
+            if kind == "none":
+                R.log("path_fixer", action="none", tool=tool, reason=reason, n_candidates=n)
+            elif kind == "block":
+                blocks.append((value, reason, n))
+            else:
+                fixes.append((item, value, reason, n))
+        if blocks:
+            message, reason, n = blocks[0]
+            if len(blocks) > 1:
+                message += f"\n({len(blocks)} file paths in this {tool} call don't exist; check each one.)"
+            if active:
+                R.mark_steer(sid, tool)     # steering, not a tool failure (see check_paths)
+                block("path_fixer", message, reason=reason, tool=tool, n_candidates=n)
+            R.log("path_fixer", action="would_block", tool=tool, reason=reason, n_candidates=n)
+            return None
+        if not fixes:
+            return None
+        for _, _, reason, n in fixes:
+            R.log("path_fixer", action="fix" if active else "would_fix", tool=tool, reason=reason, n_candidates=n)
+        if not active:
+            return None
+        if tool == "execute_code":
+            data = code.encode("utf-8")
+            starts = [0]
+            for line in data.splitlines(keepends=True):
+                starts.append(starts[-1] + len(line))
+            spans = []
+            for node, fixed, _, _ in fixes:
+                a = starts[node.lineno - 1] + node.col_offset
+                b = starts[node.end_lineno - 1] + node.end_col_offset
+                spans.append((a, b, repr(fixed).encode("utf-8")))
+            for a, b, rep in sorted(spans, reverse=True):
+                data = data[:a] + rep + data[b:]
+            new = data.decode("utf-8")
+            ast.parse(new)      # never hand back code that no longer parses
+            return {"code": new}
+        new = cmd
+        for word, fixed, _, _ in sorted(fixes, key=lambda f: f[0]["start"], reverse=True):
+            rep = _shell_quote(fixed, word["quote"])
+            if rep is None:
+                R.log("path_fixer", action="none", tool=tool, reason="unquotable", n_candidates=0)
+                return None
+            new = new[:word["start"]] + rep + new[word["end"]:]
+        return {"command": new}
+    except SystemExit:
+        raise
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------- checks
@@ -626,11 +1065,17 @@ def main():
         fixed_cmd = fix_terminal_paths(args.get("command") or "") if tool == "terminal" else None
         if fixed_cmd:
             args = dict(args, command=fixed_cmd)
+        lit_fix = check_literal_paths(p.get("session_id") or "", tool, args)   # may block
+        if lit_fix:
+            args = dict(args, **lit_fix)
         check_risky(tool, args)
         check_missing_commands(tool, args)
         check_writes(tool, args, p.get("cwd"))
+        changed = dict(lit_fix or {})
         if fixed_cmd:
-            out({"action": "modify", "args": {"command": fixed_cmd}})
+            changed.setdefault("command", fixed_cmd)
+        if changed:
+            out({"action": "modify", "args": changed})
     out()
 
 

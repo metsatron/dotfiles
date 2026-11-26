@@ -20,7 +20,7 @@ class Directive(Exception):
 
 def main():
     source = HOOK.read_text()
-    wanted = {"path_form_class", "log_path_diagnostic", "check_paths"}
+    wanted = {"path_form_class", "log_path_diagnostic", "resolve_missing", "check_paths"}
     nodes = [n for n in ast.parse(source).body
              if isinstance(n, ast.FunctionDef) and n.name in wanted]
     assert len(nodes) == len(wanted)
